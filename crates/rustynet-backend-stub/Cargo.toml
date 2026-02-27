@@ -1,0 +1,9 @@
+[package]
+name = "rustynet-backend-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustynet-backend-api = { path = "../rustynet-backend-api" }

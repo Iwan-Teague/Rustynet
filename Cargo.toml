@@ -8,6 +8,7 @@ members = [
   "crates/rustynet-crypto",
   "crates/rustynet-backend-api",
   "crates/rustynet-backend-wireguard",
+  "crates/rustynet-backend-stub",
 ]
 resolver = "2"
 

@@ -1,0 +1,10 @@
+{
+  "phase": "phase1",
+  "suite": "backend_contract_perf",
+  "metrics": [
+    {"name":"configure_peer_avg_us","value":1.251,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"apply_routes_avg_us","value":1.214585,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"stats_avg_us","value":0.048917999999999996,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"throughput_overhead_vs_wireguard_percent","value":0,"unit":"percent","threshold":"<=15","status":"not_measurable","reason":"no_production_datapath"}
+  ]
+}

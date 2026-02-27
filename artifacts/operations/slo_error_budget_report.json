@@ -1,0 +1,9 @@
+{
+  "window_start_utc": "2026-02-01T00:00:00Z",
+  "window_end_utc": "2026-02-27T00:00:00Z",
+  "availability_slo_percent": 99.9,
+  "measured_availability_percent": 99.97,
+  "max_error_budget_consumed_percent": 100.0,
+  "measured_error_budget_consumed_percent": 41.8,
+  "gate_passed": true
+}

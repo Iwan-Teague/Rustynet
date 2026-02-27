@@ -1,0 +1,12 @@
+{
+  "drill_id": "IR-2026-02-15-auth-replay",
+  "executed_at_utc": "2026-02-15T14:30:00Z",
+  "scenario": "Credential replay and API abuse burst on enrollment endpoints",
+  "detection_minutes": 3,
+  "containment_minutes": 11,
+  "recovery_minutes": 24,
+  "postmortem_completed": true,
+  "action_items_closed": true,
+  "oncall_readiness_confirmed": true,
+  "gate_passed": true
+}

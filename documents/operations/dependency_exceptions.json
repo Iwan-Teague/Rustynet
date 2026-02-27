@@ -1,0 +1,12 @@
+{
+  "exceptions": [
+    {
+      "id": "sample-allow-multiple-versions",
+      "crate": "openssl-sys",
+      "reason": "Temporary transitive duplication pending upstream convergence",
+      "owner": "security-team",
+      "expires_utc": "2026-12-31T00:00:00Z",
+      "approved_by": "engineering-owner"
+    }
+  ]
+}

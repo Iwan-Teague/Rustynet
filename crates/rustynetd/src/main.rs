@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod perf;
+
 use rustynet_backend_api::{
     ExitMode, NodeId, PeerConfig, Route, RouteKind, RuntimeContext, SocketEndpoint, TunnelBackend,
 };
@@ -15,6 +17,19 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(flag_index) = args
+        .iter()
+        .position(|value| value == "--emit-phase1-baseline")
+    {
+        let output_path = args
+            .get(flag_index + 1)
+            .ok_or_else(|| "--emit-phase1-baseline requires a path argument".to_string())?;
+        perf::write_phase1_baseline_report(output_path)?;
+        println!("phase1 baseline report emitted: {output_path}");
+        return Ok(());
+    }
+
     let local_node = NodeId::new("mini-pc-1").map_err(|err| err.to_string())?;
     let peer_node = NodeId::new("laptop-1").map_err(|err| err.to_string())?;
 

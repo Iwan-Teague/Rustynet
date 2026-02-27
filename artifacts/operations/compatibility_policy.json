@@ -1,0 +1,18 @@
+{
+  "policy_version": "2026.02",
+  "minimum_supported_client": {
+    "major": 1,
+    "minor": 2
+  },
+  "latest_server": {
+    "major": 1,
+    "minor": 9
+  },
+  "deprecation_window_days": 90,
+  "insecure_compatibility_mode": {
+    "default_enabled": false,
+    "max_exception_days": 30,
+    "auto_expiry_required": true,
+    "risk_acceptance_required": true
+  }
+}

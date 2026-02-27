@@ -1,0 +1,14 @@
+{
+  "default_backend": "wireguard",
+  "additional_backend_paths": ["stub-backend"],
+  "conformance_passed": true,
+  "security_review_complete": true,
+  "wireguard_is_adapter_boundary": true,
+  "protocol_leakage_detected": false,
+  "gate_passed": true,
+  "evidence_commands": [
+    "cargo test -p rustynet-backend-wireguard --test conformance",
+    "cargo test -p rustynet-backend-stub --all-targets --all-features",
+    "scripts/ci/phase1_gates.sh"
+  ]
+}

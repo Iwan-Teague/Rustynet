@@ -10,10 +10,11 @@ pub struct NodeId(String);
 impl NodeId {
     pub fn new(value: impl Into<String>) -> Result<Self, BackendError> {
         let value = value.into();
-        if value.trim().is_empty() {
+        let normalized = value.trim();
+        if normalized.is_empty() {
             return Err(BackendError::invalid_input("node id must not be empty"));
         }
-        Ok(Self(value))
+        Ok(Self(normalized.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -153,4 +154,21 @@ pub trait TunnelBackend: Send + Sync {
     fn stats(&self) -> Result<TunnelStats, BackendError>;
 
     fn shutdown(&mut self) -> Result<(), BackendError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendErrorKind, NodeId};
+
+    #[test]
+    fn node_id_trims_outer_whitespace() {
+        let node_id = NodeId::new("  mini-pc-1  ").expect("node id should be valid");
+        assert_eq!(node_id.as_str(), "mini-pc-1");
+    }
+
+    #[test]
+    fn node_id_rejects_empty_or_whitespace_only_values() {
+        let err = NodeId::new("   ").expect_err("whitespace-only node id must be rejected");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+    }
 }

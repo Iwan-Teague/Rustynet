@@ -1,0 +1,8 @@
+{
+  "phase":"phase3",
+  "metrics":[
+    {"name":"connected_nodes","value":3,"unit":"count"},
+    {"name":"peer_sessions","value":6,"unit":"count"},
+    {"name":"relay_sessions","value":0,"unit":"count"}
+  ]
+}
