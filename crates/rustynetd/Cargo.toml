@@ -1,0 +1,12 @@
+[package]
+name = "rustynetd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustynet-backend-api = { path = "../rustynet-backend-api" }
+rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
+rustynet-policy = { path = "../rustynet-policy" }
+rustynet-crypto = { path = "../rustynet-crypto" }

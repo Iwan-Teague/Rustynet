@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "crates/rustynet-control",
+  "crates/rustynetd",
+  "crates/rustynet-cli",
+  "crates/rustynet-relay",
+  "crates/rustynet-policy",
+  "crates/rustynet-crypto",
+  "crates/rustynet-backend-api",
+  "crates/rustynet-backend-wireguard",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+authors = ["Rustynet Team"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
