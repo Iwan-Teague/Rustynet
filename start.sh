@@ -13,7 +13,9 @@ TRUST_EVIDENCE_PATH="/var/lib/rustynet/rustynetd.trust"
 TRUST_VERIFIER_KEY_PATH="/etc/rustynet/trust-evidence.pub"
 TRUST_WATERMARK_PATH="/var/lib/rustynet/rustynetd.trust.watermark"
 WG_INTERFACE="rustynet0"
-WG_PRIVATE_KEY_PATH="/etc/rustynet/wireguard.key"
+WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
+WG_ENCRYPTED_PRIVATE_KEY_PATH="/etc/rustynet/wireguard.key.enc"
+WG_KEY_PASSPHRASE_PATH="/etc/rustynet/wireguard.passphrase"
 WG_PUBLIC_KEY_PATH="/etc/rustynet/wireguard.pub"
 EGRESS_INTERFACE=""
 BACKEND_MODE="linux-wireguard"
@@ -85,6 +87,8 @@ save_config() {
     printf 'TRUST_WATERMARK_PATH=%q\n' "${TRUST_WATERMARK_PATH}"
     printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
     printf 'WG_PRIVATE_KEY_PATH=%q\n' "${WG_PRIVATE_KEY_PATH}"
+    printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%q\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
+    printf 'WG_KEY_PASSPHRASE_PATH=%q\n' "${WG_KEY_PASSPHRASE_PATH}"
     printf 'WG_PUBLIC_KEY_PATH=%q\n' "${WG_PUBLIC_KEY_PATH}"
     printf 'EGRESS_INTERFACE=%q\n' "${EGRESS_INTERFACE}"
     printf 'BACKEND_MODE=%q\n' "${BACKEND_MODE}"
@@ -257,28 +261,62 @@ prepare_system_directories() {
   run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
   run_root install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
   run_root install -d -m 0700 "$(dirname "${TRUST_WATERMARK_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
 }
 
 ensure_wireguard_keys() {
-  if [[ -f "${WG_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" ]]; then
+  if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" && -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
     return
   fi
 
-  if ! prompt_yes_no "WireGuard keys are missing. Generate them now?" "y"; then
-    print_err "WireGuard keypair is required."
+  if ! prompt_yes_no "Encrypted WireGuard key material is missing. Initialize now?" "y"; then
+    print_err "Encrypted WireGuard key material is required."
     exit 1
   fi
 
-  local tmp_priv
-  local tmp_pub
-  tmp_priv="$(mktemp)"
-  tmp_pub="$(mktemp)"
-  wg genkey >"${tmp_priv}"
-  wg pubkey <"${tmp_priv}" >"${tmp_pub}"
-  run_root install -m 0600 "${tmp_priv}" "${WG_PRIVATE_KEY_PATH}"
-  run_root install -m 0644 "${tmp_pub}" "${WG_PUBLIC_KEY_PATH}"
-  rm -f "${tmp_priv}" "${tmp_pub}"
-  print_info "WireGuard keys written to ${WG_PRIVATE_KEY_PATH} and ${WG_PUBLIC_KEY_PATH}"
+  if [[ ! -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    local tmp_passphrase
+    tmp_passphrase="$(mktemp)"
+    openssl rand -hex 48 >"${tmp_passphrase}"
+    run_root install -m 0600 "${tmp_passphrase}" "${WG_KEY_PASSPHRASE_PATH}"
+    rm -f "${tmp_passphrase}"
+    print_info "Generated key passphrase file at ${WG_KEY_PASSPHRASE_PATH}"
+  fi
+
+  local source_private_key=""
+  if [[ -f "${WG_PRIVATE_KEY_PATH}" ]]; then
+    source_private_key="${WG_PRIVATE_KEY_PATH}"
+  elif [[ -f "/etc/rustynet/wireguard.key" ]]; then
+    source_private_key="/etc/rustynet/wireguard.key"
+  fi
+
+  if [[ -n "${source_private_key}" ]]; then
+    run_root rustynetd key migrate \
+      --existing-private-key "${source_private_key}" \
+      --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
+      --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+      --public-key "${WG_PUBLIC_KEY_PATH}" \
+      --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
+      --force
+    if [[ "${source_private_key}" != "${WG_PRIVATE_KEY_PATH}" ]]; then
+      run_root rm -f "${source_private_key}"
+      print_info "Removed legacy plaintext private key at ${source_private_key}"
+    fi
+    print_info "Existing key migrated to encrypted storage."
+    return
+  fi
+
+  run_root rustynetd key init \
+    --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
+    --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+    --public-key "${WG_PUBLIC_KEY_PATH}" \
+    --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
+    --force
+
+  print_info "WireGuard key material initialized (encrypted key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH})"
 }
 
 generate_verifier_key_from_signer() {
@@ -381,6 +419,7 @@ write_daemon_environment() {
     exit 1
   fi
   run_root env \
+    RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
     RUSTYNET_SOCKET="${SOCKET_PATH}" \
     RUSTYNET_STATE="${STATE_PATH}" \
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
@@ -389,6 +428,9 @@ write_daemon_environment() {
     RUSTYNET_BACKEND="${BACKEND_MODE}" \
     RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
     RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+    RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+    RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+    RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
     RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
     RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
     RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
@@ -456,6 +498,12 @@ find_peer_record() {
   grep "^${name}|" "${PEERS_FILE}" || true
 }
 
+find_peer_record_by_node_id() {
+  local node_id="$1"
+  ensure_peer_store
+  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF==5 && $2 == nid { print; exit }' "${PEERS_FILE}" || true
+}
+
 run_rustynet_cli() {
   if ! command -v rustynet >/dev/null 2>&1; then
     print_err "rustynet CLI not found in PATH."
@@ -468,7 +516,7 @@ connect_to_device() {
   local name node_id public_key endpoint_ip endpoint_port endpoint cidr
   prompt_default name "Peer name (local label)" "peer-$(date +%H%M%S)"
   prompt_default node_id "Peer node id" "${name}"
-  prompt_default public_key "Peer WireGuard public key (hex)" ""
+  prompt_default public_key "Peer WireGuard public key (base64)" ""
   prompt_default endpoint_ip "Peer endpoint IP or DNS" ""
   prompt_default endpoint_port "Peer endpoint port" "51820"
   prompt_default cidr "Peer tunnel CIDR" "100.64.0.2/32"
@@ -514,6 +562,53 @@ show_connected_devices() {
   run_root wg show "${WG_INTERFACE}" || print_warn "Unable to read live WireGuard state."
 }
 
+rotate_local_key() {
+  run_rustynet_cli key rotate
+}
+
+revoke_local_key() {
+  if ! prompt_yes_no "Revoke local key material now? This disables connectivity until reinitialized." "n"; then
+    print_info "Revoke cancelled."
+    return 0
+  fi
+  run_rustynet_cli key revoke
+}
+
+apply_rotation_bundle() {
+  local bundle prefix node_id new_public_key record name old_public endpoint cidr
+  prompt_default bundle "Rotation bundle (format rotation:<node_id>:<public_key>)" ""
+  if [[ -z "${bundle}" ]]; then
+    print_err "Rotation bundle is required."
+    return 1
+  fi
+  IFS=':' read -r prefix node_id new_public_key <<<"${bundle}"
+  if [[ "${prefix}" != "rotation" || -z "${node_id}" || -z "${new_public_key}" ]]; then
+    print_err "Invalid rotation bundle format."
+    return 1
+  fi
+
+  record="$(find_peer_record_by_node_id "${node_id}")"
+  if [[ -z "${record}" ]]; then
+    print_err "No saved peer found for node id ${node_id}."
+    return 1
+  fi
+
+  name="$(echo "${record}" | awk -F'|' '{print $1}')"
+  old_public="$(echo "${record}" | awk -F'|' '{print $3}')"
+  endpoint="$(echo "${record}" | awk -F'|' '{print $4}')"
+  cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
+
+  if [[ "${old_public}" == "${new_public_key}" ]]; then
+    print_info "Peer ${name} already has this key."
+    return 0
+  fi
+
+  run_root wg set "${WG_INTERFACE}" peer "${old_public}" remove || true
+  run_root wg set "${WG_INTERFACE}" peer "${new_public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
+  upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}"
+  print_info "Updated peer key for ${name} (${node_id}) without changing node identity."
+}
+
 configure_values() {
   local detected_egress
   detected_egress="$(detect_default_egress)"
@@ -528,7 +623,9 @@ configure_values() {
   prompt_default TRUST_VERIFIER_KEY_PATH "Trust verifier key path" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default TRUST_WATERMARK_PATH "Trust watermark path" "${TRUST_WATERMARK_PATH}"
   prompt_default WG_INTERFACE "WireGuard interface name" "${WG_INTERFACE}"
-  prompt_default WG_PRIVATE_KEY_PATH "WireGuard private key path" "${WG_PRIVATE_KEY_PATH}"
+  prompt_default WG_PRIVATE_KEY_PATH "WireGuard runtime private key path" "${WG_PRIVATE_KEY_PATH}"
+  prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
+  prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
   prompt_default BACKEND_MODE "Backend mode (in-memory|linux-wireguard)" "${BACKEND_MODE}"
@@ -563,7 +660,9 @@ Current Rustynet Wizard Configuration
   trust_verifier_key      : ${TRUST_VERIFIER_KEY_PATH}
   trust_watermark         : ${TRUST_WATERMARK_PATH}
   wg_interface            : ${WG_INTERFACE}
-  wg_private_key          : ${WG_PRIVATE_KEY_PATH}
+  wg_runtime_private_key  : ${WG_PRIVATE_KEY_PATH}
+  wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
+  wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
   wg_public_key           : ${WG_PUBLIC_KEY_PATH}
   egress_interface        : ${EGRESS_INTERFACE}
   backend                 : ${BACKEND_MODE}
@@ -629,7 +728,10 @@ Rustynet Control Menu
  14) Toggle LAN access
  15) Advertise route
  16) Refresh signed trust evidence now
- 17) Show current configuration
+ 17) Rotate local WireGuard key
+ 18) Revoke local key material
+ 19) Apply peer key rotation bundle
+ 20) Show current configuration
   0) Exit
 EOF
     local choice
@@ -655,7 +757,10 @@ EOF
       14) toggle_lan_access ;;
       15) advertise_route ;;
       16) refresh_signed_trust_evidence ;;
-      17) show_runtime_config ;;
+      17) rotate_local_key ;;
+      18) revoke_local_key ;;
+      19) apply_rotation_bundle ;;
+      20) show_runtime_config ;;
       0) exit 0 ;;
       *) print_warn "Unknown option: ${choice}" ;;
     esac

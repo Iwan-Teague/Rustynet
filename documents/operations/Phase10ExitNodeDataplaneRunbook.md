@@ -8,7 +8,9 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `rustynetd` and `rustynet` binaries built from current workspace.
 - `scripts/ci/phase10_gates.sh` completed and artifacts present in `artifacts/phase10/`.
 - Trust state and signed control data validation path healthy.
-- WireGuard private key present at `/etc/rustynet/wireguard.key` with mode `0600`.
+- WireGuard encrypted key present at `/etc/rustynet/wireguard.key.enc` with mode `0600`.
+- WireGuard passphrase file present at `/etc/rustynet/wireguard.passphrase` with mode `0600`.
+- Runtime decrypted key at `/run/rustynet/wireguard.key` with mode `0600` (managed by `rustynetd`).
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
 - Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
 
@@ -49,6 +51,8 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- netcheck`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- dns inspect`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- route advertise 192.168.1.0/24`
+- `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key rotate`
+- `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key revoke`
 - `cargo run -p rustynetd -- --emit-phase10-evidence artifacts/phase10`
 
 ## 7) Required Evidence for Sign-Off

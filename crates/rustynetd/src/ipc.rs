@@ -10,6 +10,8 @@ pub enum IpcCommand {
     LanAccessOff,
     DnsInspect,
     RouteAdvertise(String),
+    KeyRotate,
+    KeyRevoke,
     Unknown(String),
 }
 
@@ -22,6 +24,8 @@ impl IpcCommand {
                 | IpcCommand::LanAccessOn
                 | IpcCommand::LanAccessOff
                 | IpcCommand::RouteAdvertise(_)
+                | IpcCommand::KeyRotate
+                | IpcCommand::KeyRevoke
         )
     }
 
@@ -35,6 +39,8 @@ impl IpcCommand {
             IpcCommand::LanAccessOff => "lan-access off".to_string(),
             IpcCommand::DnsInspect => "dns inspect".to_string(),
             IpcCommand::RouteAdvertise(cidr) => format!("route advertise {cidr}"),
+            IpcCommand::KeyRotate => "key rotate".to_string(),
+            IpcCommand::KeyRevoke => "key revoke".to_string(),
             IpcCommand::Unknown(raw) => raw.clone(),
         }
     }
@@ -96,6 +102,8 @@ pub fn parse_command(raw: &str) -> IpcCommand {
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             IpcCommand::RouteAdvertise(cidr.clone())
         }
+        [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => IpcCommand::KeyRotate,
+        [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => IpcCommand::KeyRevoke,
         _ => IpcCommand::Unknown(raw.trim().to_string()),
     }
 }
@@ -122,6 +130,19 @@ mod tests {
         assert_eq!(command, IpcCommand::ExitNodeSelect("mini-pc-1".to_string()));
         assert!(command.is_mutating());
         assert_eq!(command.as_wire(), "exit-node select mini-pc-1");
+    }
+
+    #[test]
+    fn parse_key_rotation_mutations() {
+        let rotate = parse_command("key rotate");
+        assert_eq!(rotate, IpcCommand::KeyRotate);
+        assert!(rotate.is_mutating());
+        assert_eq!(rotate.as_wire(), "key rotate");
+
+        let revoke = parse_command("key revoke");
+        assert_eq!(revoke, IpcCommand::KeyRevoke);
+        assert!(revoke.is_mutating());
+        assert_eq!(revoke.as_wire(), "key revoke");
     }
 
     #[test]

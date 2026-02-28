@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_NODE_ID=daemon-local
 Environment=RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock
 Environment=RUSTYNET_STATE=/var/lib/rustynet/rustynetd.state
 Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
@@ -14,12 +15,15 @@ Environment=RUSTYNET_TRUST_VERIFIER_KEY=/etc/rustynet/trust-evidence.pub
 Environment=RUSTYNET_TRUST_WATERMARK=/var/lib/rustynet/rustynetd.trust.watermark
 Environment=RUSTYNET_BACKEND=linux-wireguard
 Environment=RUSTYNET_WG_INTERFACE=rustynet0
-Environment=RUSTYNET_WG_PRIVATE_KEY=/etc/rustynet/wireguard.key
+Environment=RUSTYNET_WG_PRIVATE_KEY=/run/rustynet/wireguard.key
+Environment=RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY=/etc/rustynet/wireguard.key.enc
+Environment=RUSTYNET_WG_KEY_PASSPHRASE=/etc/rustynet/wireguard.passphrase
+Environment=RUSTYNET_WG_PUBLIC_KEY=/etc/rustynet/wireguard.pub
 Environment=RUSTYNET_EGRESS_INTERFACE=eth0
 Environment=RUSTYNET_DATAPLANE_MODE=hybrid-native
 Environment=RUSTYNET_RECONCILE_INTERVAL_MS=1000
 Environment=RUSTYNET_MAX_RECONCILE_FAILURES=5
-ExecStart=/usr/local/bin/rustynetd daemon --socket ${RUSTYNET_SOCKET} --state ${RUSTYNET_STATE} --trust-evidence ${RUSTYNET_TRUST_EVIDENCE} --trust-verifier-key ${RUSTYNET_TRUST_VERIFIER_KEY} --trust-watermark ${RUSTYNET_TRUST_WATERMARK} --backend ${RUSTYNET_BACKEND} --wg-interface ${RUSTYNET_WG_INTERFACE} --wg-private-key ${RUSTYNET_WG_PRIVATE_KEY} --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode ${RUSTYNET_DATAPLANE_MODE} --reconcile-interval-ms ${RUSTYNET_RECONCILE_INTERVAL_MS} --max-reconcile-failures ${RUSTYNET_MAX_RECONCILE_FAILURES}
+ExecStart=/usr/local/bin/rustynetd daemon --node-id ${RUSTYNET_NODE_ID} --socket ${RUSTYNET_SOCKET} --state ${RUSTYNET_STATE} --trust-evidence ${RUSTYNET_TRUST_EVIDENCE} --trust-verifier-key ${RUSTYNET_TRUST_VERIFIER_KEY} --trust-watermark ${RUSTYNET_TRUST_WATERMARK} --backend ${RUSTYNET_BACKEND} --wg-interface ${RUSTYNET_WG_INTERFACE} --wg-private-key ${RUSTYNET_WG_PRIVATE_KEY} --wg-encrypted-private-key ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} --wg-key-passphrase ${RUSTYNET_WG_KEY_PASSPHRASE} --wg-public-key ${RUSTYNET_WG_PUBLIC_KEY} --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode ${RUSTYNET_DATAPLANE_MODE} --reconcile-interval-ms ${RUSTYNET_RECONCILE_INTERVAL_MS} --max-reconcile-failures ${RUSTYNET_MAX_RECONCILE_FAILURES}
 Restart=on-failure
 RestartSec=2s
 StartLimitBurst=5
@@ -29,7 +33,9 @@ RuntimeDirectoryMode=0700
 StateDirectory=rustynet
 StateDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /etc/rustynet
-ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.key
+ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.key.enc
+ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.passphrase
+ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.pub
 ExecStartPre=/usr/bin/test -f /var/lib/rustynet/rustynetd.trust
 ExecStartPre=/usr/bin/test -f /etc/rustynet/trust-evidence.pub
 User=root

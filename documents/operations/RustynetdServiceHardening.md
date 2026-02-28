@@ -37,7 +37,10 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `StateDirectory=rustynet` with mode `0700`
 
 ## Required Runtime Files
-- `/etc/rustynet/wireguard.key` (`0600`)
+- `/etc/rustynet/wireguard.key.enc` (`0600`, encrypted at rest)
+- `/etc/rustynet/wireguard.passphrase` (`0600`)
+- `/run/rustynet/wireguard.key` (`0600`, runtime-decrypted key material)
+- `/etc/rustynet/wireguard.pub` (`0644`)
 - `/var/lib/rustynet/rustynetd.trust` (integrity-checked trust evidence)
 - `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
 

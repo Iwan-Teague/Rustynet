@@ -18,6 +18,8 @@ enum CliCommand {
     LanAccessOff,
     DnsInspect,
     RouteAdvertise(String),
+    KeyRotate,
+    KeyRevoke,
     Help,
 }
 
@@ -43,6 +45,8 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             CliCommand::RouteAdvertise(cidr.clone())
         }
+        [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => CliCommand::KeyRotate,
+        [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => CliCommand::KeyRevoke,
         _ => CliCommand::Help,
     }
 }
@@ -77,6 +81,8 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::LanAccessOff => IpcCommand::LanAccessOff,
         CliCommand::DnsInspect => IpcCommand::DnsInspect,
         CliCommand::RouteAdvertise(cidr) => IpcCommand::RouteAdvertise(cidr),
+        CliCommand::KeyRotate => IpcCommand::KeyRotate,
+        CliCommand::KeyRevoke => IpcCommand::KeyRevoke,
         CliCommand::Login | CliCommand::Help => IpcCommand::Unknown("unsupported".to_string()),
     }
 }
@@ -122,6 +128,8 @@ fn help_text() -> String {
         "  lan-access on|off",
         "  dns inspect",
         "  route advertise <cidr>",
+        "  key rotate",
+        "  key revoke",
     ]
     .join("\n")
 }
@@ -138,6 +146,15 @@ mod tests {
             "192.168.1.0/24".to_string(),
         ]);
         assert!(format!("{command:?}").contains("RouteAdvertise"));
+    }
+
+    #[test]
+    fn parse_supports_key_commands() {
+        let rotate = parse_command(&["key".to_string(), "rotate".to_string()]);
+        assert!(format!("{rotate:?}").contains("KeyRotate"));
+
+        let revoke = parse_command(&["key".to_string(), "revoke".to_string()]);
+        assert!(format!("{revoke:?}").contains("KeyRevoke"));
     }
 
     #[test]

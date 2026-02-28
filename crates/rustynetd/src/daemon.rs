@@ -11,6 +11,11 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
+use crate::key_material::{
+    apply_interface_private_key, decrypt_private_key, encrypt_private_key,
+    generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
+    write_runtime_private_key,
+};
 use crate::phase10::{
     ApplyOptions, DataplaneState, DataplaneSystem, DryRunSystem, Phase10Controller,
     RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
@@ -50,9 +55,14 @@ pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust
 pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.pub";
 pub const DEFAULT_TRUST_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.trust.watermark";
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
+pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
+pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key.enc";
+pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/etc/rustynet/wireguard.passphrase";
+pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/etc/rustynet/wireguard.pub";
 pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
+pub const DEFAULT_NODE_ID: &str = "daemon-local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -82,6 +92,7 @@ impl Default for DaemonBackendMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
+    pub node_id: String,
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
     pub trust_evidence_path: PathBuf,
@@ -90,6 +101,9 @@ pub struct DaemonConfig {
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_private_key_path: Option<PathBuf>,
+    pub wg_encrypted_private_key_path: Option<PathBuf>,
+    pub wg_key_passphrase_path: Option<PathBuf>,
+    pub wg_public_key_path: Option<PathBuf>,
     pub egress_interface: String,
     pub dataplane_mode: DaemonDataplaneMode,
     pub reconcile_interval_ms: u64,
@@ -100,6 +114,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            node_id: DEFAULT_NODE_ID.to_string(),
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
@@ -107,7 +122,12 @@ impl Default for DaemonConfig {
             trust_watermark_path: PathBuf::from(DEFAULT_TRUST_WATERMARK_PATH),
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
-            wg_private_key_path: None,
+            wg_private_key_path: Some(PathBuf::from(DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH)),
+            wg_encrypted_private_key_path: Some(PathBuf::from(
+                DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            )),
+            wg_key_passphrase_path: Some(PathBuf::from(DEFAULT_WG_KEY_PASSPHRASE_PATH)),
+            wg_public_key_path: Some(PathBuf::from(DEFAULT_WG_PUBLIC_KEY_PATH)),
             egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
             dataplane_mode: DaemonDataplaneMode::default(),
             reconcile_interval_ms: DEFAULT_RECONCILE_INTERVAL_MS,
@@ -298,6 +318,13 @@ impl TunnelBackend for DaemonBackend {
 
 struct DaemonRuntime {
     controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
+    backend_mode: DaemonBackendMode,
+    local_node_id: String,
+    wg_interface: String,
+    wg_private_key_path: Option<PathBuf>,
+    wg_encrypted_private_key_path: Option<PathBuf>,
+    wg_key_passphrase_path: Option<PathBuf>,
+    wg_public_key_path: Option<PathBuf>,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
@@ -324,6 +351,8 @@ enum RestrictionMode {
 
 impl DaemonRuntime {
     fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        NodeId::new(config.node_id.clone())
+            .map_err(|err| DaemonError::InvalidConfig(format!("invalid node id: {err}")))?;
         let policy = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
                 src: "user:local".to_string(),
@@ -339,6 +368,13 @@ impl DaemonRuntime {
             Phase10Controller::new(backend, daemon_system(config)?, policy, trust_policy);
         Ok(Self {
             controller,
+            backend_mode: config.backend_mode,
+            local_node_id: config.node_id.clone(),
+            wg_interface: config.wg_interface.clone(),
+            wg_private_key_path: config.wg_private_key_path.clone(),
+            wg_encrypted_private_key_path: config.wg_encrypted_private_key_path.clone(),
+            wg_key_passphrase_path: config.wg_key_passphrase_path.clone(),
+            wg_public_key_path: config.wg_public_key_path.clone(),
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
@@ -393,7 +429,7 @@ impl DaemonRuntime {
         let apply = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
-                local_node: NodeId::new("daemon-local").expect("valid local node"),
+                local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
                 mesh_cidr: "100.64.0.0/10".to_string(),
             },
             Vec::new(),
@@ -429,7 +465,8 @@ impl DaemonRuntime {
 
         match command {
             IpcCommand::Status => IpcResponse::ok(format!(
-                "state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={}",
+                "node_id={} state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={}",
+                self.local_node_id,
                 self.controller.state(),
                 self.controller.generation(),
                 self.selected_exit_node.as_deref().unwrap_or("none"),
@@ -446,7 +483,12 @@ impl DaemonRuntime {
                 self.last_reconcile_unix
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                self.last_reconcile_error.as_deref().unwrap_or("none")
+                self.last_reconcile_error.as_deref().unwrap_or("none"),
+                if self.wg_encrypted_private_key_path.is_some() {
+                    "true"
+                } else {
+                    "false"
+                }
             )),
             IpcCommand::Netcheck => {
                 let transport = if self.controller.state() == DataplaneState::FailClosed {
@@ -534,7 +576,139 @@ impl DaemonRuntime {
                 }
                 IpcResponse::ok(format!("route advertised: {cidr}"))
             }
+            IpcCommand::KeyRotate => match self.rotate_local_key_material() {
+                Ok(message) => IpcResponse::ok(message),
+                Err(err) => IpcResponse::err(err),
+            },
+            IpcCommand::KeyRevoke => match self.revoke_local_key_material() {
+                Ok(message) => IpcResponse::ok(message),
+                Err(err) => IpcResponse::err(err),
+            },
             IpcCommand::Unknown(raw) => IpcResponse::err(format!("unknown command: {raw}")),
+        }
+    }
+
+    fn rotate_local_key_material(&mut self) -> Result<String, String> {
+        if !matches!(self.backend_mode, DaemonBackendMode::LinuxWireguard) {
+            return Err("key rotation is only supported for linux-wireguard backend".to_string());
+        }
+        let runtime_path = self
+            .wg_private_key_path
+            .clone()
+            .ok_or_else(|| "wg private key path is not configured".to_string())?;
+
+        let old_runtime = fs::read(&runtime_path).ok();
+        let old_encrypted = self
+            .wg_encrypted_private_key_path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok());
+        let old_public = self
+            .wg_public_key_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok());
+
+        let (mut new_private, new_public) = generate_wireguard_keypair()?;
+
+        if let Some(encrypted_path) = self.wg_encrypted_private_key_path.as_ref() {
+            let passphrase_path = self.wg_key_passphrase_path.as_ref().ok_or_else(|| {
+                "wg key passphrase path is required when encrypted key storage is configured"
+                    .to_string()
+            })?;
+            encrypt_private_key(&new_private, encrypted_path, passphrase_path)?;
+        }
+
+        if let Err(err) = write_runtime_private_key(&runtime_path, &new_private) {
+            new_private.fill(0);
+            return Err(err);
+        }
+        if let Some(public_path) = self.wg_public_key_path.as_ref()
+            && let Err(err) = write_public_key(public_path, &new_public)
+        {
+            new_private.fill(0);
+            return Err(err);
+        }
+
+        if let Err(err) = apply_interface_private_key(&self.wg_interface, &runtime_path) {
+            let _ = self.restore_key_backups(old_runtime, old_encrypted, old_public);
+            new_private.fill(0);
+            return Err(format!("rotate apply failed and rollback attempted: {err}"));
+        }
+
+        new_private.fill(0);
+
+        if let Err(err) = self.persist_state() {
+            return Err(format!("persist failed after key rotation: {err}"));
+        }
+
+        let bundle = format!("rotation:{}:{}", self.local_node_id, new_public);
+        Ok(format!(
+            "key rotated: node_id={} public_key={} rotation_bundle={}",
+            self.local_node_id, new_public, bundle
+        ))
+    }
+
+    fn restore_key_backups(
+        &self,
+        old_runtime: Option<Vec<u8>>,
+        old_encrypted: Option<Vec<u8>>,
+        old_public: Option<String>,
+    ) -> Result<(), String> {
+        if let (Some(path), Some(bytes)) = (self.wg_private_key_path.as_ref(), old_runtime) {
+            write_runtime_private_key(path, &bytes)?;
+            let _ = apply_interface_private_key(&self.wg_interface, path);
+        }
+        if let (Some(path), Some(bytes)) =
+            (self.wg_encrypted_private_key_path.as_ref(), old_encrypted)
+        {
+            write_runtime_private_key(path, &bytes)?;
+        }
+        if let (Some(path), Some(value)) = (self.wg_public_key_path.as_ref(), old_public) {
+            write_public_key(path, value.trim())?;
+        }
+        Ok(())
+    }
+
+    fn revoke_local_key_material(&mut self) -> Result<String, String> {
+        if !matches!(self.backend_mode, DaemonBackendMode::LinuxWireguard) {
+            return Err("key revoke is only supported for linux-wireguard backend".to_string());
+        }
+        self.restrict_permanent("local key revoked".to_string());
+        let _ = self.controller.force_fail_closed("local_key_revoked");
+
+        let mut failures = Vec::new();
+        if let Err(err) = set_interface_down(&self.wg_interface) {
+            failures.push(format!("interface down failed: {err}"));
+        }
+        if let Some(path) = self.wg_private_key_path.as_ref()
+            && let Err(err) = remove_file_if_present(path)
+        {
+            failures.push(err);
+        }
+        if let Some(path) = self.wg_encrypted_private_key_path.as_ref()
+            && let Err(err) = remove_file_if_present(path)
+        {
+            failures.push(err);
+        }
+        if let Some(path) = self.wg_public_key_path.as_ref()
+            && let Err(err) = remove_file_if_present(path)
+        {
+            failures.push(err);
+        }
+
+        self.selected_exit_node = None;
+        self.lan_access_enabled = false;
+
+        if let Err(err) = self.persist_state() {
+            failures.push(format!("persist failed after revoke: {err}"));
+        }
+
+        if failures.is_empty() {
+            Ok("local key revoked: interface disabled and key material removed".to_string())
+        } else {
+            Err(format!(
+                "key revoke completed with errors: {}",
+                failures.join("; ")
+            ))
         }
     }
 
@@ -599,7 +773,7 @@ impl DaemonRuntime {
             let apply = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
-                    local_node: NodeId::new("daemon-local").expect("valid local node"),
+                    local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
                     mesh_cidr: "100.64.0.0/10".to_string(),
                 },
                 Vec::new(),
@@ -690,6 +864,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         ));
     }
     validate_daemon_config(&config)?;
+    prepare_runtime_wireguard_key(&config)?;
     run_preflight_checks(&config)?;
 
     let mut runtime = DaemonRuntime::new(&config)?;
@@ -776,7 +951,35 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     Ok(())
 }
 
+fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+        return Ok(());
+    }
+
+    let Some(runtime_path) = config.wg_private_key_path.as_ref() else {
+        return Ok(());
+    };
+    let Some(encrypted_path) = config.wg_encrypted_private_key_path.as_ref() else {
+        return Ok(());
+    };
+    let passphrase_path = config.wg_key_passphrase_path.as_ref().ok_or_else(|| {
+        DaemonError::InvalidConfig(
+            "wg key passphrase path is required when encrypted key path is configured".to_string(),
+        )
+    })?;
+
+    let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
+        .map_err(|err| DaemonError::InvalidConfig(format!("wg key decrypt failed: {err}")))?;
+    write_runtime_private_key(runtime_path, &decrypted)
+        .map_err(|err| DaemonError::InvalidConfig(format!("wg runtime key write failed: {err}")))?;
+    decrypted.fill(0);
+    Ok(())
+}
+
 fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
+    NodeId::new(config.node_id.clone())
+        .map_err(|err| DaemonError::InvalidConfig(format!("node id is invalid: {err}")))?;
+
     if !config.socket_path.is_absolute() {
         return Err(DaemonError::InvalidConfig(
             "socket path must be absolute".to_string(),
@@ -827,6 +1030,48 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "trust watermark path must not be empty".to_string(),
         ));
     }
+    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+        if let Some(path) = config.wg_private_key_path.as_ref()
+            && !path.is_absolute()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg private key path must be absolute".to_string(),
+            ));
+        }
+        if let Some(path) = config.wg_encrypted_private_key_path.as_ref()
+            && !path.is_absolute()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg encrypted private key path must be absolute".to_string(),
+            ));
+        }
+        if let Some(path) = config.wg_key_passphrase_path.as_ref()
+            && !path.is_absolute()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg key passphrase path must be absolute".to_string(),
+            ));
+        }
+        if let Some(path) = config.wg_public_key_path.as_ref()
+            && !path.is_absolute()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg public key path must be absolute".to_string(),
+            ));
+        }
+        if config.wg_encrypted_private_key_path.is_some() && config.wg_key_passphrase_path.is_none()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg key passphrase path is required when encrypted key path is set".to_string(),
+            ));
+        }
+        if config.wg_key_passphrase_path.is_some() && config.wg_encrypted_private_key_path.is_none()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "wg encrypted private key path is required when passphrase path is set".to_string(),
+            ));
+        }
+    }
 
     if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
         && config.wg_private_key_path.is_none()
@@ -868,8 +1113,19 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
-    if let Some(path) = config.wg_private_key_path.as_ref() {
-        validate_private_key_permissions(path)?;
+    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+        if let Some(path) = config.wg_private_key_path.as_ref() {
+            validate_private_key_permissions(path)?;
+        }
+        if let Some(path) = config.wg_encrypted_private_key_path.as_ref() {
+            validate_private_key_permissions(path)?;
+        }
+        if let Some(path) = config.wg_key_passphrase_path.as_ref() {
+            validate_private_key_permissions(path)?;
+        }
+        if let Some(path) = config.wg_public_key_path.as_ref() {
+            validate_public_key_permissions(path)?;
+        }
     }
 
     let watermark = load_trust_watermark(&config.trust_watermark_path).map_err(|err| {
@@ -899,6 +1155,16 @@ fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
 #[cfg(not(target_os = "linux"))]
 fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "wireguard private key", 0o077)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "wireguard public key", 0o022)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "wireguard public key", 0o022)
 }
 
 fn load_trust_evidence(
