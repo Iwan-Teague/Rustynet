@@ -10,7 +10,11 @@ use rustynet_policy::{
     ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
 };
 
-use rustynetd::daemon::{DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DaemonConfig, run_daemon};
+use rustynetd::daemon::{
+    DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_RECONCILE_INTERVAL_MS,
+    DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_WG_INTERFACE,
+    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, run_daemon,
+};
 use rustynetd::perf;
 use rustynetd::phase10::{
     ApplyOptions, DryRunSystem, PathMode, Phase10Controller, RouteGrantRequest, TrustEvidence,
@@ -69,6 +73,65 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 config.state_path = value.into();
                 index += 2;
             }
+            Some("--trust-evidence") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--trust-evidence requires a value".to_string())?;
+                config.trust_evidence_path = value.into();
+                index += 2;
+            }
+            Some("--backend") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--backend requires a value".to_string())?;
+                config.backend_mode = match value.as_str() {
+                    "in-memory" => DaemonBackendMode::InMemory,
+                    "linux-wireguard" => DaemonBackendMode::LinuxWireguard,
+                    _ => {
+                        return Err(
+                            "invalid backend value: expected in-memory or linux-wireguard"
+                                .to_string(),
+                        );
+                    }
+                };
+                index += 2;
+            }
+            Some("--wg-interface") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--wg-interface requires a value".to_string())?;
+                config.wg_interface = value.clone();
+                index += 2;
+            }
+            Some("--wg-private-key") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--wg-private-key requires a value".to_string())?;
+                config.wg_private_key_path = Some(value.into());
+                index += 2;
+            }
+            Some("--egress-interface") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--egress-interface requires a value".to_string())?;
+                config.egress_interface = value.clone();
+                index += 2;
+            }
+            Some("--dataplane-mode") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dataplane-mode requires a value".to_string())?;
+                config.dataplane_mode = match value.as_str() {
+                    "shell" => DaemonDataplaneMode::Shell,
+                    "hybrid-native" => DaemonDataplaneMode::HybridNative,
+                    _ => {
+                        return Err(
+                            "invalid dataplane mode: expected shell or hybrid-native".to_string()
+                        );
+                    }
+                };
+                index += 2;
+            }
             Some("--max-requests") => {
                 let value = args
                     .get(index + 1)
@@ -77,6 +140,24 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .parse::<usize>()
                     .map_err(|err| format!("invalid max requests: {err}"))?;
                 config.max_requests = Some(parsed);
+                index += 2;
+            }
+            Some("--reconcile-interval-ms") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--reconcile-interval-ms requires a value".to_string())?;
+                config.reconcile_interval_ms = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid reconcile interval: {err}"))?;
+                index += 2;
+            }
+            Some("--max-reconcile-failures") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--max-reconcile-failures requires a value".to_string())?;
+                config.max_reconcile_failures = value
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid max reconcile failures: {err}"))?;
                 index += 2;
             }
             Some(flag) => {
@@ -254,13 +335,23 @@ fn emit_phase10_evidence(output_dir: &str) -> Result<(), String> {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--socket <path>] [--state <path>] [--max-requests <n>]",
+        "  rustynetd daemon [--socket <path>] [--state <path>] [--trust-evidence <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
         "  rustynetd --emit-phase1-baseline <path>",
         "  rustynetd --emit-phase10-evidence <dir>",
         "",
         "defaults:",
         &format!("  socket={DEFAULT_SOCKET_PATH}"),
         &format!("  state={DEFAULT_STATE_PATH}"),
+        &format!("  trust_evidence={DEFAULT_TRUST_EVIDENCE_PATH}"),
+        &format!("  backend={:?}", DaemonBackendMode::default()),
+        &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
+        &format!("  egress_interface={DEFAULT_EGRESS_INTERFACE}"),
+        &format!(
+            "  dataplane_mode={:?}",
+            DaemonDataplaneMode::default()
+        ),
+        &format!("  reconcile_interval_ms={DEFAULT_RECONCILE_INTERVAL_MS}"),
+        &format!("  max_reconcile_failures={DEFAULT_MAX_RECONCILE_FAILURES}"),
     ]
     .join("\n")
 }

@@ -3,11 +3,12 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::sys::socket::getsockopt;
 #[cfg(any(
@@ -20,30 +21,75 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
-use rustynet_backend_api::{ExitMode, NodeId, RuntimeContext};
+use rustynet_backend_api::{
+    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
+    TunnelBackend, TunnelStats,
+};
 use rustynet_backend_wireguard::WireguardBackend;
+#[cfg(target_os = "linux")]
+use rustynet_backend_wireguard::{LinuxCommandRunner, LinuxWireguardBackend};
 use rustynet_policy::{
     ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
 };
+use sha2::{Digest, Sha256};
 
 use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
-#[cfg(target_os = "linux")]
-use crate::phase10::LinuxCommandSystem;
 use crate::phase10::{
-    ApplyOptions, DataplaneState, DryRunSystem, Phase10Controller, RouteGrantRequest,
-    RuntimeSystem, TrustEvidence, TrustPolicy,
+    ApplyOptions, DataplaneState, DataplaneSystem, DryRunSystem, Phase10Controller,
+    RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
 };
+#[cfg(target_os = "linux")]
+use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
 
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rustynetd.sock";
-pub const DEFAULT_STATE_PATH: &str = "/tmp/rustynetd.state";
+pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
+pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
+pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
+pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
+pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonDataplaneMode {
+    #[default]
+    Shell,
+    HybridNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonBackendMode {
+    InMemory,
+    LinuxWireguard,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for DaemonBackendMode {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            return DaemonBackendMode::LinuxWireguard;
+        }
+
+        #[allow(unreachable_code)]
+        DaemonBackendMode::InMemory
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
+    pub trust_evidence_path: PathBuf,
+    pub backend_mode: DaemonBackendMode,
+    pub wg_interface: String,
+    pub wg_private_key_path: Option<PathBuf>,
+    pub egress_interface: String,
+    pub dataplane_mode: DaemonDataplaneMode,
+    pub reconcile_interval_ms: u64,
+    pub max_reconcile_failures: u32,
     pub max_requests: Option<usize>,
 }
 
@@ -52,6 +98,14 @@ impl Default for DaemonConfig {
         Self {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
+            trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
+            backend_mode: DaemonBackendMode::default(),
+            wg_interface: DEFAULT_WG_INTERFACE.to_string(),
+            wg_private_key_path: None,
+            egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
+            dataplane_mode: DaemonDataplaneMode::default(),
+            reconcile_interval_ms: DEFAULT_RECONCILE_INTERVAL_MS,
+            max_reconcile_failures: DEFAULT_MAX_RECONCILE_FAILURES,
             max_requests: None,
         }
     }
@@ -76,17 +130,168 @@ impl fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustBootstrapError {
+    Missing,
+    Io(String),
+    InvalidFormat(String),
+    IntegrityMismatch,
+    Stale,
+}
+
+impl fmt::Display for TrustBootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrustBootstrapError::Missing => f.write_str("trust evidence is missing"),
+            TrustBootstrapError::Io(message) => write!(f, "trust evidence io failure: {message}"),
+            TrustBootstrapError::InvalidFormat(message) => {
+                write!(f, "trust evidence invalid format: {message}")
+            }
+            TrustBootstrapError::IntegrityMismatch => f.write_str("trust evidence digest mismatch"),
+            TrustBootstrapError::Stale => f.write_str("trust evidence is stale"),
+        }
+    }
+}
+
+enum DaemonBackend {
+    InMemory(WireguardBackend),
+    #[cfg(target_os = "linux")]
+    Linux(LinuxWireguardBackend<LinuxCommandRunner>),
+}
+
+impl DaemonBackend {
+    fn from_config(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        match config.backend_mode {
+            DaemonBackendMode::InMemory => Ok(Self::InMemory(WireguardBackend::default())),
+            DaemonBackendMode::LinuxWireguard => {
+                #[cfg(target_os = "linux")]
+                {
+                    let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
+                        DaemonError::InvalidConfig(
+                            "wg private key path is required for linux-wireguard backend"
+                                .to_string(),
+                        )
+                    })?;
+                    validate_private_key_permissions(private_key)?;
+                    let backend = LinuxWireguardBackend::new(
+                        LinuxCommandRunner,
+                        config.wg_interface.clone(),
+                        private_key.to_string_lossy().to_string(),
+                    )
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    Ok(Self::Linux(backend))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "linux-wireguard backend is only supported on linux".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl TunnelBackend for DaemonBackend {
+    fn name(&self) -> &'static str {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.name(),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.name(),
+        }
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.capabilities(),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.capabilities(),
+        }
+    }
+
+    fn start(&mut self, context: RuntimeContext) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.start(context),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.start(context),
+        }
+    }
+
+    fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.configure_peer(peer),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.configure_peer(peer),
+        }
+    }
+
+    fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.remove_peer(node_id),
+        }
+    }
+
+    fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.apply_routes(routes),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.apply_routes(routes),
+        }
+    }
+
+    fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.set_exit_mode(mode),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.set_exit_mode(mode),
+        }
+    }
+
+    fn stats(&self) -> Result<TunnelStats, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.stats(),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.stats(),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.shutdown(),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.shutdown(),
+        }
+    }
+}
+
 struct DaemonRuntime {
-    controller: Phase10Controller<WireguardBackend, RuntimeSystem>,
+    controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
     state_path: PathBuf,
+    trust_evidence_path: PathBuf,
+    trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
     advertised_routes: BTreeSet<String>,
-    restricted_safe_mode: bool,
+    restriction_mode: RestrictionMode,
+    bootstrap_error: Option<String>,
+    reconcile_attempts: u64,
+    reconcile_failures: u64,
+    last_reconcile_unix: Option<u64>,
+    last_reconcile_error: Option<String>,
+    max_reconcile_failures: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestrictionMode {
+    None,
+    Recoverable,
+    Permanent,
 }
 
 impl DaemonRuntime {
-    fn new(state_path: PathBuf) -> Self {
+    fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
         let policy = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
                 src: "user:local".to_string(),
@@ -96,39 +301,49 @@ impl DaemonRuntime {
                 contexts: vec![TrafficContext::SharedExit],
             }],
         };
-        let controller = Phase10Controller::new(
-            WireguardBackend::default(),
-            daemon_system(),
-            policy,
-            TrustPolicy::default(),
-        );
-        Self {
+        let trust_policy = TrustPolicy::default();
+        let backend = DaemonBackend::from_config(config)?;
+        let controller =
+            Phase10Controller::new(backend, daemon_system(config)?, policy, trust_policy);
+        Ok(Self {
             controller,
-            state_path,
+            state_path: config.state_path.clone(),
+            trust_evidence_path: config.trust_evidence_path.clone(),
+            trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
             advertised_routes: BTreeSet::new(),
-            restricted_safe_mode: false,
-        }
+            restriction_mode: RestrictionMode::None,
+            bootstrap_error: None,
+            reconcile_attempts: 0,
+            reconcile_failures: 0,
+            last_reconcile_unix: None,
+            last_reconcile_error: None,
+            max_reconcile_failures: config.max_reconcile_failures,
+        })
     }
 
     fn bootstrap(&mut self) {
         match self.restore_state() {
             Ok(()) => {}
             Err(_err) => {
-                self.restricted_safe_mode = true;
+                self.restrict_permanent("state restore failed integrity checks".to_string());
                 let _ = self
                     .controller
                     .force_fail_closed("state_restore_integrity_failed");
+                return;
             }
         }
 
-        let trust = TrustEvidence {
-            tls13_valid: true,
-            signed_control_valid: true,
-            signed_data_age_secs: 0,
-            clock_skew_secs: 0,
+        let trust = match load_trust_evidence(&self.trust_evidence_path, self.trust_policy) {
+            Ok(evidence) => evidence,
+            Err(err) => {
+                self.restrict_recoverable(err.to_string());
+                let _ = self.controller.force_fail_closed("trust_bootstrap_failed");
+                return;
+            }
         };
+
         let apply = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -140,31 +355,52 @@ impl DaemonRuntime {
             ApplyOptions {
                 protected_dns: true,
                 ipv6_parity_supported: false,
-                exit_mode: ExitMode::Off,
+                exit_mode: self.desired_exit_mode(),
             },
         );
         if apply.is_err() {
-            self.restricted_safe_mode = true;
+            self.restrict_recoverable("dataplane bootstrap apply failed".to_string());
+            let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
+            return;
         }
+
+        if let Some(exit_node) = &self.selected_exit_node
+            && let Ok(node_id) = NodeId::new(exit_node.clone())
+        {
+            let _ = self
+                .controller
+                .set_exit_node(node_id, "user:local", Protocol::Any);
+        }
+
+        self.restriction_mode = RestrictionMode::None;
+        self.bootstrap_error = None;
     }
 
     fn handle_command(&mut self, command: IpcCommand) -> IpcResponse {
-        if self.restricted_safe_mode && command.is_mutating() {
+        if self.is_restricted() && command.is_mutating() {
             return IpcResponse::err("daemon is in restricted-safe mode");
         }
 
         match command {
             IpcCommand::Status => IpcResponse::ok(format!(
-                "state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={}",
+                "state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={}",
                 self.controller.state(),
                 self.controller.generation(),
                 self.selected_exit_node.as_deref().unwrap_or("none"),
                 if self.lan_access_enabled { "on" } else { "off" },
-                if self.restricted_safe_mode {
+                if self.is_restricted() {
                     "true"
                 } else {
                     "false"
-                }
+                },
+                self.restriction_mode,
+                self.bootstrap_error.as_deref().unwrap_or("none"),
+                self.reconcile_attempts,
+                self.reconcile_failures,
+                self.last_reconcile_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                self.last_reconcile_error.as_deref().unwrap_or("none")
             )),
             IpcCommand::Netcheck => {
                 let transport = if self.controller.state() == DataplaneState::FailClosed {
@@ -264,7 +500,7 @@ impl DaemonRuntime {
             lan_access_enabled: self.lan_access_enabled,
         };
         persist_session_snapshot(&snapshot, &self.state_path).map_err(|err| {
-            self.restricted_safe_mode = true;
+            self.restrict_permanent("state persist failure".to_string());
             let _ = self.controller.force_fail_closed("state_persist_failure");
             err.to_string()
         })
@@ -284,21 +520,121 @@ impl DaemonRuntime {
         if let Some(selected) = &self.selected_exit_node
             && let Ok(node_id) = NodeId::new(selected.clone())
         {
-            self.controller
-                .advertise_lan_route(node_id, "192.168.1.0/24");
+            for route in &self.advertised_routes {
+                self.controller.advertise_lan_route(node_id.clone(), route);
+            }
         }
 
         Ok(())
     }
+
+    fn reconcile(&mut self) {
+        self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
+        self.last_reconcile_unix = Some(unix_now());
+
+        let trust = match load_trust_evidence(&self.trust_evidence_path, self.trust_policy) {
+            Ok(evidence) => evidence,
+            Err(err) => {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("trust reconcile failed: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                let _ = self.controller.force_fail_closed("trust_reconcile_failed");
+                self.promote_to_permanent_if_over_limit();
+                return;
+            }
+        };
+
+        self.last_reconcile_error = None;
+
+        if self.controller.state() == DataplaneState::FailClosed
+            || self.restriction_mode == RestrictionMode::Recoverable
+        {
+            let apply = self.controller.apply_dataplane_generation(
+                trust,
+                RuntimeContext {
+                    local_node: NodeId::new("daemon-local").expect("valid local node"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                },
+                Vec::new(),
+                Vec::new(),
+                ApplyOptions {
+                    protected_dns: true,
+                    ipv6_parity_supported: false,
+                    exit_mode: self.desired_exit_mode(),
+                },
+            );
+
+            match apply {
+                Ok(()) => {
+                    self.restriction_mode = RestrictionMode::None;
+                    self.bootstrap_error = None;
+                    self.reconcile_failures = 0;
+                }
+                Err(err) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message = format!("reconcile dataplane apply failed: {err}");
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_recoverable(message);
+                    let _ = self.controller.force_fail_closed("reconcile_apply_failed");
+                    self.promote_to_permanent_if_over_limit();
+                }
+            }
+        }
+    }
+
+    fn desired_exit_mode(&self) -> ExitMode {
+        if self.selected_exit_node.is_some() {
+            ExitMode::FullTunnel
+        } else {
+            ExitMode::Off
+        }
+    }
+
+    fn is_restricted(&self) -> bool {
+        self.restriction_mode != RestrictionMode::None
+    }
+
+    fn restrict_recoverable(&mut self, message: String) {
+        if self.restriction_mode == RestrictionMode::Permanent {
+            return;
+        }
+        self.restriction_mode = RestrictionMode::Recoverable;
+        self.bootstrap_error = Some(message);
+    }
+
+    fn restrict_permanent(&mut self, message: String) {
+        self.restriction_mode = RestrictionMode::Permanent;
+        self.bootstrap_error = Some(message);
+    }
+
+    fn promote_to_permanent_if_over_limit(&mut self) {
+        if self.reconcile_failures >= u64::from(self.max_reconcile_failures) {
+            self.restrict_permanent(format!(
+                "reconcile failure threshold exceeded: {}",
+                self.reconcile_failures
+            ));
+        }
+    }
 }
 
-fn daemon_system() -> RuntimeSystem {
+fn daemon_system(_config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     #[cfg(target_os = "linux")]
     {
-        return RuntimeSystem::Linux(LinuxCommandSystem);
+        let mode = match _config.dataplane_mode {
+            DaemonDataplaneMode::Shell => LinuxDataplaneMode::Shell,
+            DaemonDataplaneMode::HybridNative => LinuxDataplaneMode::HybridNative,
+        };
+        let system = LinuxCommandSystem::new(
+            _config.wg_interface.clone(),
+            _config.egress_interface.clone(),
+            mode,
+        )
+        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        return Ok(RuntimeSystem::Linux(system));
     }
     #[allow(unreachable_code)]
-    RuntimeSystem::DryRun(DryRunSystem::default())
+    Ok(RuntimeSystem::DryRun(DryRunSystem::default()))
 }
 
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
@@ -307,6 +643,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             "socket path must not be empty".to_string(),
         ));
     }
+    validate_daemon_config(&config)?;
+    run_preflight_checks(&config)?;
+
+    let mut runtime = DaemonRuntime::new(&config)?;
+    runtime.bootstrap();
 
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
@@ -322,36 +663,52 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         .map_err(|err| DaemonError::Io(format!("bind failed: {err}")))?;
     fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|err| DaemonError::Io(err.to_string()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| DaemonError::Io(format!("socket nonblocking failed: {err}")))?;
 
     let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
-    let mut runtime = DaemonRuntime::new(config.state_path.clone());
-    runtime.bootstrap();
-
     let mut processed = 0usize;
-    for connection in listener.incoming() {
-        let stream = connection.map_err(|err| DaemonError::Io(err.to_string()))?;
-        let command = read_command(&stream).map_err(DaemonError::Io)?;
-        let parsed = parse_command(&command);
+    let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.max(100));
+    let mut next_reconcile = Instant::now() + reconcile_interval;
 
-        let authorized = if parsed.is_mutating() {
-            match peer_uid(&stream) {
-                Some(peer_uid) => peer_uid == 0 || peer_uid == socket_owner_uid,
-                None => false,
+    loop {
+        let mut processed_command = false;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let command = read_command(&stream).map_err(DaemonError::Io)?;
+                let parsed = parse_command(&command);
+
+                let authorized = if parsed.is_mutating() {
+                    match peer_uid(&stream) {
+                        Some(peer_uid) => peer_uid == 0 || peer_uid == socket_owner_uid,
+                        None => false,
+                    }
+                } else {
+                    true
+                };
+
+                let response = if authorized {
+                    runtime.handle_command(parsed)
+                } else {
+                    IpcResponse::err("unauthorized mutation request")
+                };
+
+                write_response(stream, response).map_err(DaemonError::Io)?;
+                processed = processed.saturating_add(1);
+                processed_command = true;
             }
-        } else {
-            true
-        };
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+            Err(err) => return Err(DaemonError::Io(format!("accept failed: {err}"))),
+        }
 
-        let response = if authorized {
-            runtime.handle_command(parsed)
-        } else {
-            IpcResponse::err("unauthorized mutation request")
-        };
+        let now = Instant::now();
+        if now >= next_reconcile {
+            runtime.reconcile();
+            next_reconcile = now + reconcile_interval;
+        }
 
-        write_response(stream, response).map_err(DaemonError::Io)?;
-
-        processed = processed.saturating_add(1);
         if config
             .max_requests
             .map(|max| processed >= max)
@@ -359,9 +716,247 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         {
             break;
         }
+
+        if !processed_command {
+            let sleep_for = next_reconcile
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25));
+            if !sleep_for.is_zero() {
+                sleep(sleep_for);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if !config.socket_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "socket path must be absolute".to_string(),
+        ));
+    }
+    if !config.state_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "state path must be absolute".to_string(),
+        ));
+    }
+    if !config.trust_evidence_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "trust evidence path must be absolute".to_string(),
+        ));
+    }
+    if config.wg_interface.is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "wireguard interface must not be empty".to_string(),
+        ));
+    }
+    if config.egress_interface.is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "egress interface must not be empty".to_string(),
+        ));
+    }
+    if config.trust_evidence_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "trust evidence path must not be empty".to_string(),
+        ));
+    }
+
+    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
+        && config.wg_private_key_path.is_none()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "wg private key path is required for linux-wireguard backend".to_string(),
+        ));
+    }
+    if config.reconcile_interval_ms == 0 {
+        return Err(DaemonError::InvalidConfig(
+            "reconcile interval must be greater than 0".to_string(),
+        ));
+    }
+    if config.max_reconcile_failures == 0 {
+        return Err(DaemonError::InvalidConfig(
+            "max reconcile failures must be greater than 0".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if let Some(parent) = config.state_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("state directory create failed: {err}"))
+        })?;
+    }
+    if let Some(parent) = config.trust_evidence_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("trust directory create failed: {err}"))
+        })?;
+    }
+
+    let _ = load_trust_evidence(&config.trust_evidence_path, TrustPolicy::default())
+        .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;
+
+    let mut system = daemon_system(config)?;
+    system
+        .check_prerequisites()
+        .map_err(|err| DaemonError::InvalidConfig(format!("dataplane preflight failed: {err}")))?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| DaemonError::InvalidConfig(format!("wg private key path error: {err}")))?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(DaemonError::InvalidConfig(
+            "wg private key file must not be group/world accessible".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_trust_evidence(
+    path: &Path,
+    trust_policy: TrustPolicy,
+) -> Result<TrustEvidence, TrustBootstrapError> {
+    if !path.exists() {
+        return Err(TrustBootstrapError::Missing);
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    let mut version: Option<u8> = None;
+    let mut tls13_valid: Option<bool> = None;
+    let mut signed_control_valid: Option<bool> = None;
+    let mut signed_data_age_secs: Option<u64> = None;
+    let mut clock_skew_secs: Option<u64> = None;
+    let mut updated_at_unix: Option<u64> = None;
+    let mut digest: Option<String> = None;
+
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(TrustBootstrapError::InvalidFormat(
+                "line missing key/value separator".to_string(),
+            ));
+        };
+
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "tls13_valid" => {
+                tls13_valid = parse_bool(value);
+            }
+            "signed_control_valid" => {
+                signed_control_valid = parse_bool(value);
+            }
+            "signed_data_age_secs" => {
+                signed_data_age_secs = value.parse::<u64>().ok();
+            }
+            "clock_skew_secs" => {
+                clock_skew_secs = value.parse::<u64>().ok();
+            }
+            "updated_at_unix" => {
+                updated_at_unix = value.parse::<u64>().ok();
+            }
+            "digest" => {
+                digest = Some(value.to_string());
+            }
+            _ => {
+                return Err(TrustBootstrapError::InvalidFormat(format!(
+                    "unknown key {key}"
+                )));
+            }
+        }
+    }
+
+    if version != Some(1) {
+        return Err(TrustBootstrapError::InvalidFormat(
+            "unsupported trust evidence version".to_string(),
+        ));
+    }
+
+    let record = TrustEvidenceRecord {
+        tls13_valid: tls13_valid
+            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing tls13_valid".to_string()))?,
+        signed_control_valid: signed_control_valid.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing signed_control_valid".to_string())
+        })?,
+        signed_data_age_secs: signed_data_age_secs.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing signed_data_age_secs".to_string())
+        })?,
+        clock_skew_secs: clock_skew_secs.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing clock_skew_secs".to_string())
+        })?,
+        updated_at_unix: updated_at_unix.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing updated_at_unix".to_string())
+        })?,
+    };
+
+    let expected_digest = digest.ok_or_else(|| {
+        TrustBootstrapError::InvalidFormat("missing trust evidence digest".to_string())
+    })?;
+    let actual_digest = sha256_hex(trust_evidence_payload(&record).as_bytes());
+    if expected_digest != actual_digest {
+        return Err(TrustBootstrapError::IntegrityMismatch);
+    }
+
+    let age = unix_now().saturating_sub(record.updated_at_unix);
+    if age > trust_policy.max_signed_data_age_secs {
+        return Err(TrustBootstrapError::Stale);
+    }
+
+    Ok(TrustEvidence {
+        tls13_valid: record.tls13_valid,
+        signed_control_valid: record.signed_control_valid,
+        signed_data_age_secs: record.signed_data_age_secs,
+        clock_skew_secs: record.clock_skew_secs,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustEvidenceRecord {
+    tls13_valid: bool,
+    signed_control_valid: bool,
+    signed_data_age_secs: u64,
+    clock_skew_secs: u64,
+    updated_at_unix: u64,
+}
+
+fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
+    format!(
+        "version=1\ntls13_valid={}\nsigned_control_valid={}\nsigned_data_age_secs={}\nclock_skew_secs={}\nupdated_at_unix={}\n",
+        if record.tls13_valid { "true" } else { "false" },
+        if record.signed_control_valid {
+            "true"
+        } else {
+            "false"
+        },
+        record.signed_data_age_secs,
+        record.clock_skew_secs,
+        record.updated_at_unix
+    )
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn read_command(stream: &UnixStream) -> Result<String, String> {
@@ -418,7 +1013,26 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonRuntime, IpcCommand};
+    use std::path::Path;
+
+    use super::{
+        DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, TrustEvidenceRecord,
+        sha256_hex, trust_evidence_payload, unix_now,
+    };
+
+    fn write_trust_file(path: &Path) {
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+        };
+        let body = trust_evidence_payload(&record);
+        let digest = sha256_hex(body.as_bytes());
+        std::fs::write(path, format!("{body}digest={digest}\n"))
+            .expect("trust file should be written");
+    }
 
     #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
@@ -430,8 +1044,16 @@ mod tests {
                 .as_nanos()
         );
         let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
+        write_trust_file(&trust_path);
 
-        let mut runtime = DaemonRuntime::new(state_path.clone());
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
         let status = runtime.handle_command(IpcCommand::Status);
@@ -450,6 +1072,34 @@ mod tests {
         let invalid_route =
             runtime.handle_command(IpcCommand::RouteAdvertise("bad-route".to_string()));
         assert!(!invalid_route.ok);
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+    }
+
+    #[test]
+    fn daemon_runtime_enters_restricted_safe_mode_without_trust_evidence() {
+        let unique = format!(
+            "rustynetd-runtime-restricted-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.missing.trust"));
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let response = runtime.handle_command(IpcCommand::ExitNodeOff);
+        assert!(!response.ok);
+        assert!(response.message.contains("restricted-safe"));
 
         let _ = std::fs::remove_file(state_path);
     }

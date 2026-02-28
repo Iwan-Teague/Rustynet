@@ -143,6 +143,7 @@ impl WireguardCommandRunner for LinuxCommandRunner {
 pub struct LinuxWireguardBackend<R: WireguardCommandRunner> {
     runner: R,
     interface_name: String,
+    private_key_path: String,
     running: bool,
     peers: BTreeMap<NodeId, PeerConfig>,
     routes: Vec<Route>,
@@ -151,12 +152,19 @@ pub struct LinuxWireguardBackend<R: WireguardCommandRunner> {
 }
 
 impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
-    pub fn new(runner: R, interface_name: impl Into<String>) -> Result<Self, BackendError> {
+    pub fn new(
+        runner: R,
+        interface_name: impl Into<String>,
+        private_key_path: impl Into<String>,
+    ) -> Result<Self, BackendError> {
         let interface_name = interface_name.into();
+        let private_key_path = private_key_path.into();
         validate_interface_name(&interface_name)?;
+        validate_private_key_path(&private_key_path)?;
         Ok(Self {
             runner,
             interface_name,
+            private_key_path,
             running: false,
             peers: BTreeMap::new(),
             routes: Vec::new(),
@@ -202,7 +210,19 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 "wireguard".to_string(),
             ],
         )?;
-        self.runner.run(
+        if let Err(err) = self.runner.run(
+            "wg",
+            &[
+                "set".to_string(),
+                self.interface_name.clone(),
+                "private-key".to_string(),
+                self.private_key_path.clone(),
+            ],
+        ) {
+            let _ = self.remove_interface();
+            return Err(err);
+        }
+        if let Err(err) = self.runner.run(
             "ip",
             &[
                 "address".to_string(),
@@ -211,8 +231,11 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 "dev".to_string(),
                 self.interface_name.clone(),
             ],
-        )?;
-        self.runner.run(
+        ) {
+            let _ = self.remove_interface();
+            return Err(err);
+        }
+        if let Err(err) = self.runner.run(
             "ip",
             &[
                 "link".to_string(),
@@ -221,7 +244,11 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 "dev".to_string(),
                 self.interface_name.clone(),
             ],
-        )
+        ) {
+            let _ = self.remove_interface();
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn remove_interface(&mut self) -> Result<(), BackendError> {
@@ -424,6 +451,25 @@ fn validate_interface_name(name: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn validate_private_key_path(path: &str) -> Result<(), BackendError> {
+    if path.trim().is_empty() {
+        return Err(BackendError::invalid_input(
+            "wireguard private key path must not be empty",
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err(BackendError::invalid_input(
+            "wireguard private key path must be absolute",
+        ));
+    }
+    if path.contains('\0') {
+        return Err(BackendError::invalid_input(
+            "wireguard private key path contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
 fn encode_hex(value: &[u8]) -> String {
     let mut output = String::with_capacity(value.len() * 2);
     for byte in value {
@@ -518,8 +564,8 @@ mod tests {
     #[test]
     fn linux_backend_executes_ip_and_wg_calls_through_runner() {
         let runner = RecordingRunner::default();
-        let mut backend =
-            LinuxWireguardBackend::new(runner, "rustynet0").expect("backend should be constructed");
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key")
+            .expect("backend should be constructed");
 
         backend
             .start(runtime_context())
@@ -545,11 +591,18 @@ mod tests {
 
     #[test]
     fn linux_backend_validates_interface_and_cidr_inputs() {
-        assert!(LinuxWireguardBackend::new(RecordingRunner::default(), "").is_err());
-        assert!(LinuxWireguardBackend::new(RecordingRunner::default(), "wg;rm").is_err());
+        assert!(LinuxWireguardBackend::new(RecordingRunner::default(), "", "/tmp/wg.key").is_err());
+        assert!(
+            LinuxWireguardBackend::new(RecordingRunner::default(), "wg;rm", "/tmp/wg.key").is_err()
+        );
+        assert!(
+            LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0", "relative.key")
+                .is_err()
+        );
 
-        let mut backend = LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0")
-            .expect("backend should be constructed");
+        let mut backend =
+            LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0", "/tmp/wg.key")
+                .expect("backend should be constructed");
         backend
             .start(runtime_context())
             .expect("start should succeed");
@@ -565,8 +618,8 @@ mod tests {
     #[test]
     fn linux_backend_propagates_runner_failures() {
         let runner = RecordingRunner::default().fail_on("ip");
-        let mut backend =
-            LinuxWireguardBackend::new(runner, "rustynet0").expect("backend should be constructed");
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key")
+            .expect("backend should be constructed");
 
         let err = backend
             .start(runtime_context())

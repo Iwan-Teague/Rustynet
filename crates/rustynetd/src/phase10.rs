@@ -165,6 +165,7 @@ impl From<SystemError> for Phase10Error {
 }
 
 pub trait DataplaneSystem {
+    fn set_generation(&mut self, _generation: u64) {}
     fn check_prerequisites(&mut self) -> Result<(), SystemError>;
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError>;
     fn rollback_routes(&mut self) -> Result<(), SystemError>;
@@ -196,6 +197,7 @@ enum StageMarker {
 pub struct DryRunSystem {
     pub operations: Vec<String>,
     fail_operation: Option<String>,
+    generation: u64,
 }
 
 impl DryRunSystem {
@@ -219,6 +221,11 @@ impl DryRunSystem {
 }
 
 impl DataplaneSystem for DryRunSystem {
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+        self.operations.push(format!("set_generation:{generation}"));
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         self.step("check_prerequisites")
     }
@@ -268,10 +275,45 @@ impl DataplaneSystem for DryRunSystem {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LinuxCommandSystem;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxCommandSystem {
+    interface_name: String,
+    egress_interface: String,
+    mode: LinuxDataplaneMode,
+    generation: u64,
+    firewall_table: Option<String>,
+    nat_table: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxDataplaneMode {
+    Shell,
+    HybridNative,
+}
 
 impl LinuxCommandSystem {
+    pub fn new(
+        interface_name: impl Into<String>,
+        egress_interface: impl Into<String>,
+        mode: LinuxDataplaneMode,
+    ) -> Result<Self, SystemError> {
+        let interface_name = interface_name.into();
+        let egress_interface = egress_interface.into();
+        validate_net_device_name(&interface_name)
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        validate_net_device_name(&egress_interface)
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+
+        Ok(Self {
+            interface_name,
+            egress_interface,
+            mode,
+            generation: 0,
+            firewall_table: None,
+            nat_table: None,
+        })
+    }
+
     fn run(program: &str, args: &[&str]) -> Result<(), SystemError> {
         let status = Command::new(program)
             .args(args)
@@ -284,14 +326,110 @@ impl LinuxCommandSystem {
             "{program} exited unsuccessfully: {status}"
         )))
     }
+
+    fn run_allow_failure(program: &str, args: &[&str]) {
+        let _ = Command::new(program).args(args).status();
+    }
+
+    fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
+        match self.mode {
+            LinuxDataplaneMode::Shell => Self::run(
+                "sysctl",
+                &[
+                    "-w",
+                    if enabled {
+                        "net.ipv4.ip_forward=1"
+                    } else {
+                        "net.ipv4.ip_forward=0"
+                    },
+                ],
+            ),
+            LinuxDataplaneMode::HybridNative => fs::write(
+                "/proc/sys/net/ipv4/ip_forward",
+                if enabled { "1\n" } else { "0\n" },
+            )
+            .map_err(|err| SystemError::Io(format!("native ip_forward write failed: {err}"))),
+        }
+    }
+
+    fn set_ipv6_disabled(&self, disabled: bool) -> Result<(), SystemError> {
+        match self.mode {
+            LinuxDataplaneMode::Shell => Self::run(
+                "sysctl",
+                &[
+                    "-w",
+                    if disabled {
+                        "net.ipv6.conf.all.disable_ipv6=1"
+                    } else {
+                        "net.ipv6.conf.all.disable_ipv6=0"
+                    },
+                ],
+            ),
+            LinuxDataplaneMode::HybridNative => fs::write(
+                "/proc/sys/net/ipv6/conf/all/disable_ipv6",
+                if disabled { "1\n" } else { "0\n" },
+            )
+            .map_err(|err| SystemError::Io(format!("native ipv6 disable write failed: {err}"))),
+        }
+    }
+
+    fn firewall_table_name(&self) -> String {
+        format!("rustynet_g{}", self.generation)
+    }
+
+    fn nat_table_name(&self) -> String {
+        format!("rustynet_nat_g{}", self.generation)
+    }
+
+    fn ensure_failclosed_table(&mut self) -> Result<String, SystemError> {
+        if let Some(table) = &self.firewall_table {
+            return Ok(table.clone());
+        }
+
+        let table = self.firewall_table_name();
+        Self::run_allow_failure("nft", &["delete", "table", "inet", table.as_str()]);
+        Self::run("nft", &["add", "table", "inet", table.as_str()])
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "output",
+                "priority",
+                "0",
+                ";",
+                "policy",
+                "drop",
+                ";",
+                "}",
+            ],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.firewall_table = Some(table.clone());
+        Ok(table)
+    }
 }
 
 impl DataplaneSystem for LinuxCommandSystem {
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         #[cfg(target_os = "linux")]
         {
             Self::run("ip", &["-V"])?;
             Self::run("nft", &["--version"])?;
+            Self::run("wg", &["--version"])?;
+            Self::run("sysctl", &["--version"])?;
             return Ok(());
         }
         #[allow(unreachable_code)]
@@ -308,6 +446,8 @@ impl DataplaneSystem for LinuxCommandSystem {
                     "route",
                     "replace",
                     route.destination_cidr.as_str(),
+                    "dev",
+                    self.interface_name.as_str(),
                     "table",
                     "51820",
                 ],
@@ -323,63 +463,192 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
-        let _ = Self::run("nft", &["add", "table", "inet", "rustynet"]);
-        let _ = Self::run(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "inet",
-                "rustynet",
-                "killswitch",
-                "{",
-                "type",
-                "filter",
-                "hook",
-                "output",
-                "priority",
-                "0",
-                ";",
-                "policy",
-                "drop",
-                ";",
-                "}",
-            ],
-        );
-        Ok(())
-    }
-
-    fn rollback_firewall(&mut self) -> Result<(), SystemError> {
-        let _ = Self::run("nft", &["delete", "table", "inet", "rustynet"]);
-        Ok(())
-    }
-
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
-        Self::run("sysctl", &["-w", "net.ipv4.ip_forward=1"])
-            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
-    }
-
-    fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
-        Self::run("sysctl", &["-w", "net.ipv4.ip_forward=0"])
-            .map_err(|err| SystemError::RollbackFailed(err.to_string()))
-    }
-
-    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
-        let _ = Self::run(
+        if let Some(previous) = self.firewall_table.take() {
+            Self::run_allow_failure("nft", &["delete", "table", "inet", previous.as_str()]);
+        }
+        let table = self.ensure_failclosed_table()?;
+        Self::run(
             "nft",
             &[
                 "add",
                 "rule",
                 "inet",
-                "rustynet",
+                table.as_str(),
+                "killswitch",
+                "oifname",
+                "lo",
+                "accept",
+            ],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "ct",
+                "state",
+                "established,related",
+                "accept",
+            ],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "oifname",
+                self.interface_name.as_str(),
+                "accept",
+            ],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+    }
+
+    fn rollback_firewall(&mut self) -> Result<(), SystemError> {
+        if let Some(table) = self.firewall_table.take() {
+            Self::run_allow_failure("nft", &["delete", "table", "inet", table.as_str()]);
+        }
+        Ok(())
+    }
+
+    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        self.set_ipv4_forwarding(true)
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        if let Some(previous) = self.nat_table.take() {
+            Self::run_allow_failure("nft", &["delete", "table", "ip", previous.as_str()]);
+        }
+        let nat_table = self.nat_table_name();
+        Self::run("nft", &["add", "table", "ip", nat_table.as_str()])
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "ip",
+                nat_table.as_str(),
+                "postrouting",
+                "{",
+                "type",
+                "nat",
+                "hook",
+                "postrouting",
+                "priority",
+                "100",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+        )
+        .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                nat_table.as_str(),
+                "postrouting",
+                "oifname",
+                self.egress_interface.as_str(),
+                "masquerade",
+            ],
+        )
+        .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
+        self.nat_table = Some(nat_table);
+        Ok(())
+    }
+
+    fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        self.set_ipv4_forwarding(false)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))?;
+        if let Some(table) = self.nat_table.take() {
+            Self::run_allow_failure("nft", &["delete", "table", "ip", table.as_str()]);
+        }
+        Ok(())
+    }
+
+    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        let table = self
+            .firewall_table
+            .clone()
+            .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "udp",
+                "dport",
+                "53",
+                "oifname",
+                "!=",
+                self.interface_name.as_str(),
+                "drop",
+            ],
+        )
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "tcp",
+                "dport",
+                "53",
+                "oifname",
+                "!=",
+                self.interface_name.as_str(),
+                "drop",
+            ],
+        )
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
                 "killswitch",
                 "udp",
                 "dport",
                 "53",
                 "accept",
             ],
-        );
-        Ok(())
+        )
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        Self::run(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "tcp",
+                "dport",
+                "53",
+                "accept",
+            ],
+        )
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
@@ -387,29 +656,33 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
-        Self::run("sysctl", &["-w", "net.ipv6.conf.all.disable_ipv6=1"])
+        self.set_ipv6_disabled(true)
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
-        Self::run("nft", &["list", "table", "inet", "rustynet"])
+        let table = self.firewall_table.clone().ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("killswitch table missing".to_string())
+        })?;
+        Self::run("nft", &["list", "table", "inet", table.as_str()])
             .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))
     }
 
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
-        let _ = Self::run(
+        let table = self.ensure_failclosed_table()?;
+        Self::run(
             "nft",
             &[
                 "add",
                 "rule",
                 "inet",
-                "rustynet",
+                table.as_str(),
                 "killswitch",
                 "counter",
                 "drop",
             ],
-        );
-        Ok(())
+        )
+        .map_err(|err| SystemError::BlockEgressFailed(err.to_string()))
     }
 }
 
@@ -420,6 +693,13 @@ pub enum RuntimeSystem {
 }
 
 impl DataplaneSystem for RuntimeSystem {
+    fn set_generation(&mut self, generation: u64) {
+        match self {
+            RuntimeSystem::DryRun(system) => system.set_generation(generation),
+            RuntimeSystem::Linux(system) => system.set_generation(generation),
+        }
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.check_prerequisites(),
@@ -585,6 +865,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         options: ApplyOptions,
     ) -> Result<(), Phase10Error> {
         validate_trust(&self.trust_policy, evidence)?;
+        let target_generation = self.generation.saturating_add(1);
+        self.system.set_generation(target_generation);
 
         if self.state == DataplaneState::Init {
             self.establish_control_trust(evidence)?;
@@ -873,6 +1155,19 @@ fn validate_trust(policy: &TrustPolicy, evidence: TrustEvidence) -> Result<(), P
     }
     if evidence.clock_skew_secs > policy.max_clock_skew_secs {
         return Err(Phase10Error::TrustRejected("clock_skew_exceeded"));
+    }
+    Ok(())
+}
+
+fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > 15 {
+        return Err("device name length must be between 1 and 15 characters");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("device name contains invalid characters");
     }
     Ok(())
 }

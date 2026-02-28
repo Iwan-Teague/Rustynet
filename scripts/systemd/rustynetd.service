@@ -1,0 +1,43 @@
+[Unit]
+Description=Rustynet Daemon
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rustynetd daemon --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --backend linux-wireguard --wg-interface rustynet0 --wg-private-key /etc/rustynet/wireguard.key --egress-interface eth0 --dataplane-mode hybrid-native --reconcile-interval-ms 1000 --max-reconcile-failures 5
+Restart=on-failure
+RestartSec=2s
+StartLimitBurst=5
+StartLimitIntervalSec=60
+RuntimeDirectory=rustynet
+RuntimeDirectoryMode=0700
+StateDirectory=rustynet
+StateDirectoryMode=0700
+ExecStartPre=/usr/bin/install -d -m 0700 /etc/rustynet
+ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.key
+ExecStartPre=/usr/bin/test -f /var/lib/rustynet/rustynetd.trust
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+ReadWritePaths=/run/rustynet /var/lib/rustynet /etc/rustynet
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
