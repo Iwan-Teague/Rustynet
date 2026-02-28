@@ -5,7 +5,7 @@
     {"name":"idle_cpu_percent","value":0.9,"unit":"percent_of_one_core","threshold":"<=2","status":"pass","reason":"measured"},
     {"name":"idle_memory_mb","value":36,"unit":"mb_rss","threshold":"<=120","status":"pass","reason":"measured"},
     {"name":"reconnect_seconds","value":0,"unit":"seconds","threshold":"<=5","status":"not_measurable","reason":"no_production_datapath"},
-    {"name":"route_policy_apply_p95_seconds","value":0.000639042,"unit":"seconds","threshold":"<=2","status":"pass","reason":"measured"},
+    {"name":"route_policy_apply_p95_seconds","value":0.000256625,"unit":"seconds","threshold":"<=2","status":"pass","reason":"measured"},
     {"name":"throughput_overhead_vs_wireguard_percent","value":0,"unit":"percent","threshold":"<=15","status":"not_measurable","reason":"no_production_datapath"}
   ]
 }

@@ -11,6 +11,7 @@
 - [Phase7.md](./Phase7.md) defines scale and commercial foundation delivery.
 - [Phase8.md](./Phase8.md) defines advanced security assurance and compliance delivery.
 - [Phase9.md](./Phase9.md) defines completion readiness, long-term operations, and protocol-agility validation.
+- [phase10.md](./phase10.md) defines production dataplane enablement for real encrypted exit-node traffic and LAN-toggle enforcement.
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) defines mandatory release-blocking security controls and evidence expectations.
 - If a phase document conflicts with this file, this file takes precedence until requirements are explicitly updated.
 - Any new phase capability that changes product behavior must be reflected back into this file.
@@ -201,7 +202,7 @@ Primary goal:
 - policy fetch
 - DNS record updates
 
-## 7) Roadmap Distribution (9 Phases)
+## 7) Roadmap Distribution (10 Phases)
 - `Phase 1`: Architecture, crate boundaries, backend abstraction boundary, and security baseline setup.
 - `Phase 2`: Identity, enrollment, throwaway credentials, and control-plane core APIs.
 - `Phase 3`: Linux data-plane MVP, WireGuard adapter, relay fallback basics, and backend conformance.
@@ -211,6 +212,7 @@ Primary goal:
 - `Phase 7`: High-availability scale-out, relay fleet maturity, commercial controls, and control-plane trust-hardening mode.
 - `Phase 8`: Security assurance program, key custody hardening, compliance, and privacy maturity.
 - `Phase 9`: Completion readiness, API compatibility guarantees, operational excellence, and long-term protocol agility validation.
+- `Phase 10`: Real Linux dataplane enablement for encrypted exit-node traffic, persistent daemon IPC control, NAT/forwarding enforcement, and fail-closed leak prevention validation.
 
 ## 8) Phase Planning Rules
 - Earlier phases must land the abstractions required by later phases before feature expansion.
@@ -337,7 +339,7 @@ lan_route_access:
 5. Run recurring roadmap reviews to keep `Requirements.md` and phase docs synchronized.
 
 ## 15) Cross-Document Consistency Rules
-- Requirement changes here must trigger updates in [Phase1.md](./Phase1.md), [Phase2.md](./Phase2.md), [Phase3.md](./Phase3.md), [Phase4.md](./Phase4.md), [Phase5.md](./Phase5.md), [Phase6.md](./Phase6.md), [Phase7.md](./Phase7.md), [Phase8.md](./Phase8.md), or [Phase9.md](./Phase9.md) where applicable.
+- Requirement changes here must trigger updates in [Phase1.md](./Phase1.md), [Phase2.md](./Phase2.md), [Phase3.md](./Phase3.md), [Phase4.md](./Phase4.md), [Phase5.md](./Phase5.md), [Phase6.md](./Phase6.md), [Phase7.md](./Phase7.md), [Phase8.md](./Phase8.md), [Phase9.md](./Phase9.md), or [phase10.md](./phase10.md) where applicable.
 - Phase documents may add implementation detail, but may not relax security, ACL, or modular-backend requirements defined here.
 - Transport backend abstraction and protocol-agnostic control-plane design are mandatory across all phases.
 

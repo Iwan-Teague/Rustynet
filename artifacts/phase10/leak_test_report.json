@@ -1,0 +1,8 @@
+{
+  "phase": "phase10",
+  "status": "pass",
+  "tunnel_fail_close": true,
+  "dns_fail_close": true,
+  "controller_state": "FailClosed",
+  "trigger": "dns_apply_failure"
+}

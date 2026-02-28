@@ -11,3 +11,4 @@ rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 sha2 = "0.10"
+nix = { version = "0.29", default-features = false, features = ["socket"] }

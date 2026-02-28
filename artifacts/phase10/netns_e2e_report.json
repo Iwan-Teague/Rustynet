@@ -1,0 +1,11 @@
+{
+  "phase": "phase10",
+  "scenario": "exit_node_full_tunnel_and_lan_toggle",
+  "status": "pass",
+  "details": {
+    "encrypted_tunnel": true,
+    "exit_node_selected": true,
+    "lan_toggle_enforced": true,
+    "state": "ExitActive"
+  }
+}

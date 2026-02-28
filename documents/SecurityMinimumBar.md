@@ -101,6 +101,7 @@ These budgets are release gates once benchmarking harnesses are active.
 - Phase 7: HA, tenant boundary hardening, and trust-state fail-closed enforcement.
 - Phase 8: external audit cadence + advanced compliance/key custody.
 - Phase 9: GA readiness with SLO/DR/performance gates fully enforced.
+- Phase 10: real Linux dataplane enforcement for encrypted exit-node traffic, NAT/forwarding hardening, and tunnel/DNS leak-prevention verification in live networking paths.
 
 ## 8) Sign-off Checklist
 - [ ] Security owner approval

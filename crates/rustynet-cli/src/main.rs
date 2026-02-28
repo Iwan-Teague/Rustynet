@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+
+use rustynetd::daemon::DEFAULT_SOCKET_PATH;
+use rustynetd::ipc::{IpcCommand, IpcResponse};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Status,
@@ -10,19 +17,14 @@ enum CliCommand {
     LanAccessOn,
     LanAccessOff,
     DnsInspect,
+    RouteAdvertise(String),
     Help,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct CliState {
-    selected_exit_node: Option<String>,
-    lan_access_enabled: bool,
 }
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let command = parse_command(&args);
-    let output = execute(command, &mut CliState::default());
+    let output = execute(command);
     println!("{output}");
 }
 
@@ -38,99 +40,109 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd] if cmd == "lan-access" && subcmd == "on" => CliCommand::LanAccessOn,
         [cmd, subcmd] if cmd == "lan-access" && subcmd == "off" => CliCommand::LanAccessOff,
         [cmd, subcmd] if cmd == "dns" && subcmd == "inspect" => CliCommand::DnsInspect,
+        [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
+            CliCommand::RouteAdvertise(cidr.clone())
+        }
         _ => CliCommand::Help,
     }
 }
 
-fn execute(command: CliCommand, state: &mut CliState) -> String {
+fn execute(command: CliCommand) -> String {
     match command {
-        CliCommand::Status => format!(
-            "status: exit_node={} lan_access={}",
-            state.selected_exit_node.as_deref().unwrap_or("none"),
-            if state.lan_access_enabled {
-                "on"
-            } else {
-                "off"
-            }
-        ),
+        CliCommand::Help => help_text(),
         CliCommand::Login => "login: open auth URL and complete device enrollment".to_string(),
-        CliCommand::Netcheck => {
-            "netcheck: direct-path preferred, relay fallback available".to_string()
+        other => {
+            let ipc_command = to_ipc_command(other);
+            match send_command(ipc_command) {
+                Ok(response) => {
+                    if response.ok {
+                        response.message
+                    } else {
+                        format!("error: {}", response.message)
+                    }
+                }
+                Err(err) => format!("error: daemon unreachable: {err}"),
+            }
         }
-        CliCommand::ExitNodeSelect(node) => {
-            state.selected_exit_node = Some(node.clone());
-            format!("exit-node: selected {node}")
-        }
-        CliCommand::ExitNodeOff => {
-            state.selected_exit_node = None;
-            "exit-node: disabled".to_string()
-        }
-        CliCommand::LanAccessOn => {
-            state.lan_access_enabled = true;
-            "lan-access: enabled".to_string()
-        }
-        CliCommand::LanAccessOff => {
-            state.lan_access_enabled = false;
-            "lan-access: disabled".to_string()
-        }
-        CliCommand::DnsInspect => "dns inspect: zone=rustynet records=dynamic".to_string(),
-        CliCommand::Help => [
-            "commands:",
-            "  status",
-            "  login",
-            "  netcheck",
-            "  exit-node select <node>",
-            "  exit-node off",
-            "  lan-access on|off",
-            "  dns inspect",
-        ]
-        .join("\n"),
     }
+}
+
+fn to_ipc_command(command: CliCommand) -> IpcCommand {
+    match command {
+        CliCommand::Status => IpcCommand::Status,
+        CliCommand::Netcheck => IpcCommand::Netcheck,
+        CliCommand::ExitNodeSelect(node) => IpcCommand::ExitNodeSelect(node),
+        CliCommand::ExitNodeOff => IpcCommand::ExitNodeOff,
+        CliCommand::LanAccessOn => IpcCommand::LanAccessOn,
+        CliCommand::LanAccessOff => IpcCommand::LanAccessOff,
+        CliCommand::DnsInspect => IpcCommand::DnsInspect,
+        CliCommand::RouteAdvertise(cidr) => IpcCommand::RouteAdvertise(cidr),
+        CliCommand::Login | CliCommand::Help => IpcCommand::Unknown("unsupported".to_string()),
+    }
+}
+
+fn daemon_socket_path() -> PathBuf {
+    std::env::var("RUSTYNET_DAEMON_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH))
+}
+
+fn send_command(command: IpcCommand) -> Result<IpcResponse, String> {
+    send_command_with_socket(command, daemon_socket_path())
+}
+
+fn send_command_with_socket(
+    command: IpcCommand,
+    socket_path: PathBuf,
+) -> Result<IpcResponse, String> {
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|err| format!("connect {} failed: {err}", socket_path.display()))?;
+
+    stream
+        .write_all(format!("{}\n", command.as_wire()).as_bytes())
+        .map_err(|err| format!("write failed: {err}"))?;
+
+    let mut line = String::new();
+    let mut reader = BufReader::new(&stream);
+    reader
+        .read_line(&mut line)
+        .map_err(|err| format!("read failed: {err}"))?;
+
+    Ok(IpcResponse::from_wire(&line))
+}
+
+fn help_text() -> String {
+    [
+        "commands:",
+        "  status",
+        "  login",
+        "  netcheck",
+        "  exit-node select <node>",
+        "  exit-node off",
+        "  lan-access on|off",
+        "  dns inspect",
+        "  route advertise <cidr>",
+    ]
+    .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CliState, execute, parse_command};
+    use super::{execute, parse_command};
 
     #[test]
-    fn phase4_cli_supports_exit_node_flows() {
-        let mut state = CliState::default();
-
-        let out = execute(
-            parse_command(&[
-                "exit-node".to_string(),
-                "select".to_string(),
-                "mini-pc-1".to_string(),
-            ]),
-            &mut state,
-        );
-        assert!(out.contains("selected mini-pc-1"));
-
-        let out = execute(
-            parse_command(&["exit-node".to_string(), "off".to_string()]),
-            &mut state,
-        );
-        assert!(out.contains("disabled"));
+    fn parse_supports_phase10_route_advertise_command() {
+        let command = parse_command(&[
+            "route".to_string(),
+            "advertise".to_string(),
+            "192.168.1.0/24".to_string(),
+        ]);
+        assert!(format!("{command:?}").contains("RouteAdvertise"));
     }
 
     #[test]
-    fn phase4_cli_supports_lan_toggle_and_dns_inspect() {
-        let mut state = CliState::default();
-
-        let on = execute(
-            parse_command(&["lan-access".to_string(), "on".to_string()]),
-            &mut state,
-        );
-        assert_eq!(on, "lan-access: enabled");
-        let off = execute(
-            parse_command(&["lan-access".to_string(), "off".to_string()]),
-            &mut state,
-        );
-        assert_eq!(off, "lan-access: disabled");
-        let dns = execute(
-            parse_command(&["dns".to_string(), "inspect".to_string()]),
-            &mut state,
-        );
-        assert!(dns.contains("dns inspect"));
+    fn execute_reports_error_when_daemon_is_unreachable() {
+        let output = execute(parse_command(&["status".to_string()]));
+        assert!(output.starts_with("error: daemon unreachable:"));
     }
 }
