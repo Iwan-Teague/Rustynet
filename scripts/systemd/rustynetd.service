@@ -7,8 +7,19 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock
+Environment=RUSTYNET_STATE=/var/lib/rustynet/rustynetd.state
+Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
+Environment=RUSTYNET_TRUST_VERIFIER_KEY=/etc/rustynet/trust-evidence.pub
+Environment=RUSTYNET_TRUST_WATERMARK=/var/lib/rustynet/rustynetd.trust.watermark
+Environment=RUSTYNET_BACKEND=linux-wireguard
+Environment=RUSTYNET_WG_INTERFACE=rustynet0
+Environment=RUSTYNET_WG_PRIVATE_KEY=/etc/rustynet/wireguard.key
 Environment=RUSTYNET_EGRESS_INTERFACE=eth0
-ExecStart=/usr/local/bin/rustynetd daemon --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --backend linux-wireguard --wg-interface rustynet0 --wg-private-key /etc/rustynet/wireguard.key --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode hybrid-native --reconcile-interval-ms 1000 --max-reconcile-failures 5
+Environment=RUSTYNET_DATAPLANE_MODE=hybrid-native
+Environment=RUSTYNET_RECONCILE_INTERVAL_MS=1000
+Environment=RUSTYNET_MAX_RECONCILE_FAILURES=5
+ExecStart=/usr/local/bin/rustynetd daemon --socket ${RUSTYNET_SOCKET} --state ${RUSTYNET_STATE} --trust-evidence ${RUSTYNET_TRUST_EVIDENCE} --trust-verifier-key ${RUSTYNET_TRUST_VERIFIER_KEY} --trust-watermark ${RUSTYNET_TRUST_WATERMARK} --backend ${RUSTYNET_BACKEND} --wg-interface ${RUSTYNET_WG_INTERFACE} --wg-private-key ${RUSTYNET_WG_PRIVATE_KEY} --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode ${RUSTYNET_DATAPLANE_MODE} --reconcile-interval-ms ${RUSTYNET_RECONCILE_INTERVAL_MS} --max-reconcile-failures ${RUSTYNET_MAX_RECONCILE_FAILURES}
 Restart=on-failure
 RestartSec=2s
 StartLimitBurst=5

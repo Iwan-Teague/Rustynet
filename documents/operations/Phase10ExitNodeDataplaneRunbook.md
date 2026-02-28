@@ -14,17 +14,18 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
-2. Install and start hardened systemd service:
+2. Recommended: run `./start.sh` and complete first-run wizard bootstrap.
+3. Install and start hardened systemd service:
 - `sudo ./scripts/systemd/install_rustynetd_service.sh`
-3. Confirm detected egress interface:
+4. Confirm detected daemon environment:
 - `cat /etc/default/rustynetd`
-4. Validate baseline daemon status:
+5. Validate baseline daemon status:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
-5. Select exit node:
+6. Select exit node:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- exit-node select <node-id>`
-6. Toggle LAN access only when required:
+7. Toggle LAN access only when required:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- lan-access on`
-7. Validate DNS policy state:
+8. Validate DNS policy state:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- dns inspect`
 
 ## 4) Rollback Procedure
