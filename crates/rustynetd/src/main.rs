@@ -12,7 +12,8 @@ use rustynet_policy::{
 
 use rustynetd::daemon::{
     DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_RECONCILE_INTERVAL_MS,
-    DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_WG_INTERFACE,
+    DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH,
+    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_WG_INTERFACE,
     DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, run_daemon,
 };
 use rustynetd::perf;
@@ -78,6 +79,20 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--trust-evidence requires a value".to_string())?;
                 config.trust_evidence_path = value.into();
+                index += 2;
+            }
+            Some("--trust-verifier-key") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--trust-verifier-key requires a value".to_string())?;
+                config.trust_verifier_key_path = value.into();
+                index += 2;
+            }
+            Some("--trust-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--trust-watermark requires a value".to_string())?;
+                config.trust_watermark_path = value.into();
                 index += 2;
             }
             Some("--backend") => {
@@ -335,7 +350,7 @@ fn emit_phase10_evidence(output_dir: &str) -> Result<(), String> {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--socket <path>] [--state <path>] [--trust-evidence <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
+        "  rustynetd daemon [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
         "  rustynetd --emit-phase1-baseline <path>",
         "  rustynetd --emit-phase10-evidence <dir>",
         "",
@@ -343,6 +358,8 @@ fn help_text() -> String {
         &format!("  socket={DEFAULT_SOCKET_PATH}"),
         &format!("  state={DEFAULT_STATE_PATH}"),
         &format!("  trust_evidence={DEFAULT_TRUST_EVIDENCE_PATH}"),
+        &format!("  trust_verifier_key={DEFAULT_TRUST_VERIFIER_KEY_PATH}"),
+        &format!("  trust_watermark={DEFAULT_TRUST_WATERMARK_PATH}"),
         &format!("  backend={:?}", DaemonBackendMode::default()),
         &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
         &format!("  egress_interface={DEFAULT_EGRESS_INTERFACE}"),

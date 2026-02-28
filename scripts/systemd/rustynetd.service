@@ -6,7 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rustynetd daemon --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --backend linux-wireguard --wg-interface rustynet0 --wg-private-key /etc/rustynet/wireguard.key --egress-interface eth0 --dataplane-mode hybrid-native --reconcile-interval-ms 1000 --max-reconcile-failures 5
+EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_EGRESS_INTERFACE=eth0
+ExecStart=/usr/local/bin/rustynetd daemon --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --backend linux-wireguard --wg-interface rustynet0 --wg-private-key /etc/rustynet/wireguard.key --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode hybrid-native --reconcile-interval-ms 1000 --max-reconcile-failures 5
 Restart=on-failure
 RestartSec=2s
 StartLimitBurst=5
@@ -18,6 +20,7 @@ StateDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /etc/rustynet
 ExecStartPre=/usr/bin/test -f /etc/rustynet/wireguard.key
 ExecStartPre=/usr/bin/test -f /var/lib/rustynet/rustynetd.trust
+ExecStartPre=/usr/bin/test -f /etc/rustynet/trust-evidence.pub
 User=root
 Group=root
 NoNewPrivileges=true

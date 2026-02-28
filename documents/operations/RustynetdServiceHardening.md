@@ -26,6 +26,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`
 - `ReadWritePaths=/run/rustynet /var/lib/rustynet /etc/rustynet`
 - `UMask=0077`
+- `EnvironmentFile=-/etc/default/rustynetd` with validated `RUSTYNET_EGRESS_INTERFACE`
 
 ## Reliability Controls
 - `Restart=on-failure`
@@ -38,6 +39,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 ## Required Runtime Files
 - `/etc/rustynet/wireguard.key` (`0600`)
 - `/var/lib/rustynet/rustynetd.trust` (integrity-checked trust evidence)
+- `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
 
 ## Verification
 1. `sudo systemctl daemon-reload`

@@ -10,18 +10,21 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Trust state and signed control data validation path healthy.
 - WireGuard private key present at `/etc/rustynet/wireguard.key` with mode `0600`.
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
+- Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
 2. Install and start hardened systemd service:
 - `sudo ./scripts/systemd/install_rustynetd_service.sh`
-3. Validate baseline daemon status:
+3. Confirm detected egress interface:
+- `cat /etc/default/rustynetd`
+4. Validate baseline daemon status:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
-4. Select exit node:
+5. Select exit node:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- exit-node select <node-id>`
-5. Toggle LAN access only when required:
+6. Toggle LAN access only when required:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- lan-access on`
-6. Validate DNS policy state:
+7. Validate DNS policy state:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- dns inspect`
 
 ## 4) Rollback Procedure

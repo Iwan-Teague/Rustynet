@@ -10,6 +10,17 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
+use crate::phase10::{
+    ApplyOptions, DataplaneState, DataplaneSystem, DryRunSystem, Phase10Controller,
+    RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
+};
+#[cfg(target_os = "linux")]
+use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
+use crate::resilience::{
+    ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
+};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nix::sys::socket::getsockopt;
 #[cfg(any(
     target_os = "macos",
@@ -21,6 +32,7 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
+use nix::unistd::Uid;
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
     TunnelBackend, TunnelStats,
@@ -31,22 +43,12 @@ use rustynet_backend_wireguard::{LinuxCommandRunner, LinuxWireguardBackend};
 use rustynet_policy::{
     ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
 };
-use sha2::{Digest, Sha256};
-
-use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
-use crate::phase10::{
-    ApplyOptions, DataplaneState, DataplaneSystem, DryRunSystem, Phase10Controller,
-    RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
-};
-#[cfg(target_os = "linux")]
-use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
-use crate::resilience::{
-    ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
-};
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
+pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.pub";
+pub const DEFAULT_TRUST_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.trust.watermark";
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
@@ -83,6 +85,8 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
     pub trust_evidence_path: PathBuf,
+    pub trust_verifier_key_path: PathBuf,
+    pub trust_watermark_path: PathBuf,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_private_key_path: Option<PathBuf>,
@@ -99,6 +103,8 @@ impl Default for DaemonConfig {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
+            trust_verifier_key_path: PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH),
+            trust_watermark_path: PathBuf::from(DEFAULT_TRUST_WATERMARK_PATH),
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
             wg_private_key_path: None,
@@ -135,7 +141,10 @@ enum TrustBootstrapError {
     Missing,
     Io(String),
     InvalidFormat(String),
-    IntegrityMismatch,
+    KeyInvalid,
+    SignatureInvalid,
+    ReplayDetected,
+    FutureDated,
     Stale,
 }
 
@@ -147,10 +156,31 @@ impl fmt::Display for TrustBootstrapError {
             TrustBootstrapError::InvalidFormat(message) => {
                 write!(f, "trust evidence invalid format: {message}")
             }
-            TrustBootstrapError::IntegrityMismatch => f.write_str("trust evidence digest mismatch"),
+            TrustBootstrapError::KeyInvalid => {
+                f.write_str("trust evidence verifier key is invalid")
+            }
+            TrustBootstrapError::SignatureInvalid => {
+                f.write_str("trust evidence signature verification failed")
+            }
+            TrustBootstrapError::ReplayDetected => f.write_str("trust evidence replay detected"),
+            TrustBootstrapError::FutureDated => {
+                f.write_str("trust evidence timestamp exceeds allowable clock skew")
+            }
             TrustBootstrapError::Stale => f.write_str("trust evidence is stale"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TrustWatermark {
+    updated_at_unix: u64,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustEvidenceEnvelope {
+    evidence: TrustEvidence,
+    watermark: TrustWatermark,
 }
 
 enum DaemonBackend {
@@ -270,6 +300,8 @@ struct DaemonRuntime {
     controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
+    trust_verifier_key_path: PathBuf,
+    trust_watermark_path: PathBuf,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -309,6 +341,8 @@ impl DaemonRuntime {
             controller,
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
+            trust_verifier_key_path: config.trust_verifier_key_path.clone(),
+            trust_watermark_path: config.trust_watermark_path.clone(),
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -323,6 +357,18 @@ impl DaemonRuntime {
         })
     }
 
+    fn load_verified_trust(&self) -> Result<TrustEvidence, TrustBootstrapError> {
+        let previous_watermark = load_trust_watermark(&self.trust_watermark_path)?;
+        let envelope = load_trust_evidence(
+            &self.trust_evidence_path,
+            &self.trust_verifier_key_path,
+            self.trust_policy,
+            previous_watermark,
+        )?;
+        persist_trust_watermark(&self.trust_watermark_path, envelope.watermark)?;
+        Ok(envelope.evidence)
+    }
+
     fn bootstrap(&mut self) {
         match self.restore_state() {
             Ok(()) => {}
@@ -335,7 +381,7 @@ impl DaemonRuntime {
             }
         }
 
-        let trust = match load_trust_evidence(&self.trust_evidence_path, self.trust_policy) {
+        let trust = match self.load_verified_trust() {
             Ok(evidence) => evidence,
             Err(err) => {
                 self.restrict_recoverable(err.to_string());
@@ -532,7 +578,7 @@ impl DaemonRuntime {
         self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
         self.last_reconcile_unix = Some(unix_now());
 
-        let trust = match load_trust_evidence(&self.trust_evidence_path, self.trust_policy) {
+        let trust = match self.load_verified_trust() {
             Ok(evidence) => evidence,
             Err(err) => {
                 self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -746,6 +792,16 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "trust evidence path must be absolute".to_string(),
         ));
     }
+    if !config.trust_verifier_key_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "trust verifier key path must be absolute".to_string(),
+        ));
+    }
+    if !config.trust_watermark_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "trust watermark path must be absolute".to_string(),
+        ));
+    }
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "wireguard interface must not be empty".to_string(),
@@ -759,6 +815,16 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.trust_evidence_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
             "trust evidence path must not be empty".to_string(),
+        ));
+    }
+    if config.trust_verifier_key_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "trust verifier key path must not be empty".to_string(),
+        ));
+    }
+    if config.trust_watermark_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "trust watermark path must not be empty".to_string(),
         ));
     }
 
@@ -794,9 +860,28 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             DaemonError::InvalidConfig(format!("trust directory create failed: {err}"))
         })?;
     }
+    if let Some(parent) = config.trust_watermark_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("trust watermark directory create failed: {err}"))
+        })?;
+    }
 
-    let _ = load_trust_evidence(&config.trust_evidence_path, TrustPolicy::default())
-        .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;
+    validate_trust_evidence_permissions(&config.trust_evidence_path)?;
+    validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
+    if let Some(path) = config.wg_private_key_path.as_ref() {
+        validate_private_key_permissions(path)?;
+    }
+
+    let watermark = load_trust_watermark(&config.trust_watermark_path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("trust watermark preflight failed: {err}"))
+    })?;
+    let _ = load_trust_evidence(
+        &config.trust_evidence_path,
+        &config.trust_verifier_key_path,
+        TrustPolicy::default(),
+        watermark,
+    )
+    .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;
 
     let mut system = daemon_system(config)?;
     system
@@ -808,25 +893,25 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
 #[cfg(target_os = "linux")]
 fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| DaemonError::InvalidConfig(format!("wg private key path error: {err}")))?;
-    let mode = metadata.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(DaemonError::InvalidConfig(
-            "wg private key file must not be group/world accessible".to_string(),
-        ));
-    }
-    Ok(())
+    validate_file_security(path, "wireguard private key", 0o077)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "wireguard private key", 0o077)
 }
 
 fn load_trust_evidence(
     path: &Path,
+    verifier_key_path: &Path,
     trust_policy: TrustPolicy,
-) -> Result<TrustEvidence, TrustBootstrapError> {
+    previous_watermark: Option<TrustWatermark>,
+) -> Result<TrustEvidenceEnvelope, TrustBootstrapError> {
     if !path.exists() {
         return Err(TrustBootstrapError::Missing);
     }
 
+    let verifying_key = load_verifying_key(verifier_key_path)?;
     let content =
         fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
     let mut version: Option<u8> = None;
@@ -835,7 +920,8 @@ fn load_trust_evidence(
     let mut signed_data_age_secs: Option<u64> = None;
     let mut clock_skew_secs: Option<u64> = None;
     let mut updated_at_unix: Option<u64> = None;
-    let mut digest: Option<String> = None;
+    let mut nonce: Option<u64> = None;
+    let mut signature_hex: Option<String> = None;
 
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -863,8 +949,11 @@ fn load_trust_evidence(
             "updated_at_unix" => {
                 updated_at_unix = value.parse::<u64>().ok();
             }
-            "digest" => {
-                digest = Some(value.to_string());
+            "nonce" => {
+                nonce = value.parse::<u64>().ok();
+            }
+            "signature" => {
+                signature_hex = Some(value.to_string());
             }
             _ => {
                 return Err(TrustBootstrapError::InvalidFormat(format!(
@@ -874,7 +963,7 @@ fn load_trust_evidence(
         }
     }
 
-    if version != Some(1) {
+    if version != Some(2) {
         return Err(TrustBootstrapError::InvalidFormat(
             "unsupported trust evidence version".to_string(),
         ));
@@ -895,26 +984,50 @@ fn load_trust_evidence(
         updated_at_unix: updated_at_unix.ok_or_else(|| {
             TrustBootstrapError::InvalidFormat("missing updated_at_unix".to_string())
         })?,
+        nonce: nonce
+            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing nonce".to_string()))?,
     };
 
-    let expected_digest = digest.ok_or_else(|| {
-        TrustBootstrapError::InvalidFormat("missing trust evidence digest".to_string())
+    let signature_hex = signature_hex.ok_or_else(|| {
+        TrustBootstrapError::InvalidFormat("missing trust evidence signature".to_string())
     })?;
-    let actual_digest = sha256_hex(trust_evidence_payload(&record).as_bytes());
-    if expected_digest != actual_digest {
-        return Err(TrustBootstrapError::IntegrityMismatch);
+    let signature_bytes = decode_hex_to_fixed::<64>(&signature_hex).map_err(|_| {
+        TrustBootstrapError::InvalidFormat("invalid signature encoding".to_string())
+    })?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(trust_evidence_payload(&record).as_bytes(), &signature)
+        .map_err(|_| TrustBootstrapError::SignatureInvalid)?;
+
+    let now = unix_now();
+    if record.updated_at_unix > now.saturating_add(trust_policy.max_clock_skew_secs) {
+        return Err(TrustBootstrapError::FutureDated);
     }
 
-    let age = unix_now().saturating_sub(record.updated_at_unix);
+    let age = now.saturating_sub(record.updated_at_unix);
     if age > trust_policy.max_signed_data_age_secs {
         return Err(TrustBootstrapError::Stale);
     }
 
-    Ok(TrustEvidence {
-        tls13_valid: record.tls13_valid,
-        signed_control_valid: record.signed_control_valid,
-        signed_data_age_secs: record.signed_data_age_secs,
-        clock_skew_secs: record.clock_skew_secs,
+    let watermark = TrustWatermark {
+        updated_at_unix: record.updated_at_unix,
+        nonce: record.nonce,
+    };
+    if previous_watermark
+        .map(|existing| watermark < existing)
+        .unwrap_or(false)
+    {
+        return Err(TrustBootstrapError::ReplayDetected);
+    }
+
+    Ok(TrustEvidenceEnvelope {
+        evidence: TrustEvidence {
+            tls13_valid: record.tls13_valid,
+            signed_control_valid: record.signed_control_valid,
+            signed_data_age_secs: record.signed_data_age_secs,
+            clock_skew_secs: record.clock_skew_secs,
+        },
+        watermark,
     })
 }
 
@@ -925,11 +1038,12 @@ struct TrustEvidenceRecord {
     signed_data_age_secs: u64,
     clock_skew_secs: u64,
     updated_at_unix: u64,
+    nonce: u64,
 }
 
 fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     format!(
-        "version=1\ntls13_valid={}\nsigned_control_valid={}\nsigned_data_age_secs={}\nclock_skew_secs={}\nupdated_at_unix={}\n",
+        "version=2\ntls13_valid={}\nsigned_control_valid={}\nsigned_data_age_secs={}\nclock_skew_secs={}\nupdated_at_unix={}\nnonce={}\n",
         if record.tls13_valid { "true" } else { "false" },
         if record.signed_control_valid {
             "true"
@@ -938,7 +1052,8 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
         },
         record.signed_data_age_secs,
         record.clock_skew_secs,
-        record.updated_at_unix
+        record.updated_at_unix,
+        record.nonce
     )
 }
 
@@ -950,13 +1065,191 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], TrustBootstrapError> {
+    let mut bytes = [0u8; N];
+    let trimmed = encoded.trim();
+    if trimmed.len() != N * 2 {
+        return Err(TrustBootstrapError::InvalidFormat(
+            "unexpected hex length".to_string(),
+        ));
     }
-    out
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < N {
+        let hi = decode_hex_nibble(raw[index * 2])?;
+        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
+        bytes[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, TrustBootstrapError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(TrustBootstrapError::InvalidFormat(
+            "invalid hex character".to_string(),
+        )),
+    }
+}
+
+fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> {
+    let content =
+        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    let key_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing verifier key".to_string()))?;
+    let key_bytes = decode_hex_to_fixed::<32>(key_line)?;
+    VerifyingKey::from_bytes(&key_bytes).map_err(|_| TrustBootstrapError::KeyInvalid)
+}
+
+fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBootstrapError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    let mut version: Option<u8> = None;
+    let mut updated_at_unix: Option<u64> = None;
+    let mut nonce: Option<u64> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(TrustBootstrapError::InvalidFormat(
+                "watermark line missing key/value separator".to_string(),
+            ));
+        };
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "updated_at_unix" => {
+                updated_at_unix = value.parse::<u64>().ok();
+            }
+            "nonce" => {
+                nonce = value.parse::<u64>().ok();
+            }
+            _ => {
+                return Err(TrustBootstrapError::InvalidFormat(format!(
+                    "unknown watermark key {key}"
+                )));
+            }
+        }
+    }
+    if version != Some(1) {
+        return Err(TrustBootstrapError::InvalidFormat(
+            "unsupported watermark version".to_string(),
+        ));
+    }
+    Ok(Some(TrustWatermark {
+        updated_at_unix: updated_at_unix.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
+        })?,
+        nonce: nonce.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        })?,
+    }))
+}
+
+fn persist_trust_watermark(
+    path: &Path,
+    watermark: TrustWatermark,
+) -> Result<(), TrustBootstrapError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    }
+    let payload = format!(
+        "version=1\nupdated_at_unix={}\nnonce={}\n",
+        watermark.updated_at_unix, watermark.nonce
+    );
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    temp.write_all(payload.as_bytes())
+        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    temp.sync_all()
+        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    fs::rename(&temp_path, path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust evidence", 0o022)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust evidence", 0o022)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust verifier key", 0o022)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust verifier key", 0o022)
+}
+
+fn validate_file_security(
+    path: &Path,
+    label: &str,
+    disallowed_mode_mask: u32,
+) -> Result<(), DaemonError> {
+    let link_metadata = fs::symlink_metadata(path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("{label} metadata read failed: {err}"))
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} must not be a symlink"
+        )));
+    }
+    if !link_metadata.file_type().is_file() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} must be a regular file"
+        )));
+    }
+
+    let metadata = fs::metadata(path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("{label} metadata read failed: {err}"))
+    })?;
+    let mode = metadata.permissions().mode();
+    if mode & disallowed_mode_mask != 0 {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} has insecure permissions: mode {:o}",
+            mode & 0o777
+        )));
+    }
+
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} owner uid mismatch: expected {expected_uid}, got {owner_uid}"
+        )));
+    }
+    Ok(())
 }
 
 fn read_command(stream: &UnixStream) -> Result<String, String> {
@@ -1015,23 +1308,43 @@ fn unix_now() -> u64 {
 mod tests {
     use std::path::Path;
 
+    use ed25519_dalek::{Signer, SigningKey};
+
     use super::{
         DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, TrustEvidenceRecord,
-        sha256_hex, trust_evidence_payload, unix_now,
+        TrustWatermark, persist_trust_watermark, trust_evidence_payload, unix_now,
     };
 
-    fn write_trust_file(path: &Path) {
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("verifier key should be written");
         let record = TrustEvidenceRecord {
             tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
             updated_at_unix: unix_now(),
+            nonce,
         };
         let body = trust_evidence_payload(&record);
-        let digest = sha256_hex(body.as_bytes());
-        std::fs::write(path, format!("{body}digest={digest}\n"))
-            .expect("trust file should be written");
+        let signature = signing_key.sign(body.as_bytes());
+        std::fs::write(
+            path,
+            format!("{body}signature={}\n", hex_encode(&signature.to_bytes())),
+        )
+        .expect("trust file should be written");
     }
 
     #[test]
@@ -1045,11 +1358,15 @@ mod tests {
         );
         let state_path = std::env::temp_dir().join(format!("{unique}.state"));
         let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        write_trust_file(&trust_path);
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
 
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -1075,6 +1392,8 @@ mod tests {
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
     }
 
     #[test]
@@ -1088,9 +1407,13 @@ mod tests {
         );
         let state_path = std::env::temp_dir().join(format!("{unique}.state"));
         let trust_path = std::env::temp_dir().join(format!("{unique}.missing.trust"));
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.missing.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -1102,5 +1425,49 @@ mod tests {
         assert!(response.message.contains("restricted-safe"));
 
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn daemon_runtime_rejects_replayed_trust_evidence() {
+        let unique = format!(
+            "rustynetd-runtime-replay-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        write_trust_file(&trust_path, &trust_verifier_path, 2);
+        persist_trust_watermark(
+            &trust_watermark_path,
+            TrustWatermark {
+                updated_at_unix: unix_now(),
+                nonce: 3,
+            },
+        )
+        .expect("watermark should be persisted");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let response = runtime.handle_command(IpcCommand::ExitNodeOff);
+        assert!(!response.ok);
+        assert!(response.message.contains("restricted-safe"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
     }
 }
