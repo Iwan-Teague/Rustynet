@@ -1,7 +1,0 @@
-{
-  "phase": "phase10",
-  "status": "pass",
-  "direct_to_relay": true,
-  "relay_to_direct": true,
-  "final_path": "direct"
-}

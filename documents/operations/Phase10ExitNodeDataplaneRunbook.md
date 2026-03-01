@@ -53,7 +53,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- route advertise 192.168.1.0/24`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key rotate`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key revoke`
-- `cargo run -p rustynetd -- --emit-phase10-evidence artifacts/phase10`
+- `./scripts/ci/phase10_gates.sh` (validates pre-generated measured artifacts in `artifacts/phase10`)
 
 ## 7) Required Evidence for Sign-Off
 - `artifacts/phase10/netns_e2e_report.json`

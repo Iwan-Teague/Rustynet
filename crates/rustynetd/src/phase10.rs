@@ -1373,47 +1373,115 @@ pub struct PerfMetric {
     pub status: &'static str,
 }
 
-pub fn write_phase10_perf_report(path: impl AsRef<Path>) -> Result<(), SystemError> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Phase10PerfMeasurement {
+    pub soak_test_hours: u64,
+    pub idle_cpu_percent: f64,
+    pub idle_rss_mb: f64,
+    pub reconnect_seconds: f64,
+    pub route_apply_p95_seconds: f64,
+    pub throughput_overhead_percent: f64,
+}
+
+impl Phase10PerfMeasurement {
+    fn validate(self) -> Result<(), SystemError> {
+        if self.soak_test_hours == 0 {
+            return Err(SystemError::PrerequisiteCheckFailed(
+                "soak_test_hours must be greater than zero".to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("idle_cpu_percent", self.idle_cpu_percent),
+            ("idle_rss_mb", self.idle_rss_mb),
+            ("reconnect_seconds", self.reconnect_seconds),
+            ("route_apply_p95_seconds", self.route_apply_p95_seconds),
+            (
+                "throughput_overhead_percent",
+                self.throughput_overhead_percent,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(SystemError::PrerequisiteCheckFailed(format!(
+                    "{name} must be a finite non-negative number"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn metric_status(value: f64, threshold_max: f64) -> &'static str {
+    if value <= threshold_max {
+        "pass"
+    } else {
+        "fail"
+    }
+}
+
+pub fn write_phase10_perf_report(
+    path: impl AsRef<Path>,
+    measurements: Phase10PerfMeasurement,
+    environment: &str,
+) -> Result<(), SystemError> {
+    measurements.validate()?;
+    if environment.trim().is_empty() {
+        return Err(SystemError::PrerequisiteCheckFailed(
+            "environment must not be empty".to_string(),
+        ));
+    }
+
     let metrics = [
         PerfMetric {
             name: "idle_cpu_percent",
-            value: 1.2,
+            value: measurements.idle_cpu_percent,
             threshold: "<=2",
-            status: "pass",
+            status: metric_status(measurements.idle_cpu_percent, 2.0),
         },
         PerfMetric {
             name: "idle_rss_mb",
-            value: 82.0,
+            value: measurements.idle_rss_mb,
             threshold: "<=120",
-            status: "pass",
+            status: metric_status(measurements.idle_rss_mb, 120.0),
         },
         PerfMetric {
             name: "reconnect_seconds",
-            value: 2.0,
+            value: measurements.reconnect_seconds,
             threshold: "<=5",
-            status: "pass",
+            status: metric_status(measurements.reconnect_seconds, 5.0),
         },
         PerfMetric {
             name: "route_apply_p95_seconds",
-            value: 0.8,
+            value: measurements.route_apply_p95_seconds,
             threshold: "<=2",
-            status: "pass",
+            status: metric_status(measurements.route_apply_p95_seconds, 2.0),
         },
         PerfMetric {
             name: "throughput_overhead_percent",
-            value: 10.5,
+            value: measurements.throughput_overhead_percent,
             threshold: "<=15",
-            status: "pass",
+            status: metric_status(measurements.throughput_overhead_percent, 15.0),
         },
     ];
+    let soak_status = if measurements.soak_test_hours >= 24
+        && metrics.iter().all(|metric| metric.status == "pass")
+    {
+        "pass"
+    } else {
+        "fail"
+    };
+    let captured_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| SystemError::Io(err.to_string()))?
+        .as_secs();
 
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| SystemError::Io(err.to_string()))?;
     }
 
-    let mut out = String::from(
-        "{\n  \"phase\": \"phase10\",\n  \"soak_test_hours\": 24,\n  \"soak_status\": \"pass\",\n  \"metrics\": [\n",
+    let mut out = format!(
+        "{{\n  \"phase\": \"phase10\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"captured_at_unix\": {},\n  \"soak_test_hours\": {},\n  \"soak_status\": \"{}\",\n  \"metrics\": [\n",
+        environment, captured_at_unix, measurements.soak_test_hours, soak_status
     );
     for (index, metric) in metrics.iter().enumerate() {
         let comma = if index + 1 == metrics.len() { "" } else { "," };
@@ -1667,11 +1735,25 @@ mod tests {
             }],
         )
         .expect("audit report should be written");
-        write_phase10_perf_report(&perf_path).expect("perf report should be written");
+        write_phase10_perf_report(
+            &perf_path,
+            Phase10PerfMeasurement {
+                soak_test_hours: 24,
+                idle_cpu_percent: 1.2,
+                idle_rss_mb: 82.0,
+                reconnect_seconds: 2.0,
+                route_apply_p95_seconds: 0.8,
+                throughput_overhead_percent: 10.5,
+            },
+            "unit-test-linux-netns",
+        )
+        .expect("perf report should be written");
 
         let audit = std::fs::read_to_string(audit_path).expect("audit should be readable");
         let perf = std::fs::read_to_string(perf_path).expect("perf should be readable");
         assert!(audit.contains("generation=0"));
         assert!(perf.contains("idle_cpu_percent"));
+        assert!(perf.contains("\"evidence_mode\": \"measured\""));
+        assert!(perf.contains("\"captured_at_unix\": "));
     }
 }

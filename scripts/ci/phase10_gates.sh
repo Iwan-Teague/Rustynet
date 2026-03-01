@@ -38,8 +38,6 @@ fi
 cargo test -p rustynetd phase10::tests --all-features
 cargo test -p rustynet-backend-wireguard --all-targets --all-features
 
-cargo run -p rustynetd -- --emit-phase10-evidence artifacts/phase10
-
 for artifact in \
   "artifacts/phase10/netns_e2e_report.json" \
   "artifacts/phase10/leak_test_report.json" \
@@ -52,20 +50,49 @@ for artifact in \
   fi
 done
 
-if ! rg -q '"status": "pass"' artifacts/phase10/netns_e2e_report.json; then
+require_measured_evidence_metadata() {
+  local artifact="$1"
+  if ! rg -q '"evidence_mode"\s*:\s*"measured"' "${artifact}"; then
+    echo "artifact is not measured evidence: ${artifact}"
+    exit 1
+  fi
+  if ! rg -q '"captured_at_unix"\s*:\s*[0-9]+' "${artifact}"; then
+    echo "artifact missing captured_at_unix metadata: ${artifact}"
+    exit 1
+  fi
+  if ! rg -q '"environment"\s*:\s*"[^"]+"' "${artifact}"; then
+    echo "artifact missing environment metadata: ${artifact}"
+    exit 1
+  fi
+}
+
+require_measured_evidence_metadata "artifacts/phase10/netns_e2e_report.json"
+require_measured_evidence_metadata "artifacts/phase10/leak_test_report.json"
+require_measured_evidence_metadata "artifacts/phase10/perf_budget_report.json"
+require_measured_evidence_metadata "artifacts/phase10/direct_relay_failover_report.json"
+
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/phase10/netns_e2e_report.json; then
   echo "netns e2e artifact did not report pass"
   exit 1
 fi
-if ! rg -q '"status": "pass"' artifacts/phase10/leak_test_report.json; then
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/phase10/leak_test_report.json; then
   echo "leak test artifact did not report pass"
   exit 1
 fi
-if ! rg -q '"status": "pass"' artifacts/phase10/direct_relay_failover_report.json; then
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/phase10/direct_relay_failover_report.json; then
   echo "failover artifact did not report pass"
   exit 1
 fi
 if ! rg -q 'idle_cpu_percent' artifacts/phase10/perf_budget_report.json; then
   echo "perf artifact missing required metrics"
+  exit 1
+fi
+if ! rg -q '"soak_status"\s*:\s*"pass"' artifacts/phase10/perf_budget_report.json; then
+  echo "perf artifact did not report passing soak status"
+  exit 1
+fi
+if rg -q '"status"\s*:\s*"fail"' artifacts/phase10/perf_budget_report.json; then
+  echo "perf artifact contains failing metric status"
   exit 1
 fi
 if ! rg -q 'generation=' artifacts/phase10/state_transition_audit.log; then

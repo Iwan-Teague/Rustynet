@@ -98,10 +98,58 @@ struct Metric {
     reason: &'static str,
 }
 
+fn metric_from_env_or_fail(
+    name: &'static str,
+    env_key: &'static str,
+    unit: &'static str,
+    threshold: &'static str,
+    threshold_max: f64,
+) -> Metric {
+    match std::env::var(env_key) {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= 0.0 => Metric {
+                name,
+                value,
+                unit,
+                threshold,
+                status: if value <= threshold_max {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                reason: "measured",
+            },
+            _ => Metric {
+                name,
+                value: 0.0,
+                unit,
+                threshold,
+                status: "fail",
+                reason: "measurement_invalid",
+            },
+        },
+        Err(_) => Metric {
+            name,
+            value: 0.0,
+            unit,
+            threshold,
+            status: "fail",
+            reason: "measurement_unavailable",
+        },
+    }
+}
+
 fn report_path() -> PathBuf {
     std::env::var("RUSTYNET_PHASE1_BACKEND_PERF_REPORT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("artifacts/perf/phase1/backend_contract_perf.json"))
+        .unwrap_or_else(|_| {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "rustynet-backend-contract-perf-{}.json",
+                std::process::id()
+            ));
+            path
+        })
 }
 
 fn measure<F>(iterations: usize, mut operation: F) -> Duration
@@ -197,14 +245,13 @@ fn phase1_backend_contract_perf_report() {
             status: "pass",
             reason: "measured",
         },
-        Metric {
-            name: "throughput_overhead_vs_wireguard_percent",
-            value: 0.0,
-            unit: "percent",
-            threshold: "<=15",
-            status: "not_measurable",
-            reason: "no_production_datapath",
-        },
+        metric_from_env_or_fail(
+            "throughput_overhead_vs_wireguard_percent",
+            "RUSTYNET_PHASE1_BACKEND_THROUGHPUT_OVERHEAD_PERCENT",
+            "percent",
+            "<=15",
+            15.0,
+        ),
     ];
 
     let output = report_path();

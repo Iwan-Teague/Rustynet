@@ -1305,7 +1305,6 @@ pub struct ControlPlaneCore {
     pub nodes: NodeRegistry,
     pub policy: PolicySet,
     transport_policy: ControlPlaneTransportPolicy,
-    signing_secret: Vec<u8>,
     assignment_signing_key: SigningKey,
     assignment_verifying_key: [u8; 32],
     assigned_tunnel_cidrs: Mutex<HashMap<String, String>>,
@@ -1313,7 +1312,10 @@ pub struct ControlPlaneCore {
 
 impl ControlPlaneCore {
     pub fn new(signing_secret: Vec<u8>, policy: PolicySet) -> Self {
-        let digest = Sha256::digest(signing_secret.as_slice());
+        let mut hasher = Sha256::new();
+        hasher.update(b"rustynet-control-assignment-signing-v1");
+        hasher.update(signing_secret.as_slice());
+        let digest = hasher.finalize();
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&digest[..32]);
         let assignment_signing_key = SigningKey::from_bytes(&seed);
@@ -1324,7 +1326,6 @@ impl ControlPlaneCore {
             nodes: NodeRegistry::default(),
             policy,
             transport_policy: ControlPlaneTransportPolicy::default(),
-            signing_secret,
             assignment_signing_key,
             assignment_verifying_key,
             assigned_tunnel_cidrs: Mutex::new(HashMap::new()),
@@ -1463,7 +1464,7 @@ impl ControlPlaneCore {
             ));
         }
 
-        let signature = self.sign_payload(&payload);
+        let signature = self.sign_peer_map_payload(&payload);
         Ok(SignedPeerMap {
             payload,
             signature,
@@ -1472,7 +1473,7 @@ impl ControlPlaneCore {
     }
 
     pub fn verify_signed_peer_map(&self, map: &SignedPeerMap) -> bool {
-        self.sign_payload(&map.payload) == map.signature
+        self.verify_peer_map_signature(&map.payload, &map.signature)
     }
 
     pub fn assignment_verifier_key_hex(&self) -> String {
@@ -1662,12 +1663,22 @@ impl ControlPlaneCore {
         false
     }
 
-    fn sign_payload(&self, payload: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.signing_secret.as_slice());
-        hasher.update(payload.as_bytes());
-        let digest = hasher.finalize();
-        hex_bytes(digest.as_slice())
+    fn sign_peer_map_payload(&self, payload: &str) -> String {
+        let signature = self.assignment_signing_key.sign(payload.as_bytes());
+        hex_bytes(&signature.to_bytes())
+    }
+
+    fn verify_peer_map_signature(&self, payload: &str, signature_hex: &str) -> bool {
+        let signature_bytes = match decode_hex_to_fixed::<64>(signature_hex) {
+            Ok(bytes) => bytes,
+            Err(()) => return false,
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let verifying_key = match VerifyingKey::from_bytes(&self.assignment_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verifying_key.verify(payload.as_bytes(), &signature).is_ok()
     }
 }
 

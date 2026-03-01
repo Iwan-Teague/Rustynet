@@ -301,6 +301,24 @@ mod tests {
                 created_at_unix: 100,
             })
             .expect("node upsert should succeed");
+
+        let user_exists = store
+            .user_exists("user-1")
+            .expect("user existence query should succeed");
+        let node_exists = store
+            .node_exists("node-1")
+            .expect("node existence query should succeed");
+        let missing_user_exists = store
+            .user_exists("missing-user")
+            .expect("missing user existence query should succeed");
+        let missing_node_exists = store
+            .node_exists("missing-node")
+            .expect("missing node existence query should succeed");
+
+        assert!(user_exists);
+        assert!(node_exists);
+        assert!(!missing_user_exists);
+        assert!(!missing_node_exists);
     }
 
     #[test]

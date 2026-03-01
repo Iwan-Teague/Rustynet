@@ -1,15 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
-
-use rustynet_backend_api::{
-    ExitMode, NodeId, PeerConfig, Route, RouteKind, RuntimeContext, SocketEndpoint,
-};
-use rustynet_backend_wireguard::WireguardBackend;
-use rustynet_policy::{
-    ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
-};
-
 use rustynetd::daemon::{
     DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
     DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID,
@@ -23,10 +13,6 @@ use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
 };
 use rustynetd::perf;
-use rustynetd::phase10::{
-    ApplyOptions, DryRunSystem, PathMode, Phase10Controller, RouteGrantRequest, TrustEvidence,
-    TrustPolicy, write_phase10_perf_report, write_state_transition_audit,
-};
 
 fn main() {
     if let Err(err) = run() {
@@ -46,11 +32,6 @@ fn run() -> Result<(), String> {
         [flag, output_path] if flag == "--emit-phase1-baseline" => {
             perf::write_phase1_baseline_report(output_path)?;
             println!("phase1 baseline report emitted: {output_path}");
-            Ok(())
-        }
-        [flag, output_dir] if flag == "--emit-phase10-evidence" => {
-            emit_phase10_evidence(output_dir)?;
-            println!("phase10 evidence emitted: {output_dir}");
             Ok(())
         }
         [cmd, rest @ ..] if cmd == "daemon" => {
@@ -351,13 +332,9 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--backend requires a value".to_string())?;
                 config.backend_mode = match value.as_str() {
-                    "in-memory" => DaemonBackendMode::InMemory,
                     "linux-wireguard" => DaemonBackendMode::LinuxWireguard,
                     _ => {
-                        return Err(
-                            "invalid backend value: expected in-memory or linux-wireguard"
-                                .to_string(),
-                        );
+                        return Err("invalid backend value: expected linux-wireguard".to_string());
                     }
                 };
                 index += 2;
@@ -456,177 +433,13 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
     Ok(config)
 }
 
-fn phase10_policy() -> ContextualPolicySet {
-    ContextualPolicySet {
-        rules: vec![ContextualPolicyRule {
-            src: "user:alice".to_string(),
-            dst: "*".to_string(),
-            protocol: Protocol::Any,
-            action: RuleAction::Allow,
-            contexts: vec![TrafficContext::SharedExit],
-        }],
-    }
-}
-
-fn trust_ok() -> TrustEvidence {
-    TrustEvidence {
-        tls13_valid: true,
-        signed_control_valid: true,
-        signed_data_age_secs: 10,
-        clock_skew_secs: 5,
-    }
-}
-
-fn sample_peer(node_id: &str, endpoint_ip: &str) -> Result<PeerConfig, String> {
-    Ok(PeerConfig {
-        node_id: NodeId::new(node_id).map_err(|err| err.to_string())?,
-        endpoint: SocketEndpoint {
-            addr: endpoint_ip
-                .parse()
-                .map_err(|err: std::net::AddrParseError| err.to_string())?,
-            port: 51820,
-        },
-        public_key: [8; 32],
-        allowed_ips: vec!["100.100.10.10/32".to_string()],
-    })
-}
-
-fn emit_phase10_evidence(output_dir: &str) -> Result<(), String> {
-    fs::create_dir_all(output_dir).map_err(|err| format!("create artifact dir failed: {err}"))?;
-
-    let mut controller = Phase10Controller::new(
-        WireguardBackend::default(),
-        DryRunSystem::default(),
-        phase10_policy(),
-        TrustPolicy::default(),
-    );
-
-    controller
-        .apply_dataplane_generation(
-            trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").map_err(|err| err.to_string())?,
-                mesh_cidr: "100.64.0.1/32".to_string(),
-            },
-            vec![sample_peer("node-b", "203.0.113.10")?],
-            vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
-                via_node: NodeId::new("node-b").map_err(|err| err.to_string())?,
-                kind: RouteKind::ExitNodeDefault,
-            }],
-            ApplyOptions {
-                protected_dns: true,
-                ipv6_parity_supported: false,
-                exit_mode: ExitMode::FullTunnel,
-            },
-        )
-        .map_err(|err| err.to_string())?;
-
-    let exit_node = NodeId::new("node-b").map_err(|err| err.to_string())?;
-    controller
-        .set_exit_node(exit_node.clone(), "user:alice", Protocol::Tcp)
-        .map_err(|err| err.to_string())?;
-    controller.set_lan_access(true);
-    controller.advertise_lan_route(exit_node.clone(), "192.168.1.0/24");
-    controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
-    controller
-        .ensure_lan_route_allowed(RouteGrantRequest {
-            user: "user:alice".to_string(),
-            cidr: "192.168.1.0/24".to_string(),
-            protocol: Protocol::Tcp,
-            context: TrafficContext::SharedExit,
-        })
-        .map_err(|err| err.to_string())?;
-
-    let peer_node = NodeId::new("node-b").map_err(|err| err.to_string())?;
-    controller
-        .mark_direct_failed(&peer_node)
-        .map_err(|err| err.to_string())?;
-    controller
-        .mark_direct_recovered(&peer_node)
-        .map_err(|err| err.to_string())?;
-
-    let netns_e2e_report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"scenario\": \"exit_node_full_tunnel_and_lan_toggle\",\n  \"status\": \"pass\",\n  \"details\": {{\n    \"encrypted_tunnel\": true,\n    \"exit_node_selected\": true,\n    \"lan_toggle_enforced\": true,\n    \"state\": \"{:?}\"\n  }}\n}}\n",
-        controller.state()
-    );
-    fs::write(
-        format!("{output_dir}/netns_e2e_report.json"),
-        netns_e2e_report,
-    )
-    .map_err(|err| format!("write netns report failed: {err}"))?;
-
-    let mut leak_controller = Phase10Controller::new(
-        WireguardBackend::default(),
-        DryRunSystem::default().fail_on("apply_dns_protection"),
-        phase10_policy(),
-        TrustPolicy::default(),
-    );
-    let leak_result = leak_controller.apply_dataplane_generation(
-        trust_ok(),
-        RuntimeContext {
-            local_node: NodeId::new("node-c").map_err(|err| err.to_string())?,
-            mesh_cidr: "100.64.0.2/32".to_string(),
-        },
-        vec![sample_peer("node-d", "203.0.113.11")?],
-        vec![Route {
-            destination_cidr: "0.0.0.0/0".to_string(),
-            via_node: NodeId::new("node-d").map_err(|err| err.to_string())?,
-            kind: RouteKind::ExitNodeDefault,
-        }],
-        ApplyOptions {
-            protected_dns: true,
-            ipv6_parity_supported: false,
-            exit_mode: ExitMode::FullTunnel,
-        },
-    );
-
-    let leak_report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"status\": \"pass\",\n  \"tunnel_fail_close\": true,\n  \"dns_fail_close\": true,\n  \"controller_state\": \"{:?}\",\n  \"trigger\": \"{}\"\n}}\n",
-        leak_controller.state(),
-        if leak_result.is_err() {
-            "dns_apply_failure"
-        } else {
-            "none"
-        }
-    );
-    fs::write(format!("{output_dir}/leak_test_report.json"), leak_report)
-        .map_err(|err| format!("write leak report failed: {err}"))?;
-
-    write_phase10_perf_report(format!("{output_dir}/perf_budget_report.json"))
-        .map_err(|err| err.to_string())?;
-
-    let failover_report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"status\": \"pass\",\n  \"direct_to_relay\": true,\n  \"relay_to_direct\": true,\n  \"final_path\": \"{}\"\n}}\n",
-        match controller.peer_path(&peer_node) {
-            Some(PathMode::Direct) => "direct",
-            Some(PathMode::Relay) => "relay",
-            None => "unknown",
-        }
-    );
-    fs::write(
-        format!("{output_dir}/direct_relay_failover_report.json"),
-        failover_report,
-    )
-    .map_err(|err| format!("write failover report failed: {err}"))?;
-
-    write_state_transition_audit(
-        format!("{output_dir}/state_transition_audit.log"),
-        controller.transition_audit(),
-    )
-    .map_err(|err| err.to_string())?;
-
-    Ok(())
-}
-
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
-        "  rustynetd --emit-phase10-evidence <dir>",
         "",
         "defaults:",
         &format!("  node_id={DEFAULT_NODE_ID}"),

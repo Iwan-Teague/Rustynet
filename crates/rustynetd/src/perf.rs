@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricRow {
@@ -14,56 +13,84 @@ pub struct MetricRow {
     pub reason: &'static str,
 }
 
-pub fn phase1_baseline_metrics() -> [MetricRow; 5] {
-    let now = Instant::now();
-    let mut accumulator = 0u64;
-    for value in 0..50_000 {
-        accumulator ^= value;
+fn metric_from_env(
+    name: &'static str,
+    env_key: &'static str,
+    unit: &'static str,
+    threshold: &'static str,
+    threshold_max: f64,
+) -> MetricRow {
+    match std::env::var(env_key) {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= 0.0 => MetricRow {
+                name,
+                value,
+                unit,
+                threshold,
+                status: if value <= threshold_max {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                reason: "measured",
+            },
+            _ => MetricRow {
+                name,
+                value: 0.0,
+                unit,
+                threshold,
+                status: "fail",
+                reason: "measurement_invalid",
+            },
+        },
+        Err(_) => MetricRow {
+            name,
+            value: 0.0,
+            unit,
+            threshold,
+            status: "fail",
+            reason: "measurement_unavailable",
+        },
     }
-    let apply_elapsed_ms = now.elapsed().as_secs_f64() * 1_000.0;
-    let _sink = std::hint::black_box(accumulator);
+}
 
+pub fn phase1_baseline_metrics() -> [MetricRow; 5] {
     [
-        MetricRow {
-            name: "idle_cpu_percent",
-            value: 0.9,
-            unit: "percent_of_one_core",
-            threshold: "<=2",
-            status: "pass",
-            reason: "measured",
-        },
-        MetricRow {
-            name: "idle_memory_mb",
-            value: 36.0,
-            unit: "mb_rss",
-            threshold: "<=120",
-            status: "pass",
-            reason: "measured",
-        },
-        MetricRow {
-            name: "reconnect_seconds",
-            value: 0.0,
-            unit: "seconds",
-            threshold: "<=5",
-            status: "not_measurable",
-            reason: "no_production_datapath",
-        },
-        MetricRow {
-            name: "route_policy_apply_p95_seconds",
-            value: apply_elapsed_ms / 1000.0,
-            unit: "seconds",
-            threshold: "<=2",
-            status: "pass",
-            reason: "measured",
-        },
-        MetricRow {
-            name: "throughput_overhead_vs_wireguard_percent",
-            value: 0.0,
-            unit: "percent",
-            threshold: "<=15",
-            status: "not_measurable",
-            reason: "no_production_datapath",
-        },
+        metric_from_env(
+            "idle_cpu_percent",
+            "RUSTYNET_PHASE1_IDLE_CPU_PERCENT",
+            "percent_of_one_core",
+            "<=2",
+            2.0,
+        ),
+        metric_from_env(
+            "idle_memory_mb",
+            "RUSTYNET_PHASE1_IDLE_MEMORY_MB",
+            "mb_rss",
+            "<=120",
+            120.0,
+        ),
+        metric_from_env(
+            "reconnect_seconds",
+            "RUSTYNET_PHASE1_RECONNECT_SECONDS",
+            "seconds",
+            "<=5",
+            5.0,
+        ),
+        metric_from_env(
+            "route_policy_apply_p95_seconds",
+            "RUSTYNET_PHASE1_ROUTE_POLICY_APPLY_P95_SECONDS",
+            "seconds",
+            "<=2",
+            2.0,
+        ),
+        metric_from_env(
+            "throughput_overhead_vs_wireguard_percent",
+            "RUSTYNET_PHASE1_THROUGHPUT_OVERHEAD_PERCENT",
+            "percent",
+            "<=15",
+            15.0,
+        ),
     ]
 }
 

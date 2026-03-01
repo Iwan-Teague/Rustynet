@@ -70,6 +70,12 @@ enum MembershipCommand {
         now_unix: u64,
         audit_output_path: PathBuf,
     },
+    GenerateEvidence {
+        paths: MembershipPaths,
+        now_unix: u64,
+        output_dir: PathBuf,
+        environment: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,8 +99,13 @@ struct ProposalConfig {
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let command = parse_command(&args);
-    let output = execute(command);
-    println!("{output}");
+    match execute(command) {
+        Ok(output) => println!("{output}"),
+        Err(err) => {
+            println!("error: {err}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_command(args: &[String]) -> CliCommand {
@@ -144,6 +155,15 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                 audit_output_path,
             })
         }
+        "generate-evidence" => Ok(MembershipCommand::GenerateEvidence {
+            paths,
+            now_unix,
+            output_dir: parser
+                .path_or_default("--output-dir", PathBuf::from("artifacts/membership")),
+            environment: parser
+                .value("--environment")
+                .unwrap_or_else(|| "unknown".to_string()),
+        }),
         "propose-add" => {
             let node_id = parser.required("--node-id")?;
             let node_pubkey_hex = parser.required("--node-pubkey")?;
@@ -299,25 +319,22 @@ fn proposal_config(
     })
 }
 
-fn execute(command: CliCommand) -> String {
+fn execute(command: CliCommand) -> Result<String, String> {
     match command {
-        CliCommand::Help => help_text(),
-        CliCommand::Login => "login: open auth URL and complete device enrollment".to_string(),
-        CliCommand::Membership(command) => match execute_membership(*command) {
-            Ok(message) => message,
-            Err(err) => format!("error: {err}"),
-        },
+        CliCommand::Help => Ok(help_text()),
+        CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
+        CliCommand::Membership(command) => execute_membership(*command),
         other => {
             let ipc_command = to_ipc_command(other);
             match send_command(ipc_command) {
                 Ok(response) => {
                     if response.ok {
-                        response.message
+                        Ok(response.message)
                     } else {
-                        format!("error: {}", response.message)
+                        Err(response.message)
                     }
                 }
-                Err(err) => format!("error: daemon unreachable: {err}"),
+                Err(err) => Err(format!("daemon unreachable: {err}")),
             }
         }
     }
@@ -490,6 +507,12 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
                 audit_output_path.display()
             ))
         }
+        MembershipCommand::GenerateEvidence {
+            paths,
+            now_unix,
+            output_dir,
+            environment,
+        } => emit_membership_evidence(paths, now_unix, output_dir, environment),
     }
 }
 
@@ -524,6 +547,147 @@ fn load_current_membership_state(
     let state = replay_membership_snapshot_and_log(&snapshot, &entries, now_unix)
         .map_err(|err| err.to_string())?;
     Ok((snapshot, entries, state))
+}
+
+fn emit_membership_evidence(
+    paths: MembershipPaths,
+    now_unix: u64,
+    output_dir: PathBuf,
+    environment: String,
+) -> Result<String, String> {
+    if environment.trim().is_empty() {
+        return Err("environment must not be empty".to_string());
+    }
+
+    let (_, entries, state) = load_current_membership_state(&paths, now_unix)?;
+    fs::create_dir_all(&output_dir).map_err(|err| format!("create output dir failed: {err}"))?;
+
+    let captured_at_unix = unix_now();
+    let active_node_count = state.active_nodes().len();
+    let state_root = state.state_root_hex().map_err(|err| err.to_string())?;
+    let conformance_path = output_dir.join("membership_conformance_report.json");
+    let negative_path = output_dir.join("membership_negative_tests_report.json");
+    let recovery_path = output_dir.join("membership_recovery_report.json");
+    let audit_path = output_dir.join("membership_audit_integrity.log");
+
+    write_membership_audit_log(&audit_path, &entries).map_err(|err| err.to_string())?;
+
+    let tampered_log_detected = detect_tampered_log(&paths.log_path, &output_dir)?;
+    let tampered_snapshot_detected = detect_tampered_snapshot(&paths.snapshot_path, &output_dir)?;
+
+    let conformance = format!(
+        "{{\n  \"phase\": \"membership\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"captured_at_unix\": {},\n  \"status\": \"pass\",\n  \"network_id\": \"{}\",\n  \"epoch\": {},\n  \"entries\": {},\n  \"active_node_count\": {},\n  \"state_root\": \"{}\",\n  \"snapshot_path\": \"{}\",\n  \"log_path\": \"{}\"\n}}\n",
+        escape_json(&environment),
+        captured_at_unix,
+        escape_json(&state.network_id),
+        state.epoch,
+        entries.len(),
+        active_node_count,
+        escape_json(&state_root),
+        escape_json(&paths.snapshot_path.display().to_string()),
+        escape_json(&paths.log_path.display().to_string()),
+    );
+    write_text_file(&conformance_path, &conformance)?;
+
+    let negative_status = if tampered_log_detected && tampered_snapshot_detected {
+        "pass"
+    } else {
+        "fail"
+    };
+    let negative = format!(
+        "{{\n  \"phase\": \"membership\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"captured_at_unix\": {},\n  \"status\": \"{}\",\n  \"tampered_log_detected\": {},\n  \"tampered_snapshot_detected\": {}\n}}\n",
+        escape_json(&environment),
+        captured_at_unix,
+        negative_status,
+        tampered_log_detected,
+        tampered_snapshot_detected,
+    );
+    write_text_file(&negative_path, &negative)?;
+
+    let recovery = format!(
+        "{{\n  \"phase\": \"membership\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"captured_at_unix\": {},\n  \"status\": \"{}\",\n  \"audit_path\": \"{}\",\n  \"entries\": {},\n  \"epoch\": {},\n  \"state_root\": \"{}\"\n}}\n",
+        escape_json(&environment),
+        captured_at_unix,
+        if negative_status == "pass" {
+            "pass"
+        } else {
+            "fail"
+        },
+        escape_json(&audit_path.display().to_string()),
+        entries.len(),
+        state.epoch,
+        escape_json(&state_root),
+    );
+    write_text_file(&recovery_path, &recovery)?;
+
+    if negative_status != "pass" {
+        return Err(
+            "membership evidence generation failed: tampering checks did not fail closed"
+                .to_string(),
+        );
+    }
+
+    Ok(format!(
+        "membership evidence generated: output_dir={} entries={} epoch={}",
+        output_dir.display(),
+        entries.len(),
+        state.epoch
+    ))
+}
+
+fn detect_tampered_log(source_path: &Path, output_dir: &Path) -> Result<bool, String> {
+    let tampered_path = output_dir.join("membership.log.tampered");
+    fs::copy(source_path, &tampered_path).map_err(|err| format!("copy log failed: {err}"))?;
+    let original = fs::read_to_string(&tampered_path).map_err(|err| err.to_string())?;
+    let tampered = if let Some((head, tail)) = original.split_once("entry=") {
+        format!("{head}entry=999{tail}")
+    } else {
+        fs::remove_file(&tampered_path).ok();
+        return Err("membership log does not contain expected entry markers".to_string());
+    };
+    fs::write(&tampered_path, tampered).map_err(|err| err.to_string())?;
+    let detected = load_membership_log(&tampered_path).is_err();
+    fs::remove_file(&tampered_path).ok();
+    Ok(detected)
+}
+
+fn detect_tampered_snapshot(source_path: &Path, output_dir: &Path) -> Result<bool, String> {
+    let tampered_path = output_dir.join("membership.snapshot.tampered");
+    fs::copy(source_path, &tampered_path).map_err(|err| format!("copy snapshot failed: {err}"))?;
+    let original = fs::read_to_string(&tampered_path).map_err(|err| err.to_string())?;
+    let mut replaced = false;
+    let mut tampered_lines = Vec::new();
+    for line in original.lines() {
+        if line.starts_with("digest=") && !replaced {
+            tampered_lines.push("digest=00".to_string());
+            replaced = true;
+        } else {
+            tampered_lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        fs::remove_file(&tampered_path).ok();
+        return Err("membership snapshot missing digest line".to_string());
+    }
+    fs::write(&tampered_path, tampered_lines.join("\n") + "\n").map_err(|err| err.to_string())?;
+    let detected = load_membership_snapshot(&tampered_path).is_err();
+    fs::remove_file(&tampered_path).ok();
+    Ok(detected)
+}
+
+fn escape_json(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
@@ -770,6 +934,7 @@ fn help_text() -> String {
         "  membership verify-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership verify-log [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
+        "  membership generate-evidence [--snapshot <path>] [--log <path>] [--output-dir <dir>] [--environment <label>] [--now <unix>]",
     ]
     .join("\n")
 }
@@ -811,8 +976,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_supports_membership_evidence_generation() {
+        let command = parse_command(&[
+            "membership".to_string(),
+            "generate-evidence".to_string(),
+            "--output-dir".to_string(),
+            "artifacts/membership".to_string(),
+            "--environment".to_string(),
+            "ci-netns".to_string(),
+        ]);
+        assert!(format!("{command:?}").contains("GenerateEvidence"));
+    }
+
+    #[test]
     fn execute_reports_error_when_daemon_is_unreachable() {
         let output = execute(parse_command(&["status".to_string()]));
-        assert!(output.starts_with("error: daemon unreachable:"));
+        assert!(output.is_err());
+        let message = output.expect_err("daemon-unreachable path should fail");
+        assert!(message.starts_with("daemon unreachable:"));
     }
 }

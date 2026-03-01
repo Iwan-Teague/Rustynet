@@ -17,8 +17,8 @@ use crate::key_material::{
     write_runtime_private_key,
 };
 use crate::phase10::{
-    ApplyOptions, DataplaneState, DataplaneSystem, DryRunSystem, Phase10Controller,
-    RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
+    ApplyOptions, DataplaneState, DataplaneSystem, Phase10Controller, RouteGrantRequest,
+    RuntimeSystem, TrustEvidence, TrustPolicy,
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
@@ -93,13 +93,7 @@ pub enum DaemonBackendMode {
 #[allow(clippy::derivable_impls)]
 impl Default for DaemonBackendMode {
     fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            return DaemonBackendMode::LinuxWireguard;
-        }
-
-        #[allow(unreachable_code)]
-        DaemonBackendMode::InMemory
+        DaemonBackendMode::LinuxWireguard
     }
 }
 
@@ -366,6 +360,7 @@ struct MembershipWatermark {
 }
 
 enum DaemonBackend {
+    #[allow(dead_code)]
     InMemory(WireguardBackend),
     #[cfg(target_os = "linux")]
     Linux(LinuxWireguardBackend<LinuxCommandRunner>),
@@ -374,7 +369,18 @@ enum DaemonBackend {
 impl DaemonBackend {
     fn from_config(config: &DaemonConfig) -> Result<Self, DaemonError> {
         match config.backend_mode {
-            DaemonBackendMode::InMemory => Ok(Self::InMemory(WireguardBackend::default())),
+            DaemonBackendMode::InMemory => {
+                #[cfg(test)]
+                {
+                    Ok(Self::InMemory(WireguardBackend::default()))
+                }
+                #[cfg(not(test))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "in-memory backend is disabled in production daemon paths".to_string(),
+                    ))
+                }
+            }
             DaemonBackendMode::LinuxWireguard => {
                 #[cfg(target_os = "linux")]
                 {
@@ -1397,26 +1403,43 @@ impl DaemonRuntime {
     }
 }
 
-fn daemon_system(_config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
+fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     #[cfg(target_os = "linux")]
     {
-        let mode = match _config.dataplane_mode {
+        let mode = match config.dataplane_mode {
             DaemonDataplaneMode::Shell => LinuxDataplaneMode::Shell,
             DaemonDataplaneMode::HybridNative => LinuxDataplaneMode::HybridNative,
         };
         let system = LinuxCommandSystem::new(
-            _config.wg_interface.clone(),
-            _config.egress_interface.clone(),
+            config.wg_interface.clone(),
+            config.egress_interface.clone(),
             mode,
         )
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         return Ok(RuntimeSystem::Linux(system));
     }
-    #[allow(unreachable_code)]
-    Ok(RuntimeSystem::DryRun(DryRunSystem::default()))
+    #[cfg(not(target_os = "linux"))]
+    {
+        if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+            #[cfg(test)]
+            {
+                return Ok(RuntimeSystem::DryRun(
+                    crate::phase10::DryRunSystem::default(),
+                ));
+            }
+        }
+        Err(DaemonError::InvalidConfig(
+            "daemon dataplane requires a linux host and linux-wireguard backend".to_string(),
+        ))
+    }
 }
 
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
+    if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+        return Err(DaemonError::InvalidConfig(
+            "in-memory backend is disabled in production daemon paths".to_string(),
+        ));
+    }
     if config.socket_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
             "socket path must not be empty".to_string(),
@@ -1536,6 +1559,12 @@ fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonErro
 }
 
 fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+        return Err(DaemonError::InvalidConfig(
+            "in-memory backend is disabled in production daemon paths".to_string(),
+        ));
+    }
+
     NodeId::new(config.node_id.clone())
         .map_err(|err| DaemonError::InvalidConfig(format!("node id is invalid: {err}")))?;
 
@@ -2838,7 +2867,7 @@ mod tests {
     use super::{
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand,
         TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
-        persist_trust_watermark, trust_evidence_payload, unix_now,
+        persist_trust_watermark, run_daemon, trust_evidence_payload, unix_now,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -2972,6 +3001,16 @@ mod tests {
             .expect("membership log should be opened");
         file.write_all(b"version=1\n")
             .expect("membership log should be written");
+    }
+
+    #[test]
+    fn run_daemon_rejects_in_memory_backend_mode() {
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("in-memory backend must be rejected");
+        assert!(err.to_string().contains("in-memory backend is disabled"));
     }
 
     #[test]

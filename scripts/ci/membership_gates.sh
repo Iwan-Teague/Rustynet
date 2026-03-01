@@ -35,8 +35,16 @@ cargo test -p rustynet-control membership::tests --all-features
 cargo test -p rustynet-policy membership_aware --all-features
 cargo test -p rustynetd daemon_runtime_denies_exit_selection_for_revoked_membership_node --all-features
 
+MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH:-/var/lib/rustynet/membership.snapshot}"
+MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG_PATH:-/var/lib/rustynet/membership.log}"
+MEMBERSHIP_EVIDENCE_ENVIRONMENT="${RUSTYNET_MEMBERSHIP_EVIDENCE_ENVIRONMENT:-ci}"
+
 mkdir -p artifacts/membership
-cargo run -p rustynet-control -- --emit-membership-evidence artifacts/membership
+cargo run -p rustynet-cli -- membership generate-evidence \
+  --snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
+  --log "${MEMBERSHIP_LOG_PATH}" \
+  --output-dir artifacts/membership \
+  --environment "${MEMBERSHIP_EVIDENCE_ENVIRONMENT}"
 
 for artifact in \
   "artifacts/membership/membership_conformance_report.json" \
@@ -49,16 +57,40 @@ for artifact in \
   fi
 done
 
-if ! rg -q '"status":"pass"' artifacts/membership/membership_conformance_report.json; then
+require_measured_evidence_metadata() {
+  local artifact="$1"
+  if ! rg -q '"evidence_mode"\s*:\s*"measured"' "${artifact}"; then
+    echo "artifact is not measured evidence: ${artifact}"
+    exit 1
+  fi
+  if ! rg -q '"captured_at_unix"\s*:\s*[0-9]+' "${artifact}"; then
+    echo "artifact missing captured_at_unix metadata: ${artifact}"
+    exit 1
+  fi
+  if ! rg -q '"environment"\s*:\s*"[^"]+"' "${artifact}"; then
+    echo "artifact missing environment metadata: ${artifact}"
+    exit 1
+  fi
+}
+
+require_measured_evidence_metadata "artifacts/membership/membership_conformance_report.json"
+require_measured_evidence_metadata "artifacts/membership/membership_negative_tests_report.json"
+require_measured_evidence_metadata "artifacts/membership/membership_recovery_report.json"
+
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/membership/membership_conformance_report.json; then
   echo "membership conformance report is not pass"
   exit 1
 fi
-if ! rg -q '"status":"pass"' artifacts/membership/membership_negative_tests_report.json; then
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/membership/membership_negative_tests_report.json; then
   echo "membership negative report is not pass"
   exit 1
 fi
-if ! rg -q '"status":"pass"' artifacts/membership/membership_recovery_report.json; then
+if ! rg -q '"status"\s*:\s*"pass"' artifacts/membership/membership_recovery_report.json; then
   echo "membership recovery report is not pass"
+  exit 1
+fi
+if rg -q '"status"\s*:\s*"fail"' artifacts/membership/membership_negative_tests_report.json; then
+  echo "membership negative report contains failure status"
   exit 1
 fi
 if ! rg -q 'index=' artifacts/membership/membership_audit_integrity.log; then

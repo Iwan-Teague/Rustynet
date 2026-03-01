@@ -31,6 +31,9 @@ TRUST_SIGNER_KEY_PATH="/etc/rustynet/trust-evidence.key"
 AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
 SETUP_COMPLETE="0"
+MANUAL_PEER_OVERRIDE="0"
+MANUAL_PEER_AUDIT_LOG="/var/log/rustynet/manual-peer-override.log"
+MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
 
 mkdir -p "${CONFIG_DIR}"
 touch "${PEERS_FILE}"
@@ -50,6 +53,58 @@ print_warn() {
 
 print_err() {
   printf '[error] %s\n' "$*" >&2
+}
+
+enforce_backend_mode() {
+  if [[ "${BACKEND_MODE}" != "linux-wireguard" ]]; then
+    print_warn "Unsupported backend '${BACKEND_MODE}' detected; forcing linux-wireguard."
+  fi
+  BACKEND_MODE="linux-wireguard"
+}
+
+enforce_auto_tunnel_policy() {
+  if [[ "${AUTO_TUNNEL_ENFORCE}" != "1" ]]; then
+    print_warn "Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
+  fi
+  AUTO_TUNNEL_ENFORCE="1"
+}
+
+manual_peer_override_enabled() {
+  [[ "${MANUAL_PEER_OVERRIDE}" == "1" || "${RUSTYNET_MANUAL_PEER_OVERRIDE:-0}" == "1" ]]
+}
+
+append_manual_peer_override_audit() {
+  local action="$1"
+  local timestamp
+  local user_name
+  local host_name
+  local line
+  timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  user_name="${SUDO_USER:-${USER:-unknown}}"
+  host_name="$(hostname -s 2>/dev/null || echo unknown)"
+  line="timestamp=${timestamp} action=${action} user=${user_name} host=${host_name}"
+
+  run_root install -d -m 0700 "$(dirname "${MANUAL_PEER_AUDIT_LOG}")"
+  printf '%s\n' "${line}" | run_root tee -a "${MANUAL_PEER_AUDIT_LOG}" >/dev/null
+  run_root chmod 600 "${MANUAL_PEER_AUDIT_LOG}"
+}
+
+require_manual_peer_override_authorization() {
+  local action="$1"
+  local confirmation
+  if ! manual_peer_override_enabled; then
+    print_err "Manual peer programming is disabled."
+    print_info "Use centrally signed auto-tunnel assignments by default."
+    print_info "To invoke break-glass mode, set MANUAL_PEER_OVERRIDE=1 in wizard config."
+    return 1
+  fi
+  print_warn "Break-glass override requested for ${action}."
+  read -r -p "Type '${MANUAL_OVERRIDE_CONFIRMATION}' to proceed: " confirmation
+  if [[ "${confirmation}" != "${MANUAL_OVERRIDE_CONFIRMATION}" ]]; then
+    print_err "Break-glass confirmation mismatch. Operation cancelled."
+    return 1
+  fi
+  append_manual_peer_override_audit "${action}"
 }
 
 run_root() {
@@ -109,6 +164,8 @@ save_config() {
     printf 'AUTO_REFRESH_TRUST=%q\n' "${AUTO_REFRESH_TRUST}"
     printf 'DEVICE_NODE_ID=%q\n' "${DEVICE_NODE_ID}"
     printf 'SETUP_COMPLETE=%q\n' "${SETUP_COMPLETE}"
+    printf 'MANUAL_PEER_OVERRIDE=%q\n' "${MANUAL_PEER_OVERRIDE}"
+    printf 'MANUAL_PEER_AUDIT_LOG=%q\n' "${MANUAL_PEER_AUDIT_LOG}"
   } >"${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
@@ -426,6 +483,8 @@ configure_trust_material() {
 }
 
 write_daemon_environment() {
+  enforce_backend_mode
+  enforce_auto_tunnel_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
@@ -544,6 +603,7 @@ connect_to_device() {
     return 1
   fi
 
+  require_manual_peer_override_authorization "manual_peer_connect:${name}:${node_id}" || return 1
   endpoint="${endpoint_ip}:${endpoint_port}"
   run_root wg set "${WG_INTERFACE}" peer "${public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
   run_root ip route replace "${cidr}" dev "${WG_INTERFACE}"
@@ -564,6 +624,7 @@ disconnect_device() {
     print_err "Peer ${name} not found."
     return 1
   fi
+  require_manual_peer_override_authorization "manual_peer_disconnect:${name}" || return 1
   public_key="$(echo "${record}" | awk -F'|' '{print $3}')"
   cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
   run_root wg set "${WG_INTERFACE}" peer "${public_key}" remove || true
@@ -621,6 +682,7 @@ apply_rotation_bundle() {
     return 0
   fi
 
+  require_manual_peer_override_authorization "manual_peer_rotation_bundle:${name}:${node_id}" || return 1
   run_root wg set "${WG_INTERFACE}" peer "${old_public}" remove || true
   run_root wg set "${WG_INTERFACE}" peer "${new_public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
   upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}"
@@ -640,7 +702,8 @@ configure_values() {
   prompt_default TRUST_EVIDENCE_PATH "Trust evidence path" "${TRUST_EVIDENCE_PATH}"
   prompt_default TRUST_VERIFIER_KEY_PATH "Trust verifier key path" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default TRUST_WATERMARK_PATH "Trust watermark path" "${TRUST_WATERMARK_PATH}"
-  prompt_default AUTO_TUNNEL_ENFORCE "Enforce centrally signed auto-tunnel bundle (0/1)" "${AUTO_TUNNEL_ENFORCE}"
+  enforce_auto_tunnel_policy
+  print_info "Auto-tunnel enforce is mandatory and fixed to 1."
   prompt_default AUTO_TUNNEL_BUNDLE_PATH "Auto-tunnel bundle path" "${AUTO_TUNNEL_BUNDLE_PATH}"
   prompt_default AUTO_TUNNEL_VERIFIER_KEY_PATH "Auto-tunnel verifier key path" "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
   prompt_default AUTO_TUNNEL_WATERMARK_PATH "Auto-tunnel watermark path" "${AUTO_TUNNEL_WATERMARK_PATH}"
@@ -651,11 +714,18 @@ configure_values() {
   prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
-  prompt_default BACKEND_MODE "Backend mode (in-memory|linux-wireguard)" "${BACKEND_MODE}"
+  enforce_backend_mode
+  print_info "Backend mode is fixed to linux-wireguard for production-safe operation."
   prompt_default DATAPLANE_MODE "Dataplane mode (shell|hybrid-native)" "${DATAPLANE_MODE}"
   prompt_default RECONCILE_INTERVAL_MS "Reconcile interval (ms)" "${RECONCILE_INTERVAL_MS}"
   prompt_default MAX_RECONCILE_FAILURES "Max reconcile failures" "${MAX_RECONCILE_FAILURES}"
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
+  prompt_default MANUAL_PEER_OVERRIDE "Enable manual peer break-glass override (0/1)" "${MANUAL_PEER_OVERRIDE}"
+  if [[ "${MANUAL_PEER_OVERRIDE}" != "1" ]]; then
+    MANUAL_PEER_OVERRIDE="0"
+  else
+    print_warn "Manual peer break-glass override is ENABLED. All use is audit logged."
+  fi
 }
 
 first_run_setup() {
@@ -699,6 +769,8 @@ Current Rustynet Wizard Configuration
   max_reconcile_failures  : ${MAX_RECONCILE_FAILURES}
   trust_signer_key        : ${TRUST_SIGNER_KEY_PATH}
   auto_refresh_trust      : ${AUTO_REFRESH_TRUST}
+  manual_peer_override    : ${MANUAL_PEER_OVERRIDE}
+  manual_peer_audit_log   : ${MANUAL_PEER_AUDIT_LOG}
 EOF
 }
 
@@ -748,8 +820,8 @@ Rustynet Control Menu
   6) Show Rustynet status
   7) Netcheck
   8) Show connected devices
-  9) Connect to device (add/update peer)
- 10) Remove device peer
+  9) Connect to device (break-glass manual peer add/update)
+ 10) Remove device peer (break-glass manual peer remove)
  11) Select exit node
  12) Disable exit node
  13) Offer this device as an exit node
@@ -758,7 +830,7 @@ Rustynet Control Menu
  16) Refresh signed trust evidence now
  17) Rotate local WireGuard key
  18) Revoke local key material
- 19) Apply peer key rotation bundle
+ 19) Apply peer key rotation bundle (break-glass manual path)
  20) Show current configuration
   0) Exit
 EOF

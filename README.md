@@ -11,7 +11,8 @@ Run the interactive setup/menu wizard:
 The wizard handles:
 - first-run bootstrap (dependencies, keys, trust material, systemd wiring)
 - daemon/service lifecycle
-- peer connection helpers
+- centrally signed auto-tunnel defaults with fail-closed enforcement
+- break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
 - local key rotation/revocation and peer rotation-bundle apply flow
 - exit-node and LAN-access toggles
