@@ -624,12 +624,13 @@ impl DaemonRuntime {
         };
         let previous = load_membership_watermark(&self.membership_watermark_path)
             .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
-        if let Some(previous) = previous
-            && (watermark.epoch < previous.epoch
+        if let Some(previous) = previous {
+            if watermark.epoch < previous.epoch
                 || (watermark.epoch == previous.epoch
-                    && watermark.state_root != previous.state_root))
-        {
-            return Err(MembershipBootstrapError::WatermarkReplay);
+                    && watermark.state_root != previous.state_root)
+            {
+                return Err(MembershipBootstrapError::WatermarkReplay);
+            }
         }
         persist_membership_watermark(&self.membership_watermark_path, &watermark)
             .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
@@ -865,12 +866,12 @@ impl DaemonRuntime {
             self.lan_access_enabled = auto_lan_access;
             self.controller.set_lan_access(auto_lan_access);
             self.last_applied_assignment = auto_watermark;
-        } else if let Some(exit_node) = &self.selected_exit_node
-            && let Ok(node_id) = NodeId::new(exit_node.clone())
-        {
-            let _ = self
-                .controller
-                .set_exit_node(node_id, "user:local", Protocol::Any);
+        } else if let Some(exit_node) = &self.selected_exit_node {
+            if let Ok(node_id) = NodeId::new(exit_node.clone()) {
+                let _ = self
+                    .controller
+                    .set_exit_node(node_id, "user:local", Protocol::Any);
+            }
         }
 
         self.restriction_mode = RestrictionMode::None;
@@ -1034,18 +1035,18 @@ impl DaemonRuntime {
                 if !validate_cidr(&cidr) {
                     return IpcResponse::err("invalid cidr format");
                 }
-                if let Some(exit_node) = &self.selected_exit_node
-                    && let Ok(node_id) = NodeId::new(exit_node.clone())
-                {
-                    if self.membership_directory.node_status(exit_node.as_str())
-                        != MembershipStatus::Active
-                    {
-                        return IpcResponse::err(
-                            "route advertise denied: selected exit node is not active in membership state",
-                        );
+                if let Some(exit_node) = &self.selected_exit_node {
+                    if let Ok(node_id) = NodeId::new(exit_node.clone()) {
+                        if self.membership_directory.node_status(exit_node.as_str())
+                            != MembershipStatus::Active
+                        {
+                            return IpcResponse::err(
+                                "route advertise denied: selected exit node is not active in membership state",
+                            );
+                        }
+                        self.controller.advertise_lan_route(node_id, &cidr);
+                        self.controller.set_lan_route_acl("user:local", &cidr, true);
                     }
-                    self.controller.advertise_lan_route(node_id, &cidr);
-                    self.controller.set_lan_route_acl("user:local", &cidr, true);
                 }
                 self.advertised_routes.insert(cidr.clone());
                 if let Err(err) = self.persist_state() {
@@ -1098,11 +1099,11 @@ impl DaemonRuntime {
             new_private.fill(0);
             return Err(err);
         }
-        if let Some(public_path) = self.wg_public_key_path.as_ref()
-            && let Err(err) = write_public_key(public_path, &new_public)
-        {
-            new_private.fill(0);
-            return Err(err);
+        if let Some(public_path) = self.wg_public_key_path.as_ref() {
+            if let Err(err) = write_public_key(public_path, &new_public) {
+                new_private.fill(0);
+                return Err(err);
+            }
         }
 
         if let Err(err) = apply_interface_private_key(&self.wg_interface, &runtime_path) {
@@ -1156,20 +1157,20 @@ impl DaemonRuntime {
         if let Err(err) = set_interface_down(&self.wg_interface) {
             failures.push(format!("interface down failed: {err}"));
         }
-        if let Some(path) = self.wg_private_key_path.as_ref()
-            && let Err(err) = remove_file_if_present(path)
-        {
-            failures.push(err);
+        if let Some(path) = self.wg_private_key_path.as_ref() {
+            if let Err(err) = remove_file_if_present(path) {
+                failures.push(err);
+            }
         }
-        if let Some(path) = self.wg_encrypted_private_key_path.as_ref()
-            && let Err(err) = remove_file_if_present(path)
-        {
-            failures.push(err);
+        if let Some(path) = self.wg_encrypted_private_key_path.as_ref() {
+            if let Err(err) = remove_file_if_present(path) {
+                failures.push(err);
+            }
         }
-        if let Some(path) = self.wg_public_key_path.as_ref()
-            && let Err(err) = remove_file_if_present(path)
-        {
-            failures.push(err);
+        if let Some(path) = self.wg_public_key_path.as_ref() {
+            if let Err(err) = remove_file_if_present(path) {
+                failures.push(err);
+            }
         }
 
         self.selected_exit_node = None;
@@ -1214,11 +1215,11 @@ impl DaemonRuntime {
         self.advertised_routes = snapshot.peer_ids.into_iter().collect::<BTreeSet<_>>();
         self.controller.set_lan_access(self.lan_access_enabled);
 
-        if let Some(selected) = &self.selected_exit_node
-            && let Ok(node_id) = NodeId::new(selected.clone())
-        {
-            for route in &self.advertised_routes {
-                self.controller.advertise_lan_route(node_id.clone(), route);
+        if let Some(selected) = &self.selected_exit_node {
+            if let Ok(node_id) = NodeId::new(selected.clone()) {
+                for route in &self.advertised_routes {
+                    self.controller.advertise_lan_route(node_id.clone(), route);
+                }
             }
         }
 
@@ -1608,26 +1609,26 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "membership watermark path must be absolute".to_string(),
         ));
     }
-    if let Some(path) = config.auto_tunnel_bundle_path.as_ref()
-        && !path.is_absolute()
-    {
-        return Err(DaemonError::InvalidConfig(
-            "auto tunnel bundle path must be absolute".to_string(),
-        ));
+    if let Some(path) = config.auto_tunnel_bundle_path.as_ref() {
+        if !path.is_absolute() {
+            return Err(DaemonError::InvalidConfig(
+                "auto tunnel bundle path must be absolute".to_string(),
+            ));
+        }
     }
-    if let Some(path) = config.auto_tunnel_verifier_key_path.as_ref()
-        && !path.is_absolute()
-    {
-        return Err(DaemonError::InvalidConfig(
-            "auto tunnel verifier key path must be absolute".to_string(),
-        ));
+    if let Some(path) = config.auto_tunnel_verifier_key_path.as_ref() {
+        if !path.is_absolute() {
+            return Err(DaemonError::InvalidConfig(
+                "auto tunnel verifier key path must be absolute".to_string(),
+            ));
+        }
     }
-    if let Some(path) = config.auto_tunnel_watermark_path.as_ref()
-        && !path.is_absolute()
-    {
-        return Err(DaemonError::InvalidConfig(
-            "auto tunnel watermark path must be absolute".to_string(),
-        ));
+    if let Some(path) = config.auto_tunnel_watermark_path.as_ref() {
+        if !path.is_absolute() {
+            return Err(DaemonError::InvalidConfig(
+                "auto tunnel watermark path must be absolute".to_string(),
+            ));
+        }
     }
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
@@ -1684,33 +1685,33 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         ));
     }
     if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
-        if let Some(path) = config.wg_private_key_path.as_ref()
-            && !path.is_absolute()
-        {
-            return Err(DaemonError::InvalidConfig(
-                "wg private key path must be absolute".to_string(),
-            ));
+        if let Some(path) = config.wg_private_key_path.as_ref() {
+            if !path.is_absolute() {
+                return Err(DaemonError::InvalidConfig(
+                    "wg private key path must be absolute".to_string(),
+                ));
+            }
         }
-        if let Some(path) = config.wg_encrypted_private_key_path.as_ref()
-            && !path.is_absolute()
-        {
-            return Err(DaemonError::InvalidConfig(
-                "wg encrypted private key path must be absolute".to_string(),
-            ));
+        if let Some(path) = config.wg_encrypted_private_key_path.as_ref() {
+            if !path.is_absolute() {
+                return Err(DaemonError::InvalidConfig(
+                    "wg encrypted private key path must be absolute".to_string(),
+                ));
+            }
         }
-        if let Some(path) = config.wg_key_passphrase_path.as_ref()
-            && !path.is_absolute()
-        {
-            return Err(DaemonError::InvalidConfig(
-                "wg key passphrase path must be absolute".to_string(),
-            ));
+        if let Some(path) = config.wg_key_passphrase_path.as_ref() {
+            if !path.is_absolute() {
+                return Err(DaemonError::InvalidConfig(
+                    "wg key passphrase path must be absolute".to_string(),
+                ));
+            }
         }
-        if let Some(path) = config.wg_public_key_path.as_ref()
-            && !path.is_absolute()
-        {
-            return Err(DaemonError::InvalidConfig(
-                "wg public key path must be absolute".to_string(),
-            ));
+        if let Some(path) = config.wg_public_key_path.as_ref() {
+            if !path.is_absolute() {
+                return Err(DaemonError::InvalidConfig(
+                    "wg public key path must be absolute".to_string(),
+                ));
+            }
         }
         if config.wg_encrypted_private_key_path.is_some() && config.wg_key_passphrase_path.is_none()
         {
@@ -1782,23 +1783,27 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             ))
         })?;
     }
-    if config.auto_tunnel_enforce
-        && let Some(path) = config.auto_tunnel_bundle_path.as_ref()
-        && let Some(parent) = path.parent()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            DaemonError::InvalidConfig(format!("auto tunnel bundle directory create failed: {err}"))
-        })?;
+    if config.auto_tunnel_enforce {
+        if let Some(path) = config.auto_tunnel_bundle_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    DaemonError::InvalidConfig(format!(
+                        "auto tunnel bundle directory create failed: {err}"
+                    ))
+                })?;
+            }
+        }
     }
-    if config.auto_tunnel_enforce
-        && let Some(path) = config.auto_tunnel_watermark_path.as_ref()
-        && let Some(parent) = path.parent()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            DaemonError::InvalidConfig(format!(
-                "auto tunnel watermark directory create failed: {err}"
-            ))
-        })?;
+    if config.auto_tunnel_enforce {
+        if let Some(path) = config.auto_tunnel_watermark_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    DaemonError::InvalidConfig(format!(
+                        "auto tunnel watermark directory create failed: {err}"
+                    ))
+                })?;
+            }
+        }
     }
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
@@ -2524,12 +2529,12 @@ fn load_auto_tunnel_bundle(
         };
         if matches!(kind, RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan) {
             let via = via_node.as_str().to_string();
-            if let Some(existing) = selected_exit_node.as_deref()
-                && existing != via
-            {
-                return Err(AutoTunnelBootstrapError::InvalidFormat(
-                    "exit routes reference multiple exit nodes".to_string(),
-                ));
+            if let Some(existing) = selected_exit_node.as_deref() {
+                if existing != via {
+                    return Err(AutoTunnelBootstrapError::InvalidFormat(
+                        "exit routes reference multiple exit nodes".to_string(),
+                    ));
+                }
             }
             selected_exit_node = Some(via);
         }

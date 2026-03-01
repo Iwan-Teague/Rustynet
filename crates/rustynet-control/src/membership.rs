@@ -1304,7 +1304,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
     let trimmed = encoded.trim();
-    if !trimmed.len().is_multiple_of(2) {
+    if trimmed.len() % 2 != 0 {
         return Err(MembershipError::InvalidFormat(
             "hex value has odd length".to_string(),
         ));

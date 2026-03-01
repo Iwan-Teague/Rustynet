@@ -503,7 +503,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
     let bytes = value.as_bytes();
-    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+    if bytes.is_empty() || bytes.len() % 2 != 0 {
         return Err(CryptoError::AttestationVerificationFailed);
     }
 
