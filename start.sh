@@ -23,6 +23,8 @@ WG_ENCRYPTED_PRIVATE_KEY_PATH="/etc/rustynet/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/etc/rustynet/wireguard.passphrase"
 WG_PUBLIC_KEY_PATH="/etc/rustynet/wireguard.pub"
 EGRESS_INTERFACE=""
+MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
+MEMBERSHIP_LOG_PATH="/var/lib/rustynet/membership.log"
 BACKEND_MODE="linux-wireguard"
 DATAPLANE_MODE="hybrid-native"
 RECONCILE_INTERVAL_MS="1000"
@@ -216,6 +218,7 @@ map_package() {
         echo "vim-common"
       fi
       ;;
+    curl) echo "curl" ;;
     cargo)
       if [[ "${pm}" == "apt" ]]; then
         echo "cargo"
@@ -332,7 +335,7 @@ ensure_rust_toolchain() {
 }
 
 install_runtime_dependencies() {
-  local required=(wg ip nft openssl xxd systemctl awk sed grep)
+  local required=(wg ip nft openssl xxd curl systemctl awk sed grep)
   local missing=()
   local cmd
   for cmd in "${required[@]}"; do
@@ -481,6 +484,20 @@ ensure_wireguard_keys() {
   print_info "WireGuard key material initialized (encrypted key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH})"
 }
 
+ensure_membership_files() {
+  if [[ -f "${MEMBERSHIP_SNAPSHOT_PATH}" && -f "${MEMBERSHIP_LOG_PATH}" ]]; then
+    print_info "Membership files already present."
+    return
+  fi
+  print_info "Initializing membership files for node '${DEVICE_NODE_ID}'."
+  run_root rustynetd membership init \
+    --snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
+    --log "${MEMBERSHIP_LOG_PATH}" \
+    --node-id "${DEVICE_NODE_ID}" \
+    --network-id "local-net" \
+    --force
+}
+
 generate_verifier_key_from_signer() {
   local tmp_pub
   tmp_pub="$(mktemp)"
@@ -576,7 +593,6 @@ configure_trust_material() {
 
 write_daemon_environment() {
   enforce_backend_mode
-  enforce_auto_tunnel_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
@@ -794,8 +810,13 @@ configure_values() {
   prompt_default TRUST_EVIDENCE_PATH "Trust evidence path" "${TRUST_EVIDENCE_PATH}"
   prompt_default TRUST_VERIFIER_KEY_PATH "Trust verifier key path" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default TRUST_WATERMARK_PATH "Trust watermark path" "${TRUST_WATERMARK_PATH}"
-  enforce_auto_tunnel_policy
-  print_info "Auto-tunnel enforce is mandatory and fixed to 1."
+  if prompt_yes_no "Enable auto-tunnel enforcement? (requires signed bundles from a central controller; disable for standalone exit node)" "n"; then
+    AUTO_TUNNEL_ENFORCE="1"
+    print_info "Auto-tunnel enforce enabled. Signed assignment bundles are required."
+  else
+    AUTO_TUNNEL_ENFORCE="0"
+    print_info "Auto-tunnel enforce disabled. Suitable for standalone exit nodes."
+  fi
   prompt_default AUTO_TUNNEL_BUNDLE_PATH "Auto-tunnel bundle path" "${AUTO_TUNNEL_BUNDLE_PATH}"
   prompt_default AUTO_TUNNEL_VERIFIER_KEY_PATH "Auto-tunnel verifier key path" "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
   prompt_default AUTO_TUNNEL_WATERMARK_PATH "Auto-tunnel watermark path" "${AUTO_TUNNEL_WATERMARK_PATH}"
@@ -828,6 +849,7 @@ first_run_setup() {
   ensure_binaries_available
   prepare_system_directories
   ensure_wireguard_keys
+  ensure_membership_files
   configure_trust_material
   write_daemon_environment
   start_or_restart_service
