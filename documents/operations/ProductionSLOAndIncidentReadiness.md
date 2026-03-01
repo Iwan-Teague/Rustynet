@@ -16,6 +16,10 @@ Operational evidence artifacts:
 - `artifacts/operations/slo_error_budget_report.json`
 - `artifacts/operations/performance_budget_report.json`
 
+Artifact generation:
+- `scripts/operations/generate_phase9_artifacts.sh` from measured raw inputs under `artifacts/operations/raw/`
+- Artifacts must include measured-evidence metadata (`evidence_mode`, `captured_at_unix`, `environment`, `source_artifacts`).
+
 ## Alerting and Gate Behavior
 - Alerting policy is default-deny for release progression: if any SLO/performance gate fails, promotion blocks.
 - Promotion tracks remain staged (`unstable -> canary -> stable`).

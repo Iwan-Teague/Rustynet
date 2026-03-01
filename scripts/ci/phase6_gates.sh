@@ -26,6 +26,9 @@ if ! rg -q "validate_platform_parity" crates/rustynetd/src/platform.rs; then
   exit 1
 fi
 
+cargo test -p rustynetd platform::tests --all-features
+./scripts/ci/check_phase6_platform_parity.sh
+
 for artifact in \
   "artifacts/release/sbom.cargo-metadata.json" \
   "artifacts/release/sbom.sha256" \

@@ -13,7 +13,7 @@ Environment=RUSTYNET_STATE=/var/lib/rustynet/rustynetd.state
 Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
 Environment=RUSTYNET_TRUST_VERIFIER_KEY=/etc/rustynet/trust-evidence.pub
 Environment=RUSTYNET_TRUST_WATERMARK=/var/lib/rustynet/rustynetd.trust.watermark
-Environment=RUSTYNET_AUTO_TUNNEL_ENFORCE=false
+Environment=RUSTYNET_AUTO_TUNNEL_ENFORCE=true
 Environment=RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment
 Environment=RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY=/etc/rustynet/assignment.pub
 Environment=RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark

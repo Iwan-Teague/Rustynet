@@ -14,7 +14,11 @@ cargo test --workspace --all-targets --all-features
 
 cargo test -p rustynet-control ga::tests --all-features
 cargo test -p rustynet-backend-wireguard --test conformance --all-features
-cargo test -p rustynet-backend-stub --all-targets --all-features
+cargo test -p rustynet-backend-api --all-targets --all-features
+
+if [[ "${RUSTYNET_PHASE9_GENERATE_ARTIFACTS:-0}" == "1" ]]; then
+  ./scripts/operations/generate_phase9_artifacts.sh
+fi
 
 ./scripts/ci/check_phase9_readiness.sh
 

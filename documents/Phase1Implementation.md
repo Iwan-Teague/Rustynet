@@ -393,12 +393,10 @@ Phase 1 requires a runnable benchmark/test harness skeleton that captures baseli
 ### Phase 1 Pass Criteria
 - Harness compiles and runs in CI.
 - Report contains all required metric keys and thresholds.
-- For metrics measurable in scaffold mode, values must pass thresholds.
-- For metrics not yet measurable due intentionally missing runtime feature, harness must emit `not_measurable` with explicit reason code and CI must mark Phase 1 as pass only when reason code matches allowed Phase 1 list:
-  - `no_production_datapath`
-  - `no_live_route_programmer`
+- Every required metric must be measured and must pass thresholds.
+- `not_measurable`, synthetic placeholders, and unavailable/invalid measurement reason codes are release-blocking failures.
 
-Fail-closed rule: unknown reason codes or missing metric keys fail CI.
+Fail-closed rule: missing metric keys or any non-measured metric status fail CI.
 
 ## 9) Acceptance Test Plan for All Phase 1 Scope Items
 | Test ID | Scope Item | Procedure | Pass Criteria |
@@ -417,7 +415,7 @@ Fail-closed rule: unknown reason codes or missing metric keys fail CI.
 | P1-AT-12 | Deprecation exceptions | Expiry behavior tests for temporary compatibility exceptions | Expired exceptions rejected automatically. |
 | P1-AT-13 | CI security gates | Execute all Section 7 commands in CI pipeline | All gates pass with zero warnings/errors. |
 | P1-AT-14 | Integration harness skeleton | Run backend contract test harness | Harness executes and reports pass/fail. |
-| P1-AT-15 | Performance harness skeleton | Run `scripts/perf/run_phase1_baseline.sh` | Report generated with required keys and valid reason codes. |
+| P1-AT-15 | Performance harness skeleton | Run `scripts/perf/run_phase1_baseline.sh` | Report generated with required keys and all metrics measured/pass. |
 | P1-AT-16 | Secret-handling baseline | Log redaction tests on crypto/debug surfaces | Secret bytes never emitted in plain text. |
 | P1-AT-17 | TLS baseline policy | Control-plane transport config lint/test | TLS 1.3-only policy declared and validated. |
 | P1-AT-18 | No custom crypto | Static review checklist + crypto module tests | No custom cryptographic construction in production path. |

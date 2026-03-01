@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -363,60 +364,74 @@ impl Default for SigningProviderPolicy {
 pub trait SigningProvider {
     fn kind(&self) -> SigningProviderKind;
     fn key_identifier(&self) -> &str;
-    fn sign_stub(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    fn sign_attestation(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    fn verify_attestation(&self, payload: &[u8], signature: &[u8]) -> Result<(), CryptoError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KmsProviderStub {
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ed25519SigningProvider {
+    provider_kind: SigningProviderKind,
     key_id: String,
+    signing_key: SigningKey,
+    verifying_key: VerifyingKey,
 }
 
-impl KmsProviderStub {
-    pub fn new(key_id: impl Into<String>) -> Self {
-        Self {
-            key_id: key_id.into(),
-        }
+impl fmt::Debug for Ed25519SigningProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ed25519SigningProvider")
+            .field("provider_kind", &self.provider_kind)
+            .field("key_id", &self.key_id)
+            .field("signing_key", &"REDACTED")
+            .field("verifying_key", &hex_bytes(self.verifying_key.as_bytes()))
+            .finish()
     }
 }
 
-impl SigningProvider for KmsProviderStub {
+impl Ed25519SigningProvider {
+    pub fn from_seed(
+        provider_kind: SigningProviderKind,
+        key_id: impl Into<String>,
+        seed: [u8; 32],
+    ) -> Self {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        Self {
+            provider_kind,
+            key_id: key_id.into(),
+            signing_key,
+            verifying_key,
+        }
+    }
+
+    pub fn verifying_key_hex(&self) -> String {
+        hex_bytes(self.verifying_key.as_bytes())
+    }
+}
+
+impl SigningProvider for Ed25519SigningProvider {
     fn kind(&self) -> SigningProviderKind {
-        SigningProviderKind::Kms
+        self.provider_kind
     }
 
     fn key_identifier(&self) -> &str {
         &self.key_id
     }
 
-    fn sign_stub(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        Ok(attestation_digest(self.key_identifier(), payload))
+    fn sign_attestation(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let signature = self.signing_key.sign(payload);
+        Ok(signature.to_bytes().to_vec())
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HsmProviderStub {
-    key_id: String,
-}
-
-impl HsmProviderStub {
-    pub fn new(key_id: impl Into<String>) -> Self {
-        Self {
-            key_id: key_id.into(),
+    fn verify_attestation(&self, payload: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+        if signature.len() != 64 {
+            return Err(CryptoError::AttestationVerificationFailed);
         }
-    }
-}
-
-impl SigningProvider for HsmProviderStub {
-    fn kind(&self) -> SigningProviderKind {
-        SigningProviderKind::Hsm
-    }
-
-    fn key_identifier(&self) -> &str {
-        &self.key_id
-    }
-
-    fn sign_stub(&self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        Ok(attestation_digest(self.key_identifier(), payload))
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(signature);
+        let signature = Signature::from_bytes(&bytes);
+        self.verifying_key
+            .verify(payload, &signature)
+            .map_err(|_| CryptoError::AttestationVerificationFailed)
     }
 }
 
@@ -448,7 +463,7 @@ pub fn create_provider_attestation(
     payload: &[u8],
 ) -> Result<ProviderAttestation, CryptoError> {
     let payload_digest = hex_bytes(&Sha256::digest(payload));
-    let signature = provider.sign_stub(payload)?;
+    let signature = provider.sign_attestation(payload)?;
     Ok(ProviderAttestation {
         provider_kind: provider.kind(),
         key_identifier: provider.key_identifier().to_string(),
@@ -474,18 +489,8 @@ pub fn verify_provider_attestation(
         return Err(CryptoError::AttestationVerificationFailed);
     }
 
-    let expected_signature = hex_bytes(&provider.sign_stub(payload)?);
-    if expected_signature != attestation.signature_hex {
-        return Err(CryptoError::AttestationVerificationFailed);
-    }
-    Ok(())
-}
-
-fn attestation_digest(key_identifier: &str, payload: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(key_identifier.as_bytes());
-    hasher.update(payload);
-    hasher.finalize().to_vec()
+    let signature = hex_decode(attestation.signature_hex.as_str())?;
+    provider.verify_attestation(payload, &signature)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -494,6 +499,25 @@ fn hex_bytes(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return Err(CryptoError::AttestationVerificationFailed);
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or(CryptoError::AttestationVerificationFailed)?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or(CryptoError::AttestationVerificationFailed)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }
 
 pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
@@ -675,9 +699,9 @@ pub fn validate_key_custody_permissions(
 #[cfg(test)]
 mod tests {
     use super::{
-        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError, KeyCustodyManager,
-        KeyCustodyPermissionPolicy, KmsProviderStub, NoOsSecureStore, NodeKeyPair,
-        SigningProviderKind, SigningProviderPolicy, create_provider_attestation,
+        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
+        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
+        NodeKeyPair, SigningProviderKind, SigningProviderPolicy, create_provider_attestation,
         decrypt_private_key_fallback, encrypt_private_key_fallback, generate_key_custody_material,
         read_encrypted_key_file, validate_key_custody_permissions,
         validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
@@ -939,7 +963,11 @@ mod tests {
 
     #[test]
     fn provider_attestation_roundtrip_verifies() {
-        let provider = KmsProviderStub::new("kms://rustynet/signing-key");
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/signing-key",
+            [7; 32],
+        );
         let payload = b"release-artifact-digest";
         let attestation =
             create_provider_attestation(&provider, payload).expect("attestation should be created");
@@ -950,6 +978,29 @@ mod tests {
         let bad_result = verify_provider_attestation(&provider, b"tampered", &attestation);
         assert_eq!(
             bad_result.err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn provider_attestation_rejects_wrong_signing_key() {
+        let source = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/signing-key",
+            [7; 32],
+        );
+        let payload = b"release-artifact-digest";
+        let attestation =
+            create_provider_attestation(&source, payload).expect("attestation should be created");
+
+        let wrong_provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/signing-key",
+            [9; 32],
+        );
+        let verification = verify_provider_attestation(&wrong_provider, payload, &attestation);
+        assert_eq!(
+            verification.err(),
             Some(CryptoError::AttestationVerificationFailed)
         );
     }

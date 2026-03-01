@@ -16,12 +16,7 @@
 ## Latest Validation Evidence
 Artifact:
 - `artifacts/operations/dr_failover_report.json`
-
-Measured values in latest report:
-- regions tested: `us-east`, `us-west`
-- measured RPO: `9 minutes`
-- measured RTO: `37 minutes`
-- restore integrity verified: `true`
+- Generated via `scripts/operations/generate_phase9_artifacts.sh` from measured raw evidence inputs.
 
 ## Fail-Closed Decision
 If RPO/RTO or restore-integrity checks fail, stable release promotion is blocked.

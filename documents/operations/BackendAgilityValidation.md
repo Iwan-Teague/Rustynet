@@ -6,13 +6,14 @@ Guarantee that WireGuard remains the default backend adapter while the control/p
 ## Required Conditions
 - WireGuard remains behind `TunnelBackend` interface boundaries.
 - At least one additional backend path exists and is runnable through the same interface.
+- Additional backend path cannot be a stub/fake/mock/simulated backend.
 - Backend conformance suite must pass before support claims.
 - Backend support claim requires security review completion.
 - Any WireGuard leakage outside adapter crates blocks release.
 
 ## Implemented Backends
 - Default: `rustynet-backend-wireguard`
-- Additional path: `rustynet-backend-stub`
+- Additional path: must be an implementation that is non-simulated and validated with measured evidence.
 
 ## Enforcement Points
 - `crates/rustynet-backend-api/src/lib.rs` (`TunnelBackend` contract)
@@ -23,11 +24,12 @@ Guarantee that WireGuard remains the default backend adapter while the control/p
 ## Evidence
 Artifact:
 - `artifacts/operations/backend_agility_report.json`
+- Generated via `scripts/operations/generate_phase9_artifacts.sh` from measured raw evidence inputs.
 
 Conformance and boundary checks:
 - `cargo test -p rustynet-backend-wireguard --test conformance`
-- `cargo test -p rustynet-backend-stub --all-targets --all-features`
+- `cargo test -p rustynet-backend-api --all-targets --all-features`
 - `scripts/ci/phase1_gates.sh`
 
 ## Fail-Closed Rule
-If backend conformance fails, leakage is detected, or security review is incomplete, release promotion is blocked.
+If backend conformance fails, leakage is detected, security review is incomplete, or evidence uses simulated backend paths, release promotion is blocked.

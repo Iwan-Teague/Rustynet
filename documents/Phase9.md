@@ -30,7 +30,7 @@ Finalize GA-grade operational maturity, compatibility guarantees, and long-term 
 
 4. Protocol agility validation:
 - Keep WireGuard as default backend.
-- Add at least one additional backend path (experimental/stub) through same interface.
+- Add at least one additional non-simulated backend path through same interface.
 - Require backend conformance suite pass and security review before support claims.
 - Produce post-quantum transition plan with hybrid migration experiment and decision gates.
 
@@ -41,6 +41,7 @@ Finalize GA-grade operational maturity, compatibility guarantees, and long-term 
 - Backend agility validation report showing architecture remains swappable.
 - Published crypto deprecation and migration schedule.
 - Published post-quantum migration readiness and hybrid-evaluation report.
+- Measured evidence generation workflow documented in `documents/operations/MeasuredEvidenceGeneration.md`.
 
 ## 4) Security Gates
 - No release without passing SLO, incident, and DR readiness gates.

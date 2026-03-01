@@ -16,7 +16,7 @@ Rustynet Phase 1 through Phase 9 implementation is complete in this workspace ac
 6. **Phase 6**: Implemented admin security controls (deny-by-default RBAC, MFA, CSRF/session/clickjacking protections), helper command validation, and cross-platform parity safety checks.
 7. **Phase 7**: Implemented HA/tenant/commercial foundations, relay regional selection primitives, enterprise auth hooks, and trust-hardening fail-closed controls.
 8. **Phase 8**: Implemented assurance/compliance controls, KMS/HSM-ready signing abstractions, release attestation verification, dependency exception governance, and privacy/compliance artifacts.
-9. **Phase 9**: Implemented GA readiness controls and artifacts: compatibility/support policy, crypto deprecation lifecycle, SLO/error-budget and incident-drill gates, DR validation, backend agility validation (including additional backend stub path), PQ transition plan, and launch checklist/sign-offs.
+9. **Phase 9**: Implemented GA readiness controls and artifacts framework: compatibility/support policy, crypto deprecation lifecycle, SLO/error-budget and incident-drill gates, DR validation, backend agility validation with non-simulated backend requirement, PQ transition plan, and launch checklist/sign-offs.
 
 ## 3) Requirement and Security Compliance Summary
 - **Rust-first architecture** is maintained across control plane, daemon, CLI, policy engine, and backend interfaces.
@@ -25,7 +25,7 @@ Rustynet Phase 1 through Phase 9 implementation is complete in this workspace ac
 - **Default-deny and fail-closed posture** is enforced across policy, trust state, exit/LAN routing, and compatibility exception handling.
 - **SecurityMinimumBar critical/high/performance controls** are represented by code-level enforcement points plus validation commands and artifacts.
 
-Primary Phase 9 security/operations artifacts:
+Primary Phase 9 security/operations artifact paths:
 - `artifacts/operations/compatibility_policy.json`
 - `artifacts/operations/slo_error_budget_report.json`
 - `artifacts/operations/performance_budget_report.json`
@@ -46,17 +46,17 @@ Primary Phase 9 security/operations artifacts:
 Final gate command:
 - `./scripts/ci/phase9_gates.sh`
 
-Phase 9 gate chain includes and passed:
+Phase 9 gate chain includes:
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo check --workspace --all-targets --all-features`
 - `cargo test --workspace --all-targets --all-features`
 - `./scripts/ci/phase8_gates.sh`
 - `./scripts/ci/phase1_gates.sh` (includes `cargo audit --deny warnings` and `cargo deny check bans licenses sources advisories`)
-- backend conformance checks (`rustynet-backend-wireguard`, `rustynet-backend-stub`)
+- backend conformance checks (`rustynet-backend-wireguard`, `rustynet-backend-api`)
 - `./scripts/ci/check_phase9_readiness.sh`
 
-Result: **PASS**.
+Result: **conditional**. Release readiness now fails closed unless fresh measured artifacts and non-simulated backend agility evidence are provided.
 
 ## 5) Blockers Encountered and Resolved
 1. Advisory DB lock path blocked under sandbox during `cargo audit`.
@@ -66,7 +66,6 @@ Result: **PASS**.
 
 ## 6) Final Completion Statement
 - All phases (1-9) are implemented and evidenced in `documents/ExecutionProgress.md`.
-- All listed mandatory gates pass.
-- No unresolved blockers remain.
-- No phase-scope TODO/FIXME/placeholders remain in deliverables.
-- Phase 9 scope is complete with no deferred Phase 9 TODOs.
+- Code-level checks (`fmt`, `clippy`, `check`, `test`) pass across the workspace.
+- Release gates now fail closed unless measured Phase 6/9 evidence artifacts are generated from real inputs.
+- No unresolved code TODO/FIXME/placeholders remain in deliverables.

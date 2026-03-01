@@ -138,7 +138,7 @@ impl Default for DaemonConfig {
             membership_snapshot_path: PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
             membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
             membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
-            auto_tunnel_enforce: false,
+            auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_BUNDLE_PATH)),
             auto_tunnel_verifier_key_path: Some(PathBuf::from(
                 DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH,
@@ -3046,6 +3046,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -3160,6 +3161,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };

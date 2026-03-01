@@ -5,6 +5,7 @@ Rustynet only allows production cryptographic primitives that satisfy the approv
 
 ## Schedule Source
 - `artifacts/operations/crypto_deprecation_schedule.json`
+- Generated via `scripts/operations/generate_phase9_artifacts.sh` from measured raw evidence inputs.
 
 ## Current Deprecation Calendar
 | Algorithm | Deprecates At (UTC) | Removal At (UTC) | Release Behavior |
