@@ -2,9 +2,9 @@
   "phase": "phase1",
   "suite": "backend_contract_perf",
   "metrics": [
-    {"name":"configure_peer_avg_us","value":0.452,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
-    {"name":"apply_routes_avg_us","value":0.5475,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
-    {"name":"stats_avg_us","value":0.010916,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"configure_peer_avg_us","value":0.542836,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"apply_routes_avg_us","value":0.487915,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
+    {"name":"stats_avg_us","value":0.01275,"unit":"microseconds","threshold":"<=5000","status":"pass","reason":"measured"},
     {"name":"throughput_overhead_vs_wireguard_percent","value":0,"unit":"percent","threshold":"<=15","status":"not_measurable","reason":"no_production_datapath"}
   ]
 }

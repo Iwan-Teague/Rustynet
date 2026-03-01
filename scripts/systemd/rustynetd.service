@@ -13,6 +13,11 @@ Environment=RUSTYNET_STATE=/var/lib/rustynet/rustynetd.state
 Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
 Environment=RUSTYNET_TRUST_VERIFIER_KEY=/etc/rustynet/trust-evidence.pub
 Environment=RUSTYNET_TRUST_WATERMARK=/var/lib/rustynet/rustynetd.trust.watermark
+Environment=RUSTYNET_AUTO_TUNNEL_ENFORCE=false
+Environment=RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment
+Environment=RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY=/etc/rustynet/assignment.pub
+Environment=RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark
+Environment=RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=300
 Environment=RUSTYNET_BACKEND=linux-wireguard
 Environment=RUSTYNET_WG_INTERFACE=rustynet0
 Environment=RUSTYNET_WG_PRIVATE_KEY=/run/rustynet/wireguard.key
@@ -23,7 +28,7 @@ Environment=RUSTYNET_EGRESS_INTERFACE=eth0
 Environment=RUSTYNET_DATAPLANE_MODE=hybrid-native
 Environment=RUSTYNET_RECONCILE_INTERVAL_MS=1000
 Environment=RUSTYNET_MAX_RECONCILE_FAILURES=5
-ExecStart=/usr/local/bin/rustynetd daemon --node-id ${RUSTYNET_NODE_ID} --socket ${RUSTYNET_SOCKET} --state ${RUSTYNET_STATE} --trust-evidence ${RUSTYNET_TRUST_EVIDENCE} --trust-verifier-key ${RUSTYNET_TRUST_VERIFIER_KEY} --trust-watermark ${RUSTYNET_TRUST_WATERMARK} --backend ${RUSTYNET_BACKEND} --wg-interface ${RUSTYNET_WG_INTERFACE} --wg-private-key ${RUSTYNET_WG_PRIVATE_KEY} --wg-encrypted-private-key ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} --wg-key-passphrase ${RUSTYNET_WG_KEY_PASSPHRASE} --wg-public-key ${RUSTYNET_WG_PUBLIC_KEY} --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode ${RUSTYNET_DATAPLANE_MODE} --reconcile-interval-ms ${RUSTYNET_RECONCILE_INTERVAL_MS} --max-reconcile-failures ${RUSTYNET_MAX_RECONCILE_FAILURES}
+ExecStart=/usr/local/bin/rustynetd daemon --node-id ${RUSTYNET_NODE_ID} --socket ${RUSTYNET_SOCKET} --state ${RUSTYNET_STATE} --trust-evidence ${RUSTYNET_TRUST_EVIDENCE} --trust-verifier-key ${RUSTYNET_TRUST_VERIFIER_KEY} --trust-watermark ${RUSTYNET_TRUST_WATERMARK} --auto-tunnel-enforce ${RUSTYNET_AUTO_TUNNEL_ENFORCE} --auto-tunnel-bundle ${RUSTYNET_AUTO_TUNNEL_BUNDLE} --auto-tunnel-verifier-key ${RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY} --auto-tunnel-watermark ${RUSTYNET_AUTO_TUNNEL_WATERMARK} --auto-tunnel-max-age-secs ${RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS} --backend ${RUSTYNET_BACKEND} --wg-interface ${RUSTYNET_WG_INTERFACE} --wg-private-key ${RUSTYNET_WG_PRIVATE_KEY} --wg-encrypted-private-key ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} --wg-key-passphrase ${RUSTYNET_WG_KEY_PASSPHRASE} --wg-public-key ${RUSTYNET_WG_PUBLIC_KEY} --egress-interface ${RUSTYNET_EGRESS_INTERFACE} --dataplane-mode ${RUSTYNET_DATAPLANE_MODE} --reconcile-interval-ms ${RUSTYNET_RECONCILE_INTERVAL_MS} --max-reconcile-failures ${RUSTYNET_MAX_RECONCILE_FAILURES}
 Restart=on-failure
 RestartSec=2s
 StartLimitBurst=5

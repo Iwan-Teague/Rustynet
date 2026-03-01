@@ -11,7 +11,8 @@ use rustynet_policy::{
 };
 
 use rustynetd::daemon::{
-    DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_NODE_ID,
+    DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
+    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID,
     DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
     DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
     DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
@@ -277,6 +278,72 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--trust-watermark requires a value".to_string())?;
                 config.trust_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--membership-snapshot") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--membership-snapshot requires a value".to_string())?;
+                config.membership_snapshot_path = value.into();
+                index += 2;
+            }
+            Some("--membership-log") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--membership-log requires a value".to_string())?;
+                config.membership_log_path = value.into();
+                index += 2;
+            }
+            Some("--membership-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--membership-watermark requires a value".to_string())?;
+                config.membership_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--auto-tunnel-enforce") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-tunnel-enforce requires a value".to_string())?;
+                config.auto_tunnel_enforce = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(
+                            "invalid auto-tunnel-enforce value: expected true/false".to_string()
+                        );
+                    }
+                };
+                index += 2;
+            }
+            Some("--auto-tunnel-bundle") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-tunnel-bundle requires a value".to_string())?;
+                config.auto_tunnel_bundle_path = Some(value.into());
+                index += 2;
+            }
+            Some("--auto-tunnel-verifier-key") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-tunnel-verifier-key requires a value".to_string())?;
+                config.auto_tunnel_verifier_key_path = Some(value.into());
+                index += 2;
+            }
+            Some("--auto-tunnel-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-tunnel-watermark requires a value".to_string())?;
+                config.auto_tunnel_watermark_path = Some(value.into());
+                index += 2;
+            }
+            Some("--auto-tunnel-max-age-secs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-tunnel-max-age-secs requires a value".to_string())?;
+                config.auto_tunnel_max_age_secs = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid auto tunnel max age: {err}"))?;
                 index += 2;
             }
             Some("--backend") => {
@@ -555,7 +622,7 @@ fn emit_phase10_evidence(output_dir: &str) -> Result<(), String> {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <in-memory|linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
@@ -568,6 +635,9 @@ fn help_text() -> String {
         &format!("  trust_evidence={DEFAULT_TRUST_EVIDENCE_PATH}"),
         &format!("  trust_verifier_key={DEFAULT_TRUST_VERIFIER_KEY_PATH}"),
         &format!("  trust_watermark={DEFAULT_TRUST_WATERMARK_PATH}"),
+        &format!("  membership_snapshot={DEFAULT_MEMBERSHIP_SNAPSHOT_PATH}"),
+        &format!("  membership_log={DEFAULT_MEMBERSHIP_LOG_PATH}"),
+        &format!("  membership_watermark={DEFAULT_MEMBERSHIP_WATERMARK_PATH}"),
         &format!("  backend={:?}", DaemonBackendMode::default()),
         &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
         &format!("  wg_private_key={DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH}"),

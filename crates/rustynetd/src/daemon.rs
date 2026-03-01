@@ -39,14 +39,19 @@ use nix::sys::socket::sockopt::LocalPeerCred;
 use nix::sys::socket::sockopt::PeerCredentials;
 use nix::unistd::Uid;
 use rustynet_backend_api::{
-    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
-    TunnelBackend, TunnelStats,
+    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
+    RuntimeContext, TunnelBackend, TunnelStats,
 };
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(target_os = "linux")]
 use rustynet_backend_wireguard::{LinuxCommandRunner, LinuxWireguardBackend};
+use rustynet_control::membership::{
+    MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
+    replay_membership_snapshot_and_log,
+};
 use rustynet_policy::{
-    ContextualPolicyRule, ContextualPolicySet, Protocol, RuleAction, TrafficContext,
+    ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet, Decision,
+    MembershipDirectory, MembershipStatus, Protocol, RuleAction, TrafficContext,
 };
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
@@ -54,6 +59,14 @@ pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
 pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.pub";
 pub const DEFAULT_TRUST_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.trust.watermark";
+pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = "/var/lib/rustynet/membership.snapshot";
+pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
+pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
+pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
+pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/assignment.pub";
+pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
+    "/var/lib/rustynet/rustynetd.assignment.watermark";
+pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key.enc";
@@ -98,6 +111,14 @@ pub struct DaemonConfig {
     pub trust_evidence_path: PathBuf,
     pub trust_verifier_key_path: PathBuf,
     pub trust_watermark_path: PathBuf,
+    pub membership_snapshot_path: PathBuf,
+    pub membership_log_path: PathBuf,
+    pub membership_watermark_path: PathBuf,
+    pub auto_tunnel_enforce: bool,
+    pub auto_tunnel_bundle_path: Option<PathBuf>,
+    pub auto_tunnel_verifier_key_path: Option<PathBuf>,
+    pub auto_tunnel_watermark_path: Option<PathBuf>,
+    pub auto_tunnel_max_age_secs: u64,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_private_key_path: Option<PathBuf>,
@@ -120,6 +141,16 @@ impl Default for DaemonConfig {
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
             trust_verifier_key_path: PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH),
             trust_watermark_path: PathBuf::from(DEFAULT_TRUST_WATERMARK_PATH),
+            membership_snapshot_path: PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
+            membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
+            membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
+            auto_tunnel_enforce: false,
+            auto_tunnel_bundle_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_BUNDLE_PATH)),
+            auto_tunnel_verifier_key_path: Some(PathBuf::from(
+                DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH,
+            )),
+            auto_tunnel_watermark_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_WATERMARK_PATH)),
+            auto_tunnel_max_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
             wg_private_key_path: Some(PathBuf::from(DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH)),
@@ -201,6 +232,137 @@ struct TrustWatermark {
 struct TrustEvidenceEnvelope {
     evidence: TrustEvidence,
     watermark: TrustWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoTunnelBootstrapError {
+    Disabled,
+    MissingConfig(&'static str),
+    Missing,
+    Io(String),
+    InvalidFormat(String),
+    KeyInvalid,
+    SignatureInvalid,
+    ReplayDetected,
+    FutureDated,
+    Stale,
+    WrongNode,
+    PolicyDenied(String),
+}
+
+impl fmt::Display for AutoTunnelBootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AutoTunnelBootstrapError::Disabled => f.write_str("auto-tunnel is disabled"),
+            AutoTunnelBootstrapError::MissingConfig(field) => {
+                write!(f, "auto-tunnel missing config: {field}")
+            }
+            AutoTunnelBootstrapError::Missing => f.write_str("auto-tunnel bundle is missing"),
+            AutoTunnelBootstrapError::Io(message) => {
+                write!(f, "auto-tunnel bundle io failure: {message}")
+            }
+            AutoTunnelBootstrapError::InvalidFormat(message) => {
+                write!(f, "auto-tunnel bundle invalid format: {message}")
+            }
+            AutoTunnelBootstrapError::KeyInvalid => {
+                f.write_str("auto-tunnel verifier key is invalid")
+            }
+            AutoTunnelBootstrapError::SignatureInvalid => {
+                f.write_str("auto-tunnel signature verification failed")
+            }
+            AutoTunnelBootstrapError::ReplayDetected => {
+                f.write_str("auto-tunnel bundle replay detected")
+            }
+            AutoTunnelBootstrapError::FutureDated => {
+                f.write_str("auto-tunnel bundle is future dated")
+            }
+            AutoTunnelBootstrapError::Stale => f.write_str("auto-tunnel bundle is stale"),
+            AutoTunnelBootstrapError::WrongNode => {
+                f.write_str("auto-tunnel bundle node id does not match local node")
+            }
+            AutoTunnelBootstrapError::PolicyDenied(reason) => {
+                write!(f, "auto-tunnel bundle denied by local policy: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AutoTunnelBootstrapError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AutoTunnelWatermark {
+    generated_at_unix: u64,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AutoTunnelBundleEnvelope {
+    bundle: AutoTunnelBundle,
+    watermark: AutoTunnelWatermark,
+}
+
+#[derive(Debug, Clone)]
+struct AutoTunnelBundle {
+    node_id: String,
+    mesh_cidr: String,
+    peers: Vec<PeerConfig>,
+    routes: Vec<Route>,
+    selected_exit_node: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MembershipBootstrapError {
+    MissingSnapshot,
+    MissingLog,
+    SnapshotLoad(String),
+    LogLoad(String),
+    Replay(String),
+    InvalidRoot,
+    WatermarkReplay,
+    LocalNodeNotActive,
+    ExitNodeNotActive(String),
+    Io(String),
+}
+
+impl fmt::Display for MembershipBootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MembershipBootstrapError::MissingSnapshot => {
+                f.write_str("membership snapshot is missing")
+            }
+            MembershipBootstrapError::MissingLog => f.write_str("membership log is missing"),
+            MembershipBootstrapError::SnapshotLoad(msg) => {
+                write!(f, "membership snapshot load failed: {msg}")
+            }
+            MembershipBootstrapError::LogLoad(msg) => {
+                write!(f, "membership log load failed: {msg}")
+            }
+            MembershipBootstrapError::Replay(msg) => {
+                write!(f, "membership replay failed: {msg}")
+            }
+            MembershipBootstrapError::InvalidRoot => {
+                f.write_str("membership root verification failed")
+            }
+            MembershipBootstrapError::WatermarkReplay => {
+                f.write_str("membership replay/rollback detected by watermark")
+            }
+            MembershipBootstrapError::LocalNodeNotActive => {
+                f.write_str("local node is not active in membership state")
+            }
+            MembershipBootstrapError::ExitNodeNotActive(node_id) => {
+                write!(f, "selected exit node is not active: {node_id}")
+            }
+            MembershipBootstrapError::Io(msg) => write!(f, "membership io failure: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for MembershipBootstrapError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MembershipWatermark {
+    epoch: u64,
+    state_root: String,
 }
 
 enum DaemonBackend {
@@ -318,6 +480,7 @@ impl TunnelBackend for DaemonBackend {
 
 struct DaemonRuntime {
     controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
+    policy: ContextualPolicySet,
     backend_mode: DaemonBackendMode,
     local_node_id: String,
     wg_interface: String,
@@ -329,6 +492,14 @@ struct DaemonRuntime {
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
     trust_watermark_path: PathBuf,
+    membership_snapshot_path: PathBuf,
+    membership_log_path: PathBuf,
+    membership_watermark_path: PathBuf,
+    auto_tunnel_enforce: bool,
+    auto_tunnel_bundle_path: Option<PathBuf>,
+    auto_tunnel_verifier_key_path: Option<PathBuf>,
+    auto_tunnel_watermark_path: Option<PathBuf>,
+    auto_tunnel_max_age_secs: u64,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -339,7 +510,10 @@ struct DaemonRuntime {
     reconcile_failures: u64,
     last_reconcile_unix: Option<u64>,
     last_reconcile_error: Option<String>,
+    last_applied_assignment: Option<AutoTunnelWatermark>,
     max_reconcile_failures: u32,
+    membership_state: Option<MembershipState>,
+    membership_directory: MembershipDirectory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,15 +533,20 @@ impl DaemonRuntime {
                 dst: "*".to_string(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
-                contexts: vec![TrafficContext::SharedExit],
+                contexts: vec![TrafficContext::Mesh, TrafficContext::SharedExit],
             }],
         };
         let trust_policy = TrustPolicy::default();
         let backend = DaemonBackend::from_config(config)?;
-        let controller =
-            Phase10Controller::new(backend, daemon_system(config)?, policy, trust_policy);
+        let controller = Phase10Controller::new(
+            backend,
+            daemon_system(config)?,
+            policy.clone(),
+            trust_policy,
+        );
         Ok(Self {
             controller,
+            policy,
             backend_mode: config.backend_mode,
             local_node_id: config.node_id.clone(),
             wg_interface: config.wg_interface.clone(),
@@ -379,6 +558,14 @@ impl DaemonRuntime {
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
             trust_watermark_path: config.trust_watermark_path.clone(),
+            membership_snapshot_path: config.membership_snapshot_path.clone(),
+            membership_log_path: config.membership_log_path.clone(),
+            membership_watermark_path: config.membership_watermark_path.clone(),
+            auto_tunnel_enforce: config.auto_tunnel_enforce,
+            auto_tunnel_bundle_path: config.auto_tunnel_bundle_path.clone(),
+            auto_tunnel_verifier_key_path: config.auto_tunnel_verifier_key_path.clone(),
+            auto_tunnel_watermark_path: config.auto_tunnel_watermark_path.clone(),
+            auto_tunnel_max_age_secs: config.auto_tunnel_max_age_secs,
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -389,7 +576,10 @@ impl DaemonRuntime {
             reconcile_failures: 0,
             last_reconcile_unix: None,
             last_reconcile_error: None,
+            last_applied_assignment: None,
             max_reconcile_failures: config.max_reconcile_failures,
+            membership_state: None,
+            membership_directory: MembershipDirectory::default(),
         })
     }
 
@@ -403,6 +593,161 @@ impl DaemonRuntime {
         )?;
         persist_trust_watermark(&self.trust_watermark_path, envelope.watermark)?;
         Ok(envelope.evidence)
+    }
+
+    fn load_verified_membership(&self) -> Result<MembershipState, MembershipBootstrapError> {
+        if !self.membership_snapshot_path.exists() {
+            return Err(MembershipBootstrapError::MissingSnapshot);
+        }
+        if !self.membership_log_path.exists() {
+            return Err(MembershipBootstrapError::MissingLog);
+        }
+
+        let snapshot = load_membership_snapshot(&self.membership_snapshot_path)
+            .map_err(|err| MembershipBootstrapError::SnapshotLoad(err.to_string()))?;
+        let entries = load_membership_log(&self.membership_log_path)
+            .map_err(|err| MembershipBootstrapError::LogLoad(err.to_string()))?;
+        let replayed = replay_membership_snapshot_and_log(&snapshot, &entries, unix_now())
+            .map_err(|err| MembershipBootstrapError::Replay(err.to_string()))?;
+        let state_root = replayed
+            .state_root_hex()
+            .map_err(|_| MembershipBootstrapError::InvalidRoot)?;
+        let watermark = MembershipWatermark {
+            epoch: replayed.epoch,
+            state_root: state_root.clone(),
+        };
+        let previous = load_membership_watermark(&self.membership_watermark_path)
+            .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
+        if let Some(previous) = previous
+            && (watermark.epoch < previous.epoch
+                || (watermark.epoch == previous.epoch
+                    && watermark.state_root != previous.state_root))
+        {
+            return Err(MembershipBootstrapError::WatermarkReplay);
+        }
+        persist_membership_watermark(&self.membership_watermark_path, &watermark)
+            .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
+
+        let local_active = replayed.nodes.iter().any(|node| {
+            node.node_id == self.local_node_id && node.status == MembershipNodeStatus::Active
+        });
+        if !local_active {
+            return Err(MembershipBootstrapError::LocalNodeNotActive);
+        }
+        if let Some(exit_node) = self.selected_exit_node.as_deref() {
+            let exit_active = replayed.nodes.iter().any(|node| {
+                node.node_id == exit_node && node.status == MembershipNodeStatus::Active
+            });
+            if !exit_active {
+                return Err(MembershipBootstrapError::ExitNodeNotActive(
+                    exit_node.to_string(),
+                ));
+            }
+        }
+
+        Ok(replayed)
+    }
+
+    fn auto_tunnel_paths(&self) -> Result<(&Path, &Path, &Path), AutoTunnelBootstrapError> {
+        if !self.auto_tunnel_enforce {
+            return Err(AutoTunnelBootstrapError::Disabled);
+        }
+        let bundle_path = self.auto_tunnel_bundle_path.as_deref().ok_or(
+            AutoTunnelBootstrapError::MissingConfig("auto_tunnel_bundle_path"),
+        )?;
+        let verifier_path = self.auto_tunnel_verifier_key_path.as_deref().ok_or(
+            AutoTunnelBootstrapError::MissingConfig("auto_tunnel_verifier_key_path"),
+        )?;
+        let watermark_path = self.auto_tunnel_watermark_path.as_deref().ok_or(
+            AutoTunnelBootstrapError::MissingConfig("auto_tunnel_watermark_path"),
+        )?;
+        Ok((bundle_path, verifier_path, watermark_path))
+    }
+
+    fn load_verified_auto_tunnel(
+        &self,
+        membership_directory: &MembershipDirectory,
+    ) -> Result<AutoTunnelBundleEnvelope, AutoTunnelBootstrapError> {
+        let (bundle_path, verifier_path, watermark_path) = self.auto_tunnel_paths()?;
+        let previous_watermark = load_auto_tunnel_watermark(watermark_path)?;
+        let envelope = load_auto_tunnel_bundle(
+            bundle_path,
+            verifier_path,
+            self.auto_tunnel_max_age_secs,
+            self.trust_policy,
+            previous_watermark,
+        )?;
+        if envelope.bundle.node_id != self.local_node_id {
+            return Err(AutoTunnelBootstrapError::WrongNode);
+        }
+        self.policy_gate_auto_tunnel(&envelope.bundle, membership_directory)?;
+        persist_auto_tunnel_watermark(watermark_path, envelope.watermark)?;
+        Ok(envelope)
+    }
+
+    fn policy_gate_auto_tunnel(
+        &self,
+        bundle: &AutoTunnelBundle,
+        membership_directory: &MembershipDirectory,
+    ) -> Result<(), AutoTunnelBootstrapError> {
+        let subject = "user:local";
+
+        for peer in &bundle.peers {
+            let decision = self.policy.evaluate_with_membership(
+                &ContextualAccessRequest {
+                    src: subject.to_string(),
+                    dst: format!("node:{}", peer.node_id.as_str()),
+                    protocol: Protocol::Any,
+                    context: TrafficContext::Mesh,
+                },
+                membership_directory,
+            );
+            if decision != Decision::Allow {
+                return Err(AutoTunnelBootstrapError::PolicyDenied(format!(
+                    "peer {} denied",
+                    peer.node_id
+                )));
+            }
+        }
+
+        for route in &bundle.routes {
+            let context = match route.kind {
+                RouteKind::Mesh => TrafficContext::Mesh,
+                RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan => TrafficContext::SharedExit,
+            };
+            let cidr_decision = self.policy.evaluate_with_membership(
+                &ContextualAccessRequest {
+                    src: subject.to_string(),
+                    dst: route.destination_cidr.clone(),
+                    protocol: Protocol::Any,
+                    context,
+                },
+                membership_directory,
+            );
+            if cidr_decision != Decision::Allow {
+                return Err(AutoTunnelBootstrapError::PolicyDenied(format!(
+                    "route {} denied",
+                    route.destination_cidr
+                )));
+            }
+            let via_decision = self.policy.evaluate_with_membership(
+                &ContextualAccessRequest {
+                    src: subject.to_string(),
+                    dst: format!("node:{}", route.via_node.as_str()),
+                    protocol: Protocol::Any,
+                    context,
+                },
+                membership_directory,
+            );
+            if via_decision != Decision::Allow {
+                return Err(AutoTunnelBootstrapError::PolicyDenied(format!(
+                    "route via node {} denied",
+                    route.via_node
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     fn bootstrap(&mut self) {
@@ -426,18 +771,79 @@ impl DaemonRuntime {
             }
         };
 
+        let membership_state = match self.load_verified_membership() {
+            Ok(state) => state,
+            Err(err) => {
+                self.restrict_recoverable(err.to_string());
+                let _ = self
+                    .controller
+                    .force_fail_closed("membership_bootstrap_failed");
+                return;
+            }
+        };
+        let membership_directory = membership_directory_from_state(&membership_state);
+
+        let auto_bundle = if self.auto_tunnel_enforce {
+            match self.load_verified_auto_tunnel(&membership_directory) {
+                Ok(bundle) => Some(bundle),
+                Err(err) => {
+                    self.restrict_recoverable(err.to_string());
+                    let _ = self
+                        .controller
+                        .force_fail_closed("auto_tunnel_bootstrap_failed");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let (mesh_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
+            if let Some(envelope) = auto_bundle {
+                let lan_enabled = envelope
+                    .bundle
+                    .routes
+                    .iter()
+                    .any(|route| route.kind == RouteKind::ExitNodeLan);
+                (
+                    envelope.bundle.mesh_cidr,
+                    envelope.bundle.peers,
+                    envelope.bundle.routes,
+                    envelope.bundle.selected_exit_node,
+                    lan_enabled,
+                    Some(envelope.watermark),
+                )
+            } else {
+                (
+                    "100.64.0.0/10".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    false,
+                    None,
+                )
+            };
+
         let apply = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
                 local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
+                mesh_cidr,
             },
-            Vec::new(),
-            Vec::new(),
+            peers,
+            routes,
             ApplyOptions {
                 protected_dns: true,
                 ipv6_parity_supported: false,
-                exit_mode: self.desired_exit_mode(),
+                exit_mode: if self.auto_tunnel_enforce {
+                    if auto_exit.is_some() {
+                        ExitMode::FullTunnel
+                    } else {
+                        ExitMode::Off
+                    }
+                } else {
+                    self.desired_exit_mode()
+                },
             },
         );
         if apply.is_err() {
@@ -445,8 +851,15 @@ impl DaemonRuntime {
             let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
             return;
         }
+        self.membership_state = Some(membership_state);
+        self.membership_directory = membership_directory;
 
-        if let Some(exit_node) = &self.selected_exit_node
+        if self.auto_tunnel_enforce {
+            self.selected_exit_node = auto_exit;
+            self.lan_access_enabled = auto_lan_access;
+            self.controller.set_lan_access(auto_lan_access);
+            self.last_applied_assignment = auto_watermark;
+        } else if let Some(exit_node) = &self.selected_exit_node
             && let Ok(node_id) = NodeId::new(exit_node.clone())
         {
             let _ = self
@@ -462,34 +875,72 @@ impl DaemonRuntime {
         if self.is_restricted() && command.is_mutating() {
             return IpcResponse::err("daemon is in restricted-safe mode");
         }
+        if self.auto_tunnel_enforce
+            && matches!(
+                command,
+                IpcCommand::ExitNodeSelect(_)
+                    | IpcCommand::ExitNodeOff
+                    | IpcCommand::LanAccessOn
+                    | IpcCommand::LanAccessOff
+                    | IpcCommand::RouteAdvertise(_)
+            )
+        {
+            return IpcResponse::err(
+                "manual route and exit mutations are disabled while auto-tunnel is enforced",
+            );
+        }
 
         match command {
-            IpcCommand::Status => IpcResponse::ok(format!(
-                "node_id={} state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={}",
-                self.local_node_id,
-                self.controller.state(),
-                self.controller.generation(),
-                self.selected_exit_node.as_deref().unwrap_or("none"),
-                if self.lan_access_enabled { "on" } else { "off" },
-                if self.is_restricted() {
-                    "true"
-                } else {
-                    "false"
-                },
-                self.restriction_mode,
-                self.bootstrap_error.as_deref().unwrap_or("none"),
-                self.reconcile_attempts,
-                self.reconcile_failures,
-                self.last_reconcile_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                self.last_reconcile_error.as_deref().unwrap_or("none"),
-                if self.wg_encrypted_private_key_path.is_some() {
-                    "true"
-                } else {
-                    "false"
-                }
-            )),
+            IpcCommand::Status => {
+                let last_assignment = self
+                    .last_applied_assignment
+                    .map(|watermark| format!("{}:{}", watermark.generated_at_unix, watermark.nonce))
+                    .unwrap_or_else(|| "none".to_string());
+                let membership_epoch = self
+                    .membership_state
+                    .as_ref()
+                    .map(|state| state.epoch.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let membership_active_nodes = self
+                    .membership_state
+                    .as_ref()
+                    .map(|state| state.active_nodes().len().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                IpcResponse::ok(format!(
+                    "node_id={} state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    self.local_node_id,
+                    self.controller.state(),
+                    self.controller.generation(),
+                    self.selected_exit_node.as_deref().unwrap_or("none"),
+                    if self.lan_access_enabled { "on" } else { "off" },
+                    if self.is_restricted() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    self.restriction_mode,
+                    self.bootstrap_error.as_deref().unwrap_or("none"),
+                    self.reconcile_attempts,
+                    self.reconcile_failures,
+                    self.last_reconcile_unix
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    self.last_reconcile_error.as_deref().unwrap_or("none"),
+                    if self.wg_encrypted_private_key_path.is_some() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    if self.auto_tunnel_enforce {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    last_assignment,
+                    membership_epoch,
+                    membership_active_nodes
+                ))
+            }
             IpcCommand::Netcheck => {
                 let transport = if self.controller.state() == DataplaneState::FailClosed {
                     "fail-closed"
@@ -503,6 +954,12 @@ impl DaemonRuntime {
                     Ok(value) => value,
                     Err(err) => return IpcResponse::err(format!("invalid node: {err}")),
                 };
+                if self.membership_directory.node_status(node.as_str()) != MembershipStatus::Active
+                {
+                    return IpcResponse::err(
+                        "exit-node selection denied: node is not active in membership state",
+                    );
+                }
                 match self
                     .controller
                     .set_exit_node(node_id, "user:local", Protocol::Any)
@@ -531,6 +988,13 @@ impl DaemonRuntime {
                 self.controller.set_lan_access(true);
                 self.lan_access_enabled = true;
                 if let Some(exit_node) = &self.selected_exit_node {
+                    if self.membership_directory.node_status(exit_node.as_str())
+                        != MembershipStatus::Active
+                    {
+                        return IpcResponse::err(
+                            "lan-access denied: selected exit node is not active in membership state",
+                        );
+                    }
                     self.controller
                         .set_lan_route_acl("user:local", "192.168.1.0/24", true);
                     if let Ok(node_id) = NodeId::new(exit_node.clone()) {
@@ -564,13 +1028,20 @@ impl DaemonRuntime {
                 if !validate_cidr(&cidr) {
                     return IpcResponse::err("invalid cidr format");
                 }
-                self.advertised_routes.insert(cidr.clone());
                 if let Some(exit_node) = &self.selected_exit_node
                     && let Ok(node_id) = NodeId::new(exit_node.clone())
                 {
+                    if self.membership_directory.node_status(exit_node.as_str())
+                        != MembershipStatus::Active
+                    {
+                        return IpcResponse::err(
+                            "route advertise denied: selected exit node is not active in membership state",
+                        );
+                    }
                     self.controller.advertise_lan_route(node_id, &cidr);
                     self.controller.set_lan_route_acl("user:local", &cidr, true);
                 }
+                self.advertised_routes.insert(cidr.clone());
                 if let Err(err) = self.persist_state() {
                     return IpcResponse::err(format!("persist failed: {err}"));
                 }
@@ -765,28 +1236,116 @@ impl DaemonRuntime {
             }
         };
 
+        let membership_state = match self.load_verified_membership() {
+            Ok(state) => state,
+            Err(err) => {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("membership reconcile failed: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                let _ = self
+                    .controller
+                    .force_fail_closed("membership_reconcile_failed");
+                self.promote_to_permanent_if_over_limit();
+                return;
+            }
+        };
+        let membership_directory = membership_directory_from_state(&membership_state);
+
+        let auto_bundle = if self.auto_tunnel_enforce {
+            match self.load_verified_auto_tunnel(&membership_directory) {
+                Ok(bundle) => Some(bundle),
+                Err(err) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message = format!("auto-tunnel reconcile failed: {err}");
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_recoverable(message);
+                    let _ = self
+                        .controller
+                        .force_fail_closed("auto_tunnel_reconcile_failed");
+                    self.promote_to_permanent_if_over_limit();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let assignment_changed = auto_bundle
+            .as_ref()
+            .map(|envelope| Some(envelope.watermark) != self.last_applied_assignment)
+            .unwrap_or(false);
+        let membership_changed = self
+            .membership_state
+            .as_ref()
+            .map(|current| current.epoch != membership_state.epoch)
+            .unwrap_or(true);
+
         self.last_reconcile_error = None;
 
         if self.controller.state() == DataplaneState::FailClosed
             || self.restriction_mode == RestrictionMode::Recoverable
+            || assignment_changed
+            || membership_changed
         {
+            let (mesh_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
+                if let Some(envelope) = auto_bundle {
+                    let lan_enabled = envelope
+                        .bundle
+                        .routes
+                        .iter()
+                        .any(|route| route.kind == RouteKind::ExitNodeLan);
+                    (
+                        envelope.bundle.mesh_cidr,
+                        envelope.bundle.peers,
+                        envelope.bundle.routes,
+                        envelope.bundle.selected_exit_node,
+                        lan_enabled,
+                        Some(envelope.watermark),
+                    )
+                } else {
+                    (
+                        "100.64.0.0/10".to_string(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        false,
+                        None,
+                    )
+                };
             let apply = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
                     local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    mesh_cidr,
                 },
-                Vec::new(),
-                Vec::new(),
+                peers,
+                routes,
                 ApplyOptions {
                     protected_dns: true,
                     ipv6_parity_supported: false,
-                    exit_mode: self.desired_exit_mode(),
+                    exit_mode: if self.auto_tunnel_enforce {
+                        if auto_exit.is_some() {
+                            ExitMode::FullTunnel
+                        } else {
+                            ExitMode::Off
+                        }
+                    } else {
+                        self.desired_exit_mode()
+                    },
                 },
             );
 
             match apply {
                 Ok(()) => {
+                    self.membership_state = Some(membership_state);
+                    self.membership_directory = membership_directory;
+                    if self.auto_tunnel_enforce {
+                        self.selected_exit_node = auto_exit;
+                        self.lan_access_enabled = auto_lan_access;
+                        self.controller.set_lan_access(auto_lan_access);
+                        self.last_applied_assignment = auto_watermark;
+                    }
                     self.restriction_mode = RestrictionMode::None;
                     self.bootstrap_error = None;
                     self.reconcile_failures = 0;
@@ -1005,6 +1564,42 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "trust watermark path must be absolute".to_string(),
         ));
     }
+    if !config.membership_snapshot_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "membership snapshot path must be absolute".to_string(),
+        ));
+    }
+    if !config.membership_log_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "membership log path must be absolute".to_string(),
+        ));
+    }
+    if !config.membership_watermark_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "membership watermark path must be absolute".to_string(),
+        ));
+    }
+    if let Some(path) = config.auto_tunnel_bundle_path.as_ref()
+        && !path.is_absolute()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "auto tunnel bundle path must be absolute".to_string(),
+        ));
+    }
+    if let Some(path) = config.auto_tunnel_verifier_key_path.as_ref()
+        && !path.is_absolute()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "auto tunnel verifier key path must be absolute".to_string(),
+        ));
+    }
+    if let Some(path) = config.auto_tunnel_watermark_path.as_ref()
+        && !path.is_absolute()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "auto tunnel watermark path must be absolute".to_string(),
+        ));
+    }
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "wireguard interface must not be empty".to_string(),
@@ -1028,6 +1623,35 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.trust_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
             "trust watermark path must not be empty".to_string(),
+        ));
+    }
+    if config.membership_snapshot_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "membership snapshot path must not be empty".to_string(),
+        ));
+    }
+    if config.membership_log_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "membership log path must not be empty".to_string(),
+        ));
+    }
+    if config.membership_watermark_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "membership watermark path must not be empty".to_string(),
+        ));
+    }
+    if config.auto_tunnel_max_age_secs == 0 {
+        return Err(DaemonError::InvalidConfig(
+            "auto tunnel max age must be greater than 0".to_string(),
+        ));
+    }
+    if config.auto_tunnel_enforce
+        && (config.auto_tunnel_bundle_path.is_none()
+            || config.auto_tunnel_verifier_key_path.is_none()
+            || config.auto_tunnel_watermark_path.is_none())
+    {
+        return Err(DaemonError::InvalidConfig(
+            "auto tunnel enforce requires bundle, verifier key, and watermark paths".to_string(),
         ));
     }
     if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
@@ -1110,9 +1734,63 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             DaemonError::InvalidConfig(format!("trust watermark directory create failed: {err}"))
         })?;
     }
+    if let Some(parent) = config.membership_snapshot_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!(
+                "membership snapshot directory create failed: {err}"
+            ))
+        })?;
+    }
+    if let Some(parent) = config.membership_log_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("membership log directory create failed: {err}"))
+        })?;
+    }
+    if let Some(parent) = config.membership_watermark_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!(
+                "membership watermark directory create failed: {err}"
+            ))
+        })?;
+    }
+    if config.auto_tunnel_enforce
+        && let Some(path) = config.auto_tunnel_bundle_path.as_ref()
+        && let Some(parent) = path.parent()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("auto tunnel bundle directory create failed: {err}"))
+        })?;
+    }
+    if config.auto_tunnel_enforce
+        && let Some(path) = config.auto_tunnel_watermark_path.as_ref()
+        && let Some(parent) = path.parent()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!(
+                "auto tunnel watermark directory create failed: {err}"
+            ))
+        })?;
+    }
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
+    validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
+    validate_membership_log_permissions(&config.membership_log_path)?;
+    if config.auto_tunnel_enforce {
+        let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
+            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_string())
+        })?;
+        let verifier_key_path = config
+            .auto_tunnel_verifier_key_path
+            .as_ref()
+            .ok_or_else(|| {
+                DaemonError::InvalidConfig(
+                    "auto tunnel enforce requires verifier key path".to_string(),
+                )
+            })?;
+        validate_auto_tunnel_bundle_permissions(bundle_path)?;
+        validate_auto_tunnel_verifier_key_permissions(verifier_key_path)?;
+    }
     if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
         if let Some(path) = config.wg_private_key_path.as_ref() {
             validate_private_key_permissions(path)?;
@@ -1138,6 +1816,48 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         watermark,
     )
     .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;
+    let membership_snapshot =
+        load_membership_snapshot(&config.membership_snapshot_path).map_err(|err| {
+            DaemonError::InvalidConfig(format!("membership snapshot preflight failed: {err}"))
+        })?;
+    let membership_entries = load_membership_log(&config.membership_log_path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("membership log preflight failed: {err}"))
+    })?;
+    let _ =
+        replay_membership_snapshot_and_log(&membership_snapshot, &membership_entries, unix_now())
+            .map_err(|err| {
+            DaemonError::InvalidConfig(format!("membership replay preflight failed: {err}"))
+        })?;
+
+    if config.auto_tunnel_enforce {
+        let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
+            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_string())
+        })?;
+        let verifier_key_path = config
+            .auto_tunnel_verifier_key_path
+            .as_ref()
+            .ok_or_else(|| {
+                DaemonError::InvalidConfig(
+                    "auto tunnel enforce requires verifier key path".to_string(),
+                )
+            })?;
+        let watermark_path = config.auto_tunnel_watermark_path.as_ref().ok_or_else(|| {
+            DaemonError::InvalidConfig("auto tunnel enforce requires watermark path".to_string())
+        })?;
+        let watermark = load_auto_tunnel_watermark(watermark_path).map_err(|err| {
+            DaemonError::InvalidConfig(format!("auto tunnel watermark preflight failed: {err}"))
+        })?;
+        let _ = load_auto_tunnel_bundle(
+            bundle_path,
+            verifier_key_path,
+            config.auto_tunnel_max_age_secs,
+            TrustPolicy::default(),
+            watermark,
+        )
+        .map_err(|err| {
+            DaemonError::InvalidConfig(format!("auto tunnel preflight failed: {err}"))
+        })?;
+    }
 
     let mut system = daemon_system(config)?;
     system
@@ -1165,6 +1885,26 @@ fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
 #[cfg(not(target_os = "linux"))]
 fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "wireguard public key", 0o022)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_membership_snapshot_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "membership snapshot", 0o077)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_membership_snapshot_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "membership snapshot", 0o077)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "membership log", 0o077)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "membership log", 0o077)
 }
 
 fn load_trust_evidence(
@@ -1458,6 +2198,484 @@ fn persist_trust_watermark(
     Ok(())
 }
 
+fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut version: Option<u8> = None;
+    let mut epoch: Option<u64> = None;
+    let mut state_root: Option<String> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err("membership watermark line missing key/value separator".to_string());
+        };
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "epoch" => {
+                epoch = value.parse::<u64>().ok();
+            }
+            "state_root" => {
+                state_root = Some(value.to_string());
+            }
+            _ => return Err(format!("unknown membership watermark key {key}")),
+        }
+    }
+    if version != Some(1) {
+        return Err("unsupported membership watermark version".to_string());
+    }
+    Ok(Some(MembershipWatermark {
+        epoch: epoch.ok_or_else(|| "missing membership watermark epoch".to_string())?,
+        state_root: state_root
+            .ok_or_else(|| "missing membership watermark state_root".to_string())?,
+    }))
+}
+
+fn persist_membership_watermark(
+    path: &Path,
+    watermark: &MembershipWatermark,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let payload = format!(
+        "version=1\nepoch={}\nstate_root={}\n",
+        watermark.epoch, watermark.state_root
+    );
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options.open(&temp_path).map_err(|err| err.to_string())?;
+    temp.write_all(payload.as_bytes())
+        .map_err(|err| err.to_string())?;
+    temp.sync_all().map_err(|err| err.to_string())?;
+    fs::rename(&temp_path, path).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn load_auto_tunnel_bundle(
+    path: &Path,
+    verifier_key_path: &Path,
+    max_age_secs: u64,
+    trust_policy: TrustPolicy,
+    previous_watermark: Option<AutoTunnelWatermark>,
+) -> Result<AutoTunnelBundleEnvelope, AutoTunnelBootstrapError> {
+    if !path.exists() {
+        return Err(AutoTunnelBootstrapError::Missing);
+    }
+
+    let verifying_key = load_auto_tunnel_verifying_key(verifier_key_path)?;
+    let content =
+        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+
+    let mut payload = String::new();
+    let mut signature_hex: Option<String> = None;
+    let mut fields = std::collections::HashMap::new();
+
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "line missing key/value separator".to_string(),
+            ));
+        };
+        if key == "signature" {
+            signature_hex = Some(value.to_string());
+            continue;
+        }
+        payload.push_str(line);
+        payload.push('\n');
+        if fields.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "duplicate key {key}"
+            )));
+        }
+    }
+
+    let version = fields
+        .get("version")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing version".to_string()))?;
+    if version != "1" {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "unsupported bundle version".to_string(),
+        ));
+    }
+
+    let node_id = fields
+        .get("node_id")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing node_id".to_string()))?
+        .to_string();
+    NodeId::new(node_id.clone())
+        .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
+
+    let mesh_cidr = fields
+        .get("mesh_cidr")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing mesh_cidr".to_string()))?
+        .to_string();
+    if !is_valid_ipv4_or_ipv6_cidr(&mesh_cidr) {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "invalid mesh_cidr".to_string(),
+        ));
+    }
+
+    let assigned_cidr = fields.get("assigned_cidr").ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_string())
+    })?;
+    if !is_valid_ipv4_or_ipv6_cidr(assigned_cidr) {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "invalid assigned_cidr".to_string(),
+        ));
+    }
+
+    let generated_at_unix = fields
+        .get("generated_at_unix")
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing generated_at_unix".to_string())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            AutoTunnelBootstrapError::InvalidFormat("invalid generated_at_unix".to_string())
+        })?;
+    let expires_at_unix = fields
+        .get("expires_at_unix")
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing expires_at_unix".to_string())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            AutoTunnelBootstrapError::InvalidFormat("invalid expires_at_unix".to_string())
+        })?;
+    if generated_at_unix >= expires_at_unix {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "invalid generated/expires ordering".to_string(),
+        ));
+    }
+
+    let nonce = fields
+        .get("nonce")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing nonce".to_string()))?
+        .parse::<u64>()
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid nonce".to_string()))?;
+
+    let signature_hex = signature_hex.ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing bundle signature".to_string())
+    })?;
+    let signature_bytes = decode_auto_tunnel_hex_to_fixed::<64>(&signature_hex)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| AutoTunnelBootstrapError::SignatureInvalid)?;
+
+    let now = unix_now();
+    if generated_at_unix > now.saturating_add(trust_policy.max_clock_skew_secs) {
+        return Err(AutoTunnelBootstrapError::FutureDated);
+    }
+    if now > expires_at_unix || now.saturating_sub(generated_at_unix) > max_age_secs {
+        return Err(AutoTunnelBootstrapError::Stale);
+    }
+
+    let watermark = AutoTunnelWatermark {
+        generated_at_unix,
+        nonce,
+    };
+    if previous_watermark
+        .map(|existing| watermark <= existing)
+        .unwrap_or(false)
+    {
+        return Err(AutoTunnelBootstrapError::ReplayDetected);
+    }
+
+    let peer_count = fields
+        .get("peer_count")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing peer_count".to_string()))?
+        .parse::<usize>()
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid peer_count".to_string()))?;
+    let mut peers = Vec::with_capacity(peer_count);
+    for index in 0..peer_count {
+        let node_id_key = format!("peer.{index}.node_id");
+        let endpoint_key = format!("peer.{index}.endpoint");
+        let public_key_key = format!("peer.{index}.public_key_hex");
+        let allowed_ips_key = format!("peer.{index}.allowed_ips");
+
+        let peer_node = fields.get(&node_id_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {node_id_key}"))
+        })?;
+        let peer_node_id = NodeId::new(peer_node.clone())
+            .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
+
+        let endpoint_raw = fields.get(&endpoint_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {endpoint_key}"))
+        })?;
+        let endpoint = endpoint_raw.parse::<std::net::SocketAddr>().map_err(|_| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("invalid endpoint {endpoint_key}"))
+        })?;
+
+        let public_key_hex = fields.get(&public_key_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {public_key_key}"))
+        })?;
+        let public_key = decode_auto_tunnel_hex_to_fixed::<32>(public_key_hex)?;
+
+        let allowed_ips_raw = fields.get(&allowed_ips_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {allowed_ips_key}"))
+        })?;
+        let allowed_ips = allowed_ips_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if allowed_ips.is_empty()
+            || allowed_ips
+                .iter()
+                .any(|cidr| !is_valid_ipv4_or_ipv6_cidr(cidr))
+        {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "invalid allowed_ips for peer {index}"
+            )));
+        }
+
+        peers.push(PeerConfig {
+            node_id: peer_node_id,
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: endpoint.ip(),
+                port: endpoint.port(),
+            },
+            public_key,
+            allowed_ips,
+        });
+    }
+
+    let route_count = fields
+        .get("route_count")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing route_count".to_string()))?
+        .parse::<usize>()
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid route_count".to_string()))?;
+    let mut routes = Vec::with_capacity(route_count);
+    let mut selected_exit_node: Option<String> = None;
+    for index in 0..route_count {
+        let destination_key = format!("route.{index}.destination_cidr");
+        let via_node_key = format!("route.{index}.via_node");
+        let kind_key = format!("route.{index}.kind");
+
+        let destination_cidr = fields.get(&destination_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {destination_key}"))
+        })?;
+        if !is_valid_ipv4_or_ipv6_cidr(destination_cidr) {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "invalid destination cidr for route {index}"
+            )));
+        }
+        let via_node_raw = fields.get(&via_node_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {via_node_key}"))
+        })?;
+        let via_node = NodeId::new(via_node_raw.clone())
+            .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
+        let kind = match fields.get(&kind_key).map(String::as_str) {
+            Some("mesh") => RouteKind::Mesh,
+            Some("exit_lan") => RouteKind::ExitNodeLan,
+            Some("exit_default") => RouteKind::ExitNodeDefault,
+            _ => {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                    "invalid route kind for route {index}"
+                )));
+            }
+        };
+        if matches!(kind, RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan) {
+            let via = via_node.as_str().to_string();
+            if let Some(existing) = selected_exit_node.as_deref()
+                && existing != via
+            {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(
+                    "exit routes reference multiple exit nodes".to_string(),
+                ));
+            }
+            selected_exit_node = Some(via);
+        }
+
+        routes.push(Route {
+            destination_cidr: destination_cidr.clone(),
+            via_node,
+            kind,
+        });
+    }
+
+    Ok(AutoTunnelBundleEnvelope {
+        bundle: AutoTunnelBundle {
+            node_id,
+            mesh_cidr,
+            peers,
+            routes,
+            selected_exit_node,
+        },
+        watermark,
+    })
+}
+
+fn load_auto_tunnel_verifying_key(path: &Path) -> Result<VerifyingKey, AutoTunnelBootstrapError> {
+    let content =
+        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    let key_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing verifier key".to_string())
+        })?;
+    let key_bytes = decode_auto_tunnel_hex_to_fixed::<32>(key_line)?;
+    VerifyingKey::from_bytes(&key_bytes).map_err(|_| AutoTunnelBootstrapError::KeyInvalid)
+}
+
+fn decode_auto_tunnel_hex_to_fixed<const N: usize>(
+    encoded: &str,
+) -> Result<[u8; N], AutoTunnelBootstrapError> {
+    let mut bytes = [0u8; N];
+    let trimmed = encoded.trim();
+    if trimmed.len() != N * 2 {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "unexpected hex length".to_string(),
+        ));
+    }
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < N {
+        let hi = decode_auto_tunnel_hex_nibble(raw[index * 2])?;
+        let lo = decode_auto_tunnel_hex_nibble(raw[index * 2 + 1])?;
+        bytes[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
+fn decode_auto_tunnel_hex_nibble(value: u8) -> Result<u8, AutoTunnelBootstrapError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(AutoTunnelBootstrapError::InvalidFormat(
+            "invalid hex character".to_string(),
+        )),
+    }
+}
+
+fn load_auto_tunnel_watermark(
+    path: &Path,
+) -> Result<Option<AutoTunnelWatermark>, AutoTunnelBootstrapError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    let mut version: Option<u8> = None;
+    let mut generated_at_unix: Option<u64> = None;
+    let mut nonce: Option<u64> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "watermark line missing key/value separator".to_string(),
+            ));
+        };
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "generated_at_unix" => {
+                generated_at_unix = value.parse::<u64>().ok();
+            }
+            "nonce" => {
+                nonce = value.parse::<u64>().ok();
+            }
+            _ => {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                    "unknown watermark key {key}"
+                )));
+            }
+        }
+    }
+    if version != Some(1) {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "unsupported watermark version".to_string(),
+        ));
+    }
+    Ok(Some(AutoTunnelWatermark {
+        generated_at_unix: generated_at_unix.ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(
+                "missing watermark generated_at_unix".to_string(),
+            )
+        })?,
+        nonce: nonce.ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        })?,
+    }))
+}
+
+fn persist_auto_tunnel_watermark(
+    path: &Path,
+    watermark: AutoTunnelWatermark,
+) -> Result<(), AutoTunnelBootstrapError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    }
+    let payload = format!(
+        "version=1\ngenerated_at_unix={}\nnonce={}\n",
+        watermark.generated_at_unix, watermark.nonce
+    );
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    temp.write_all(payload.as_bytes())
+        .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    temp.sync_all()
+        .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    fs::rename(&temp_path, path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    Ok(())
+}
+
+fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
+    let Some((ip_part, prefix_part)) = value.split_once('/') else {
+        return false;
+    };
+    if ip_part.parse::<std::net::IpAddr>().is_err() {
+        return false;
+    }
+    let Ok(prefix) = prefix_part.parse::<u8>() else {
+        return false;
+    };
+    if ip_part.contains(':') {
+        prefix <= 128
+    } else {
+        prefix <= 32
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "trust evidence", 0o022)
@@ -1466,6 +2684,26 @@ fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
 #[cfg(not(target_os = "linux"))]
 fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "trust evidence", 0o022)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_auto_tunnel_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "auto tunnel bundle", 0o077)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_auto_tunnel_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "auto tunnel bundle", 0o077)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "auto tunnel verifier key", 0o022)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "auto tunnel verifier key", 0o022)
 }
 
 #[cfg(target_os = "linux")]
@@ -1570,15 +2808,37 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn membership_directory_from_state(state: &MembershipState) -> MembershipDirectory {
+    let mut directory = MembershipDirectory::default();
+    for node in &state.nodes {
+        let status = match node.status {
+            MembershipNodeStatus::Active => MembershipStatus::Active,
+            MembershipNodeStatus::Revoked | MembershipNodeStatus::Quarantined => {
+                MembershipStatus::Revoked
+            }
+        };
+        directory.set_node_status(node.node_id.clone(), status);
+    }
+    directory
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::Path;
 
     use ed25519_dalek::{Signer, SigningKey};
+    use rustynet_control::membership::{
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
+        persist_membership_snapshot,
+    };
 
     use super::{
-        DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, TrustEvidenceRecord,
-        TrustWatermark, persist_trust_watermark, trust_evidence_payload, unix_now,
+        AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand,
+        TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
+        persist_trust_watermark, trust_evidence_payload, unix_now,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -1613,6 +2873,107 @@ mod tests {
         .expect("trust file should be written");
     }
 
+    fn write_auto_tunnel_file(
+        path: &Path,
+        verifier_path: &Path,
+        node_id: &str,
+        nonce: u64,
+        tamper_after_sign: bool,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("auto tunnel verifier key should be written");
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(300);
+        let peer_public = hex_encode(&[9u8; 32]);
+        let payload = format!(
+            "version=1\nnode_id={node_id}\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.endpoint=203.0.113.20:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=1\nroute.0.destination_cidr=0.0.0.0/0\nroute.0.via_node=node-exit\nroute.0.kind=exit_default\n"
+        );
+        let signature = signing_key.sign(payload.as_bytes());
+        let mut body = format!(
+            "{}signature={}\n",
+            payload,
+            hex_encode(&signature.to_bytes())
+        );
+        if tamper_after_sign {
+            body = body.replace("route_count=1", "route_count=2");
+        }
+        std::fs::write(path, body).expect("auto tunnel file should be written");
+    }
+
+    fn write_membership_files(snapshot_path: &Path, log_path: &Path, local_node_id: &str) {
+        write_membership_files_with_exit_status(
+            snapshot_path,
+            log_path,
+            local_node_id,
+            MembershipNodeStatus::Active,
+        );
+    }
+
+    fn write_membership_files_with_exit_status(
+        snapshot_path: &Path,
+        log_path: &Path,
+        local_node_id: &str,
+        exit_status: MembershipNodeStatus,
+    ) {
+        let owner_signing = SigningKey::from_bytes(&[7; 32]);
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_string(),
+            epoch: 1,
+            nodes: vec![
+                MembershipNode {
+                    node_id: local_node_id.to_string(),
+                    node_pubkey_hex: hex_encode(&[9; 32]),
+                    owner: "owner@example.local".to_string(),
+                    status: MembershipNodeStatus::Active,
+                    roles: vec!["tag:servers".to_string()],
+                    joined_at_unix: 100,
+                    updated_at_unix: 100,
+                },
+                MembershipNode {
+                    node_id: "node-exit".to_string(),
+                    node_pubkey_hex: hex_encode(&[11; 32]),
+                    owner: "owner@example.local".to_string(),
+                    status: exit_status,
+                    roles: vec!["tag:exit".to_string()],
+                    joined_at_unix: 100,
+                    updated_at_unix: 100,
+                },
+            ],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_string(),
+                approver_pubkey_hex: hex_encode(owner_signing.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        persist_membership_snapshot(snapshot_path, &state)
+            .expect("membership snapshot should be written");
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).expect("membership log parent should exist");
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(log_path)
+            .expect("membership log should be opened");
+        file.write_all(b"version=1\n")
+            .expect("membership log should be written");
+    }
+
     #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
         let unique = format!(
@@ -1626,13 +2987,26 @@ mod tests {
         let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
         let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
         let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
         write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
 
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path.clone(),
             trust_verifier_key_path: trust_verifier_path.clone(),
             trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -1660,6 +3034,9 @@ mod tests {
         let _ = std::fs::remove_file(trust_path);
         let _ = std::fs::remove_file(trust_verifier_path);
         let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
     }
 
     #[test]
@@ -1675,11 +3052,24 @@ mod tests {
         let trust_path = std::env::temp_dir().join(format!("{unique}.missing.trust"));
         let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.missing.pub"));
         let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path,
             trust_verifier_key_path: trust_verifier_path,
             trust_watermark_path,
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -1691,6 +3081,63 @@ mod tests {
         assert!(response.message.contains("restricted-safe"));
 
         let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+    }
+
+    #[test]
+    fn daemon_runtime_denies_exit_selection_for_revoked_membership_node() {
+        let unique = format!(
+            "rustynetd-runtime-membership-revoked-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_exit_status(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            MembershipNodeStatus::Revoked,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(!denied.ok);
+        assert!(denied.message.contains("not active in membership state"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
     }
 
     #[test]
@@ -1706,7 +3153,17 @@ mod tests {
         let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
         let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
         let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
         write_trust_file(&trust_path, &trust_verifier_path, 2);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
         persist_trust_watermark(
             &trust_watermark_path,
             TrustWatermark {
@@ -1721,6 +3178,9 @@ mod tests {
             trust_evidence_path: trust_path.clone(),
             trust_verifier_key_path: trust_verifier_path.clone(),
             trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -1735,5 +3195,187 @@ mod tests {
         let _ = std::fs::remove_file(trust_path);
         let _ = std::fs::remove_file(trust_verifier_path);
         let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_enforcement_applies_and_blocks_manual_mutations() {
+        let unique = format!(
+            "rustynetd-runtime-auto-tunnel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.trust.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let assignment_path = std::env::temp_dir().join(format!("{unique}.assignment"));
+        let assignment_verifier_path =
+            std::env::temp_dir().join(format!("{unique}.assignment.pub"));
+        let assignment_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.assignment.watermark"));
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("auto_tunnel_enforce=true"));
+        assert!(status.message.contains("last_assignment="));
+
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(!denied.ok);
+        assert!(
+            denied
+                .message
+                .contains("disabled while auto-tunnel is enforced")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_tamper_and_replay_fail_closed() {
+        let unique = format!(
+            "rustynetd-runtime-auto-tunnel-reject-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
+        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
+        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
+        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.trust.watermark"));
+        let membership_snapshot_path =
+            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
+        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
+        let membership_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let assignment_path = std::env::temp_dir().join(format!("{unique}.assignment"));
+        let assignment_verifier_path =
+            std::env::temp_dir().join(format!("{unique}.assignment.pub"));
+        let assignment_watermark_path =
+            std::env::temp_dir().join(format!("{unique}.assignment.watermark"));
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            true,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("restricted_safe_mode=true"));
+
+        let denied = runtime.handle_command(IpcCommand::ExitNodeOff);
+        assert!(!denied.ok);
+        assert!(denied.message.contains("restricted-safe"));
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            2,
+            false,
+        );
+        persist_auto_tunnel_watermark(
+            &assignment_watermark_path,
+            AutoTunnelWatermark {
+                generated_at_unix: unix_now().saturating_add(10),
+                nonce: 99,
+            },
+        )
+        .expect("assignment watermark should be persisted");
+        let mut replay_runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        replay_runtime.bootstrap();
+
+        let replay_status = replay_runtime.handle_command(IpcCommand::Status);
+        assert!(replay_status.ok);
+        assert!(replay_status.message.contains("restricted_safe_mode=true"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
     }
 }

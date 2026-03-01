@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 rustynet-backend-api = { path = "../rustynet-backend-api" }
 rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
+rustynet-control = { path = "../rustynet-control" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 ed25519-dalek = "2"

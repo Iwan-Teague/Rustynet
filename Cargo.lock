@@ -490,6 +490,8 @@ dependencies = [
 name = "rustynet-cli"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "rustynet-control",
  "rustynetd",
 ]
 
@@ -497,6 +499,7 @@ dependencies = [
 name = "rustynet-control"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "rusqlite",
  "rustynet-crypto",
  "rustynet-policy",
@@ -529,6 +532,7 @@ dependencies = [
  "nix",
  "rustynet-backend-api",
  "rustynet-backend-wireguard",
+ "rustynet-control",
  "rustynet-crypto",
  "rustynet-policy",
  "sha2",

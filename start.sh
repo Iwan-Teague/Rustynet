@@ -12,6 +12,11 @@ STATE_PATH="/var/lib/rustynet/rustynetd.state"
 TRUST_EVIDENCE_PATH="/var/lib/rustynet/rustynetd.trust"
 TRUST_VERIFIER_KEY_PATH="/etc/rustynet/trust-evidence.pub"
 TRUST_WATERMARK_PATH="/var/lib/rustynet/rustynetd.trust.watermark"
+AUTO_TUNNEL_ENFORCE="0"
+AUTO_TUNNEL_BUNDLE_PATH="/var/lib/rustynet/rustynetd.assignment"
+AUTO_TUNNEL_VERIFIER_KEY_PATH="/etc/rustynet/assignment.pub"
+AUTO_TUNNEL_WATERMARK_PATH="/var/lib/rustynet/rustynetd.assignment.watermark"
+AUTO_TUNNEL_MAX_AGE_SECS="300"
 WG_INTERFACE="rustynet0"
 WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/etc/rustynet/wireguard.key.enc"
@@ -85,6 +90,11 @@ save_config() {
     printf 'TRUST_EVIDENCE_PATH=%q\n' "${TRUST_EVIDENCE_PATH}"
     printf 'TRUST_VERIFIER_KEY_PATH=%q\n' "${TRUST_VERIFIER_KEY_PATH}"
     printf 'TRUST_WATERMARK_PATH=%q\n' "${TRUST_WATERMARK_PATH}"
+    printf 'AUTO_TUNNEL_ENFORCE=%q\n' "${AUTO_TUNNEL_ENFORCE}"
+    printf 'AUTO_TUNNEL_BUNDLE_PATH=%q\n' "${AUTO_TUNNEL_BUNDLE_PATH}"
+    printf 'AUTO_TUNNEL_VERIFIER_KEY_PATH=%q\n' "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
+    printf 'AUTO_TUNNEL_WATERMARK_PATH=%q\n' "${AUTO_TUNNEL_WATERMARK_PATH}"
+    printf 'AUTO_TUNNEL_MAX_AGE_SECS=%q\n' "${AUTO_TUNNEL_MAX_AGE_SECS}"
     printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
     printf 'WG_PRIVATE_KEY_PATH=%q\n' "${WG_PRIVATE_KEY_PATH}"
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%q\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
@@ -261,6 +271,9 @@ prepare_system_directories() {
   run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
   run_root install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
   run_root install -d -m 0700 "$(dirname "${TRUST_WATERMARK_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_BUNDLE_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_WATERMARK_PATH}")"
+  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")"
   run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
   run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
   run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
@@ -425,6 +438,11 @@ write_daemon_environment() {
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
     RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
     RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
+    RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
     RUSTYNET_BACKEND="${BACKEND_MODE}" \
     RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
     RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
@@ -622,6 +640,11 @@ configure_values() {
   prompt_default TRUST_EVIDENCE_PATH "Trust evidence path" "${TRUST_EVIDENCE_PATH}"
   prompt_default TRUST_VERIFIER_KEY_PATH "Trust verifier key path" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default TRUST_WATERMARK_PATH "Trust watermark path" "${TRUST_WATERMARK_PATH}"
+  prompt_default AUTO_TUNNEL_ENFORCE "Enforce centrally signed auto-tunnel bundle (0/1)" "${AUTO_TUNNEL_ENFORCE}"
+  prompt_default AUTO_TUNNEL_BUNDLE_PATH "Auto-tunnel bundle path" "${AUTO_TUNNEL_BUNDLE_PATH}"
+  prompt_default AUTO_TUNNEL_VERIFIER_KEY_PATH "Auto-tunnel verifier key path" "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
+  prompt_default AUTO_TUNNEL_WATERMARK_PATH "Auto-tunnel watermark path" "${AUTO_TUNNEL_WATERMARK_PATH}"
+  prompt_default AUTO_TUNNEL_MAX_AGE_SECS "Auto-tunnel bundle max age (secs)" "${AUTO_TUNNEL_MAX_AGE_SECS}"
   prompt_default WG_INTERFACE "WireGuard interface name" "${WG_INTERFACE}"
   prompt_default WG_PRIVATE_KEY_PATH "WireGuard runtime private key path" "${WG_PRIVATE_KEY_PATH}"
   prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
@@ -659,6 +682,11 @@ Current Rustynet Wizard Configuration
   trust_evidence          : ${TRUST_EVIDENCE_PATH}
   trust_verifier_key      : ${TRUST_VERIFIER_KEY_PATH}
   trust_watermark         : ${TRUST_WATERMARK_PATH}
+  auto_tunnel_enforce     : ${AUTO_TUNNEL_ENFORCE}
+  auto_tunnel_bundle      : ${AUTO_TUNNEL_BUNDLE_PATH}
+  auto_tunnel_verifier_key: ${AUTO_TUNNEL_VERIFIER_KEY_PATH}
+  auto_tunnel_watermark   : ${AUTO_TUNNEL_WATERMARK_PATH}
+  auto_tunnel_max_age_secs: ${AUTO_TUNNEL_MAX_AGE_SECS}
   wg_interface            : ${WG_INTERFACE}
   wg_runtime_private_key  : ${WG_PRIVATE_KEY_PATH}
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}

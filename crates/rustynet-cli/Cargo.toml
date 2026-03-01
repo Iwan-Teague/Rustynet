@@ -6,4 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+rustynet-control = { path = "../rustynet-control" }
 rustynetd = { path = "../rustynetd" }
+ed25519-dalek = "2"

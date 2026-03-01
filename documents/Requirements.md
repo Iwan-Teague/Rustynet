@@ -13,6 +13,8 @@
 - [Phase9.md](./Phase9.md) defines completion readiness, long-term operations, and protocol-agility validation.
 - [phase10.md](./phase10.md) defines production dataplane enablement for real encrypted exit-node traffic and LAN-toggle enforcement.
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) defines mandatory release-blocking security controls and evidence expectations.
+- [MembershipConsensus.md](./MembershipConsensus.md) defines quorum-signed membership governance and tamper-evident membership state verification.
+- [MembershipImplementationPlan.md](./MembershipImplementationPlan.md) defines phased implementation work for quorum-signed membership governance.
 - If a phase document conflicts with this file, this file takes precedence until requirements are explicitly updated.
 - Any new phase capability that changes product behavior must be reflected back into this file.
 

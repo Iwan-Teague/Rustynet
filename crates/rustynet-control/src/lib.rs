@@ -2,16 +2,19 @@
 
 pub mod admin;
 pub mod ga;
+pub mod membership;
 pub mod operations;
 pub mod persistence;
 pub mod scale;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rustynet_policy::PolicySet;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1081,6 +1084,7 @@ pub struct NodeMetadata {
     pub os: String,
     pub tags: Vec<String>,
     pub owner: String,
+    pub endpoint: String,
     pub last_seen_unix: u64,
     pub public_key: [u8; 32],
 }
@@ -1116,6 +1120,7 @@ pub struct EnrollmentRequest {
     pub os: String,
     pub tags: Vec<String>,
     pub owner: String,
+    pub endpoint: String,
     pub public_key: [u8; 32],
     pub now_unix: u64,
 }
@@ -1131,6 +1136,48 @@ pub struct SignedPeerMap {
     pub payload: String,
     pub signature: String,
     pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTunnelRouteKind {
+    Mesh,
+    ExitNodeLan,
+    ExitNodeDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTunnelPeer {
+    pub node_id: String,
+    pub endpoint: String,
+    pub public_key: [u8; 32],
+    pub allowed_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTunnelRoute {
+    pub destination_cidr: String,
+    pub via_node: String,
+    pub kind: AutoTunnelRouteKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTunnelBundleRequest {
+    pub node_id: String,
+    pub generated_at_unix: u64,
+    pub ttl_secs: u64,
+    pub nonce: u64,
+    pub mesh_cidr: String,
+    pub exit_node_id: Option<String>,
+    pub lan_routes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAutoTunnelBundle {
+    pub payload: String,
+    pub signature_hex: String,
+    pub generated_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub node_id: String,
 }
 
 #[derive(Debug)]
@@ -1259,10 +1306,18 @@ pub struct ControlPlaneCore {
     pub policy: PolicySet,
     transport_policy: ControlPlaneTransportPolicy,
     signing_secret: Vec<u8>,
+    assignment_signing_key: SigningKey,
+    assignment_verifying_key: [u8; 32],
+    assigned_tunnel_cidrs: Mutex<HashMap<String, String>>,
 }
 
 impl ControlPlaneCore {
     pub fn new(signing_secret: Vec<u8>, policy: PolicySet) -> Self {
+        let digest = Sha256::digest(signing_secret.as_slice());
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&digest[..32]);
+        let assignment_signing_key = SigningKey::from_bytes(&seed);
+        let assignment_verifying_key = *assignment_signing_key.verifying_key().as_bytes();
         Self {
             auth_guard: AuthSurfaceGuard::default(),
             credentials: ThrowawayCredentialStore::default(),
@@ -1270,6 +1325,9 @@ impl ControlPlaneCore {
             policy,
             transport_policy: ControlPlaneTransportPolicy::default(),
             signing_secret,
+            assignment_signing_key,
+            assignment_verifying_key,
+            assigned_tunnel_cidrs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1302,6 +1360,7 @@ impl ControlPlaneCore {
             os: request.os,
             tags: request.tags,
             owner: request.owner.clone(),
+            endpoint: request.endpoint,
             last_seen_unix: request.now_unix,
             public_key: request.public_key,
         };
@@ -1416,6 +1475,193 @@ impl ControlPlaneCore {
         self.sign_payload(&map.payload) == map.signature
     }
 
+    pub fn assignment_verifier_key_hex(&self) -> String {
+        hex_bytes(&self.assignment_verifying_key)
+    }
+
+    pub fn signed_auto_tunnel_bundle(
+        &self,
+        request: AutoTunnelBundleRequest,
+    ) -> Result<SignedAutoTunnelBundle, ControlPlaneError> {
+        if request.ttl_secs == 0 {
+            return Err(ControlPlaneError::Assignment(
+                "auto-tunnel ttl must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs > 24 * 60 * 60 {
+            return Err(ControlPlaneError::Assignment(
+                "auto-tunnel ttl exceeds max supported value".to_string(),
+            ));
+        }
+        if !is_valid_ipv4_or_ipv6_cidr(&request.mesh_cidr) {
+            return Err(ControlPlaneError::Assignment(
+                "mesh cidr is invalid".to_string(),
+            ));
+        }
+
+        let target = self.nodes.get(&request.node_id)?.ok_or_else(|| {
+            ControlPlaneError::Assignment("requested node does not exist".to_string())
+        })?;
+        if target.endpoint.parse::<SocketAddr>().is_err() {
+            return Err(ControlPlaneError::Assignment(
+                "requested node endpoint is invalid".to_string(),
+            ));
+        }
+
+        let target_cidr = self.assign_tunnel_cidr(&target.node_id)?;
+        let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
+
+        let mut peers = self.nodes.list()?;
+        peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+        let mut bundle_peers = Vec::new();
+        let mut bundle_routes = Vec::new();
+        for peer in peers
+            .iter()
+            .filter(|candidate| candidate.node_id != target.node_id)
+        {
+            if !self.policy_allows_node_pair(&target, peer) {
+                continue;
+            }
+            if peer.endpoint.parse::<SocketAddr>().is_err() {
+                continue;
+            }
+
+            let peer_cidr = self.assign_tunnel_cidr(&peer.node_id)?;
+            bundle_peers.push(AutoTunnelPeer {
+                node_id: peer.node_id.clone(),
+                endpoint: peer.endpoint.clone(),
+                public_key: peer.public_key,
+                allowed_ips: vec![peer_cidr.clone()],
+            });
+            bundle_routes.push(AutoTunnelRoute {
+                destination_cidr: peer_cidr,
+                via_node: peer.node_id.clone(),
+                kind: AutoTunnelRouteKind::Mesh,
+            });
+        }
+
+        if let Some(exit_node_id) = request.exit_node_id.as_deref() {
+            let exit_node = self.nodes.get(exit_node_id)?.ok_or_else(|| {
+                ControlPlaneError::Assignment("exit node does not exist".to_string())
+            })?;
+            if !self.policy_allows_node_pair(&target, &exit_node) {
+                return Err(ControlPlaneError::Assignment(
+                    "exit node denied by policy".to_string(),
+                ));
+            }
+            bundle_routes.push(AutoTunnelRoute {
+                destination_cidr: "0.0.0.0/0".to_string(),
+                via_node: exit_node.node_id.clone(),
+                kind: AutoTunnelRouteKind::ExitNodeDefault,
+            });
+            for cidr in &request.lan_routes {
+                if !is_valid_ipv4_or_ipv6_cidr(cidr) {
+                    return Err(ControlPlaneError::Assignment(
+                        "lan route cidr is invalid".to_string(),
+                    ));
+                }
+                bundle_routes.push(AutoTunnelRoute {
+                    destination_cidr: cidr.clone(),
+                    via_node: exit_node.node_id.clone(),
+                    kind: AutoTunnelRouteKind::ExitNodeLan,
+                });
+            }
+        }
+
+        let payload = serialize_auto_tunnel_payload(
+            &AutoTunnelPayloadHeader {
+                node_id: &target.node_id,
+                mesh_cidr: &request.mesh_cidr,
+                assigned_cidr: &target_cidr,
+                generated_at_unix: request.generated_at_unix,
+                expires_at_unix,
+                nonce: request.nonce,
+            },
+            &bundle_peers,
+            &bundle_routes,
+        );
+        let signature = self.assignment_signing_key.sign(payload.as_bytes());
+
+        Ok(SignedAutoTunnelBundle {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            generated_at_unix: request.generated_at_unix,
+            expires_at_unix,
+            node_id: request.node_id,
+        })
+    }
+
+    pub fn verify_signed_auto_tunnel_bundle(&self, bundle: &SignedAutoTunnelBundle) -> bool {
+        if bundle.generated_at_unix > bundle.expires_at_unix {
+            return false;
+        }
+        let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
+            Ok(bytes) => bytes,
+            Err(()) => return false,
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let verifying_key = match VerifyingKey::from_bytes(&self.assignment_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verifying_key
+            .verify(bundle.payload.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    pub fn signed_auto_tunnel_bundle_to_wire(bundle: &SignedAutoTunnelBundle) -> String {
+        format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
+    }
+
+    fn assign_tunnel_cidr(&self, node_id: &str) -> Result<String, ControlPlaneError> {
+        let mut guard = self
+            .assigned_tunnel_cidrs
+            .lock()
+            .map_err(|_| ControlPlaneError::Internal)?;
+        if let Some(existing) = guard.get(node_id) {
+            return Ok(existing.clone());
+        }
+
+        const MAX_OFFSET: u32 = 0x3f_ffff;
+        let mut offset = 1u32;
+        while offset <= MAX_OFFSET {
+            let second_octet = 64 + ((offset >> 16) & 0x3f);
+            let third_octet = (offset >> 8) & 0xff;
+            let fourth_octet = offset & 0xff;
+            let cidr = format!("100.{second_octet}.{third_octet}.{fourth_octet}/32");
+            if !guard.values().any(|assigned| assigned == &cidr) {
+                guard.insert(node_id.to_string(), cidr.clone());
+                return Ok(cidr);
+            }
+            offset = offset.saturating_add(1);
+        }
+
+        Err(ControlPlaneError::Assignment(
+            "no available tunnel cidr assignment remains".to_string(),
+        ))
+    }
+
+    fn policy_allows_node_pair(&self, source: &NodeMetadata, destination: &NodeMetadata) -> bool {
+        let source_selectors = selectors_for_node(source);
+        let destination_selectors = selectors_for_node(destination);
+        for src in &source_selectors {
+            for dst in &destination_selectors {
+                for protocol in [Protocol::Any, Protocol::Udp, Protocol::Tcp] {
+                    let decision = self.policy.evaluate(&AccessRequest {
+                        src: src.clone(),
+                        dst: dst.clone(),
+                        protocol,
+                    });
+                    if decision == PolicyEngineDecision::Allow {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn sign_payload(&self, payload: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.signing_secret.as_slice());
@@ -1431,6 +1677,7 @@ pub enum ControlPlaneError {
     Auth(AuthError),
     Trust(TrustStateError),
     Persistence(persistence::PersistenceError),
+    Assignment(String),
     Internal,
 }
 
@@ -1441,6 +1688,7 @@ impl fmt::Display for ControlPlaneError {
             ControlPlaneError::Auth(err) => write!(f, "auth error: {err}"),
             ControlPlaneError::Trust(err) => write!(f, "trust error: {err}"),
             ControlPlaneError::Persistence(err) => write!(f, "persistence error: {err}"),
+            ControlPlaneError::Assignment(err) => write!(f, "assignment error: {err}"),
             ControlPlaneError::Internal => f.write_str("control-plane internal error"),
         }
     }
@@ -1456,18 +1704,135 @@ fn hex_bytes(bytes: &[u8]) -> String {
     hex
 }
 
+fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
+    let mut bytes = [0u8; N];
+    let trimmed = encoded.trim();
+    if trimmed.len() != N * 2 {
+        return Err(());
+    }
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < N {
+        let hi = decode_hex_nibble(raw[index * 2])?;
+        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
+        bytes[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, ()> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+fn selectors_for_node(node: &NodeMetadata) -> Vec<String> {
+    let mut selectors = vec![
+        format!("node:{}", node.node_id),
+        format!("user:{}", node.owner),
+    ];
+    for tag in &node.tags {
+        selectors.push(format!("tag:{tag}"));
+    }
+    selectors
+}
+
+struct AutoTunnelPayloadHeader<'a> {
+    node_id: &'a str,
+    mesh_cidr: &'a str,
+    assigned_cidr: &'a str,
+    generated_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: u64,
+}
+
+fn serialize_auto_tunnel_payload(
+    header: &AutoTunnelPayloadHeader<'_>,
+    peers: &[AutoTunnelPeer],
+    routes: &[AutoTunnelRoute],
+) -> String {
+    let mut payload = String::new();
+    payload.push_str("version=1\n");
+    payload.push_str(&format!("node_id={}\n", header.node_id));
+    payload.push_str(&format!("mesh_cidr={}\n", header.mesh_cidr));
+    payload.push_str(&format!("assigned_cidr={}\n", header.assigned_cidr));
+    payload.push_str(&format!("generated_at_unix={}\n", header.generated_at_unix));
+    payload.push_str(&format!("expires_at_unix={}\n", header.expires_at_unix));
+    payload.push_str(&format!("nonce={}\n", header.nonce));
+    payload.push_str(&format!("peer_count={}\n", peers.len()));
+    for (index, peer) in peers.iter().enumerate() {
+        payload.push_str(&format!("peer.{index}.node_id={}\n", peer.node_id));
+        payload.push_str(&format!("peer.{index}.endpoint={}\n", peer.endpoint));
+        payload.push_str(&format!(
+            "peer.{index}.public_key_hex={}\n",
+            hex_bytes(&peer.public_key)
+        ));
+        payload.push_str(&format!(
+            "peer.{index}.allowed_ips={}\n",
+            peer.allowed_ips.join(",")
+        ));
+    }
+    payload.push_str(&format!("route_count={}\n", routes.len()));
+    for (index, route) in routes.iter().enumerate() {
+        payload.push_str(&format!(
+            "route.{index}.destination_cidr={}\n",
+            route.destination_cidr
+        ));
+        payload.push_str(&format!("route.{index}.via_node={}\n", route.via_node));
+        let kind = match route.kind {
+            AutoTunnelRouteKind::Mesh => "mesh",
+            AutoTunnelRouteKind::ExitNodeLan => "exit_lan",
+            AutoTunnelRouteKind::ExitNodeDefault => "exit_default",
+        };
+        payload.push_str(&format!("route.{index}.kind={kind}\n"));
+    }
+    payload
+}
+
+fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
+    let Some((ip_part, prefix_part)) = value.split_once('/') else {
+        return false;
+    };
+    if ip_part.parse::<std::net::IpAddr>().is_err() {
+        return false;
+    }
+    let Ok(prefix) = prefix_part.parse::<u8>() else {
+        return false;
+    };
+    if ip_part.contains(':') {
+        prefix <= 128
+    } else {
+        prefix <= 32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AbuseAlertPolicy, ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard,
-        ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
-        EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
-        ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
+        AutoTunnelBundleRequest, ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion,
+        CredentialError, EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision,
+        PolicyGuard, ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
         ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
         TrustState, load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
-    use rustynet_policy::PolicySet;
+    use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
+
+    fn payload_field(payload: &str, key: &str) -> Option<String> {
+        payload.lines().find_map(|line| {
+            let (line_key, value) = line.split_once('=')?;
+            if line_key == key {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+    }
 
     #[test]
     fn auth_rate_limit_enforces_per_ip_limits() {
@@ -1684,6 +2049,7 @@ mod tests {
                 os: "linux".to_string(),
                 tags: vec!["servers".to_string()],
                 owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.10:51820".to_string(),
                 public_key: [3; 32],
                 now_unix: 120,
             })
@@ -1704,6 +2070,7 @@ mod tests {
             os: "linux".to_string(),
             tags: vec!["servers".to_string()],
             owner: "alice@example.local".to_string(),
+            endpoint: "198.51.100.11:51820".to_string(),
             public_key: [4; 32],
             now_unix: 125,
         });
@@ -1730,6 +2097,7 @@ mod tests {
             os: "linux".to_string(),
             tags: vec!["servers".to_string()],
             owner: "alice@example.local".to_string(),
+            endpoint: "198.51.100.20:51820".to_string(),
             public_key: [8; 32],
             now_unix: 120,
         })
@@ -1742,6 +2110,171 @@ mod tests {
 
         peer_map.payload.push_str("tampered-line\n");
         assert!(!core.verify_signed_peer_map(&peer_map));
+    }
+
+    #[test]
+    fn auto_tunnel_bundle_is_centrally_assigned_and_signed() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+
+        core.credentials
+            .create(
+                "cred-node-a".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+        core.credentials
+            .create(
+                "cred-node-b".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+
+        core.enroll_with_throwaway(EnrollmentRequest {
+            credential_id: "cred-node-a".to_string(),
+            node_id: "node-a".to_string(),
+            hostname: "node-a".to_string(),
+            os: "linux".to_string(),
+            tags: vec!["servers".to_string()],
+            owner: "alice@example.local".to_string(),
+            endpoint: "198.51.100.40:51820".to_string(),
+            public_key: [41; 32],
+            now_unix: 120,
+        })
+        .expect("enrollment should succeed");
+        core.enroll_with_throwaway(EnrollmentRequest {
+            credential_id: "cred-node-b".to_string(),
+            node_id: "node-b".to_string(),
+            hostname: "node-b".to_string(),
+            os: "linux".to_string(),
+            tags: vec!["servers".to_string()],
+            owner: "alice@example.local".to_string(),
+            endpoint: "198.51.100.41:51820".to_string(),
+            public_key: [42; 32],
+            now_unix: 121,
+        })
+        .expect("enrollment should succeed");
+
+        let bundle = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-a".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 300,
+                nonce: 11,
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                exit_node_id: Some("node-b".to_string()),
+                lan_routes: vec!["192.168.1.0/24".to_string()],
+            })
+            .expect("auto tunnel bundle should be emitted");
+
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
+        assert_eq!(
+            payload_field(&bundle.payload, "node_id").as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "route_count").as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "peer_count").as_deref(),
+            Some("1")
+        );
+
+        let wire = ControlPlaneCore::signed_auto_tunnel_bundle_to_wire(&bundle);
+        assert!(wire.contains("signature="));
+
+        let mut tampered = bundle.clone();
+        tampered.payload.push_str("peer.99.node_id=tampered\n");
+        assert!(!core.verify_signed_auto_tunnel_bundle(&tampered));
+    }
+
+    #[test]
+    fn auto_tunnel_bundle_is_policy_gated_and_assignment_is_stable() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:node-a".to_string(),
+                dst: "node:node-b".to_string(),
+                protocol: Protocol::Udp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.50:51820", [51; 32]),
+            ("cred-b", "node-b", "198.51.100.51:51820", [52; 32]),
+            ("cred-c", "node-c", "198.51.100.52:51820", [53; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let first = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-a".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 300,
+                nonce: 22,
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                exit_node_id: None,
+                lan_routes: Vec::new(),
+            })
+            .expect("bundle should be generated");
+        let second = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-a".to_string(),
+                generated_at_unix: 201,
+                ttl_secs: 300,
+                nonce: 23,
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                exit_node_id: None,
+                lan_routes: Vec::new(),
+            })
+            .expect("bundle should be generated");
+
+        assert_eq!(
+            payload_field(&first.payload, "assigned_cidr"),
+            payload_field(&second.payload, "assigned_cidr")
+        );
+        assert_eq!(
+            payload_field(&first.payload, "peer_count").as_deref(),
+            Some("1")
+        );
+        assert!(first.payload.contains("peer.0.node_id=node-b"));
+        assert!(!first.payload.contains("node-c"));
     }
 
     #[test]
@@ -1933,6 +2466,7 @@ mod tests {
                     os: "linux".to_string(),
                     tags: vec!["servers".to_string()],
                     owner: "alice@example.local".to_string(),
+                    endpoint: "198.51.100.30:51820".to_string(),
                     public_key: [7; 32],
                     now_unix: 150,
                 },

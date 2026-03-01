@@ -52,6 +52,31 @@ pub enum Decision {
     Deny,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipStatus {
+    Active,
+    Revoked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MembershipDirectory {
+    nodes: HashMap<String, MembershipStatus>,
+}
+
+impl MembershipDirectory {
+    pub fn set_node_status(&mut self, node_id: impl Into<String>, status: MembershipStatus) {
+        self.nodes.insert(node_id.into(), status);
+    }
+
+    pub fn node_status(&self, node_id: &str) -> MembershipStatus {
+        self.nodes
+            .get(node_id)
+            .copied()
+            .unwrap_or(MembershipStatus::Unknown)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PolicySet {
     pub rules: Vec<PolicyRule>,
@@ -60,6 +85,38 @@ pub struct PolicySet {
 impl PolicySet {
     pub fn evaluate(&self, request: &AccessRequest) -> Decision {
         for rule in &self.rules {
+            if !selector_matches(&rule.src, &request.src) {
+                continue;
+            }
+            if !selector_matches(&rule.dst, &request.dst) {
+                continue;
+            }
+            if rule.protocol != Protocol::Any && rule.protocol != request.protocol {
+                continue;
+            }
+
+            return match rule.action {
+                RuleAction::Allow => Decision::Allow,
+                RuleAction::Deny => Decision::Deny,
+            };
+        }
+
+        Decision::Deny
+    }
+
+    pub fn evaluate_with_membership(
+        &self,
+        request: &AccessRequest,
+        membership: &MembershipDirectory,
+    ) -> Decision {
+        if !membership_request_allowed(request.src.as_str(), request.dst.as_str(), membership) {
+            return Decision::Deny;
+        }
+
+        for rule in &self.rules {
+            if !membership_rule_allowed(rule.src.as_str(), rule.dst.as_str(), membership) {
+                continue;
+            }
             if !selector_matches(&rule.src, &request.src) {
                 continue;
             }
@@ -97,6 +154,41 @@ pub struct ContextualPolicySet {
 impl ContextualPolicySet {
     pub fn evaluate(&self, request: &ContextualAccessRequest) -> Decision {
         for rule in &self.rules {
+            if !selector_matches(&rule.src, &request.src) {
+                continue;
+            }
+            if !selector_matches(&rule.dst, &request.dst) {
+                continue;
+            }
+            if rule.protocol != Protocol::Any && rule.protocol != request.protocol {
+                continue;
+            }
+            if !context_matches(&rule.contexts, request.context) {
+                continue;
+            }
+
+            return match rule.action {
+                RuleAction::Allow => Decision::Allow,
+                RuleAction::Deny => Decision::Deny,
+            };
+        }
+
+        Decision::Deny
+    }
+
+    pub fn evaluate_with_membership(
+        &self,
+        request: &ContextualAccessRequest,
+        membership: &MembershipDirectory,
+    ) -> Decision {
+        if !membership_request_allowed(request.src.as_str(), request.dst.as_str(), membership) {
+            return Decision::Deny;
+        }
+
+        for rule in &self.rules {
+            if !membership_rule_allowed(rule.src.as_str(), rule.dst.as_str(), membership) {
+                continue;
+            }
             if !selector_matches(&rule.src, &request.src) {
                 continue;
             }
@@ -189,12 +281,36 @@ fn context_matches(allowed_contexts: &[TrafficContext], candidate: TrafficContex
     allowed_contexts.is_empty() || allowed_contexts.contains(&candidate)
 }
 
+fn membership_rule_allowed(
+    src_selector: &str,
+    dst_selector: &str,
+    membership: &MembershipDirectory,
+) -> bool {
+    selector_membership_allowed(src_selector, membership)
+        && selector_membership_allowed(dst_selector, membership)
+}
+
+fn membership_request_allowed(src: &str, dst: &str, membership: &MembershipDirectory) -> bool {
+    selector_membership_allowed(src, membership) && selector_membership_allowed(dst, membership)
+}
+
+fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
+    let Some(node_id) = selector_node_id(selector) else {
+        return true;
+    };
+    membership.node_status(node_id) == MembershipStatus::Active
+}
+
+fn selector_node_id(selector: &str) -> Option<&str> {
+    selector.strip_prefix("node:")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AccessRequest, ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet,
-        Decision, PolicyRolloutController, PolicyRule, PolicySet, Protocol, RolloutError,
-        RuleAction, TrafficContext,
+        Decision, MembershipDirectory, MembershipStatus, PolicyRolloutController, PolicyRule,
+        PolicySet, Protocol, RolloutError, RuleAction, TrafficContext,
     };
 
     #[test]
@@ -374,5 +490,82 @@ mod tests {
             .rollback_to("rev-1")
             .expect("rollback should target known revision");
         assert_eq!(controller.active_revision(), Some("rev-1"));
+    }
+
+    #[test]
+    fn membership_aware_contextual_policy_denies_revoked_and_unknown_nodes() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "user:local".to_string(),
+                dst: "node:node-exit".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::SharedExit],
+            }],
+        };
+
+        let request = ContextualAccessRequest {
+            src: "user:local".to_string(),
+            dst: "node:node-exit".to_string(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::SharedExit,
+        };
+
+        let unknown_membership = MembershipDirectory::default();
+        assert_eq!(
+            set.evaluate_with_membership(&request, &unknown_membership),
+            Decision::Deny
+        );
+
+        let mut revoked_membership = MembershipDirectory::default();
+        revoked_membership.set_node_status("node-exit", MembershipStatus::Revoked);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &revoked_membership),
+            Decision::Deny
+        );
+
+        let mut active_membership = MembershipDirectory::default();
+        active_membership.set_node_status("node-exit", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &active_membership),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn membership_aware_policy_preserves_protocol_filters() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "user:local".to_string(),
+                dst: "node:node-a".to_string(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+
+        let tcp = ContextualAccessRequest {
+            src: "user:local".to_string(),
+            dst: "node:node-a".to_string(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+        let udp = ContextualAccessRequest {
+            src: "user:local".to_string(),
+            dst: "node:node-a".to_string(),
+            protocol: Protocol::Udp,
+            context: TrafficContext::Mesh,
+        };
+
+        assert_eq!(
+            set.evaluate_with_membership(&tcp, &membership),
+            Decision::Allow
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&udp, &membership),
+            Decision::Deny
+        );
     }
 }

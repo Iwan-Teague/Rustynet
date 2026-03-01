@@ -10,3 +10,4 @@ rustynet-policy = { path = "../rustynet-policy" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
+ed25519-dalek = "2"
