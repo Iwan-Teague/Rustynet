@@ -32,6 +32,7 @@ AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
 SETUP_COMPLETE="0"
 MANUAL_PEER_OVERRIDE="0"
+RUST_MIN_VERSION="1.85"
 MANUAL_PEER_AUDIT_LOG="/var/log/rustynet/manual-peer-override.log"
 MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
 
@@ -237,6 +238,99 @@ map_package() {
   esac
 }
 
+check_rust_min_version() {
+  if ! command -v rustc >/dev/null 2>&1; then
+    return 1
+  fi
+  local installed_ver
+  installed_ver="$(rustc --version 2>/dev/null | awk '{print $2}' | cut -d- -f1)"
+  # sort -V puts the lower version first; if min <= installed, min comes first (or they're equal)
+  [[ "$(printf '%s\n%s\n' "${RUST_MIN_VERSION}" "${installed_ver}" | sort -V | head -1)" == "${RUST_MIN_VERSION}" ]]
+}
+
+install_rust_via_rustup() {
+  print_info "Installing Rust via rustup (latest stable toolchain)."
+  if ! command -v curl >/dev/null 2>&1; then
+    print_err "curl is required for the rustup installer. Install curl first."
+    return 1
+  fi
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  # Make cargo available in the current shell session
+  # shellcheck disable=SC1091
+  source "${HOME}/.cargo/env" 2>/dev/null || export PATH="${HOME}/.cargo/bin:${PATH}"
+}
+
+ensure_rust_toolchain() {
+  local need_install=0
+  if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+    need_install=1
+  elif ! check_rust_min_version; then
+    print_warn "Installed Rust $(rustc --version 2>/dev/null | awk '{print $2}') is below the required minimum ${RUST_MIN_VERSION}."
+    need_install=1
+  fi
+
+  if [[ "${need_install}" -eq 0 ]]; then
+    print_info "Rust toolchain $(rustc --version 2>/dev/null) is present and sufficient."
+    return 0
+  fi
+
+  print_warn "Rust >= ${RUST_MIN_VERSION} is required to build Rustynet binaries."
+  echo "  1) Install via rustup (recommended — always gets latest stable)"
+  echo "  2) Install via system package manager (may be outdated on some distros)"
+  echo "  3) Skip — I will install Rust manually before building"
+  local choice
+  read -r -p "Choose Rust install method [1]: " choice
+  choice="${choice:-1}"
+
+  case "${choice}" in
+    1)
+      install_rust_via_rustup
+      ;;
+    2)
+      local pm
+      pm="$(package_manager)"
+      if [[ "${pm}" == "unknown" ]]; then
+        print_err "No supported package manager found. Install Rust manually from https://rustup.rs"
+        return 1
+      fi
+      local packages=()
+      case "${pm}" in
+        pacman) packages=(rust) ;;
+        *) packages=(cargo rustc) ;;
+      esac
+      print_info "Installing Rust via ${pm}: ${packages[*]}"
+      case "${pm}" in
+        apt)
+          run_root apt-get update
+          run_root apt-get install -y "${packages[@]}"
+          ;;
+        dnf)    run_root dnf install -y "${packages[@]}" ;;
+        pacman) run_root pacman -Sy --noconfirm "${packages[@]}" ;;
+        zypper) run_root zypper --non-interactive install "${packages[@]}" ;;
+      esac
+      ;;
+    3)
+      print_warn "Skipping Rust installation. The build step will fail unless Rust >= ${RUST_MIN_VERSION} is installed."
+      return 0
+      ;;
+    *)
+      print_err "Invalid choice '${choice}'."
+      return 1
+      ;;
+  esac
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    print_err "cargo not found after installation attempt."
+    print_info "If installed via rustup, open a new terminal or run: source \"\$HOME/.cargo/env\""
+    return 1
+  fi
+  if ! check_rust_min_version; then
+    print_warn "Installed Rust $(rustc --version 2>/dev/null | awk '{print $2}') may still be below minimum ${RUST_MIN_VERSION}. Build may fail."
+  else
+    print_info "Rust toolchain $(rustc --version 2>/dev/null) installed successfully."
+  fi
+}
+
 install_runtime_dependencies() {
   local required=(wg ip nft openssl xxd systemctl awk sed grep)
   local missing=()
@@ -302,10 +396,8 @@ ensure_binaries_available() {
   fi
 
   print_warn "rustynet binaries are not installed in PATH."
-  if ! command -v cargo >/dev/null 2>&1; then
-    if prompt_yes_no "Install Rust toolchain package dependency (cargo/rustc)?" "y"; then
-      install_runtime_dependencies
-    fi
+  if ! command -v cargo >/dev/null 2>&1 || ! check_rust_min_version; then
+    ensure_rust_toolchain
   fi
 
   if ! command -v cargo >/dev/null 2>&1; then
@@ -732,6 +824,7 @@ first_run_setup() {
   print_info "Starting first-run Rustynet setup wizard."
   configure_values
   install_runtime_dependencies
+  ensure_rust_toolchain
   ensure_binaries_available
   prepare_system_directories
   ensure_wireguard_keys
