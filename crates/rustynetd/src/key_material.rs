@@ -10,8 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 use rustynet_crypto::{
-    KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
+    KeyCustodyBackend, KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore,
+    write_encrypted_key_file,
 };
+use sha2::{Digest, Sha256};
 
 pub fn read_passphrase_file(path: &Path) -> Result<String, String> {
     let raw =
@@ -28,16 +30,11 @@ pub fn decrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<Vec<u8>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
-    let parent = encrypted_key_path
-        .parent()
-        .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
-    let mut key = read_encrypted_key_file(
-        parent,
-        encrypted_key_path,
-        &passphrase,
-        KeyCustodyPermissionPolicy::default(),
-    )
-    .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
+    let manager = key_custody_manager(encrypted_key_path, &passphrase)?;
+    let key_id = key_custody_key_id(encrypted_key_path);
+    let mut key = manager
+        .load_private_key(&key_id)
+        .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
         return Err("decrypted key is empty".to_string());
     }
@@ -53,17 +50,51 @@ pub fn encrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<(), String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
+    let manager = key_custody_manager(encrypted_key_path, &passphrase)?;
+    let key_id = key_custody_key_id(encrypted_key_path);
+    let backend = manager
+        .store_private_key(&key_id, private_key)
+        .map_err(|err| format!("encrypt key failed: {err}"))?;
+    if backend == KeyCustodyBackend::OsSecureStore {
+        let parent = encrypted_key_path
+            .parent()
+            .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
+        write_encrypted_key_file(
+            parent,
+            encrypted_key_path,
+            private_key,
+            &passphrase,
+            KeyCustodyPermissionPolicy::default(),
+        )
+        .map_err(|err| format!("encrypt key backup failed: {err}"))?;
+    }
+    Ok(())
+}
+
+fn key_custody_manager(
+    encrypted_key_path: &Path,
+    passphrase: &str,
+) -> Result<KeyCustodyManager<PlatformOsSecureStore>, String> {
     let parent = encrypted_key_path
         .parent()
         .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
-    write_encrypted_key_file(
-        parent,
-        encrypted_key_path,
-        private_key,
-        &passphrase,
+    Ok(KeyCustodyManager::new(
+        PlatformOsSecureStore,
+        parent.to_path_buf(),
+        passphrase.to_string(),
         KeyCustodyPermissionPolicy::default(),
-    )
-    .map_err(|err| format!("encrypt key failed: {err}"))
+    ))
+}
+
+fn key_custody_key_id(encrypted_key_path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(encrypted_key_path.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    format!("wg-private-{suffix}")
 }
 
 pub fn write_runtime_private_key(path: &Path, private_key: &[u8]) -> Result<(), String> {

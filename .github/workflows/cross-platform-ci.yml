@@ -1,0 +1,62 @@
+name: Cross Platform CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS build+security
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap CI tools
+        run: |
+          RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
+      - name: Workspace validation
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo check --workspace --all-targets --all-features
+          cargo test --workspace --all-targets --all-features
+      - name: Security gates
+        run: |
+          cargo audit --deny warnings
+          cargo deny check bans licenses sources advisories
+
+  debian13:
+    name: Debian 13 build+security
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: Workspace validation
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo check --workspace --all-targets --all-features
+          cargo test --workspace --all-targets --all-features
+      - name: Security gates
+        run: |
+          cargo audit --deny warnings
+          cargo deny check bans licenses sources advisories
+
+  linux_e2e:
+    name: Linux real WireGuard E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: Run real dataplane E2E harness
+        run: |
+          sudo -E ./scripts/e2e/real_wireguard_exitnode_e2e.sh

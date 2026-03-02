@@ -3,6 +3,10 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
@@ -262,6 +266,43 @@ impl OsSecureStore for NoOsSecureStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlatformOsSecureStore;
+
+impl OsSecureStore for PlatformOsSecureStore {
+    fn store_key(&self, key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+        #[cfg(target_os = "macos")]
+        {
+            store_in_macos_keychain(key_id, key_material)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return store_in_linux_secret_service(key_id, key_material);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (key_id, key_material);
+            Err(CryptoError::OsStoreUnavailable)
+        }
+    }
+
+    fn load_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError> {
+        #[cfg(target_os = "macos")]
+        {
+            load_from_macos_keychain(key_id)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return load_from_linux_secret_service(key_id);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = key_id;
+            Err(CryptoError::OsStoreUnavailable)
+        }
+    }
+}
+
 pub struct KeyCustodyManager<S: OsSecureStore> {
     os_store: S,
     fallback_directory: PathBuf,
@@ -337,6 +378,87 @@ fn is_valid_key_identifier(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+#[cfg(target_os = "macos")]
+fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+    let encoded = hex_bytes(key_material);
+    let status = Command::new("security")
+        .arg("add-generic-password")
+        .arg("-a")
+        .arg("rustynet")
+        .arg("-s")
+        .arg(format!("rustynet.{key_id}"))
+        .arg("-w")
+        .arg(encoded)
+        .arg("-U")
+        .status()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(CryptoError::OsStoreUnavailable)
+}
+
+#[cfg(target_os = "macos")]
+fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-a")
+        .arg("rustynet")
+        .arg("-s")
+        .arg(format!("rustynet.{key_id}"))
+        .arg("-w")
+        .output()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    if !output.status.success() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let value = String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let trimmed = value.trim();
+    hex_decode(trimmed)
+}
+
+#[cfg(target_os = "linux")]
+fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+    let mut child = Command::new("secret-tool")
+        .arg("store")
+        .arg("--label=Rustynet Key")
+        .arg("rustynet-key-id")
+        .arg(key_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let mut stdin = child.stdin.take().ok_or(CryptoError::OsStoreUnavailable)?;
+    use std::io::Write;
+    let encoded = hex_bytes(key_material);
+    stdin
+        .write_all(encoded.as_bytes())
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    drop(stdin);
+    let status = child.wait().map_err(|_| CryptoError::OsStoreUnavailable)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(CryptoError::OsStoreUnavailable)
+}
+
+#[cfg(target_os = "linux")]
+fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    let output = Command::new("secret-tool")
+        .arg("lookup")
+        .arg("rustynet-key-id")
+        .arg(key_id)
+        .output()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    if !output.status.success() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let value = String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let trimmed = value.trim();
+    hex_decode(trimmed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

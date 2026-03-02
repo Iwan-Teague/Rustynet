@@ -1,0 +1,37 @@
+[package]
+name = "rustynet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rustynetd = { path = "../crates/rustynetd" }
+rustynet-control = { path = "../crates/rustynet-control" }
+
+[[bin]]
+name = "ipc_parse_command"
+path = "fuzz_targets/ipc_parse_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "membership_decode_state"
+path = "fuzz_targets/membership_decode_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "membership_decode_signed_update"
+path = "fuzz_targets/membership_decode_signed_update.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

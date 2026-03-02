@@ -646,6 +646,122 @@ ensure_binaries_available() {
   run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
 }
 
+stat_mode() {
+  local path="$1"
+  stat -f %Lp "${path}" 2>/dev/null || stat -c %a "${path}" 2>/dev/null || true
+}
+
+doctor_preflight() {
+  local failures=0
+  local warnings=0
+
+  doctor_ok() {
+    printf '[ok] %s\n' "$1"
+  }
+  doctor_warn() {
+    warnings=$((warnings + 1))
+    printf '[warn] %s\n' "$1"
+  }
+  doctor_fail() {
+    failures=$((failures + 1))
+    printf '[error] %s\n' "$1" >&2
+  }
+  doctor_require_cmd() {
+    local cmd="$1"
+    local label="$2"
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      doctor_ok "${label}: ${cmd} present"
+    else
+      doctor_fail "${label}: ${cmd} missing"
+    fi
+  }
+  doctor_check_mode() {
+    local path="$1"
+    local expected="$2"
+    local label="$3"
+    if [[ ! -e "${path}" ]]; then
+      doctor_fail "${label}: ${path} missing"
+      return
+    fi
+    local mode
+    mode="$(stat_mode "${path}")"
+    if [[ "${mode}" == "${expected}" ]]; then
+      doctor_ok "${label}: ${path} mode ${mode}"
+    else
+      doctor_fail "${label}: ${path} mode ${mode:-unknown} (expected ${expected})"
+    fi
+  }
+
+  print_info "Running Rustynet preflight doctor..."
+  doctor_require_cmd rustynetd "binary"
+  doctor_require_cmd rustynet "binary"
+  doctor_require_cmd cargo "toolchain"
+  doctor_require_cmd openssl "crypto runtime"
+  doctor_require_cmd curl "network runtime"
+  doctor_require_cmd awk "shell runtime"
+  doctor_require_cmd sed "shell runtime"
+  doctor_require_cmd grep "shell runtime"
+  doctor_require_cmd rg "shell runtime"
+
+  if check_rust_min_version; then
+    doctor_ok "rust toolchain >= ${RUST_MIN_VERSION}"
+  else
+    doctor_fail "rust toolchain < ${RUST_MIN_VERSION}; run first-run bootstrap"
+  fi
+
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    local cfg_mode
+    cfg_mode="$(stat_mode "${CONFIG_FILE}")"
+    if [[ "${cfg_mode}" == "600" ]]; then
+      doctor_ok "config permissions are strict (${cfg_mode})"
+    else
+      doctor_fail "config permissions are ${cfg_mode:-unknown}; expected 600"
+    fi
+  else
+    doctor_warn "config file not present yet (${CONFIG_FILE})"
+  fi
+
+  if is_linux_host; then
+    doctor_require_cmd wg "linux dataplane"
+    doctor_require_cmd ip "linux dataplane"
+    doctor_require_cmd nft "linux dataplane"
+    doctor_require_cmd systemctl "linux service"
+    doctor_require_cmd python3 "linux e2e/runtime"
+
+    if [[ "${SETUP_COMPLETE}" == "1" ]]; then
+      doctor_check_mode "${WG_KEY_PASSPHRASE_PATH}" "600" "key custody"
+      doctor_check_mode "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "600" "encrypted private key"
+      doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
+      doctor_check_mode "${TRUST_EVIDENCE_PATH}" "600" "trust evidence"
+      doctor_check_mode "${TRUST_WATERMARK_PATH}" "600" "trust watermark"
+      if [[ -S "${SOCKET_PATH}" ]]; then
+        doctor_ok "daemon IPC socket present (${SOCKET_PATH})"
+      else
+        doctor_warn "daemon IPC socket not present (${SOCKET_PATH}); service may be stopped"
+      fi
+    else
+      doctor_warn "setup not marked complete; run first-run setup"
+    fi
+  elif is_macos_host; then
+    if command -v brew >/dev/null 2>&1; then
+      doctor_ok "homebrew present for macOS dependency management"
+    else
+      doctor_fail "homebrew missing; install from https://brew.sh"
+    fi
+    doctor_warn "macOS runs in compatibility mode; Linux host is required for dataplane runtime."
+  else
+    doctor_fail "unsupported host OS ${HOST_OS}"
+  fi
+
+  if (( failures > 0 )); then
+    print_err "Preflight doctor failed with ${failures} error(s) and ${warnings} warning(s)."
+    return 1
+  fi
+
+  print_info "Preflight doctor passed with ${warnings} warning(s)."
+  return 0
+}
+
 prepare_system_directories() {
   require_linux_dataplane "prepare_system_directories" || return 0
   run_root install -d -m 0700 /etc/rustynet /run/rustynet /var/lib/rustynet
@@ -870,6 +986,10 @@ write_daemon_environment() {
 
 start_or_restart_service() {
   require_linux_dataplane "start_or_restart_service" || return 0
+  if ! doctor_preflight; then
+    print_err "Refusing to start service until preflight doctor passes."
+    return 1
+  fi
   write_daemon_environment
   if [[ "${AUTO_REFRESH_TRUST}" == "1" && -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     refresh_signed_trust_evidence || print_warn "Failed to refresh trust evidence before start."
@@ -1287,6 +1407,7 @@ Rustynet Control Menu
  18) Revoke local key material
  19) Apply peer key rotation bundle (break-glass manual path)
  20) Show current configuration
+ 21) Preflight doctor (security + prerequisites)
   0) Exit
 EOF
     local choice
@@ -1319,6 +1440,7 @@ EOF
       18) revoke_local_key ;;
       19) apply_rotation_bundle ;;
       20) show_runtime_config ;;
+      21) doctor_preflight ;;
       0) exit 0 ;;
       *) print_warn "Unknown option: ${choice}" ;;
     esac

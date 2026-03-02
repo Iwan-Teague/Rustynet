@@ -62,6 +62,18 @@ fi
 cargo test -p rustynetd phase10::tests --all-features
 cargo test -p rustynet-backend-wireguard --all-targets --all-features
 
+if [[ "${RUSTYNET_PHASE10_RUN_REAL_E2E:-0}" == "1" ]]; then
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "real phase10 e2e can only run on Linux hosts"
+    exit 1
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    ./scripts/e2e/real_wireguard_exitnode_e2e.sh
+  else
+    sudo -E ./scripts/e2e/real_wireguard_exitnode_e2e.sh
+  fi
+fi
+
 for artifact in \
   "artifacts/phase10/netns_e2e_report.json" \
   "artifacts/phase10/leak_test_report.json" \
