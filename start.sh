@@ -649,7 +649,7 @@ ensure_binaries_available() {
 
 stat_mode() {
   local path="$1"
-  stat -f %Lp "${path}" 2>/dev/null || stat -c %a "${path}" 2>/dev/null || true
+  stat -c %a "${path}" 2>/dev/null || stat -f %Lp "${path}" 2>/dev/null || true
 }
 
 doctor_preflight() {
