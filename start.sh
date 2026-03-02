@@ -1290,7 +1290,10 @@ Rustynet Control Menu
   0) Exit
 EOF
     local choice
-    read -r -p "Choose an option: " choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; exiting menu."
+      break
+    fi
     case "${choice}" in
       1) first_run_setup ;;
       2)
