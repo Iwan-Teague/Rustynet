@@ -443,12 +443,12 @@ fn run_membership_command(args: &[String]) -> Result<(), String> {
 }
 
 fn run_membership_init(args: &[String]) -> Result<(), String> {
+    use ed25519_dalek::SigningKey;
     use rustynet_control::membership::{
-        MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
-        MembershipNodeStatus, MembershipState, MEMBERSHIP_SCHEMA_VERSION,
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
         persist_membership_snapshot,
     };
-    use ed25519_dalek::SigningKey;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -470,10 +470,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 index += 2;
             }
             Some("--log") => {
-                log_path = args
-                    .get(index + 1)
-                    .ok_or("--log requires a value")?
-                    .clone();
+                log_path = args.get(index + 1).ok_or("--log requires a value")?.clone();
                 index += 2;
             }
             Some("--node-id") => {
