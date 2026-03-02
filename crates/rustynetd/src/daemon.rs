@@ -1407,6 +1407,16 @@ impl DaemonRuntime {
 fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     #[cfg(target_os = "linux")]
     {
+        // In test mode, the in-memory backend uses DryRunSystem to avoid modifying
+        // host network state (nftables killswitch, ip rules, sysctl) which would sever
+        // the network connection running the tests.
+        #[cfg(test)]
+        if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+            return Ok(RuntimeSystem::DryRun(
+                crate::phase10::DryRunSystem::default(),
+            ));
+        }
+
         let mode = match config.dataplane_mode {
             DaemonDataplaneMode::Shell => LinuxDataplaneMode::Shell,
             DaemonDataplaneMode::HybridNative => LinuxDataplaneMode::HybridNative,

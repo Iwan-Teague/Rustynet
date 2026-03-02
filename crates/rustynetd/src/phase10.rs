@@ -710,7 +710,45 @@ impl DataplaneSystem for LinuxCommandSystem {
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
+        // Collect firewall table name and egress interface before moving nat_table.
+        let egress_allow = self
+            .firewall_table
+            .as_ref()
+            .map(|fw| (fw.clone(), self.egress_interface.clone()));
+
         self.nat_table = Some(nat_table);
+
+        // Allow the exit node device's own outbound traffic via the egress interface.
+        // The killswitch chain has policy drop on the OUTPUT hook; without this rule
+        // the exit node device itself cannot open new connections to the internet
+        // while acting as an exit node.
+        if let Some((fw_table, egress_iface)) = egress_allow {
+            let nat_name = self.nat_table.as_deref().unwrap_or("").to_string();
+            if let Err(err) = Self::run(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    fw_table.as_str(),
+                    "killswitch",
+                    "oifname",
+                    egress_iface.as_str(),
+                    "accept",
+                ],
+            ) {
+                Self::run_allow_failure(
+                    "nft",
+                    &["delete", "table", "ip", nat_name.as_str()],
+                );
+                self.nat_table = None;
+                let _ = self.restore_ipv4_forwarding();
+                return Err(SystemError::NatApplyFailed(format!(
+                    "egress access rule failed: {err}"
+                )));
+            }
+        }
+
         Ok(())
     }
 

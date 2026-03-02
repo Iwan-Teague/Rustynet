@@ -637,6 +637,49 @@ stop_service() {
   run_root systemctl stop rustynetd.service
 }
 
+disconnect_vpn() {
+  print_info "Stopping Rustynet service..."
+  run_root systemctl stop rustynetd.service 2>/dev/null || true
+
+  print_info "Removing WireGuard interface ${WG_INTERFACE}..."
+  if run_root ip link del dev "${WG_INTERFACE}" 2>/dev/null; then
+    print_info "Interface ${WG_INTERFACE} removed (all associated routes cleared)."
+  else
+    print_info "Interface ${WG_INTERFACE} was not present."
+  fi
+
+  print_info "Flushing exit-node routing table 51820..."
+  run_root ip route flush table 51820 2>/dev/null || true
+
+  print_info "Removing exit-node IP policy rule (table 51820)..."
+  run_root ip rule del table 51820 2>/dev/null || true
+
+  print_info "Removing Rustynet nftables firewall and NAT tables..."
+  if command -v nft >/dev/null 2>&1; then
+    local tables_output
+    tables_output="$(run_root nft list tables 2>/dev/null)" || tables_output=""
+    while IFS= read -r line; do
+      case "${line}" in
+        "table inet rustynet_g"*)
+          local t="${line#table inet }"
+          run_root nft delete table inet "${t}" 2>/dev/null || true
+          print_info "Removed nft table: inet ${t}"
+          ;;
+        "table ip rustynet_nat_g"*)
+          local t="${line#table ip }"
+          run_root nft delete table ip "${t}" 2>/dev/null || true
+          print_info "Removed nft table: ip ${t}"
+          ;;
+      esac
+    done <<< "${tables_output}"
+  fi
+
+  print_info "Restoring IPv6 (disabled during VPN operation)..."
+  run_root sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
+
+  print_info "Rustynet VPN disconnected. Device is now using normal internet connectivity."
+}
+
 show_service_status() {
   run_root systemctl --no-pager --full status rustynetd.service || true
 }
@@ -930,7 +973,7 @@ Rustynet Control Menu
   1) First-run setup/bootstrap
   2) Reconfigure daemon values
   3) Start/restart Rustynet service
-  4) Stop Rustynet service
+  4) Disconnect VPN (stop service + restore normal network)
   5) Show service status
   6) Show Rustynet status
   7) Netcheck
@@ -959,7 +1002,7 @@ EOF
         write_daemon_environment
         ;;
       3) start_or_restart_service ;;
-      4) stop_service ;;
+      4) disconnect_vpn ;;
       5) show_service_status ;;
       6) run_rustynet_cli status ;;
       7) run_rustynet_cli netcheck ;;
