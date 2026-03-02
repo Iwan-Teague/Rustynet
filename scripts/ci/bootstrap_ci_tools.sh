@@ -30,8 +30,9 @@ rustup toolchain install 1.85.0 --profile minimal --component rustfmt --componen
 rustup default 1.85.0
 
 if ! command -v cargo-audit >/dev/null 2>&1; then
-  cargo install cargo-audit --locked
+  cargo install cargo-audit --locked --version 0.22.1
 fi
 if ! command -v cargo-deny >/dev/null 2>&1; then
-  cargo install cargo-deny --locked
+  # Keep cargo-deny aligned with the pinned Rust toolchain (1.85.0).
+  cargo install cargo-deny --locked --version 0.18.3
 fi
