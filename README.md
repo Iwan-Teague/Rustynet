@@ -69,3 +69,15 @@ Then run gates:
 ./scripts/ci/phase10_gates.sh
 ./scripts/ci/membership_gates.sh
 ```
+
+## Phase 1 Measured Baseline Inputs
+
+Phase 1 baseline gates require measured runtime inputs (`RUSTYNET_PHASE1_*` vars).  
+Generate them from measured evidence sources (fail-closed, no synthetic fallback):
+
+```bash
+./scripts/perf/collect_phase1_measured_env.sh
+./scripts/perf/run_phase1_baseline.sh
+```
+
+`run_phase1_baseline.sh` will auto-run the collector when env vars are missing.

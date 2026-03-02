@@ -3,6 +3,37 @@
 ## Purpose
 Generate Phase 6 and Phase 9 release-gate artifacts only from measured evidence. Static/pass-through artifact commits are not accepted.
 
+## Phase 1: Runtime Baseline Inputs
+
+### Automated measured env collector
+Generate required Phase 1 baseline environment variables from measured evidence:
+
+```bash
+./scripts/perf/collect_phase1_measured_env.sh
+```
+
+Supported measured sources (checked in order unless overridden):
+- `artifacts/perf/phase1/source/performance_samples.ndjson`
+- `artifacts/operations/source/performance_samples.ndjson`
+- `artifacts/phase10/perf_budget_report.json`
+- `artifacts/operations/raw/performance_budget_report.json`
+
+Override source explicitly:
+```bash
+RUSTYNET_PHASE1_PERF_SAMPLES_PATH=/absolute/path/to/performance_samples.ndjson \
+./scripts/perf/collect_phase1_measured_env.sh
+```
+
+Generated file:
+- `artifacts/perf/phase1/measured_env.sh` (owner-readable only)
+
+Then run baseline:
+```bash
+./scripts/perf/run_phase1_baseline.sh
+```
+
+`run_phase1_baseline.sh` auto-invokes the collector (fail-closed) when required `RUSTYNET_PHASE1_*` vars are missing.
+
 ## Phase 6: Platform Parity Report
 
 ### Automated collector

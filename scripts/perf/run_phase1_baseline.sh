@@ -17,12 +17,41 @@ required_measurement_env=(
   "RUSTYNET_PHASE1_BACKEND_THROUGHPUT_OVERHEAD_PERCENT"
 )
 
+missing_measurement_env=()
 for env_key in "${required_measurement_env[@]}"; do
   if [[ -z "${!env_key:-}" ]]; then
-    echo "missing required measured input environment variable: $env_key"
-    exit 1
+    missing_measurement_env+=("$env_key")
   fi
 done
+
+AUTO_COLLECT="${RUSTYNET_PHASE1_AUTO_COLLECT:-1}"
+PHASE1_MEASURED_ENV_FILE="${RUSTYNET_PHASE1_MEASURED_ENV_OUT:-$ROOT_DIR/artifacts/perf/phase1/measured_env.sh}"
+
+if (( ${#missing_measurement_env[@]} > 0 )) && [[ "$AUTO_COLLECT" == "1" ]]; then
+  if [[ ! -x "$ROOT_DIR/scripts/perf/collect_phase1_measured_env.sh" ]]; then
+    chmod 700 "$ROOT_DIR/scripts/perf/collect_phase1_measured_env.sh"
+  fi
+  "$ROOT_DIR/scripts/perf/collect_phase1_measured_env.sh"
+  if [[ ! -f "$PHASE1_MEASURED_ENV_FILE" ]]; then
+    echo "phase1 measured env file was not generated: $PHASE1_MEASURED_ENV_FILE"
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$PHASE1_MEASURED_ENV_FILE"
+fi
+
+missing_measurement_env=()
+for env_key in "${required_measurement_env[@]}"; do
+  if [[ -z "${!env_key:-}" ]]; then
+    missing_measurement_env+=("$env_key")
+  fi
+done
+
+if (( ${#missing_measurement_env[@]} > 0 )); then
+  echo "missing required measured input environment variable(s): ${missing_measurement_env[*]}"
+  echo "set RUSTYNET_PHASE1_AUTO_COLLECT=1 with a valid measured source ndjson, or export metrics manually"
+  exit 1
+fi
 
 cargo run -p rustynetd -- --emit-phase1-baseline "$RUNTIME_REPORT"
 RUSTYNET_PHASE1_BACKEND_PERF_REPORT="$BACKEND_REPORT_ABS" cargo test -p rustynet-backend-api --test backend_contract_perf
