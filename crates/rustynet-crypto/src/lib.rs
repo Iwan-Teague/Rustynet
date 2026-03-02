@@ -277,7 +277,7 @@ impl OsSecureStore for PlatformOsSecureStore {
         }
         #[cfg(target_os = "linux")]
         {
-            return store_in_linux_secret_service(key_id, key_material);
+            store_in_linux_secret_service(key_id, key_material)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -293,7 +293,7 @@ impl OsSecureStore for PlatformOsSecureStore {
         }
         #[cfg(target_os = "linux")]
         {
-            return load_from_linux_secret_service(key_id);
+            load_from_linux_secret_service(key_id)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
