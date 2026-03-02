@@ -42,6 +42,7 @@ Finalize GA-grade operational maturity, compatibility guarantees, and long-term 
 - Published crypto deprecation and migration schedule.
 - Published post-quantum migration readiness and hybrid-evaluation report.
 - Measured evidence generation workflow documented in `documents/operations/MeasuredEvidenceGeneration.md`.
+- Automated phase9 raw-evidence collector implemented (`scripts/operations/collect_phase9_raw_evidence.sh`).
 
 ## 4) Security Gates
 - No release without passing SLO, incident, and DR readiness gates.

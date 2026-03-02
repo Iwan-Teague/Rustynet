@@ -27,9 +27,15 @@ Rustynet no longer accepts static/pass-through readiness JSON artifacts.
 Before Phase 6/9 gates can pass, generate measured evidence artifacts from real inputs:
 
 ```bash
+# Phase 6 probe collection + parity evidence
+./scripts/release/collect_platform_parity_bundle.sh
+
 # Phase 6 platform parity evidence
 RUSTYNET_PHASE6_PARITY_ENVIRONMENT=lab \
 ./scripts/release/generate_platform_parity_report.sh
+
+# Phase 9 raw evidence collection from logs/probes
+./scripts/operations/collect_phase9_raw_evidence.sh
 
 # Phase 9 operational evidence
 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=prod-lab \
@@ -40,7 +46,14 @@ Raw measured inputs must exist first:
 - `artifacts/release/raw/platform_parity_linux.json`
 - `artifacts/release/raw/platform_parity_macos.json`
 - `artifacts/release/raw/platform_parity_windows.json`
-- `artifacts/operations/raw/*.json` for all phase9 reports
+- `artifacts/operations/source/*.ndjson|*.json` phase9 source logs/config:
+  - `compatibility_policy.json`
+  - `crypto_deprecation_schedule.json`
+  - `slo_windows.ndjson`
+  - `performance_samples.ndjson`
+  - `incident_drills.ndjson`
+  - `dr_drills.ndjson`
+  - `backend_security_review.json`
 
 Then run gates:
 

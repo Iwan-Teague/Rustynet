@@ -12,6 +12,7 @@ This policy governs Rustynet control-plane/client compatibility, upgrade sequenc
 Current policy artifact:
 - `artifacts/operations/compatibility_policy.json`
 - Generated via `scripts/operations/generate_phase9_artifacts.sh` from measured raw evidence inputs.
+- Raw evidence can be auto-collected from operational source logs/config via `scripts/operations/collect_phase9_raw_evidence.sh`.
 
 ## Support Window
 - Minimum supported client: `1.2`

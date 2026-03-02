@@ -26,6 +26,10 @@ if ! rg -q "validate_platform_parity" crates/rustynetd/src/platform.rs; then
   exit 1
 fi
 
+if [[ "${RUSTYNET_PHASE6_COLLECT_PARITY:-0}" == "1" ]]; then
+  ./scripts/release/collect_platform_parity_bundle.sh
+fi
+
 cargo test -p rustynetd platform::tests --all-features
 ./scripts/ci/check_phase6_platform_parity.sh
 

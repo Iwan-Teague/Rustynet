@@ -18,6 +18,7 @@ Operational evidence artifacts:
 
 Artifact generation:
 - `scripts/operations/generate_phase9_artifacts.sh` from measured raw inputs under `artifacts/operations/raw/`
+- `scripts/operations/collect_phase9_raw_evidence.sh` to build raw inputs from operational source logs/config under `artifacts/operations/source/`
 - Artifacts must include measured-evidence metadata (`evidence_mode`, `captured_at_unix`, `environment`, `source_artifacts`).
 
 ## Alerting and Gate Behavior
