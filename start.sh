@@ -41,11 +41,6 @@ MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
 mkdir -p "${CONFIG_DIR}"
 touch "${PEERS_FILE}"
 
-if [[ -f "${CONFIG_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  source "${CONFIG_FILE}"
-fi
-
 print_info() {
   printf '[info] %s\n' "$*"
 }
@@ -56,6 +51,98 @@ print_warn() {
 
 print_err() {
   printf '[error] %s\n' "$*" >&2
+}
+
+is_allowed_config_key() {
+  local key="$1"
+  case "${key}" in
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_config_value() {
+  local value="$1"
+  if [[ "${value}" == "''" ]]; then
+    printf '%s' ""
+    return
+  fi
+  if [[ "${value}" =~ ^\'(.*)\'$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  printf '%s' "${value}"
+}
+
+validate_config_file_security() {
+  [[ -f "${CONFIG_FILE}" ]] || return 0
+
+  if [[ -L "${CONFIG_FILE}" ]]; then
+    print_err "Refusing to load symlink config file: ${CONFIG_FILE}"
+    exit 1
+  fi
+
+  local owner_uid=""
+  if stat -c '%u' "${CONFIG_FILE}" >/dev/null 2>&1; then
+    owner_uid="$(stat -c '%u' "${CONFIG_FILE}")"
+  elif stat -f '%u' "${CONFIG_FILE}" >/dev/null 2>&1; then
+    owner_uid="$(stat -f '%u' "${CONFIG_FILE}")"
+  fi
+  if [[ -n "${owner_uid}" ]]; then
+    local current_uid
+    current_uid="$(id -u)"
+    if [[ "${owner_uid}" != "${current_uid}" && "${owner_uid}" != "0" ]]; then
+      print_err "Config file owner is not trusted (${CONFIG_FILE}, uid=${owner_uid})."
+      exit 1
+    fi
+  fi
+
+  local mode=""
+  if stat -c '%a' "${CONFIG_FILE}" >/dev/null 2>&1; then
+    mode="$(stat -c '%a' "${CONFIG_FILE}")"
+  elif stat -f '%OLp' "${CONFIG_FILE}" >/dev/null 2>&1; then
+    mode="$(stat -f '%OLp' "${CONFIG_FILE}")"
+    mode="${mode#0}"
+  fi
+  if [[ "${mode}" =~ ^[0-9]{3,4}$ ]]; then
+    local mode3="${mode: -3}"
+    local group_digit="${mode3:1:1}"
+    local other_digit="${mode3:2:1}"
+    if (( (10#${group_digit} & 2) != 0 || (10#${other_digit} & 2) != 0 )); then
+      print_err "Config file must not be group/world writable: ${CONFIG_FILE} (mode ${mode3})."
+      exit 1
+    fi
+  fi
+}
+
+load_config_file() {
+  [[ -f "${CONFIG_FILE}" ]] || return 0
+  validate_config_file_security
+
+  local line
+  local key
+  local raw_value
+  local value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    if [[ ! "${line}" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+      print_warn "Ignoring malformed config line in ${CONFIG_FILE}."
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    raw_value="${BASH_REMATCH[2]}"
+    if ! is_allowed_config_key "${key}"; then
+      print_warn "Ignoring unknown config key '${key}' in ${CONFIG_FILE}."
+      continue
+    fi
+    value="$(normalize_config_value "${raw_value}")"
+    value="${value%$'\r'}"
+    printf -v "${key}" '%s' "${value}"
+  done <"${CONFIG_FILE}"
 }
 
 enforce_backend_mode() {
@@ -143,32 +230,32 @@ prompt_yes_no() {
 
 save_config() {
   {
-    printf 'SOCKET_PATH=%q\n' "${SOCKET_PATH}"
-    printf 'STATE_PATH=%q\n' "${STATE_PATH}"
-    printf 'TRUST_EVIDENCE_PATH=%q\n' "${TRUST_EVIDENCE_PATH}"
-    printf 'TRUST_VERIFIER_KEY_PATH=%q\n' "${TRUST_VERIFIER_KEY_PATH}"
-    printf 'TRUST_WATERMARK_PATH=%q\n' "${TRUST_WATERMARK_PATH}"
-    printf 'AUTO_TUNNEL_ENFORCE=%q\n' "${AUTO_TUNNEL_ENFORCE}"
-    printf 'AUTO_TUNNEL_BUNDLE_PATH=%q\n' "${AUTO_TUNNEL_BUNDLE_PATH}"
-    printf 'AUTO_TUNNEL_VERIFIER_KEY_PATH=%q\n' "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
-    printf 'AUTO_TUNNEL_WATERMARK_PATH=%q\n' "${AUTO_TUNNEL_WATERMARK_PATH}"
-    printf 'AUTO_TUNNEL_MAX_AGE_SECS=%q\n' "${AUTO_TUNNEL_MAX_AGE_SECS}"
-    printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
-    printf 'WG_PRIVATE_KEY_PATH=%q\n' "${WG_PRIVATE_KEY_PATH}"
-    printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%q\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
-    printf 'WG_KEY_PASSPHRASE_PATH=%q\n' "${WG_KEY_PASSPHRASE_PATH}"
-    printf 'WG_PUBLIC_KEY_PATH=%q\n' "${WG_PUBLIC_KEY_PATH}"
-    printf 'EGRESS_INTERFACE=%q\n' "${EGRESS_INTERFACE}"
-    printf 'BACKEND_MODE=%q\n' "${BACKEND_MODE}"
-    printf 'DATAPLANE_MODE=%q\n' "${DATAPLANE_MODE}"
-    printf 'RECONCILE_INTERVAL_MS=%q\n' "${RECONCILE_INTERVAL_MS}"
-    printf 'MAX_RECONCILE_FAILURES=%q\n' "${MAX_RECONCILE_FAILURES}"
-    printf 'TRUST_SIGNER_KEY_PATH=%q\n' "${TRUST_SIGNER_KEY_PATH}"
-    printf 'AUTO_REFRESH_TRUST=%q\n' "${AUTO_REFRESH_TRUST}"
-    printf 'DEVICE_NODE_ID=%q\n' "${DEVICE_NODE_ID}"
-    printf 'SETUP_COMPLETE=%q\n' "${SETUP_COMPLETE}"
-    printf 'MANUAL_PEER_OVERRIDE=%q\n' "${MANUAL_PEER_OVERRIDE}"
-    printf 'MANUAL_PEER_AUDIT_LOG=%q\n' "${MANUAL_PEER_AUDIT_LOG}"
+    printf 'SOCKET_PATH=%s\n' "${SOCKET_PATH}"
+    printf 'STATE_PATH=%s\n' "${STATE_PATH}"
+    printf 'TRUST_EVIDENCE_PATH=%s\n' "${TRUST_EVIDENCE_PATH}"
+    printf 'TRUST_VERIFIER_KEY_PATH=%s\n' "${TRUST_VERIFIER_KEY_PATH}"
+    printf 'TRUST_WATERMARK_PATH=%s\n' "${TRUST_WATERMARK_PATH}"
+    printf 'AUTO_TUNNEL_ENFORCE=%s\n' "${AUTO_TUNNEL_ENFORCE}"
+    printf 'AUTO_TUNNEL_BUNDLE_PATH=%s\n' "${AUTO_TUNNEL_BUNDLE_PATH}"
+    printf 'AUTO_TUNNEL_VERIFIER_KEY_PATH=%s\n' "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
+    printf 'AUTO_TUNNEL_WATERMARK_PATH=%s\n' "${AUTO_TUNNEL_WATERMARK_PATH}"
+    printf 'AUTO_TUNNEL_MAX_AGE_SECS=%s\n' "${AUTO_TUNNEL_MAX_AGE_SECS}"
+    printf 'WG_INTERFACE=%s\n' "${WG_INTERFACE}"
+    printf 'WG_PRIVATE_KEY_PATH=%s\n' "${WG_PRIVATE_KEY_PATH}"
+    printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
+    printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
+    printf 'WG_PUBLIC_KEY_PATH=%s\n' "${WG_PUBLIC_KEY_PATH}"
+    printf 'EGRESS_INTERFACE=%s\n' "${EGRESS_INTERFACE}"
+    printf 'BACKEND_MODE=%s\n' "${BACKEND_MODE}"
+    printf 'DATAPLANE_MODE=%s\n' "${DATAPLANE_MODE}"
+    printf 'RECONCILE_INTERVAL_MS=%s\n' "${RECONCILE_INTERVAL_MS}"
+    printf 'MAX_RECONCILE_FAILURES=%s\n' "${MAX_RECONCILE_FAILURES}"
+    printf 'TRUST_SIGNER_KEY_PATH=%s\n' "${TRUST_SIGNER_KEY_PATH}"
+    printf 'AUTO_REFRESH_TRUST=%s\n' "${AUTO_REFRESH_TRUST}"
+    printf 'DEVICE_NODE_ID=%s\n' "${DEVICE_NODE_ID}"
+    printf 'SETUP_COMPLETE=%s\n' "${SETUP_COMPLETE}"
+    printf 'MANUAL_PEER_OVERRIDE=%s\n' "${MANUAL_PEER_OVERRIDE}"
+    printf 'MANUAL_PEER_AUDIT_LOG=%s\n' "${MANUAL_PEER_AUDIT_LOG}"
   } >"${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
@@ -218,6 +305,7 @@ map_package() {
         echo "vim-common"
       fi
       ;;
+    rg) echo "ripgrep" ;;
     curl) echo "curl" ;;
     cargo)
       if [[ "${pm}" == "apt" ]]; then
@@ -263,6 +351,51 @@ install_rust_via_rustup() {
   source "${HOME}/.cargo/env" 2>/dev/null || export PATH="${HOME}/.cargo/bin:${PATH}"
 }
 
+ensure_rust_components() {
+  if ! command -v rustup >/dev/null 2>&1; then
+    print_warn "rustup is not available; cannot auto-install rustfmt/clippy components."
+    return 0
+  fi
+
+  local missing=()
+  if ! rustup component list --installed | grep -q '^rustfmt'; then
+    missing+=("rustfmt")
+  fi
+  if ! rustup component list --installed | grep -q '^clippy'; then
+    missing+=("clippy")
+  fi
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  print_info "Installing Rust components: ${missing[*]}"
+  rustup component add "${missing[@]}"
+}
+
+ensure_ci_security_tools() {
+  local missing_bins=()
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    missing_bins+=("cargo-audit")
+  fi
+  if ! command -v cargo-deny >/dev/null 2>&1; then
+    missing_bins+=("cargo-deny")
+  fi
+  if [[ "${#missing_bins[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  print_warn "Missing CI security tools: ${missing_bins[*]}"
+  if ! prompt_yes_no "Install missing CI security tools with cargo install --locked?" "y"; then
+    print_warn "Skipping CI security tool installation."
+    return 0
+  fi
+
+  local tool
+  for tool in "${missing_bins[@]}"; do
+    cargo install --locked "${tool}"
+  done
+}
+
 ensure_rust_toolchain() {
   local need_install=0
   if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
@@ -274,6 +407,7 @@ ensure_rust_toolchain() {
 
   if [[ "${need_install}" -eq 0 ]]; then
     print_info "Rust toolchain $(rustc --version 2>/dev/null) is present and sufficient."
+    ensure_rust_components
     return 0
   fi
 
@@ -332,10 +466,11 @@ ensure_rust_toolchain() {
   else
     print_info "Rust toolchain $(rustc --version 2>/dev/null) installed successfully."
   fi
+  ensure_rust_components
 }
 
 install_runtime_dependencies() {
-  local required=(wg ip nft openssl xxd curl systemctl awk sed grep)
+  local required=(wg ip nft openssl xxd curl systemctl awk sed grep rg)
   local missing=()
   local cmd
   for cmd in "${required[@]}"; do
@@ -396,6 +531,15 @@ install_runtime_dependencies() {
 ensure_binaries_available() {
   if command -v rustynetd >/dev/null 2>&1 && command -v rustynet >/dev/null 2>&1; then
     return
+  fi
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    print_err "Refusing to compile Rustynet from a root-owned shell in the repository workspace."
+    print_info "Run ./start.sh as a normal user; it will invoke sudo only for privileged installation steps."
+    print_info "Set RUSTYNET_ALLOW_ROOT_BUILD=1 to override this guard."
+    if [[ "${RUSTYNET_ALLOW_ROOT_BUILD:-0}" != "1" ]]; then
+      exit 1
+    fi
   fi
 
   print_warn "rustynet binaries are not installed in PATH."
@@ -551,10 +695,21 @@ configure_trust_material() {
   echo "  1) Lab mode (generate local signer key and auto-refresh trust evidence)"
   echo "  2) Bring externally signed trust evidence + verifier key"
   local choice
-  read -r -p "Choose mode [1/2]: " choice
-  choice="${choice:-1}"
+  read -r -p "Choose mode [1/2, default 2]: " choice
+  choice="${choice:-2}"
+  if [[ "${choice}" != "1" && "${choice}" != "2" ]]; then
+    print_err "Invalid trust mode '${choice}'. Expected 1 or 2."
+    return 1
+  fi
 
   if [[ "${choice}" == "1" ]]; then
+    local lab_ack
+    print_warn "Lab mode reduces trust separation and is intended for local development only."
+    read -r -p "Type 'LAB_MODE_ACK' to continue in lab mode: " lab_ack
+    if [[ "${lab_ack}" != "LAB_MODE_ACK" ]]; then
+      print_err "Lab mode confirmation mismatch."
+      return 1
+    fi
     if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
       run_root openssl genpkey -algorithm ED25519 -out "${TRUST_SIGNER_KEY_PATH}"
       run_root chmod 600 "${TRUST_SIGNER_KEY_PATH}"
@@ -593,6 +748,7 @@ configure_trust_material() {
 
 write_daemon_environment() {
   enforce_backend_mode
+  enforce_auto_tunnel_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
@@ -624,6 +780,7 @@ write_daemon_environment() {
 }
 
 start_or_restart_service() {
+  write_daemon_environment
   if [[ "${AUTO_REFRESH_TRUST}" == "1" && -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     refresh_signed_trust_evidence || print_warn "Failed to refresh trust evidence before start."
   fi
@@ -853,13 +1010,8 @@ configure_values() {
   prompt_default TRUST_EVIDENCE_PATH "Trust evidence path" "${TRUST_EVIDENCE_PATH}"
   prompt_default TRUST_VERIFIER_KEY_PATH "Trust verifier key path" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default TRUST_WATERMARK_PATH "Trust watermark path" "${TRUST_WATERMARK_PATH}"
-  if prompt_yes_no "Enable auto-tunnel enforcement? (requires signed bundles from a central controller; disable for standalone exit node)" "n"; then
-    AUTO_TUNNEL_ENFORCE="1"
-    print_info "Auto-tunnel enforce enabled. Signed assignment bundles are required."
-  else
-    AUTO_TUNNEL_ENFORCE="0"
-    print_info "Auto-tunnel enforce disabled. Suitable for standalone exit nodes."
-  fi
+  enforce_auto_tunnel_policy
+  print_info "Auto-tunnel enforcement is mandatory. Signed assignment bundles are required."
   prompt_default AUTO_TUNNEL_BUNDLE_PATH "Auto-tunnel bundle path" "${AUTO_TUNNEL_BUNDLE_PATH}"
   prompt_default AUTO_TUNNEL_VERIFIER_KEY_PATH "Auto-tunnel verifier key path" "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"
   prompt_default AUTO_TUNNEL_WATERMARK_PATH "Auto-tunnel watermark path" "${AUTO_TUNNEL_WATERMARK_PATH}"
@@ -889,6 +1041,7 @@ first_run_setup() {
   configure_values
   install_runtime_dependencies
   ensure_rust_toolchain
+  ensure_ci_security_tools
   ensure_binaries_available
   prepare_system_directories
   ensure_wireguard_keys
@@ -1024,6 +1177,8 @@ EOF
     esac
   done
 }
+
+load_config_file
 
 if [[ "${SETUP_COMPLETE}" != "1" ]]; then
   print_warn "Rustynet is not configured yet."

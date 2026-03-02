@@ -831,10 +831,19 @@ impl DaemonRuntime {
                 )
             };
 
+        let local_node = match NodeId::new(self.local_node_id.clone()) {
+            Ok(node_id) => node_id,
+            Err(err) => {
+                self.restrict_permanent(format!("invalid local node id in runtime: {err}"));
+                let _ = self.controller.force_fail_closed("invalid_local_node_id");
+                return;
+            }
+        };
+
         let apply = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
-                local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
+                local_node,
                 mesh_cidr,
             },
             peers,
@@ -1320,10 +1329,22 @@ impl DaemonRuntime {
                         None,
                     )
                 };
+            let local_node = match NodeId::new(self.local_node_id.clone()) {
+                Ok(node_id) => node_id,
+                Err(err) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message = format!("invalid local node id in runtime: {err}");
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_permanent(message);
+                    let _ = self.controller.force_fail_closed("invalid_local_node_id");
+                    return;
+                }
+            };
+
             let apply = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
-                    local_node: NodeId::new(self.local_node_id.clone()).expect("valid local node"),
+                    local_node,
                     mesh_cidr,
                 },
                 peers,

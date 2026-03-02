@@ -986,8 +986,20 @@ mod tests {
             2
         );
 
-        let report_path = std::env::var("RUSTYNET_PHASE3_MESH_REPORT")
-            .unwrap_or_else(|_| "artifacts/perf/phase3/mesh_baseline.json".to_string());
+        let report_path = std::env::var("RUSTYNET_PHASE3_MESH_REPORT").unwrap_or_else(|_| {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos();
+            std::env::temp_dir()
+                .join(format!(
+                    "rustynet-phase3-mesh-baseline-{}-{}.json",
+                    std::process::id(),
+                    unique
+                ))
+                .to_string_lossy()
+                .to_string()
+        });
         write_phase3_mesh_report(&report_path, 3, 6, 0).expect("phase3 report should be written");
     }
 

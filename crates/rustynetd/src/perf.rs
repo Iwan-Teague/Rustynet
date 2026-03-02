@@ -142,10 +142,19 @@ mod tests {
     #[test]
     fn baseline_report_is_writable() {
         let temp_dir = std::env::temp_dir();
-        let report_path = temp_dir.join("rustynet-phase1-runtime-baseline.json");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let report_path = temp_dir.join(format!(
+            "rustynet-phase1-runtime-baseline-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
         write_phase1_baseline_report(&report_path).expect("report should be written");
         let content =
             std::fs::read_to_string(&report_path).expect("report content should be readable");
         assert!(content.contains("\"metrics\""));
+        let _ = std::fs::remove_file(&report_path);
     }
 }

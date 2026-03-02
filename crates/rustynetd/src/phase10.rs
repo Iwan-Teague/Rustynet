@@ -737,10 +737,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                     "accept",
                 ],
             ) {
-                Self::run_allow_failure(
-                    "nft",
-                    &["delete", "table", "ip", nat_name.as_str()],
-                );
+                Self::run_allow_failure("nft", &["delete", "table", "ip", nat_name.as_str()]);
                 self.nat_table = None;
                 let _ = self.restore_ipv4_forwarding();
                 return Err(SystemError::NatApplyFailed(format!(
@@ -1760,8 +1757,20 @@ mod tests {
     #[test]
     fn audit_and_perf_reports_are_writable() {
         let temp_dir = std::env::temp_dir();
-        let audit_path = temp_dir.join("phase10-state-transition-audit.log");
-        let perf_path = temp_dir.join("phase10-perf-budget-report.json");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let audit_path = temp_dir.join(format!(
+            "phase10-state-transition-audit-{}-{}.log",
+            std::process::id(),
+            unique
+        ));
+        let perf_path = temp_dir.join(format!(
+            "phase10-perf-budget-report-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
 
         write_state_transition_audit(
             &audit_path,
@@ -1787,11 +1796,13 @@ mod tests {
         )
         .expect("perf report should be written");
 
-        let audit = std::fs::read_to_string(audit_path).expect("audit should be readable");
-        let perf = std::fs::read_to_string(perf_path).expect("perf should be readable");
+        let audit = std::fs::read_to_string(&audit_path).expect("audit should be readable");
+        let perf = std::fs::read_to_string(&perf_path).expect("perf should be readable");
         assert!(audit.contains("generation=0"));
         assert!(perf.contains("idle_cpu_percent"));
         assert!(perf.contains("\"evidence_mode\": \"measured\""));
         assert!(perf.contains("\"captured_at_unix\": "));
+        let _ = std::fs::remove_file(&audit_path);
+        let _ = std::fs::remove_file(&perf_path);
     }
 }

@@ -4,6 +4,30 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+require_command() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "missing required command: ${cmd}" >&2
+    exit 1
+  fi
+}
+
+require_cargo_subcommand() {
+  local subcommand="$1"
+  if ! cargo "${subcommand}" --version >/dev/null 2>&1; then
+    echo "missing required cargo subcommand: cargo ${subcommand}" >&2
+    echo "install toolchain components/tools and retry." >&2
+    exit 1
+  fi
+}
+
+require_command cargo
+require_command rg
+require_cargo_subcommand fmt
+require_cargo_subcommand clippy
+require_cargo_subcommand audit
+require_cargo_subcommand deny
+
 AUDIT_DB="${RUSTYNET_AUDIT_DB_PATH:-$ROOT_DIR/.cargo-audit-db}"
 if [[ ! -d "$AUDIT_DB" && -d "$HOME/.cargo/advisory-db" ]]; then
   mkdir -p "$(dirname "$AUDIT_DB")"
