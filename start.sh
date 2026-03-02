@@ -1194,10 +1194,16 @@ refresh_menu_runtime_status() {
 
 print_menu_runtime_header() {
   refresh_menu_runtime_status
+  local connected_display
+  local state_display
+  local exit_display
+  connected_display="${MENU_NETWORK_CONNECTED^^}"
+  state_display="${MENU_NETWORK_STATE^^}"
+  exit_display="${MENU_EXIT_ROLE^^}"
   printf '[status] Connected: %s (state=%s) | Exit role: %s\n' \
-    "${MENU_NETWORK_CONNECTED}" \
-    "${MENU_NETWORK_STATE}" \
-    "${MENU_EXIT_ROLE}"
+    "${connected_display}" \
+    "${state_display}" \
+    "${exit_display}"
 }
 
 connect_to_device() {
