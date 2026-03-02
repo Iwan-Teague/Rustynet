@@ -37,6 +37,7 @@ MANUAL_PEER_OVERRIDE="0"
 RUST_MIN_VERSION="1.85"
 MANUAL_PEER_AUDIT_LOG="/var/log/rustynet/manual-peer-override.log"
 MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
+HOST_OS="$(uname -s)"
 
 mkdir -p "${CONFIG_DIR}"
 touch "${PEERS_FILE}"
@@ -51,6 +52,28 @@ print_warn() {
 
 print_err() {
   printf '[error] %s\n' "$*" >&2
+}
+
+is_linux_host() {
+  [[ "${HOST_OS}" == "Linux" ]]
+}
+
+is_macos_host() {
+  [[ "${HOST_OS}" == "Darwin" ]]
+}
+
+require_linux_dataplane() {
+  local action="$1"
+  if is_linux_host; then
+    return 0
+  fi
+  print_err "${action} requires a Linux dataplane host."
+  if is_macos_host; then
+    print_info "On macOS, use this wizard for build/validation and manage a Linux node for dataplane/runtime."
+  else
+    print_info "Current host OS '${HOST_OS}' is not supported for dataplane/runtime operations."
+  fi
+  return 1
 }
 
 is_allowed_config_key() {
@@ -261,10 +284,25 @@ save_config() {
 }
 
 detect_default_egress() {
-  ip -o -4 route show to default 2>/dev/null | awk 'NR==1 { print $5 }'
+  if is_linux_host; then
+    ip -o -4 route show to default 2>/dev/null | awk 'NR==1 { print $5 }'
+    return
+  fi
+  if is_macos_host; then
+    route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
+    return
+  fi
 }
 
 package_manager() {
+  if is_macos_host; then
+    if command -v brew >/dev/null 2>&1; then
+      echo brew
+    else
+      echo unknown
+    fi
+    return
+  fi
   if command -v apt-get >/dev/null 2>&1; then
     echo apt
     return
@@ -288,18 +326,47 @@ map_package() {
   local pm="$1"
   local cmd="$2"
   case "${cmd}" in
-    wg) echo "wireguard-tools" ;;
+    wg)
+      if [[ "${pm}" == "brew" ]]; then
+        echo "wireguard-tools"
+      else
+        echo "wireguard-tools"
+      fi
+      ;;
     ip)
       if [[ "${pm}" == "dnf" ]]; then
         echo "iproute"
+      elif [[ "${pm}" == "brew" ]]; then
+        echo ""
       else
         echo "iproute2"
       fi
       ;;
-    nft) echo "nftables" ;;
-    openssl) echo "openssl" ;;
+    nft)
+      if [[ "${pm}" == "brew" ]]; then
+        echo ""
+      else
+        echo "nftables"
+      fi
+      ;;
+    openssl)
+      if [[ "${pm}" == "brew" ]]; then
+        echo "openssl@3"
+      else
+        echo "openssl"
+      fi
+      ;;
+    systemctl)
+      if [[ "${pm}" == "brew" ]]; then
+        echo ""
+      else
+        echo "systemd"
+      fi
+      ;;
     xxd)
-      if [[ "${pm}" == "apt" ]]; then
+      if [[ "${pm}" == "brew" ]]; then
+        echo "vim"
+      elif [[ "${pm}" == "apt" ]]; then
         echo "xxd"
       else
         echo "vim-common"
@@ -312,6 +379,8 @@ map_package() {
         echo "cargo"
       elif [[ "${pm}" == "dnf" ]]; then
         echo "cargo"
+      elif [[ "${pm}" == "brew" ]]; then
+        echo "rust"
       elif [[ "${pm}" == "pacman" ]]; then
         echo "rust"
       else
@@ -319,7 +388,9 @@ map_package() {
       fi
       ;;
     rustc)
-      if [[ "${pm}" == "pacman" ]]; then
+      if [[ "${pm}" == "brew" ]]; then
+        echo "rust"
+      elif [[ "${pm}" == "pacman" ]]; then
         echo "rust"
       else
         echo "rustc"
@@ -432,6 +503,7 @@ ensure_rust_toolchain() {
       fi
       local packages=()
       case "${pm}" in
+        brew) packages=(rust) ;;
         pacman) packages=(rust) ;;
         *) packages=(cargo rustc) ;;
       esac
@@ -444,6 +516,7 @@ ensure_rust_toolchain() {
         dnf)    run_root dnf install -y "${packages[@]}" ;;
         pacman) run_root pacman -Sy --noconfirm "${packages[@]}" ;;
         zypper) run_root zypper --non-interactive install "${packages[@]}" ;;
+        brew)   brew install "${packages[@]}" ;;
       esac
       ;;
     3)
@@ -470,7 +543,10 @@ ensure_rust_toolchain() {
 }
 
 install_runtime_dependencies() {
-  local required=(wg ip nft openssl xxd curl systemctl awk sed grep rg)
+  local required=(openssl xxd curl awk sed grep rg)
+  if is_linux_host; then
+    required+=(wg ip nft systemctl)
+  fi
   local missing=()
   local cmd
   for cmd in "${required[@]}"; do
@@ -491,6 +567,11 @@ install_runtime_dependencies() {
 
   local pm
   pm="$(package_manager)"
+  if is_macos_host && [[ "${pm}" != "brew" ]]; then
+    print_err "Homebrew is required on macOS for automated dependency installs."
+    print_info "Install Homebrew from https://brew.sh and rerun ./start.sh."
+    exit 1
+  fi
   if [[ "${pm}" == "unknown" ]]; then
     print_err "No supported package manager found. Install manually: ${missing[*]}"
     exit 1
@@ -524,6 +605,9 @@ install_runtime_dependencies() {
       ;;
     zypper)
       run_root zypper --non-interactive install "${packages[@]}"
+      ;;
+    brew)
+      brew install "${packages[@]}"
       ;;
   esac
 }
@@ -563,6 +647,7 @@ ensure_binaries_available() {
 }
 
 prepare_system_directories() {
+  require_linux_dataplane "prepare_system_directories" || return 0
   run_root install -d -m 0700 /etc/rustynet /run/rustynet /var/lib/rustynet
   run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
   run_root install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
@@ -577,6 +662,7 @@ prepare_system_directories() {
 }
 
 ensure_wireguard_keys() {
+  require_linux_dataplane "ensure_wireguard_keys" || return 0
   if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" && -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
     return
   fi
@@ -629,6 +715,7 @@ ensure_wireguard_keys() {
 }
 
 ensure_membership_files() {
+  require_linux_dataplane "ensure_membership_files" || return 0
   if [[ -f "${MEMBERSHIP_SNAPSHOT_PATH}" && -f "${MEMBERSHIP_LOG_PATH}" ]]; then
     print_info "Membership files already present."
     return
@@ -691,6 +778,7 @@ EOF
 }
 
 configure_trust_material() {
+  require_linux_dataplane "configure_trust_material" || return 0
   print_info "Trust material setup:"
   echo "  1) Lab mode (generate local signer key and auto-refresh trust evidence)"
   echo "  2) Bring externally signed trust evidence + verifier key"
@@ -747,6 +835,7 @@ configure_trust_material() {
 }
 
 write_daemon_environment() {
+  require_linux_dataplane "write_daemon_environment" || return 0
   enforce_backend_mode
   enforce_auto_tunnel_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
@@ -780,6 +869,7 @@ write_daemon_environment() {
 }
 
 start_or_restart_service() {
+  require_linux_dataplane "start_or_restart_service" || return 0
   write_daemon_environment
   if [[ "${AUTO_REFRESH_TRUST}" == "1" && -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     refresh_signed_trust_evidence || print_warn "Failed to refresh trust evidence before start."
@@ -787,16 +877,22 @@ start_or_restart_service() {
   run_root systemctl daemon-reload
   run_root systemctl enable rustynetd.service
   run_root systemctl restart rustynetd.service
-  run_root systemctl --no-pager --full status rustynetd.service || true
+  if ! run_root systemctl --no-pager --full status rustynetd.service; then
+    print_warn "Unable to read rustynetd.service status after restart."
+  fi
 }
 
 stop_service() {
+  require_linux_dataplane "stop_service" || return 0
   run_root systemctl stop rustynetd.service
 }
 
 disconnect_vpn() {
+  require_linux_dataplane "disconnect_vpn" || return 0
   print_info "Stopping Rustynet service..."
-  run_root systemctl stop rustynetd.service 2>/dev/null || true
+  if ! run_root systemctl stop rustynetd.service 2>/dev/null; then
+    print_warn "Rustynet service was not running or could not be stopped cleanly."
+  fi
 
   print_info "Removing WireGuard interface ${WG_INTERFACE}..."
   if run_root ip link del dev "${WG_INTERFACE}" 2>/dev/null; then
@@ -806,10 +902,14 @@ disconnect_vpn() {
   fi
 
   print_info "Flushing exit-node routing table 51820..."
-  run_root ip route flush table 51820 2>/dev/null || true
+  if ! run_root ip route flush table 51820 2>/dev/null; then
+    print_warn "No routes found in table 51820 or flush failed."
+  fi
 
   print_info "Removing exit-node IP policy rule (table 51820)..."
-  run_root ip rule del table 51820 2>/dev/null || true
+  if ! run_root ip rule del table 51820 2>/dev/null; then
+    print_warn "No policy rule for table 51820 or delete failed."
+  fi
 
   print_info "Removing Rustynet nftables firewall and NAT tables..."
   if command -v nft >/dev/null 2>&1; then
@@ -819,26 +919,37 @@ disconnect_vpn() {
       case "${line}" in
         "table inet rustynet_g"*)
           local t="${line#table inet }"
-          run_root nft delete table inet "${t}" 2>/dev/null || true
-          print_info "Removed nft table: inet ${t}"
+          if run_root nft delete table inet "${t}" 2>/dev/null; then
+            print_info "Removed nft table: inet ${t}"
+          else
+            print_warn "Failed to remove nft table: inet ${t}"
+          fi
           ;;
         "table ip rustynet_nat_g"*)
           local t="${line#table ip }"
-          run_root nft delete table ip "${t}" 2>/dev/null || true
-          print_info "Removed nft table: ip ${t}"
+          if run_root nft delete table ip "${t}" 2>/dev/null; then
+            print_info "Removed nft table: ip ${t}"
+          else
+            print_warn "Failed to remove nft table: ip ${t}"
+          fi
           ;;
       esac
     done <<< "${tables_output}"
   fi
 
   print_info "Restoring IPv6 (disabled during VPN operation)..."
-  run_root sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null || true
+  if ! run_root sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; then
+    print_warn "Failed to restore IPv6 global setting."
+  fi
 
   print_info "Rustynet VPN disconnected. Device is now using normal internet connectivity."
 }
 
 show_service_status() {
-  run_root systemctl --no-pager --full status rustynetd.service || true
+  require_linux_dataplane "show_service_status" || return 0
+  if ! run_root systemctl --no-pager --full status rustynetd.service; then
+    print_warn "Unable to read rustynetd.service status."
+  fi
 }
 
 ensure_peer_store() {
@@ -863,7 +974,7 @@ upsert_peer() {
   ensure_peer_store
   local tmp
   tmp="$(mktemp)"
-  grep -v "^${name}|" "${PEERS_FILE}" >"${tmp}" || true
+  awk -F'|' -v n="${name}" '$0 ~ /^#/ || $1 != n { print }' "${PEERS_FILE}" >"${tmp}"
   printf '%s|%s|%s|%s|%s\n' "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" >>"${tmp}"
   mv "${tmp}" "${PEERS_FILE}"
 }
@@ -873,20 +984,20 @@ remove_peer_record() {
   ensure_peer_store
   local tmp
   tmp="$(mktemp)"
-  grep -v "^${name}|" "${PEERS_FILE}" >"${tmp}" || true
+  awk -F'|' -v n="${name}" '$0 ~ /^#/ || $1 != n { print }' "${PEERS_FILE}" >"${tmp}"
   mv "${tmp}" "${PEERS_FILE}"
 }
 
 find_peer_record() {
   local name="$1"
   ensure_peer_store
-  grep "^${name}|" "${PEERS_FILE}" || true
+  awk -F'|' -v n="${name}" '$0 !~ /^#/ && NF==5 && $1 == n { print; exit }' "${PEERS_FILE}"
 }
 
 find_peer_record_by_node_id() {
   local node_id="$1"
   ensure_peer_store
-  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF==5 && $2 == nid { print; exit }' "${PEERS_FILE}" || true
+  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF==5 && $2 == nid { print; exit }' "${PEERS_FILE}"
 }
 
 run_rustynet_cli() {
@@ -898,6 +1009,7 @@ run_rustynet_cli() {
 }
 
 connect_to_device() {
+  require_linux_dataplane "connect_to_device" || return 0
   local name node_id public_key endpoint_ip endpoint_port endpoint cidr
   prompt_default name "Peer name (local label)" "peer-$(date +%H%M%S)"
   prompt_default node_id "Peer node id" "${name}"
@@ -920,6 +1032,7 @@ connect_to_device() {
 }
 
 disconnect_device() {
+  require_linux_dataplane "disconnect_device" || return 0
   local name record public_key cidr
   print_saved_peers
   prompt_default name "Peer name to remove" ""
@@ -935,13 +1048,18 @@ disconnect_device() {
   require_manual_peer_override_authorization "manual_peer_disconnect:${name}" || return 1
   public_key="$(echo "${record}" | awk -F'|' '{print $3}')"
   cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
-  run_root wg set "${WG_INTERFACE}" peer "${public_key}" remove || true
-  run_root ip route del "${cidr}" dev "${WG_INTERFACE}" || true
+  if ! run_root wg set "${WG_INTERFACE}" peer "${public_key}" remove; then
+    print_warn "Peer ${name} was not present in WireGuard runtime state."
+  fi
+  if ! run_root ip route del "${cidr}" dev "${WG_INTERFACE}"; then
+    print_warn "Route ${cidr} was not present on ${WG_INTERFACE}."
+  fi
   remove_peer_record "${name}"
   print_info "Peer ${name} removed."
 }
 
 show_connected_devices() {
+  require_linux_dataplane "show_connected_devices" || return 0
   echo "Saved peers:"
   print_saved_peers
   echo
@@ -950,10 +1068,12 @@ show_connected_devices() {
 }
 
 rotate_local_key() {
+  require_linux_dataplane "rotate_local_key" || return 0
   run_rustynet_cli key rotate
 }
 
 revoke_local_key() {
+  require_linux_dataplane "revoke_local_key" || return 0
   if ! prompt_yes_no "Revoke local key material now? This disables connectivity until reinitialized." "n"; then
     print_info "Revoke cancelled."
     return 0
@@ -962,6 +1082,7 @@ revoke_local_key() {
 }
 
 apply_rotation_bundle() {
+  require_linux_dataplane "apply_rotation_bundle" || return 0
   local bundle prefix node_id new_public_key record name old_public endpoint cidr
   prompt_default bundle "Rotation bundle (format rotation:<node_id>:<public_key>)" ""
   if [[ -z "${bundle}" ]]; then
@@ -991,7 +1112,9 @@ apply_rotation_bundle() {
   fi
 
   require_manual_peer_override_authorization "manual_peer_rotation_bundle:${name}:${node_id}" || return 1
-  run_root wg set "${WG_INTERFACE}" peer "${old_public}" remove || true
+  if ! run_root wg set "${WG_INTERFACE}" peer "${old_public}" remove; then
+    print_warn "Previous peer key was not present in WireGuard runtime state."
+  fi
   run_root wg set "${WG_INTERFACE}" peer "${new_public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
   upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}"
   print_info "Updated peer key for ${name} (${node_id}) without changing node identity."
@@ -999,9 +1122,13 @@ apply_rotation_bundle() {
 
 configure_values() {
   local detected_egress
+  local fallback_egress="eth0"
+  if is_macos_host; then
+    fallback_egress="en0"
+  fi
   detected_egress="$(detect_default_egress)"
   if [[ -z "${EGRESS_INTERFACE}" ]]; then
-    EGRESS_INTERFACE="${detected_egress:-eth0}"
+    EGRESS_INTERFACE="${detected_egress:-${fallback_egress}}"
   fi
 
   prompt_default DEVICE_NODE_ID "Local device node id (used for display)" "${DEVICE_NODE_ID}"
@@ -1043,6 +1170,14 @@ first_run_setup() {
   ensure_rust_toolchain
   ensure_ci_security_tools
   ensure_binaries_available
+  if ! is_linux_host; then
+    print_warn "Linux dataplane/runtime provisioning is skipped on ${HOST_OS}."
+    print_info "This host is configured for build/validation workflows only."
+    print_info "Run runtime dataplane setup on a Debian/Linux node with ./start.sh."
+    SETUP_COMPLETE="1"
+    save_config
+    return 0
+  fi
   prepare_system_directories
   ensure_wireguard_keys
   ensure_membership_files
@@ -1086,12 +1221,14 @@ EOF
 }
 
 offer_device_as_exit_node() {
+  require_linux_dataplane "offer_device_as_exit_node" || return 0
   print_info "Advertising exit route (0.0.0.0/0)."
   run_rustynet_cli route advertise 0.0.0.0/0
   print_info "This device can now be selected as an exit node by peers (node id: ${DEVICE_NODE_ID})."
 }
 
 toggle_lan_access() {
+  require_linux_dataplane "toggle_lan_access" || return 0
   local choice
   read -r -p "LAN access [on/off]: " choice
   case "${choice}" in
@@ -1102,6 +1239,7 @@ toggle_lan_access() {
 }
 
 select_exit_node() {
+  require_linux_dataplane "select_exit_node" || return 0
   local node
   print_saved_peers
   prompt_default node "Exit node id to select" ""
@@ -1113,12 +1251,18 @@ select_exit_node() {
 }
 
 advertise_route() {
+  require_linux_dataplane "advertise_route" || return 0
   local cidr
   prompt_default cidr "CIDR to advertise (for LAN/exit routing)" "192.168.1.0/24"
   run_rustynet_cli route advertise "${cidr}"
 }
 
 main_menu() {
+  if is_linux_host; then
+    print_info "Host OS: ${HOST_OS} (full dataplane/runtime mode)."
+  else
+    print_warn "Host OS: ${HOST_OS} (compatibility mode: Linux dataplane actions are blocked)."
+  fi
   while true; do
     cat <<'EOF'
 
