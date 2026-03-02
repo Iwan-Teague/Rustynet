@@ -113,7 +113,7 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let public = initialize_encrypted_key_material(
+    initialize_encrypted_key_material(
         std::path::Path::new(&runtime_path),
         std::path::Path::new(&encrypted_path),
         std::path::Path::new(&public_path),
@@ -122,8 +122,8 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
     )?;
 
     println!(
-        "key init complete: runtime_private_key={} encrypted_private_key={} public_key={} public_key_value={}",
-        runtime_path, encrypted_path, public_path, public
+        "key init complete: runtime_private_key={} encrypted_private_key={} public_key={}",
+        runtime_path, encrypted_path, public_path
     );
     Ok(())
 }
@@ -199,7 +199,7 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let public = migrate_existing_private_key_material(
+    migrate_existing_private_key_material(
         std::path::Path::new(&existing_private_key_path),
         std::path::Path::new(&runtime_path),
         std::path::Path::new(&encrypted_path),
@@ -209,8 +209,8 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
     )?;
 
     println!(
-        "key migrate complete: existing_private_key={} runtime_private_key={} encrypted_private_key={} public_key={} public_key_value={}",
-        existing_private_key_path, runtime_path, encrypted_path, public_path, public
+        "key migrate complete: existing_private_key={} runtime_private_key={} encrypted_private_key={} public_key={}",
+        existing_private_key_path, runtime_path, encrypted_path, public_path
     );
     Ok(())
 }

@@ -307,6 +307,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -510,6 +519,7 @@ dependencies = [
  "nix",
  "rustynet-control",
  "rustynetd",
+ "zeroize",
 ]
 
 [[package]]
@@ -517,10 +527,14 @@ name = "rustynet-control"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "hmac",
+ "nix",
+ "rand",
  "rusqlite",
  "rustynet-crypto",
  "rustynet-policy",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
@@ -533,6 +547,7 @@ dependencies = [
  "rand",
  "security-framework",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
@@ -555,6 +570,7 @@ dependencies = [
  "rustynet-crypto",
  "rustynet-policy",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

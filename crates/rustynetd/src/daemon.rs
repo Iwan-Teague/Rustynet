@@ -1142,6 +1142,11 @@ impl DaemonRuntime {
             if let Err(err) = self.persist_state() {
                 return Err(format!("persist failed after key rotation: {err}"));
             }
+            if let Err(err) = self.scrub_runtime_private_key_file() {
+                return Err(format!(
+                    "key rotation completed but runtime key cleanup failed: {err}"
+                ));
+            }
 
             let bundle = format!("rotation:{}:{}", self.local_node_id, new_public);
             Ok(format!(
@@ -1218,6 +1223,16 @@ impl DaemonRuntime {
                 failures.join("; ")
             ))
         }
+    }
+
+    fn scrub_runtime_private_key_file(&self) -> Result<(), String> {
+        if self.wg_encrypted_private_key_path.is_none() {
+            return Ok(());
+        }
+        if let Some(path) = self.wg_private_key_path.as_ref() {
+            remove_file_if_present(path)?;
+        }
+        Ok(())
     }
 
     fn persist_state(&mut self) -> Result<(), String> {
@@ -1510,6 +1525,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
     let mut runtime = DaemonRuntime::new(&config)?;
     runtime.bootstrap();
+    scrub_runtime_wireguard_key_after_bootstrap(&config)?;
 
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
@@ -1589,6 +1605,27 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
     }
 
+    scrub_runtime_wireguard_key_after_bootstrap(&config)?;
+    Ok(())
+}
+
+fn scrub_runtime_wireguard_key_after_bootstrap(config: &DaemonConfig) -> Result<(), DaemonError> {
+    if !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+        return Ok(());
+    }
+    // Keep runtime key material ephemeral when encrypted custody is configured.
+    if config.wg_encrypted_private_key_path.is_none() {
+        return Ok(());
+    }
+    let Some(runtime_path) = config.wg_private_key_path.as_ref() else {
+        return Ok(());
+    };
+    if !runtime_path.exists() {
+        return Ok(());
+    }
+    remove_file_if_present(runtime_path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("runtime private key cleanup failed: {err}"))
+    })?;
     Ok(())
 }
 
@@ -3067,6 +3104,22 @@ mod tests {
             .expect("membership log should be written");
     }
 
+    fn secure_test_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&dir).expect("secure test directory should be creatable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("secure test directory permissions should be set");
+        }
+        dir
+    }
+
     #[test]
     fn run_daemon_rejects_in_memory_backend_mode() {
         let config = DaemonConfig {
@@ -3086,22 +3139,14 @@ mod tests {
 
     #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
-        let unique = format!(
-            "rustynetd-runtime-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-test");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
         write_trust_file(&trust_path, &trust_verifier_path, 1);
         write_membership_files(
             &membership_snapshot_path,
@@ -3148,26 +3193,19 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_enters_restricted_safe_mode_without_trust_evidence() {
-        let unique = format!(
-            "rustynetd-runtime-restricted-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.missing.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.missing.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-restricted");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("missing.trust");
+        let trust_verifier_path = test_dir.join("missing.trust.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
         write_membership_files(
             &membership_snapshot_path,
             &membership_log_path,
@@ -3195,26 +3233,19 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_denies_exit_selection_for_revoked_membership_node() {
-        let unique = format!(
-            "rustynetd-runtime-membership-revoked-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-membership-revoked");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
         write_membership_files_with_exit_status(
@@ -3250,26 +3281,19 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_rejects_replayed_trust_evidence() {
-        let unique = format!(
-            "rustynetd-runtime-replay-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-replay");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
         write_trust_file(&trust_path, &trust_verifier_path, 2);
         write_membership_files(
             &membership_snapshot_path,
@@ -3310,31 +3334,22 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_auto_tunnel_enforcement_applies_and_blocks_manual_mutations() {
-        let unique = format!(
-            "rustynetd-runtime-auto-tunnel-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.trust.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
-        let assignment_path = std::env::temp_dir().join(format!("{unique}.assignment"));
-        let assignment_verifier_path =
-            std::env::temp_dir().join(format!("{unique}.assignment.pub"));
-        let assignment_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.assignment.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
         write_membership_files(
@@ -3391,31 +3406,22 @@ mod tests {
         let _ = std::fs::remove_file(assignment_path);
         let _ = std::fs::remove_file(assignment_verifier_path);
         let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_auto_tunnel_tamper_and_replay_fail_closed() {
-        let unique = format!(
-            "rustynetd-runtime-auto-tunnel-reject-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let state_path = std::env::temp_dir().join(format!("{unique}.state"));
-        let trust_path = std::env::temp_dir().join(format!("{unique}.trust"));
-        let trust_verifier_path = std::env::temp_dir().join(format!("{unique}.trust.pub"));
-        let trust_watermark_path = std::env::temp_dir().join(format!("{unique}.trust.watermark"));
-        let membership_snapshot_path =
-            std::env::temp_dir().join(format!("{unique}.membership.snapshot"));
-        let membership_log_path = std::env::temp_dir().join(format!("{unique}.membership.log"));
-        let membership_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.membership.watermark"));
-        let assignment_path = std::env::temp_dir().join(format!("{unique}.assignment"));
-        let assignment_verifier_path =
-            std::env::temp_dir().join(format!("{unique}.assignment.pub"));
-        let assignment_watermark_path =
-            std::env::temp_dir().join(format!("{unique}.assignment.watermark"));
+        let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel-reject");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
         write_membership_files(
@@ -3489,5 +3495,6 @@ mod tests {
         let _ = std::fs::remove_file(assignment_path);
         let _ = std::fs::remove_file(assignment_verifier_path);
         let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }

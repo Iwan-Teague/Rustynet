@@ -4,10 +4,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(unix)]
+use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u8 = 1;
@@ -1178,7 +1182,32 @@ fn parse_membership_update_payload(
 
 fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipError> {
     if let Some(parent) = path.parent() {
+        if parent.exists() {
+            let metadata =
+                fs::symlink_metadata(parent).map_err(|err| MembershipError::Io(err.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                return Err(MembershipError::InvalidFormat(format!(
+                    "membership parent path {} must be a real directory",
+                    parent.display()
+                )));
+            }
+        }
         fs::create_dir_all(parent).map_err(|err| MembershipError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| MembershipError::Io(err.to_string()))?;
+        }
+    }
+    if path.exists() {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|err| MembershipError::Io(err.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(MembershipError::InvalidFormat(format!(
+                "membership target {} must not be a symlink",
+                path.display()
+            )));
+        }
     }
     let temp_path = path.with_extension(format!(
         "tmp.{}.{}",
@@ -1203,6 +1232,13 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipErr
     temp.sync_all()
         .map_err(|err| MembershipError::Io(err.to_string()))?;
     fs::rename(&temp_path, path).map_err(|err| MembershipError::Io(err.to_string()))?;
+    if let Some(parent) = path.parent() {
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| MembershipError::Io(err.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| MembershipError::Io(err.to_string()))?;
+    }
     validate_membership_file_security(path, "membership state file")?;
     Ok(())
 }
@@ -1210,17 +1246,25 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipErr
 fn validate_membership_file_security(path: &Path, label: &str) -> Result<(), MembershipError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path).map_err(|err| MembershipError::Io(err.to_string()))?;
-        if !metadata.is_file() {
+        let link_metadata =
+            fs::symlink_metadata(path).map_err(|err| MembershipError::Io(err.to_string()))?;
+        if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
             return Err(MembershipError::InvalidFormat(format!(
-                "{label} path is not a regular file"
+                "{label} path must be a regular file and must not be a symlink"
             )));
         }
+        let metadata = fs::metadata(path).map_err(|err| MembershipError::Io(err.to_string()))?;
         let mode = metadata.mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(MembershipError::InvalidFormat(format!(
                 "{label} permissions are too broad: {mode:o}"
+            )));
+        }
+        let owner_uid = metadata.uid();
+        let expected_uid = Uid::effective().as_raw();
+        if owner_uid != expected_uid {
+            return Err(MembershipError::InvalidFormat(format!(
+                "{label} owner uid mismatch: expected {expected_uid}, got {owner_uid}"
             )));
         }
     }

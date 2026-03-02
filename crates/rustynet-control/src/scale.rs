@@ -384,21 +384,30 @@ mod tests {
             enabled: true,
             break_glass_secret: "break-glass".to_string(),
         };
-        let missing_path = std::env::temp_dir().join("rustynet-trust-hardening-missing");
+        let unique_dir = format!(
+            "rustynet-trust-hardening-dir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let test_dir = std::env::temp_dir().join(unique_dir);
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("test directory permissions should be set");
+        }
+
+        let missing_path = test_dir.join("missing.state");
         let missing = authorize_trusted_key(&config, &missing_path, "ed25519:abc");
         match missing.err() {
             Some(TrustHardeningError::TrustState(_)) => {}
             other => panic!("unexpected missing-state result: {other:?}"),
         }
 
-        let unique = format!(
-            "rustynet-trust-hardening-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
+        let path = test_dir.join("trust.state");
         persist_trust_state(
             &path,
             &TrustState {
@@ -415,7 +424,9 @@ mod tests {
         );
         assert!(authorize_trusted_key(&config, &path, "ed25519:trusted").is_ok());
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
+        let _ = std::fs::remove_dir(&test_dir);
     }
 
     #[test]

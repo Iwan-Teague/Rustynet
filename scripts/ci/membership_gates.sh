@@ -35,12 +35,20 @@ if [[ ! -d "$AUDIT_DB" && -d "$HOME/.cargo/advisory-db" ]]; then
   cp -R "$HOME/.cargo/advisory-db" "$AUDIT_DB"
 fi
 
+cargo_with_security_toolchain() {
+  if cargo +"${SECURITY_TOOLCHAIN}" --version >/dev/null 2>&1; then
+    cargo +"${SECURITY_TOOLCHAIN}" "$@"
+  else
+    cargo "$@"
+  fi
+}
+
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-targets --all-features
-CARGO_HOME="$ROOT_DIR/.cargo-home" cargo +"${SECURITY_TOOLCHAIN}" audit --deny warnings --stale --no-fetch --db "$AUDIT_DB"
-cargo +"${SECURITY_TOOLCHAIN}" deny check bans licenses sources advisories
+CARGO_HOME="$ROOT_DIR/.cargo-home" cargo_with_security_toolchain audit --deny warnings --stale --no-fetch --db "$AUDIT_DB"
+cargo_with_security_toolchain deny check bans licenses sources advisories
 
 ./scripts/ci/phase9_gates.sh
 ./scripts/ci/phase10_gates.sh

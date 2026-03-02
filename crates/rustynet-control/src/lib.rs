@@ -9,13 +9,22 @@ pub mod scale;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
+#[cfg(unix)]
+use nix::unistd::Uid;
+use rand::RngCore;
 use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRateLimitConfig {
@@ -81,6 +90,21 @@ impl fmt::Debug for TokenClaims {
             .field("issued_at_unix", &self.issued_at_unix)
             .field("expires_at_unix", &self.expires_at_unix)
             .field("nonce", &"REDACTED")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignedTokenClaims {
+    pub claims: TokenClaims,
+    pub signature_hex: String,
+}
+
+impl fmt::Debug for SignedTokenClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignedTokenClaims")
+            .field("claims", &self.claims)
+            .field("signature_hex", &"REDACTED")
             .finish()
     }
 }
@@ -234,6 +258,7 @@ pub enum AuthError {
     LockedOutUntil(u64),
     ReplayDetected,
     InvalidTokenLifetime,
+    TokenSignatureInvalid,
     TokenExpired,
     TokenNotYetValid,
     Internal,
@@ -246,6 +271,7 @@ impl fmt::Display for AuthError {
             AuthError::LockedOutUntil(ts) => write!(f, "identity locked out until {ts}"),
             AuthError::ReplayDetected => f.write_str("replay detected"),
             AuthError::InvalidTokenLifetime => f.write_str("invalid token lifetime"),
+            AuthError::TokenSignatureInvalid => f.write_str("token signature invalid"),
             AuthError::TokenExpired => f.write_str("token expired"),
             AuthError::TokenNotYetValid => f.write_str("token not yet valid"),
             AuthError::Internal => f.write_str("internal auth guard error"),
@@ -941,6 +967,8 @@ pub enum TrustStateError {
     InvalidFormat,
     PersistFailure,
     IntegrityMismatch,
+    PermissionDenied,
+    KeyUnavailable,
 }
 
 impl fmt::Display for TrustStateError {
@@ -951,6 +979,8 @@ impl fmt::Display for TrustStateError {
             TrustStateError::InvalidFormat => f.write_str("trust state invalid format"),
             TrustStateError::PersistFailure => f.write_str("trust state persist failure"),
             TrustStateError::IntegrityMismatch => f.write_str("trust state integrity mismatch"),
+            TrustStateError::PermissionDenied => f.write_str("trust state permission denied"),
+            TrustStateError::KeyUnavailable => f.write_str("trust state integrity key unavailable"),
         }
     }
 }
@@ -961,19 +991,27 @@ pub fn persist_trust_state(
     path: impl AsRef<Path>,
     state: &TrustState,
 ) -> Result<(), TrustStateError> {
+    let path = path.as_ref();
+    ensure_secure_parent_directory(path)?;
+    let key_path = trust_state_key_path(path);
+    let key = load_or_create_trust_state_mac_key(&key_path)?;
     let payload = trust_state_payload(state);
-    let digest = hex_sha256(payload.as_bytes());
-    let body = format!("{payload}digest={digest}\n");
-
-    std::fs::write(path, body).map_err(|_| TrustStateError::PersistFailure)
+    let mac = compute_trust_state_mac(payload.as_bytes(), &key)?;
+    let body = format!("{payload}mac={mac}\n");
+    atomic_write_secure(path, body.as_bytes(), 0o600)?;
+    validate_secure_file(path, "trust state", 0o077)?;
+    Ok(())
 }
 
 pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustStateError> {
-    let content = std::fs::read_to_string(path).map_err(|_| TrustStateError::Missing)?;
+    let path = path.as_ref();
+    validate_secure_file(path, "trust state", 0o077)?;
+    let content = fs::read_to_string(path).map_err(|_| TrustStateError::Missing)?;
     let mut generation: Option<u64> = None;
     let mut fingerprint: Option<String> = None;
     let mut updated_at: Option<u64> = None;
-    let mut digest: Option<String> = None;
+    let mut version: Option<u8> = None;
+    let mut mac: Option<String> = None;
 
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -982,9 +1020,7 @@ pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustState
 
         match key {
             "version" => {
-                if value != "1" {
-                    return Err(TrustStateError::InvalidFormat);
-                }
+                version = value.parse::<u8>().ok();
             }
             "generation" => {
                 generation = value.parse::<u64>().ok();
@@ -995,11 +1031,14 @@ pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustState
             "updated_at_unix" => {
                 updated_at = value.parse::<u64>().ok();
             }
-            "digest" => {
-                digest = Some(value.to_string());
+            "mac" => {
+                mac = Some(value.to_string());
             }
             _ => return Err(TrustStateError::InvalidFormat),
         }
+    }
+    if version != Some(2) {
+        return Err(TrustStateError::InvalidFormat);
     }
 
     let state = TrustState {
@@ -1008,31 +1047,175 @@ pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustState
         updated_at_unix: updated_at.ok_or(TrustStateError::Corrupt)?,
     };
 
-    let expected_digest = digest.ok_or(TrustStateError::Corrupt)?;
+    let expected_mac = mac.ok_or(TrustStateError::Corrupt)?;
     let payload = trust_state_payload(&state);
-    let actual_digest = hex_sha256(payload.as_bytes());
-
-    if actual_digest != expected_digest {
-        return Err(TrustStateError::IntegrityMismatch);
-    }
+    let key_path = trust_state_key_path(path);
+    let key = load_trust_state_mac_key(&key_path)?;
+    verify_trust_state_mac(payload.as_bytes(), &key, expected_mac.as_str())?;
 
     Ok(state)
 }
 
 fn trust_state_payload(state: &TrustState) -> String {
     format!(
-        "version=1\ngeneration={}\nsigning_fingerprint={}\nupdated_at_unix={}\n",
+        "version=2\ngeneration={}\nsigning_fingerprint={}\nupdated_at_unix={}\n",
         state.generation, state.signing_fingerprint, state.updated_at_unix
     )
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        hex.push_str(&format!("{byte:02x}"));
+fn trust_state_key_path(path: &Path) -> std::path::PathBuf {
+    let mut out = path.as_os_str().to_os_string();
+    out.push(".integrity.key");
+    std::path::PathBuf::from(out)
+}
+
+fn load_or_create_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStateError> {
+    if path.exists() {
+        return load_trust_state_mac_key(path);
     }
-    hex
+    ensure_secure_parent_directory(path)?;
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    let body = format!("{}\n", hex_bytes(&key));
+    atomic_write_secure(path, body.as_bytes(), 0o600)?;
+    validate_secure_file(path, "trust state integrity key", 0o077)?;
+    Ok(key)
+}
+
+fn load_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStateError> {
+    validate_secure_file(path, "trust state integrity key", 0o077)
+        .map_err(|_| TrustStateError::KeyUnavailable)?;
+    let mut content = fs::read_to_string(path).map_err(|_| TrustStateError::KeyUnavailable)?;
+    let mut key_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or(TrustStateError::KeyUnavailable)?
+        .to_string();
+    content.zeroize();
+    let key = decode_hex_to_fixed::<32>(&key_line).map_err(|_| TrustStateError::InvalidFormat)?;
+    key_line.zeroize();
+    Ok(key)
+}
+
+fn compute_trust_state_mac(payload: &[u8], key: &[u8; 32]) -> Result<String, TrustStateError> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|_| TrustStateError::KeyUnavailable)?;
+    mac.update(payload);
+    Ok(hex_bytes(mac.finalize().into_bytes().as_slice()))
+}
+
+fn verify_trust_state_mac(
+    payload: &[u8],
+    key: &[u8; 32],
+    mac_hex: &str,
+) -> Result<(), TrustStateError> {
+    let expected =
+        decode_hex_to_fixed::<32>(mac_hex).map_err(|_| TrustStateError::InvalidFormat)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|_| TrustStateError::KeyUnavailable)?;
+    mac.update(payload);
+    mac.verify_slice(&expected)
+        .map_err(|_| TrustStateError::IntegrityMismatch)?;
+    Ok(())
+}
+
+fn ensure_secure_parent_directory(path: &Path) -> Result<(), TrustStateError> {
+    let Some(parent) = path.parent() else {
+        return Err(TrustStateError::PersistFailure);
+    };
+    if parent.exists() {
+        let metadata = fs::symlink_metadata(parent).map_err(|_| TrustStateError::PersistFailure)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(TrustStateError::PermissionDenied);
+        }
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(parent).map_err(|_| TrustStateError::PersistFailure)?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(TrustStateError::PermissionDenied);
+            }
+            let owner_uid = metadata.uid();
+            let expected_uid = Uid::effective().as_raw();
+            if owner_uid != expected_uid {
+                return Err(TrustStateError::PermissionDenied);
+            }
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(parent).map_err(|_| TrustStateError::PersistFailure)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|_| TrustStateError::PersistFailure)?;
+    }
+    Ok(())
+}
+
+fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustStateError> {
+    ensure_secure_parent_directory(path)?;
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::PersistFailure)?;
+        if metadata.file_type().is_symlink() {
+            return Err(TrustStateError::PermissionDenied);
+        }
+    }
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(mode);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|_| TrustStateError::PersistFailure)?;
+    temp.write_all(body)
+        .map_err(|_| TrustStateError::PersistFailure)?;
+    temp.sync_all()
+        .map_err(|_| TrustStateError::PersistFailure)?;
+    fs::rename(&temp_path, path).map_err(|_| TrustStateError::PersistFailure)?;
+    if let Some(parent) = path.parent() {
+        let parent_dir = fs::File::open(parent).map_err(|_| TrustStateError::PersistFailure)?;
+        parent_dir
+            .sync_all()
+            .map_err(|_| TrustStateError::PersistFailure)?;
+    }
+    Ok(())
+}
+
+fn validate_secure_file(
+    path: &Path,
+    label: &str,
+    disallowed_mode_mask: u32,
+) -> Result<(), TrustStateError> {
+    let link_metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::Missing)?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
+        return Err(TrustStateError::PermissionDenied);
+    }
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(path).map_err(|_| TrustStateError::Missing)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & disallowed_mode_mask != 0 {
+            return Err(TrustStateError::PermissionDenied);
+        }
+        let owner_uid = metadata.uid();
+        let expected_uid = Uid::effective().as_raw();
+        if owner_uid != expected_uid {
+            return Err(TrustStateError::PermissionDenied);
+        }
+    }
+    let _ = label;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,7 +1311,7 @@ pub struct EnrollmentRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnrollmentResponse {
     pub node_id: String,
-    pub access_token: TokenClaims,
+    pub access_token: SignedTokenClaims,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,19 +1490,23 @@ pub struct ControlPlaneCore {
     transport_policy: ControlPlaneTransportPolicy,
     assignment_signing_key: SigningKey,
     assignment_verifying_key: [u8; 32],
+    access_token_signing_key: SigningKey,
+    access_token_verifying_key: [u8; 32],
     assigned_tunnel_cidrs: Mutex<HashMap<String, String>>,
 }
 
 impl ControlPlaneCore {
-    pub fn new(signing_secret: Vec<u8>, policy: PolicySet) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"rustynet-control-assignment-signing-v1");
-        hasher.update(signing_secret.as_slice());
-        let digest = hasher.finalize();
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&digest[..32]);
-        let assignment_signing_key = SigningKey::from_bytes(&seed);
+    pub fn new(mut signing_secret: Vec<u8>, policy: PolicySet) -> Self {
+        let assignment_seed =
+            derive_signing_seed(b"rustynet-control-assignment-signing-v1", &signing_secret);
+        let access_token_seed =
+            derive_signing_seed(b"rustynet-control-access-token-signing-v1", &signing_secret);
+        signing_secret.zeroize();
+
+        let assignment_signing_key = SigningKey::from_bytes(&assignment_seed);
         let assignment_verifying_key = *assignment_signing_key.verifying_key().as_bytes();
+        let access_token_signing_key = SigningKey::from_bytes(&access_token_seed);
+        let access_token_verifying_key = *access_token_signing_key.verifying_key().as_bytes();
         Self {
             auth_guard: AuthSurfaceGuard::default(),
             credentials: ThrowawayCredentialStore::default(),
@@ -1328,6 +1515,8 @@ impl ControlPlaneCore {
             transport_policy: ControlPlaneTransportPolicy::default(),
             assignment_signing_key,
             assignment_verifying_key,
+            access_token_signing_key,
+            access_token_verifying_key,
             assigned_tunnel_cidrs: Mutex::new(HashMap::new()),
         }
     }
@@ -1368,7 +1557,7 @@ impl ControlPlaneCore {
 
         self.nodes.upsert(node)?;
 
-        let token = TokenClaims {
+        let token_claims = TokenClaims {
             subject: request.owner,
             issued_at_unix: request.now_unix,
             expires_at_unix: request
@@ -1376,6 +1565,7 @@ impl ControlPlaneCore {
                 .saturating_add(ReplayPolicy::default().token_lifetime_secs),
             nonce: format!("nonce-{}-{}", request.node_id, request.now_unix),
         };
+        let token = self.sign_access_token(&token_claims);
 
         Ok(EnrollmentResponse {
             node_id: request.node_id,
@@ -1478,6 +1668,36 @@ impl ControlPlaneCore {
 
     pub fn assignment_verifier_key_hex(&self) -> String {
         hex_bytes(&self.assignment_verifying_key)
+    }
+
+    pub fn access_token_verifier_key_hex(&self) -> String {
+        hex_bytes(&self.access_token_verifying_key)
+    }
+
+    pub fn verify_access_token(&self, token: &SignedTokenClaims) -> bool {
+        let signature_bytes = match decode_hex_to_fixed::<64>(&token.signature_hex) {
+            Ok(bytes) => bytes,
+            Err(()) => return false,
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let verifying_key = match VerifyingKey::from_bytes(&self.access_token_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        let payload = token_claims_payload(&token.claims);
+        verifying_key.verify(payload.as_bytes(), &signature).is_ok()
+    }
+
+    pub fn validate_signed_token_and_nonce(
+        &self,
+        guard: &mut AuthSurfaceGuard,
+        token: &SignedTokenClaims,
+        now_unix: u64,
+    ) -> Result<(), AuthError> {
+        if !self.verify_access_token(token) {
+            return Err(AuthError::TokenSignatureInvalid);
+        }
+        guard.validate_token_and_nonce(&token.claims, now_unix)
     }
 
     pub fn signed_auto_tunnel_bundle(
@@ -1668,6 +1888,15 @@ impl ControlPlaneCore {
         hex_bytes(&signature.to_bytes())
     }
 
+    fn sign_access_token(&self, claims: &TokenClaims) -> SignedTokenClaims {
+        let payload = token_claims_payload(claims);
+        let signature = self.access_token_signing_key.sign(payload.as_bytes());
+        SignedTokenClaims {
+            claims: claims.clone(),
+            signature_hex: hex_bytes(&signature.to_bytes()),
+        }
+    }
+
     fn verify_peer_map_signature(&self, payload: &str, signature_hex: &str) -> bool {
         let signature_bytes = match decode_hex_to_fixed::<64>(signature_hex) {
             Ok(bytes) => bytes,
@@ -1706,6 +1935,23 @@ impl fmt::Display for ControlPlaneError {
 }
 
 impl std::error::Error for ControlPlaneError {}
+
+fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(secret);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest[..32]);
+    seed
+}
+
+fn token_claims_payload(claims: &TokenClaims) -> String {
+    format!(
+        "version=1\nsubject={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\n",
+        claims.subject, claims.issued_at_unix, claims.expires_at_unix, claims.nonce
+    )
+}
 
 fn hex_bytes(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
@@ -1987,14 +2233,22 @@ mod tests {
 
     #[test]
     fn trust_state_persist_and_integrity_check() {
-        let unique = format!(
-            "rustynet-trust-state-{}",
+        let unique_dir = format!(
+            "rustynet-trust-state-dir-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock should be valid")
                 .as_nanos()
         );
-        let path = std::env::temp_dir().join(unique);
+        let test_dir = std::env::temp_dir().join(unique_dir);
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("test directory permissions should be set");
+        }
+        let path = test_dir.join("trust.state");
 
         let state = TrustState {
             generation: 7,
@@ -2014,6 +2268,8 @@ mod tests {
         assert!(matches!(err, super::TrustStateError::IntegrityMismatch));
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
+        let _ = std::fs::remove_dir(&test_dir);
     }
 
     #[test]
@@ -2067,6 +2323,7 @@ mod tests {
             .expect("enrollment should succeed");
 
         assert_eq!(response.node_id, "node-1");
+        assert!(core.verify_access_token(&response.access_token));
         let node = core
             .nodes
             .get("node-1")
@@ -2542,6 +2799,52 @@ mod tests {
         assert!(!rendered.contains("alice@example.local"));
         assert!(!rendered.contains("nonce-secret"));
         assert!(rendered.contains("REDACTED"));
+    }
+
+    #[test]
+    fn signed_token_claims_are_verified_and_replay_guarded() {
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
+        core.credentials
+            .create(
+                "cred-token".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+
+        let response = core
+            .enroll_with_throwaway(EnrollmentRequest {
+                credential_id: "cred-token".to_string(),
+                node_id: "node-token".to_string(),
+                hostname: "mini-pc-token".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.60:51820".to_string(),
+                public_key: [60; 32],
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+
+        assert!(core.verify_access_token(&response.access_token));
+
+        let mut guard = AuthSurfaceGuard::default();
+        assert!(
+            core.validate_signed_token_and_nonce(&mut guard, &response.access_token, 121)
+                .is_ok()
+        );
+        let replay = core.validate_signed_token_and_nonce(&mut guard, &response.access_token, 122);
+        assert_eq!(replay.err(), Some(AuthError::ReplayDetected));
+
+        let mut tampered = response.access_token.clone();
+        tampered.claims.subject = "mallory@example.local".to_string();
+        let tampered_result = core.validate_signed_token_and_nonce(&mut guard, &tampered, 123);
+        assert_eq!(
+            tampered_result.err(),
+            Some(AuthError::TokenSignatureInvalid)
+        );
     }
 
     #[test]

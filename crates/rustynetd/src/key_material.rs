@@ -7,6 +7,10 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use nix::unistd::Uid;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use rustynet_crypto::{
@@ -14,14 +18,19 @@ use rustynet_crypto::{
     write_encrypted_key_file,
 };
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
-pub fn read_passphrase_file(path: &Path) -> Result<String, String> {
-    let raw =
+pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
+    validate_secret_file_security(path, "passphrase file")?;
+    let mut raw =
         fs::read_to_string(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
-    let value = raw.trim().to_string();
-    if value.len() < 16 {
+    let trimmed = raw.trim();
+    if trimmed.len() < 16 {
+        raw.zeroize();
         return Err("passphrase must be at least 16 characters".to_string());
     }
+    let value = Zeroizing::new(trimmed.to_string());
+    raw.zeroize();
     Ok(value)
 }
 
@@ -84,6 +93,43 @@ fn key_custody_manager(
         passphrase.to_string(),
         KeyCustodyPermissionPolicy::default(),
     ))
+}
+
+fn validate_secret_file_security(path: &Path, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|err| format!("{label} metadata read failed: {err}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{label} must not be a symlink"));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!("{label} must be a regular file"));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{label} permissions are too broad: expected owner-only, found {:03o}",
+                mode
+            ));
+        }
+        let owner_uid = metadata.uid();
+        let expected_uid = Uid::effective().as_raw();
+        if owner_uid != expected_uid {
+            return Err(format!(
+                "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata =
+            fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{label} must be a regular file"));
+        }
+    }
+    Ok(())
 }
 
 fn key_custody_key_id(encrypted_key_path: &Path) -> String {
@@ -250,6 +296,20 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("path {} has no parent", path.display()))?;
+    if parent.exists() {
+        let parent_meta = fs::symlink_metadata(parent).map_err(|err| {
+            format!(
+                "inspect parent directory {} failed: {err}",
+                parent.display()
+            )
+        })?;
+        if parent_meta.file_type().is_symlink() || !parent_meta.file_type().is_dir() {
+            return Err(format!(
+                "parent path {} must be a real directory, not a symlink",
+                parent.display()
+            ));
+        }
+    }
     fs::create_dir_all(parent)
         .map_err(|err| format!("create parent directory {} failed: {err}", parent.display()))?;
 
@@ -261,6 +321,16 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     }
 
     let temp = temp_path_for(path);
+    if path.exists() {
+        let target_meta = fs::symlink_metadata(path)
+            .map_err(|err| format!("inspect target {} failed: {err}", path.display()))?;
+        if target_meta.file_type().is_symlink() {
+            return Err(format!("target {} must not be a symlink", path.display()));
+        }
+        if !target_meta.file_type().is_file() {
+            return Err(format!("target {} must be a regular file", path.display()));
+        }
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -281,6 +351,11 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
             path.display()
         )
     })?;
+    let parent_dir = fs::File::open(parent)
+        .map_err(|err| format!("open parent directory {} failed: {err}", parent.display()))?;
+    parent_dir
+        .sync_all()
+        .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?;
     Ok(())
 }
 

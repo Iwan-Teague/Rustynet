@@ -139,6 +139,28 @@ fn metric_from_env_or_fail(
     }
 }
 
+fn metric_from_measured(
+    name: &'static str,
+    value: f64,
+    unit: &'static str,
+    threshold: &'static str,
+    threshold_max: f64,
+) -> Metric {
+    let status = if value.is_finite() && value >= 0.0 && value <= threshold_max {
+        "pass"
+    } else {
+        "fail"
+    };
+    Metric {
+        name,
+        value,
+        unit,
+        threshold,
+        status,
+        reason: "measured",
+    }
+}
+
 fn report_path() -> PathBuf {
     std::env::var("RUSTYNET_PHASE1_BACKEND_PERF_REPORT")
         .map(PathBuf::from)
@@ -221,30 +243,27 @@ fn phase1_backend_contract_perf_report() {
     backend.shutdown().expect("shutdown should succeed");
 
     let metrics = vec![
-        Metric {
-            name: "configure_peer_avg_us",
-            value: (configure_duration.as_secs_f64() * 1_000_000.0) / 250.0,
-            unit: "microseconds",
-            threshold: "<=5000",
-            status: "pass",
-            reason: "measured",
-        },
-        Metric {
-            name: "apply_routes_avg_us",
-            value: (route_duration.as_secs_f64() * 1_000_000.0) / 200.0,
-            unit: "microseconds",
-            threshold: "<=5000",
-            status: "pass",
-            reason: "measured",
-        },
-        Metric {
-            name: "stats_avg_us",
-            value: (stats_duration.as_secs_f64() * 1_000_000.0) / 500.0,
-            unit: "microseconds",
-            threshold: "<=5000",
-            status: "pass",
-            reason: "measured",
-        },
+        metric_from_measured(
+            "configure_peer_avg_us",
+            (configure_duration.as_secs_f64() * 1_000_000.0) / 250.0,
+            "microseconds",
+            "<=5000",
+            5_000.0,
+        ),
+        metric_from_measured(
+            "apply_routes_avg_us",
+            (route_duration.as_secs_f64() * 1_000_000.0) / 200.0,
+            "microseconds",
+            "<=5000",
+            5_000.0,
+        ),
+        metric_from_measured(
+            "stats_avg_us",
+            (stats_duration.as_secs_f64() * 1_000_000.0) / 500.0,
+            "microseconds",
+            "<=5000",
+            5_000.0,
+        ),
         metric_from_env_or_fail(
             "throughput_overhead_vs_wireguard_percent",
             "RUSTYNET_PHASE1_BACKEND_THROUGHPUT_OVERHEAD_PERCENT",

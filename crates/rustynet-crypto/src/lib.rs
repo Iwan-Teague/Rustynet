@@ -17,6 +17,7 @@ use rand::RngCore;
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey([u8; 32]);
@@ -308,7 +309,7 @@ impl OsSecureStore for PlatformOsSecureStore {
 pub struct KeyCustodyManager<S: OsSecureStore> {
     os_store: S,
     fallback_directory: PathBuf,
-    fallback_passphrase: String,
+    fallback_passphrase: Zeroizing<String>,
     permission_policy: KeyCustodyPermissionPolicy,
 }
 
@@ -322,7 +323,7 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         Self {
             os_store,
             fallback_directory,
-            fallback_passphrase,
+            fallback_passphrase: Zeroizing::new(fallback_passphrase),
             permission_policy,
         }
     }
@@ -340,7 +341,7 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
                     &self.fallback_directory,
                     &file_path,
                     key_material,
-                    &self.fallback_passphrase,
+                    self.fallback_passphrase.as_str(),
                     self.permission_policy,
                 )?;
                 Ok(KeyCustodyBackend::EncryptedFileFallback)
@@ -357,7 +358,7 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
                 read_encrypted_key_file(
                     &self.fallback_directory,
                     &file_path,
-                    &self.fallback_passphrase,
+                    self.fallback_passphrase.as_str(),
                     self.permission_policy,
                 )
             }
@@ -394,7 +395,7 @@ fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), Cryp
 
 #[cfg(target_os = "macos")]
 fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
-    let value = get_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
+    let mut value = get_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
 
     if let Ok(text) = std::str::from_utf8(&value) {
@@ -405,6 +406,7 @@ fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
         .then(|| hex_decode(trimmed))
         .and_then(Result::ok);
         if let Some(decoded) = maybe_hex_decoded {
+            value.zeroize();
             return Ok(decoded);
         }
     }
@@ -426,7 +428,7 @@ fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<()
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
     let mut stdin = child.stdin.take().ok_or(CryptoError::OsStoreUnavailable)?;
     use std::io::Write;
-    let encoded = hex_bytes(key_material);
+    let encoded = Zeroizing::new(hex_bytes(key_material));
     stdin
         .write_all(encoded.as_bytes())
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
@@ -449,9 +451,14 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> 
     if !output.status.success() {
         return Err(CryptoError::OsStoreUnavailable);
     }
-    let value = String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
-    let trimmed = value.trim();
-    hex_decode(trimmed)
+    let mut value =
+        String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let decoded = {
+        let trimmed = value.trim();
+        hex_decode(trimmed)?
+    };
+    value.zeroize();
+    Ok(decoded)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

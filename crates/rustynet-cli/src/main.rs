@@ -22,6 +22,7 @@ use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -701,13 +702,17 @@ fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
 
 fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
     validate_signing_key_file_security(path)?;
-    let content = fs::read_to_string(path).map_err(|err| format!("read key failed: {err}"))?;
+    let mut content = fs::read_to_string(path).map_err(|err| format!("read key failed: {err}"))?;
     let key_line = content
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| "signing key file is empty".to_string())?;
-    let bytes = decode_hex_to_32(key_line)?;
+        .ok_or_else(|| "signing key file is empty".to_string())?
+        .to_string();
+    content.zeroize();
+
+    let key_line = Zeroizing::new(key_line);
+    let bytes = decode_hex_to_32(key_line.as_str())?;
     Ok(SigningKey::from_bytes(&bytes))
 }
 
