@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
 
 REPORT_PATH="${RUSTYNET_E2E_REPORT_PATH:-artifacts/phase10/netns_e2e_report.json}"
 RUNTIME_DIR="${RUSTYNET_E2E_RUNTIME_DIR:-/tmp/rustynet-e2e}"

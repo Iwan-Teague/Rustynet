@@ -38,6 +38,7 @@ RUST_MIN_VERSION="1.85"
 MANUAL_PEER_AUDIT_LOG="/var/log/rustynet/manual-peer-override.log"
 MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
 HOST_OS="$(uname -s)"
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
 touch "${PEERS_FILE}"
