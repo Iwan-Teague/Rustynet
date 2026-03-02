@@ -39,3 +39,7 @@ if ! command -v cargo-deny >/dev/null 2>&1 || ! cargo-deny --version | grep -q '
   # Newer advisories use CVSS4 metadata; cargo-deny 0.19+ is required.
   cargo +"${SECURITY_TOOLCHAIN}" install cargo-deny --locked --force
 fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+AUDIT_DB="${RUSTYNET_AUDIT_DB_PATH:-$ROOT_DIR/.cargo-audit-db}"
+"$ROOT_DIR/scripts/ci/prepare_advisory_db.sh" "$AUDIT_DB"
