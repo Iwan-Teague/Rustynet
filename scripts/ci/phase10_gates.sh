@@ -34,24 +34,48 @@ SECURITY_TOOLCHAIN="${RUSTYNET_SECURITY_TOOLCHAIN:-1.88.0}"
 SOURCE_CARGO_HOME="${RUSTYNET_SOURCE_CARGO_HOME:-${CARGO_HOME:-$HOME/.cargo}}"
 AUDIT_HOME="${RUSTYNET_AUDIT_HOME:-$ROOT_DIR/.ci-home}"
 CARGO_HOME_PATH="${RUSTYNET_CARGO_HOME_PATH:-$ROOT_DIR/.cargo-home}"
-mkdir -p "$AUDIT_HOME" "$CARGO_HOME_PATH"
-if [[ "$SOURCE_CARGO_HOME" != "$CARGO_HOME_PATH" ]]; then
-  if [[ ! -d "$CARGO_HOME_PATH/advisory-dbs" && -d "$SOURCE_CARGO_HOME/advisory-dbs" ]]; then
-    cp -R "$SOURCE_CARGO_HOME/advisory-dbs" "$CARGO_HOME_PATH/advisory-dbs"
-  fi
-  if [[ ! -d "$CARGO_HOME_PATH/registry" && -d "$SOURCE_CARGO_HOME/registry" ]]; then
-    cp -R "$SOURCE_CARGO_HOME/registry" "$CARGO_HOME_PATH/registry"
-  fi
-  if [[ ! -d "$CARGO_HOME_PATH/git" && -d "$SOURCE_CARGO_HOME/git" ]]; then
-    cp -R "$SOURCE_CARGO_HOME/git" "$CARGO_HOME_PATH/git"
+USE_SOURCE_CARGO_HOME=1
+probe_file="$SOURCE_CARGO_HOME/.rustynet-ci-write-test.$$"
+if [[ ! -d "$SOURCE_CARGO_HOME" ]]; then
+  if ! mkdir -p "$SOURCE_CARGO_HOME" 2>/dev/null; then
+    USE_SOURCE_CARGO_HOME=0
   fi
 fi
-DENY_DB_ROOT="$CARGO_HOME_PATH/advisory-dbs"
-# cargo-deny keys advisory DB directories by URL hash; allow override if upstream changes.
-DENY_DB_NAME="${RUSTYNET_CARGO_DENY_DB_NAME:-advisory-db-3157b0e258782691}"
-if [[ ! -d "$DENY_DB_ROOT/$DENY_DB_NAME" ]]; then
-  mkdir -p "$DENY_DB_ROOT"
-  cp -R "$AUDIT_DB" "$DENY_DB_ROOT/$DENY_DB_NAME"
+if [[ "$USE_SOURCE_CARGO_HOME" -eq 1 ]]; then
+  if ! ( : > "$probe_file" ) 2>/dev/null; then
+    USE_SOURCE_CARGO_HOME=0
+  else
+    rm -f "$probe_file"
+  fi
+fi
+
+if [[ "$USE_SOURCE_CARGO_HOME" -eq 1 ]]; then
+  EFFECTIVE_HOME="$HOME"
+  EFFECTIVE_CARGO_HOME="$SOURCE_CARGO_HOME"
+  DENY_DISABLE_FETCH=0
+else
+  EFFECTIVE_HOME="$AUDIT_HOME"
+  EFFECTIVE_CARGO_HOME="$CARGO_HOME_PATH"
+  DENY_DISABLE_FETCH=1
+  mkdir -p "$AUDIT_HOME" "$CARGO_HOME_PATH"
+  if [[ "$SOURCE_CARGO_HOME" != "$CARGO_HOME_PATH" ]]; then
+    if [[ ! -d "$CARGO_HOME_PATH/advisory-dbs" && -d "$SOURCE_CARGO_HOME/advisory-dbs" ]]; then
+      cp -R "$SOURCE_CARGO_HOME/advisory-dbs" "$CARGO_HOME_PATH/advisory-dbs"
+    fi
+    if [[ ! -d "$CARGO_HOME_PATH/registry" && -d "$SOURCE_CARGO_HOME/registry" ]]; then
+      cp -R "$SOURCE_CARGO_HOME/registry" "$CARGO_HOME_PATH/registry"
+    fi
+    if [[ ! -d "$CARGO_HOME_PATH/git" && -d "$SOURCE_CARGO_HOME/git" ]]; then
+      cp -R "$SOURCE_CARGO_HOME/git" "$CARGO_HOME_PATH/git"
+    fi
+  fi
+  DENY_DB_ROOT="$CARGO_HOME_PATH/advisory-dbs"
+  # cargo-deny keys advisory DB directories by URL hash; allow override if upstream changes.
+  DENY_DB_NAME="${RUSTYNET_CARGO_DENY_DB_NAME:-advisory-db-3157b0e258782691}"
+  if [[ ! -d "$DENY_DB_ROOT/$DENY_DB_NAME" ]]; then
+    mkdir -p "$DENY_DB_ROOT"
+    cp -R "$AUDIT_DB" "$DENY_DB_ROOT/$DENY_DB_NAME"
+  fi
 fi
 
 cargo_with_security_toolchain() {
@@ -66,8 +90,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-targets --all-features
-HOME="$AUDIT_HOME" CARGO_HOME="$CARGO_HOME_PATH" cargo_with_security_toolchain audit --deny warnings --stale --no-fetch --db "$AUDIT_DB"
-HOME="$AUDIT_HOME" CARGO_HOME="$CARGO_HOME_PATH" cargo_with_security_toolchain deny check --disable-fetch bans licenses sources advisories
+HOME="$EFFECTIVE_HOME" CARGO_HOME="$EFFECTIVE_CARGO_HOME" cargo_with_security_toolchain audit --deny warnings --stale --no-fetch --db "$AUDIT_DB"
+if [[ "$DENY_DISABLE_FETCH" -eq 1 ]]; then
+  HOME="$EFFECTIVE_HOME" CARGO_HOME="$EFFECTIVE_CARGO_HOME" cargo_with_security_toolchain deny check --disable-fetch bans licenses sources advisories
+else
+  HOME="$EFFECTIVE_HOME" CARGO_HOME="$EFFECTIVE_CARGO_HOME" cargo_with_security_toolchain deny check bans licenses sources advisories
+fi
 
 ./scripts/ci/phase9_gates.sh
 
