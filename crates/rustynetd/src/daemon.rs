@@ -1449,7 +1449,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             mode,
         )
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
-        return Ok(RuntimeSystem::Linux(system));
+        Ok(RuntimeSystem::Linux(system))
     }
     #[cfg(not(target_os = "linux"))]
     {
