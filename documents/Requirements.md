@@ -126,6 +126,13 @@ Primary goal:
 - A future non-WireGuard backend must be swappable with minimal changes outside backend adapter crates.
 - Cross-platform clients:
 - Linux (priority), macOS, Windows.
+- Setup/runtime host profiling:
+- The startup wizard and runtime bootstrap must detect host OS at launch and enforce a host profile (`linux`, `macos`, or unsupported).
+- Linux profile may provision dataplane/runtime artifacts and privileged integration.
+- Non-Linux profiles must block Linux-only dataplane/runtime operations by default and remain in compatibility mode unless explicitly supported by phase scope.
+- Cross-OS runtime artifact segregation:
+- Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) must only be used on Linux hosts.
+- On macOS/Windows compatibility hosts, runtime/config artifacts must be stored in user-scoped platform directories and must not create Linux runtime roots.
 - Performance budgets (to be benchmarked and enforced in CI):
 - Idle daemon CPU target: <= 2% of one core on Raspberry Pi-class hardware.
 - Idle daemon memory target: <= 120 MB RSS under normal operating profile.
@@ -329,6 +336,11 @@ lan_route_access:
 ## 13) Operational Requirements
 - Single binary per component where practical.
 - Systemd service files for Linux deployment.
+- Startup wizard must enforce OS-aware provisioning:
+- Linux hosts: allow full service/dataplane provisioning.
+- Non-Linux hosts: block Linux service/dataplane provisioning and emit explicit operator guidance.
+- Startup config ingestion must enforce host-storage policy:
+- Linux-runtime-root paths found on non-Linux hosts must be rejected or normalized to platform-safe user-scoped paths with explicit warning/audit visibility.
 - Structured logging (JSON option).
 - Metrics endpoint (Prometheus format preferred).
 - Backup/restore strategy for control-plane state.

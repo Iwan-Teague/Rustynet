@@ -35,12 +35,17 @@ Deliver real Linux dataplane execution so one enrolled device can act as an auth
 | Area | Requirement | Enforcement |
 | --- | --- | --- |
 | OS | Linux-only for Phase 10 dataplane | startup capability check |
+| Setup host profile | Wizard/bootstrap must detect host OS and enforce `linux` vs compatibility host behavior | startup host-profile gate + preflight doctor |
 | Kernel features | WireGuard + netfilter/nftables + policy routing | startup probe; fail closed |
 | Privileges | minimal required capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW` only where required) | process capability audit at startup |
 | Tooling | Rust native route/rule/firewall APIs preferred; no shell composition | CI check + code review gate |
 | Distros in test matrix | Debian 12 baseline + one secondary Linux distro | phase10 gate matrix |
 
 If prerequisites are not satisfied, daemon remains in restricted-safe mode and refuses tunnel/exit activation.
+
+Host-profile storage policy requirement:
+- Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are valid only on Linux hosts.
+- Non-Linux compatibility hosts must store wizard/runtime artifacts in platform-safe user-scoped directories and must not create Linux runtime roots.
 
 ## 5) Gap Assessment (Previous Draft)
 Previous Phase 10 draft was directionally correct but underspecified in these areas:

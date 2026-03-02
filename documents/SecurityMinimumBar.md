@@ -32,27 +32,33 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 - Trusted authorization/signing state fails closed when unavailable or corrupt.
 - Secret redaction verified across MDM, env, CLI, API, and UI ingestion paths.
 
-5. Policy and privilege enforcement:
+5. Host-OS boundary enforcement:
+- Startup/setup path must detect host OS and enforce host profile behavior.
+- Linux-only dataplane/runtime provisioning must be blocked on non-Linux hosts.
+- Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) must not be created/used on non-Linux hosts.
+- Non-Linux compatibility mode must enforce platform-safe user-scoped storage paths and reject/normalize unsafe Linux-root paths fail-closed.
+
+6. Policy and privilege enforcement:
 - Default-deny ACL behavior across mesh, routes, and exit-node access.
 - RBAC enforced on admin API/UI paths.
 - MFA required for privileged mutations.
 
-6. Web/admin security:
+7. Web/admin security:
 - CSRF protections for state-changing UI/API flows.
 - Secure cookie/session policy.
 - Clickjacking defenses.
 - Privileged helper/system integration paths use argv-only command invocation with strict input validation.
 
-7. Data-plane leak prevention:
+8. Data-plane leak prevention:
 - Tunnel fail-close behavior in protected-routing modes.
 - DNS fail-close behavior in protected DNS modes.
 - Protocol-filter ACL behavior is validated in shared subnet-router and shared-exit scenarios.
 
-8. Audit and forensics:
+9. Audit and forensics:
 - Tamper-evident, append-only audit logging.
 - Retention policy and integrity-verification process active.
 
-9. Supply-chain integrity:
+10. Supply-chain integrity:
 - Signed artifacts required for beta+ releases.
 - SBOM generated and retained for released artifacts.
 - Staged release tracks (unstable/canary/stable) required for security-sensitive rollout paths.

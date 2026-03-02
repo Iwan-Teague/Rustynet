@@ -29,6 +29,7 @@ Expand product usability through a web admin experience and broaden client suppo
 - Platform-specific route/firewall/DNS integration hardening.
 - Cross-platform leak-class mitigation parity with Linux baseline.
 - Privileged helper hardening: argv-only command invocation, strict input validation, and least-privilege execution model.
+- Startup wizard host-profile enforcement: detect OS at launch, block unsupported dataplane/runtime operations, and enforce platform-safe storage roots.
 
 4. Packaging and updates:
 - Installer strategy and versioning basics.
@@ -52,6 +53,7 @@ Expand product usability through a web admin experience and broaden client suppo
 - Default policy posture cannot silently become allow-all in new deployments.
 - macOS/Windows pass leak-class tests required by Phase 4 mitigation matrix.
 - Privileged helper paths prove no shell-command construction with untrusted values.
+- Host-profile/path-policy checks ensure Linux runtime roots are not used on non-Linux hosts.
 
 ## 5) Phase 6 Exit Criteria
 - Admins can manage nodes, policies, and credentials via UI.

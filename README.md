@@ -9,6 +9,7 @@ Run the interactive setup/menu wizard:
 ```
 
 The wizard handles:
+- host OS detection on startup with strict host-profile enforcement (`linux` dataplane vs `macos` compatibility)
 - first-run bootstrap (dependencies, keys, trust material, systemd wiring)
 - daemon/service lifecycle
 - centrally signed auto-tunnel defaults with fail-closed enforcement
@@ -17,6 +18,11 @@ The wizard handles:
 - local key rotation/revocation and peer rotation-bundle apply flow
 - exit-node and LAN-access toggles
 - route advertisement and status checks
+
+Host-profile behavior:
+- Linux host: full runtime/dataplane provisioning.
+- macOS host: compatibility mode only (build/validation workflows); Linux dataplane actions are blocked.
+- macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 

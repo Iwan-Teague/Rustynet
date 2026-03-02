@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
@@ -14,6 +14,8 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
+#[cfg(target_os = "macos")]
+use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,41 +384,32 @@ fn is_valid_key_identifier(value: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
-    let encoded = hex_bytes(key_material);
-    let status = Command::new("security")
-        .arg("add-generic-password")
-        .arg("-a")
-        .arg("rustynet")
-        .arg("-s")
-        .arg(format!("rustynet.{key_id}"))
-        .arg("-w")
-        .arg(encoded)
-        .arg("-U")
-        .status()
-        .map_err(|_| CryptoError::OsStoreUnavailable)?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(CryptoError::OsStoreUnavailable)
+    set_generic_password(
+        format!("rustynet.{key_id}").as_str(),
+        "rustynet",
+        key_material,
+    )
+    .map_err(|_| CryptoError::OsStoreUnavailable)
 }
 
 #[cfg(target_os = "macos")]
 fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
-    let output = Command::new("security")
-        .arg("find-generic-password")
-        .arg("-a")
-        .arg("rustynet")
-        .arg("-s")
-        .arg(format!("rustynet.{key_id}"))
-        .arg("-w")
-        .output()
+    let value = get_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
-    if !output.status.success() {
-        return Err(CryptoError::OsStoreUnavailable);
+
+    if let Ok(text) = std::str::from_utf8(&value) {
+        let trimmed = text.trim();
+        let maybe_hex_decoded = (!trimmed.is_empty()
+            && (trimmed.len() & 1) == 0
+            && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hex_decode(trimmed))
+        .and_then(Result::ok);
+        if let Some(decoded) = maybe_hex_decoded {
+            return Ok(decoded);
+        }
     }
-    let value = String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
-    let trimmed = value.trim();
-    hex_decode(trimmed)
+
+    Ok(value)
 }
 
 #[cfg(target_os = "linux")]
@@ -706,8 +699,19 @@ pub fn write_encrypted_key_file(
     let blob = encrypt_private_key_fallback(plaintext, passphrase, salt, nonce)?;
     let encoded = encode_encrypted_blob(&blob);
 
+    if directory.exists() {
+        let directory_link_metadata =
+            std::fs::symlink_metadata(directory).map_err(|_| CryptoError::Io)?;
+        if directory_link_metadata.file_type().is_symlink() || !directory_link_metadata.is_dir() {
+            return Err(CryptoError::PermissionDenied);
+        }
+    }
+
     std::fs::create_dir_all(directory).map_err(|_| CryptoError::Io)?;
-    std::fs::write(file, encoded).map_err(|_| CryptoError::Io)?;
+    if file.parent() != Some(directory) {
+        return Err(CryptoError::Io);
+    }
+    write_atomic_encrypted_key_file(file, &encoded, policy.required_file_mode)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -724,6 +728,54 @@ pub fn write_encrypted_key_file(
     }
     validate_key_custody_permissions(directory, file, policy)?;
     Ok(())
+}
+
+fn write_atomic_encrypted_key_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), CryptoError> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let parent = path.parent().ok_or(CryptoError::Io)?;
+    let temp = temp_path_for(path);
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+
+    let mut file = options.open(&temp).map_err(|_| CryptoError::Io)?;
+    if file.write_all(bytes).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(CryptoError::Io);
+    }
+    if file.sync_all().is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(CryptoError::Io);
+    }
+    if std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(CryptoError::Io);
+    }
+
+    let parent_dir = std::fs::File::open(parent).map_err(|_| CryptoError::Io)?;
+    parent_dir.sync_all().map_err(|_| CryptoError::Io)?;
+    Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut out = path.as_os_str().to_os_string();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    out.push(format!(".tmp.{}.{}", std::process::id(), stamp));
+    PathBuf::from(out)
 }
 
 pub fn read_encrypted_key_file(
@@ -794,6 +846,16 @@ pub fn validate_key_custody_permissions(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        let directory_link_metadata =
+            std::fs::symlink_metadata(directory).map_err(|_| CryptoError::Io)?;
+        if directory_link_metadata.file_type().is_symlink() || !directory_link_metadata.is_dir() {
+            return Err(CryptoError::PermissionDenied);
+        }
+        let file_link_metadata = std::fs::symlink_metadata(file).map_err(|_| CryptoError::Io)?;
+        if file_link_metadata.file_type().is_symlink() || !file_link_metadata.is_file() {
+            return Err(CryptoError::PermissionDenied);
+        }
 
         let directory_metadata = std::fs::metadata(directory).map_err(|_| CryptoError::Io)?;
         let file_metadata = std::fs::metadata(file).map_err(|_| CryptoError::Io)?;
@@ -1055,6 +1117,38 @@ mod tests {
         let key_file = fallback_directory.join("node_identity.enc");
         let _ = std::fs::remove_file(key_file);
         let _ = std::fs::remove_dir(fallback_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_key_file_permissions() {
+        use std::os::unix::fs::symlink;
+
+        let unique = format!(
+            "rustynet-key-custody-symlink-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let target = directory.join("node-key.target");
+        let file = directory.join("node-key.enc");
+
+        std::fs::create_dir_all(&directory).expect("directory should be created");
+        std::fs::write(&target, b"ciphertext").expect("target should be written");
+        symlink(&target, &file).expect("symlink should be created");
+
+        let result = validate_key_custody_permissions(
+            &directory,
+            &file,
+            KeyCustodyPermissionPolicy::default(),
+        );
+        assert_eq!(result.err(), Some(CryptoError::PermissionDenied));
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&directory);
     }
 
     #[test]

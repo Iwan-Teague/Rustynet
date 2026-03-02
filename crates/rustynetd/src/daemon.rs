@@ -1091,8 +1091,8 @@ impl DaemonRuntime {
             .clone()
             .ok_or_else(|| "wg private key path is not configured".to_string())?;
 
-        let old_runtime = fs::read(&runtime_path).ok();
-        let old_encrypted = self
+        let mut old_runtime = fs::read(&runtime_path).ok();
+        let mut old_encrypted = self
             .wg_encrypted_private_key_path
             .as_ref()
             .and_then(|path| fs::read(path).ok());
@@ -1101,60 +1101,74 @@ impl DaemonRuntime {
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok());
 
-        let (mut new_private, new_public) = generate_wireguard_keypair()?;
+        let result = (|| -> Result<String, String> {
+            let (mut new_private, new_public) = generate_wireguard_keypair()?;
 
-        if let Some(encrypted_path) = self.wg_encrypted_private_key_path.as_ref() {
-            let passphrase_path = self.wg_key_passphrase_path.as_ref().ok_or_else(|| {
-                "wg key passphrase path is required when encrypted key storage is configured"
-                    .to_string()
-            })?;
-            encrypt_private_key(&new_private, encrypted_path, passphrase_path)?;
-        }
+            if let Some(encrypted_path) = self.wg_encrypted_private_key_path.as_ref() {
+                let passphrase_path = self.wg_key_passphrase_path.as_ref().ok_or_else(|| {
+                    "wg key passphrase path is required when encrypted key storage is configured"
+                        .to_string()
+                })?;
+                if let Err(err) = encrypt_private_key(&new_private, encrypted_path, passphrase_path)
+                {
+                    new_private.fill(0);
+                    return Err(err);
+                }
+            }
 
-        if let Err(err) = write_runtime_private_key(&runtime_path, &new_private) {
-            new_private.fill(0);
-            return Err(err);
-        }
-        if let Some(public_path) = self.wg_public_key_path.as_ref() {
-            if let Err(err) = write_public_key(public_path, &new_public) {
+            if let Err(err) = write_runtime_private_key(&runtime_path, &new_private) {
                 new_private.fill(0);
                 return Err(err);
             }
-        }
+            if let Some(public_path) = self.wg_public_key_path.as_ref() {
+                if let Err(err) = write_public_key(public_path, &new_public) {
+                    new_private.fill(0);
+                    return Err(err);
+                }
+            }
 
-        if let Err(err) = apply_interface_private_key(&self.wg_interface, &runtime_path) {
-            let _ = self.restore_key_backups(old_runtime, old_encrypted, old_public);
+            if let Err(err) = apply_interface_private_key(&self.wg_interface, &runtime_path) {
+                let _ = self.restore_key_backups(
+                    old_runtime.as_deref(),
+                    old_encrypted.as_deref(),
+                    old_public.as_deref(),
+                );
+                new_private.fill(0);
+                return Err(format!("rotate apply failed and rollback attempted: {err}"));
+            }
+
             new_private.fill(0);
-            return Err(format!("rotate apply failed and rollback attempted: {err}"));
-        }
 
-        new_private.fill(0);
+            if let Err(err) = self.persist_state() {
+                return Err(format!("persist failed after key rotation: {err}"));
+            }
 
-        if let Err(err) = self.persist_state() {
-            return Err(format!("persist failed after key rotation: {err}"));
-        }
+            let bundle = format!("rotation:{}:{}", self.local_node_id, new_public);
+            Ok(format!(
+                "key rotated: node_id={} public_key={} rotation_bundle={}",
+                self.local_node_id, new_public, bundle
+            ))
+        })();
 
-        let bundle = format!("rotation:{}:{}", self.local_node_id, new_public);
-        Ok(format!(
-            "key rotated: node_id={} public_key={} rotation_bundle={}",
-            self.local_node_id, new_public, bundle
-        ))
+        zeroize_optional_bytes(&mut old_runtime);
+        zeroize_optional_bytes(&mut old_encrypted);
+        result
     }
 
     fn restore_key_backups(
         &self,
-        old_runtime: Option<Vec<u8>>,
-        old_encrypted: Option<Vec<u8>>,
-        old_public: Option<String>,
+        old_runtime: Option<&[u8]>,
+        old_encrypted: Option<&[u8]>,
+        old_public: Option<&str>,
     ) -> Result<(), String> {
         if let (Some(path), Some(bytes)) = (self.wg_private_key_path.as_ref(), old_runtime) {
-            write_runtime_private_key(path, &bytes)?;
+            write_runtime_private_key(path, bytes)?;
             let _ = apply_interface_private_key(&self.wg_interface, path);
         }
         if let (Some(path), Some(bytes)) =
             (self.wg_encrypted_private_key_path.as_ref(), old_encrypted)
         {
-            write_runtime_private_key(path, &bytes)?;
+            write_runtime_private_key(path, bytes)?;
         }
         if let (Some(path), Some(value)) = (self.wg_public_key_path.as_ref(), old_public) {
             write_public_key(path, value.trim())?;
@@ -1429,6 +1443,12 @@ impl DaemonRuntime {
                 self.reconcile_failures
             ));
         }
+    }
+}
+
+fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
+    if let Some(bytes) = value.as_mut() {
+        bytes.fill(0);
     }
 }
 
@@ -2911,6 +2931,7 @@ mod tests {
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand,
         TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
         persist_trust_watermark, run_daemon, trust_evidence_payload, unix_now,
+        zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -3054,6 +3075,13 @@ mod tests {
         };
         let err = run_daemon(config).expect_err("in-memory backend must be rejected");
         assert!(err.to_string().contains("in-memory backend is disabled"));
+    }
+
+    #[test]
+    fn zeroize_optional_bytes_scrubs_sensitive_buffer() {
+        let mut value = Some(vec![7u8, 9u8, 13u8, 17u8]);
+        zeroize_optional_bytes(&mut value);
+        assert_eq!(value, Some(vec![0u8, 0u8, 0u8, 0u8]));
     }
 
     #[test]

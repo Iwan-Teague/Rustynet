@@ -3,11 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
+use nix::unistd::Uid;
 use rustynet_control::membership::{
     MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
     MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipUpdateRecord,
@@ -698,6 +700,7 @@ fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
 }
 
 fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
+    validate_signing_key_file_security(path)?;
     let content = fs::read_to_string(path).map_err(|err| format!("read key failed: {err}"))?;
     let key_line = content
         .lines()
@@ -706,6 +709,34 @@ fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
         .ok_or_else(|| "signing key file is empty".to_string())?;
     let bytes = decode_hex_to_32(key_line)?;
     Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn validate_signing_key_file_security(path: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| format!("inspect signing key failed: {err}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("signing key path must not be a symlink".to_string());
+    }
+    if !metadata.file_type().is_file() {
+        return Err("signing key path must reference a regular file".to_string());
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if (mode & 0o077) != 0 {
+        return Err(format!(
+            "signing key file permissions must be owner-only (0600); found {:03o}",
+            mode
+        ));
+    }
+
+    let expected_uid = Uid::effective().as_raw();
+    let owner_uid = metadata.uid();
+    if owner_uid != expected_uid {
+        return Err(format!(
+            "signing key file owner mismatch: expected uid {expected_uid}, found {owner_uid}"
+        ));
+    }
+    Ok(())
 }
 
 fn decode_hex_to_32(encoded: &str) -> Result<[u8; 32], String> {
@@ -941,7 +972,7 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, parse_command};
+    use super::{execute, load_signing_key, parse_command};
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
@@ -986,6 +1017,82 @@ mod tests {
             "ci-netns".to_string(),
         ]);
         assert!(format!("{command:?}").contains("GenerateEvidence"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_loader_rejects_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-signing-key-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(format!("{unique}.key"));
+        std::fs::write(&path, format!("{}\n", "11".repeat(32))).expect("key file should exist");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("permissions should be set");
+
+        let result = load_signing_key(&path);
+        assert!(result.is_err());
+        let message = result.expect_err("weak file permissions must fail");
+        assert!(message.contains("owner-only"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_loader_rejects_symlink_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let unique = format!(
+            "rustynet-cli-signing-key-symlink-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let target = std::env::temp_dir().join(format!("{unique}.target.key"));
+        let link = std::env::temp_dir().join(format!("{unique}.key"));
+        std::fs::write(&target, format!("{}\n", "22".repeat(32))).expect("target key exists");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions should be set");
+        symlink(&target, &link).expect("symlink should be created");
+
+        let result = load_signing_key(&link);
+        assert!(result.is_err());
+        let message = result.expect_err("symlink key path must fail");
+        assert!(message.contains("must not be a symlink"));
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_loader_accepts_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-signing-key-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(format!("{unique}.key"));
+        std::fs::write(&path, format!("{}\n", "33".repeat(32))).expect("key file should exist");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions should be set");
+
+        let result = load_signing_key(&path);
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -34,10 +34,22 @@ AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
 SETUP_COMPLETE="0"
 MANUAL_PEER_OVERRIDE="0"
+DEFAULT_LAUNCH_PROFILE="menu"
+AUTO_LAUNCH_ON_START="0"
+AUTO_LAUNCH_EXIT_NODE_ID=""
+AUTO_LAUNCH_LAN_MODE="skip"
+REQUESTED_LAUNCH_PROFILE=""
+REQUESTED_EXIT_NODE_ID=""
+REQUESTED_LAN_MODE=""
+AUTO_ONLY_LAUNCH="0"
 RUST_MIN_VERSION="1.85"
 MANUAL_PEER_AUDIT_LOG="/var/log/rustynet/manual-peer-override.log"
 MANUAL_OVERRIDE_CONFIRMATION="RUSTYNET_BREAK_GLASS_ACK"
 HOST_OS="$(uname -s)"
+HOST_PROFILE="unknown"
+MACOS_STATE_BASE="${HOME}/Library/Application Support/rustynet"
+MACOS_RUNTIME_BASE="${HOME}/Library/Caches/rustynet"
+MACOS_LOG_BASE="${HOME}/Library/Logs/rustynet"
 export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
@@ -63,6 +75,97 @@ is_macos_host() {
   [[ "${HOST_OS}" == "Darwin" ]]
 }
 
+apply_host_profile_defaults() {
+  if is_linux_host; then
+    HOST_PROFILE="linux"
+    return
+  fi
+
+  if is_macos_host; then
+    HOST_PROFILE="macos"
+
+    SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd.sock"
+    STATE_PATH="${MACOS_STATE_BASE}/rustynetd.state"
+    TRUST_EVIDENCE_PATH="${MACOS_STATE_BASE}/compat/trust/rustynetd.trust"
+    TRUST_VERIFIER_KEY_PATH="${MACOS_STATE_BASE}/compat/trust/trust-evidence.pub"
+    TRUST_WATERMARK_PATH="${MACOS_STATE_BASE}/compat/trust/rustynetd.trust.watermark"
+    AUTO_TUNNEL_BUNDLE_PATH="${MACOS_STATE_BASE}/compat/assignment/rustynetd.assignment"
+    AUTO_TUNNEL_VERIFIER_KEY_PATH="${MACOS_STATE_BASE}/compat/assignment/assignment.pub"
+    AUTO_TUNNEL_WATERMARK_PATH="${MACOS_STATE_BASE}/compat/assignment/rustynetd.assignment.watermark"
+    WG_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key"
+    WG_ENCRYPTED_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
+    WG_KEY_PASSPHRASE_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
+    WG_PUBLIC_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
+    MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
+    MEMBERSHIP_LOG_PATH="${MACOS_STATE_BASE}/compat/membership/membership.log"
+    TRUST_SIGNER_KEY_PATH="${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
+    MANUAL_PEER_AUDIT_LOG="${MACOS_LOG_BASE}/manual-peer-override.log"
+    MANUAL_PEER_OVERRIDE="0"
+    return
+  fi
+
+  HOST_PROFILE="unsupported"
+}
+
+path_in_linux_runtime_roots() {
+  local value="$1"
+  [[ "${value}" == /etc/rustynet* ]] \
+    || [[ "${value}" == /var/lib/rustynet* ]] \
+    || [[ "${value}" == /run/rustynet* ]] \
+    || [[ "${value}" == /var/log/rustynet* ]]
+}
+
+coerce_macos_path_var() {
+  local var_name="$1"
+  local fallback="$2"
+  local current="${!var_name:-}"
+
+  if [[ -z "${current}" ]]; then
+    printf -v "${var_name}" '%s' "${fallback}"
+    return
+  fi
+
+  if path_in_linux_runtime_roots "${current}"; then
+    print_warn "Path '${var_name}' points to Linux runtime storage on macOS; resetting to '${fallback}'."
+    printf -v "${var_name}" '%s' "${fallback}"
+  fi
+}
+
+enforce_host_storage_policy() {
+  if is_linux_host; then
+    HOST_PROFILE="linux"
+    return
+  fi
+
+  if ! is_macos_host; then
+    HOST_PROFILE="unsupported"
+    return
+  fi
+
+  HOST_PROFILE="macos"
+  coerce_macos_path_var SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd.sock"
+  coerce_macos_path_var STATE_PATH "${MACOS_STATE_BASE}/rustynetd.state"
+  coerce_macos_path_var TRUST_EVIDENCE_PATH "${MACOS_STATE_BASE}/compat/trust/rustynetd.trust"
+  coerce_macos_path_var TRUST_VERIFIER_KEY_PATH "${MACOS_STATE_BASE}/compat/trust/trust-evidence.pub"
+  coerce_macos_path_var TRUST_WATERMARK_PATH "${MACOS_STATE_BASE}/compat/trust/rustynetd.trust.watermark"
+  coerce_macos_path_var AUTO_TUNNEL_BUNDLE_PATH "${MACOS_STATE_BASE}/compat/assignment/rustynetd.assignment"
+  coerce_macos_path_var AUTO_TUNNEL_VERIFIER_KEY_PATH "${MACOS_STATE_BASE}/compat/assignment/assignment.pub"
+  coerce_macos_path_var AUTO_TUNNEL_WATERMARK_PATH "${MACOS_STATE_BASE}/compat/assignment/rustynetd.assignment.watermark"
+  coerce_macos_path_var WG_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key"
+  coerce_macos_path_var WG_ENCRYPTED_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
+  coerce_macos_path_var WG_KEY_PASSPHRASE_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
+  coerce_macos_path_var WG_PUBLIC_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
+  coerce_macos_path_var MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
+  coerce_macos_path_var MEMBERSHIP_LOG_PATH "${MACOS_STATE_BASE}/compat/membership/membership.log"
+  coerce_macos_path_var TRUST_SIGNER_KEY_PATH "${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
+  coerce_macos_path_var MANUAL_PEER_AUDIT_LOG "${MACOS_LOG_BASE}/manual-peer-override.log"
+
+  if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
+    print_warn "Manual peer break-glass override is disabled on macOS compatibility hosts."
+    MANUAL_PEER_OVERRIDE="0"
+  fi
+}
+
 require_linux_dataplane() {
   local action="$1"
   if is_linux_host; then
@@ -80,7 +183,7 @@ require_linux_dataplane() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -252,6 +355,113 @@ prompt_yes_no() {
   [[ "${value}" =~ ^[Yy]$ ]]
 }
 
+is_valid_launch_profile() {
+  case "$1" in
+    menu|quick-connect|quick-exit-node|quick-hybrid) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_valid_lan_mode() {
+  case "$1" in
+    skip|on|off) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sanitize_launch_defaults() {
+  if ! is_valid_launch_profile "${DEFAULT_LAUNCH_PROFILE}"; then
+    print_warn "Invalid DEFAULT_LAUNCH_PROFILE='${DEFAULT_LAUNCH_PROFILE}', reverting to 'menu'."
+    DEFAULT_LAUNCH_PROFILE="menu"
+  fi
+  if [[ "${AUTO_LAUNCH_ON_START}" != "1" ]]; then
+    AUTO_LAUNCH_ON_START="0"
+  fi
+  if ! is_valid_lan_mode "${AUTO_LAUNCH_LAN_MODE}"; then
+    print_warn "Invalid AUTO_LAUNCH_LAN_MODE='${AUTO_LAUNCH_LAN_MODE}', reverting to 'skip'."
+    AUTO_LAUNCH_LAN_MODE="skip"
+  fi
+}
+
+print_start_help() {
+  cat <<EOF
+Rustynet startup options:
+  ./start.sh
+    Interactive menu mode.
+
+  ./start.sh --profile <menu|quick-connect|quick-exit-node|quick-hybrid>
+    Apply a launch profile once. Non-menu profiles apply and exit.
+
+  ./start.sh --auto
+    Apply saved default launch profile once and exit.
+
+  Optional modifiers:
+    --exit-node-id <node-id>   Override configured exit node id for this run.
+    --lan <skip|on|off>        Override configured LAN mode for this run.
+    --help                     Show this help.
+EOF
+}
+
+parse_start_arguments() {
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        if [[ "$#" -lt 2 ]]; then
+          print_err "--profile requires a value."
+          exit 1
+        fi
+        REQUESTED_LAUNCH_PROFILE="$2"
+        shift 2
+        ;;
+      --auto)
+        REQUESTED_LAUNCH_PROFILE="auto"
+        AUTO_ONLY_LAUNCH="1"
+        shift
+        ;;
+      --exit-node-id)
+        if [[ "$#" -lt 2 ]]; then
+          print_err "--exit-node-id requires a value."
+          exit 1
+        fi
+        REQUESTED_EXIT_NODE_ID="$2"
+        shift 2
+        ;;
+      --lan)
+        if [[ "$#" -lt 2 ]]; then
+          print_err "--lan requires a value (skip|on|off)."
+          exit 1
+        fi
+        REQUESTED_LAN_MODE="$2"
+        shift 2
+        ;;
+      --help|-h)
+        print_start_help
+        exit 0
+        ;;
+      *)
+        print_err "Unknown argument: $1"
+        print_start_help
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "${REQUESTED_LAUNCH_PROFILE}" && "${REQUESTED_LAUNCH_PROFILE}" != "auto" ]]; then
+    if ! is_valid_launch_profile "${REQUESTED_LAUNCH_PROFILE}"; then
+      print_err "Invalid --profile value '${REQUESTED_LAUNCH_PROFILE}'."
+      exit 1
+    fi
+    if [[ "${REQUESTED_LAUNCH_PROFILE}" != "menu" ]]; then
+      AUTO_ONLY_LAUNCH="1"
+    fi
+  fi
+
+  if [[ -n "${REQUESTED_LAN_MODE}" ]] && ! is_valid_lan_mode "${REQUESTED_LAN_MODE}"; then
+    print_err "Invalid --lan value '${REQUESTED_LAN_MODE}'. Expected skip|on|off."
+    exit 1
+  fi
+}
+
 save_config() {
   {
     printf 'SOCKET_PATH=%s\n' "${SOCKET_PATH}"
@@ -277,9 +487,14 @@ save_config() {
     printf 'TRUST_SIGNER_KEY_PATH=%s\n' "${TRUST_SIGNER_KEY_PATH}"
     printf 'AUTO_REFRESH_TRUST=%s\n' "${AUTO_REFRESH_TRUST}"
     printf 'DEVICE_NODE_ID=%s\n' "${DEVICE_NODE_ID}"
+    printf 'HOST_PROFILE=%s\n' "${HOST_PROFILE}"
     printf 'SETUP_COMPLETE=%s\n' "${SETUP_COMPLETE}"
     printf 'MANUAL_PEER_OVERRIDE=%s\n' "${MANUAL_PEER_OVERRIDE}"
     printf 'MANUAL_PEER_AUDIT_LOG=%s\n' "${MANUAL_PEER_AUDIT_LOG}"
+    printf 'DEFAULT_LAUNCH_PROFILE=%s\n' "${DEFAULT_LAUNCH_PROFILE}"
+    printf 'AUTO_LAUNCH_ON_START=%s\n' "${AUTO_LAUNCH_ON_START}"
+    printf 'AUTO_LAUNCH_EXIT_NODE_ID=%s\n' "${AUTO_LAUNCH_EXIT_NODE_ID}"
+    printf 'AUTO_LAUNCH_LAN_MODE=%s\n' "${AUTO_LAUNCH_LAN_MODE}"
   } >"${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
@@ -749,6 +964,14 @@ doctor_preflight() {
     else
       doctor_fail "homebrew missing; install from https://brew.sh"
     fi
+    if path_in_linux_runtime_roots "${SOCKET_PATH}" \
+      || path_in_linux_runtime_roots "${STATE_PATH}" \
+      || path_in_linux_runtime_roots "${TRUST_EVIDENCE_PATH}" \
+      || path_in_linux_runtime_roots "${WG_PRIVATE_KEY_PATH}"; then
+      doctor_fail "macOS path policy violation detected (Linux runtime roots in config); rerun setup to normalize paths"
+    else
+      doctor_ok "macOS path policy enforced (no Linux runtime roots)"
+    fi
     doctor_warn "macOS runs in compatibility mode; Linux host is required for dataplane runtime."
   else
     doctor_fail "unsupported host OS ${HOST_OS}"
@@ -1197,9 +1420,9 @@ print_menu_runtime_header() {
   local connected_display
   local state_display
   local exit_display
-  connected_display="${MENU_NETWORK_CONNECTED^^}"
-  state_display="${MENU_NETWORK_STATE^^}"
-  exit_display="${MENU_EXIT_ROLE^^}"
+  connected_display="$(printf '%s' "${MENU_NETWORK_CONNECTED}" | tr '[:lower:]' '[:upper:]')"
+  state_display="$(printf '%s' "${MENU_NETWORK_STATE}" | tr '[:lower:]' '[:upper:]')"
+  exit_display="$(printf '%s' "${MENU_EXIT_ROLE}" | tr '[:lower:]' '[:upper:]')"
   printf '[status] Connected: %s (state=%s) | Exit role: %s\n' \
     "${connected_display}" \
     "${state_display}" \
@@ -1318,6 +1541,22 @@ apply_rotation_bundle() {
   print_info "Updated peer key for ${name} (${node_id}) without changing node identity."
 }
 
+configure_launch_defaults() {
+  prompt_default DEFAULT_LAUNCH_PROFILE \
+    "Default launch profile (menu|quick-connect|quick-exit-node|quick-hybrid)" \
+    "${DEFAULT_LAUNCH_PROFILE}"
+  prompt_default AUTO_LAUNCH_ON_START \
+    "Auto-apply default launch profile on startup (0/1)" \
+    "${AUTO_LAUNCH_ON_START}"
+  prompt_default AUTO_LAUNCH_EXIT_NODE_ID \
+    "Default exit node id for quick-connect/quick-hybrid (blank for none)" \
+    "${AUTO_LAUNCH_EXIT_NODE_ID}"
+  prompt_default AUTO_LAUNCH_LAN_MODE \
+    "Default LAN mode for quick-exit-node/quick-hybrid (skip|on|off)" \
+    "${AUTO_LAUNCH_LAN_MODE}"
+  sanitize_launch_defaults
+}
+
 configure_values() {
   local detected_egress
   local fallback_egress="eth0"
@@ -1330,6 +1569,13 @@ configure_values() {
   fi
 
   prompt_default DEVICE_NODE_ID "Local device node id (used for display)" "${DEVICE_NODE_ID}"
+
+  if is_macos_host; then
+    print_info "macOS compatibility profile is active."
+    print_info "Linux dataplane/runtime actions remain blocked on this host."
+    print_info "Only user-space Rustynet paths are allowed; Linux system roots (/etc,/var,/run) are rejected."
+  fi
+
   prompt_default SOCKET_PATH "Daemon socket path" "${SOCKET_PATH}"
   prompt_default STATE_PATH "Daemon state path" "${STATE_PATH}"
   prompt_default TRUST_EVIDENCE_PATH "Trust evidence path" "${TRUST_EVIDENCE_PATH}"
@@ -1348,17 +1594,29 @@ configure_values() {
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
   enforce_backend_mode
-  print_info "Backend mode is fixed to linux-wireguard for production-safe operation."
+  if is_linux_host; then
+    print_info "Backend mode is fixed to linux-wireguard for production-safe operation."
+  else
+    print_info "Backend mode remains linux-wireguard for cross-host config compatibility."
+  fi
   prompt_default DATAPLANE_MODE "Dataplane mode (shell|hybrid-native)" "${DATAPLANE_MODE}"
   prompt_default RECONCILE_INTERVAL_MS "Reconcile interval (ms)" "${RECONCILE_INTERVAL_MS}"
   prompt_default MAX_RECONCILE_FAILURES "Max reconcile failures" "${MAX_RECONCILE_FAILURES}"
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
-  prompt_default MANUAL_PEER_OVERRIDE "Enable manual peer break-glass override (0/1)" "${MANUAL_PEER_OVERRIDE}"
-  if [[ "${MANUAL_PEER_OVERRIDE}" != "1" ]]; then
-    MANUAL_PEER_OVERRIDE="0"
+
+  if is_linux_host; then
+    prompt_default MANUAL_PEER_OVERRIDE "Enable manual peer break-glass override (0/1)" "${MANUAL_PEER_OVERRIDE}"
+    if [[ "${MANUAL_PEER_OVERRIDE}" != "1" ]]; then
+      MANUAL_PEER_OVERRIDE="0"
+    else
+      print_warn "Manual peer break-glass override is ENABLED. All use is audit logged."
+    fi
   else
-    print_warn "Manual peer break-glass override is ENABLED. All use is audit logged."
+    MANUAL_PEER_OVERRIDE="0"
   fi
+
+  configure_launch_defaults
+  enforce_host_storage_policy
 }
 
 first_run_setup() {
@@ -1371,6 +1629,7 @@ first_run_setup() {
   if ! is_linux_host; then
     print_warn "Linux dataplane/runtime provisioning is skipped on ${HOST_OS}."
     print_info "This host is configured for build/validation workflows only."
+    print_info "No Linux runtime directories (/etc/rustynet, /var/lib/rustynet, /run/rustynet) are created on this host."
     print_info "Run runtime dataplane setup on a Debian/Linux node with ./start.sh."
     SETUP_COMPLETE="1"
     save_config
@@ -1391,6 +1650,7 @@ show_runtime_config() {
   cat <<EOF
 Current Rustynet Wizard Configuration
   node_id                 : ${DEVICE_NODE_ID}
+  host_profile            : ${HOST_PROFILE}
   socket                  : ${SOCKET_PATH}
   state                   : ${STATE_PATH}
   trust_evidence          : ${TRUST_EVIDENCE_PATH}
@@ -1415,6 +1675,10 @@ Current Rustynet Wizard Configuration
   auto_refresh_trust      : ${AUTO_REFRESH_TRUST}
   manual_peer_override    : ${MANUAL_PEER_OVERRIDE}
   manual_peer_audit_log   : ${MANUAL_PEER_AUDIT_LOG}
+  default_launch_profile  : ${DEFAULT_LAUNCH_PROFILE}
+  auto_launch_on_start    : ${AUTO_LAUNCH_ON_START}
+  auto_launch_exit_node_id: ${AUTO_LAUNCH_EXIT_NODE_ID}
+  auto_launch_lan_mode    : ${AUTO_LAUNCH_LAN_MODE}
 EOF
 }
 
@@ -1453,6 +1717,82 @@ advertise_route() {
   local cidr
   prompt_default cidr "CIDR to advertise (for LAN/exit routing)" "192.168.1.0/24"
   run_rustynet_cli route advertise "${cidr}"
+}
+
+apply_lan_mode_noninteractive() {
+  local mode="$1"
+  case "${mode}" in
+    on|off)
+      if run_rustynet_cli lan-access "${mode}"; then
+        print_info "LAN access set to '${mode}'."
+      else
+        print_warn "Failed to set LAN access to '${mode}'."
+      fi
+      ;;
+    skip|"")
+      ;;
+    *)
+      print_warn "Ignoring unsupported LAN mode '${mode}'."
+      ;;
+  esac
+}
+
+apply_launch_profile() {
+  local profile="$1"
+  local exit_node_id="${2:-}"
+  local lan_mode="${3:-skip}"
+
+  if ! is_valid_launch_profile "${profile}"; then
+    print_err "Unsupported launch profile '${profile}'."
+    return 1
+  fi
+  if ! is_valid_lan_mode "${lan_mode}"; then
+    print_warn "Invalid LAN mode '${lan_mode}', using 'skip'."
+    lan_mode="skip"
+  fi
+
+  if [[ "${profile}" == "menu" ]]; then
+    return 0
+  fi
+
+  require_linux_dataplane "apply_launch_profile:${profile}" || return 0
+  print_info "Applying launch profile '${profile}'."
+  start_or_restart_service
+
+  case "${profile}" in
+    quick-connect)
+      if [[ -n "${exit_node_id}" ]]; then
+        if run_rustynet_cli exit-node select "${exit_node_id}"; then
+          print_info "Exit node selected: ${exit_node_id}"
+        else
+          print_warn "Failed to select exit node '${exit_node_id}'."
+        fi
+      fi
+      ;;
+    quick-exit-node)
+      if run_rustynet_cli route advertise 0.0.0.0/0; then
+        print_info "Exit route advertised (0.0.0.0/0)."
+      else
+        print_warn "Failed to advertise exit route. Check auto-tunnel policy restrictions."
+      fi
+      apply_lan_mode_noninteractive "${lan_mode}"
+      ;;
+    quick-hybrid)
+      if [[ -n "${exit_node_id}" ]]; then
+        if run_rustynet_cli exit-node select "${exit_node_id}"; then
+          print_info "Exit node selected: ${exit_node_id}"
+        else
+          print_warn "Failed to select exit node '${exit_node_id}'."
+        fi
+      fi
+      if run_rustynet_cli route advertise 0.0.0.0/0; then
+        print_info "Exit route advertised (0.0.0.0/0)."
+      else
+        print_warn "Failed to advertise exit route. Check auto-tunnel policy restrictions."
+      fi
+      apply_lan_mode_noninteractive "${lan_mode}"
+      ;;
+  esac
 }
 
 menu_service_setup_operations() {
@@ -1616,6 +1956,8 @@ Configuration
   1) Reconfigure daemon values
   2) Show current configuration
   3) Save configuration now
+  4) Configure launch defaults
+  5) Apply default launch profile now
   0) Back
 EOF
     local choice
@@ -1633,6 +1975,14 @@ EOF
       3)
         save_config
         print_info "Configuration saved to ${CONFIG_FILE}."
+        ;;
+      4)
+        configure_launch_defaults
+        save_config
+        print_info "Launch defaults updated."
+        ;;
+      5)
+        apply_launch_profile "${DEFAULT_LAUNCH_PROFILE}" "${AUTO_LAUNCH_EXIT_NODE_ID}" "${AUTO_LAUNCH_LAN_MODE}"
         ;;
       0) return ;;
       *) print_warn "Unknown option: ${choice}" ;;
@@ -1677,14 +2027,51 @@ EOF
   done
 }
 
+parse_start_arguments "$@"
+apply_host_profile_defaults
 load_config_file
+enforce_host_storage_policy
+sanitize_launch_defaults
 
 if [[ "${SETUP_COMPLETE}" != "1" ]]; then
   print_warn "Rustynet is not configured yet."
+  if [[ "${AUTO_ONLY_LAUNCH}" == "1" ]]; then
+    print_err "Cannot run non-interactive launch profile before first-run setup."
+    print_info "Run ./start.sh and complete setup first."
+    exit 1
+  fi
   if prompt_yes_no "Run first-run setup now?" "y"; then
     first_run_setup
   fi
 fi
 
+enforce_host_storage_policy
 save_config
+
+launch_profile=""
+launch_exit_node_id="${AUTO_LAUNCH_EXIT_NODE_ID}"
+launch_lan_mode="${AUTO_LAUNCH_LAN_MODE}"
+
+if [[ -n "${REQUESTED_EXIT_NODE_ID}" ]]; then
+  launch_exit_node_id="${REQUESTED_EXIT_NODE_ID}"
+fi
+if [[ -n "${REQUESTED_LAN_MODE}" ]]; then
+  launch_lan_mode="${REQUESTED_LAN_MODE}"
+fi
+
+if [[ "${REQUESTED_LAUNCH_PROFILE}" == "auto" ]]; then
+  launch_profile="${DEFAULT_LAUNCH_PROFILE}"
+elif [[ -n "${REQUESTED_LAUNCH_PROFILE}" ]]; then
+  launch_profile="${REQUESTED_LAUNCH_PROFILE}"
+elif [[ "${AUTO_LAUNCH_ON_START}" == "1" ]]; then
+  launch_profile="${DEFAULT_LAUNCH_PROFILE}"
+fi
+
+if [[ -n "${launch_profile}" && "${launch_profile}" != "menu" ]]; then
+  apply_launch_profile "${launch_profile}" "${launch_exit_node_id}" "${launch_lan_mode}"
+  if [[ "${AUTO_ONLY_LAUNCH}" == "1" ]]; then
+    exit 0
+  fi
+fi
+
 main_menu
