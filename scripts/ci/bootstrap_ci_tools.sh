@@ -29,10 +29,13 @@ fi
 rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
 rustup default 1.85.0
 
-if ! command -v cargo-audit >/dev/null 2>&1; then
-  cargo install cargo-audit --locked --version 0.22.1
+SECURITY_TOOLCHAIN="${RUSTYNET_SECURITY_TOOLCHAIN:-1.88.0}"
+rustup toolchain install "${SECURITY_TOOLCHAIN}" --profile minimal
+
+if ! command -v cargo-audit >/dev/null 2>&1 || ! cargo-audit --version | grep -q '^cargo-audit 0\.22\.'; then
+  cargo +"${SECURITY_TOOLCHAIN}" install cargo-audit --locked --version 0.22.1 --force
 fi
-if ! command -v cargo-deny >/dev/null 2>&1; then
-  # Keep cargo-deny aligned with the pinned Rust toolchain (1.85.0).
-  cargo install cargo-deny --locked --version 0.18.3
+if ! command -v cargo-deny >/dev/null 2>&1 || ! cargo-deny --version | grep -q '^cargo-deny 0\.19\.'; then
+  # Newer advisories use CVSS4 metadata; cargo-deny 0.19+ is required.
+  cargo +"${SECURITY_TOOLCHAIN}" install cargo-deny --locked --force
 fi
