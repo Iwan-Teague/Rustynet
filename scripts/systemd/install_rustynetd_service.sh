@@ -30,6 +30,14 @@ AUTO_TUNNEL_VERIFIER_KEY_PATH="${RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY:-/etc/rustyne
 AUTO_TUNNEL_WATERMARK_PATH="${RUSTYNET_AUTO_TUNNEL_WATERMARK:-/var/lib/rustynet/rustynetd.assignment.watermark}"
 AUTO_TUNNEL_MAX_AGE_SECS="${RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS:-300}"
 NODE_ID="${RUSTYNET_NODE_ID:-$(hostname -s 2>/dev/null || echo daemon-local)}"
+NODE_ROLE="${RUSTYNET_NODE_ROLE:-client}"
+case "${NODE_ROLE}" in
+  admin|client) ;;
+  *)
+    echo "invalid node role: ${NODE_ROLE} (expected admin|client)" >&2
+    exit 1
+    ;;
+esac
 BACKEND_MODE="${RUSTYNET_BACKEND:-linux-wireguard}"
 WG_INTERFACE="${RUSTYNET_WG_INTERFACE:-rustynet0}"
 WG_PRIVATE_KEY_PATH="${RUSTYNET_WG_PRIVATE_KEY:-/run/rustynet/wireguard.key}"
@@ -53,6 +61,7 @@ if ! ip link show "${EGRESS_IFACE}" >/dev/null 2>&1; then
 fi
 cat >"${ENV_DST}" <<EOF
 RUSTYNET_NODE_ID=${NODE_ID}
+RUSTYNET_NODE_ROLE=${NODE_ROLE}
 RUSTYNET_SOCKET=${SOCKET_PATH}
 RUSTYNET_STATE=${STATE_PATH}
 RUSTYNET_TRUST_EVIDENCE=${TRUST_EVIDENCE_PATH}

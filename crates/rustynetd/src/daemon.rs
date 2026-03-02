@@ -98,9 +98,54 @@ impl Default for DaemonBackendMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeRole {
+    #[default]
+    Admin,
+    Client,
+}
+
+impl NodeRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeRole::Admin => "admin",
+            NodeRole::Client => "client",
+        }
+    }
+
+    fn allows_command(self, command: &IpcCommand) -> bool {
+        match self {
+            NodeRole::Admin => true,
+            NodeRole::Client => matches!(
+                command,
+                IpcCommand::Status
+                    | IpcCommand::Netcheck
+                    | IpcCommand::ExitNodeSelect(_)
+                    | IpcCommand::ExitNodeOff
+                    | IpcCommand::LanAccessOn
+                    | IpcCommand::LanAccessOff
+                    | IpcCommand::DnsInspect
+            ),
+        }
+    }
+}
+
+impl std::str::FromStr for NodeRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "admin" => Ok(NodeRole::Admin),
+            "client" => Ok(NodeRole::Client),
+            _ => Err("invalid node role: expected admin or client".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub node_id: String,
+    pub node_role: NodeRole,
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
     pub trust_evidence_path: PathBuf,
@@ -131,6 +176,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             node_id: DEFAULT_NODE_ID.to_string(),
+            node_role: NodeRole::default(),
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
@@ -489,6 +535,7 @@ struct DaemonRuntime {
     controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
     policy: ContextualPolicySet,
     backend_mode: DaemonBackendMode,
+    node_role: NodeRole,
     local_node_id: String,
     wg_interface: String,
     wg_private_key_path: Option<PathBuf>,
@@ -555,6 +602,7 @@ impl DaemonRuntime {
             controller,
             policy,
             backend_mode: config.backend_mode,
+            node_role: config.node_role,
             local_node_id: config.node_id.clone(),
             wg_interface: config.wg_interface.clone(),
             wg_private_key_path: config.wg_private_key_path.clone(),
@@ -889,6 +937,11 @@ impl DaemonRuntime {
     }
 
     fn handle_command(&mut self, command: IpcCommand) -> IpcResponse {
+        if !self.node_role.allows_command(&command) {
+            return IpcResponse::err(
+                "command denied: current node role does not permit this operation",
+            );
+        }
         if self.is_restricted() && command.is_mutating() {
             return IpcResponse::err("daemon is in restricted-safe mode");
         }
@@ -929,8 +982,9 @@ impl DaemonRuntime {
                     "false"
                 };
                 IpcResponse::ok(format!(
-                    "node_id={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
+                    self.node_role.as_str(),
                     self.controller.state(),
                     self.controller.generation(),
                     self.selected_exit_node.as_deref().unwrap_or("none"),
@@ -2965,7 +3019,7 @@ mod tests {
     };
 
     use super::{
-        AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand,
+        AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
         TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
         persist_trust_watermark, run_daemon, trust_evidence_payload, unix_now,
         zeroize_optional_bytes,
@@ -3185,6 +3239,65 @@ mod tests {
         let invalid_route =
             runtime.handle_command(IpcCommand::RouteAdvertise("bad-route".to_string()));
         assert!(!invalid_route.ok);
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_client_role_blocks_admin_mutations() {
+        let test_dir = secure_test_dir("rustynetd-runtime-client-role");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::Client,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("node_role=client"));
+
+        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(select.ok);
+
+        let route =
+            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
+        assert!(!route.ok);
+        assert!(route.message.contains("node role"));
+
+        let key_rotate = runtime.handle_command(IpcCommand::KeyRotate);
+        assert!(!key_rotate.ok);
+        assert!(key_rotate.message.contains("node role"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);

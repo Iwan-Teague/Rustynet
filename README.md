@@ -9,6 +9,7 @@ Run the interactive setup/menu wizard:
 ```
 
 The wizard handles:
+- role selection (`admin` or `client`) during setup, with role-specific console permissions
 - host OS detection on startup with strict host-profile enforcement (`linux` dataplane vs `macos` compatibility)
 - first-run bootstrap (dependencies, keys, trust material, systemd wiring)
 - daemon/service lifecycle
@@ -25,6 +26,10 @@ Host-profile behavior:
 - macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
+
+Role model:
+- `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
+- `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
 
 ## Release Readiness Evidence (Fail-Closed)
 

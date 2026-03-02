@@ -33,6 +33,7 @@ TRUST_SIGNER_KEY_PATH="/etc/rustynet/trust-evidence.key"
 AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
 SETUP_COMPLETE="0"
+NODE_ROLE=""
 MANUAL_PEER_OVERRIDE="0"
 DEFAULT_LAUNCH_PROFILE="menu"
 AUTO_LAUNCH_ON_START="0"
@@ -180,10 +181,60 @@ require_linux_dataplane() {
   return 1
 }
 
+normalize_node_role() {
+  if [[ -z "${NODE_ROLE}" ]]; then
+    if [[ "${SETUP_COMPLETE}" == "1" ]]; then
+      NODE_ROLE="admin"
+    else
+      NODE_ROLE="client"
+    fi
+  fi
+
+  case "${NODE_ROLE}" in
+    admin|client) ;;
+    *)
+      print_warn "Invalid NODE_ROLE='${NODE_ROLE}', defaulting to 'client'."
+      NODE_ROLE="client"
+      ;;
+  esac
+}
+
+is_admin_role() {
+  [[ "${NODE_ROLE}" == "admin" ]]
+}
+
+is_client_role() {
+  [[ "${NODE_ROLE}" == "client" ]]
+}
+
+require_admin_role() {
+  local action="$1"
+  if is_admin_role; then
+    return 0
+  fi
+  print_err "${action} requires node role 'admin'."
+  print_info "This device is configured as role '${NODE_ROLE}'."
+  return 1
+}
+
+enforce_role_policy_defaults() {
+  normalize_node_role
+  if is_client_role; then
+    MANUAL_PEER_OVERRIDE="0"
+    AUTO_REFRESH_TRUST="0"
+    case "${DEFAULT_LAUNCH_PROFILE}" in
+      quick-exit-node|quick-hybrid)
+        print_warn "Launch profile '${DEFAULT_LAUNCH_PROFILE}' is admin-only; forcing 'quick-connect' for client role."
+        DEFAULT_LAUNCH_PROFILE="quick-connect"
+        ;;
+    esac
+  fi
+}
+
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -287,7 +338,7 @@ enforce_auto_tunnel_policy() {
 }
 
 manual_peer_override_enabled() {
-  [[ "${MANUAL_PEER_OVERRIDE}" == "1" || "${RUSTYNET_MANUAL_PEER_OVERRIDE:-0}" == "1" ]]
+  is_admin_role && [[ "${MANUAL_PEER_OVERRIDE}" == "1" || "${RUSTYNET_MANUAL_PEER_OVERRIDE:-0}" == "1" ]]
 }
 
 append_manual_peer_override_audit() {
@@ -370,6 +421,7 @@ is_valid_lan_mode() {
 }
 
 sanitize_launch_defaults() {
+  enforce_role_policy_defaults
   if ! is_valid_launch_profile "${DEFAULT_LAUNCH_PROFILE}"; then
     print_warn "Invalid DEFAULT_LAUNCH_PROFILE='${DEFAULT_LAUNCH_PROFILE}', reverting to 'menu'."
     DEFAULT_LAUNCH_PROFILE="menu"
@@ -489,6 +541,7 @@ save_config() {
     printf 'DEVICE_NODE_ID=%s\n' "${DEVICE_NODE_ID}"
     printf 'HOST_PROFILE=%s\n' "${HOST_PROFILE}"
     printf 'SETUP_COMPLETE=%s\n' "${SETUP_COMPLETE}"
+    printf 'NODE_ROLE=%s\n' "${NODE_ROLE}"
     printf 'MANUAL_PEER_OVERRIDE=%s\n' "${MANUAL_PEER_OVERRIDE}"
     printf 'MANUAL_PEER_AUDIT_LOG=%s\n' "${MANUAL_PEER_AUDIT_LOG}"
     printf 'DEFAULT_LAUNCH_PROFILE=%s\n' "${DEFAULT_LAUNCH_PROFILE}"
@@ -1080,6 +1133,7 @@ generate_verifier_key_from_signer() {
 }
 
 refresh_signed_trust_evidence() {
+  require_admin_role "refresh_signed_trust_evidence" || return 0
   if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     print_err "Signer key not found at ${TRUST_SIGNER_KEY_PATH}"
     return 1
@@ -1119,6 +1173,21 @@ EOF
 
 configure_trust_material() {
   require_linux_dataplane "configure_trust_material" || return 0
+  if is_client_role; then
+    print_info "Client role detected: trust signer operations are disabled."
+    local source_verifier
+    local source_trust
+    prompt_default source_verifier "Path to verifier key (32-byte hex line)" "${TRUST_VERIFIER_KEY_PATH}"
+    prompt_default source_trust "Path to signed trust evidence file" "${TRUST_EVIDENCE_PATH}"
+    if [[ "${source_verifier}" != "${TRUST_VERIFIER_KEY_PATH}" || ! -f "${TRUST_VERIFIER_KEY_PATH}" ]]; then
+      run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
+    fi
+    if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
+      run_root install -m 0600 "${source_trust}" "${TRUST_EVIDENCE_PATH}"
+    fi
+    AUTO_REFRESH_TRUST="0"
+    return 0
+  fi
   print_info "Trust material setup:"
   echo "  1) Lab mode (generate local signer key and auto-refresh trust evidence)"
   echo "  2) Bring externally signed trust evidence + verifier key"
@@ -1176,6 +1245,7 @@ configure_trust_material() {
 
 write_daemon_environment() {
   require_linux_dataplane "write_daemon_environment" || return 0
+  enforce_role_policy_defaults
   enforce_backend_mode
   enforce_auto_tunnel_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
@@ -1185,6 +1255,7 @@ write_daemon_environment() {
   fi
   run_root env \
     RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
+    RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
     RUSTYNET_SOCKET="${SOCKET_PATH}" \
     RUSTYNET_STATE="${STATE_PATH}" \
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
@@ -1299,14 +1370,31 @@ show_service_status() {
 ensure_peer_store() {
   if [[ ! -s "${PEERS_FILE}" ]]; then
     cat >"${PEERS_FILE}" <<'EOF'
-# name|node_id|public_key|endpoint|cidr
+# name|node_id|public_key|endpoint|cidr|role
 EOF
   fi
 }
 
 print_saved_peers() {
   ensure_peer_store
-  awk -F'|' 'NF==5 && $0 !~ /^#/ { printf "  - %s (node=%s endpoint=%s cidr=%s)\n", $1, $2, $4, $5 }' "${PEERS_FILE}"
+  awk -F'|' '
+    $0 !~ /^#/ && NF >= 5 {
+      role = (NF >= 6 && $6 != "") ? $6 : "unknown";
+      printf "  - %s (node=%s endpoint=%s cidr=%s role=%s)\n", $1, $2, $4, $5, role
+    }
+  ' "${PEERS_FILE}"
+}
+
+print_saved_admin_peers() {
+  ensure_peer_store
+  awk -F'|' '
+    $0 !~ /^#/ && NF >= 5 {
+      role = (NF >= 6 && $6 != "") ? $6 : "unknown";
+      if (role == "admin") {
+        printf "  - %s (node=%s endpoint=%s cidr=%s)\n", $1, $2, $4, $5
+      }
+    }
+  ' "${PEERS_FILE}"
 }
 
 upsert_peer() {
@@ -1315,11 +1403,12 @@ upsert_peer() {
   local public_key="$3"
   local endpoint="$4"
   local cidr="$5"
+  local role="${6:-unknown}"
   ensure_peer_store
   local tmp
   tmp="$(mktemp)"
   awk -F'|' -v n="${name}" '$0 ~ /^#/ || $1 != n { print }' "${PEERS_FILE}" >"${tmp}"
-  printf '%s|%s|%s|%s|%s\n' "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" >>"${tmp}"
+  printf '%s|%s|%s|%s|%s|%s\n' "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${role}" >>"${tmp}"
   mv "${tmp}" "${PEERS_FILE}"
 }
 
@@ -1335,13 +1424,13 @@ remove_peer_record() {
 find_peer_record() {
   local name="$1"
   ensure_peer_store
-  awk -F'|' -v n="${name}" '$0 !~ /^#/ && NF==5 && $1 == n { print; exit }' "${PEERS_FILE}"
+  awk -F'|' -v n="${name}" '$0 !~ /^#/ && NF>=5 && $1 == n { print; exit }' "${PEERS_FILE}"
 }
 
 find_peer_record_by_node_id() {
   local node_id="$1"
   ensure_peer_store
-  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF==5 && $2 == nid { print; exit }' "${PEERS_FILE}"
+  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF>=5 && $2 == nid { print; exit }' "${PEERS_FILE}"
 }
 
 run_rustynet_cli() {
@@ -1368,6 +1457,7 @@ extract_status_field() {
 refresh_menu_runtime_status() {
   MENU_NETWORK_STATE="unknown"
   MENU_NETWORK_CONNECTED="unknown"
+  MENU_NODE_ROLE="${NODE_ROLE}"
   MENU_EXIT_ROLE="off"
   MENU_EXIT_SELECTED_NODE="none"
   MENU_EXIT_SERVING="false"
@@ -1375,6 +1465,7 @@ refresh_menu_runtime_status() {
   if ! is_linux_host; then
     MENU_NETWORK_STATE="compatibility-mode"
     MENU_NETWORK_CONNECTED="n/a"
+    MENU_NODE_ROLE="${NODE_ROLE}"
     MENU_EXIT_ROLE="n/a"
     return
   fi
@@ -1382,6 +1473,7 @@ refresh_menu_runtime_status() {
   if ! command -v rustynet >/dev/null 2>&1; then
     MENU_NETWORK_STATE="cli-missing"
     MENU_NETWORK_CONNECTED="no"
+    MENU_NODE_ROLE="${NODE_ROLE}"
     MENU_EXIT_ROLE="unknown"
     return
   fi
@@ -1390,10 +1482,15 @@ refresh_menu_runtime_status() {
   if ! status_line="$(RUSTYNET_DAEMON_SOCKET="${SOCKET_PATH}" rustynet status 2>/dev/null)"; then
     MENU_NETWORK_STATE="daemon-unreachable"
     MENU_NETWORK_CONNECTED="no"
+    MENU_NODE_ROLE="${NODE_ROLE}"
     MENU_EXIT_ROLE="off"
     return
   fi
 
+  MENU_NODE_ROLE="$(extract_status_field "${status_line}" "node_role")"
+  if [[ -z "${MENU_NODE_ROLE}" ]]; then
+    MENU_NODE_ROLE="${NODE_ROLE}"
+  fi
   MENU_NETWORK_STATE="$(extract_status_field "${status_line}" "state")"
   MENU_EXIT_SELECTED_NODE="$(extract_status_field "${status_line}" "exit_node")"
   MENU_EXIT_SERVING="$(extract_status_field "${status_line}" "serving_exit_node")"
@@ -1418,26 +1515,38 @@ refresh_menu_runtime_status() {
 print_menu_runtime_header() {
   refresh_menu_runtime_status
   local connected_display
+  local node_role_display
   local state_display
   local exit_display
   connected_display="$(printf '%s' "${MENU_NETWORK_CONNECTED}" | tr '[:lower:]' '[:upper:]')"
+  node_role_display="$(printf '%s' "${MENU_NODE_ROLE}" | tr '[:lower:]' '[:upper:]')"
   state_display="$(printf '%s' "${MENU_NETWORK_STATE}" | tr '[:lower:]' '[:upper:]')"
   exit_display="$(printf '%s' "${MENU_EXIT_ROLE}" | tr '[:lower:]' '[:upper:]')"
-  printf '[status] Connected: %s (state=%s) | Exit role: %s\n' \
+  printf '[status] Node role: %s | Connected: %s (state=%s) | Exit role: %s\n' \
+    "${node_role_display}" \
     "${connected_display}" \
     "${state_display}" \
     "${exit_display}"
 }
 
 connect_to_device() {
+  require_admin_role "connect_to_device" || return 0
   require_linux_dataplane "connect_to_device" || return 0
-  local name node_id public_key endpoint_ip endpoint_port endpoint cidr
+  local name node_id public_key endpoint_ip endpoint_port endpoint cidr peer_role
   prompt_default name "Peer name (local label)" "peer-$(date +%H%M%S)"
   prompt_default node_id "Peer node id" "${name}"
   prompt_default public_key "Peer WireGuard public key (base64)" ""
   prompt_default endpoint_ip "Peer endpoint IP or DNS" ""
   prompt_default endpoint_port "Peer endpoint port" "51820"
   prompt_default cidr "Peer tunnel CIDR" "100.64.0.2/32"
+  prompt_default peer_role "Peer role (admin|client)" "client"
+  case "${peer_role}" in
+    admin|client) ;;
+    *)
+      print_warn "Unsupported peer role '${peer_role}', storing as client."
+      peer_role="client"
+      ;;
+  esac
 
   if [[ -z "${public_key}" || -z "${endpoint_ip}" ]]; then
     print_err "Public key and endpoint are required."
@@ -1448,11 +1557,12 @@ connect_to_device() {
   endpoint="${endpoint_ip}:${endpoint_port}"
   run_root wg set "${WG_INTERFACE}" peer "${public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
   run_root ip route replace "${cidr}" dev "${WG_INTERFACE}"
-  upsert_peer "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}"
+  upsert_peer "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${peer_role}"
   print_info "Peer ${name} configured on ${WG_INTERFACE}."
 }
 
 disconnect_device() {
+  require_admin_role "disconnect_device" || return 0
   require_linux_dataplane "disconnect_device" || return 0
   local name record public_key cidr
   print_saved_peers
@@ -1488,12 +1598,40 @@ show_connected_devices() {
   run_root wg show "${WG_INTERFACE}" || print_warn "Unable to read live WireGuard state."
 }
 
+connect_to_saved_admin_peers() {
+  require_admin_role "connect_to_saved_admin_peers" || return 0
+  require_linux_dataplane "connect_to_saved_admin_peers" || return 0
+  ensure_peer_store
+  require_manual_peer_override_authorization "manual_peer_admin_mesh_sync" || return 1
+
+  local configured=0
+  local failed=0
+  while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
+    [[ -z "${name}" || "${name}" == \#* ]] && continue
+    if [[ "${role:-unknown}" != "admin" ]]; then
+      continue
+    fi
+
+    if run_root wg set "${WG_INTERFACE}" peer "${public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25 \
+      && run_root ip route replace "${cidr}" dev "${WG_INTERFACE}"; then
+      configured=$((configured + 1))
+    else
+      failed=$((failed + 1))
+      print_warn "Failed to apply admin peer '${name}' (${node_id})."
+    fi
+  done <"${PEERS_FILE}"
+
+  print_info "Admin-peer sync complete: configured=${configured} failed=${failed}."
+}
+
 rotate_local_key() {
+  require_admin_role "rotate_local_key" || return 0
   require_linux_dataplane "rotate_local_key" || return 0
   run_rustynet_cli key rotate
 }
 
 revoke_local_key() {
+  require_admin_role "revoke_local_key" || return 0
   require_linux_dataplane "revoke_local_key" || return 0
   if ! prompt_yes_no "Revoke local key material now? This disables connectivity until reinitialized." "n"; then
     print_info "Revoke cancelled."
@@ -1503,8 +1641,9 @@ revoke_local_key() {
 }
 
 apply_rotation_bundle() {
+  require_admin_role "apply_rotation_bundle" || return 0
   require_linux_dataplane "apply_rotation_bundle" || return 0
-  local bundle prefix node_id new_public_key record name old_public endpoint cidr
+  local bundle prefix node_id new_public_key record name old_public endpoint cidr peer_role
   prompt_default bundle "Rotation bundle (format rotation:<node_id>:<public_key>)" ""
   if [[ -z "${bundle}" ]]; then
     print_err "Rotation bundle is required."
@@ -1526,6 +1665,10 @@ apply_rotation_bundle() {
   old_public="$(echo "${record}" | awk -F'|' '{print $3}')"
   endpoint="$(echo "${record}" | awk -F'|' '{print $4}')"
   cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
+  peer_role="$(echo "${record}" | awk -F'|' '{print $6}')"
+  if [[ -z "${peer_role}" ]]; then
+    peer_role="unknown"
+  fi
 
   if [[ "${old_public}" == "${new_public_key}" ]]; then
     print_info "Peer ${name} already has this key."
@@ -1537,13 +1680,19 @@ apply_rotation_bundle() {
     print_warn "Previous peer key was not present in WireGuard runtime state."
   fi
   run_root wg set "${WG_INTERFACE}" peer "${new_public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
-  upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}"
+  upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}" "${peer_role}"
   print_info "Updated peer key for ${name} (${node_id}) without changing node identity."
 }
 
 configure_launch_defaults() {
+  local profile_prompt
+  if is_admin_role; then
+    profile_prompt="Default launch profile (menu|quick-connect|quick-exit-node|quick-hybrid)"
+  else
+    profile_prompt="Default launch profile (menu|quick-connect)"
+  fi
   prompt_default DEFAULT_LAUNCH_PROFILE \
-    "Default launch profile (menu|quick-connect|quick-exit-node|quick-hybrid)" \
+    "${profile_prompt}" \
     "${DEFAULT_LAUNCH_PROFILE}"
   prompt_default AUTO_LAUNCH_ON_START \
     "Auto-apply default launch profile on startup (0/1)" \
@@ -1560,6 +1709,7 @@ configure_launch_defaults() {
 configure_values() {
   local detected_egress
   local fallback_egress="eth0"
+  local previous_role selected_role confirm_default
   if is_macos_host; then
     fallback_egress="en0"
   fi
@@ -1568,7 +1718,22 @@ configure_values() {
     EGRESS_INTERFACE="${detected_egress:-${fallback_egress}}"
   fi
 
+  normalize_node_role
+  previous_role="${NODE_ROLE}"
   prompt_default DEVICE_NODE_ID "Local device node id (used for display)" "${DEVICE_NODE_ID}"
+  prompt_default selected_role "Node role (admin|client)" "${NODE_ROLE}"
+  NODE_ROLE="${selected_role}"
+  normalize_node_role
+  if is_admin_role; then
+    confirm_default="n"
+    if [[ "${previous_role}" == "admin" ]]; then
+      confirm_default="y"
+    fi
+    if ! prompt_yes_no "Confirm admin role for this node (full control-plane privileges)" "${confirm_default}"; then
+      print_warn "Admin role confirmation declined. Reverting to client role."
+      NODE_ROLE="client"
+    fi
+  fi
 
   if is_macos_host; then
     print_info "macOS compatibility profile is active."
@@ -1604,7 +1769,7 @@ configure_values() {
   prompt_default MAX_RECONCILE_FAILURES "Max reconcile failures" "${MAX_RECONCILE_FAILURES}"
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
 
-  if is_linux_host; then
+  if is_linux_host && is_admin_role; then
     prompt_default MANUAL_PEER_OVERRIDE "Enable manual peer break-glass override (0/1)" "${MANUAL_PEER_OVERRIDE}"
     if [[ "${MANUAL_PEER_OVERRIDE}" != "1" ]]; then
       MANUAL_PEER_OVERRIDE="0"
@@ -1615,6 +1780,7 @@ configure_values() {
     MANUAL_PEER_OVERRIDE="0"
   fi
 
+  enforce_role_policy_defaults
   configure_launch_defaults
   enforce_host_storage_policy
 }
@@ -1650,6 +1816,7 @@ show_runtime_config() {
   cat <<EOF
 Current Rustynet Wizard Configuration
   node_id                 : ${DEVICE_NODE_ID}
+  node_role               : ${NODE_ROLE}
   host_profile            : ${HOST_PROFILE}
   socket                  : ${SOCKET_PATH}
   state                   : ${STATE_PATH}
@@ -1683,6 +1850,7 @@ EOF
 }
 
 offer_device_as_exit_node() {
+  require_admin_role "offer_device_as_exit_node" || return 0
   require_linux_dataplane "offer_device_as_exit_node" || return 0
   print_info "Advertising exit route (0.0.0.0/0)."
   run_rustynet_cli route advertise 0.0.0.0/0
@@ -1713,6 +1881,7 @@ select_exit_node() {
 }
 
 advertise_route() {
+  require_admin_role "advertise_route" || return 0
   require_linux_dataplane "advertise_route" || return 0
   local cidr
   prompt_default cidr "CIDR to advertise (for LAN/exit routing)" "192.168.1.0/24"
@@ -1744,6 +1913,10 @@ apply_launch_profile() {
 
   if ! is_valid_launch_profile "${profile}"; then
     print_err "Unsupported launch profile '${profile}'."
+    return 1
+  fi
+  if is_client_role && [[ "${profile}" == "quick-exit-node" || "${profile}" == "quick-hybrid" ]]; then
+    print_err "Launch profile '${profile}' is admin-only for serving exit traffic."
     return 1
   fi
   if ! is_valid_lan_mode "${lan_mode}"; then
@@ -1860,7 +2033,8 @@ EOF
 menu_peer_exit_routing() {
   while true; do
     print_menu_runtime_header
-    cat <<'EOF'
+    if is_admin_role; then
+      cat <<'EOF'
 
 Peer, Exit Node & Routing
   1) Connect to device (break-glass manual peer add/update)
@@ -1871,29 +2045,65 @@ Peer, Exit Node & Routing
   6) Toggle LAN access
   7) Advertise route
   8) Apply peer key rotation bundle (break-glass manual path)
+  9) Sync all saved admin peers (admin mesh break-glass)
+  10) Show saved admin peers
   0) Back
 EOF
+    else
+      cat <<'EOF'
+
+Client Connectivity
+  1) Select exit node
+  2) Disable exit node
+  3) Toggle LAN access
+  4) Show saved admin peers
+  0) Back
+EOF
+    fi
     local choice
     if ! read -r -p "Choose an option: " choice; then
       print_info "Input closed; returning to main menu."
       return
     fi
-    case "${choice}" in
-      1) connect_to_device ;;
-      2) disconnect_device ;;
-      3) select_exit_node ;;
-      4) run_rustynet_cli exit-node off ;;
-      5) offer_device_as_exit_node ;;
-      6) toggle_lan_access ;;
-      7) advertise_route ;;
-      8) apply_rotation_bundle ;;
-      0) return ;;
-      *) print_warn "Unknown option: ${choice}" ;;
-    esac
+    if is_admin_role; then
+      case "${choice}" in
+        1) connect_to_device ;;
+        2) disconnect_device ;;
+        3) select_exit_node ;;
+        4) run_rustynet_cli exit-node off ;;
+        5) offer_device_as_exit_node ;;
+        6) toggle_lan_access ;;
+        7) advertise_route ;;
+        8) apply_rotation_bundle ;;
+        9) connect_to_saved_admin_peers ;;
+        10)
+          echo "Saved admin peers:"
+          print_saved_admin_peers
+          ;;
+        0) return ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+    else
+      case "${choice}" in
+        1) select_exit_node ;;
+        2) run_rustynet_cli exit-node off ;;
+        3) toggle_lan_access ;;
+        4)
+          echo "Saved admin peers:"
+          print_saved_admin_peers
+          ;;
+        0) return ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+    fi
   done
 }
 
 menu_security_key_management() {
+  if ! is_admin_role; then
+    print_warn "Security & key management menu is available only to admin-role nodes."
+    return 0
+  fi
   while true; do
     print_menu_runtime_header
     cat <<'EOF'
@@ -1998,9 +2208,10 @@ main_menu() {
   fi
   while true; do
     print_menu_runtime_header
-    cat <<'EOF'
+    if is_admin_role; then
+      cat <<'EOF'
 
-Rustynet Control Menu
+Rustynet Admin Console
   1) Service setup & operations
   2) Network information & diagnostics
   3) Peer, exit node & routing
@@ -2009,21 +2220,45 @@ Rustynet Control Menu
   6) Configuration
   0) Exit
 EOF
+    else
+      cat <<'EOF'
+
+Rustynet Client Console
+  1) Service setup & operations
+  2) Network information & diagnostics
+  3) Client connectivity
+  4) Emergency & recovery
+  5) Configuration
+  0) Exit
+EOF
+    fi
     local choice
     if ! read -r -p "Choose an option: " choice; then
       print_info "Input closed; exiting menu."
       break
     fi
-    case "${choice}" in
-      1) menu_service_setup_operations ;;
-      2) menu_network_information ;;
-      3) menu_peer_exit_routing ;;
-      4) menu_security_key_management ;;
-      5) menu_emergency_recovery ;;
-      6) menu_configuration ;;
-      0) exit 0 ;;
-      *) print_warn "Unknown option: ${choice}" ;;
-    esac
+    if is_admin_role; then
+      case "${choice}" in
+        1) menu_service_setup_operations ;;
+        2) menu_network_information ;;
+        3) menu_peer_exit_routing ;;
+        4) menu_security_key_management ;;
+        5) menu_emergency_recovery ;;
+        6) menu_configuration ;;
+        0) exit 0 ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+    else
+      case "${choice}" in
+        1) menu_service_setup_operations ;;
+        2) menu_network_information ;;
+        3) menu_peer_exit_routing ;;
+        4) menu_emergency_recovery ;;
+        5) menu_configuration ;;
+        0) exit 0 ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+    fi
   done
 }
 
@@ -2068,7 +2303,11 @@ elif [[ "${AUTO_LAUNCH_ON_START}" == "1" ]]; then
 fi
 
 if [[ -n "${launch_profile}" && "${launch_profile}" != "menu" ]]; then
-  apply_launch_profile "${launch_profile}" "${launch_exit_node_id}" "${launch_lan_mode}"
+  if ! apply_launch_profile "${launch_profile}" "${launch_exit_node_id}" "${launch_lan_mode}"; then
+    if [[ "${AUTO_ONLY_LAUNCH}" == "1" ]]; then
+      exit 1
+    fi
+  fi
   if [[ "${AUTO_ONLY_LAUNCH}" == "1" ]]; then
     exit 0
   fi
