@@ -1129,6 +1129,77 @@ run_rustynet_cli() {
   RUSTYNET_DAEMON_SOCKET="${SOCKET_PATH}" rustynet "$@"
 }
 
+extract_status_field() {
+  local status_line="$1"
+  local key="$2"
+  awk -v key="${key}" '{
+    for (i = 1; i <= NF; i++) {
+      if (index($i, key "=") == 1) {
+        print substr($i, length(key) + 2)
+        exit
+      }
+    }
+  }' <<<"${status_line}"
+}
+
+refresh_menu_runtime_status() {
+  MENU_NETWORK_STATE="unknown"
+  MENU_NETWORK_CONNECTED="unknown"
+  MENU_EXIT_ROLE="off"
+  MENU_EXIT_SELECTED_NODE="none"
+  MENU_EXIT_SERVING="false"
+
+  if ! is_linux_host; then
+    MENU_NETWORK_STATE="compatibility-mode"
+    MENU_NETWORK_CONNECTED="n/a"
+    MENU_EXIT_ROLE="n/a"
+    return
+  fi
+
+  if ! command -v rustynet >/dev/null 2>&1; then
+    MENU_NETWORK_STATE="cli-missing"
+    MENU_NETWORK_CONNECTED="no"
+    MENU_EXIT_ROLE="unknown"
+    return
+  fi
+
+  local status_line
+  if ! status_line="$(RUSTYNET_DAEMON_SOCKET="${SOCKET_PATH}" rustynet status 2>/dev/null)"; then
+    MENU_NETWORK_STATE="daemon-unreachable"
+    MENU_NETWORK_CONNECTED="no"
+    MENU_EXIT_ROLE="off"
+    return
+  fi
+
+  MENU_NETWORK_STATE="$(extract_status_field "${status_line}" "state")"
+  MENU_EXIT_SELECTED_NODE="$(extract_status_field "${status_line}" "exit_node")"
+  MENU_EXIT_SERVING="$(extract_status_field "${status_line}" "serving_exit_node")"
+
+  case "${MENU_NETWORK_STATE}" in
+    ControlTrusted|DataplaneApplied|ExitActive) MENU_NETWORK_CONNECTED="yes" ;;
+    Init|FailClosed|"") MENU_NETWORK_CONNECTED="no" ;;
+    *) MENU_NETWORK_CONNECTED="unknown" ;;
+  esac
+
+  if [[ "${MENU_EXIT_SERVING}" == "true" && "${MENU_EXIT_SELECTED_NODE}" != "none" && -n "${MENU_EXIT_SELECTED_NODE}" ]]; then
+    MENU_EXIT_ROLE="serving+using(${MENU_EXIT_SELECTED_NODE})"
+  elif [[ "${MENU_EXIT_SERVING}" == "true" ]]; then
+    MENU_EXIT_ROLE="serving"
+  elif [[ "${MENU_EXIT_SELECTED_NODE}" != "none" && -n "${MENU_EXIT_SELECTED_NODE}" ]]; then
+    MENU_EXIT_ROLE="using(${MENU_EXIT_SELECTED_NODE})"
+  else
+    MENU_EXIT_ROLE="off"
+  fi
+}
+
+print_menu_runtime_header() {
+  refresh_menu_runtime_status
+  printf '[status] Connected: %s (state=%s) | Exit role: %s\n' \
+    "${MENU_NETWORK_CONNECTED}" \
+    "${MENU_NETWORK_STATE}" \
+    "${MENU_EXIT_ROLE}"
+}
+
 connect_to_device() {
   require_linux_dataplane "connect_to_device" || return 0
   local name node_id public_key endpoint_ip endpoint_port endpoint cidr
@@ -1378,43 +1449,22 @@ advertise_route() {
   run_rustynet_cli route advertise "${cidr}"
 }
 
-main_menu() {
-  if is_linux_host; then
-    print_info "Host OS: ${HOST_OS} (full dataplane/runtime mode)."
-  else
-    print_warn "Host OS: ${HOST_OS} (compatibility mode: Linux dataplane actions are blocked)."
-  fi
+menu_service_setup_operations() {
   while true; do
+    print_menu_runtime_header
     cat <<'EOF'
 
-Rustynet Control Menu
+Service Setup & Operations
   1) First-run setup/bootstrap
   2) Reconfigure daemon values
   3) Start/restart Rustynet service
-  4) Disconnect VPN (stop service + restore normal network)
-  5) Show service status
-  6) Show Rustynet status
-  7) Netcheck
-  8) Show connected devices
-  9) Connect to device (break-glass manual peer add/update)
- 10) Remove device peer (break-glass manual peer remove)
- 11) Select exit node
- 12) Disable exit node
- 13) Offer this device as an exit node
- 14) Toggle LAN access
- 15) Advertise route
- 16) Refresh signed trust evidence now
- 17) Rotate local WireGuard key
- 18) Revoke local key material
- 19) Apply peer key rotation bundle (break-glass manual path)
- 20) Show current configuration
- 21) Preflight doctor (security + prerequisites)
-  0) Exit
+  4) Show service status
+  0) Back
 EOF
     local choice
     if ! read -r -p "Choose an option: " choice; then
-      print_info "Input closed; exiting menu."
-      break
+      print_info "Input closed; returning to main menu."
+      return
     fi
     case "${choice}" in
       1) first_run_setup ;;
@@ -1424,24 +1474,197 @@ EOF
         write_daemon_environment
         ;;
       3) start_or_restart_service ;;
-      4) disconnect_vpn ;;
-      5) show_service_status ;;
-      6) run_rustynet_cli status ;;
-      7) run_rustynet_cli netcheck ;;
-      8) show_connected_devices ;;
-      9) connect_to_device ;;
-      10) disconnect_device ;;
-      11) select_exit_node ;;
-      12) run_rustynet_cli exit-node off ;;
-      13) offer_device_as_exit_node ;;
-      14) toggle_lan_access ;;
-      15) advertise_route ;;
-      16) refresh_signed_trust_evidence ;;
-      17) rotate_local_key ;;
-      18) revoke_local_key ;;
-      19) apply_rotation_bundle ;;
-      20) show_runtime_config ;;
-      21) doctor_preflight ;;
+      4) show_service_status ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+menu_network_information() {
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Network Information & Diagnostics
+  1) Show Rustynet status
+  2) Netcheck
+  3) Show connected devices
+  4) Show current configuration
+  5) Preflight doctor (security + prerequisites)
+  0) Back
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; returning to main menu."
+      return
+    fi
+    case "${choice}" in
+      1) run_rustynet_cli status ;;
+      2) run_rustynet_cli netcheck ;;
+      3) show_connected_devices ;;
+      4) show_runtime_config ;;
+      5) doctor_preflight ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+menu_peer_exit_routing() {
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Peer, Exit Node & Routing
+  1) Connect to device (break-glass manual peer add/update)
+  2) Remove device peer (break-glass manual peer remove)
+  3) Select exit node
+  4) Disable exit node
+  5) Offer this device as an exit node
+  6) Toggle LAN access
+  7) Advertise route
+  8) Apply peer key rotation bundle (break-glass manual path)
+  0) Back
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; returning to main menu."
+      return
+    fi
+    case "${choice}" in
+      1) connect_to_device ;;
+      2) disconnect_device ;;
+      3) select_exit_node ;;
+      4) run_rustynet_cli exit-node off ;;
+      5) offer_device_as_exit_node ;;
+      6) toggle_lan_access ;;
+      7) advertise_route ;;
+      8) apply_rotation_bundle ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+menu_security_key_management() {
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Security & Key Management
+  1) Refresh signed trust evidence now
+  2) Rotate local WireGuard key
+  3) Revoke local key material
+  0) Back
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; returning to main menu."
+      return
+    fi
+    case "${choice}" in
+      1) refresh_signed_trust_evidence ;;
+      2) rotate_local_key ;;
+      3) revoke_local_key ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+menu_emergency_recovery() {
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Emergency & Recovery
+  1) Disconnect VPN (stop service + restore normal network)
+  2) Disable exit node
+  3) Show service status
+  4) Preflight doctor (security + prerequisites)
+  0) Back
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; returning to main menu."
+      return
+    fi
+    case "${choice}" in
+      1) disconnect_vpn ;;
+      2) run_rustynet_cli exit-node off ;;
+      3) show_service_status ;;
+      4) doctor_preflight ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+menu_configuration() {
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Configuration
+  1) Reconfigure daemon values
+  2) Show current configuration
+  3) Save configuration now
+  0) Back
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; returning to main menu."
+      return
+    fi
+    case "${choice}" in
+      1)
+        configure_values
+        save_config
+        write_daemon_environment
+        ;;
+      2) show_runtime_config ;;
+      3)
+        save_config
+        print_info "Configuration saved to ${CONFIG_FILE}."
+        ;;
+      0) return ;;
+      *) print_warn "Unknown option: ${choice}" ;;
+    esac
+  done
+}
+
+main_menu() {
+  if is_linux_host; then
+    print_info "Host OS: ${HOST_OS} (full dataplane/runtime mode)."
+  else
+    print_warn "Host OS: ${HOST_OS} (compatibility mode: Linux dataplane actions are blocked)."
+  fi
+  while true; do
+    print_menu_runtime_header
+    cat <<'EOF'
+
+Rustynet Control Menu
+  1) Service setup & operations
+  2) Network information & diagnostics
+  3) Peer, exit node & routing
+  4) Security & key management
+  5) Emergency & recovery
+  6) Configuration
+  0) Exit
+EOF
+    local choice
+    if ! read -r -p "Choose an option: " choice; then
+      print_info "Input closed; exiting menu."
+      break
+    fi
+    case "${choice}" in
+      1) menu_service_setup_operations ;;
+      2) menu_network_information ;;
+      3) menu_peer_exit_routing ;;
+      4) menu_security_key_management ;;
+      5) menu_emergency_recovery ;;
+      6) menu_configuration ;;
       0) exit 0 ;;
       *) print_warn "Unknown option: ${choice}" ;;
     esac

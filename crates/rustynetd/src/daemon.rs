@@ -923,12 +923,18 @@ impl DaemonRuntime {
                     .as_ref()
                     .map(|state| state.active_nodes().len().to_string())
                     .unwrap_or_else(|| "none".to_string());
+                let serving_exit_node = if self.advertised_routes.contains("0.0.0.0/0") {
+                    "true"
+                } else {
+                    "false"
+                };
                 IpcResponse::ok(format!(
-                    "node_id={} state={:?} generation={} exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.controller.state(),
                     self.controller.generation(),
                     self.selected_exit_node.as_deref().unwrap_or("none"),
+                    serving_exit_node,
                     if self.lan_access_enabled { "on" } else { "off" },
                     if self.is_restricted() {
                         "true"
