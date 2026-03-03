@@ -783,6 +783,21 @@ check_rust_min_version() {
   [[ "$(printf '%s\n%s\n' "${RUST_MIN_VERSION}" "${installed_ver}" | sort -V | head -1)" == "${RUST_MIN_VERSION}" ]]
 }
 
+install_compatible_cargo_deny() {
+  local installed_ver=""
+  if command -v rustc >/dev/null 2>&1; then
+    installed_ver="$(rustc --version 2>/dev/null | awk '{print $2}' | cut -d- -f1)"
+  fi
+
+  if [[ -n "${installed_ver}" ]] && [[ "$(printf '%s\n%s\n' "1.88.0" "${installed_ver}" | sort -V | head -1)" != "1.88.0" ]]; then
+    print_warn "rustc ${installed_ver} is below 1.88.0; installing cargo-deny 0.18.3 for compatibility."
+    cargo install --locked cargo-deny --version 0.18.3
+    return
+  fi
+
+  cargo install --locked cargo-deny
+}
+
 install_rust_via_rustup() {
   print_info "Installing Rust via rustup (latest stable toolchain)."
   if ! command -v curl >/dev/null 2>&1; then
@@ -836,7 +851,11 @@ ensure_ci_security_tools() {
 
   local tool
   for tool in "${missing_bins[@]}"; do
-    cargo install --locked "${tool}"
+    if [[ "${tool}" == "cargo-deny" ]]; then
+      install_compatible_cargo_deny
+    else
+      cargo install --locked "${tool}"
+    fi
   done
 }
 
