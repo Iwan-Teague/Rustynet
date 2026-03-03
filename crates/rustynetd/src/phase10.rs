@@ -666,11 +666,13 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn rollback_routes(&mut self) -> Result<(), SystemError> {
-        self.run(
+        // `ip route flush table 51820` exits non-zero when the table is absent,
+        // which is an acceptable rollback outcome on a fresh host.
+        self.run_allow_failure(
             PrivilegedCommandProgram::Ip,
             &["route", "flush", "table", "51820"],
-        )
-        .map_err(|err| SystemError::RollbackFailed(err.to_string()))
+        );
+        Ok(())
     }
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
