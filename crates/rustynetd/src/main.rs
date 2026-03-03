@@ -3,17 +3,19 @@
 use rustynetd::daemon::{
     DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES,
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
-    DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_RECONCILE_INTERVAL_MS,
-    DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH,
-    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
-    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
+    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
+    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
+    DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode, DaemonConfig, DaemonDataplaneMode,
+    NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
 };
 use rustynetd::perf;
+use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
 
 fn main() {
     if let Err(err) = run() {
@@ -39,6 +41,7 @@ fn run() -> Result<(), String> {
             let config = parse_daemon_config(rest)?;
             run_daemon(config).map_err(|err| err.to_string())
         }
+        [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
         [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
         [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
         _ => Err(help_text()),
@@ -54,6 +57,57 @@ fn run_key_command(args: &[String]) -> Result<(), String> {
         "migrate" => run_key_migrate(&args[1..]),
         other => Err(format!("unknown key subcommand: {other}")),
     }
+}
+
+fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {
+    let mut config = PrivilegedHelperConfig::default();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--socket") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--socket requires a value".to_string())?;
+                config.socket_path = value.into();
+                index += 2;
+            }
+            Some("--allowed-uid") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--allowed-uid requires a value".to_string())?;
+                config.allowed_uid = value
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid --allowed-uid value: {err}"))?;
+                index += 2;
+            }
+            Some("--allowed-gid") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--allowed-gid requires a value".to_string())?;
+                let gid = value
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid --allowed-gid value: {err}"))?;
+                config.allowed_gid = Some(gid);
+                index += 2;
+            }
+            Some("--timeout-ms") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--timeout-ms requires a value".to_string())?;
+                let timeout_ms = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --timeout-ms value: {err}"))?;
+                if timeout_ms == 0 {
+                    return Err("--timeout-ms must be greater than zero".to_string());
+                }
+                config.io_timeout = std::time::Duration::from_millis(timeout_ms);
+                index += 2;
+            }
+            Some(flag) => return Err(format!("unknown privileged-helper argument: {flag}")),
+            None => break,
+        }
+    }
+    run_privileged_helper(config)
 }
 
 fn run_key_init(args: &[String]) -> Result<(), String> {
@@ -405,6 +459,22 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 };
                 index += 2;
             }
+            Some("--privileged-helper-socket") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--privileged-helper-socket requires a value".to_string())?;
+                config.privileged_helper_socket_path = Some(value.into());
+                index += 2;
+            }
+            Some("--privileged-helper-timeout-ms") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--privileged-helper-timeout-ms requires a value".to_string())?;
+                config.privileged_helper_timeout_ms = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid privileged helper timeout: {err}"))?;
+                index += 2;
+            }
             Some("--max-requests") => {
                 let value = args
                     .get(index + 1)
@@ -635,7 +705,8 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--node-id <id>] [--network-id <id>] [--force]",
@@ -662,6 +733,10 @@ fn help_text() -> String {
         &format!(
             "  dataplane_mode={:?}",
             DaemonDataplaneMode::default()
+        ),
+        &format!("  privileged_helper_socket={DEFAULT_TRUSTED_HELPER_SOCKET_PATH}"),
+        &format!(
+            "  privileged_helper_timeout_ms={DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS}"
         ),
         &format!("  reconcile_interval_ms={DEFAULT_RECONCILE_INTERVAL_MS}"),
         &format!("  max_reconcile_failures={DEFAULT_MAX_RECONCILE_FAILURES}"),

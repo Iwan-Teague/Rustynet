@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +39,7 @@ pub fn decrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<Vec<u8>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
-    let manager = key_custody_manager(encrypted_key_path, &passphrase)?;
+    let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
     let mut key = manager
         .load_private_key(&key_id)
@@ -59,7 +59,7 @@ pub fn encrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<(), String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
-    let manager = key_custody_manager(encrypted_key_path, &passphrase)?;
+    let manager = key_custody_manager(encrypted_key_path, passphrase.clone())?;
     let key_id = key_custody_key_id(encrypted_key_path);
     let backend = manager
         .store_private_key(&key_id, private_key)
@@ -82,15 +82,15 @@ pub fn encrypt_private_key(
 
 fn key_custody_manager(
     encrypted_key_path: &Path,
-    passphrase: &str,
+    passphrase: Zeroizing<String>,
 ) -> Result<KeyCustodyManager<PlatformOsSecureStore>, String> {
     let parent = encrypted_key_path
         .parent()
         .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
-    Ok(KeyCustodyManager::new(
+    Ok(KeyCustodyManager::new_zeroizing(
         PlatformOsSecureStore,
         parent.to_path_buf(),
-        passphrase.to_string(),
+        passphrase,
         KeyCustodyPermissionPolicy::default(),
     ))
 }
@@ -174,7 +174,13 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
         private_key.push(b'\n');
     }
 
-    let public_key = derive_public_key_from_private_key(&private_key)?;
+    let public_key = match derive_public_key_from_private_key(&private_key) {
+        Ok(value) => value,
+        Err(err) => {
+            private_key.fill(0);
+            return Err(err);
+        }
+    };
     Ok((private_key, public_key))
 }
 
@@ -243,11 +249,20 @@ pub fn initialize_encrypted_key_material(
     }
 
     let (mut private_key, public_key) = generate_wireguard_keypair()?;
-    encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
-    write_runtime_private_key(runtime_private_key_path, &private_key)?;
-    write_public_key(public_key_path, &public_key)?;
+    let result = (|| -> Result<String, String> {
+        encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
+        if let Err(err) = write_runtime_private_key(runtime_private_key_path, &private_key) {
+            let _ = remove_file_if_present(runtime_private_key_path);
+            return Err(err);
+        }
+        if let Err(err) = write_public_key(public_key_path, &public_key) {
+            let _ = remove_file_if_present(public_key_path);
+            return Err(err);
+        }
+        Ok(public_key.clone())
+    })();
     private_key.fill(0);
-    Ok(public_key)
+    result
 }
 
 pub fn migrate_existing_private_key_material(
@@ -284,12 +299,21 @@ pub fn migrate_existing_private_key_material(
         private_key.push(b'\n');
     }
 
-    let public_key = derive_public_key_from_private_key(&private_key)?;
-    encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
-    write_runtime_private_key(runtime_private_key_path, &private_key)?;
-    write_public_key(public_key_path, &public_key)?;
+    let result = (|| -> Result<String, String> {
+        let public_key = derive_public_key_from_private_key(&private_key)?;
+        encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
+        if let Err(err) = write_runtime_private_key(runtime_private_key_path, &private_key) {
+            let _ = remove_file_if_present(runtime_private_key_path);
+            return Err(err);
+        }
+        if let Err(err) = write_public_key(public_key_path, &public_key) {
+            let _ = remove_file_if_present(public_key_path);
+            return Err(err);
+        }
+        Ok(public_key)
+    })();
     private_key.fill(0);
-    Ok(public_key)
+    result
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -315,9 +339,42 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|err| format!("set parent permissions {} failed: {err}", parent.display()))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        match fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                let metadata = fs::metadata(parent).map_err(|meta_err| {
+                    format!(
+                        "inspect parent permissions {} failed after chmod denial: {meta_err}",
+                        parent.display()
+                    )
+                })?;
+                let mode = metadata.permissions().mode() & 0o777;
+                let owner_uid = metadata.uid();
+                let expected_uid = Uid::effective().as_raw();
+                // Privilege-separated deployments keep /run/rustynet root-owned and group-writable
+                // for helper + daemon cooperation; accept that hardened shared parent shape.
+                let root_managed_shared_runtime = owner_uid == 0 && mode == 0o770;
+                if !root_managed_shared_runtime {
+                    return Err(format!(
+                        "set parent permissions {} failed: {err}",
+                        parent.display()
+                    ));
+                }
+                if owner_uid == expected_uid {
+                    return Err(format!(
+                        "set parent permissions {} failed despite owner match: {err}",
+                        parent.display()
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(format!(
+                    "set parent permissions {} failed: {err}",
+                    parent.display()
+                ));
+            }
+        }
     }
 
     let temp = temp_path_for(path);
@@ -340,17 +397,28 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let mut file = options
         .open(&temp)
         .map_err(|err| format!("create temp key file {} failed: {err}", temp.display()))?;
-    file.write_all(bytes)
-        .map_err(|err| format!("write temp key file {} failed: {err}", temp.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("sync temp key file {} failed: {err}", temp.display()))?;
-    fs::rename(&temp, path).map_err(|err| {
-        format!(
+    if let Err(err) = file.write_all(bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "write temp key file {} failed: {err}",
+            temp.display()
+        ));
+    }
+    if let Err(err) = file.sync_all() {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "sync temp key file {} failed: {err}",
+            temp.display()
+        ));
+    }
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
             "rename temp key file {} to {} failed: {err}",
             temp.display(),
             path.display()
-        )
-    })?;
+        ));
+    }
     let parent_dir = fs::File::open(parent)
         .map_err(|err| format!("open parent directory {} failed: {err}", parent.display()))?;
     parent_dir

@@ -7,6 +7,9 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 
+use crate::privileged_helper::{
+    PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
+};
 use rustynet_backend_api::{
     BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext, TunnelBackend,
 };
@@ -295,6 +298,7 @@ pub struct LinuxCommandSystem {
     interface_name: String,
     egress_interface: String,
     mode: LinuxDataplaneMode,
+    privileged_client: Option<PrivilegedCommandClient>,
     generation: u64,
     fail_closed_ssh_allow: bool,
     fail_closed_ssh_allow_cidrs: Vec<String>,
@@ -315,6 +319,7 @@ impl LinuxCommandSystem {
         interface_name: impl Into<String>,
         egress_interface: impl Into<String>,
         mode: LinuxDataplaneMode,
+        privileged_client: Option<PrivilegedCommandClient>,
         fail_closed_ssh_allow: bool,
         fail_closed_ssh_allow_cidrs: Vec<String>,
     ) -> Result<Self, SystemError> {
@@ -335,6 +340,7 @@ impl LinuxCommandSystem {
             interface_name,
             egress_interface,
             mode,
+            privileged_client,
             generation: 0,
             fail_closed_ssh_allow,
             fail_closed_ssh_allow_cidrs,
@@ -345,21 +351,42 @@ impl LinuxCommandSystem {
         })
     }
 
-    fn run(program: &str, args: &[&str]) -> Result<(), SystemError> {
-        let status = Command::new(program)
-            .args(args)
-            .status()
-            .map_err(|err| SystemError::Io(format!("{program} spawn failed: {err}")))?;
-        if status.success() {
+    fn run(&self, program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), SystemError> {
+        let output = self.run_capture(program, args)?;
+        if output.success() {
             return Ok(());
         }
         Err(SystemError::Io(format!(
-            "{program} exited unsuccessfully: {status}"
+            "{} exited unsuccessfully: status={} stderr={}",
+            program.as_str(),
+            output.status,
+            output.stderr
         )))
     }
 
-    fn run_allow_failure(program: &str, args: &[&str]) {
-        let _ = Command::new(program).args(args).status();
+    fn run_allow_failure(&self, program: PrivilegedCommandProgram, args: &[&str]) {
+        let _ = self.run_capture(program, args);
+    }
+
+    fn run_capture(
+        &self,
+        program: PrivilegedCommandProgram,
+        args: &[&str],
+    ) -> Result<PrivilegedCommandOutput, SystemError> {
+        if let Some(client) = self.privileged_client.as_ref() {
+            return client.run_capture(program, args).map_err(SystemError::Io);
+        }
+
+        let binary = program.as_str().to_string();
+        let output = Command::new(binary.as_str())
+            .args(args)
+            .output()
+            .map_err(|err| SystemError::Io(format!("{} spawn failed: {err}", program.as_str())))?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
     }
 
     fn nft_family_for_cidr(cidr: &str) -> Option<&'static str> {
@@ -381,8 +408,8 @@ impl LinuxCommandSystem {
             let family = Self::nft_family_for_cidr(cidr).ok_or_else(|| {
                 SystemError::FirewallApplyFailed(format!("invalid management cidr: {cidr}"))
             })?;
-            Self::run(
-                "nft",
+            self.run(
+                PrivilegedCommandProgram::Nft,
                 &[
                     "add",
                     "rule",
@@ -408,45 +435,49 @@ impl LinuxCommandSystem {
     }
 
     fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
-        match self.mode {
-            LinuxDataplaneMode::Shell => Self::run(
-                "sysctl",
-                &[
-                    "-w",
-                    if enabled {
-                        "net.ipv4.ip_forward=1"
-                    } else {
-                        "net.ipv4.ip_forward=0"
-                    },
-                ],
-            ),
-            LinuxDataplaneMode::HybridNative => fs::write(
+        let use_native_write = matches!(self.mode, LinuxDataplaneMode::HybridNative)
+            && self.privileged_client.is_none();
+        if use_native_write {
+            return fs::write(
                 "/proc/sys/net/ipv4/ip_forward",
                 if enabled { "1\n" } else { "0\n" },
             )
-            .map_err(|err| SystemError::Io(format!("native ip_forward write failed: {err}"))),
+            .map_err(|err| SystemError::Io(format!("native ip_forward write failed: {err}")));
         }
+        self.run(
+            PrivilegedCommandProgram::Sysctl,
+            &[
+                "-w",
+                if enabled {
+                    "net.ipv4.ip_forward=1"
+                } else {
+                    "net.ipv4.ip_forward=0"
+                },
+            ],
+        )
     }
 
     fn set_ipv6_disabled(&self, disabled: bool) -> Result<(), SystemError> {
-        match self.mode {
-            LinuxDataplaneMode::Shell => Self::run(
-                "sysctl",
-                &[
-                    "-w",
-                    if disabled {
-                        "net.ipv6.conf.all.disable_ipv6=1"
-                    } else {
-                        "net.ipv6.conf.all.disable_ipv6=0"
-                    },
-                ],
-            ),
-            LinuxDataplaneMode::HybridNative => fs::write(
+        let use_native_write = matches!(self.mode, LinuxDataplaneMode::HybridNative)
+            && self.privileged_client.is_none();
+        if use_native_write {
+            return fs::write(
                 "/proc/sys/net/ipv6/conf/all/disable_ipv6",
                 if disabled { "1\n" } else { "0\n" },
             )
-            .map_err(|err| SystemError::Io(format!("native ipv6 disable write failed: {err}"))),
+            .map_err(|err| SystemError::Io(format!("native ipv6 disable write failed: {err}")));
         }
+        self.run(
+            PrivilegedCommandProgram::Sysctl,
+            &[
+                "-w",
+                if disabled {
+                    "net.ipv6.conf.all.disable_ipv6=1"
+                } else {
+                    "net.ipv6.conf.all.disable_ipv6=0"
+                },
+            ],
+        )
     }
 
     fn firewall_table_name(&self) -> String {
@@ -463,11 +494,17 @@ impl LinuxCommandSystem {
         }
 
         let table = self.firewall_table_name();
-        Self::run_allow_failure("nft", &["delete", "table", "inet", table.as_str()]);
-        Self::run("nft", &["add", "table", "inet", table.as_str()])
-            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run_allow_failure(
+            PrivilegedCommandProgram::Nft,
+            &["delete", "table", "inet", table.as_str()],
+        );
+        self.run(
+            PrivilegedCommandProgram::Nft,
+            &["add", "table", "inet", table.as_str()],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "chain",
@@ -513,27 +550,38 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    fn list_tables() -> Result<Vec<(String, String)>, SystemError> {
-        let output = Command::new("nft")
-            .args(["list", "tables"])
-            .output()
-            .map_err(|err| SystemError::Io(format!("nft list tables failed: {err}")))?;
-        if !output.status.success() {
+    fn list_tables(&self) -> Result<Vec<(String, String)>, SystemError> {
+        let output = self.run_capture(PrivilegedCommandProgram::Nft, &["list", "tables"])?;
+        if !output.success() {
             return Err(SystemError::Io(format!(
-                "nft list tables exited unsuccessfully: {}",
-                output.status
+                "nft list tables exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
             )));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|err| SystemError::Io(format!("nft output decode failed: {err}")))?;
         let mut tables = Vec::new();
-        for line in stdout.lines() {
+        for line in output.stdout.lines() {
             let parts = line.split_whitespace().collect::<Vec<_>>();
             if parts.len() == 3 && parts[0] == "table" {
                 tables.push((parts[1].to_string(), parts[2].to_string()));
             }
         }
         Ok(tables)
+    }
+
+    fn has_fail_closed_drop_rule(&self, table: &str) -> Result<bool, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "chain", "inet", table, "killswitch"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::BlockEgressFailed(format!(
+                "nft list chain exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        Ok(output
+            .stdout
+            .contains("comment \"rustynet_fail_closed_drop\""))
     }
 }
 
@@ -545,7 +593,7 @@ impl DataplaneSystem for LinuxCommandSystem {
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         let keep_firewall = self.firewall_table_name();
         let keep_nat = self.nat_table_name();
-        for (family, table) in Self::list_tables()? {
+        for (family, table) in self.list_tables()? {
             let is_owned = (family == "inet" && table.starts_with("rustynet_g"))
                 || (family == "ip" && table.starts_with("rustynet_nat_g"));
             if !is_owned {
@@ -555,7 +603,10 @@ impl DataplaneSystem for LinuxCommandSystem {
             {
                 continue;
             }
-            Self::run_allow_failure("nft", &["delete", "table", family.as_str(), table.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", family.as_str(), table.as_str()],
+            );
         }
         Ok(())
     }
@@ -563,10 +614,10 @@ impl DataplaneSystem for LinuxCommandSystem {
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         #[cfg(target_os = "linux")]
         {
-            Self::run("ip", &["-V"])?;
-            Self::run("nft", &["--version"])?;
-            Self::run("wg", &["--version"])?;
-            Self::run("sysctl", &["--version"])?;
+            self.run(PrivilegedCommandProgram::Ip, &["-V"])?;
+            self.run(PrivilegedCommandProgram::Nft, &["--version"])?;
+            self.run(PrivilegedCommandProgram::Wg, &["--version"])?;
+            self.run(PrivilegedCommandProgram::Sysctl, &["--version"])?;
             return Ok(());
         }
         #[allow(unreachable_code)]
@@ -577,8 +628,8 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError> {
         for route in routes {
-            Self::run(
-                "ip",
+            self.run(
+                PrivilegedCommandProgram::Ip,
                 &[
                     "route",
                     "replace",
@@ -595,17 +646,23 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn rollback_routes(&mut self) -> Result<(), SystemError> {
-        Self::run("ip", &["route", "flush", "table", "51820"])
-            .map_err(|err| SystemError::RollbackFailed(err.to_string()))
+        self.run(
+            PrivilegedCommandProgram::Ip,
+            &["route", "flush", "table", "51820"],
+        )
+        .map_err(|err| SystemError::RollbackFailed(err.to_string()))
     }
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
         if let Some(previous) = self.firewall_table.take() {
-            Self::run_allow_failure("nft", &["delete", "table", "inet", previous.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "inet", previous.as_str()],
+            );
         }
         let table = self.ensure_failclosed_table()?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "chain",
@@ -627,8 +684,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -641,8 +698,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -656,8 +713,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -670,8 +727,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -685,8 +742,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -705,7 +762,10 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
         if let Some(table) = self.firewall_table.take() {
-            Self::run_allow_failure("nft", &["delete", "table", "inet", table.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "inet", table.as_str()],
+            );
         }
         Ok(())
     }
@@ -719,15 +779,21 @@ impl DataplaneSystem for LinuxCommandSystem {
             .map_err(|err| SystemError::NatApplyFailed(err.to_string()))?;
 
         if let Some(previous) = self.nat_table.take() {
-            Self::run_allow_failure("nft", &["delete", "table", "ip", previous.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", previous.as_str()],
+            );
         }
         let nat_table = self.nat_table_name();
-        if let Err(err) = Self::run("nft", &["add", "table", "ip", nat_table.as_str()]) {
+        if let Err(err) = self.run(
+            PrivilegedCommandProgram::Nft,
+            &["add", "table", "ip", nat_table.as_str()],
+        ) {
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
-        if let Err(err) = Self::run(
-            "nft",
+        if let Err(err) = self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "chain",
@@ -748,12 +814,15 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "}",
             ],
         ) {
-            Self::run_allow_failure("nft", &["delete", "table", "ip", nat_table.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", nat_table.as_str()],
+            );
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
-        if let Err(err) = Self::run(
-            "nft",
+        if let Err(err) = self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -765,7 +834,10 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "masquerade",
             ],
         ) {
-            Self::run_allow_failure("nft", &["delete", "table", "ip", nat_table.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", nat_table.as_str()],
+            );
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
@@ -783,8 +855,8 @@ impl DataplaneSystem for LinuxCommandSystem {
         // while acting as an exit node.
         if let Some((fw_table, egress_iface)) = egress_allow {
             let nat_name = self.nat_table.as_deref().unwrap_or("").to_string();
-            if let Err(err) = Self::run(
-                "nft",
+            if let Err(err) = self.run(
+                PrivilegedCommandProgram::Nft,
                 &[
                     "add",
                     "rule",
@@ -796,7 +868,10 @@ impl DataplaneSystem for LinuxCommandSystem {
                     "accept",
                 ],
             ) {
-                Self::run_allow_failure("nft", &["delete", "table", "ip", nat_name.as_str()]);
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "ip", nat_name.as_str()],
+                );
                 self.nat_table = None;
                 let _ = self.restore_ipv4_forwarding();
                 return Err(SystemError::NatApplyFailed(format!(
@@ -810,7 +885,10 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
         if let Some(table) = self.nat_table.take() {
-            Self::run_allow_failure("nft", &["delete", "table", "ip", table.as_str()]);
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", table.as_str()],
+            );
         }
         self.restore_ipv4_forwarding()
     }
@@ -820,8 +898,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             .firewall_table
             .clone()
             .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -838,8 +916,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -856,8 +934,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -871,8 +949,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        Self::run(
-            "nft",
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -913,14 +991,20 @@ impl DataplaneSystem for LinuxCommandSystem {
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("killswitch table missing".to_string())
         })?;
-        Self::run("nft", &["list", "table", "inet", table.as_str()])
-            .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))
+        self.run(
+            PrivilegedCommandProgram::Nft,
+            &["list", "table", "inet", table.as_str()],
+        )
+        .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))
     }
 
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         let table = self.ensure_failclosed_table()?;
-        Self::run(
-            "nft",
+        if self.has_fail_closed_drop_rule(table.as_str())? {
+            return Ok(());
+        }
+        self.run(
+            PrivilegedCommandProgram::Nft,
             &[
                 "add",
                 "rule",
@@ -929,6 +1013,8 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "killswitch",
                 "counter",
                 "drop",
+                "comment",
+                "rustynet_fail_closed_drop",
             ],
         )
         .map_err(|err| SystemError::BlockEgressFailed(err.to_string()))

@@ -7,4 +7,5 @@ pub mod key_material;
 pub mod perf;
 pub mod phase10;
 pub mod platform;
+pub mod privileged_helper;
 pub mod resilience;

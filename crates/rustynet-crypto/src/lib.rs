@@ -320,10 +320,24 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         fallback_passphrase: String,
         permission_policy: KeyCustodyPermissionPolicy,
     ) -> Self {
+        Self::new_zeroizing(
+            os_store,
+            fallback_directory,
+            Zeroizing::new(fallback_passphrase),
+            permission_policy,
+        )
+    }
+
+    pub fn new_zeroizing(
+        os_store: S,
+        fallback_directory: PathBuf,
+        fallback_passphrase: Zeroizing<String>,
+        permission_policy: KeyCustodyPermissionPolicy,
+    ) -> Self {
         Self {
             os_store,
             fallback_directory,
-            fallback_passphrase: Zeroizing::new(fallback_passphrase),
+            fallback_passphrase,
             permission_policy,
         }
     }
@@ -455,10 +469,10 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> 
         String::from_utf8(output.stdout).map_err(|_| CryptoError::OsStoreUnavailable)?;
     let decoded = {
         let trimmed = value.trim();
-        hex_decode(trimmed)?
+        hex_decode(trimmed)
     };
     value.zeroize();
-    Ok(decoded)
+    decoded
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,9 +677,13 @@ pub fn encrypt_private_key_fallback(
         .map_err(|_| CryptoError::KdfFailed)?;
 
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
-        .map_err(|_| CryptoError::EncryptionFailed)?;
+    let ciphertext = match cipher.encrypt(XNonce::from_slice(&nonce), plaintext) {
+        Ok(value) => value,
+        Err(_) => {
+            key.fill(0);
+            return Err(CryptoError::EncryptionFailed);
+        }
+    };
 
     key.fill(0);
 
@@ -686,9 +704,14 @@ pub fn decrypt_private_key_fallback(
         .map_err(|_| CryptoError::KdfFailed)?;
 
     let cipher = XChaCha20Poly1305::new((&key).into());
-    let plaintext = cipher
-        .decrypt(XNonce::from_slice(&blob.nonce), blob.ciphertext.as_ref())
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let plaintext = match cipher.decrypt(XNonce::from_slice(&blob.nonce), blob.ciphertext.as_ref())
+    {
+        Ok(value) => value,
+        Err(_) => {
+            key.fill(0);
+            return Err(CryptoError::DecryptionFailed);
+        }
+    };
 
     key.fill(0);
 

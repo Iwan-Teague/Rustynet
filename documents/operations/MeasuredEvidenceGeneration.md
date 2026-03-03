@@ -15,6 +15,7 @@ Generate required Phase 1 baseline environment variables from measured evidence:
 Supported measured sources (checked in order unless overridden):
 - `artifacts/perf/phase1/source/performance_samples.ndjson`
 - `artifacts/operations/source/performance_samples.ndjson`
+- `artifacts/operations/performance_budget_report.json`
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/operations/raw/performance_budget_report.json`
 

@@ -194,11 +194,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ResilienceError> {
 
     let temp_path = temp_path_for(path);
     let mut temp_file = create_restricted_file(&temp_path)?;
-    temp_file
-        .write_all(bytes)
-        .map_err(|_| ResilienceError::Io)?;
-    temp_file.sync_all().map_err(|_| ResilienceError::Io)?;
-    fs::rename(&temp_path, path).map_err(|_| ResilienceError::Io)?;
+    if temp_file.write_all(bytes).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ResilienceError::Io);
+    }
+    if temp_file.sync_all().is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ResilienceError::Io);
+    }
+    if fs::rename(&temp_path, path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(ResilienceError::Io);
+    }
 
     let parent_dir = File::open(parent).map_err(|_| ResilienceError::Io)?;
     parent_dir.sync_all().map_err(|_| ResilienceError::Io)?;

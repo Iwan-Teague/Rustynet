@@ -1178,11 +1178,18 @@ fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustS
     let mut temp = options
         .open(&temp_path)
         .map_err(|_| TrustStateError::PersistFailure)?;
-    temp.write_all(body)
-        .map_err(|_| TrustStateError::PersistFailure)?;
-    temp.sync_all()
-        .map_err(|_| TrustStateError::PersistFailure)?;
-    fs::rename(&temp_path, path).map_err(|_| TrustStateError::PersistFailure)?;
+    if temp.write_all(body).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustStateError::PersistFailure);
+    }
+    if temp.sync_all().is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustStateError::PersistFailure);
+    }
+    if fs::rename(&temp_path, path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustStateError::PersistFailure);
+    }
     if let Some(parent) = path.parent() {
         let parent_dir = fs::File::open(parent).map_err(|_| TrustStateError::PersistFailure)?;
         parent_dir

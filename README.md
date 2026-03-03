@@ -86,3 +86,5 @@ Generate them from measured evidence sources (fail-closed, no synthetic fallback
 ```
 
 `run_phase1_baseline.sh` will auto-run the collector when env vars are missing.
+If present, the collector can use `artifacts/operations/performance_budget_report.json`
+as measured Phase1 input source.

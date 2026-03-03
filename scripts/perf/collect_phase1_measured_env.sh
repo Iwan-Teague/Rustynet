@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 default_phase1_source="$ROOT_DIR/artifacts/perf/phase1/source/performance_samples.ndjson"
 default_phase9_source="$ROOT_DIR/artifacts/operations/source/performance_samples.ndjson"
+default_phase9_out_perf_report="$ROOT_DIR/artifacts/operations/performance_budget_report.json"
 default_phase10_perf_report="$ROOT_DIR/artifacts/phase10/perf_budget_report.json"
 default_phase9_perf_report="$ROOT_DIR/artifacts/operations/raw/performance_budget_report.json"
 
@@ -15,6 +16,8 @@ if [[ -z "$source_path" ]]; then
     source_path="$default_phase1_source"
   elif [[ -f "$default_phase9_source" ]]; then
     source_path="$default_phase9_source"
+  elif [[ -f "$default_phase9_out_perf_report" ]]; then
+    source_path="$default_phase9_out_perf_report"
   elif [[ -f "$default_phase10_perf_report" ]]; then
     source_path="$default_phase10_perf_report"
   elif [[ -f "$default_phase9_perf_report" ]]; then
@@ -27,6 +30,7 @@ if [[ -z "$source_path" ]]; then
   echo "set RUSTYNET_PHASE1_PERF_SAMPLES_PATH or provide one of:" >&2
   echo "  - $default_phase1_source" >&2
   echo "  - $default_phase9_source" >&2
+  echo "  - $default_phase9_out_perf_report" >&2
   echo "  - $default_phase10_perf_report" >&2
   echo "  - $default_phase9_perf_report" >&2
   exit 1

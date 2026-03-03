@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,11 @@ use crate::phase10::{
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
+use crate::privileged_helper::{
+    DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH as HELPER_DEFAULT_SOCKET_PATH,
+    DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS, PrivilegedCommandClient,
+    PrivilegedCommandProgram,
+};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
@@ -70,14 +75,16 @@ pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
 pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
-pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key.enc";
-pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/etc/rustynet/wireguard.passphrase";
-pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/etc/rustynet/wireguard.pub";
+pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
+pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
+pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub";
 pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
+pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
+pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -168,6 +175,8 @@ pub struct DaemonConfig {
     pub wg_public_key_path: Option<PathBuf>,
     pub egress_interface: String,
     pub dataplane_mode: DaemonDataplaneMode,
+    pub privileged_helper_socket_path: Option<PathBuf>,
+    pub privileged_helper_timeout_ms: u64,
     pub reconcile_interval_ms: u64,
     pub max_reconcile_failures: u32,
     pub fail_closed_ssh_allow: bool,
@@ -205,6 +214,8 @@ impl Default for DaemonConfig {
             wg_public_key_path: Some(PathBuf::from(DEFAULT_WG_PUBLIC_KEY_PATH)),
             egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
             dataplane_mode: DaemonDataplaneMode::default(),
+            privileged_helper_socket_path: Some(PathBuf::from(DEFAULT_TRUSTED_HELPER_SOCKET_PATH)),
+            privileged_helper_timeout_ms: DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
             reconcile_interval_ms: DEFAULT_RECONCILE_INTERVAL_MS,
             max_reconcile_failures: DEFAULT_MAX_RECONCILE_FAILURES,
             fail_closed_ssh_allow: DEFAULT_FAIL_CLOSED_SSH_ALLOW,
@@ -547,6 +558,7 @@ struct DaemonRuntime {
     wg_encrypted_private_key_path: Option<PathBuf>,
     wg_key_passphrase_path: Option<PathBuf>,
     wg_public_key_path: Option<PathBuf>,
+    privileged_helper_client: Option<PrivilegedCommandClient>,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
@@ -603,6 +615,17 @@ impl DaemonRuntime {
             policy.clone(),
             trust_policy,
         );
+        let privileged_helper_client = config
+            .privileged_helper_socket_path
+            .as_ref()
+            .map(|path| {
+                PrivilegedCommandClient::new(
+                    path.clone(),
+                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                )
+            })
+            .transpose()
+            .map_err(DaemonError::InvalidConfig)?;
         Ok(Self {
             controller,
             policy,
@@ -614,6 +637,7 @@ impl DaemonRuntime {
             wg_encrypted_private_key_path: config.wg_encrypted_private_key_path.clone(),
             wg_key_passphrase_path: config.wg_key_passphrase_path.clone(),
             wg_public_key_path: config.wg_public_key_path.clone(),
+            privileged_helper_client,
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
@@ -1141,6 +1165,48 @@ impl DaemonRuntime {
         }
     }
 
+    fn apply_interface_private_key_runtime(&self, runtime_key_path: &Path) -> Result<(), String> {
+        if let Some(client) = self.privileged_helper_client.as_ref() {
+            let runtime_path = runtime_key_path
+                .to_str()
+                .ok_or_else(|| "runtime key path must be valid utf-8".to_string())?;
+            let output = client.run_capture(
+                PrivilegedCommandProgram::Wg,
+                &[
+                    "set",
+                    self.wg_interface.as_str(),
+                    "private-key",
+                    runtime_path,
+                ],
+            )?;
+            if output.success() {
+                return Ok(());
+            }
+            return Err(format!(
+                "wg set private-key failed for {}: status={} stderr={}",
+                self.wg_interface, output.status, output.stderr
+            ));
+        }
+        apply_interface_private_key(&self.wg_interface, runtime_key_path)
+    }
+
+    fn set_interface_down_runtime(&self) -> Result<(), String> {
+        if let Some(client) = self.privileged_helper_client.as_ref() {
+            let output = client.run_capture(
+                PrivilegedCommandProgram::Ip,
+                &["link", "set", "down", "dev", self.wg_interface.as_str()],
+            )?;
+            if output.success() {
+                return Ok(());
+            }
+            return Err(format!(
+                "ip link set down failed for {}: status={} stderr={}",
+                self.wg_interface, output.status, output.stderr
+            ));
+        }
+        set_interface_down(&self.wg_interface)
+    }
+
     fn rotate_local_key_material(&mut self) -> Result<String, String> {
         if !matches!(self.backend_mode, DaemonBackendMode::LinuxWireguard) {
             return Err("key rotation is only supported for linux-wireguard backend".to_string());
@@ -1186,7 +1252,7 @@ impl DaemonRuntime {
                 }
             }
 
-            if let Err(err) = apply_interface_private_key(&self.wg_interface, &runtime_path) {
+            if let Err(err) = self.apply_interface_private_key_runtime(&runtime_path) {
                 let _ = self.restore_key_backups(
                     old_runtime.as_deref(),
                     old_encrypted.as_deref(),
@@ -1227,7 +1293,7 @@ impl DaemonRuntime {
     ) -> Result<(), String> {
         if let (Some(path), Some(bytes)) = (self.wg_private_key_path.as_ref(), old_runtime) {
             write_runtime_private_key(path, bytes)?;
-            let _ = apply_interface_private_key(&self.wg_interface, path);
+            let _ = self.apply_interface_private_key_runtime(path);
         }
         if let (Some(path), Some(bytes)) =
             (self.wg_encrypted_private_key_path.as_ref(), old_encrypted)
@@ -1248,7 +1314,7 @@ impl DaemonRuntime {
         let _ = self.controller.force_fail_closed("local_key_revoked");
 
         let mut failures = Vec::new();
-        if let Err(err) = set_interface_down(&self.wg_interface) {
+        if let Err(err) = self.set_interface_down_runtime() {
             failures.push(format!("interface down failed: {err}"));
         }
         if let Some(path) = self.wg_private_key_path.as_ref() {
@@ -1543,10 +1609,22 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             DaemonDataplaneMode::Shell => LinuxDataplaneMode::Shell,
             DaemonDataplaneMode::HybridNative => LinuxDataplaneMode::HybridNative,
         };
+        let helper_client = config
+            .privileged_helper_socket_path
+            .as_ref()
+            .map(|path| {
+                PrivilegedCommandClient::new(
+                    path.clone(),
+                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                )
+            })
+            .transpose()
+            .map_err(DaemonError::InvalidConfig)?;
         let system = LinuxCommandSystem::new(
             config.wg_interface.clone(),
             config.egress_interface.clone(),
             mode,
+            helper_client,
             config.fail_closed_ssh_allow,
             config.fail_closed_ssh_allow_cidrs.clone(),
         )
@@ -1582,16 +1660,43 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     }
     validate_daemon_config(&config)?;
     prepare_runtime_wireguard_key(&config)?;
-    run_preflight_checks(&config)?;
+    if let Err(err) = run_preflight_checks(&config) {
+        let _ = scrub_runtime_wireguard_key_after_bootstrap(&config);
+        return Err(err);
+    }
 
-    let mut runtime = DaemonRuntime::new(&config)?;
+    let mut runtime = match DaemonRuntime::new(&config) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = scrub_runtime_wireguard_key_after_bootstrap(&config);
+            return Err(err);
+        }
+    };
     runtime.bootstrap();
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
 
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|err| DaemonError::Io(err.to_string()))?;
+        match fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                let metadata = fs::metadata(parent).map_err(|meta_err| {
+                    DaemonError::Io(format!(
+                        "inspect socket parent after chmod denial failed: {meta_err}"
+                    ))
+                })?;
+                let mode = metadata.permissions().mode() & 0o777;
+                let owner_uid = metadata.uid();
+                let expected_uid = Uid::effective().as_raw();
+                let root_managed_shared_runtime = owner_uid == 0 && mode == 0o770;
+                if !root_managed_shared_runtime || owner_uid == expected_uid {
+                    return Err(DaemonError::Io(err.to_string()));
+                }
+            }
+            Err(err) => {
+                return Err(DaemonError::Io(err.to_string()));
+            }
+        }
     }
 
     if config.socket_path.exists() {
@@ -1616,6 +1721,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         let mut processed_command = false;
         match listener.accept() {
             Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .map_err(|err| DaemonError::Io(format!("socket read-timeout failed: {err}")))?;
                 let command = read_command(&stream).map_err(DaemonError::Io)?;
                 let parsed = parse_command(&command);
 
@@ -1709,9 +1817,14 @@ fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonErro
 
     let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
         .map_err(|err| DaemonError::InvalidConfig(format!("wg key decrypt failed: {err}")))?;
-    write_runtime_private_key(runtime_path, &decrypted)
-        .map_err(|err| DaemonError::InvalidConfig(format!("wg runtime key write failed: {err}")))?;
+    let write_result = write_runtime_private_key(runtime_path, &decrypted);
     decrypted.fill(0);
+    if let Err(err) = write_result {
+        let _ = remove_file_if_present(runtime_path);
+        return Err(DaemonError::InvalidConfig(format!(
+            "wg runtime key write failed: {err}"
+        )));
+    }
     Ok(())
 }
 
@@ -1734,6 +1847,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         return Err(DaemonError::InvalidConfig(
             "state path must be absolute".to_string(),
         ));
+    }
+    if let Some(path) = config.privileged_helper_socket_path.as_ref() {
+        if !path.is_absolute() {
+            return Err(DaemonError::InvalidConfig(
+                "privileged helper socket path must be absolute".to_string(),
+            ));
+        }
     }
     if !config.trust_evidence_path.is_absolute() {
         return Err(DaemonError::InvalidConfig(
@@ -1900,6 +2020,11 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "max reconcile failures must be greater than 0".to_string(),
         ));
     }
+    if config.privileged_helper_timeout_ms == 0 {
+        return Err(DaemonError::InvalidConfig(
+            "privileged helper timeout must be greater than 0".to_string(),
+        ));
+    }
     if config.fail_closed_ssh_allow {
         if config.fail_closed_ssh_allow_cidrs.is_empty() {
             return Err(DaemonError::InvalidConfig(
@@ -1915,6 +2040,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
                 "fail-closed ssh allow cidrs must be valid ipv4/ipv6 cidr values".to_string(),
             ));
         }
+    }
+    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
+        && config.privileged_helper_socket_path.is_none()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "privileged helper socket path is required for linux-wireguard backend".to_string(),
+        ));
     }
 
     Ok(())
@@ -2075,42 +2207,42 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
 #[cfg(target_os = "linux")]
 fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "wireguard private key", 0o077)
+    validate_file_security(path, "wireguard private key", 0o077, false)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "wireguard private key", 0o077)
+    validate_file_security(path, "wireguard private key", 0o077, false)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "wireguard public key", 0o022)
+    validate_file_security(path, "wireguard public key", 0o022, false)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_public_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "wireguard public key", 0o022)
+    validate_file_security(path, "wireguard public key", 0o022, false)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_membership_snapshot_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "membership snapshot", 0o077)
+    validate_file_security(path, "membership snapshot", 0o037, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_membership_snapshot_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "membership snapshot", 0o077)
+    validate_file_security(path, "membership snapshot", 0o037, true)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "membership log", 0o077)
+    validate_file_security(path, "membership log", 0o037, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "membership log", 0o077)
+    validate_file_security(path, "membership log", 0o037, true)
 }
 
 fn load_trust_evidence(
@@ -2373,6 +2505,12 @@ fn persist_trust_watermark(
 ) -> Result<(), TrustBootstrapError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        }
     }
     let payload = format!(
         "version=1\nupdated_at_unix={}\nnonce={}\n",
@@ -2396,11 +2534,25 @@ fn persist_trust_watermark(
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
-    temp.write_all(payload.as_bytes())
-        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
-    temp.sync_all()
-        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
-    fs::rename(&temp_path, path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TrustBootstrapError::Io(err.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2445,6 +2597,12 @@ fn persist_membership_watermark(
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| err.to_string())?;
+        }
     }
     let payload = format!(
         "version=1\nepoch={}\nstate_root={}\n",
@@ -2466,10 +2624,22 @@ fn persist_membership_watermark(
         options.mode(0o600);
     }
     let mut temp = options.open(&temp_path).map_err(|err| err.to_string())?;
-    temp.write_all(payload.as_bytes())
-        .map_err(|err| err.to_string())?;
-    temp.sync_all().map_err(|err| err.to_string())?;
-    fs::rename(&temp_path, path).map_err(|err| err.to_string())?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    if let Some(parent) = path.parent() {
+        let parent_dir = fs::File::open(parent).map_err(|err| err.to_string())?;
+        parent_dir.sync_all().map_err(|err| err.to_string())?;
+    }
     Ok(())
 }
 
@@ -2834,6 +3004,12 @@ fn persist_auto_tunnel_watermark(
 ) -> Result<(), AutoTunnelBootstrapError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+        }
     }
     let payload = format!(
         "version=1\ngenerated_at_unix={}\nnonce={}\n",
@@ -2857,11 +3033,25 @@ fn persist_auto_tunnel_watermark(
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
-    temp.write_all(payload.as_bytes())
-        .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
-    temp.sync_all()
-        .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
-    fs::rename(&temp_path, path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(AutoTunnelBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(AutoTunnelBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(AutoTunnelBootstrapError::Io(err.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2884,48 +3074,49 @@ fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "trust evidence", 0o022)
+    validate_file_security(path, "trust evidence", 0o022, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_trust_evidence_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "trust evidence", 0o022)
+    validate_file_security(path, "trust evidence", 0o022, true)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_auto_tunnel_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "auto tunnel bundle", 0o077)
+    validate_file_security(path, "auto tunnel bundle", 0o037, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_auto_tunnel_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "auto tunnel bundle", 0o077)
+    validate_file_security(path, "auto tunnel bundle", 0o037, true)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "auto tunnel verifier key", 0o022)
+    validate_file_security(path, "auto tunnel verifier key", 0o022, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "auto tunnel verifier key", 0o022)
+    validate_file_security(path, "auto tunnel verifier key", 0o022, true)
 }
 
 #[cfg(target_os = "linux")]
 fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "trust verifier key", 0o022)
+    validate_file_security(path, "trust verifier key", 0o022, true)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
-    validate_file_security(path, "trust verifier key", 0o022)
+    validate_file_security(path, "trust verifier key", 0o022, true)
 }
 
 fn validate_file_security(
     path: &Path,
     label: &str,
     disallowed_mode_mask: u32,
+    allow_root_owner: bool,
 ) -> Result<(), DaemonError> {
     let link_metadata = fs::symlink_metadata(path).map_err(|err| {
         DaemonError::InvalidConfig(format!("{label} metadata read failed: {err}"))
@@ -2954,20 +3145,33 @@ fn validate_file_security(
 
     let owner_uid = metadata.uid();
     let expected_uid = Uid::effective().as_raw();
-    if owner_uid != expected_uid {
+    if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
         return Err(DaemonError::InvalidConfig(format!(
             "{label} owner uid mismatch: expected {expected_uid}, got {owner_uid}"
         )));
     }
+    fs::File::open(path).map_err(|err| {
+        DaemonError::InvalidConfig(format!(
+            "{label} is not readable by runtime user (uid {expected_uid}): {err}"
+        ))
+    })?;
     Ok(())
 }
 
 fn read_command(stream: &UnixStream) -> Result<String, String> {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    let reader = BufReader::new(stream);
+    let mut limited = reader.take(4097);
+    let mut bytes = Vec::new();
+    limited
+        .read_until(b'\n', &mut bytes)
         .map_err(|err| format!("read failed: {err}"))?;
+    if bytes.len() > 4096 {
+        return Err("command too long".to_string());
+    }
+    if bytes.iter().any(|byte| *byte == b'\0') {
+        return Err("command contains null byte".to_string());
+    }
+    let line = String::from_utf8(bytes).map_err(|_| "command is not valid utf-8".to_string())?;
     Ok(line.trim().to_string())
 }
 

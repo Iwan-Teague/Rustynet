@@ -1,0 +1,45 @@
+[Unit]
+Description=Rustynet Privileged Helper
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target
+Wants=network-online.target
+Before=rustynetd.service
+PartOf=rustynetd.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_PRIVILEGED_HELPER_SOCKET=/run/rustynet/rustynetd-privileged.sock
+Environment=RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID=0
+Environment=RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID=0
+Environment=RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS=2000
+ExecStart=/usr/local/bin/rustynetd privileged-helper --socket ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} --allowed-uid ${RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID} --allowed-gid ${RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID} --timeout-ms ${RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS}
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=rustynet
+RuntimeDirectoryMode=0770
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE
+ReadWritePaths=-/run/rustynet
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

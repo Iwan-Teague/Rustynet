@@ -1227,11 +1227,18 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipErr
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| MembershipError::Io(err.to_string()))?;
-    temp.write_all(body)
-        .map_err(|err| MembershipError::Io(err.to_string()))?;
-    temp.sync_all()
-        .map_err(|err| MembershipError::Io(err.to_string()))?;
-    fs::rename(&temp_path, path).map_err(|err| MembershipError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(body) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(MembershipError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(MembershipError::Io(err.to_string()));
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(MembershipError::Io(err.to_string()));
+    }
     if let Some(parent) = path.parent() {
         let parent_dir =
             fs::File::open(parent).map_err(|err| MembershipError::Io(err.to_string()))?;
