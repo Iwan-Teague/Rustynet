@@ -199,17 +199,20 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
 
     fn configure_interface(&mut self, context: &RuntimeContext) -> Result<(), BackendError> {
         Self::ensure_cidr(&context.mesh_cidr)?;
-        self.runner.run(
-            "ip",
-            &[
-                "link".to_string(),
-                "add".to_string(),
-                "dev".to_string(),
-                self.interface_name.clone(),
-                "type".to_string(),
-                "wireguard".to_string(),
-            ],
-        )?;
+        let add_args = [
+            "link".to_string(),
+            "add".to_string(),
+            "dev".to_string(),
+            self.interface_name.clone(),
+            "type".to_string(),
+            "wireguard".to_string(),
+        ];
+        if self.runner.run("ip", &add_args).is_err() {
+            // Recover from stale runtime state (e.g. prior crash left interface behind)
+            // by removing any existing interface and retrying once.
+            let _ = self.remove_interface();
+            self.runner.run("ip", &add_args)?;
+        }
         if let Err(err) = self.runner.run(
             "wg",
             &[
