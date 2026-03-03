@@ -394,7 +394,19 @@ run_root() {
   if [[ "${EUID}" -eq 0 ]]; then
     "$@"
   else
-    sudo "$@"
+    if [[ -t 0 && -t 1 ]]; then
+      sudo "$@"
+      return
+    fi
+
+    if sudo -n true >/dev/null 2>&1; then
+      sudo -n "$@"
+      return
+    fi
+
+    print_err "A TTY sudo prompt is unavailable and cached sudo credentials were not found."
+    print_info "Run 'sudo -v' in an interactive shell, then rerun this action."
+    return 1
   fi
 }
 
