@@ -582,6 +582,7 @@ detect_default_egress() {
 
 package_manager() {
   if is_macos_host; then
+    add_macos_homebrew_to_path
     if command -v brew >/dev/null 2>&1; then
       echo brew
     else
@@ -606,6 +607,92 @@ package_manager() {
     return
   fi
   echo unknown
+}
+
+add_macos_homebrew_to_path() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
+    return 0
+  fi
+  if [[ -x /usr/local/bin/brew ]]; then
+    export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
+    return 0
+  fi
+}
+
+ensure_macos_command_line_tools() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  if xcode-select -p >/dev/null 2>&1; then
+    return 0
+  fi
+
+  print_warn "Xcode Command Line Tools are required on macOS and are not installed."
+  if ! prompt_yes_no "Install Command Line Tools now (softwareupdate)?" "y"; then
+    print_err "Cannot continue without Xcode Command Line Tools."
+    exit 1
+  fi
+
+  if ! command -v softwareupdate >/dev/null 2>&1; then
+    print_err "softwareupdate is unavailable; cannot automate Command Line Tools install."
+    print_info "Run 'xcode-select --install' and rerun ./start.sh."
+    exit 1
+  fi
+
+  local clt_label=""
+  clt_label="$(softwareupdate --list 2>/dev/null | sed -n 's/^\\* Label: //p' | grep '^Command Line Tools for Xcode' | tail -n 1)"
+  if [[ -z "${clt_label}" ]]; then
+    print_err "No Command Line Tools update label detected via softwareupdate."
+    print_info "Install with 'xcode-select --install' and rerun ./start.sh."
+    exit 1
+  fi
+
+  print_info "Installing '${clt_label}' (this may take several minutes)."
+  run_root softwareupdate --install "${clt_label}" --verbose
+  if ! xcode-select -p >/dev/null 2>&1; then
+    print_err "Command Line Tools installation did not complete successfully."
+    exit 1
+  fi
+}
+
+ensure_macos_homebrew() {
+  if ! is_macos_host; then
+    return 0
+  fi
+
+  add_macos_homebrew_to_path
+  if command -v brew >/dev/null 2>&1; then
+    return 0
+  fi
+
+  print_warn "Homebrew is required on macOS for automated dependency installs and is not installed."
+  if ! prompt_yes_no "Install Homebrew now (official installer)?" "y"; then
+    print_err "Cannot continue without Homebrew on macOS."
+    print_info "Install Homebrew from https://brew.sh and rerun ./start.sh."
+    exit 1
+  fi
+
+  if [[ ! -x /bin/bash ]]; then
+    print_err "Cannot find /bin/bash required for Homebrew installer."
+    exit 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    print_err "curl is required for Homebrew installer."
+    exit 1
+  fi
+
+  print_info "Installing Homebrew via official installer."
+  NONINTERACTIVE=1 /bin/bash -c "$(curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  add_macos_homebrew_to_path
+  if ! command -v brew >/dev/null 2>&1; then
+    print_err "Homebrew install finished but brew is still not in PATH."
+    print_info "Open a new shell and rerun ./start.sh."
+    exit 1
+  fi
 }
 
 map_package() {
@@ -829,6 +916,11 @@ ensure_rust_toolchain() {
 }
 
 install_runtime_dependencies() {
+  if is_macos_host; then
+    ensure_macos_command_line_tools
+    ensure_macos_homebrew
+  fi
+
   local required=(openssl xxd curl awk sed grep rg)
   if is_linux_host; then
     required+=(wg ip nft systemctl)
@@ -853,11 +945,6 @@ install_runtime_dependencies() {
 
   local pm
   pm="$(package_manager)"
-  if is_macos_host && [[ "${pm}" != "brew" ]]; then
-    print_err "Homebrew is required on macOS for automated dependency installs."
-    print_info "Install Homebrew from https://brew.sh and rerun ./start.sh."
-    exit 1
-  fi
   if [[ "${pm}" == "unknown" ]]; then
     print_err "No supported package manager found. Install manually: ${missing[*]}"
     exit 1
@@ -2294,6 +2381,7 @@ EOF
 
 parse_start_arguments "$@"
 apply_host_profile_defaults
+add_macos_homebrew_to_path
 load_config_file
 enforce_host_storage_policy
 sanitize_launch_defaults
