@@ -918,7 +918,7 @@ ensure_rust_toolchain() {
 install_runtime_dependencies() {
   if is_macos_host; then
     ensure_macos_command_line_tools
-    ensure_macos_homebrew
+    add_macos_homebrew_to_path
   fi
 
   local required=(openssl xxd curl awk sed grep rg)
@@ -945,6 +945,37 @@ install_runtime_dependencies() {
 
   local pm
   pm="$(package_manager)"
+  if is_macos_host && [[ "${pm}" == "unknown" ]]; then
+    local only_rg_missing=1
+    for cmd in "${missing[@]}"; do
+      if [[ "${cmd}" != "rg" ]]; then
+        only_rg_missing=0
+        break
+      fi
+    done
+
+    if [[ "${only_rg_missing}" == "1" ]]; then
+      print_warn "Homebrew is unavailable; falling back to cargo install for ripgrep."
+      if ! command -v cargo >/dev/null 2>&1 || ! check_rust_min_version; then
+        ensure_rust_toolchain
+      fi
+      if ! command -v cargo >/dev/null 2>&1; then
+        print_err "cargo is required for ripgrep fallback installation."
+        exit 1
+      fi
+      cargo install --locked ripgrep
+      export PATH="${HOME}/.cargo/bin:${PATH}"
+      if command -v rg >/dev/null 2>&1; then
+        print_info "ripgrep installed via cargo fallback."
+        return
+      fi
+      print_err "ripgrep fallback install did not produce an 'rg' binary in PATH."
+      exit 1
+    fi
+
+    ensure_macos_homebrew
+    pm="$(package_manager)"
+  fi
   if [[ "${pm}" == "unknown" ]]; then
     print_err "No supported package manager found. Install manually: ${missing[*]}"
     exit 1
@@ -1119,7 +1150,7 @@ doctor_preflight() {
     if command -v brew >/dev/null 2>&1; then
       doctor_ok "homebrew present for macOS dependency management"
     else
-      doctor_fail "homebrew missing; install from https://brew.sh"
+      doctor_warn "homebrew missing; limited fallback path is used when only ripgrep is absent"
     fi
     if path_in_linux_runtime_roots "${SOCKET_PATH}" \
       || path_in_linux_runtime_roots "${STATE_PATH}" \
