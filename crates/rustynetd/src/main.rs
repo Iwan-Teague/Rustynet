@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 use rustynetd::daemon::{
-    DEFAULT_EGRESS_INTERFACE, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
-    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID,
-    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
-    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
+    DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES,
+    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
+    DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_RECONCILE_INTERVAL_MS,
+    DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH,
+    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
     DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
     DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
     DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
@@ -432,6 +433,33 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .map_err(|err| format!("invalid max reconcile failures: {err}"))?;
                 index += 2;
             }
+            Some("--fail-closed-ssh-allow") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--fail-closed-ssh-allow requires a value".to_string())?;
+                config.fail_closed_ssh_allow = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(
+                            "invalid fail-closed-ssh-allow value: expected true/false".to_string()
+                        );
+                    }
+                };
+                index += 2;
+            }
+            Some("--fail-closed-ssh-allow-cidrs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--fail-closed-ssh-allow-cidrs requires a value".to_string())?;
+                config.fail_closed_ssh_allow_cidrs = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                index += 2;
+            }
             Some(flag) => {
                 return Err(format!("unknown daemon argument: {flag}"));
             }
@@ -607,7 +635,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--node-id <id>] [--network-id <id>] [--force]",
@@ -637,6 +665,8 @@ fn help_text() -> String {
         ),
         &format!("  reconcile_interval_ms={DEFAULT_RECONCILE_INTERVAL_MS}"),
         &format!("  max_reconcile_failures={DEFAULT_MAX_RECONCILE_FAILURES}"),
+        &format!("  fail_closed_ssh_allow={DEFAULT_FAIL_CLOSED_SSH_ALLOW}"),
+        "  fail_closed_ssh_allow_cidrs=<empty>",
     ]
     .join("\n")
 }

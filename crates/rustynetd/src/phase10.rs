@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 
@@ -295,6 +296,8 @@ pub struct LinuxCommandSystem {
     egress_interface: String,
     mode: LinuxDataplaneMode,
     generation: u64,
+    fail_closed_ssh_allow: bool,
+    fail_closed_ssh_allow_cidrs: Vec<String>,
     firewall_table: Option<String>,
     nat_table: Option<String>,
     prior_ipv4_forwarding: Option<bool>,
@@ -312,6 +315,8 @@ impl LinuxCommandSystem {
         interface_name: impl Into<String>,
         egress_interface: impl Into<String>,
         mode: LinuxDataplaneMode,
+        fail_closed_ssh_allow: bool,
+        fail_closed_ssh_allow_cidrs: Vec<String>,
     ) -> Result<Self, SystemError> {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
@@ -319,12 +324,20 @@ impl LinuxCommandSystem {
             .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
         validate_net_device_name(&egress_interface)
             .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        if fail_closed_ssh_allow && fail_closed_ssh_allow_cidrs.is_empty() {
+            return Err(SystemError::PrerequisiteCheckFailed(
+                "fail-closed ssh allow is enabled but no management cidrs were provided"
+                    .to_string(),
+            ));
+        }
 
         Ok(Self {
             interface_name,
             egress_interface,
             mode,
             generation: 0,
+            fail_closed_ssh_allow,
+            fail_closed_ssh_allow_cidrs,
             firewall_table: None,
             nat_table: None,
             prior_ipv4_forwarding: None,
@@ -347,6 +360,51 @@ impl LinuxCommandSystem {
 
     fn run_allow_failure(program: &str, args: &[&str]) {
         let _ = Command::new(program).args(args).status();
+    }
+
+    fn nft_family_for_cidr(cidr: &str) -> Option<&'static str> {
+        let (base, prefix) = cidr.split_once('/')?;
+        if prefix.parse::<u8>().is_err() {
+            return None;
+        }
+        match base.parse::<IpAddr>().ok()? {
+            IpAddr::V4(_) => Some("ip"),
+            IpAddr::V6(_) => Some("ip6"),
+        }
+    }
+
+    fn apply_fail_closed_management_allow_rules(&self, table: &str) -> Result<(), SystemError> {
+        if !self.fail_closed_ssh_allow {
+            return Ok(());
+        }
+        for cidr in &self.fail_closed_ssh_allow_cidrs {
+            let family = Self::nft_family_for_cidr(cidr).ok_or_else(|| {
+                SystemError::FirewallApplyFailed(format!("invalid management cidr: {cidr}"))
+            })?;
+            Self::run(
+                "nft",
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    table,
+                    "killswitch",
+                    family,
+                    "daddr",
+                    cidr.as_str(),
+                    "tcp",
+                    "sport",
+                    "22",
+                    "accept",
+                ],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "management ssh fail-closed allow rule failed for {cidr}: {err}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
@@ -431,6 +489,7 @@ impl LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.apply_fail_closed_management_allow_rules(table.as_str())?;
         self.firewall_table = Some(table.clone());
         Ok(table)
     }

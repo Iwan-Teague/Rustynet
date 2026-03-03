@@ -29,6 +29,8 @@ BACKEND_MODE="linux-wireguard"
 DATAPLANE_MODE="hybrid-native"
 RECONCILE_INTERVAL_MS="1000"
 MAX_RECONCILE_FAILURES="5"
+FAIL_CLOSED_SSH_ALLOW="0"
+FAIL_CLOSED_SSH_ALLOW_CIDRS=""
 TRUST_SIGNER_KEY_PATH="/etc/rustynet/trust-evidence.key"
 AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
@@ -234,7 +236,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -335,6 +337,19 @@ enforce_auto_tunnel_policy() {
     print_warn "Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
   fi
   AUTO_TUNNEL_ENFORCE="1"
+}
+
+enforce_fail_closed_ssh_policy() {
+  if [[ "${FAIL_CLOSED_SSH_ALLOW}" != "1" ]]; then
+    FAIL_CLOSED_SSH_ALLOW="0"
+    FAIL_CLOSED_SSH_ALLOW_CIDRS=""
+    return
+  fi
+
+  if [[ -z "${FAIL_CLOSED_SSH_ALLOW_CIDRS// }" ]]; then
+    print_err "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1."
+    exit 1
+  fi
 }
 
 manual_peer_override_enabled() {
@@ -536,6 +551,8 @@ save_config() {
     printf 'DATAPLANE_MODE=%s\n' "${DATAPLANE_MODE}"
     printf 'RECONCILE_INTERVAL_MS=%s\n' "${RECONCILE_INTERVAL_MS}"
     printf 'MAX_RECONCILE_FAILURES=%s\n' "${MAX_RECONCILE_FAILURES}"
+    printf 'FAIL_CLOSED_SSH_ALLOW=%s\n' "${FAIL_CLOSED_SSH_ALLOW}"
+    printf 'FAIL_CLOSED_SSH_ALLOW_CIDRS=%s\n' "${FAIL_CLOSED_SSH_ALLOW_CIDRS}"
     printf 'TRUST_SIGNER_KEY_PATH=%s\n' "${TRUST_SIGNER_KEY_PATH}"
     printf 'AUTO_REFRESH_TRUST=%s\n' "${AUTO_REFRESH_TRUST}"
     printf 'DEVICE_NODE_ID=%s\n' "${DEVICE_NODE_ID}"
@@ -1248,6 +1265,7 @@ write_daemon_environment() {
   enforce_role_policy_defaults
   enforce_backend_mode
   enforce_auto_tunnel_policy
+  enforce_fail_closed_ssh_policy
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
@@ -1276,6 +1294,8 @@ write_daemon_environment() {
     RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
     RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
     RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
+    RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
+    RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
     "${service_installer}"
 }
 
@@ -1767,6 +1787,14 @@ configure_values() {
   prompt_default DATAPLANE_MODE "Dataplane mode (shell|hybrid-native)" "${DATAPLANE_MODE}"
   prompt_default RECONCILE_INTERVAL_MS "Reconcile interval (ms)" "${RECONCILE_INTERVAL_MS}"
   prompt_default MAX_RECONCILE_FAILURES "Max reconcile failures" "${MAX_RECONCILE_FAILURES}"
+  prompt_default FAIL_CLOSED_SSH_ALLOW "Allow SSH management during fail-closed mode (0/1)" "${FAIL_CLOSED_SSH_ALLOW}"
+  if [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]]; then
+    prompt_default FAIL_CLOSED_SSH_ALLOW_CIDRS "Fail-closed SSH allow CIDRs (comma-separated)" "${FAIL_CLOSED_SSH_ALLOW_CIDRS}"
+  else
+    FAIL_CLOSED_SSH_ALLOW="0"
+    FAIL_CLOSED_SSH_ALLOW_CIDRS=""
+  fi
+  enforce_fail_closed_ssh_policy
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
 
   if is_linux_host && is_admin_role; then
@@ -1838,6 +1866,8 @@ Current Rustynet Wizard Configuration
   dataplane_mode          : ${DATAPLANE_MODE}
   reconcile_interval_ms   : ${RECONCILE_INTERVAL_MS}
   max_reconcile_failures  : ${MAX_RECONCILE_FAILURES}
+  fail_closed_ssh_allow   : ${FAIL_CLOSED_SSH_ALLOW}
+  fail_closed_ssh_cidrs   : ${FAIL_CLOSED_SSH_ALLOW_CIDRS}
   trust_signer_key        : ${TRUST_SIGNER_KEY_PATH}
   auto_refresh_trust      : ${AUTO_REFRESH_TRUST}
   manual_peer_override    : ${MANUAL_PEER_OVERRIDE}

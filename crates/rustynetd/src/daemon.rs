@@ -77,6 +77,7 @@ pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
+pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -169,6 +170,8 @@ pub struct DaemonConfig {
     pub dataplane_mode: DaemonDataplaneMode,
     pub reconcile_interval_ms: u64,
     pub max_reconcile_failures: u32,
+    pub fail_closed_ssh_allow: bool,
+    pub fail_closed_ssh_allow_cidrs: Vec<String>,
     pub max_requests: Option<usize>,
 }
 
@@ -204,6 +207,8 @@ impl Default for DaemonConfig {
             dataplane_mode: DaemonDataplaneMode::default(),
             reconcile_interval_ms: DEFAULT_RECONCILE_INTERVAL_MS,
             max_reconcile_failures: DEFAULT_MAX_RECONCILE_FAILURES,
+            fail_closed_ssh_allow: DEFAULT_FAIL_CLOSED_SSH_ALLOW,
+            fail_closed_ssh_allow_cidrs: Vec::new(),
             max_requests: None,
         }
     }
@@ -1542,6 +1547,8 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             config.wg_interface.clone(),
             config.egress_interface.clone(),
             mode,
+            config.fail_closed_ssh_allow,
+            config.fail_closed_ssh_allow_cidrs.clone(),
         )
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Linux(system))
@@ -1892,6 +1899,22 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         return Err(DaemonError::InvalidConfig(
             "max reconcile failures must be greater than 0".to_string(),
         ));
+    }
+    if config.fail_closed_ssh_allow {
+        if config.fail_closed_ssh_allow_cidrs.is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "fail-closed ssh allow requires at least one management cidr".to_string(),
+            ));
+        }
+        if config
+            .fail_closed_ssh_allow_cidrs
+            .iter()
+            .any(|cidr| !is_valid_ipv4_or_ipv6_cidr(cidr))
+        {
+            return Err(DaemonError::InvalidConfig(
+                "fail-closed ssh allow cidrs must be valid ipv4/ipv6 cidr values".to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -3022,7 +3045,7 @@ mod tests {
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
         TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
         persist_trust_watermark, run_daemon, trust_evidence_payload, unix_now,
-        zeroize_optional_bytes,
+        validate_daemon_config, zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -3182,6 +3205,30 @@ mod tests {
         };
         let err = run_daemon(config).expect_err("in-memory backend must be rejected");
         assert!(err.to_string().contains("in-memory backend is disabled"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_fail_closed_ssh_allow_without_cidrs() {
+        let config = DaemonConfig {
+            fail_closed_ssh_allow: true,
+            fail_closed_ssh_allow_cidrs: Vec::new(),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("fail-closed ssh allow must require management cidrs");
+        assert!(err.to_string().contains("at least one management cidr"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_invalid_fail_closed_ssh_cidrs() {
+        let config = DaemonConfig {
+            fail_closed_ssh_allow: true,
+            fail_closed_ssh_allow_cidrs: vec!["not-a-cidr".to_string()],
+            ..DaemonConfig::default()
+        };
+        let err =
+            validate_daemon_config(&config).expect_err("invalid management cidr must be rejected");
+        assert!(err.to_string().contains("valid ipv4/ipv6 cidr"));
     }
 
     #[test]
