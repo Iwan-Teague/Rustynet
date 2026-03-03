@@ -560,6 +560,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
 
     let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string();
     let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
+    let mut watermark_path = DEFAULT_MEMBERSHIP_WATERMARK_PATH.to_string();
     let mut node_id = read_hostname_short();
     let mut network_id = "local-net".to_string();
     let mut force = false;
@@ -576,6 +577,13 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             }
             Some("--log") => {
                 log_path = args.get(index + 1).ok_or("--log requires a value")?.clone();
+                index += 2;
+            }
+            Some("--watermark") => {
+                watermark_path = args
+                    .get(index + 1)
+                    .ok_or("--watermark requires a value")?
+                    .clone();
                 index += 2;
             }
             Some("--node-id") => {
@@ -607,21 +615,30 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     if !log_path.starts_with('/') {
         return Err(format!("log path must be absolute: {log_path}"));
     }
+    if !watermark_path.starts_with('/') {
+        return Err(format!("watermark path must be absolute: {watermark_path}"));
+    }
 
     if !force
         && (std::path::Path::new(&snapshot_path).exists()
-            || std::path::Path::new(&log_path).exists())
+            || std::path::Path::new(&log_path).exists()
+            || std::path::Path::new(&watermark_path).exists())
     {
         return Err(format!(
-            "membership files already exist at {snapshot_path} or {log_path}; use --force to overwrite"
+            "membership files already exist at {snapshot_path}, {log_path}, or {watermark_path}; use --force to overwrite"
         ));
     }
 
-    for path_str in [&snapshot_path, &log_path] {
+    for path_str in [&snapshot_path, &log_path, &watermark_path] {
         if let Some(parent) = std::path::Path::new(path_str.as_str()).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
         }
+    }
+
+    if std::path::Path::new(&watermark_path).exists() {
+        std::fs::remove_file(&watermark_path)
+            .map_err(|e| format!("failed to remove membership watermark {watermark_path}: {e}"))?;
     }
 
     let mut node_key_bytes = [0u8; 32];
@@ -676,7 +693,9 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         .write_all(format!("version={MEMBERSHIP_SCHEMA_VERSION}\n").as_bytes())
         .map_err(|e| format!("failed to write membership log: {e}"))?;
 
-    println!("membership init complete: snapshot={snapshot_path} log={log_path}");
+    println!(
+        "membership init complete: snapshot={snapshot_path} log={log_path} watermark_reset={watermark_path}"
+    );
     println!("  node_id={node_id} network_id={network_id}");
     Ok(())
 }
@@ -709,7 +728,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
-        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--node-id <id>] [--network-id <id>] [--force]",
+        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",

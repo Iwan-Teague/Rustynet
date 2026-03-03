@@ -50,7 +50,7 @@ use rustynet_backend_api::{
 };
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(target_os = "linux")]
-use rustynet_backend_wireguard::{LinuxCommandRunner, LinuxWireguardBackend};
+use rustynet_backend_wireguard::{LinuxWireguardBackend, WireguardCommandRunner};
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
@@ -428,7 +428,63 @@ enum DaemonBackend {
     #[allow(dead_code)]
     InMemory(WireguardBackend),
     #[cfg(target_os = "linux")]
-    Linux(LinuxWireguardBackend<LinuxCommandRunner>),
+    Linux(LinuxWireguardBackend<PrivilegedHelperWireguardRunner>),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct PrivilegedHelperWireguardRunner {
+    helper_client: PrivilegedCommandClient,
+}
+
+#[cfg(target_os = "linux")]
+impl PrivilegedHelperWireguardRunner {
+    fn new(helper_client: PrivilegedCommandClient) -> Self {
+        Self { helper_client }
+    }
+
+    fn helper_program_for(program: &str) -> Result<PrivilegedCommandProgram, BackendError> {
+        match program {
+            "ip" => Ok(PrivilegedCommandProgram::Ip),
+            "wg" => Ok(PrivilegedCommandProgram::Wg),
+            _ => Err(BackendError::invalid_input(
+                "unsupported privileged wireguard backend command",
+            )),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl WireguardCommandRunner for PrivilegedHelperWireguardRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+        let helper_program = Self::helper_program_for(program)?;
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self
+            .helper_client
+            .run_capture(helper_program, &arg_refs)
+            .map_err(|err| {
+                BackendError::internal(format!(
+                    "privileged helper {program} invocation failed: {err}"
+                ))
+            })?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        let stderr = output.stderr.trim();
+        if stderr.is_empty() {
+            return Err(BackendError::internal(format!(
+                "privileged helper {program} exited with status {}",
+                output.status
+            )));
+        }
+
+        Err(BackendError::internal(format!(
+            "privileged helper {program} exited with status {}: {stderr}",
+            output.status
+        )))
+    }
 }
 
 impl DaemonBackend {
@@ -449,6 +505,15 @@ impl DaemonBackend {
             DaemonBackendMode::LinuxWireguard => {
                 #[cfg(target_os = "linux")]
                 {
+                    let helper_socket = config
+                        .privileged_helper_socket_path
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DaemonError::InvalidConfig(
+                                "privileged helper socket path is required for linux-wireguard backend"
+                                    .to_string(),
+                            )
+                        })?;
                     let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
                         DaemonError::InvalidConfig(
                             "wg private key path is required for linux-wireguard backend"
@@ -456,8 +521,13 @@ impl DaemonBackend {
                         )
                     })?;
                     validate_private_key_permissions(private_key)?;
+                    let helper_client = PrivilegedCommandClient::new(
+                        helper_socket.clone(),
+                        Duration::from_millis(config.privileged_helper_timeout_ms),
+                    )
+                    .map_err(DaemonError::InvalidConfig)?;
                     let backend = LinuxWireguardBackend::new(
-                        LinuxCommandRunner,
+                        PrivilegedHelperWireguardRunner::new(helper_client),
                         config.wg_interface.clone(),
                         private_key.to_string_lossy().to_string(),
                     )
