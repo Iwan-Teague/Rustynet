@@ -1077,6 +1077,7 @@ ensure_binaries_available() {
   fi
 
   (cd "${ROOT_DIR}" && cargo build --release -p rustynetd -p rustynet-cli)
+  run_root install -d -m 0755 /usr/local/bin
   run_root install -m 0755 "${ROOT_DIR}/target/release/rustynetd" /usr/local/bin/rustynetd
   run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
 }
