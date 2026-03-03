@@ -24,6 +24,10 @@ const PASSPHRASE_CREDENTIAL_PATH_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_CREDENT
 const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
 const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
+const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
+const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
+const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
+const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     let source_path = resolve_passphrase_source(path);
@@ -220,10 +224,11 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
 }
 
 pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
-    let private = Command::new("wg")
+    let wg_binary = resolve_wireguard_binary_path()?;
+    let private = Command::new(&wg_binary)
         .arg("genkey")
         .output()
-        .map_err(|err| format!("wg genkey spawn failed: {err}"))?;
+        .map_err(|err| format!("wg genkey spawn failed ({}): {err}", wg_binary.display()))?;
     if !private.status.success() {
         return Err(format!("wg genkey failed: {}", private.status));
     }
@@ -250,13 +255,19 @@ pub fn apply_interface_private_key(
     runtime_key_path: &Path,
 ) -> Result<(), String> {
     validate_interface_name(interface_name)?;
-    let status = Command::new("wg")
+    let wg_binary = resolve_wireguard_binary_path()?;
+    let status = Command::new(&wg_binary)
         .arg("set")
         .arg(interface_name)
         .arg("private-key")
         .arg(runtime_key_path)
         .status()
-        .map_err(|err| format!("wg set private-key spawn failed: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "wg set private-key spawn failed ({}): {err}",
+                wg_binary.display()
+            )
+        })?;
     if status.success() {
         return Ok(());
     }
@@ -268,14 +279,20 @@ pub fn apply_interface_private_key(
 
 pub fn set_interface_down(interface_name: &str) -> Result<(), String> {
     validate_interface_name(interface_name)?;
-    let status = Command::new("ip")
+    let ip_binary = resolve_ip_binary_path()?;
+    let status = Command::new(&ip_binary)
         .arg("link")
         .arg("set")
         .arg("down")
         .arg("dev")
         .arg(interface_name)
         .status()
-        .map_err(|err| format!("ip link set down spawn failed: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "ip link set down spawn failed ({}): {err}",
+                ip_binary.display()
+            )
+        })?;
     if status.success() {
         return Ok(());
     }
@@ -541,13 +558,80 @@ fn validate_interface_name(value: &str) -> Result<(), String> {
     Err("interface name contains invalid characters".to_string())
 }
 
+fn resolve_wireguard_binary_path() -> Result<PathBuf, String> {
+    resolve_binary_path(WG_BINARY_PATH_ENV, DEFAULT_WG_BINARY_PATH, "wg")
+}
+
+fn resolve_ip_binary_path() -> Result<PathBuf, String> {
+    resolve_binary_path(IP_BINARY_PATH_ENV, DEFAULT_IP_BINARY_PATH, "ip")
+}
+
+fn resolve_binary_path(env_var: &str, default_path: &str, label: &str) -> Result<PathBuf, String> {
+    let configured = std::env::var(env_var).ok();
+    let candidate = configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_path);
+    validate_binary_path(candidate, label)?;
+    Ok(PathBuf::from(candidate))
+}
+
+fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
+    let path = Path::new(raw_path);
+    if !path.is_absolute() {
+        return Err(format!("{label} binary path must be absolute: {raw_path}"));
+    }
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        format!(
+            "{label} binary canonicalization failed for {}: {err}",
+            path.display()
+        )
+    })?;
+    let metadata =
+        fs::metadata(&canonical).map_err(|err| format!("{label} binary metadata failed: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} binary path must be a regular file: {}",
+            canonical.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o111 == 0 {
+            return Err(format!(
+                "{label} binary is not executable: {} ({:03o})",
+                canonical.display(),
+                mode
+            ));
+        }
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{label} binary must not be group/other writable: {} ({:03o})",
+                canonical.display(),
+                mode
+            ));
+        }
+        let owner_uid = metadata.uid();
+        if owner_uid != 0 {
+            return Err(format!(
+                "{label} binary must be root-owned: {} (uid={owner_uid})",
+                canonical.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, String> {
-    let mut child = Command::new("wg")
+    let wg_binary = resolve_wireguard_binary_path()?;
+    let mut child = Command::new(&wg_binary)
         .arg("pubkey")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("wg pubkey spawn failed: {err}"))?;
+        .map_err(|err| format!("wg pubkey spawn failed ({}): {err}", wg_binary.display()))?;
     {
         let stdin = child
             .stdin
@@ -577,7 +661,7 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 mod tests {
     use super::{
         DEFAULT_PASSPHRASE_CREDENTIAL_NAME, remove_file_if_present,
-        resolve_passphrase_source_from_env,
+        resolve_passphrase_source_from_env, validate_binary_path,
     };
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
@@ -645,6 +729,32 @@ mod tests {
         std::fs::write(&target, b"wireguard-private-key").expect("test target should be writable");
         remove_file_if_present(&target).expect("remove should succeed");
         assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn validate_binary_path_rejects_relative_paths() {
+        let err = validate_binary_path("wg", "wg").expect_err("relative paths should be rejected");
+        assert!(err.contains("must be absolute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_binary_path_rejects_symlink_to_untrusted_target() {
+        let test_dir = unique_test_dir("rustynet-binary-symlink");
+        let target = test_dir.join("wg-real");
+        let symlink = test_dir.join("wg-link");
+        std::fs::write(&target, "#!/bin/sh\n").expect("target should be writable");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("target should be executable");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink should be creatable");
+
+        let err =
+            validate_binary_path(symlink.to_str().expect("symlink path should be utf8"), "wg")
+                .expect_err("untrusted symlink target should be rejected");
+        assert!(err.contains("must be root-owned"));
+
         let _ = std::fs::remove_dir_all(test_dir);
     }
 }

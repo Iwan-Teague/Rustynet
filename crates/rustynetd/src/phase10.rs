@@ -4,8 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
@@ -16,6 +19,15 @@ use rustynet_backend_api::{
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, Protocol, TrafficContext,
 };
+
+const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
+const NFT_BINARY_PATH_ENV: &str = "RUSTYNET_NFT_BINARY_PATH";
+const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
+const SYSCTL_BINARY_PATH_ENV: &str = "RUSTYNET_SYSCTL_BINARY_PATH";
+const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
+const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
+const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
+const DEFAULT_SYSCTL_BINARY_PATH: &str = "/usr/sbin/sysctl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataplaneState {
@@ -377,11 +389,19 @@ impl LinuxCommandSystem {
             return client.run_capture(program, args).map_err(SystemError::Io);
         }
 
-        let binary = program.as_str().to_string();
-        let output = Command::new(binary.as_str())
-            .args(args)
-            .output()
-            .map_err(|err| SystemError::Io(format!("{} spawn failed: {err}", program.as_str())))?;
+        let binary = resolve_binary_path_for_program(program).map_err(|err| {
+            SystemError::Io(format!(
+                "{} binary resolution failed: {err}",
+                program.as_str()
+            ))
+        })?;
+        let output = Command::new(&binary).args(args).output().map_err(|err| {
+            SystemError::Io(format!(
+                "{} spawn failed ({}): {err}",
+                program.as_str(),
+                binary.display()
+            ))
+        })?;
         Ok(PrivilegedCommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1512,6 +1532,108 @@ fn validate_trust(policy: &TrustPolicy, evidence: TrustEvidence) -> Result<(), P
     Ok(())
 }
 
+fn resolve_binary_path(
+    env_var: &str,
+    default: &str,
+    program: PrivilegedCommandProgram,
+) -> Result<PathBuf, SystemError> {
+    let configured = std::env::var(env_var).ok();
+    let raw = configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default);
+    validate_binary_path(raw, program)?;
+    Ok(PathBuf::from(raw))
+}
+
+fn resolve_binary_path_for_program(
+    program: PrivilegedCommandProgram,
+) -> Result<PathBuf, SystemError> {
+    match program {
+        PrivilegedCommandProgram::Ip => resolve_binary_path(
+            IP_BINARY_PATH_ENV,
+            DEFAULT_IP_BINARY_PATH,
+            PrivilegedCommandProgram::Ip,
+        ),
+        PrivilegedCommandProgram::Nft => resolve_binary_path(
+            NFT_BINARY_PATH_ENV,
+            DEFAULT_NFT_BINARY_PATH,
+            PrivilegedCommandProgram::Nft,
+        ),
+        PrivilegedCommandProgram::Wg => resolve_binary_path(
+            WG_BINARY_PATH_ENV,
+            DEFAULT_WG_BINARY_PATH,
+            PrivilegedCommandProgram::Wg,
+        ),
+        PrivilegedCommandProgram::Sysctl => resolve_binary_path(
+            SYSCTL_BINARY_PATH_ENV,
+            DEFAULT_SYSCTL_BINARY_PATH,
+            PrivilegedCommandProgram::Sysctl,
+        ),
+    }
+}
+
+fn validate_binary_path(raw: &str, program: PrivilegedCommandProgram) -> Result<(), SystemError> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{} binary path must be absolute: {raw}",
+            program.as_str()
+        )));
+    }
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        SystemError::PrerequisiteCheckFailed(format!(
+            "{} binary canonicalization failed for {}: {err}",
+            program.as_str(),
+            path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&canonical).map_err(|err| {
+        SystemError::PrerequisiteCheckFailed(format!(
+            "{} binary metadata read failed for {}: {err}",
+            program.as_str(),
+            canonical.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{} binary path must be a regular file: {}",
+            program.as_str(),
+            canonical.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o111 == 0 {
+            return Err(SystemError::PrerequisiteCheckFailed(format!(
+                "{} binary is not executable: {} ({:03o})",
+                program.as_str(),
+                canonical.display(),
+                mode
+            )));
+        }
+        if mode & 0o022 != 0 {
+            return Err(SystemError::PrerequisiteCheckFailed(format!(
+                "{} binary must not be group/other writable: {} ({:03o})",
+                program.as_str(),
+                canonical.display(),
+                mode
+            )));
+        }
+        let owner_uid = metadata.uid();
+        if owner_uid != 0 {
+            return Err(SystemError::PrerequisiteCheckFailed(format!(
+                "{} binary must be root-owned: {} (uid={owner_uid})",
+                program.as_str(),
+                canonical.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
     if value.is_empty() || value.len() > 15 {
         return Err("device name length must be between 1 and 15 characters");
@@ -1949,5 +2071,42 @@ mod tests {
         assert!(perf.contains("\"captured_at_unix\": "));
         let _ = std::fs::remove_file(&audit_path);
         let _ = std::fs::remove_file(&perf_path);
+    }
+
+    #[test]
+    fn validate_binary_path_rejects_relative_paths() {
+        let err = validate_binary_path("ip", PrivilegedCommandProgram::Ip)
+            .expect_err("relative paths must be rejected");
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_binary_path_rejects_symlink_to_untrusted_target() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "phase10-binary-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let target = temp_dir.join("nft-real");
+        let symlink = temp_dir.join("nft-link");
+        std::fs::write(&target, "#!/bin/sh\n").expect("target should be writable");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("target should be executable");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink should be creatable");
+
+        let err = validate_binary_path(
+            symlink.to_str().expect("symlink path should be utf8"),
+            PrivilegedCommandProgram::Nft,
+        )
+        .expect_err("untrusted symlink targets must be rejected");
+        assert!(err.to_string().contains("must be root-owned"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
