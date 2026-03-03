@@ -20,11 +20,30 @@ use rustynet_crypto::{
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+const PASSPHRASE_CREDENTIAL_PATH_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH";
+const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
+const MAX_PASSPHRASE_BYTES: usize = 4096;
+
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
-    validate_secret_file_security(path, "passphrase file")?;
+    let source_path = resolve_passphrase_source(path);
+    let allow_root_owner = is_systemd_credential_path(&source_path);
+    validate_secret_file_security(&source_path, "passphrase file", allow_root_owner)?;
+
     let mut raw =
-        fs::read_to_string(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
-    let trimmed = raw.trim();
+        fs::read(&source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    if raw.len() > MAX_PASSPHRASE_BYTES {
+        raw.zeroize();
+        return Err("passphrase exceeds maximum allowed size".to_string());
+    }
+    let decoded = match std::str::from_utf8(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            raw.zeroize();
+            return Err("passphrase file contains non-utf8 bytes".to_string());
+        }
+    };
+    let trimmed = decoded.trim();
     if trimmed.len() < 16 {
         raw.zeroize();
         return Err("passphrase must be at least 16 characters".to_string());
@@ -95,7 +114,11 @@ fn key_custody_manager(
     ))
 }
 
-fn validate_secret_file_security(path: &Path, label: &str) -> Result<(), String> {
+fn validate_secret_file_security(
+    path: &Path,
+    label: &str,
+    allow_root_owner: bool,
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         let metadata = fs::symlink_metadata(path)
@@ -107,15 +130,21 @@ fn validate_secret_file_security(path: &Path, label: &str) -> Result<(), String>
             return Err(format!("{label} must be a regular file"));
         }
         let mode = metadata.mode() & 0o777;
-        if mode & 0o077 != 0 {
+        let disallowed_mode_mask = if allow_root_owner { 0o037 } else { 0o077 };
+        if mode & disallowed_mode_mask != 0 {
+            let expected = if allow_root_owner {
+                "owner-only or root-owned credential with group-read only"
+            } else {
+                "owner-only"
+            };
             return Err(format!(
-                "{label} permissions are too broad: expected owner-only, found {:03o}",
-                mode
+                "{label} permissions are too broad: expected {expected}, found {:03o}",
+                mode,
             ));
         }
         let owner_uid = metadata.uid();
         let expected_uid = Uid::effective().as_raw();
-        if owner_uid != expected_uid {
+        if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
             return Err(format!(
                 "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
             ));
@@ -130,6 +159,38 @@ fn validate_secret_file_security(path: &Path, label: &str) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+fn resolve_passphrase_source(configured_path: &Path) -> PathBuf {
+    let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
+    let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
+    resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
+}
+
+fn resolve_passphrase_source_from_env(
+    configured_path: &Path,
+    explicit_credential_path: Option<&str>,
+    credentials_directory: Option<&str>,
+) -> PathBuf {
+    if let Some(explicit) = explicit_credential_path {
+        let explicit_path = PathBuf::from(explicit);
+        if explicit_path.exists() {
+            return explicit_path;
+        }
+    }
+
+    if let Some(directory) = credentials_directory {
+        let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    configured_path.to_path_buf()
+}
+
+fn is_systemd_credential_path(path: &Path) -> bool {
+    path.starts_with("/run/credentials/")
 }
 
 fn key_custody_key_id(encrypted_key_path: &Path) -> String {
@@ -228,7 +289,34 @@ pub fn remove_file_if_present(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
+    best_effort_scrub_file_contents(path);
     fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))
+}
+
+fn best_effort_scrub_file_contents(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    let mut file = match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let mut remaining = metadata.len();
+    if remaining == 0 {
+        return;
+    }
+    let zero_block = [0u8; 8192];
+    while remaining > 0 {
+        let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
+        if file.write_all(&zero_block[..chunk_len]).is_err() {
+            return;
+        }
+        remaining -= chunk_len as u64;
+    }
+    let _ = file.sync_all();
 }
 
 pub fn initialize_encrypted_key_material(
@@ -483,4 +571,80 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
         return Err("wg pubkey produced empty key".to_string());
     }
     Ok(public_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_PASSPHRASE_CREDENTIAL_NAME, remove_file_if_present,
+        resolve_passphrase_source_from_env,
+    };
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{stamp}"));
+        std::fs::create_dir_all(&dir).expect("test directory should be creatable");
+        dir
+    }
+
+    #[test]
+    fn resolve_passphrase_source_prefers_explicit_credential_path_env() {
+        let test_dir = unique_test_dir("rustynet-passphrase-source-explicit");
+        let configured = test_dir.join("configured.passphrase");
+        let explicit = test_dir.join("explicit.passphrase");
+        std::fs::write(&configured, "configured").expect("configured path should be writable");
+        std::fs::write(&explicit, "explicit").expect("explicit path should be writable");
+
+        let resolved = resolve_passphrase_source_from_env(
+            &configured,
+            Some(&explicit.to_string_lossy()),
+            None,
+        );
+        assert_eq!(resolved, explicit);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn resolve_passphrase_source_uses_credentials_directory_when_present() {
+        let test_dir = unique_test_dir("rustynet-passphrase-source-credentials-dir");
+        let configured = test_dir.join("configured.passphrase");
+        let credentials_dir = test_dir.join("credentials");
+        std::fs::create_dir_all(&credentials_dir).expect("credentials dir should be creatable");
+        let credential = credentials_dir.join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
+        std::fs::write(&configured, "configured").expect("configured path should be writable");
+        std::fs::write(&credential, "credential").expect("credential path should be writable");
+
+        let resolved = resolve_passphrase_source_from_env(
+            &configured,
+            None,
+            Some(&credentials_dir.to_string_lossy()),
+        );
+        assert_eq!(resolved, credential);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn resolve_passphrase_source_falls_back_to_configured_path() {
+        let test_dir = unique_test_dir("rustynet-passphrase-source-fallback");
+        let configured = test_dir.join("configured.passphrase");
+        std::fs::write(&configured, "configured").expect("configured path should be writable");
+
+        let resolved = resolve_passphrase_source_from_env(&configured, None, None);
+        assert_eq!(resolved, configured);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn remove_file_if_present_removes_target_file() {
+        let test_dir = unique_test_dir("rustynet-remove-file");
+        let target = test_dir.join("secret.key");
+        std::fs::write(&target, b"wireguard-private-key").expect("test target should be writable");
+        remove_file_if_present(&target).expect("remove should succeed");
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
 }
