@@ -59,6 +59,7 @@ use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet, Decision,
     MembershipDirectory, MembershipStatus, Protocol, RuleAction, TrafficContext,
 };
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
@@ -279,10 +280,11 @@ impl fmt::Display for TrustBootstrapError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrustWatermark {
     updated_at_unix: u64,
     nonce: u64,
+    payload_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2339,8 +2341,9 @@ fn load_trust_evidence(
         TrustBootstrapError::InvalidFormat("invalid signature encoding".to_string())
     })?;
     let signature = Signature::from_bytes(&signature_bytes);
+    let payload = trust_evidence_payload(&record);
     verifying_key
-        .verify(trust_evidence_payload(&record).as_bytes(), &signature)
+        .verify(payload.as_bytes(), &signature)
         .map_err(|_| TrustBootstrapError::SignatureInvalid)?;
 
     let now = unix_now();
@@ -2353,15 +2356,22 @@ fn load_trust_evidence(
         return Err(TrustBootstrapError::Stale);
     }
 
+    let payload_digest = sha256_digest(payload.as_bytes());
     let watermark = TrustWatermark {
         updated_at_unix: record.updated_at_unix,
         nonce: record.nonce,
+        payload_digest: Some(payload_digest),
     };
-    if previous_watermark
-        .map(|existing| watermark < existing)
-        .unwrap_or(false)
-    {
-        return Err(TrustBootstrapError::ReplayDetected);
+    if let Some(existing) = previous_watermark {
+        match compare_trust_watermark_generation(&watermark, &existing) {
+            std::cmp::Ordering::Less => return Err(TrustBootstrapError::ReplayDetected),
+            std::cmp::Ordering::Equal => {
+                if existing.payload_digest != Some(payload_digest) {
+                    return Err(TrustBootstrapError::ReplayDetected);
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
     }
 
     Ok(TrustEvidenceEnvelope {
@@ -2407,6 +2417,28 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn compare_trust_watermark_generation(
+    incoming: &TrustWatermark,
+    existing: &TrustWatermark,
+) -> std::cmp::Ordering {
+    (incoming.updated_at_unix, incoming.nonce).cmp(&(existing.updated_at_unix, existing.nonce))
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], TrustBootstrapError> {
@@ -2461,6 +2493,7 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
     let mut version: Option<u8> = None;
     let mut updated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
+    let mut payload_digest: Option<[u8; 32]> = None;
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(TrustBootstrapError::InvalidFormat(
@@ -2477,6 +2510,9 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
             "nonce" => {
                 nonce = value.parse::<u64>().ok();
             }
+            "payload_digest_sha256" => {
+                payload_digest = Some(decode_hex_to_fixed::<32>(value)?);
+            }
             _ => {
                 return Err(TrustBootstrapError::InvalidFormat(format!(
                     "unknown watermark key {key}"
@@ -2484,19 +2520,33 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
             }
         }
     }
-    if version != Some(1) {
-        return Err(TrustBootstrapError::InvalidFormat(
+    match version {
+        Some(1) => Ok(Some(TrustWatermark {
+            updated_at_unix: updated_at_unix.ok_or_else(|| {
+                TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
+            })?,
+            nonce: nonce.ok_or_else(|| {
+                TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+            })?,
+            payload_digest: None,
+        })),
+        Some(2) => Ok(Some(TrustWatermark {
+            updated_at_unix: updated_at_unix.ok_or_else(|| {
+                TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
+            })?,
+            nonce: nonce.ok_or_else(|| {
+                TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+            })?,
+            payload_digest: Some(payload_digest.ok_or_else(|| {
+                TrustBootstrapError::InvalidFormat(
+                    "missing watermark payload_digest_sha256".to_string(),
+                )
+            })?),
+        })),
+        _ => Err(TrustBootstrapError::InvalidFormat(
             "unsupported watermark version".to_string(),
-        ));
+        )),
     }
-    Ok(Some(TrustWatermark {
-        updated_at_unix: updated_at_unix.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
-        })?,
-        nonce: nonce.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
-        })?,
-    }))
 }
 
 fn persist_trust_watermark(
@@ -2513,8 +2563,14 @@ fn persist_trust_watermark(
         }
     }
     let payload = format!(
-        "version=1\nupdated_at_unix={}\nnonce={}\n",
-        watermark.updated_at_unix, watermark.nonce
+        "version=2\nupdated_at_unix={}\nnonce={}\npayload_digest_sha256={}\n",
+        watermark.updated_at_unix,
+        watermark.nonce,
+        encode_hex(&watermark.payload_digest.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat(
+                "watermark payload digest must be present".to_string(),
+            )
+        })?)
     );
     let temp_path = path.with_extension(format!(
         "tmp.{}.{}",
@@ -3247,9 +3303,10 @@ mod tests {
 
     use super::{
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
-        TrustEvidenceRecord, TrustWatermark, persist_auto_tunnel_watermark,
-        persist_trust_watermark, run_daemon, trust_evidence_payload, unix_now,
-        validate_daemon_config, zeroize_optional_bytes,
+        TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_trust_evidence,
+        load_trust_watermark, persist_auto_tunnel_watermark, persist_trust_watermark, run_daemon,
+        sha256_digest, trust_evidence_payload, unix_now, validate_daemon_config,
+        zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -3261,12 +3318,6 @@ mod tests {
     }
 
     fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(
-            verifier_path,
-            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
-        )
-        .expect("verifier key should be written");
         let record = TrustEvidenceRecord {
             tls13_valid: true,
             signed_control_valid: true,
@@ -3275,6 +3326,20 @@ mod tests {
             updated_at_unix: unix_now(),
             nonce,
         };
+        write_trust_file_with_record(path, verifier_path, record);
+    }
+
+    fn write_trust_file_with_record(
+        path: &Path,
+        verifier_path: &Path,
+        record: TrustEvidenceRecord,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("verifier key should be written");
         let body = trust_evidence_payload(&record);
         let signature = signing_key.sign(body.as_bytes());
         std::fs::write(
@@ -3440,6 +3505,142 @@ mod tests {
         let mut value = Some(vec![7u8, 9u8, 13u8, 17u8]);
         zeroize_optional_bytes(&mut value);
         assert_eq!(value, Some(vec![0u8, 0u8, 0u8, 0u8]));
+    }
+
+    #[test]
+    fn trust_watermark_round_trip_persists_payload_digest() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-round-trip");
+        let watermark_path = test_dir.join("trust.watermark");
+        let expected = TrustWatermark {
+            updated_at_unix: 123,
+            nonce: 9,
+            payload_digest: Some([0x5au8; 32]),
+        };
+        persist_trust_watermark(&watermark_path, expected).expect("watermark should persist");
+        let loaded = load_trust_watermark(&watermark_path)
+            .expect("watermark should load")
+            .expect("watermark should exist");
+        assert_eq!(loaded, expected);
+        let raw = std::fs::read_to_string(&watermark_path).expect("watermark file should exist");
+        assert!(raw.contains("version=2"));
+        assert!(raw.contains("payload_digest_sha256="));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_watermark_supports_legacy_version_without_digest() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-v1");
+        let watermark_path = test_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, "version=1\nupdated_at_unix=100\nnonce=7\n")
+            .expect("legacy watermark should be written");
+        let loaded = load_trust_watermark(&watermark_path)
+            .expect("legacy watermark should load")
+            .expect("legacy watermark should exist");
+        assert_eq!(
+            loaded,
+            TrustWatermark {
+                updated_at_unix: 100,
+                nonce: 7,
+                payload_digest: None,
+            }
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_allows_equal_watermark_when_payload_digest_matches() {
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-match");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+            nonce: 41,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let previous = TrustWatermark {
+            updated_at_unix: record.updated_at_unix,
+            nonce: record.nonce,
+            payload_digest: Some(sha256_digest(trust_evidence_payload(&record).as_bytes())),
+        };
+        let envelope = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect("matching digest for equal watermark should be accepted");
+        assert_eq!(envelope.watermark, previous);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_rejects_equal_watermark_when_payload_digest_differs() {
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-mismatch");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+            nonce: 42,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let tampered_record = TrustEvidenceRecord {
+            signed_control_valid: false,
+            ..record
+        };
+        let previous = TrustWatermark {
+            updated_at_unix: record.updated_at_unix,
+            nonce: record.nonce,
+            payload_digest: Some(sha256_digest(
+                trust_evidence_payload(&tampered_record).as_bytes(),
+            )),
+        };
+        let err = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect_err("mismatched digest for equal watermark must be rejected");
+        assert!(matches!(err, super::TrustBootstrapError::ReplayDetected));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_rejects_equal_watermark_when_legacy_digest_missing() {
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-legacy");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+            nonce: 43,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let previous = TrustWatermark {
+            updated_at_unix: record.updated_at_unix,
+            nonce: record.nonce,
+            payload_digest: None,
+        };
+        let err = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect_err("legacy equal watermark without digest must fail closed");
+        assert!(matches!(err, super::TrustBootstrapError::ReplayDetected));
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
@@ -3669,6 +3870,7 @@ mod tests {
             TrustWatermark {
                 updated_at_unix: unix_now(),
                 nonce: 3,
+                payload_digest: Some([0u8; 32]),
             },
         )
         .expect("watermark should be persisted");
