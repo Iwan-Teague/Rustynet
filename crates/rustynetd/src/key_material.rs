@@ -14,8 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 use rustynet_crypto::{
-    KeyCustodyBackend, KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore,
-    write_encrypted_key_file,
+    KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
 };
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -90,22 +89,22 @@ pub fn encrypt_private_key(
     let passphrase = read_passphrase_file(passphrase_path)?;
     let manager = key_custody_manager(encrypted_key_path, passphrase.clone())?;
     let key_id = key_custody_key_id(encrypted_key_path);
-    let backend = manager
+    let _backend = manager
         .store_private_key(&key_id, private_key)
         .map_err(|err| format!("encrypt key failed: {err}"))?;
-    if backend == KeyCustodyBackend::OsSecureStore {
-        let parent = encrypted_key_path
-            .parent()
-            .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
-        write_encrypted_key_file(
-            parent,
-            encrypted_key_path,
-            private_key,
-            &passphrase,
-            KeyCustodyPermissionPolicy::default(),
-        )
-        .map_err(|err| format!("encrypt key backup failed: {err}"))?;
-    }
+    let parent = encrypted_key_path
+        .parent()
+        .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
+    // Keep the configured encrypted-key path materialized on disk for service prechecks and
+    // deterministic bootstrap across hosts, even when the custody backend also stores by key-id.
+    write_encrypted_key_file(
+        parent,
+        encrypted_key_path,
+        private_key,
+        &passphrase,
+        KeyCustodyPermissionPolicy::default(),
+    )
+    .map_err(|err| format!("encrypt key backup failed: {err}"))?;
     Ok(())
 }
 
