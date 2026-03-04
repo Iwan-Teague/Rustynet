@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
     TunnelBackend, TunnelStats,
@@ -382,7 +383,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
                 "set".to_string(),
                 self.interface_name.clone(),
                 "peer".to_string(),
-                encode_hex(&peer.public_key),
+                encode_wg_public_key_base64(&peer.public_key),
                 "endpoint".to_string(),
                 endpoint,
                 "allowed-ips".to_string(),
@@ -405,7 +406,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
                 "set".to_string(),
                 self.interface_name.clone(),
                 "peer".to_string(),
-                encode_hex(&peer.public_key),
+                encode_wg_public_key_base64(&peer.public_key),
                 "remove".to_string(),
             ],
         )
@@ -809,7 +810,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
                 "set".to_string(),
                 self.interface_name.clone(),
                 "peer".to_string(),
-                encode_hex(&peer.public_key),
+                encode_wg_public_key_base64(&peer.public_key),
                 "endpoint".to_string(),
                 endpoint,
                 "allowed-ips".to_string(),
@@ -832,7 +833,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
                 "set".to_string(),
                 self.interface_name.clone(),
                 "peer".to_string(),
-                encode_hex(&peer.public_key),
+                encode_wg_public_key_base64(&peer.public_key),
                 "remove".to_string(),
             ],
         )
@@ -1059,12 +1060,8 @@ fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError
     Ok(pids)
 }
 
-fn encode_hex(value: &[u8]) -> String {
-    let mut output = String::with_capacity(value.len() * 2);
-    for byte in value {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
+fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
+    BASE64_STANDARD.encode(value)
 }
 
 #[cfg(test)]
@@ -1176,6 +1173,38 @@ mod tests {
 
         let stats = backend.stats();
         assert!(stats.is_err());
+    }
+
+    #[test]
+    fn linux_backend_uses_base64_peer_key_for_wg_commands() {
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+        backend
+            .remove_peer(&NodeId::new("peer-a").expect("valid node id"))
+            .expect("peer remove should work");
+
+        let expected_public_key = encode_wg_public_key_base64(&[7; 32]);
+        let mut peer_key_args = backend
+            .runner
+            .calls
+            .iter()
+            .filter(|(program, args)| {
+                program == "wg" && args.len() >= 4 && args[0] == "set" && args[2] == "peer"
+            })
+            .map(|(_, args)| args[3].clone())
+            .collect::<Vec<_>>();
+        peer_key_args.sort();
+        assert_eq!(
+            peer_key_args,
+            vec![expected_public_key.clone(), expected_public_key]
+        );
     }
 
     #[test]
