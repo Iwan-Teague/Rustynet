@@ -23,8 +23,10 @@ The wizard handles:
 
 Host-profile behavior:
 - Linux host: full runtime/dataplane provisioning.
-- macOS host: compatibility mode only (build/validation workflows); Linux dataplane actions are blocked.
+- macOS host: full client/runtime dataplane provisioning using userspace WireGuard (`wireguard-go`) with privileged-helper mediated system operations.
+- macOS non-admin fallback: when Homebrew cannot be installed (no admin rights), `start.sh` can bootstrap `wg` and `wireguard-go` into `~/.local/rustynet-tools/bin` and pins daemon/helper binary paths to those absolute locations.
 - macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
+- macOS PF safety: stale Rustynet PF anchors (`com.apple/rustynet_g*`) are pruned on dataplane generation apply to prevent residual fail-closed anchors after crashes/restarts.
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 

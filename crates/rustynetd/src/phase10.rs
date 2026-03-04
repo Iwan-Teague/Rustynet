@@ -25,10 +25,20 @@ const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
 const NFT_BINARY_PATH_ENV: &str = "RUSTYNET_NFT_BINARY_PATH";
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 const SYSCTL_BINARY_PATH_ENV: &str = "RUSTYNET_SYSCTL_BINARY_PATH";
+const IFCONFIG_BINARY_PATH_ENV: &str = "RUSTYNET_IFCONFIG_BINARY_PATH";
+const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
+const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
+const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
+const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
 const DEFAULT_SYSCTL_BINARY_PATH: &str = "/usr/sbin/sysctl";
+const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
+const DEFAULT_ROUTE_BINARY_PATH: &str = "/sbin/route";
+const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
+const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
+const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataplaneState {
@@ -1044,10 +1054,346 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacosCommandSystem {
+    interface_name: String,
+    egress_interface: String,
+    privileged_client: Option<PrivilegedCommandClient>,
+    generation: u64,
+    fail_closed_ssh_allow: bool,
+    fail_closed_ssh_allow_cidrs: Vec<String>,
+    anchor_name: Option<String>,
+    allow_egress_interface: bool,
+    ipv6_blocked: bool,
+}
+
+impl MacosCommandSystem {
+    pub fn new(
+        interface_name: impl Into<String>,
+        egress_interface: impl Into<String>,
+        privileged_client: Option<PrivilegedCommandClient>,
+        fail_closed_ssh_allow: bool,
+        fail_closed_ssh_allow_cidrs: Vec<String>,
+    ) -> Result<Self, SystemError> {
+        let interface_name = interface_name.into();
+        let egress_interface = egress_interface.into();
+        validate_net_device_name(&interface_name)
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        validate_net_device_name(&egress_interface)
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        if fail_closed_ssh_allow && fail_closed_ssh_allow_cidrs.is_empty() {
+            return Err(SystemError::PrerequisiteCheckFailed(
+                "fail-closed ssh allow is enabled but no management cidrs were provided"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            interface_name,
+            egress_interface,
+            privileged_client,
+            generation: 0,
+            fail_closed_ssh_allow,
+            fail_closed_ssh_allow_cidrs,
+            anchor_name: None,
+            allow_egress_interface: false,
+            ipv6_blocked: false,
+        })
+    }
+
+    fn run(&self, program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), SystemError> {
+        let output = self.run_capture(program, args)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(SystemError::Io(format!(
+            "{} exited unsuccessfully: status={} stderr={}",
+            program.as_str(),
+            output.status,
+            output.stderr
+        )))
+    }
+
+    fn run_allow_failure(&self, program: PrivilegedCommandProgram, args: &[&str]) {
+        let _ = self.run_capture(program, args);
+    }
+
+    fn run_capture(
+        &self,
+        program: PrivilegedCommandProgram,
+        args: &[&str],
+    ) -> Result<PrivilegedCommandOutput, SystemError> {
+        if let Some(client) = self.privileged_client.as_ref() {
+            return client.run_capture(program, args).map_err(SystemError::Io);
+        }
+
+        let binary = resolve_binary_path_for_program(program).map_err(|err| {
+            SystemError::Io(format!(
+                "{} binary resolution failed: {err}",
+                program.as_str()
+            ))
+        })?;
+        let output = Command::new(&binary).args(args).output().map_err(|err| {
+            SystemError::Io(format!(
+                "{} spawn failed ({}): {err}",
+                program.as_str(),
+                binary.display()
+            ))
+        })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    fn current_anchor_name(&self) -> String {
+        format!("com.apple/rustynet_g{}", self.generation)
+    }
+
+    fn ensure_pf_enabled(&self) -> Result<(), SystemError> {
+        let info = self.run_capture(PrivilegedCommandProgram::Pfctl, &["-s", "info"])?;
+        if info.success() && info.stdout.contains("Status: Enabled") {
+            return Ok(());
+        }
+        self.run(PrivilegedCommandProgram::Pfctl, &["-E"])
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+    }
+
+    fn management_cidr_family(cidr: &str) -> Result<&'static str, SystemError> {
+        let (base, prefix) = cidr.split_once('/').ok_or_else(|| {
+            SystemError::FirewallApplyFailed(format!("invalid management cidr: {cidr}"))
+        })?;
+        let prefix_valid = prefix.parse::<u8>().is_ok();
+        if !prefix_valid {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "invalid management cidr prefix: {cidr}"
+            )));
+        }
+        match base.parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => Ok("inet"),
+            Ok(IpAddr::V6(_)) => Ok("inet6"),
+            Err(_) => Err(SystemError::FirewallApplyFailed(format!(
+                "invalid management cidr: {cidr}"
+            ))),
+        }
+    }
+
+    fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
+        let mut rules = String::new();
+        rules.push_str("set block-policy drop\n");
+        if !strict_fail_closed {
+            rules.push_str("pass out quick inet on lo0 all keep state\n");
+            rules.push_str(&format!(
+                "pass out quick inet on {} all keep state\n",
+                self.interface_name
+            ));
+            if self.allow_egress_interface {
+                rules.push_str(&format!(
+                    "pass out quick inet on {} all keep state\n",
+                    self.egress_interface
+                ));
+            }
+        }
+        if self.fail_closed_ssh_allow {
+            for cidr in &self.fail_closed_ssh_allow_cidrs {
+                let family = Self::management_cidr_family(cidr)?;
+                rules.push_str(&format!(
+                    "pass out quick {} proto tcp from any port 22 to {} keep state\n",
+                    family, cidr
+                ));
+            }
+        }
+        if self.ipv6_blocked {
+            rules.push_str("block drop out quick inet6 all\n");
+        }
+        rules.push_str("block drop out quick all\n");
+        Ok(rules)
+    }
+
+    fn apply_pf_rules(&mut self, strict_fail_closed: bool) -> Result<(), SystemError> {
+        self.ensure_pf_enabled()?;
+        let next_anchor = self.current_anchor_name();
+        if let Some(previous) = self.anchor_name.clone() {
+            if previous != next_anchor {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Pfctl,
+                    &["-a", previous.as_str(), "-F", "all"],
+                );
+            }
+        }
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "rustynet-pf-rules-{}-{}.conf",
+            std::process::id(),
+            self.generation
+        ));
+        let rules = self.render_pf_rules(strict_fail_closed)?;
+        fs::write(&tmp_path, rules)
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        let tmp = tmp_path
+            .to_str()
+            .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_string()))?;
+        let apply_result = self.run(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", next_anchor.as_str(), "-f", tmp],
+        );
+        let _ = fs::remove_file(&tmp_path);
+        apply_result.map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.anchor_name = Some(next_anchor);
+        Ok(())
+    }
+
+    fn owned_anchor_names_from_output(stdout: &str) -> Vec<String> {
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && line.starts_with("com.apple/rustynet_g"))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn list_owned_anchors(&self) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(PrivilegedCommandProgram::Pfctl, &["-s", "Anchors"])?;
+        if output.success() {
+            return Ok(Self::owned_anchor_names_from_output(&output.stdout));
+        }
+        let stderr = output.stderr.to_ascii_lowercase();
+        if stderr.contains("pf not enabled") {
+            return Ok(Vec::new());
+        }
+        Err(SystemError::Io(format!(
+            "pfctl anchor query failed: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
+    fn flush_anchor(&mut self) {
+        if let Some(anchor) = self.anchor_name.take() {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor.as_str(), "-F", "all"],
+            );
+        }
+    }
+}
+
+impl DataplaneSystem for MacosCommandSystem {
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
+        for anchor in self.list_owned_anchors()? {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor.as_str(), "-F", "all"],
+            );
+        }
+        self.anchor_name = None;
+        Ok(())
+    }
+
+    fn check_prerequisites(&mut self) -> Result<(), SystemError> {
+        #[cfg(target_os = "macos")]
+        {
+            resolve_binary_path_for_program(PrivilegedCommandProgram::Wg)?;
+            resolve_binary_path_for_program(PrivilegedCommandProgram::WireguardGo)?;
+            resolve_binary_path_for_program(PrivilegedCommandProgram::Ifconfig)?;
+            resolve_binary_path_for_program(PrivilegedCommandProgram::Route)?;
+            resolve_binary_path_for_program(PrivilegedCommandProgram::Pfctl)?;
+            self.run(PrivilegedCommandProgram::Ifconfig, &["-l"])?;
+            self.run(PrivilegedCommandProgram::Route, &["-n", "get", "default"])?;
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Err(SystemError::PrerequisiteCheckFailed(
+            "macos command system is only supported on macos".to_string(),
+        ))
+    }
+
+    fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn rollback_routes(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
+        self.allow_egress_interface = false;
+        self.apply_pf_rules(false)
+    }
+
+    fn rollback_firewall(&mut self) -> Result<(), SystemError> {
+        self.flush_anchor();
+        Ok(())
+    }
+
+    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        self.allow_egress_interface = true;
+        self.apply_pf_rules(false)
+            .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
+    }
+
+    fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        self.allow_egress_interface = false;
+        self.apply_pf_rules(false)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))
+    }
+
+    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
+        self.ipv6_blocked = true;
+        self.apply_pf_rules(false)
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+    }
+
+    fn rollback_ipv6_egress(&mut self) -> Result<(), SystemError> {
+        self.ipv6_blocked = false;
+        self.apply_pf_rules(false)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))
+    }
+
+    fn assert_killswitch(&mut self) -> Result<(), SystemError> {
+        let anchor = self.anchor_name.clone().ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("pf anchor missing".to_string())
+        })?;
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", anchor.as_str(), "-s", "rules"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "pfctl rules query failed: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        if !output.stdout.contains("block drop out quick all") {
+            return Err(SystemError::KillSwitchAssertionFailed(
+                "pf killswitch rule missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn block_all_egress(&mut self) -> Result<(), SystemError> {
+        self.apply_pf_rules(true)
+            .map_err(|err| SystemError::BlockEgressFailed(err.to_string()))
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeSystem {
     DryRun(DryRunSystem),
     Linux(LinuxCommandSystem),
+    Macos(MacosCommandSystem),
 }
 
 impl DataplaneSystem for RuntimeSystem {
@@ -1055,6 +1401,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.set_generation(generation),
             RuntimeSystem::Linux(system) => system.set_generation(generation),
+            RuntimeSystem::Macos(system) => system.set_generation(generation),
         }
     }
 
@@ -1062,6 +1409,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.prune_owned_tables(),
             RuntimeSystem::Linux(system) => system.prune_owned_tables(),
+            RuntimeSystem::Macos(system) => system.prune_owned_tables(),
         }
     }
 
@@ -1069,6 +1417,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.check_prerequisites(),
             RuntimeSystem::Linux(system) => system.check_prerequisites(),
+            RuntimeSystem::Macos(system) => system.check_prerequisites(),
         }
     }
 
@@ -1076,6 +1425,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_routes(routes),
             RuntimeSystem::Linux(system) => system.apply_routes(routes),
+            RuntimeSystem::Macos(system) => system.apply_routes(routes),
         }
     }
 
@@ -1083,6 +1433,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_routes(),
             RuntimeSystem::Linux(system) => system.rollback_routes(),
+            RuntimeSystem::Macos(system) => system.rollback_routes(),
         }
     }
 
@@ -1090,6 +1441,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_firewall_killswitch(),
             RuntimeSystem::Linux(system) => system.apply_firewall_killswitch(),
+            RuntimeSystem::Macos(system) => system.apply_firewall_killswitch(),
         }
     }
 
@@ -1097,6 +1449,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_firewall(),
             RuntimeSystem::Linux(system) => system.rollback_firewall(),
+            RuntimeSystem::Macos(system) => system.rollback_firewall(),
         }
     }
 
@@ -1104,6 +1457,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_nat_forwarding(),
             RuntimeSystem::Linux(system) => system.apply_nat_forwarding(),
+            RuntimeSystem::Macos(system) => system.apply_nat_forwarding(),
         }
     }
 
@@ -1111,6 +1465,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_nat_forwarding(),
             RuntimeSystem::Linux(system) => system.rollback_nat_forwarding(),
+            RuntimeSystem::Macos(system) => system.rollback_nat_forwarding(),
         }
     }
 
@@ -1118,6 +1473,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_dns_protection(),
             RuntimeSystem::Linux(system) => system.apply_dns_protection(),
+            RuntimeSystem::Macos(system) => system.apply_dns_protection(),
         }
     }
 
@@ -1125,6 +1481,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_dns_protection(),
             RuntimeSystem::Linux(system) => system.rollback_dns_protection(),
+            RuntimeSystem::Macos(system) => system.rollback_dns_protection(),
         }
     }
 
@@ -1132,6 +1489,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.hard_disable_ipv6_egress(),
             RuntimeSystem::Linux(system) => system.hard_disable_ipv6_egress(),
+            RuntimeSystem::Macos(system) => system.hard_disable_ipv6_egress(),
         }
     }
 
@@ -1139,6 +1497,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_ipv6_egress(),
             RuntimeSystem::Linux(system) => system.rollback_ipv6_egress(),
+            RuntimeSystem::Macos(system) => system.rollback_ipv6_egress(),
         }
     }
 
@@ -1146,6 +1505,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.assert_killswitch(),
             RuntimeSystem::Linux(system) => system.assert_killswitch(),
+            RuntimeSystem::Macos(system) => system.assert_killswitch(),
         }
     }
 
@@ -1153,6 +1513,7 @@ impl DataplaneSystem for RuntimeSystem {
         match self {
             RuntimeSystem::DryRun(system) => system.block_all_egress(),
             RuntimeSystem::Linux(system) => system.block_all_egress(),
+            RuntimeSystem::Macos(system) => system.block_all_egress(),
         }
     }
 }
@@ -1578,6 +1939,31 @@ fn resolve_binary_path_for_program(
             SYSCTL_BINARY_PATH_ENV,
             DEFAULT_SYSCTL_BINARY_PATH,
             PrivilegedCommandProgram::Sysctl,
+        ),
+        PrivilegedCommandProgram::Ifconfig => resolve_binary_path(
+            IFCONFIG_BINARY_PATH_ENV,
+            DEFAULT_IFCONFIG_BINARY_PATH,
+            PrivilegedCommandProgram::Ifconfig,
+        ),
+        PrivilegedCommandProgram::Route => resolve_binary_path(
+            ROUTE_BINARY_PATH_ENV,
+            DEFAULT_ROUTE_BINARY_PATH,
+            PrivilegedCommandProgram::Route,
+        ),
+        PrivilegedCommandProgram::Pfctl => resolve_binary_path(
+            PFCTL_BINARY_PATH_ENV,
+            DEFAULT_PFCTL_BINARY_PATH,
+            PrivilegedCommandProgram::Pfctl,
+        ),
+        PrivilegedCommandProgram::WireguardGo => resolve_binary_path(
+            WIREGUARD_GO_BINARY_PATH_ENV,
+            DEFAULT_WIREGUARD_GO_BINARY_PATH,
+            PrivilegedCommandProgram::WireguardGo,
+        ),
+        PrivilegedCommandProgram::Kill => resolve_binary_path(
+            KILL_BINARY_PATH_ENV,
+            DEFAULT_KILL_BINARY_PATH,
+            PrivilegedCommandProgram::Kill,
         ),
     }
 }
@@ -2242,5 +2628,19 @@ mod tests {
         assert!(err.to_string().contains("must be root-owned"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn owned_anchor_names_filters_only_rustynet_anchors() {
+        let parsed = MacosCommandSystem::owned_anchor_names_from_output(
+            "com.apple\ncom.apple/rustynet_g1\ncom.apple/other\n  com.apple/rustynet_g77\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "com.apple/rustynet_g1".to_string(),
+                "com.apple/rustynet_g77".to_string()
+            ]
+        );
     }
 }

@@ -37,6 +37,11 @@ pub enum PrivilegedCommandProgram {
     Nft,
     Wg,
     Sysctl,
+    Ifconfig,
+    Route,
+    Pfctl,
+    WireguardGo,
+    Kill,
 }
 
 impl PrivilegedCommandProgram {
@@ -46,6 +51,11 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Nft => "nft",
             PrivilegedCommandProgram::Wg => "wg",
             PrivilegedCommandProgram::Sysctl => "sysctl",
+            PrivilegedCommandProgram::Ifconfig => "ifconfig",
+            PrivilegedCommandProgram::Route => "route",
+            PrivilegedCommandProgram::Pfctl => "pfctl",
+            PrivilegedCommandProgram::WireguardGo => "wireguard-go",
+            PrivilegedCommandProgram::Kill => "kill",
         }
     }
 
@@ -55,6 +65,11 @@ impl PrivilegedCommandProgram {
             "nft" => Some(PrivilegedCommandProgram::Nft),
             "wg" => Some(PrivilegedCommandProgram::Wg),
             "sysctl" => Some(PrivilegedCommandProgram::Sysctl),
+            "ifconfig" => Some(PrivilegedCommandProgram::Ifconfig),
+            "route" => Some(PrivilegedCommandProgram::Route),
+            "pfctl" => Some(PrivilegedCommandProgram::Pfctl),
+            "wireguard-go" => Some(PrivilegedCommandProgram::WireguardGo),
+            "kill" => Some(PrivilegedCommandProgram::Kill),
             _ => None,
         }
     }
@@ -67,6 +82,19 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Sysctl => {
                 &["/usr/sbin/sysctl", "/sbin/sysctl", "/usr/bin/sysctl"]
             }
+            PrivilegedCommandProgram::Ifconfig => {
+                &["/sbin/ifconfig", "/usr/sbin/ifconfig", "/usr/bin/ifconfig"]
+            }
+            PrivilegedCommandProgram::Route => {
+                &["/sbin/route", "/usr/sbin/route", "/usr/bin/route"]
+            }
+            PrivilegedCommandProgram::Pfctl => &["/sbin/pfctl", "/usr/sbin/pfctl"],
+            PrivilegedCommandProgram::WireguardGo => &[
+                "/usr/local/bin/wireguard-go",
+                "/opt/homebrew/bin/wireguard-go",
+                "/usr/bin/wireguard-go",
+            ],
+            PrivilegedCommandProgram::Kill => &["/bin/kill", "/usr/bin/kill"],
         }
     }
 

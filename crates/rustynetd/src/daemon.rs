@@ -17,6 +17,8 @@ use crate::key_material::{
     generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
     write_runtime_private_key,
 };
+#[cfg(target_os = "macos")]
+use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
     ApplyOptions, DataplaneState, DataplaneSystem, Phase10Controller, RouteGrantRequest,
     RuntimeSystem, TrustEvidence, TrustPolicy,
@@ -48,9 +50,13 @@ use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
     RuntimeContext, TunnelBackend, TunnelStats,
 };
-use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(target_os = "linux")]
-use rustynet_backend_wireguard::{LinuxWireguardBackend, WireguardCommandRunner};
+use rustynet_backend_wireguard::LinuxWireguardBackend;
+#[cfg(target_os = "macos")]
+use rustynet_backend_wireguard::MacosWireguardBackend;
+use rustynet_backend_wireguard::WireguardBackend;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use rustynet_backend_wireguard::WireguardCommandRunner;
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
@@ -98,11 +104,21 @@ pub enum DaemonDataplaneMode {
 pub enum DaemonBackendMode {
     InMemory,
     LinuxWireguard,
+    MacosWireguard,
 }
 
 #[allow(clippy::derivable_impls)]
 impl Default for DaemonBackendMode {
     fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            return DaemonBackendMode::LinuxWireguard;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return DaemonBackendMode::MacosWireguard;
+        }
+        #[allow(unreachable_code)]
         DaemonBackendMode::LinuxWireguard
     }
 }
@@ -429,15 +445,17 @@ enum DaemonBackend {
     InMemory(WireguardBackend),
     #[cfg(target_os = "linux")]
     Linux(LinuxWireguardBackend<PrivilegedHelperWireguardRunner>),
+    #[cfg(target_os = "macos")]
+    Macos(MacosWireguardBackend<PrivilegedHelperWireguardRunner>),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone)]
 struct PrivilegedHelperWireguardRunner {
     helper_client: PrivilegedCommandClient,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PrivilegedHelperWireguardRunner {
     fn new(helper_client: PrivilegedCommandClient) -> Self {
         Self { helper_client }
@@ -447,6 +465,10 @@ impl PrivilegedHelperWireguardRunner {
         match program {
             "ip" => Ok(PrivilegedCommandProgram::Ip),
             "wg" => Ok(PrivilegedCommandProgram::Wg),
+            "ifconfig" => Ok(PrivilegedCommandProgram::Ifconfig),
+            "route" => Ok(PrivilegedCommandProgram::Route),
+            "wireguard-go" => Ok(PrivilegedCommandProgram::WireguardGo),
+            "kill" => Ok(PrivilegedCommandProgram::Kill),
             _ => Err(BackendError::invalid_input(
                 "unsupported privileged wireguard backend command",
             )),
@@ -454,7 +476,7 @@ impl PrivilegedHelperWireguardRunner {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WireguardCommandRunner for PrivilegedHelperWireguardRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
         let helper_program = Self::helper_program_for(program)?;
@@ -541,6 +563,46 @@ impl DaemonBackend {
                     ))
                 }
             }
+            DaemonBackendMode::MacosWireguard => {
+                #[cfg(target_os = "macos")]
+                {
+                    let helper_socket = config
+                        .privileged_helper_socket_path
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DaemonError::InvalidConfig(
+                                "privileged helper socket path is required for macos-wireguard backend"
+                                    .to_string(),
+                            )
+                        })?;
+                    let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
+                        DaemonError::InvalidConfig(
+                            "wg private key path is required for macos-wireguard backend"
+                                .to_string(),
+                        )
+                    })?;
+                    validate_private_key_permissions(private_key)?;
+                    let helper_client = PrivilegedCommandClient::new(
+                        helper_socket.clone(),
+                        Duration::from_millis(config.privileged_helper_timeout_ms),
+                    )
+                    .map_err(DaemonError::InvalidConfig)?;
+                    let backend = MacosWireguardBackend::new(
+                        PrivilegedHelperWireguardRunner::new(helper_client),
+                        config.wg_interface.clone(),
+                        private_key.to_string_lossy().to_string(),
+                        config.egress_interface.clone(),
+                    )
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    Ok(Self::Macos(backend))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "macos-wireguard backend is only supported on macos".to_string(),
+                    ))
+                }
+            }
         }
     }
 }
@@ -551,6 +613,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.name(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.name(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.name(),
         }
     }
 
@@ -559,6 +623,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.capabilities(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.capabilities(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.capabilities(),
         }
     }
 
@@ -567,6 +633,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.start(context),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.start(context),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.start(context),
         }
     }
 
@@ -575,6 +643,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.configure_peer(peer),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.configure_peer(peer),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.configure_peer(peer),
         }
     }
 
@@ -583,6 +653,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.remove_peer(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.remove_peer(node_id),
         }
     }
 
@@ -591,6 +663,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.apply_routes(routes),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.apply_routes(routes),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.apply_routes(routes),
         }
     }
 
@@ -599,6 +673,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.set_exit_mode(mode),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.set_exit_mode(mode),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.set_exit_mode(mode),
         }
     }
 
@@ -607,6 +683,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.stats(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.stats(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.stats(),
         }
     }
 
@@ -615,6 +693,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => backend.shutdown(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.shutdown(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.shutdown(),
         }
     }
 }
@@ -1292,15 +1372,29 @@ impl DaemonRuntime {
 
     fn set_interface_down_runtime(&self) -> Result<(), String> {
         if let Some(client) = self.privileged_helper_client.as_ref() {
-            let output = client.run_capture(
-                PrivilegedCommandProgram::Ip,
-                &["link", "set", "down", "dev", self.wg_interface.as_str()],
-            )?;
+            let output = match self.backend_mode {
+                DaemonBackendMode::LinuxWireguard => client.run_capture(
+                    PrivilegedCommandProgram::Ip,
+                    &["link", "set", "down", "dev", self.wg_interface.as_str()],
+                )?,
+                DaemonBackendMode::MacosWireguard => client.run_capture(
+                    PrivilegedCommandProgram::Ifconfig,
+                    &[self.wg_interface.as_str(), "down"],
+                )?,
+                DaemonBackendMode::InMemory => {
+                    return Err("interface down is not supported for in-memory backend".to_string());
+                }
+            };
             if output.success() {
                 return Ok(());
             }
+            let command_label = match self.backend_mode {
+                DaemonBackendMode::LinuxWireguard => "ip link set down",
+                DaemonBackendMode::MacosWireguard => "ifconfig down",
+                DaemonBackendMode::InMemory => "interface down",
+            };
             return Err(format!(
-                "ip link set down failed for {}: status={} stderr={}",
+                "{command_label} failed for {}: status={} stderr={}",
                 self.wg_interface, output.status, output.stderr
             ));
         }
@@ -1308,8 +1402,14 @@ impl DaemonRuntime {
     }
 
     fn rotate_local_key_material(&mut self) -> Result<String, String> {
-        if !matches!(self.backend_mode, DaemonBackendMode::LinuxWireguard) {
-            return Err("key rotation is only supported for linux-wireguard backend".to_string());
+        if !matches!(
+            self.backend_mode,
+            DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+        ) {
+            return Err(
+                "key rotation is only supported for linux-wireguard or macos-wireguard backend"
+                    .to_string(),
+            );
         }
         let runtime_path = self
             .wg_private_key_path
@@ -1407,8 +1507,14 @@ impl DaemonRuntime {
     }
 
     fn revoke_local_key_material(&mut self) -> Result<String, String> {
-        if !matches!(self.backend_mode, DaemonBackendMode::LinuxWireguard) {
-            return Err("key revoke is only supported for linux-wireguard backend".to_string());
+        if !matches!(
+            self.backend_mode,
+            DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+        ) {
+            return Err(
+                "key revoke is only supported for linux-wireguard or macos-wireguard backend"
+                    .to_string(),
+            );
         }
         self.restrict_permanent("local key revoked".to_string());
         let _ = self.controller.force_fail_closed("local_key_revoked");
@@ -1782,7 +1888,37 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Linux(system))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(test)]
+        if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+            return Ok(RuntimeSystem::DryRun(
+                crate::phase10::DryRunSystem::default(),
+            ));
+        }
+
+        let helper_client = config
+            .privileged_helper_socket_path
+            .as_ref()
+            .map(|path| {
+                PrivilegedCommandClient::new(
+                    path.clone(),
+                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                )
+            })
+            .transpose()
+            .map_err(DaemonError::InvalidConfig)?;
+        let system = MacosCommandSystem::new(
+            config.wg_interface.clone(),
+            config.egress_interface.clone(),
+            helper_client,
+            config.fail_closed_ssh_allow,
+            config.fail_closed_ssh_allow_cidrs.clone(),
+        )
+        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        Ok(RuntimeSystem::Macos(system))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
             #[cfg(test)]
@@ -1793,7 +1929,8 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             }
         }
         Err(DaemonError::InvalidConfig(
-            "daemon dataplane requires a linux host and linux-wireguard backend".to_string(),
+            "daemon dataplane requires a linux or macos host with a supported wireguard backend"
+                .to_string(),
         ))
     }
 }
@@ -1943,7 +2080,10 @@ fn scrub_runtime_wireguard_key_material(
     runtime_path: Option<&Path>,
     encrypted_private_key_path: Option<&Path>,
 ) -> Result<(), String> {
-    if !matches!(backend_mode, DaemonBackendMode::LinuxWireguard) {
+    if !matches!(
+        backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) {
         return Ok(());
     }
     if encrypted_private_key_path.is_none() {
@@ -1974,12 +2114,16 @@ fn prepare_runtime_wireguard_key_material(
     encrypted_private_key_path: Option<&Path>,
     passphrase_path: Option<&Path>,
 ) -> Result<(), String> {
-    if !matches!(backend_mode, DaemonBackendMode::LinuxWireguard) {
+    if !matches!(
+        backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) {
         return Ok(());
     }
 
-    let runtime_path = runtime_path
-        .ok_or_else(|| "wg private key path is required for linux-wireguard backend".to_string())?;
+    let runtime_path = runtime_path.ok_or_else(|| {
+        "wg private key path is required for linux-wireguard or macos-wireguard backend".to_string()
+    })?;
 
     if let Some(encrypted_path) = encrypted_private_key_path {
         let passphrase_path = passphrase_path.ok_or_else(|| {
@@ -2131,7 +2275,10 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "auto tunnel enforce requires bundle, verifier key, and watermark paths".to_string(),
         ));
     }
-    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) {
         if let Some(path) = config.wg_private_key_path.as_ref() {
             if !path.is_absolute() {
                 return Err(DaemonError::InvalidConfig(
@@ -2174,11 +2321,14 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         }
     }
 
-    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
-        && config.wg_private_key_path.is_none()
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) && config.wg_private_key_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "wg private key path is required for linux-wireguard backend".to_string(),
+            "wg private key path is required for linux-wireguard or macos-wireguard backend"
+                .to_string(),
         ));
     }
     if config.reconcile_interval_ms == 0 {
@@ -2212,11 +2362,14 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             ));
         }
     }
-    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
-        && config.privileged_helper_socket_path.is_none()
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) && config.privileged_helper_socket_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "privileged helper socket path is required for linux-wireguard backend".to_string(),
+            "privileged helper socket path is required for linux-wireguard or macos-wireguard backend"
+                .to_string(),
         ));
     }
 
@@ -2300,7 +2453,10 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         validate_auto_tunnel_bundle_permissions(bundle_path)?;
         validate_auto_tunnel_verifier_key_permissions(verifier_key_path)?;
     }
-    if matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+    ) {
         if let Some(path) = config.wg_private_key_path.as_ref() {
             validate_private_key_permissions(path)?;
         }

@@ -25,9 +25,15 @@ const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
 const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
+#[cfg(not(target_os = "macos"))]
 const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
+#[cfg(target_os = "macos")]
+const IFCONFIG_BINARY_PATH_ENV: &str = "RUSTYNET_IFCONFIG_BINARY_PATH";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
+#[cfg(target_os = "macos")]
+const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     let source_path = resolve_passphrase_source(path);
@@ -279,23 +285,46 @@ pub fn apply_interface_private_key(
 
 pub fn set_interface_down(interface_name: &str) -> Result<(), String> {
     validate_interface_name(interface_name)?;
-    let ip_binary = resolve_ip_binary_path()?;
-    let status = Command::new(&ip_binary)
-        .arg("link")
-        .arg("set")
-        .arg("down")
-        .arg("dev")
-        .arg(interface_name)
-        .status()
-        .map_err(|err| {
-            format!(
-                "ip link set down spawn failed ({}): {err}",
-                ip_binary.display()
-            )
-        })?;
+    #[cfg(target_os = "macos")]
+    let status = {
+        let ifconfig_binary = resolve_ifconfig_binary_path()?;
+        Command::new(&ifconfig_binary)
+            .arg(interface_name)
+            .arg("down")
+            .status()
+            .map_err(|err| {
+                format!(
+                    "ifconfig down spawn failed ({}): {err}",
+                    ifconfig_binary.display()
+                )
+            })?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status = {
+        let ip_binary = resolve_ip_binary_path()?;
+        Command::new(&ip_binary)
+            .arg("link")
+            .arg("set")
+            .arg("down")
+            .arg("dev")
+            .arg(interface_name)
+            .status()
+            .map_err(|err| {
+                format!(
+                    "ip link set down spawn failed ({}): {err}",
+                    ip_binary.display()
+                )
+            })?
+    };
     if status.success() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    return Err(format!(
+        "ifconfig down failed for {}: {}",
+        interface_name, status
+    ));
+    #[cfg(not(target_os = "macos"))]
     Err(format!(
         "ip link set down failed for {}: {}",
         interface_name, status
@@ -562,8 +591,18 @@ fn resolve_wireguard_binary_path() -> Result<PathBuf, String> {
     resolve_binary_path(WG_BINARY_PATH_ENV, DEFAULT_WG_BINARY_PATH, "wg")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn resolve_ip_binary_path() -> Result<PathBuf, String> {
     resolve_binary_path(IP_BINARY_PATH_ENV, DEFAULT_IP_BINARY_PATH, "ip")
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_ifconfig_binary_path() -> Result<PathBuf, String> {
+    resolve_binary_path(
+        IFCONFIG_BINARY_PATH_ENV,
+        DEFAULT_IFCONFIG_BINARY_PATH,
+        "ifconfig",
+    )
 }
 
 fn resolve_binary_path(env_var: &str, default_path: &str, label: &str) -> Result<PathBuf, String> {

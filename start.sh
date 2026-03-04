@@ -25,8 +25,11 @@ WG_PUBLIC_KEY_PATH="/var/lib/rustynet/keys/wireguard.pub"
 EGRESS_INTERFACE=""
 MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
 MEMBERSHIP_LOG_PATH="/var/lib/rustynet/membership.log"
+MEMBERSHIP_WATERMARK_PATH="/var/lib/rustynet/membership.watermark"
 BACKEND_MODE="linux-wireguard"
 DATAPLANE_MODE="hybrid-native"
+PRIVILEGED_HELPER_SOCKET_PATH="/run/rustynet/rustynetd-privileged.sock"
+PRIVILEGED_HELPER_TIMEOUT_MS="2000"
 RECONCILE_INTERVAL_MS="1000"
 MAX_RECONCILE_FAILURES="5"
 FAIL_CLOSED_SSH_ALLOW="0"
@@ -53,7 +56,15 @@ HOST_PROFILE="unknown"
 MACOS_STATE_BASE="${HOME}/Library/Application Support/rustynet"
 MACOS_RUNTIME_BASE="${HOME}/Library/Caches/rustynet"
 MACOS_LOG_BASE="${HOME}/Library/Logs/rustynet"
-export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+MACOS_DAEMON_PID_PATH="${MACOS_RUNTIME_BASE}/rustynetd.pid"
+MACOS_HELPER_PID_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.pid"
+MACOS_DAEMON_LOG_PATH="${MACOS_LOG_BASE}/rustynetd.log"
+MACOS_HELPER_LOG_PATH="${MACOS_LOG_BASE}/rustynetd-privileged.log"
+MACOS_LOCAL_TOOLS_BASE="${HOME}/.local/rustynet-tools"
+MACOS_LOCAL_TOOLS_BIN="${MACOS_LOCAL_TOOLS_BASE}/bin"
+MACOS_LOCAL_GO_VERSION="1.23.1"
+MACOS_WIREGUARD_TOOLS_VERSION="1.0.20210914"
+export PATH="/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/sbin:/sbin:${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
 touch "${PEERS_FILE}"
@@ -99,9 +110,12 @@ apply_host_profile_defaults() {
     WG_ENCRYPTED_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
     WG_KEY_PASSPHRASE_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
     WG_PUBLIC_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
+    WG_INTERFACE="utun9"
     MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
     MEMBERSHIP_LOG_PATH="${MACOS_STATE_BASE}/compat/membership/membership.log"
+    MEMBERSHIP_WATERMARK_PATH="${MACOS_STATE_BASE}/compat/membership/membership.watermark"
     TRUST_SIGNER_KEY_PATH="${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
+    PRIVILEGED_HELPER_SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
     MANUAL_PEER_AUDIT_LOG="${MACOS_LOG_BASE}/manual-peer-override.log"
     MANUAL_PEER_OVERRIDE="0"
     return
@@ -158,13 +172,20 @@ enforce_host_storage_policy() {
   coerce_macos_path_var WG_ENCRYPTED_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
   coerce_macos_path_var WG_KEY_PASSPHRASE_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
   coerce_macos_path_var WG_PUBLIC_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
+  coerce_macos_path_var PRIVILEGED_HELPER_SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
   coerce_macos_path_var MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
   coerce_macos_path_var MEMBERSHIP_LOG_PATH "${MACOS_STATE_BASE}/compat/membership/membership.log"
+  coerce_macos_path_var MEMBERSHIP_WATERMARK_PATH "${MACOS_STATE_BASE}/compat/membership/membership.watermark"
   coerce_macos_path_var TRUST_SIGNER_KEY_PATH "${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
   coerce_macos_path_var MANUAL_PEER_AUDIT_LOG "${MACOS_LOG_BASE}/manual-peer-override.log"
 
+  if [[ ! "${WG_INTERFACE}" =~ ^utun[0-9]+$ ]]; then
+    print_warn "WG_INTERFACE '${WG_INTERFACE}' is not valid on macOS; resetting to 'utun9'."
+    WG_INTERFACE="utun9"
+  fi
+
   if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
-    print_warn "Manual peer break-glass override is disabled on macOS compatibility hosts."
+    print_warn "Manual peer break-glass override is disabled on macOS hosts."
     MANUAL_PEER_OVERRIDE="0"
   fi
 }
@@ -176,7 +197,7 @@ require_linux_dataplane() {
   fi
   print_err "${action} requires a Linux dataplane host."
   if is_macos_host; then
-    print_info "On macOS, use this wizard for build/validation and manage a Linux node for dataplane/runtime."
+    print_info "This operation currently has no macOS implementation path in start.sh."
   else
     print_info "Current host OS '${HOST_OS}' is not supported for dataplane/runtime operations."
   fi
@@ -236,7 +257,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|BACKEND_MODE|DATAPLANE_MODE|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -326,10 +347,14 @@ load_config_file() {
 }
 
 enforce_backend_mode() {
-  if [[ "${BACKEND_MODE}" != "linux-wireguard" ]]; then
-    print_warn "Unsupported backend '${BACKEND_MODE}' detected; forcing linux-wireguard."
+  local expected="linux-wireguard"
+  if is_macos_host; then
+    expected="macos-wireguard"
   fi
-  BACKEND_MODE="linux-wireguard"
+  if [[ "${BACKEND_MODE}" != "${expected}" ]]; then
+    print_warn "Unsupported backend '${BACKEND_MODE}' detected for ${HOST_PROFILE}; forcing ${expected}."
+  fi
+  BACKEND_MODE="${expected}"
 }
 
 enforce_auto_tunnel_policy() {
@@ -408,6 +433,27 @@ run_root() {
     print_info "Run 'sudo -v' in an interactive shell, then rerun this action."
     return 1
   fi
+}
+
+run_root_background() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@" &
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    sudo -b "$@"
+    return
+  fi
+
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -n -b "$@"
+    return
+  fi
+
+  print_err "A TTY sudo prompt is unavailable and cached sudo credentials were not found."
+  print_info "Run 'sudo -v' in an interactive shell, then rerun this action."
+  return 1
 }
 
 prompt_default() {
@@ -559,8 +605,13 @@ save_config() {
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
     printf 'WG_PUBLIC_KEY_PATH=%s\n' "${WG_PUBLIC_KEY_PATH}"
     printf 'EGRESS_INTERFACE=%s\n' "${EGRESS_INTERFACE}"
+    printf 'MEMBERSHIP_SNAPSHOT_PATH=%s\n' "${MEMBERSHIP_SNAPSHOT_PATH}"
+    printf 'MEMBERSHIP_LOG_PATH=%s\n' "${MEMBERSHIP_LOG_PATH}"
+    printf 'MEMBERSHIP_WATERMARK_PATH=%s\n' "${MEMBERSHIP_WATERMARK_PATH}"
     printf 'BACKEND_MODE=%s\n' "${BACKEND_MODE}"
     printf 'DATAPLANE_MODE=%s\n' "${DATAPLANE_MODE}"
+    printf 'PRIVILEGED_HELPER_SOCKET_PATH=%s\n' "${PRIVILEGED_HELPER_SOCKET_PATH}"
+    printf 'PRIVILEGED_HELPER_TIMEOUT_MS=%s\n' "${PRIVILEGED_HELPER_TIMEOUT_MS}"
     printf 'RECONCILE_INTERVAL_MS=%s\n' "${RECONCILE_INTERVAL_MS}"
     printf 'MAX_RECONCILE_FAILURES=%s\n' "${MAX_RECONCILE_FAILURES}"
     printf 'FAIL_CLOSED_SSH_ALLOW=%s\n' "${FAIL_CLOSED_SSH_ALLOW}"
@@ -625,6 +676,16 @@ add_macos_homebrew_to_path() {
   if ! is_macos_host; then
     return 0
   fi
+  if [[ -d "${MACOS_LOCAL_TOOLS_BIN}" ]]; then
+    case ":${PATH}:" in
+      *":${MACOS_LOCAL_TOOLS_BIN}:"*) ;;
+      *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BIN}" ;;
+    esac
+    case ":${PATH}:" in
+      *":${MACOS_LOCAL_TOOLS_BASE}/go/bin:"*) ;;
+      *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BASE}/go/bin" ;;
+    esac
+  fi
   if [[ -x /opt/homebrew/bin/brew ]]; then
     export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
     return 0
@@ -632,6 +693,99 @@ add_macos_homebrew_to_path() {
   if [[ -x /usr/local/bin/brew ]]; then
     export PATH="/usr/local/bin:/usr/local/sbin:${PATH}"
     return 0
+  fi
+}
+
+is_macos_admin_user() {
+  if ! is_macos_host; then
+    return 1
+  fi
+  id -Gn 2>/dev/null | tr ' ' '\n' | grep -qx 'admin'
+}
+
+ensure_macos_local_go_toolchain() {
+  if command -v go >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local arch go_arch tarball_url tmp_tar
+  arch="$(uname -m)"
+  case "${arch}" in
+    arm64|aarch64) go_arch="arm64" ;;
+    x86_64|amd64) go_arch="amd64" ;;
+    *)
+      print_err "Unsupported macOS architecture for local Go bootstrap: ${arch}"
+      return 1
+      ;;
+  esac
+
+  install -d -m 0700 "${MACOS_LOCAL_TOOLS_BASE}"
+  tmp_tar="$(mktemp)"
+  tarball_url="https://go.dev/dl/go${MACOS_LOCAL_GO_VERSION}.darwin-${go_arch}.tar.gz"
+  print_info "Installing local Go toolchain (${MACOS_LOCAL_GO_VERSION}) to ${MACOS_LOCAL_TOOLS_BASE}/go."
+  if ! curl --proto '=https' --tlsv1.2 -fsSL "${tarball_url}" -o "${tmp_tar}"; then
+    rm -f "${tmp_tar}"
+    print_err "Failed to download Go toolchain from ${tarball_url}"
+    return 1
+  fi
+  rm -rf "${MACOS_LOCAL_TOOLS_BASE}/go"
+  tar -xzf "${tmp_tar}" -C "${MACOS_LOCAL_TOOLS_BASE}"
+  rm -f "${tmp_tar}"
+  export PATH="${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
+}
+
+install_macos_unprivileged_wireguard_tools() {
+  if ! is_macos_host; then
+    return 0
+  fi
+
+  install -d -m 0700 "${MACOS_LOCAL_TOOLS_BIN}"
+  export PATH="${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
+
+  if [[ ! -x "/usr/local/bin/wireguard-go" ]]; then
+    ensure_macos_local_go_toolchain || return 1
+    local wg_go_src_dir
+    wg_go_src_dir="$(mktemp -d)"
+    if command -v git >/dev/null 2>&1; then
+      git clone --depth 1 https://git.zx2c4.com/wireguard-go "${wg_go_src_dir}"
+    else
+      local wg_go_tar
+      wg_go_tar="$(mktemp)"
+      curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://git.zx2c4.com/wireguard-go/snapshot/wireguard-go-master.tar.xz" \
+        -o "${wg_go_tar}"
+      tar -xf "${wg_go_tar}" -C "${wg_go_src_dir}" --strip-components=1
+      rm -f "${wg_go_tar}"
+    fi
+    make -C "${wg_go_src_dir}"
+    if run_root install -d -m 0755 /usr/local/bin \
+      && run_root install -m 0755 "${wg_go_src_dir}/wireguard-go" /usr/local/bin/wireguard-go; then
+      print_info "Installed wireguard-go to /usr/local/bin/wireguard-go"
+    else
+      install -m 0755 "${wg_go_src_dir}/wireguard-go" "${MACOS_LOCAL_TOOLS_BIN}/wireguard-go"
+      print_warn "Installed fallback wireguard-go at ${MACOS_LOCAL_TOOLS_BIN}/wireguard-go (not root-owned)."
+    fi
+    rm -rf "${wg_go_src_dir}"
+  fi
+
+  if [[ ! -x "/usr/local/bin/wg" ]]; then
+    local wg_tools_src_dir wg_tools_tar
+    wg_tools_src_dir="$(mktemp -d)"
+    wg_tools_tar="$(mktemp)"
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-${MACOS_WIREGUARD_TOOLS_VERSION}.tar.xz" \
+      -o "${wg_tools_tar}"
+    tar -xf "${wg_tools_tar}" -C "${wg_tools_src_dir}" --strip-components=1
+    rm -f "${wg_tools_tar}"
+    make -C "${wg_tools_src_dir}/src"
+    if run_root install -d -m 0755 /usr/local/bin \
+      && run_root install -m 0755 "${wg_tools_src_dir}/src/wg" /usr/local/bin/wg; then
+      print_info "Installed wg to /usr/local/bin/wg"
+    else
+      install -m 0755 "${wg_tools_src_dir}/src/wg" "${MACOS_LOCAL_TOOLS_BIN}/wg"
+      print_warn "Installed fallback wg at ${MACOS_LOCAL_TOOLS_BIN}/wg (not root-owned)."
+    fi
+    rm -rf "${wg_tools_src_dir}"
   fi
 }
 
@@ -716,6 +870,13 @@ map_package() {
         echo "wireguard-tools"
       else
         echo "wireguard-tools"
+      fi
+      ;;
+    wireguard-go)
+      if [[ "${pm}" == "brew" ]]; then
+        echo "wireguard-go"
+      else
+        echo ""
       fi
       ;;
     ip)
@@ -955,6 +1116,8 @@ install_runtime_dependencies() {
   local required=(openssl xxd curl awk sed grep rg)
   if is_linux_host; then
     required+=(wg ip nft systemctl)
+  elif is_macos_host; then
+    required+=(wg wireguard-go)
   fi
   local missing=()
   local cmd
@@ -978,10 +1141,13 @@ install_runtime_dependencies() {
   pm="$(package_manager)"
   if is_macos_host && [[ "${pm}" == "unknown" ]]; then
     local only_rg_missing=1
+    local requires_wireguard_tools=0
     for cmd in "${missing[@]}"; do
       if [[ "${cmd}" != "rg" ]]; then
         only_rg_missing=0
-        break
+      fi
+      if [[ "${cmd}" == "wg" || "${cmd}" == "wireguard-go" ]]; then
+        requires_wireguard_tools=1
       fi
     done
 
@@ -1001,6 +1167,34 @@ install_runtime_dependencies() {
         return
       fi
       print_err "ripgrep fallback install did not produce an 'rg' binary in PATH."
+      exit 1
+    fi
+
+    if [[ "${requires_wireguard_tools}" == "1" ]] && ! is_macos_admin_user; then
+      print_warn "Homebrew is unavailable and current user is not in the macOS admin group."
+      print_info "Falling back to unprivileged local install for wireguard-go and wg."
+      install_macos_unprivileged_wireguard_tools
+      export PATH="${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
+      missing=()
+      for cmd in "${required[@]}"; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+          missing+=("${cmd}")
+        fi
+      done
+      if [[ "${#missing[@]}" -eq 0 ]]; then
+        return
+      fi
+      if [[ "${#missing[@]}" -eq 1 && "${missing[0]}" == "rg" ]]; then
+        if ! command -v cargo >/dev/null 2>&1 || ! check_rust_min_version; then
+          ensure_rust_toolchain
+        fi
+        cargo install --locked ripgrep
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+        if command -v rg >/dev/null 2>&1; then
+          return
+        fi
+      fi
+      print_err "Missing commands after unprivileged macOS fallback: ${missing[*]}"
       exit 1
     fi
 
@@ -1077,9 +1271,26 @@ ensure_binaries_available() {
   fi
 
   (cd "${ROOT_DIR}" && cargo build --release -p rustynetd -p rustynet-cli)
-  run_root install -d -m 0755 /usr/local/bin
-  run_root install -m 0755 "${ROOT_DIR}/target/release/rustynetd" /usr/local/bin/rustynetd
-  run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
+  local install_dir="/usr/local/bin"
+  if is_macos_host && ! test -w "${install_dir}"; then
+    if is_macos_admin_user; then
+      run_root install -d -m 0755 "${install_dir}"
+      run_root install -m 0755 "${ROOT_DIR}/target/release/rustynetd" "${install_dir}/rustynetd"
+      run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" "${install_dir}/rustynet"
+      return
+    fi
+    install_dir="${MACOS_LOCAL_TOOLS_BIN}"
+    print_warn "No admin write access to /usr/local/bin; installing rustynet binaries to ${install_dir}."
+    install -d -m 0700 "${install_dir}"
+    install -m 0755 "${ROOT_DIR}/target/release/rustynetd" "${install_dir}/rustynetd"
+    install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" "${install_dir}/rustynet"
+    export PATH="${install_dir}:${PATH}"
+    return
+  fi
+
+  run_root install -d -m 0755 "${install_dir}"
+  run_root install -m 0755 "${ROOT_DIR}/target/release/rustynetd" "${install_dir}/rustynetd"
+  run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" "${install_dir}/rustynet"
 }
 
 stat_mode() {
@@ -1167,7 +1378,11 @@ doctor_preflight() {
     if [[ "${SETUP_COMPLETE}" == "1" ]]; then
       doctor_check_mode "${WG_KEY_PASSPHRASE_PATH}" "600" "key custody"
       doctor_check_mode "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "600" "encrypted private key"
-      doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
+      if [[ -f "${WG_PRIVATE_KEY_PATH}" ]]; then
+        doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
+      else
+        doctor_warn "runtime private key not present (${WG_PRIVATE_KEY_PATH}); it will be derived at daemon startup"
+      fi
       doctor_check_mode "${TRUST_EVIDENCE_PATH}" "600" "trust evidence"
       doctor_check_mode "${TRUST_WATERMARK_PATH}" "600" "trust watermark"
       if [[ -S "${SOCKET_PATH}" ]]; then
@@ -1179,10 +1394,15 @@ doctor_preflight() {
       doctor_warn "setup not marked complete; run first-run setup"
     fi
   elif is_macos_host; then
+    doctor_require_cmd wg "macOS dataplane"
+    doctor_require_cmd wireguard-go "macOS dataplane"
+    doctor_require_cmd ifconfig "macOS dataplane"
+    doctor_require_cmd route "macOS dataplane"
+    doctor_require_cmd pfctl "macOS dataplane"
     if command -v brew >/dev/null 2>&1; then
       doctor_ok "homebrew present for macOS dependency management"
     else
-      doctor_warn "homebrew missing; limited fallback path is used when only ripgrep is absent"
+      doctor_warn "homebrew missing; dependency upgrades must be managed manually"
     fi
     if path_in_linux_runtime_roots "${SOCKET_PATH}" \
       || path_in_linux_runtime_roots "${STATE_PATH}" \
@@ -1192,7 +1412,24 @@ doctor_preflight() {
     else
       doctor_ok "macOS path policy enforced (no Linux runtime roots)"
     fi
-    doctor_warn "macOS runs in compatibility mode; Linux host is required for dataplane runtime."
+    if [[ "${SETUP_COMPLETE}" == "1" ]]; then
+      doctor_check_mode "${WG_KEY_PASSPHRASE_PATH}" "600" "key custody"
+      doctor_check_mode "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "600" "encrypted private key"
+      if [[ -f "${WG_PRIVATE_KEY_PATH}" ]]; then
+        doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
+      else
+        doctor_warn "runtime private key not present (${WG_PRIVATE_KEY_PATH}); it will be derived at daemon startup"
+      fi
+      doctor_check_mode "${TRUST_EVIDENCE_PATH}" "600" "trust evidence"
+      doctor_check_mode "${TRUST_WATERMARK_PATH}" "600" "trust watermark"
+      if [[ -S "${SOCKET_PATH}" ]]; then
+        doctor_ok "daemon IPC socket present (${SOCKET_PATH})"
+      else
+        doctor_warn "daemon IPC socket not present (${SOCKET_PATH}); daemon may be stopped"
+      fi
+    else
+      doctor_warn "setup not marked complete; run first-run setup"
+    fi
   else
     doctor_fail "unsupported host OS ${HOST_OS}"
   fi
@@ -1207,23 +1444,54 @@ doctor_preflight() {
 }
 
 prepare_system_directories() {
+  if is_linux_host; then
+    run_root install -d -m 0700 /etc/rustynet /run/rustynet /var/lib/rustynet
+    run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${TRUST_WATERMARK_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_BUNDLE_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_WATERMARK_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${PRIVILEGED_HELPER_SOCKET_PATH}")"
+    return
+  fi
+
+  if is_macos_host; then
+    install -d -m 0700 "${MACOS_STATE_BASE}" "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
+    install -d -m 0700 "$(dirname "${STATE_PATH}")"
+    install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
+    install -d -m 0700 "$(dirname "${TRUST_WATERMARK_PATH}")"
+    install -d -m 0700 "$(dirname "${AUTO_TUNNEL_BUNDLE_PATH}")"
+    install -d -m 0700 "$(dirname "${AUTO_TUNNEL_WATERMARK_PATH}")"
+    install -d -m 0700 "$(dirname "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")"
+    install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
+    install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
+    install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
+    install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
+    install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
+    install -d -m 0700 "$(dirname "${PRIVILEGED_HELPER_SOCKET_PATH}")"
+    return
+  fi
+
   require_linux_dataplane "prepare_system_directories" || return 0
-  run_root install -d -m 0700 /etc/rustynet /run/rustynet /var/lib/rustynet
-  run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${TRUST_EVIDENCE_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${TRUST_WATERMARK_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_BUNDLE_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_WATERMARK_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
-  run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
 }
 
 ensure_wireguard_keys() {
-  require_linux_dataplane "ensure_wireguard_keys" || return 0
+  run_with_scope() {
+    if is_linux_host; then
+      run_root "$@"
+    else
+      "$@"
+    fi
+  }
+
   if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" && -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    unset -f run_with_scope >/dev/null 2>&1 || true
     return
   fi
 
@@ -1236,7 +1504,7 @@ ensure_wireguard_keys() {
     local tmp_passphrase
     tmp_passphrase="$(mktemp)"
     openssl rand -hex 48 >"${tmp_passphrase}"
-    run_root install -m 0600 "${tmp_passphrase}" "${WG_KEY_PASSPHRASE_PATH}"
+    run_with_scope install -m 0600 "${tmp_passphrase}" "${WG_KEY_PASSPHRASE_PATH}"
     rm -f "${tmp_passphrase}"
     print_info "Generated key passphrase file at ${WG_KEY_PASSPHRASE_PATH}"
   fi
@@ -1249,7 +1517,7 @@ ensure_wireguard_keys() {
   fi
 
   if [[ -n "${source_private_key}" ]]; then
-    run_root rustynetd key migrate \
+    run_with_scope rustynetd key migrate \
       --existing-private-key "${source_private_key}" \
       --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
       --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
@@ -1257,14 +1525,15 @@ ensure_wireguard_keys() {
       --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
       --force
     if [[ "${source_private_key}" != "${WG_PRIVATE_KEY_PATH}" ]]; then
-      run_root rm -f "${source_private_key}"
+      run_with_scope rm -f "${source_private_key}"
       print_info "Removed legacy plaintext private key at ${source_private_key}"
     fi
     print_info "Existing key migrated to encrypted storage."
+    unset -f run_with_scope >/dev/null 2>&1 || true
     return
   fi
 
-  run_root rustynetd key init \
+  run_with_scope rustynetd key init \
     --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
     --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
     --public-key "${WG_PUBLIC_KEY_PATH}" \
@@ -1272,21 +1541,31 @@ ensure_wireguard_keys() {
     --force
 
   print_info "WireGuard key material initialized (encrypted key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH})"
+  unset -f run_with_scope >/dev/null 2>&1 || true
 }
 
 ensure_membership_files() {
-  require_linux_dataplane "ensure_membership_files" || return 0
+  run_with_scope() {
+    if is_linux_host; then
+      run_root "$@"
+    else
+      "$@"
+    fi
+  }
   if [[ -f "${MEMBERSHIP_SNAPSHOT_PATH}" && -f "${MEMBERSHIP_LOG_PATH}" ]]; then
     print_info "Membership files already present."
+    unset -f run_with_scope >/dev/null 2>&1 || true
     return
   fi
   print_info "Initializing membership files for node '${DEVICE_NODE_ID}'."
-  run_root rustynetd membership init \
+  run_with_scope rustynetd membership init \
     --snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
     --log "${MEMBERSHIP_LOG_PATH}" \
+    --watermark "${MEMBERSHIP_WATERMARK_PATH}" \
     --node-id "${DEVICE_NODE_ID}" \
     --network-id "local-net" \
     --force
+  unset -f run_with_scope >/dev/null 2>&1 || true
 }
 
 generate_verifier_key_from_signer() {
@@ -1317,11 +1596,17 @@ refresh_signed_trust_evidence() {
     RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
     RUSTYNET_TRUST_AUTO_REFRESH=true \
     "${refresh_script}"
+  if is_macos_host; then
+    local current_uid current_gid
+    current_uid="$(id -u)"
+    current_gid="$(id -g)"
+    run_root chown "${current_uid}:${current_gid}" "${TRUST_EVIDENCE_PATH}"
+    run_root chmod 600 "${TRUST_EVIDENCE_PATH}"
+  fi
   print_info "Signed trust evidence refreshed at ${TRUST_EVIDENCE_PATH}"
 }
 
 configure_trust_material() {
-  require_linux_dataplane "configure_trust_material" || return 0
   if is_client_role; then
     print_info "Client role detected: trust signer operations are disabled."
     local source_verifier
@@ -1333,13 +1618,19 @@ configure_trust_material() {
     fi
     if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
       local trust_group="root"
-      local trust_mode="0644"
-      local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
-      if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
-        trust_group="${daemon_group}"
-        trust_mode="0640"
+      local trust_mode="0600"
+      if is_linux_host; then
+        trust_mode="0644"
+        local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+        if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
+          trust_group="${daemon_group}"
+          trust_mode="0640"
+        fi
       fi
       run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
+      if is_macos_host; then
+        run_root chown "$(id -u):$(id -g)" "${TRUST_EVIDENCE_PATH}"
+      fi
     fi
     AUTO_REFRESH_TRUST="0"
     return 0
@@ -1387,13 +1678,19 @@ configure_trust_material() {
 
   if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
     local trust_group="root"
-    local trust_mode="0644"
-    local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
-    if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
-      trust_group="${daemon_group}"
-      trust_mode="0640"
+    local trust_mode="0600"
+    if is_linux_host; then
+      trust_mode="0644"
+      local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+      if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
+        trust_group="${daemon_group}"
+        trust_mode="0640"
+      fi
     fi
     run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
+    if is_macos_host; then
+      run_root chown "$(id -u):$(id -g)" "${TRUST_EVIDENCE_PATH}"
+    fi
   fi
 
   if prompt_yes_no "Do you also have signer key access for auto-refresh?" "n"; then
@@ -1405,11 +1702,14 @@ configure_trust_material() {
 }
 
 write_daemon_environment() {
-  require_linux_dataplane "write_daemon_environment" || return 0
   enforce_role_policy_defaults
   enforce_backend_mode
-  enforce_auto_tunnel_policy
   enforce_fail_closed_ssh_policy
+  if is_macos_host; then
+    return 0
+  fi
+  enforce_auto_tunnel_policy
+  require_linux_dataplane "write_daemon_environment" || return 0
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
@@ -1425,6 +1725,9 @@ write_daemon_environment() {
     RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
     RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
     RUSTYNET_TRUST_AUTO_REFRESH="$( [[ "${AUTO_REFRESH_TRUST}" == "1" ]] && echo true || echo false )" \
+    RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+    RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+    RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
     RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
     RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
     RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
@@ -1438,6 +1741,8 @@ write_daemon_environment() {
     RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
     RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
     RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
+    RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+    RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
     RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
     RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
     RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
@@ -1445,8 +1750,210 @@ write_daemon_environment() {
     "${service_installer}"
 }
 
+macos_wait_for_socket() {
+  local socket_path="$1"
+  local attempts=50
+  while (( attempts > 0 )); do
+    if [[ -S "${socket_path}" ]]; then
+      return 0
+    fi
+    sleep 0.1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+resolve_absolute_command_path() {
+  local cmd_name="$1"
+  local resolved
+  resolved="$(command -v "${cmd_name}" 2>/dev/null || true)"
+  if [[ -n "${resolved}" && "${resolved}" != /* ]]; then
+    resolved="$(type -P "${cmd_name}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${resolved}" || "${resolved}" != /* ]]; then
+    return 1
+  fi
+  printf '%s' "${resolved}"
+}
+
+require_root_owned_binary_path() {
+  local binary_path="$1"
+  local label="$2"
+  local owner_uid=""
+  if stat -c '%u' "${binary_path}" >/dev/null 2>&1; then
+    owner_uid="$(stat -c '%u' "${binary_path}")"
+  elif stat -f '%u' "${binary_path}" >/dev/null 2>&1; then
+    owner_uid="$(stat -f '%u' "${binary_path}")"
+  fi
+  if [[ -z "${owner_uid}" ]]; then
+    print_err "Unable to determine owner for ${label} binary at ${binary_path}"
+    return 1
+  fi
+  if [[ "${owner_uid}" != "0" ]]; then
+    print_err "${label} binary must be root-owned for privileged runtime safety: ${binary_path}"
+    return 1
+  fi
+}
+
+configure_macos_binary_path_env() {
+  if ! is_macos_host; then
+    return 0
+  fi
+
+  add_macos_homebrew_to_path
+  case ":${PATH}:" in
+    *":${MACOS_LOCAL_TOOLS_BIN}:"*) ;;
+    *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BIN}" ;;
+  esac
+  case ":${PATH}:" in
+    *":${MACOS_LOCAL_TOOLS_BASE}/go/bin:"*) ;;
+    *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BASE}/go/bin" ;;
+  esac
+
+  local wg_bin wireguard_go_bin ifconfig_bin route_bin pfctl_bin kill_bin
+  wg_bin="$(resolve_absolute_command_path wg)" || {
+    print_err "Unable to resolve absolute path for wg."
+    return 1
+  }
+  wireguard_go_bin="$(resolve_absolute_command_path wireguard-go)" || {
+    print_err "Unable to resolve absolute path for wireguard-go."
+    return 1
+  }
+  ifconfig_bin="$(resolve_absolute_command_path ifconfig)" || {
+    print_err "Unable to resolve absolute path for ifconfig."
+    return 1
+  }
+  route_bin="$(resolve_absolute_command_path route)" || {
+    print_err "Unable to resolve absolute path for route."
+    return 1
+  }
+  pfctl_bin="$(resolve_absolute_command_path pfctl)" || {
+    print_err "Unable to resolve absolute path for pfctl."
+    return 1
+  }
+  kill_bin="$(resolve_absolute_command_path kill)" || {
+    print_err "Unable to resolve absolute path for kill."
+    return 1
+  }
+
+  require_root_owned_binary_path "${wg_bin}" "wg" || return 1
+  require_root_owned_binary_path "${wireguard_go_bin}" "wireguard-go" || return 1
+  require_root_owned_binary_path "${ifconfig_bin}" "ifconfig" || return 1
+  require_root_owned_binary_path "${route_bin}" "route" || return 1
+  require_root_owned_binary_path "${pfctl_bin}" "pfctl" || return 1
+  require_root_owned_binary_path "${kill_bin}" "kill" || return 1
+
+  export RUSTYNET_WG_BINARY_PATH="${wg_bin}"
+  export RUSTYNET_WIREGUARD_GO_BINARY_PATH="${wireguard_go_bin}"
+  export RUSTYNET_IFCONFIG_BINARY_PATH="${ifconfig_bin}"
+  export RUSTYNET_ROUTE_BINARY_PATH="${route_bin}"
+  export RUSTYNET_PFCTL_BINARY_PATH="${pfctl_bin}"
+  export RUSTYNET_KILL_BINARY_PATH="${kill_bin}"
+}
+
+macos_stop_daemon_process() {
+  if [[ -f "${MACOS_DAEMON_PID_PATH}" ]]; then
+    local pid
+    pid="$(cat "${MACOS_DAEMON_PID_PATH}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      sleep 0.5
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    fi
+    rm -f "${MACOS_DAEMON_PID_PATH}"
+  fi
+  rm -f "${SOCKET_PATH}"
+}
+
+macos_stop_privileged_helper_process() {
+  run_root pkill -f "rustynetd privileged-helper --socket ${PRIVILEGED_HELPER_SOCKET_PATH}" 2>/dev/null || true
+  rm -f "${PRIVILEGED_HELPER_SOCKET_PATH}"
+}
+
+macos_start_privileged_helper_process() {
+  macos_stop_privileged_helper_process
+  configure_macos_binary_path_env || return 1
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  run_root_background env \
+    RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
+    RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
+    RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
+    RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
+    RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
+    RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
+    rustynetd privileged-helper \
+    --socket "${PRIVILEGED_HELPER_SOCKET_PATH}" \
+    --allowed-uid "${uid}" \
+    --allowed-gid "${gid}" \
+    --timeout-ms "${PRIVILEGED_HELPER_TIMEOUT_MS}"
+  if ! macos_wait_for_socket "${PRIVILEGED_HELPER_SOCKET_PATH}"; then
+    print_err "Timed out waiting for macOS privileged helper socket at ${PRIVILEGED_HELPER_SOCKET_PATH}."
+    return 1
+  fi
+}
+
+macos_start_daemon_process() {
+  macos_stop_daemon_process
+  configure_macos_binary_path_env || return 1
+  local uid gid
+  uid="$(id -u)"
+  gid="$(id -g)"
+  run_root install -d -m 0700 "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
+  run_root chown "${uid}:${gid}" "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
+  env \
+    RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
+    RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
+    RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
+    RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
+    RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
+    RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
+    rustynetd daemon \
+    --node-id "${DEVICE_NODE_ID}" \
+    --node-role "${NODE_ROLE}" \
+    --socket "${SOCKET_PATH}" \
+    --state "${STATE_PATH}" \
+    --trust-evidence "${TRUST_EVIDENCE_PATH}" \
+    --trust-verifier-key "${TRUST_VERIFIER_KEY_PATH}" \
+    --trust-watermark "${TRUST_WATERMARK_PATH}" \
+    --membership-snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
+    --membership-log "${MEMBERSHIP_LOG_PATH}" \
+    --membership-watermark "${MEMBERSHIP_WATERMARK_PATH}" \
+    --auto-tunnel-enforce "$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
+    --auto-tunnel-bundle "${AUTO_TUNNEL_BUNDLE_PATH}" \
+    --auto-tunnel-verifier-key "${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+    --auto-tunnel-watermark "${AUTO_TUNNEL_WATERMARK_PATH}" \
+    --auto-tunnel-max-age-secs "${AUTO_TUNNEL_MAX_AGE_SECS}" \
+    --backend "${BACKEND_MODE}" \
+    --wg-interface "${WG_INTERFACE}" \
+    --wg-private-key "${WG_PRIVATE_KEY_PATH}" \
+    --wg-encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+    --wg-key-passphrase "${WG_KEY_PASSPHRASE_PATH}" \
+    --wg-public-key "${WG_PUBLIC_KEY_PATH}" \
+    --egress-interface "${EGRESS_INTERFACE}" \
+    --dataplane-mode "${DATAPLANE_MODE}" \
+    --privileged-helper-socket "${PRIVILEGED_HELPER_SOCKET_PATH}" \
+    --privileged-helper-timeout-ms "${PRIVILEGED_HELPER_TIMEOUT_MS}" \
+    --reconcile-interval-ms "${RECONCILE_INTERVAL_MS}" \
+    --max-reconcile-failures "${MAX_RECONCILE_FAILURES}" \
+    --fail-closed-ssh-allow "$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
+    --fail-closed-ssh-allow-cidrs "${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
+    >"${MACOS_DAEMON_LOG_PATH}" 2>&1 &
+  local daemon_pid=$!
+  printf '%s\n' "${daemon_pid}" >"${MACOS_DAEMON_PID_PATH}"
+  chmod 600 "${MACOS_DAEMON_PID_PATH}"
+
+  if ! macos_wait_for_socket "${SOCKET_PATH}"; then
+    print_err "Timed out waiting for rustynetd socket at ${SOCKET_PATH}."
+    tail -n 40 "${MACOS_DAEMON_LOG_PATH}" 2>/dev/null || true
+    return 1
+  fi
+}
+
 start_or_restart_service() {
-  require_linux_dataplane "start_or_restart_service" || return 0
   if ! doctor_preflight; then
     print_err "Refusing to start service until preflight doctor passes."
     return 1
@@ -1455,20 +1962,61 @@ start_or_restart_service() {
   if [[ "${AUTO_REFRESH_TRUST}" == "1" && -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     refresh_signed_trust_evidence || print_warn "Failed to refresh trust evidence before start."
   fi
-  run_root systemctl daemon-reload
-  run_root systemctl enable rustynetd.service
-  run_root systemctl restart rustynetd.service
-  if ! run_root systemctl --no-pager --full status rustynetd.service; then
-    print_warn "Unable to read rustynetd.service status after restart."
+
+  if is_linux_host; then
+    run_root systemctl daemon-reload
+    run_root systemctl enable rustynetd.service
+    run_root systemctl restart rustynetd.service
+    if ! run_root systemctl --no-pager --full status rustynetd.service; then
+      print_warn "Unable to read rustynetd.service status after restart."
+    fi
+    return
   fi
+
+  if is_macos_host; then
+    macos_start_privileged_helper_process
+    macos_start_daemon_process
+    show_service_status
+    return
+  fi
+
+  require_linux_dataplane "start_or_restart_service" || return 0
 }
 
 stop_service() {
+  if is_linux_host; then
+    run_root systemctl stop rustynetd.service
+    return
+  fi
+  if is_macos_host; then
+    macos_stop_daemon_process
+    macos_stop_privileged_helper_process
+    return
+  fi
   require_linux_dataplane "stop_service" || return 0
-  run_root systemctl stop rustynetd.service
 }
 
 disconnect_vpn() {
+  if is_macos_host; then
+    print_info "Disabling exit-node mode before shutdown..."
+    run_rustynet_cli exit-node off >/dev/null 2>&1 || true
+    print_info "Stopping Rustynet daemon + privileged helper..."
+    stop_service
+    print_info "Stopping any remaining wireguard-go process for ${WG_INTERFACE}..."
+    run_root pkill -f "wireguard-go ${WG_INTERFACE}" 2>/dev/null || true
+    print_info "Flushing Rustynet PF anchors..."
+    local anchors_output=""
+    anchors_output="$(run_root pfctl -s Anchors 2>/dev/null)" || anchors_output=""
+    while IFS= read -r anchor; do
+      [[ -z "${anchor}" ]] && continue
+      if [[ "${anchor}" == com.apple/rustynet_g* ]]; then
+        run_root pfctl -a "${anchor}" -F all 2>/dev/null || true
+      fi
+    done <<<"${anchors_output}"
+    print_info "Rustynet VPN disconnected."
+    return
+  fi
+
   require_linux_dataplane "disconnect_vpn" || return 0
   print_info "Stopping Rustynet service..."
   if ! run_root systemctl stop rustynetd.service 2>/dev/null; then
@@ -1527,10 +2075,33 @@ disconnect_vpn() {
 }
 
 show_service_status() {
-  require_linux_dataplane "show_service_status" || return 0
-  if ! run_root systemctl --no-pager --full status rustynetd.service; then
-    print_warn "Unable to read rustynetd.service status."
+  if is_linux_host; then
+    if ! run_root systemctl --no-pager --full status rustynetd.service; then
+      print_warn "Unable to read rustynetd.service status."
+    fi
+    return
   fi
+  if is_macos_host; then
+    local daemon_pid=""
+    daemon_pid="$(cat "${MACOS_DAEMON_PID_PATH}" 2>/dev/null || true)"
+    if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
+      print_info "rustynetd running (pid ${daemon_pid})"
+    else
+      print_warn "rustynetd is not running."
+    fi
+    if [[ -S "${SOCKET_PATH}" ]]; then
+      print_info "daemon IPC socket present (${SOCKET_PATH})"
+    else
+      print_warn "daemon IPC socket missing (${SOCKET_PATH})"
+    fi
+    if [[ -S "${PRIVILEGED_HELPER_SOCKET_PATH}" ]]; then
+      print_info "privileged helper socket present (${PRIVILEGED_HELPER_SOCKET_PATH})"
+    else
+      print_warn "privileged helper socket missing (${PRIVILEGED_HELPER_SOCKET_PATH})"
+    fi
+    return
+  fi
+  require_linux_dataplane "show_service_status" || return 0
 }
 
 ensure_peer_store() {
@@ -1628,8 +2199,8 @@ refresh_menu_runtime_status() {
   MENU_EXIT_SELECTED_NODE="none"
   MENU_EXIT_SERVING="false"
 
-  if ! is_linux_host; then
-    MENU_NETWORK_STATE="compatibility-mode"
+  if ! is_linux_host && ! is_macos_host; then
+    MENU_NETWORK_STATE="unsupported-host"
     MENU_NETWORK_CONNECTED="n/a"
     MENU_NODE_ROLE="${NODE_ROLE}"
     MENU_EXIT_ROLE="n/a"
@@ -1756,7 +2327,6 @@ disconnect_device() {
 }
 
 show_connected_devices() {
-  require_linux_dataplane "show_connected_devices" || return 0
   echo "Saved peers:"
   print_saved_peers
   echo
@@ -1792,13 +2362,11 @@ connect_to_saved_admin_peers() {
 
 rotate_local_key() {
   require_admin_role "rotate_local_key" || return 0
-  require_linux_dataplane "rotate_local_key" || return 0
   run_rustynet_cli key rotate
 }
 
 revoke_local_key() {
   require_admin_role "revoke_local_key" || return 0
-  require_linux_dataplane "revoke_local_key" || return 0
   if ! prompt_yes_no "Revoke local key material now? This disables connectivity until reinitialized." "n"; then
     print_info "Revoke cancelled."
     return 0
@@ -1902,9 +2470,8 @@ configure_values() {
   fi
 
   if is_macos_host; then
-    print_info "macOS compatibility profile is active."
-    print_info "Linux dataplane/runtime actions remain blocked on this host."
-    print_info "Only user-space Rustynet paths are allowed; Linux system roots (/etc,/var,/run) are rejected."
+    print_info "macOS dataplane profile is active."
+    print_info "Runtime paths are user-scoped; Linux system roots (/etc,/var,/run) are rejected."
   fi
 
   prompt_default SOCKET_PATH "Daemon socket path" "${SOCKET_PATH}"
@@ -1924,13 +2491,14 @@ configure_values() {
   prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
+  prompt_default MEMBERSHIP_SNAPSHOT_PATH "Membership snapshot path" "${MEMBERSHIP_SNAPSHOT_PATH}"
+  prompt_default MEMBERSHIP_LOG_PATH "Membership log path" "${MEMBERSHIP_LOG_PATH}"
+  prompt_default MEMBERSHIP_WATERMARK_PATH "Membership watermark path" "${MEMBERSHIP_WATERMARK_PATH}"
   enforce_backend_mode
-  if is_linux_host; then
-    print_info "Backend mode is fixed to linux-wireguard for production-safe operation."
-  else
-    print_info "Backend mode remains linux-wireguard for cross-host config compatibility."
-  fi
+  print_info "Backend mode is fixed to ${BACKEND_MODE} for this host profile."
   prompt_default DATAPLANE_MODE "Dataplane mode (shell|hybrid-native)" "${DATAPLANE_MODE}"
+  prompt_default PRIVILEGED_HELPER_SOCKET_PATH "Privileged helper socket path" "${PRIVILEGED_HELPER_SOCKET_PATH}"
+  prompt_default PRIVILEGED_HELPER_TIMEOUT_MS "Privileged helper timeout (ms)" "${PRIVILEGED_HELPER_TIMEOUT_MS}"
   prompt_default RECONCILE_INTERVAL_MS "Reconcile interval (ms)" "${RECONCILE_INTERVAL_MS}"
   prompt_default MAX_RECONCILE_FAILURES "Max reconcile failures" "${MAX_RECONCILE_FAILURES}"
   prompt_default FAIL_CLOSED_SSH_ALLOW "Allow SSH management during fail-closed mode (0/1)" "${FAIL_CLOSED_SSH_ALLOW}"
@@ -1966,15 +2534,6 @@ first_run_setup() {
   ensure_rust_toolchain
   ensure_ci_security_tools
   ensure_binaries_available
-  if ! is_linux_host; then
-    print_warn "Linux dataplane/runtime provisioning is skipped on ${HOST_OS}."
-    print_info "This host is configured for build/validation workflows only."
-    print_info "No Linux runtime directories (/etc/rustynet, /var/lib/rustynet, /run/rustynet) are created on this host."
-    print_info "Run runtime dataplane setup on a Debian/Linux node with ./start.sh."
-    SETUP_COMPLETE="1"
-    save_config
-    return 0
-  fi
   prepare_system_directories
   ensure_wireguard_keys
   ensure_membership_files
@@ -2008,8 +2567,13 @@ Current Rustynet Wizard Configuration
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
   wg_public_key           : ${WG_PUBLIC_KEY_PATH}
   egress_interface        : ${EGRESS_INTERFACE}
+  membership_snapshot     : ${MEMBERSHIP_SNAPSHOT_PATH}
+  membership_log          : ${MEMBERSHIP_LOG_PATH}
+  membership_watermark    : ${MEMBERSHIP_WATERMARK_PATH}
   backend                 : ${BACKEND_MODE}
   dataplane_mode          : ${DATAPLANE_MODE}
+  privileged_helper_socket: ${PRIVILEGED_HELPER_SOCKET_PATH}
+  privileged_helper_timeout_ms: ${PRIVILEGED_HELPER_TIMEOUT_MS}
   reconcile_interval_ms   : ${RECONCILE_INTERVAL_MS}
   max_reconcile_failures  : ${MAX_RECONCILE_FAILURES}
   fail_closed_ssh_allow   : ${FAIL_CLOSED_SSH_ALLOW}
@@ -2027,14 +2591,12 @@ EOF
 
 offer_device_as_exit_node() {
   require_admin_role "offer_device_as_exit_node" || return 0
-  require_linux_dataplane "offer_device_as_exit_node" || return 0
   print_info "Advertising exit route (0.0.0.0/0)."
   run_rustynet_cli route advertise 0.0.0.0/0
   print_info "This device can now be selected as an exit node by peers (node id: ${DEVICE_NODE_ID})."
 }
 
 toggle_lan_access() {
-  require_linux_dataplane "toggle_lan_access" || return 0
   local choice
   read -r -p "LAN access [on/off]: " choice
   case "${choice}" in
@@ -2045,7 +2607,6 @@ toggle_lan_access() {
 }
 
 select_exit_node() {
-  require_linux_dataplane "select_exit_node" || return 0
   local node
   print_saved_peers
   prompt_default node "Exit node id to select" ""
@@ -2058,7 +2619,6 @@ select_exit_node() {
 
 advertise_route() {
   require_admin_role "advertise_route" || return 0
-  require_linux_dataplane "advertise_route" || return 0
   local cidr
   prompt_default cidr "CIDR to advertise (for LAN/exit routing)" "192.168.1.0/24"
   run_rustynet_cli route advertise "${cidr}"
@@ -2104,7 +2664,6 @@ apply_launch_profile() {
     return 0
   fi
 
-  require_linux_dataplane "apply_launch_profile:${profile}" || return 0
   print_info "Applying launch profile '${profile}'."
   start_or_restart_service
 
@@ -2377,10 +2936,10 @@ EOF
 }
 
 main_menu() {
-  if is_linux_host; then
+  if is_linux_host || is_macos_host; then
     print_info "Host OS: ${HOST_OS} (full dataplane/runtime mode)."
   else
-    print_warn "Host OS: ${HOST_OS} (compatibility mode: Linux dataplane actions are blocked)."
+    print_warn "Host OS: ${HOST_OS} (unsupported dataplane/runtime mode)."
   fi
   while true; do
     print_menu_runtime_header
@@ -2444,6 +3003,7 @@ add_macos_homebrew_to_path
 load_config_file
 enforce_host_storage_policy
 sanitize_launch_defaults
+enforce_backend_mode
 
 if [[ "${SETUP_COMPLETE}" != "1" ]]; then
   print_warn "Rustynet is not configured yet."
