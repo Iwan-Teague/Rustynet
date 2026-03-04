@@ -2,14 +2,14 @@
 
 use rustynetd::daemon::{
     DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES,
-    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
-    DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
-    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
-    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
-    DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode, DaemonConfig, DaemonDataplaneMode,
-    NodeRole, run_daemon,
+    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID,
+    DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS, DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH,
+    DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
+    DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_TRUSTED_HELPER_SOCKET_PATH,
+    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
+    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -561,10 +561,12 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zeroize::Zeroize;
 
     let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string();
     let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
     let mut watermark_path = DEFAULT_MEMBERSHIP_WATERMARK_PATH.to_string();
+    let mut owner_signing_key_path = DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH.to_string();
     let mut node_id = read_hostname_short();
     let mut network_id = "local-net".to_string();
     let mut force = false;
@@ -587,6 +589,13 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 watermark_path = args
                     .get(index + 1)
                     .ok_or("--watermark requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--owner-signing-key") => {
+                owner_signing_key_path = args
+                    .get(index + 1)
+                    .ok_or("--owner-signing-key requires a value")?
                     .clone();
                 index += 2;
             }
@@ -622,18 +631,29 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     if !watermark_path.starts_with('/') {
         return Err(format!("watermark path must be absolute: {watermark_path}"));
     }
+    if !owner_signing_key_path.starts_with('/') {
+        return Err(format!(
+            "owner signing key path must be absolute: {owner_signing_key_path}"
+        ));
+    }
 
     if !force
         && (std::path::Path::new(&snapshot_path).exists()
             || std::path::Path::new(&log_path).exists()
-            || std::path::Path::new(&watermark_path).exists())
+            || std::path::Path::new(&watermark_path).exists()
+            || std::path::Path::new(&owner_signing_key_path).exists())
     {
         return Err(format!(
-            "membership files already exist at {snapshot_path}, {log_path}, or {watermark_path}; use --force to overwrite"
+            "membership files already exist at {snapshot_path}, {log_path}, {watermark_path}, or {owner_signing_key_path}; use --force to overwrite"
         ));
     }
 
-    for path_str in [&snapshot_path, &log_path, &watermark_path] {
+    for path_str in [
+        &snapshot_path,
+        &log_path,
+        &watermark_path,
+        &owner_signing_key_path,
+    ] {
         if let Some(parent) = std::path::Path::new(path_str.as_str()).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
@@ -652,55 +672,69 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     fill_random_bytes(&mut approver_key_bytes)
         .map_err(|e| format!("failed to generate approver key: {e}"))?;
 
-    let approver_signing = SigningKey::from_bytes(&approver_key_bytes);
-    let approver_pubkey_hex = encode_hex(approver_signing.verifying_key().as_bytes());
-    let node_pubkey_hex = encode_hex(&node_key_bytes);
+    let init_result = (|| -> Result<String, String> {
+        let approver_signing = SigningKey::from_bytes(&approver_key_bytes);
+        let approver_pubkey_hex = encode_hex(approver_signing.verifying_key().as_bytes());
+        let node_pubkey_hex = encode_hex(&node_key_bytes);
+        let owner_approver_id = format!("{node_id}-owner");
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        persist_owner_signing_key(
+            std::path::Path::new(&owner_signing_key_path),
+            &approver_key_bytes,
+            force,
+        )?;
 
-    let state = MembershipState {
-        schema_version: MEMBERSHIP_SCHEMA_VERSION,
-        network_id: network_id.clone(),
-        epoch: 1,
-        nodes: vec![MembershipNode {
-            node_id: node_id.clone(),
-            node_pubkey_hex,
-            owner: node_id.clone(),
-            status: MembershipNodeStatus::Active,
-            roles: vec![],
-            joined_at_unix: now,
-            updated_at_unix: now,
-        }],
-        approver_set: vec![MembershipApprover {
-            approver_id: format!("{node_id}-owner"),
-            approver_pubkey_hex,
-            role: MembershipApproverRole::Owner,
-            status: MembershipApproverStatus::Active,
-            created_at_unix: now,
-        }],
-        quorum_threshold: 1,
-        metadata_hash: None,
-    };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-    persist_membership_snapshot(&snapshot_path, &state)
-        .map_err(|e| format!("failed to write membership snapshot: {e}"))?;
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: network_id.clone(),
+            epoch: 1,
+            nodes: vec![MembershipNode {
+                node_id: node_id.clone(),
+                node_pubkey_hex,
+                owner: node_id.clone(),
+                status: MembershipNodeStatus::Active,
+                roles: vec![],
+                joined_at_unix: now,
+                updated_at_unix: now,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: owner_approver_id.clone(),
+                approver_pubkey_hex,
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: now,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
-    let mut log_file = opts
-        .open(&log_path)
-        .map_err(|e| format!("failed to create membership log: {e}"))?;
-    log_file
-        .write_all(format!("version={MEMBERSHIP_SCHEMA_VERSION}\n").as_bytes())
-        .map_err(|e| format!("failed to write membership log: {e}"))?;
+        persist_membership_snapshot(&snapshot_path, &state)
+            .map_err(|e| format!("failed to write membership snapshot: {e}"))?;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut log_file = opts
+            .open(&log_path)
+            .map_err(|e| format!("failed to create membership log: {e}"))?;
+        log_file
+            .write_all(format!("version={MEMBERSHIP_SCHEMA_VERSION}\n").as_bytes())
+            .map_err(|e| format!("failed to write membership log: {e}"))?;
+        Ok(owner_approver_id)
+    })();
+
+    node_key_bytes.zeroize();
+    approver_key_bytes.zeroize();
+    let owner_approver_id = init_result?;
 
     println!(
-        "membership init complete: snapshot={snapshot_path} log={log_path} watermark_reset={watermark_path}"
+        "membership init complete: snapshot={snapshot_path} log={log_path} watermark_reset={watermark_path} owner_signing_key={owner_signing_key_path}"
     );
-    println!("  node_id={node_id} network_id={network_id}");
+    println!("  node_id={node_id} network_id={network_id} owner_approver_id={owner_approver_id}");
     Ok(())
 }
 
@@ -715,6 +749,79 @@ fn encode_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn persist_owner_signing_key(
+    path: &std::path::Path,
+    key_bytes: &[u8; 32],
+    force: bool,
+) -> Result<(), String> {
+    use std::io::{ErrorKind, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use zeroize::Zeroize;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "owner signing key path must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "owner signing key path must reference a regular file: {}",
+                    path.display()
+                ));
+            }
+            if !force {
+                return Err(format!(
+                    "owner signing key already exists at {}; use --force to overwrite",
+                    path.display()
+                ));
+            }
+            std::fs::remove_file(path).map_err(|err| {
+                format!(
+                    "failed to remove existing owner signing key {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect owner signing key {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options.open(path).map_err(|err| {
+        format!(
+            "failed to create owner signing key {}: {err}",
+            path.display()
+        )
+    })?;
+    let mut encoded = encode_hex(key_bytes);
+    encoded.push('\n');
+    file.write_all(encoded.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write owner signing key {}: {err}",
+            path.display()
+        )
+    })?;
+    file.sync_all()
+        .map_err(|err| format!("failed to sync owner signing key {}: {err}", path.display()))?;
+    encoded.zeroize();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
+        format!(
+            "failed to set owner signing key permissions {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn read_hostname_short() -> String {
@@ -732,7 +839,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
-        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--node-id <id>] [--network-id <id>] [--force]",
+        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
@@ -746,6 +853,9 @@ fn help_text() -> String {
         &format!("  membership_snapshot={DEFAULT_MEMBERSHIP_SNAPSHOT_PATH}"),
         &format!("  membership_log={DEFAULT_MEMBERSHIP_LOG_PATH}"),
         &format!("  membership_watermark={DEFAULT_MEMBERSHIP_WATERMARK_PATH}"),
+        &format!(
+            "  membership_owner_signing_key={DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
+        ),
         &format!("  backend={:?}", DaemonBackendMode::default()),
         &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
         &format!("  wg_private_key={DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH}"),

@@ -18,6 +18,7 @@ The wizard handles:
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
 - local key rotation/revocation and peer rotation-bundle apply flow
+- membership bootstrap with persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles
 - route advertisement and status checks
 

@@ -26,6 +26,7 @@ EGRESS_INTERFACE=""
 MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
 MEMBERSHIP_LOG_PATH="/var/lib/rustynet/membership.log"
 MEMBERSHIP_WATERMARK_PATH="/var/lib/rustynet/membership.watermark"
+MEMBERSHIP_OWNER_SIGNING_KEY_PATH="/etc/rustynet/membership.owner.key"
 BACKEND_MODE="linux-wireguard"
 DATAPLANE_MODE="hybrid-native"
 PRIVILEGED_HELPER_SOCKET_PATH="/run/rustynet/rustynetd-privileged.sock"
@@ -114,6 +115,7 @@ apply_host_profile_defaults() {
     MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
     MEMBERSHIP_LOG_PATH="${MACOS_STATE_BASE}/compat/membership/membership.log"
     MEMBERSHIP_WATERMARK_PATH="${MACOS_STATE_BASE}/compat/membership/membership.watermark"
+    MEMBERSHIP_OWNER_SIGNING_KEY_PATH="${MACOS_STATE_BASE}/compat/membership/membership.owner.key"
     TRUST_SIGNER_KEY_PATH="${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
     PRIVILEGED_HELPER_SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
     MANUAL_PEER_AUDIT_LOG="${MACOS_LOG_BASE}/manual-peer-override.log"
@@ -176,6 +178,7 @@ enforce_host_storage_policy() {
   coerce_macos_path_var MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
   coerce_macos_path_var MEMBERSHIP_LOG_PATH "${MACOS_STATE_BASE}/compat/membership/membership.log"
   coerce_macos_path_var MEMBERSHIP_WATERMARK_PATH "${MACOS_STATE_BASE}/compat/membership/membership.watermark"
+  coerce_macos_path_var MEMBERSHIP_OWNER_SIGNING_KEY_PATH "${MACOS_STATE_BASE}/compat/membership/membership.owner.key"
   coerce_macos_path_var TRUST_SIGNER_KEY_PATH "${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
   coerce_macos_path_var MANUAL_PEER_AUDIT_LOG "${MACOS_LOG_BASE}/manual-peer-override.log"
 
@@ -257,7 +260,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -608,6 +611,7 @@ save_config() {
     printf 'MEMBERSHIP_SNAPSHOT_PATH=%s\n' "${MEMBERSHIP_SNAPSHOT_PATH}"
     printf 'MEMBERSHIP_LOG_PATH=%s\n' "${MEMBERSHIP_LOG_PATH}"
     printf 'MEMBERSHIP_WATERMARK_PATH=%s\n' "${MEMBERSHIP_WATERMARK_PATH}"
+    printf 'MEMBERSHIP_OWNER_SIGNING_KEY_PATH=%s\n' "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
     printf 'BACKEND_MODE=%s\n' "${BACKEND_MODE}"
     printf 'DATAPLANE_MODE=%s\n' "${DATAPLANE_MODE}"
     printf 'PRIVILEGED_HELPER_SOCKET_PATH=%s\n' "${PRIVILEGED_HELPER_SOCKET_PATH}"
@@ -1457,6 +1461,7 @@ prepare_system_directories() {
     run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${PRIVILEGED_HELPER_SOCKET_PATH}")"
     return
   fi
@@ -1474,6 +1479,7 @@ prepare_system_directories() {
     install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
     install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
+    install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${PRIVILEGED_HELPER_SOCKET_PATH}")"
     return
   fi
@@ -1562,6 +1568,7 @@ ensure_membership_files() {
     --snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
     --log "${MEMBERSHIP_LOG_PATH}" \
     --watermark "${MEMBERSHIP_WATERMARK_PATH}" \
+    --owner-signing-key "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
     --node-id "${DEVICE_NODE_ID}" \
     --network-id "local-net" \
     --force
@@ -1728,6 +1735,7 @@ write_daemon_environment() {
     RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
     RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
     RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+    RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
     RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
     RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
     RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
@@ -2494,6 +2502,7 @@ configure_values() {
   prompt_default MEMBERSHIP_SNAPSHOT_PATH "Membership snapshot path" "${MEMBERSHIP_SNAPSHOT_PATH}"
   prompt_default MEMBERSHIP_LOG_PATH "Membership log path" "${MEMBERSHIP_LOG_PATH}"
   prompt_default MEMBERSHIP_WATERMARK_PATH "Membership watermark path" "${MEMBERSHIP_WATERMARK_PATH}"
+  prompt_default MEMBERSHIP_OWNER_SIGNING_KEY_PATH "Membership owner signing key path" "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
   enforce_backend_mode
   print_info "Backend mode is fixed to ${BACKEND_MODE} for this host profile."
   prompt_default DATAPLANE_MODE "Dataplane mode (shell|hybrid-native)" "${DATAPLANE_MODE}"
@@ -2570,6 +2579,7 @@ Current Rustynet Wizard Configuration
   membership_snapshot     : ${MEMBERSHIP_SNAPSHOT_PATH}
   membership_log          : ${MEMBERSHIP_LOG_PATH}
   membership_watermark    : ${MEMBERSHIP_WATERMARK_PATH}
+  membership_owner_signing_key: ${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}
   backend                 : ${BACKEND_MODE}
   dataplane_mode          : ${DATAPLANE_MODE}
   privileged_helper_socket: ${PRIVILEGED_HELPER_SOCKET_PATH}
