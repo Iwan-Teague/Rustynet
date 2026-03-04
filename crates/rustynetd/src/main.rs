@@ -8,8 +8,8 @@ use rustynetd::daemon::{
     DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
     DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_TRUSTED_HELPER_SOCKET_PATH,
     DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
-    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DEFAULT_WG_LISTEN_PORT, DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -411,6 +411,19 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--wg-interface requires a value".to_string())?;
                 config.wg_interface = value.clone();
+                index += 2;
+            }
+            Some("--wg-listen-port") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--wg-listen-port requires a value".to_string())?;
+                let port = value
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid --wg-listen-port value: {err}"))?;
+                if port == 0 {
+                    return Err("--wg-listen-port must be in range 1-65535".to_string());
+                }
+                config.wg_listen_port = port;
                 index += 2;
             }
             Some("--wg-private-key") => {
@@ -835,7 +848,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -858,6 +871,7 @@ fn help_text() -> String {
         ),
         &format!("  backend={:?}", DaemonBackendMode::default()),
         &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
+        &format!("  wg_listen_port={DEFAULT_WG_LISTEN_PORT}"),
         &format!("  wg_private_key={DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH}"),
         &format!("  wg_encrypted_private_key={DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH}"),
         &format!("  wg_key_passphrase={DEFAULT_WG_KEY_PASSPHRASE_PATH}"),

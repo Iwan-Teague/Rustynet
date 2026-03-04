@@ -147,6 +147,7 @@ pub struct LinuxWireguardBackend<R: WireguardCommandRunner> {
     runner: R,
     interface_name: String,
     private_key_path: String,
+    listen_port: u16,
     running: bool,
     peers: BTreeMap<NodeId, PeerConfig>,
     routes: Vec<Route>,
@@ -159,15 +160,18 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         runner: R,
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
+        listen_port: u16,
     ) -> Result<Self, BackendError> {
         let interface_name = interface_name.into();
         let private_key_path = private_key_path.into();
         validate_interface_name(&interface_name)?;
         validate_private_key_path(&private_key_path)?;
+        validate_listen_port(listen_port)?;
         Ok(Self {
             runner,
             interface_name,
             private_key_path,
+            listen_port,
             running: false,
             peers: BTreeMap::new(),
             routes: Vec::new(),
@@ -223,6 +227,8 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 self.interface_name.clone(),
                 "private-key".to_string(),
                 self.private_key_path.clone(),
+                "listen-port".to_string(),
+                self.listen_port.to_string(),
             ],
         ) {
             let _ = self.remove_interface();
@@ -446,6 +452,7 @@ pub struct MacosWireguardBackend<R: WireguardCommandRunner> {
     interface_name: String,
     private_key_path: String,
     egress_interface: String,
+    listen_port: u16,
     running: bool,
     peers: BTreeMap<NodeId, PeerConfig>,
     routes: Vec<Route>,
@@ -461,6 +468,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
         egress_interface: impl Into<String>,
+        listen_port: u16,
     ) -> Result<Self, BackendError> {
         let interface_name = interface_name.into();
         let private_key_path = private_key_path.into();
@@ -468,11 +476,13 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         validate_macos_interface_name(&interface_name)?;
         validate_private_key_path(&private_key_path)?;
         validate_interface_name(&egress_interface)?;
+        validate_listen_port(listen_port)?;
         Ok(Self {
             runner,
             interface_name,
             private_key_path,
             egress_interface,
+            listen_port,
             running: false,
             peers: BTreeMap::new(),
             routes: Vec::new(),
@@ -528,6 +538,8 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
                 self.interface_name.clone(),
                 "private-key".to_string(),
                 self.private_key_path.clone(),
+                "listen-port".to_string(),
+                self.listen_port.to_string(),
             ],
         ) {
             let _ = self.remove_interface();
@@ -913,6 +925,15 @@ fn validate_private_key_path(path: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn validate_listen_port(port: u16) -> Result<(), BackendError> {
+    if port == 0 {
+        return Err(BackendError::invalid_input(
+            "wireguard listen port must be in range 1-65535",
+        ));
+    }
+    Ok(())
+}
+
 fn extract_ip_from_cidr(cidr: &str) -> Result<String, BackendError> {
     let (ip, prefix) = cidr
         .split_once('/')
@@ -1132,7 +1153,7 @@ mod tests {
     #[test]
     fn linux_backend_executes_ip_and_wg_calls_through_runner() {
         let runner = RecordingRunner::default();
-        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key")
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
             .expect("backend should be constructed");
 
         backend
@@ -1159,18 +1180,35 @@ mod tests {
 
     #[test]
     fn linux_backend_validates_interface_and_cidr_inputs() {
-        assert!(LinuxWireguardBackend::new(RecordingRunner::default(), "", "/tmp/wg.key").is_err());
         assert!(
-            LinuxWireguardBackend::new(RecordingRunner::default(), "wg;rm", "/tmp/wg.key").is_err()
+            LinuxWireguardBackend::new(RecordingRunner::default(), "", "/tmp/wg.key", 51820)
+                .is_err()
         );
         assert!(
-            LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0", "relative.key")
+            LinuxWireguardBackend::new(RecordingRunner::default(), "wg;rm", "/tmp/wg.key", 51820)
+                .is_err()
+        );
+        assert!(
+            LinuxWireguardBackend::new(
+                RecordingRunner::default(),
+                "rustynet0",
+                "relative.key",
+                51820
+            )
+            .is_err()
+        );
+        assert!(
+            LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0", "/tmp/wg.key", 0)
                 .is_err()
         );
 
-        let mut backend =
-            LinuxWireguardBackend::new(RecordingRunner::default(), "rustynet0", "/tmp/wg.key")
-                .expect("backend should be constructed");
+        let mut backend = LinuxWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            "/tmp/wg.key",
+            51820,
+        )
+        .expect("backend should be constructed");
         backend
             .start(runtime_context())
             .expect("start should succeed");
@@ -1186,7 +1224,7 @@ mod tests {
     #[test]
     fn linux_backend_propagates_runner_failures() {
         let runner = RecordingRunner::default().fail_on("ip");
-        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key")
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
             .expect("backend should be constructed");
 
         let err = backend
@@ -1202,6 +1240,7 @@ mod tests {
             "rustynet0",
             "/tmp/wg.key",
             "en0",
+            51820,
         )
         .expect_err("non-utun interface names must be rejected");
         assert_eq!(err.kind, BackendErrorKind::InvalidInput);
@@ -1209,9 +1248,14 @@ mod tests {
 
     #[test]
     fn macos_backend_accepts_basic_lifecycle_with_recording_runner() {
-        let mut backend =
-            MacosWireguardBackend::new(RecordingRunner::default(), "utun9", "/tmp/wg.key", "en0")
-                .expect("backend should be constructed");
+        let mut backend = MacosWireguardBackend::new(
+            RecordingRunner::default(),
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should be constructed");
 
         backend
             .start(runtime_context())

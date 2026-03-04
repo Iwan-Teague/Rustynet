@@ -82,6 +82,7 @@ pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.assignment.watermark";
 pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
+pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
 pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
@@ -187,6 +188,7 @@ pub struct DaemonConfig {
     pub auto_tunnel_max_age_secs: u64,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
+    pub wg_listen_port: u16,
     pub wg_private_key_path: Option<PathBuf>,
     pub wg_encrypted_private_key_path: Option<PathBuf>,
     pub wg_key_passphrase_path: Option<PathBuf>,
@@ -224,6 +226,7 @@ impl Default for DaemonConfig {
             auto_tunnel_max_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
+            wg_listen_port: DEFAULT_WG_LISTEN_PORT,
             wg_private_key_path: Some(PathBuf::from(DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH)),
             wg_encrypted_private_key_path: Some(PathBuf::from(
                 DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
@@ -553,6 +556,7 @@ impl DaemonBackend {
                         PrivilegedHelperWireguardRunner::new(helper_client),
                         config.wg_interface.clone(),
                         private_key.to_string_lossy().to_string(),
+                        config.wg_listen_port,
                     )
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
                     Ok(Self::Linux(backend))
@@ -593,6 +597,7 @@ impl DaemonBackend {
                         config.wg_interface.clone(),
                         private_key.to_string_lossy().to_string(),
                         config.egress_interface.clone(),
+                        config.wg_listen_port,
                     )
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
                     Ok(Self::Macos(backend))
@@ -2225,6 +2230,11 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "wireguard interface must not be empty".to_string(),
+        ));
+    }
+    if config.wg_listen_port == 0 {
+        return Err(DaemonError::InvalidConfig(
+            "wireguard listen port must be in range 1-65535".to_string(),
         ));
     }
     if config.egress_interface.is_empty() {

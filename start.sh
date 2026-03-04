@@ -18,6 +18,7 @@ AUTO_TUNNEL_VERIFIER_KEY_PATH="/etc/rustynet/assignment.pub"
 AUTO_TUNNEL_WATERMARK_PATH="/var/lib/rustynet/rustynetd.assignment.watermark"
 AUTO_TUNNEL_MAX_AGE_SECS="300"
 WG_INTERFACE="rustynet0"
+WG_LISTEN_PORT="51820"
 WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
@@ -260,7 +261,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -377,6 +378,13 @@ enforce_fail_closed_ssh_policy() {
   if [[ -z "${FAIL_CLOSED_SSH_ALLOW_CIDRS// }" ]]; then
     print_err "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1."
     exit 1
+  fi
+}
+
+enforce_wg_listen_port_policy() {
+  if ! [[ "${WG_LISTEN_PORT}" =~ ^[0-9]+$ ]] || (( WG_LISTEN_PORT < 1 || WG_LISTEN_PORT > 65535 )); then
+    print_warn "Invalid WG_LISTEN_PORT '${WG_LISTEN_PORT}' detected; forcing secure default 51820."
+    WG_LISTEN_PORT="51820"
   fi
 }
 
@@ -603,6 +611,7 @@ save_config() {
     printf 'AUTO_TUNNEL_WATERMARK_PATH=%s\n' "${AUTO_TUNNEL_WATERMARK_PATH}"
     printf 'AUTO_TUNNEL_MAX_AGE_SECS=%s\n' "${AUTO_TUNNEL_MAX_AGE_SECS}"
     printf 'WG_INTERFACE=%s\n' "${WG_INTERFACE}"
+    printf 'WG_LISTEN_PORT=%s\n' "${WG_LISTEN_PORT}"
     printf 'WG_PRIVATE_KEY_PATH=%s\n' "${WG_PRIVATE_KEY_PATH}"
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
@@ -1712,6 +1721,7 @@ write_daemon_environment() {
   enforce_role_policy_defaults
   enforce_backend_mode
   enforce_fail_closed_ssh_policy
+  enforce_wg_listen_port_policy
   if is_macos_host; then
     return 0
   fi
@@ -1743,6 +1753,7 @@ write_daemon_environment() {
     RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
     RUSTYNET_BACKEND="${BACKEND_MODE}" \
     RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
+    RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
     RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
     RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
     RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
@@ -1937,6 +1948,7 @@ macos_start_daemon_process() {
     --auto-tunnel-max-age-secs "${AUTO_TUNNEL_MAX_AGE_SECS}" \
     --backend "${BACKEND_MODE}" \
     --wg-interface "${WG_INTERFACE}" \
+    --wg-listen-port "${WG_LISTEN_PORT}" \
     --wg-private-key "${WG_PRIVATE_KEY_PATH}" \
     --wg-encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
     --wg-key-passphrase "${WG_KEY_PASSPHRASE_PATH}" \
@@ -2494,6 +2506,7 @@ configure_values() {
   prompt_default AUTO_TUNNEL_WATERMARK_PATH "Auto-tunnel watermark path" "${AUTO_TUNNEL_WATERMARK_PATH}"
   prompt_default AUTO_TUNNEL_MAX_AGE_SECS "Auto-tunnel bundle max age (secs)" "${AUTO_TUNNEL_MAX_AGE_SECS}"
   prompt_default WG_INTERFACE "WireGuard interface name" "${WG_INTERFACE}"
+  prompt_default WG_LISTEN_PORT "WireGuard listen port (1-65535)" "${WG_LISTEN_PORT}"
   prompt_default WG_PRIVATE_KEY_PATH "WireGuard runtime private key path" "${WG_PRIVATE_KEY_PATH}"
   prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
   prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
@@ -2518,6 +2531,7 @@ configure_values() {
     FAIL_CLOSED_SSH_ALLOW_CIDRS=""
   fi
   enforce_fail_closed_ssh_policy
+  enforce_wg_listen_port_policy
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
 
   if is_linux_host && is_admin_role; then
@@ -2571,6 +2585,7 @@ Current Rustynet Wizard Configuration
   auto_tunnel_watermark   : ${AUTO_TUNNEL_WATERMARK_PATH}
   auto_tunnel_max_age_secs: ${AUTO_TUNNEL_MAX_AGE_SECS}
   wg_interface            : ${WG_INTERFACE}
+  wg_listen_port          : ${WG_LISTEN_PORT}
   wg_runtime_private_key  : ${WG_PRIVATE_KEY_PATH}
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
