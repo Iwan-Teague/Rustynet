@@ -812,12 +812,24 @@ pub fn replay_membership_snapshot_and_log(
     entries: &[MembershipLogEntry],
     now_unix: u64,
 ) -> Result<MembershipState, MembershipError> {
+    let snapshot_root = snapshot.state_root_hex()?;
     let mut state = snapshot.clone();
     let mut replay_cache = MembershipReplayCache {
         seen_update_ids: HashSet::new(),
         max_epoch: snapshot.epoch,
     };
+    let mut replay_started = false;
     for entry in entries {
+        if !replay_started {
+            let record = &entry.signed_update.record;
+            if record.epoch_prev < snapshot.epoch {
+                continue;
+            }
+            if record.epoch_prev != snapshot.epoch || record.prev_state_root != snapshot_root {
+                return Err(MembershipError::PrevStateRootMismatch);
+            }
+            replay_started = true;
+        }
         state = apply_signed_update(&state, &entry.signed_update, now_unix, &mut replay_cache)?;
     }
     Ok(state)
@@ -1661,6 +1673,14 @@ mod tests {
         let replayed =
             replay_membership_snapshot_and_log(&loaded_snapshot, &entries, 140).expect("replay");
         assert!(replayed.nodes.iter().any(|node| node.node_id == "node-b"));
+        let replayed_from_checkpoint = replay_membership_snapshot_and_log(&replayed, &entries, 141)
+            .expect("checkpoint replay should ignore historical entries");
+        assert_eq!(
+            replayed_from_checkpoint
+                .state_root_hex()
+                .expect("checkpoint replay root"),
+            replayed.state_root_hex().expect("replayed root")
+        );
 
         let mut tampered = std::fs::read_to_string(&log).expect("log should read");
         tampered = tampered.replace("entry=0|", "entry=1|");
