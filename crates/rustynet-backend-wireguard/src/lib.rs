@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
     TunnelBackend, TunnelStats,
@@ -1061,7 +1060,31 @@ fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError
 }
 
 fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
-    BASE64_STANDARD.encode(value)
+    const BASE64_TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(44);
+    let mut index = 0usize;
+    while index + 3 <= value.len() {
+        let chunk = ((value[index] as u32) << 16)
+            | ((value[index + 1] as u32) << 8)
+            | (value[index + 2] as u32);
+        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        output.push(BASE64_TABLE[(chunk & 0x3f) as usize] as char);
+        index += 3;
+    }
+
+    let remaining = value.len() - index;
+    if remaining == 2 {
+        let chunk = ((value[index] as u32) << 16) | ((value[index + 1] as u32) << 8);
+        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
+        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
+        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
+        output.push('=');
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -1204,6 +1227,14 @@ mod tests {
         assert_eq!(
             peer_key_args,
             vec![expected_public_key.clone(), expected_public_key]
+        );
+    }
+
+    #[test]
+    fn base64_encoder_matches_wireguard_key_format() {
+        assert_eq!(
+            encode_wg_public_key_base64(&[0u8; 32]),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         );
     }
 
