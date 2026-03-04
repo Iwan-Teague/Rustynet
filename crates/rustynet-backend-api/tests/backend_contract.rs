@@ -106,6 +106,7 @@ fn sample_runtime_context() -> RuntimeContext {
     RuntimeContext {
         local_node: NodeId::new("local-node").expect("valid node id"),
         mesh_cidr: "100.64.0.0/10".to_string(),
+        local_cidr: "100.64.0.1/32".to_string(),
     }
 }
 

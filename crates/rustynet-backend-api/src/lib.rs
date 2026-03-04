@@ -66,6 +66,7 @@ pub struct PeerConfig {
 pub struct RuntimeContext {
     pub local_node: NodeId,
     pub mesh_cidr: String,
+    pub local_cidr: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -116,6 +116,7 @@ mod tests {
         RuntimeContext {
             local_node: NodeId::new("stub-local").expect("node id should be valid"),
             mesh_cidr: "100.64.0.0/10".to_string(),
+            local_cidr: "100.64.0.1/32".to_string(),
         }
     }
 

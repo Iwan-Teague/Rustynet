@@ -91,6 +91,7 @@ pub struct ApplyOptions {
     pub protected_dns: bool,
     pub ipv6_parity_supported: bool,
     pub exit_mode: ExitMode,
+    pub serve_exit_node: bool,
 }
 
 impl Default for ApplyOptions {
@@ -99,6 +100,7 @@ impl Default for ApplyOptions {
             protected_dns: true,
             ipv6_parity_supported: false,
             exit_mode: ExitMode::Off,
+            serve_exit_node: false,
         }
     }
 }
@@ -465,6 +467,38 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    fn apply_fail_closed_management_bypass_routes(&self) -> Result<(), SystemError> {
+        if !self.fail_closed_ssh_allow {
+            return Ok(());
+        }
+        for cidr in &self.fail_closed_ssh_allow_cidrs {
+            let args = Self::management_bypass_route_args(cidr, self.egress_interface.as_str());
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
+            result.map_err(|err| {
+                SystemError::RouteApplyFailed(format!(
+                    "management ssh bypass route failed for {cidr}: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn management_bypass_route_args(cidr: &str, egress_interface: &str) -> Vec<String> {
+        let mut args = Vec::with_capacity(9);
+        if cidr.contains(':') {
+            args.push("-6".to_string());
+        }
+        args.push("route".to_string());
+        args.push("replace".to_string());
+        args.push(cidr.to_string());
+        args.push("dev".to_string());
+        args.push(egress_interface.to_string());
+        args.push("table".to_string());
+        args.push("51820".to_string());
+        args
+    }
+
     fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
         let use_native_write = matches!(self.mode, LinuxDataplaneMode::HybridNative)
             && self.privileged_client.is_none();
@@ -658,6 +692,7 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError> {
+        self.apply_fail_closed_management_bypass_routes()?;
         for route in routes {
             self.run(
                 PrivilegedCommandProgram::Ip,
@@ -1639,7 +1674,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.generation = self.generation.saturating_add(1);
         self.last_safe_generation = self.generation;
 
-        if options.exit_mode == ExitMode::FullTunnel {
+        if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.transition_to(
                 DataplaneState::ExitActive,
                 "dataplane_apply_commit_exit_active",
@@ -1673,7 +1708,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system.apply_firewall_killswitch()?;
         applied_stages.push(StageMarker::FirewallApplied);
 
-        if options.exit_mode == ExitMode::FullTunnel {
+        if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.system.apply_nat_forwarding()?;
             applied_stages.push(StageMarker::NatApplied);
         }
@@ -2335,6 +2370,7 @@ mod tests {
                 RuntimeContext {
                     local_node: NodeId::new("node-a").expect("node should parse"),
                     mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
                 },
                 vec![sample_peer("node-b")],
                 vec![Route {
@@ -2369,6 +2405,7 @@ mod tests {
             RuntimeContext {
                 local_node: NodeId::new("node-a").expect("node should parse"),
                 mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
             },
             Vec::new(),
             Vec::new(),
@@ -2402,6 +2439,7 @@ mod tests {
                 RuntimeContext {
                     local_node: NodeId::new("node-a").expect("node should parse"),
                     mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
                 },
                 Vec::new(),
                 Vec::new(),
@@ -2411,6 +2449,70 @@ mod tests {
 
         assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
         assert_eq!(controller.generation(), 1);
+    }
+
+    #[test]
+    fn apply_does_not_require_nat_when_not_full_tunnel_or_exit_serving() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default().fail_on("apply_nat_forwarding"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("nat should not be required for plain mesh apply");
+
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+    }
+
+    #[test]
+    fn apply_exit_serving_requires_nat_forwarding() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default().fail_on("apply_nat_forwarding"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            RuntimeContext {
+                local_node: NodeId::new("node-a").expect("node should parse"),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
+            },
+            vec![sample_peer("node-b")],
+            vec![Route {
+                destination_cidr: "100.100.20.0/24".to_string(),
+                via_node: NodeId::new("node-b").expect("node should parse"),
+                kind: RouteKind::Mesh,
+            }],
+            ApplyOptions {
+                serve_exit_node: true,
+                ..ApplyOptions::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
     }
 
     #[test]
@@ -2428,6 +2530,7 @@ mod tests {
             RuntimeContext {
                 local_node: NodeId::new("node-a").expect("node should parse"),
                 mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
             },
             vec![sample_peer("node-b")],
             vec![Route {
@@ -2463,6 +2566,7 @@ mod tests {
                 RuntimeContext {
                     local_node: NodeId::new("node-a").expect("node should parse"),
                     mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
                 },
                 vec![sample_peer("node-b")],
                 vec![Route {
@@ -2517,6 +2621,7 @@ mod tests {
                 RuntimeContext {
                     local_node: NodeId::new("node-a").expect("node should parse"),
                     mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
                 },
                 vec![sample_peer("node-b")],
                 vec![Route {
@@ -2591,6 +2696,41 @@ mod tests {
         assert!(perf.contains("\"captured_at_unix\": "));
         let _ = std::fs::remove_file(&audit_path);
         let _ = std::fs::remove_file(&perf_path);
+    }
+
+    #[test]
+    fn management_bypass_route_args_use_ipv4_routing_for_ipv4_cidr() {
+        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24", "enp0s8");
+        assert_eq!(
+            args,
+            vec![
+                "route".to_string(),
+                "replace".to_string(),
+                "192.168.18.0/24".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
+        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64", "enp0s8");
+        assert_eq!(
+            args,
+            vec![
+                "-6".to_string(),
+                "route".to_string(),
+                "replace".to_string(),
+                "fd00::/64".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ]
+        );
     }
 
     #[test]

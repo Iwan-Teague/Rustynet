@@ -333,6 +333,7 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
         self.backend.start(RuntimeContext {
             local_node: self.local_node.clone(),
             mesh_cidr: self.mesh_cidr.clone(),
+            local_cidr: self.mesh_cidr.clone(),
         })?;
         self.started = true;
         Ok(())

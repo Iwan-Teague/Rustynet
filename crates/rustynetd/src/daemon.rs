@@ -385,6 +385,7 @@ struct AutoTunnelBundleEnvelope {
 struct AutoTunnelBundle {
     node_id: String,
     mesh_cidr: String,
+    assigned_cidr: String,
     peers: Vec<PeerConfig>,
     routes: Vec<Route>,
     selected_exit_node: Option<String>,
@@ -1042,7 +1043,7 @@ impl DaemonRuntime {
             None
         };
 
-        let (mesh_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
+        let (mesh_cidr, local_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
             if let Some(envelope) = auto_bundle {
                 let lan_enabled = envelope
                     .bundle
@@ -1051,6 +1052,7 @@ impl DaemonRuntime {
                     .any(|route| route.kind == RouteKind::ExitNodeLan);
                 (
                     envelope.bundle.mesh_cidr,
+                    envelope.bundle.assigned_cidr,
                     envelope.bundle.peers,
                     envelope.bundle.routes,
                     envelope.bundle.selected_exit_node,
@@ -1060,6 +1062,7 @@ impl DaemonRuntime {
             } else {
                 (
                     "100.64.0.0/10".to_string(),
+                    "100.64.0.1/32".to_string(),
                     Vec::new(),
                     Vec::new(),
                     None,
@@ -1085,17 +1088,25 @@ impl DaemonRuntime {
             return;
         }
 
+        let serve_exit_node = if self.auto_tunnel_enforce {
+            self.is_serving_exit_node(auto_exit.as_deref())
+        } else {
+            self.is_serving_exit_node(self.selected_exit_node.as_deref())
+        };
+
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
                 local_node,
                 mesh_cidr,
+                local_cidr,
             },
             peers,
             routes,
             ApplyOptions {
                 protected_dns: true,
                 ipv6_parity_supported: false,
+                serve_exit_node,
                 exit_mode: if self.auto_tunnel_enforce {
                     if auto_exit.is_some() {
                         ExitMode::FullTunnel
@@ -1161,18 +1172,24 @@ impl DaemonRuntime {
         if self.is_restricted() && command.is_mutating() {
             return IpcResponse::err("daemon is in restricted-safe mode");
         }
+        let auto_tunnel_route_advertise_allowed = matches!(
+            &command,
+            IpcCommand::RouteAdvertise(cidr)
+                if self.allow_auto_tunnel_exit_advertisement(cidr)
+        );
         if self.auto_tunnel_enforce
             && matches!(
-                command,
+                &command,
                 IpcCommand::ExitNodeSelect(_)
                     | IpcCommand::ExitNodeOff
                     | IpcCommand::LanAccessOn
                     | IpcCommand::LanAccessOff
                     | IpcCommand::RouteAdvertise(_)
             )
+            && !auto_tunnel_route_advertise_allowed
         {
             return IpcResponse::err(
-                "manual route and exit mutations are disabled while auto-tunnel is enforced",
+                "manual route and exit mutations are disabled while auto-tunnel is enforced (except route advertise 0.0.0.0/0 for exit-serving nodes)",
             );
         }
 
@@ -1192,11 +1209,12 @@ impl DaemonRuntime {
                     .as_ref()
                     .map(|state| state.active_nodes().len().to_string())
                     .unwrap_or_else(|| "none".to_string());
-                let serving_exit_node = if self.advertised_routes.contains("0.0.0.0/0") {
-                    "true"
-                } else {
-                    "false"
-                };
+                let serving_exit_node =
+                    if self.is_serving_exit_node(self.selected_exit_node.as_deref()) {
+                        "true"
+                    } else {
+                        "false"
+                    };
                 IpcResponse::ok(format!(
                     "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
@@ -1318,6 +1336,11 @@ impl DaemonRuntime {
                 IpcResponse::ok("dns inspect: protected=true resolver=rustynet")
             }
             IpcCommand::RouteAdvertise(cidr) => {
+                if self.auto_tunnel_enforce && !self.allow_auto_tunnel_exit_advertisement(&cidr) {
+                    return IpcResponse::err(
+                        "manual route and exit mutations are disabled while auto-tunnel is enforced (except route advertise 0.0.0.0/0 for exit-serving nodes)",
+                    );
+                }
                 if !validate_cidr(&cidr) {
                     return IpcResponse::err("invalid cidr format");
                 }
@@ -1695,7 +1718,7 @@ impl DaemonRuntime {
             || assignment_changed
             || membership_changed
         {
-            let (mesh_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
+            let (mesh_cidr, local_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
                 if let Some(envelope) = auto_bundle {
                     let lan_enabled = envelope
                         .bundle
@@ -1704,6 +1727,7 @@ impl DaemonRuntime {
                         .any(|route| route.kind == RouteKind::ExitNodeLan);
                     (
                         envelope.bundle.mesh_cidr,
+                        envelope.bundle.assigned_cidr,
                         envelope.bundle.peers,
                         envelope.bundle.routes,
                         envelope.bundle.selected_exit_node,
@@ -1713,6 +1737,7 @@ impl DaemonRuntime {
                 } else {
                     (
                         "100.64.0.0/10".to_string(),
+                        "100.64.0.1/32".to_string(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -1744,17 +1769,25 @@ impl DaemonRuntime {
                 return;
             }
 
+            let serve_exit_node = if self.auto_tunnel_enforce {
+                self.is_serving_exit_node(auto_exit.as_deref())
+            } else {
+                self.is_serving_exit_node(self.selected_exit_node.as_deref())
+            };
+
             let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
                     local_node,
                     mesh_cidr,
+                    local_cidr,
                 },
                 peers,
                 routes,
                 ApplyOptions {
                     protected_dns: true,
                     ipv6_parity_supported: false,
+                    serve_exit_node,
                     exit_mode: if self.auto_tunnel_enforce {
                         if auto_exit.is_some() {
                             ExitMode::FullTunnel
@@ -1821,6 +1854,14 @@ impl DaemonRuntime {
         } else {
             ExitMode::Off
         }
+    }
+
+    fn is_serving_exit_node(&self, selected_exit_node: Option<&str>) -> bool {
+        selected_exit_node.is_none() && self.advertised_routes.contains("0.0.0.0/0")
+    }
+
+    fn allow_auto_tunnel_exit_advertisement(&self, cidr: &str) -> bool {
+        cidr == "0.0.0.0/0" && self.selected_exit_node.is_none()
     }
 
     fn is_restricted(&self) -> bool {
@@ -3100,12 +3141,25 @@ fn load_auto_tunnel_bundle(
         ));
     }
 
-    let assigned_cidr = fields.get("assigned_cidr").ok_or_else(|| {
-        AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_string())
-    })?;
-    if !is_valid_ipv4_or_ipv6_cidr(assigned_cidr) {
+    let assigned_cidr = fields
+        .get("assigned_cidr")
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_string())
+        })?
+        .to_string();
+    if !is_valid_ipv4_or_ipv6_cidr(&assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
             "invalid assigned_cidr".to_string(),
+        ));
+    }
+    if !is_host_cidr(&assigned_cidr) {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "assigned_cidr must be a host cidr".to_string(),
+        ));
+    }
+    if !cidr_contains(&mesh_cidr, &assigned_cidr) {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "assigned_cidr is outside mesh_cidr".to_string(),
         ));
     }
 
@@ -3297,6 +3351,7 @@ fn load_auto_tunnel_bundle(
         bundle: AutoTunnelBundle {
             node_id,
             mesh_cidr,
+            assigned_cidr,
             peers,
             routes,
             selected_exit_node,
@@ -3495,20 +3550,59 @@ fn persist_auto_tunnel_watermark(
 }
 
 fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
-    let Some((ip_part, prefix_part)) = value.split_once('/') else {
+    parse_cidr(value).is_some()
+}
+
+fn is_host_cidr(value: &str) -> bool {
+    match parse_cidr(value) {
+        Some((std::net::IpAddr::V4(_), prefix)) => prefix == 32,
+        Some((std::net::IpAddr::V6(_), prefix)) => prefix == 128,
+        None => false,
+    }
+}
+
+fn cidr_contains(container: &str, candidate: &str) -> bool {
+    let Some((container_ip, container_prefix)) = parse_cidr(container) else {
         return false;
     };
-    if ip_part.parse::<std::net::IpAddr>().is_err() {
-        return false;
-    }
-    let Ok(prefix) = prefix_part.parse::<u8>() else {
+    let Some((candidate_ip, candidate_prefix)) = parse_cidr(candidate) else {
         return false;
     };
-    if ip_part.contains(':') {
-        prefix <= 128
-    } else {
-        prefix <= 32
+    if candidate_prefix < container_prefix {
+        return false;
     }
+    match (container_ip, candidate_ip) {
+        (std::net::IpAddr::V4(container_v4), std::net::IpAddr::V4(candidate_v4)) => {
+            let mask = if container_prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - container_prefix)
+            };
+            (u32::from(container_v4) & mask) == (u32::from(candidate_v4) & mask)
+        }
+        (std::net::IpAddr::V6(container_v6), std::net::IpAddr::V6(candidate_v6)) => {
+            let container_raw = u128::from_be_bytes(container_v6.octets());
+            let candidate_raw = u128::from_be_bytes(candidate_v6.octets());
+            let mask = if container_prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - container_prefix)
+            };
+            (container_raw & mask) == (candidate_raw & mask)
+        }
+        _ => false,
+    }
+}
+
+fn parse_cidr(value: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (ip_part, prefix_part) = value.split_once('/')?;
+    let ip = ip_part.parse::<std::net::IpAddr>().ok()?;
+    let prefix = prefix_part.parse::<u8>().ok()?;
+    let valid = match ip {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    };
+    if valid { Some((ip, prefix)) } else { None }
 }
 
 #[cfg(target_os = "linux")]
@@ -3764,6 +3858,37 @@ mod tests {
             body = body.replace("route_count=1", "route_count=2");
         }
         std::fs::write(path, body).expect("auto tunnel file should be written");
+    }
+
+    fn write_auto_tunnel_file_exitless(
+        path: &Path,
+        verifier_path: &Path,
+        node_id: &str,
+        nonce: u64,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("auto tunnel verifier key should be written");
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(300);
+        let peer_public = hex_encode(&[9u8; 32]);
+        let payload = format!(
+            "version=1\nnode_id={node_id}\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.endpoint=203.0.113.21:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=0\n"
+        );
+        let signature = signing_key.sign(payload.as_bytes());
+        std::fs::write(
+            path,
+            format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            ),
+        )
+        .expect("auto tunnel file should be written");
     }
 
     fn write_membership_files(snapshot_path: &Path, log_path: &Path, local_node_id: &str) {
@@ -4206,6 +4331,70 @@ mod tests {
     }
 
     #[test]
+    fn load_auto_tunnel_bundle_rejects_assigned_cidr_outside_mesh() {
+        let test_dir = secure_test_dir("rustynetd-auto-assigned-outside-mesh");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            9,
+            false,
+        );
+        let body = std::fs::read_to_string(&assignment_path)
+            .expect("auto tunnel bundle should be readable");
+        let tampered = body.replace("assigned_cidr=100.64.0.1/32", "assigned_cidr=10.0.0.1/32");
+        std::fs::write(&assignment_path, tampered).expect("tampered bundle should be writable");
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("assigned cidr outside mesh must be rejected");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(err.to_string().contains("outside mesh"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_rejects_non_host_assigned_cidr() {
+        let test_dir = secure_test_dir("rustynetd-auto-assigned-not-host");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            10,
+            false,
+        );
+        let body = std::fs::read_to_string(&assignment_path)
+            .expect("auto tunnel bundle should be readable");
+        let tampered = body.replace("assigned_cidr=100.64.0.1/32", "assigned_cidr=100.64.0.0/10");
+        std::fs::write(&assignment_path, tampered).expect("tampered bundle should be writable");
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("non-host assigned cidr must be rejected");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(err.to_string().contains("host cidr"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
         let test_dir = secure_test_dir("rustynetd-runtime-test");
         let state_path = test_dir.join("daemon.state");
@@ -4517,6 +4706,80 @@ mod tests {
         assert!(status.message.contains("last_assignment="));
 
         let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(!denied.ok);
+        assert!(
+            denied
+                .message
+                .contains("disabled while auto-tunnel is enforced")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_allows_exit_service_advertise_only() {
+        let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel-exit-service");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file_exitless(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let allowed = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()));
+        assert!(allowed.ok);
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("serving_exit_node=true"));
+
+        let denied =
+            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
         assert!(!denied.ok);
         assert!(
             denied

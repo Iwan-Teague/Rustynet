@@ -205,7 +205,7 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
     }
 
     fn configure_interface(&mut self, context: &RuntimeContext) -> Result<(), BackendError> {
-        Self::ensure_cidr(&context.mesh_cidr)?;
+        Self::ensure_cidr(&context.local_cidr)?;
         let add_args = [
             "link".to_string(),
             "add".to_string(),
@@ -239,7 +239,7 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             &[
                 "address".to_string(),
                 "add".to_string(),
-                context.mesh_cidr.clone(),
+                context.local_cidr.clone(),
                 "dev".to_string(),
                 self.interface_name.clone(),
             ],
@@ -293,6 +293,9 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
 
         for route in next_routes {
             Self::ensure_cidr(&route.destination_cidr)?;
+            if matches!(route.kind, rustynet_backend_api::RouteKind::ExitNodeDefault) {
+                continue;
+            }
             self.runner.run(
                 "ip",
                 &[
@@ -518,8 +521,8 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
     }
 
     fn configure_interface(&mut self, context: &RuntimeContext) -> Result<(), BackendError> {
-        Self::ensure_cidr(&context.mesh_cidr)?;
-        let local_ip = extract_ip_from_cidr(&context.mesh_cidr)?;
+        Self::ensure_cidr(&context.local_cidr)?;
+        let local_ip = extract_ip_from_cidr(&context.local_cidr)?;
 
         if self
             .runner
@@ -1125,6 +1128,7 @@ mod tests {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
             mesh_cidr: "100.64.0.1/32".to_string(),
+            local_cidr: "100.64.0.1/32".to_string(),
         }
     }
 

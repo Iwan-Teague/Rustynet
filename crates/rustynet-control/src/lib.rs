@@ -7,7 +7,7 @@ pub mod operations;
 pub mod persistence;
 pub mod scale;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -1499,7 +1499,6 @@ pub struct ControlPlaneCore {
     assignment_verifying_key: [u8; 32],
     access_token_signing_key: SigningKey,
     access_token_verifying_key: [u8; 32],
-    assigned_tunnel_cidrs: Mutex<HashMap<String, String>>,
 }
 
 impl ControlPlaneCore {
@@ -1524,7 +1523,6 @@ impl ControlPlaneCore {
             assignment_verifying_key,
             access_token_signing_key,
             access_token_verifying_key,
-            assigned_tunnel_cidrs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1736,13 +1734,22 @@ impl ControlPlaneCore {
             ));
         }
 
-        let target_cidr = self.assign_tunnel_cidr(&target.node_id)?;
         let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
 
         let mut peers = self.nodes.list()?;
         peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let tunnel_assignments =
+            Self::deterministic_tunnel_assignments(peers.iter().map(|peer| peer.node_id.as_str()))?;
+        let target_cidr = tunnel_assignments
+            .get(target.node_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                ControlPlaneError::Assignment(
+                    "requested node assignment is unavailable".to_string(),
+                )
+            })?;
 
-        let mut bundle_peers = Vec::new();
+        let mut selected_peers = Vec::new();
         let mut bundle_routes = Vec::new();
         for peer in peers
             .iter()
@@ -1755,13 +1762,16 @@ impl ControlPlaneCore {
                 continue;
             }
 
-            let peer_cidr = self.assign_tunnel_cidr(&peer.node_id)?;
-            bundle_peers.push(AutoTunnelPeer {
-                node_id: peer.node_id.clone(),
-                endpoint: peer.endpoint.clone(),
-                public_key: peer.public_key,
-                allowed_ips: vec![peer_cidr.clone()],
-            });
+            let peer_cidr = tunnel_assignments
+                .get(peer.node_id.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    ControlPlaneError::Assignment(format!(
+                        "peer assignment is unavailable: {}",
+                        peer.node_id
+                    ))
+                })?;
+            selected_peers.push((peer.clone(), peer_cidr.clone()));
             bundle_routes.push(AutoTunnelRoute {
                 destination_cidr: peer_cidr,
                 via_node: peer.node_id.clone(),
@@ -1795,6 +1805,33 @@ impl ControlPlaneCore {
                     kind: AutoTunnelRouteKind::ExitNodeLan,
                 });
             }
+        }
+
+        let mut peer_allowed_ips = HashMap::<String, BTreeSet<String>>::new();
+        for (peer, peer_cidr) in &selected_peers {
+            peer_allowed_ips
+                .entry(peer.node_id.clone())
+                .or_default()
+                .insert(peer_cidr.clone());
+        }
+        for route in &bundle_routes {
+            if let Some(allowed_ips) = peer_allowed_ips.get_mut(route.via_node.as_str()) {
+                allowed_ips.insert(route.destination_cidr.clone());
+            }
+        }
+
+        let mut bundle_peers = Vec::with_capacity(selected_peers.len());
+        for (peer, _peer_cidr) in selected_peers {
+            let allowed_ips = peer_allowed_ips
+                .remove(peer.node_id.as_str())
+                .map(|ips| ips.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            bundle_peers.push(AutoTunnelPeer {
+                node_id: peer.node_id,
+                endpoint: peer.endpoint,
+                public_key: peer.public_key,
+                allowed_ips,
+            });
         }
 
         let payload = serialize_auto_tunnel_payload(
@@ -1842,32 +1879,54 @@ impl ControlPlaneCore {
         format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
     }
 
-    fn assign_tunnel_cidr(&self, node_id: &str) -> Result<String, ControlPlaneError> {
-        let mut guard = self
-            .assigned_tunnel_cidrs
-            .lock()
-            .map_err(|_| ControlPlaneError::Internal)?;
-        if let Some(existing) = guard.get(node_id) {
-            return Ok(existing.clone());
-        }
-
+    fn deterministic_tunnel_assignments<'a>(
+        node_ids: impl Iterator<Item = &'a str>,
+    ) -> Result<HashMap<String, String>, ControlPlaneError> {
         const MAX_OFFSET: u32 = 0x3f_ffff;
-        let mut offset = 1u32;
-        while offset <= MAX_OFFSET {
-            let second_octet = 64 + ((offset >> 16) & 0x3f);
-            let third_octet = (offset >> 8) & 0xff;
-            let fourth_octet = offset & 0xff;
-            let cidr = format!("100.{second_octet}.{third_octet}.{fourth_octet}/32");
-            if !guard.values().any(|assigned| assigned == &cidr) {
-                guard.insert(node_id.to_string(), cidr.clone());
-                return Ok(cidr);
-            }
-            offset = offset.saturating_add(1);
+        let mut ordered_ids = node_ids.map(ToOwned::to_owned).collect::<Vec<String>>();
+        ordered_ids.sort();
+        ordered_ids.dedup();
+
+        if ordered_ids.len() as u32 > MAX_OFFSET {
+            return Err(ControlPlaneError::Assignment(
+                "no available tunnel cidr assignment remains".to_string(),
+            ));
         }
 
-        Err(ControlPlaneError::Assignment(
-            "no available tunnel cidr assignment remains".to_string(),
-        ))
+        let mut used_offsets = HashSet::new();
+        let mut assignments = HashMap::with_capacity(ordered_ids.len());
+        for node_id in ordered_ids {
+            let mut offset = Self::deterministic_offset_for_node_id(node_id.as_str());
+            let start = offset;
+            loop {
+                if used_offsets.insert(offset) {
+                    assignments.insert(node_id, Self::cidr_from_offset(offset));
+                    break;
+                }
+                offset = if offset == MAX_OFFSET { 1 } else { offset + 1 };
+                if offset == start {
+                    return Err(ControlPlaneError::Assignment(
+                        "no available tunnel cidr assignment remains".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(assignments)
+    }
+
+    fn deterministic_offset_for_node_id(node_id: &str) -> u32 {
+        const MAX_OFFSET: u32 = 0x3f_ffff;
+        let digest = sha256_digest(node_id.as_bytes());
+        let raw = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        (raw % MAX_OFFSET) + 1
+    }
+
+    fn cidr_from_offset(offset: u32) -> String {
+        let second_octet = 64 + ((offset >> 16) & 0x3f);
+        let third_octet = (offset >> 8) & 0xff;
+        let fourth_octet = offset & 0xff;
+        format!("100.{second_octet}.{third_octet}.{fourth_octet}/32")
     }
 
     fn policy_allows_node_pair(&self, source: &NodeMetadata, destination: &NodeMetadata) -> bool {
@@ -1951,6 +2010,15 @@ fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&digest[..32]);
     seed
+}
+
+fn sha256_digest(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
 }
 
 fn token_claims_payload(claims: &TokenClaims) -> String {
@@ -2468,6 +2536,10 @@ mod tests {
             payload_field(&bundle.payload, "peer_count").as_deref(),
             Some("1")
         );
+        let peer_allowed_ips = payload_field(&bundle.payload, "peer.0.allowed_ips")
+            .expect("peer allowed ips should be present");
+        assert!(peer_allowed_ips.contains("0.0.0.0/0"));
+        assert!(peer_allowed_ips.contains("192.168.1.0/24"));
 
         let wire = ControlPlaneCore::signed_auto_tunnel_bundle_to_wire(&bundle);
         assert!(wire.contains("signature="));
@@ -2550,6 +2622,83 @@ mod tests {
         );
         assert!(first.payload.contains("peer.0.node_id=node-b"));
         assert!(!first.payload.contains("node-c"));
+    }
+
+    #[test]
+    fn auto_tunnel_bundle_assignments_are_consistent_across_targets() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.50:51820", [51; 32]),
+            ("cred-b", "node-b", "198.51.100.51:51820", [52; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let bundle_a = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-a".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 300,
+                nonce: 31,
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                exit_node_id: None,
+                lan_routes: Vec::new(),
+            })
+            .expect("bundle should be generated");
+        let bundle_b = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-b".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 300,
+                nonce: 32,
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                exit_node_id: None,
+                lan_routes: Vec::new(),
+            })
+            .expect("bundle should be generated");
+
+        let assigned_a =
+            payload_field(&bundle_a.payload, "assigned_cidr").expect("assigned cidr for node-a");
+        let assigned_b =
+            payload_field(&bundle_b.payload, "assigned_cidr").expect("assigned cidr for node-b");
+        assert_ne!(assigned_a, assigned_b);
+        assert_eq!(
+            payload_field(&bundle_a.payload, "peer.0.allowed_ips"),
+            Some(assigned_b.clone())
+        );
+        assert_eq!(
+            payload_field(&bundle_b.payload, "peer.0.allowed_ips"),
+            Some(assigned_a.clone())
+        );
     }
 
     #[test]
