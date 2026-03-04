@@ -368,10 +368,11 @@ impl fmt::Display for AutoTunnelBootstrapError {
 
 impl std::error::Error for AutoTunnelBootstrapError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AutoTunnelWatermark {
     generated_at_unix: u64,
     nonce: u64,
+    payload_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -3155,15 +3156,27 @@ fn load_auto_tunnel_bundle(
         return Err(AutoTunnelBootstrapError::Stale);
     }
 
+    let payload_digest = sha256_digest(payload.as_bytes());
     let watermark = AutoTunnelWatermark {
         generated_at_unix,
         nonce,
+        payload_digest: Some(payload_digest),
     };
-    if previous_watermark
-        .map(|existing| watermark <= existing)
-        .unwrap_or(false)
-    {
-        return Err(AutoTunnelBootstrapError::ReplayDetected);
+    if let Some(existing) = previous_watermark {
+        match auto_tunnel_watermark_ordering(&watermark, &existing) {
+            std::cmp::Ordering::Less => {
+                return Err(AutoTunnelBootstrapError::ReplayDetected);
+            }
+            std::cmp::Ordering::Equal => {
+                let existing_digest = existing
+                    .payload_digest
+                    .ok_or(AutoTunnelBootstrapError::ReplayDetected)?;
+                if existing_digest != payload_digest {
+                    return Err(AutoTunnelBootstrapError::ReplayDetected);
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
     }
 
     let peer_count = fields
@@ -3338,6 +3351,16 @@ fn decode_auto_tunnel_hex_nibble(value: u8) -> Result<u8, AutoTunnelBootstrapErr
     }
 }
 
+fn auto_tunnel_watermark_ordering(
+    current: &AutoTunnelWatermark,
+    previous: &AutoTunnelWatermark,
+) -> std::cmp::Ordering {
+    current
+        .generated_at_unix
+        .cmp(&previous.generated_at_unix)
+        .then(current.nonce.cmp(&previous.nonce))
+}
+
 fn load_auto_tunnel_watermark(
     path: &Path,
 ) -> Result<Option<AutoTunnelWatermark>, AutoTunnelBootstrapError> {
@@ -3350,6 +3373,7 @@ fn load_auto_tunnel_watermark(
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
+    let mut payload_digest: Option<[u8; 32]> = None;
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(AutoTunnelBootstrapError::InvalidFormat(
@@ -3366,6 +3390,9 @@ fn load_auto_tunnel_watermark(
             "nonce" => {
                 nonce = value.parse::<u64>().ok();
             }
+            "payload_digest_sha256" => {
+                payload_digest = Some(decode_auto_tunnel_hex_to_fixed::<32>(value)?);
+            }
             _ => {
                 return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
                     "unknown watermark key {key}"
@@ -3373,20 +3400,32 @@ fn load_auto_tunnel_watermark(
             }
         }
     }
-    if version != Some(1) {
-        return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "unsupported watermark version".to_string(),
-        ));
-    }
-    Ok(Some(AutoTunnelWatermark {
-        generated_at_unix: generated_at_unix.ok_or_else(|| {
+    let generated_at_unix = generated_at_unix.ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_string())
+    })?;
+    let nonce = nonce.ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+    })?;
+    let version = version.ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark version".to_string())
+    })?;
+    let payload_digest = match version {
+        1 => None,
+        2 => Some(payload_digest.ok_or_else(|| {
             AutoTunnelBootstrapError::InvalidFormat(
-                "missing watermark generated_at_unix".to_string(),
+                "missing watermark payload_digest_sha256".to_string(),
             )
-        })?,
-        nonce: nonce.ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("missing watermark nonce".to_string())
-        })?,
+        })?),
+        _ => {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "unsupported watermark version".to_string(),
+            ));
+        }
+    };
+    Ok(Some(AutoTunnelWatermark {
+        generated_at_unix,
+        nonce,
+        payload_digest,
     }))
 }
 
@@ -3403,9 +3442,17 @@ fn persist_auto_tunnel_watermark(
                 .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
         }
     }
+    let payload_digest = watermark
+        .payload_digest
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(
+                "watermark payload digest is required".to_string(),
+            )
+        })
+        .map(|digest| encode_hex(&digest))?;
     let payload = format!(
-        "version=1\ngenerated_at_unix={}\nnonce={}\n",
-        watermark.generated_at_unix, watermark.nonce
+        "version=2\ngenerated_at_unix={}\nnonce={}\npayload_digest_sha256={}\n",
+        watermark.generated_at_unix, watermark.nonce, payload_digest
     );
     let temp_path = path.with_extension(format!(
         "tmp.{}.{}",
@@ -3639,8 +3686,9 @@ mod tests {
 
     use super::{
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_trust_evidence,
-        load_trust_watermark, persist_auto_tunnel_watermark, persist_trust_watermark,
+        TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_auto_tunnel_bundle,
+        load_auto_tunnel_watermark, load_trust_evidence, load_trust_watermark,
+        persist_auto_tunnel_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, run_daemon, scrub_runtime_wireguard_key_material,
         sha256_digest, trust_evidence_payload, unix_now, validate_daemon_config,
         zeroize_optional_bytes,
@@ -4042,6 +4090,122 @@ mod tests {
     }
 
     #[test]
+    fn auto_tunnel_watermark_round_trip_persists_payload_digest() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-round-trip");
+        let watermark_path = test_dir.join("assignment.watermark");
+        let expected = AutoTunnelWatermark {
+            generated_at_unix: 100,
+            nonce: 9,
+            payload_digest: Some([0x33u8; 32]),
+        };
+        persist_auto_tunnel_watermark(&watermark_path, expected)
+            .expect("auto tunnel watermark should persist");
+        let loaded = load_auto_tunnel_watermark(&watermark_path)
+            .expect("auto tunnel watermark should load")
+            .expect("auto tunnel watermark should exist");
+        assert_eq!(loaded, expected);
+        let raw = std::fs::read_to_string(&watermark_path)
+            .expect("auto tunnel watermark file should exist");
+        assert!(raw.contains("version=2"));
+        assert!(raw.contains("payload_digest_sha256="));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_watermark_supports_legacy_version_without_digest() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-v1");
+        let watermark_path = test_dir.join("assignment.watermark");
+        std::fs::write(
+            &watermark_path,
+            "version=1\ngenerated_at_unix=10\nnonce=2\n",
+        )
+        .expect("legacy auto tunnel watermark should be written");
+        let loaded = load_auto_tunnel_watermark(&watermark_path)
+            .expect("legacy auto tunnel watermark should load")
+            .expect("legacy auto tunnel watermark should exist");
+        assert_eq!(
+            loaded,
+            AutoTunnelWatermark {
+                generated_at_unix: 10,
+                nonce: 2,
+                payload_digest: None,
+            }
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_allows_equal_watermark_when_payload_digest_matches() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-equal-match");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            7,
+            false,
+        );
+        let first = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first auto tunnel load should succeed");
+        let second = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(first.watermark),
+        )
+        .expect("equal watermark should be accepted when digest matches");
+        assert_eq!(second.watermark, first.watermark);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_rejects_equal_watermark_when_payload_digest_differs() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-equal-mismatch");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            8,
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first auto tunnel load should succeed");
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(AutoTunnelWatermark {
+                generated_at_unix: envelope.watermark.generated_at_unix,
+                nonce: envelope.watermark.nonce,
+                payload_digest: Some([0x44u8; 32]),
+            }),
+        )
+        .expect_err("equal watermark with mismatched payload digest must fail");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::ReplayDetected
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
         let test_dir = secure_test_dir("rustynetd-runtime-test");
         let state_path = test_dir.join("daemon.state");
@@ -4439,6 +4603,7 @@ mod tests {
             AutoTunnelWatermark {
                 generated_at_unix: unix_now().saturating_add(10),
                 nonce: 99,
+                payload_digest: Some([0xabu8; 32]),
             },
         )
         .expect("assignment watermark should be persisted");
