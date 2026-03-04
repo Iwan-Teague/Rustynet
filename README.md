@@ -39,6 +39,22 @@ Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
 
+Signed auto-tunnel assignment issuance:
+- Issue centrally signed per-node assignment bundles with explicit allow rules:
+```bash
+rustynet assignment issue \
+  --target-node-id client-40 \
+  --nodes "client-40|192.168.18.40:51820|<client_pubkey_hex>;exit-37|192.168.18.37:51820|<exit_pubkey_hex>" \
+  --allow "client-40|exit-37" \
+  --signing-secret /etc/rustynet/assignment.signing.secret \
+  --output /tmp/client-40.assignment \
+  --verifier-key-output /tmp/assignment.pub \
+  --exit-node-id exit-37 \
+  --ttl-secs 300
+```
+- `--nodes` format: `node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]` entries separated by `;`.
+- `--allow` format: `source_node_id|destination_node_id` entries separated by `;` (default-deny unless explicitly allowed).
+
 ## Release Readiness Evidence (Fail-Closed)
 
 Rustynet no longer accepts static/pass-through readiness JSON artifacts.

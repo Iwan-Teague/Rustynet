@@ -530,6 +530,7 @@ dependencies = [
  "ed25519-dalek",
  "nix",
  "rustynet-control",
+ "rustynet-policy",
  "rustynetd",
  "zeroize",
 ]

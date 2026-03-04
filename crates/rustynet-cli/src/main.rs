@@ -18,6 +18,8 @@ use rustynet_control::membership::{
     load_membership_snapshot, persist_membership_snapshot, replay_membership_snapshot_and_log,
     sign_update_record, write_membership_audit_log,
 };
+use rustynet_control::{AutoTunnelBundleRequest, ControlPlaneCore, NodeMetadata};
+use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
 };
@@ -37,6 +39,7 @@ enum CliCommand {
     RouteAdvertise(String),
     KeyRotate,
     KeyRevoke,
+    Assignment(Box<AssignmentCommand>),
     Membership(Box<MembershipCommand>),
     Help,
 }
@@ -79,6 +82,41 @@ enum MembershipCommand {
         output_dir: PathBuf,
         environment: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AssignmentCommand {
+    Issue {
+        signing_secret_path: PathBuf,
+        target_node_id: String,
+        output_path: PathBuf,
+        verifier_key_output_path: Option<PathBuf>,
+        nodes: Vec<AssignmentNodeSpec>,
+        allow_pairs: Vec<AssignmentAllowPair>,
+        mesh_cidr: String,
+        exit_node_id: Option<String>,
+        lan_routes: Vec<String>,
+        generated_at_unix: u64,
+        ttl_secs: u64,
+        nonce: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentNodeSpec {
+    node_id: String,
+    endpoint: String,
+    public_key: [u8; 32],
+    owner: String,
+    hostname: String,
+    os: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentAllowPair {
+    source_node_id: String,
+    destination_node_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +166,10 @@ fn parse_command(args: &[String]) -> CliCommand {
         }
         [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => CliCommand::KeyRotate,
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => CliCommand::KeyRevoke,
+        [cmd, rest @ ..] if cmd == "assignment" => match parse_assignment_command(rest) {
+            Ok(command) => CliCommand::Assignment(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
         [cmd, rest @ ..] if cmd == "membership" => match parse_membership_command(rest) {
             Ok(command) => CliCommand::Membership(Box::new(command)),
             Err(_) => CliCommand::Help,
@@ -300,6 +342,58 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
     }
 }
 
+fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String> {
+    if args.is_empty() {
+        return Err("assignment subcommand is required".to_string());
+    }
+    let subcommand = args[0].as_str();
+    let parser = OptionParser::parse(&args[1..])?;
+    match subcommand {
+        "issue" => {
+            let target_node_id = parser.required("--target-node-id")?;
+            let output_path = parser.required_path("--output")?;
+            let signing_secret_path = parser.required_path("--signing-secret")?;
+            let verifier_key_output_path = parser.optional_path("--verifier-key-output");
+            let nodes = parse_assignment_nodes(parser.required("--nodes")?.as_str())?;
+            let allow_pairs = parse_assignment_allow_pairs(parser.required("--allow")?.as_str())?;
+            let mesh_cidr = parser
+                .value("--mesh-cidr")
+                .unwrap_or_else(|| "100.64.0.0/10".to_string());
+            let exit_node_id = parser.value("--exit-node-id");
+            let lan_routes = parser
+                .value("--lan-routes")
+                .map(split_csv)
+                .unwrap_or_default();
+            let generated_at_unix = parser.parse_u64_or_default("--generated-at", unix_now())?;
+            let ttl_secs = parser.parse_u64_or_default("--ttl-secs", 300)?;
+            let nonce = parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?;
+
+            validate_assignment_issue_config(
+                nodes.as_slice(),
+                allow_pairs.as_slice(),
+                target_node_id.as_str(),
+                exit_node_id.as_deref(),
+            )?;
+
+            Ok(AssignmentCommand::Issue {
+                signing_secret_path,
+                target_node_id,
+                output_path,
+                verifier_key_output_path,
+                nodes,
+                allow_pairs,
+                mesh_cidr,
+                exit_node_id,
+                lan_routes,
+                generated_at_unix,
+                ttl_secs,
+                nonce,
+            })
+        }
+        _ => Err(format!("unknown assignment subcommand: {subcommand}")),
+    }
+}
+
 fn proposal_config(
     parser: &OptionParser,
     paths: MembershipPaths,
@@ -326,6 +420,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
     match command {
         CliCommand::Help => Ok(help_text()),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
+        CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         other => {
             let ipc_command = to_ipc_command(other);
@@ -339,6 +434,87 @@ fn execute(command: CliCommand) -> Result<String, String> {
                 }
                 Err(err) => Err(format!("daemon unreachable: {err}")),
             }
+        }
+    }
+}
+
+fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
+    match command {
+        AssignmentCommand::Issue {
+            signing_secret_path,
+            target_node_id,
+            output_path,
+            verifier_key_output_path,
+            nodes,
+            allow_pairs,
+            mesh_cidr,
+            exit_node_id,
+            lan_routes,
+            generated_at_unix,
+            ttl_secs,
+            nonce,
+        } => {
+            let signing_secret = load_assignment_signing_secret(&signing_secret_path)?;
+
+            let policy = PolicySet {
+                rules: allow_pairs
+                    .iter()
+                    .map(|pair| PolicyRule {
+                        src: format!("node:{}", pair.source_node_id),
+                        dst: format!("node:{}", pair.destination_node_id),
+                        protocol: Protocol::Any,
+                        action: RuleAction::Allow,
+                    })
+                    .collect::<Vec<_>>(),
+            };
+
+            let core = ControlPlaneCore::new(signing_secret, policy);
+            for node in nodes {
+                core.nodes
+                    .upsert(NodeMetadata {
+                        node_id: node.node_id,
+                        hostname: node.hostname,
+                        os: node.os,
+                        tags: node.tags,
+                        owner: node.owner,
+                        endpoint: node.endpoint,
+                        last_seen_unix: generated_at_unix,
+                        public_key: node.public_key,
+                    })
+                    .map_err(|err| format!("register node failed: {err}"))?;
+            }
+
+            let bundle = core
+                .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                    node_id: target_node_id.clone(),
+                    generated_at_unix,
+                    ttl_secs,
+                    nonce,
+                    mesh_cidr,
+                    exit_node_id: exit_node_id.clone(),
+                    lan_routes,
+                })
+                .map_err(|err| format!("issue assignment bundle failed: {err}"))?;
+
+            let wire = ControlPlaneCore::signed_auto_tunnel_bundle_to_wire(&bundle);
+            write_text_file(&output_path, &wire)?;
+
+            let verifier_key_hex = core.assignment_verifier_key_hex();
+            if let Some(verifier_path) = verifier_key_output_path.as_ref() {
+                write_text_file(verifier_path, &format!("{verifier_key_hex}\n"))?;
+            }
+
+            Ok(format!(
+                "assignment bundle issued: target={} output={} generated_at_unix={} expires_at_unix={} verifier_key_output={}",
+                target_node_id,
+                output_path.display(),
+                bundle.generated_at_unix,
+                bundle.expires_at_unix,
+                verifier_key_output_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<not_written>".to_string())
+            ))
         }
     }
 }
@@ -779,6 +955,182 @@ fn split_csv(value: String) -> Vec<String> {
         .collect()
 }
 
+fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, String> {
+    let mut nodes = Vec::new();
+    for raw in encoded
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let fields = raw.split('|').collect::<Vec<_>>();
+        if fields.len() < 3 || fields.len() > 7 {
+            return Err("invalid --nodes entry format; expected node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]".to_string());
+        }
+
+        let node_id = fields[0].trim();
+        if node_id.is_empty() {
+            return Err("node_id must not be empty in --nodes".to_string());
+        }
+        let endpoint = fields[1].trim();
+        endpoint
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| format!("invalid endpoint for node {node_id}: {endpoint}"))?;
+        let public_key = decode_hex_to_32(fields[2].trim())
+            .map_err(|err| format!("invalid public key for node {node_id}: {err}"))?;
+        let owner = fields
+            .get(3)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| node_id.to_string());
+        let hostname = fields
+            .get(4)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| node_id.to_string());
+        let os = fields
+            .get(5)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "linux".to_string());
+        let tags = fields
+            .get(6)
+            .map(|value| split_csv((*value).to_string()))
+            .unwrap_or_default();
+
+        nodes.push(AssignmentNodeSpec {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+            public_key,
+            owner,
+            hostname,
+            os,
+            tags,
+        });
+    }
+    if nodes.is_empty() {
+        return Err("at least one node is required in --nodes".to_string());
+    }
+    Ok(nodes)
+}
+
+fn parse_assignment_allow_pairs(encoded: &str) -> Result<Vec<AssignmentAllowPair>, String> {
+    let mut pairs = Vec::new();
+    for raw in encoded
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let fields = raw.split('|').collect::<Vec<_>>();
+        if fields.len() != 2 {
+            return Err(
+                "invalid --allow entry format; expected source_node_id|destination_node_id"
+                    .to_string(),
+            );
+        }
+        let source_node_id = fields[0].trim();
+        let destination_node_id = fields[1].trim();
+        if source_node_id.is_empty() || destination_node_id.is_empty() {
+            return Err("allow pair node ids must not be empty".to_string());
+        }
+        pairs.push(AssignmentAllowPair {
+            source_node_id: source_node_id.to_string(),
+            destination_node_id: destination_node_id.to_string(),
+        });
+    }
+    if pairs.is_empty() {
+        return Err("at least one allow pair is required in --allow".to_string());
+    }
+    Ok(pairs)
+}
+
+fn validate_assignment_issue_config(
+    nodes: &[AssignmentNodeSpec],
+    allow_pairs: &[AssignmentAllowPair],
+    target_node_id: &str,
+    exit_node_id: Option<&str>,
+) -> Result<(), String> {
+    let mut node_ids = HashSet::new();
+    for node in nodes {
+        if !node_ids.insert(node.node_id.clone()) {
+            return Err(format!("duplicate node id in --nodes: {}", node.node_id));
+        }
+    }
+    if !node_ids.contains(target_node_id) {
+        return Err(format!(
+            "target node {} is not present in --nodes",
+            target_node_id
+        ));
+    }
+    if let Some(exit_node_id) = exit_node_id {
+        if !node_ids.contains(exit_node_id) {
+            return Err(format!(
+                "exit node {} is not present in --nodes",
+                exit_node_id
+            ));
+        }
+    }
+    let mut allow_pair_set = HashSet::new();
+    for pair in allow_pairs {
+        if !node_ids.contains(&pair.source_node_id) {
+            return Err(format!(
+                "allow rule source node {} is not present in --nodes",
+                pair.source_node_id
+            ));
+        }
+        if !node_ids.contains(&pair.destination_node_id) {
+            return Err(format!(
+                "allow rule destination node {} is not present in --nodes",
+                pair.destination_node_id
+            ));
+        }
+        let marker = format!("{}|{}", pair.source_node_id, pair.destination_node_id);
+        if !allow_pair_set.insert(marker) {
+            return Err(format!(
+                "duplicate allow rule {} -> {}",
+                pair.source_node_id, pair.destination_node_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_assignment_signing_secret(path: &Path) -> Result<Vec<u8>, String> {
+    validate_signing_key_file_security(path)?;
+    let mut content =
+        fs::read_to_string(path).map_err(|err| format!("read signing secret failed: {err}"))?;
+    let secret_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| "signing secret file is empty".to_string())?
+        .to_string();
+    content.zeroize();
+
+    let secret_line = Zeroizing::new(secret_line);
+    let secret = decode_hex(secret_line.as_str())?;
+    if secret.len() < 32 {
+        return Err("signing secret must be at least 32 bytes (64 hex chars)".to_string());
+    }
+    Ok(secret)
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
+    let trimmed = encoded.trim();
+    if trimmed.len() % 2 != 0 {
+        return Err("hex payload must have even length".to_string());
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < raw.len() {
+        let hi = decode_hex_nibble(raw[index])?;
+        let lo = decode_hex_nibble(raw[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Ok(out)
+}
+
 fn generate_update_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -792,6 +1144,14 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn generate_assignment_nonce() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    (nanos & u128::from(u64::MAX)) as u64
 }
 
 trait MembershipOperationName {
@@ -909,9 +1269,10 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::RouteAdvertise(cidr) => IpcCommand::RouteAdvertise(cidr),
         CliCommand::KeyRotate => IpcCommand::KeyRotate,
         CliCommand::KeyRevoke => IpcCommand::KeyRevoke,
-        CliCommand::Login | CliCommand::Help | CliCommand::Membership(_) => {
-            IpcCommand::Unknown("unsupported".to_string())
-        }
+        CliCommand::Login
+        | CliCommand::Help
+        | CliCommand::Assignment(_)
+        | CliCommand::Membership(_) => IpcCommand::Unknown("unsupported".to_string()),
     }
 }
 
@@ -958,6 +1319,9 @@ fn help_text() -> String {
         "  route advertise <cidr>",
         "  key rotate",
         "  key revoke",
+        "  assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]",
+        "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv];... ",
+        "    allow_specs format: source_node_id|destination_node_id;...",
         "  membership status [--snapshot <path>] [--log <path>]",
         "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  membership propose-remove --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
@@ -1022,6 +1386,25 @@ mod tests {
             "ci-netns".to_string(),
         ]);
         assert!(format!("{command:?}").contains("GenerateEvidence"));
+    }
+
+    #[test]
+    fn parse_supports_assignment_issue_command() {
+        let command = parse_command(&[
+            "assignment".to_string(),
+            "issue".to_string(),
+            "--target-node-id".to_string(),
+            "client-40".to_string(),
+            "--nodes".to_string(),
+            "client-40|192.0.2.40:51820|11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff;exit-37|192.0.2.37:51820|aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
+            "--allow".to_string(),
+            "client-40|exit-37".to_string(),
+            "--signing-secret".to_string(),
+            "/tmp/assignment.secret".to_string(),
+            "--output".to_string(),
+            "/tmp/assignment.bundle".to_string(),
+        ]);
+        assert!(format!("{command:?}").contains("Assignment"));
     }
 
     #[cfg(unix)]
