@@ -282,7 +282,7 @@ if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
 else
   systemctl disable --now rustynetd-trust-refresh.timer >/dev/null 2>&1 || true
 fi
-systemctl reset-failed rustynetd-privileged-helper.service rustynetd.service rustynetd-trust-refresh.service rustynetd-trust-refresh.timer || true
+systemctl reset-failed rustynetd-privileged-helper.service rustynetd.service rustynetd-trust-refresh.service rustynetd-trust-refresh.timer >/dev/null 2>&1 || true
 systemctl restart rustynetd-privileged-helper.service
 if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
   systemctl start rustynetd-trust-refresh.service
