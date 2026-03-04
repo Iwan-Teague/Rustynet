@@ -1333,7 +1333,14 @@ EOF
   cat "${payload}" >"${trust_tmp}"
   printf 'signature=%s\n' "${sig_hex}" >>"${trust_tmp}"
 
-  run_root install -m 0600 "${trust_tmp}" "${TRUST_EVIDENCE_PATH}"
+  local trust_group="root"
+  local trust_mode="0644"
+  local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+  if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
+    trust_group="${daemon_group}"
+    trust_mode="0640"
+  fi
+  run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${trust_tmp}" "${TRUST_EVIDENCE_PATH}"
   rm -f "${payload}" "${sig_bin}" "${trust_tmp}"
   print_info "Signed trust evidence refreshed at ${TRUST_EVIDENCE_PATH}"
 }

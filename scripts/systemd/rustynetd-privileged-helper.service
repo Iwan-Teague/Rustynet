@@ -28,7 +28,8 @@ PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
-ProtectKernelTunables=true
+# Required so helper can enforce IPv4/IPv6 kernel networking toggles via sysctl.
+ProtectKernelTunables=false
 ProtectKernelModules=true
 ProtectKernelLogs=true
 MemoryDenyWriteExecute=true
@@ -36,9 +37,10 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 SystemCallArchitectures=native
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE
-ReadWritePaths=-/run/rustynet
+# CAP_SYS_ADMIN is required for sysctl writes used by fail-closed IPv6/forwarding enforcement.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+ReadWritePaths=-/run/rustynet -/proc/sys/net/ipv4 -/proc/sys/net/ipv6
 UMask=0077
 
 [Install]

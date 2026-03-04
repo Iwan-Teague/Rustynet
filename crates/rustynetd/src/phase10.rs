@@ -14,7 +14,8 @@ use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
 };
 use rustynet_backend_api::{
-    BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext, TunnelBackend,
+    BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
+    TunnelBackend,
 };
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, Protocol, TrafficContext,
@@ -1257,8 +1258,13 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system.prune_owned_tables()?;
 
         let mut applied_stages = Vec::new();
-        if self.backend.start(context).is_ok() {
-            applied_stages.push(StageMarker::BackendStarted);
+        match self.backend.start(context) {
+            Ok(()) => applied_stages.push(StageMarker::BackendStarted),
+            Err(err) if err.kind == BackendErrorKind::AlreadyRunning => {}
+            Err(err) => {
+                self.force_fail_closed("backend_start_failed")?;
+                return Err(err.into());
+            }
         }
 
         let result = self.apply_generation_stages(peers, routes, options, &mut applied_stages);
@@ -1803,11 +1809,78 @@ pub fn write_phase10_perf_report(
 mod tests {
     use std::net::IpAddr;
 
-    use rustynet_backend_api::{RouteKind, SocketEndpoint};
+    use rustynet_backend_api::{
+        BackendCapabilities, BackendError, BackendErrorKind, RouteKind, SocketEndpoint, TunnelStats,
+    };
     use rustynet_backend_wireguard::WireguardBackend;
     use rustynet_policy::{ContextualPolicyRule, RuleAction};
 
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum StartBehavior {
+        AlreadyRunning,
+        FailInternal,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ControlledStartBackend {
+        behavior: StartBehavior,
+    }
+
+    impl ControlledStartBackend {
+        fn new(behavior: StartBehavior) -> Self {
+            Self { behavior }
+        }
+    }
+
+    impl TunnelBackend for ControlledStartBackend {
+        fn name(&self) -> &'static str {
+            "controlled-start-backend"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                supports_roaming: true,
+                supports_exit_nodes: true,
+                supports_lan_routes: true,
+                supports_ipv6: true,
+            }
+        }
+
+        fn start(&mut self, _context: RuntimeContext) -> Result<(), BackendError> {
+            match self.behavior {
+                StartBehavior::AlreadyRunning => {
+                    Err(BackendError::already_running("backend already running"))
+                }
+                StartBehavior::FailInternal => Err(BackendError::internal("backend start failed")),
+            }
+        }
+
+        fn configure_peer(&mut self, _peer: PeerConfig) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn remove_peer(&mut self, _node_id: &NodeId) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn apply_routes(&mut self, _routes: Vec<Route>) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn set_exit_mode(&mut self, _mode: ExitMode) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn stats(&self) -> Result<TunnelStats, BackendError> {
+            Ok(TunnelStats::default())
+        }
+
+        fn shutdown(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
 
     fn allow_shared_exit_policy() -> ContextualPolicySet {
         ContextualPolicySet {
@@ -1893,6 +1966,65 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::ExitActive);
         assert_eq!(controller.generation(), 1);
         assert_eq!(controller.last_safe_generation(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_backend_start_failure_and_fail_closes() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            ControlledStartBackend::new(StartBehavior::FailInternal),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            RuntimeContext {
+                local_node: NodeId::new("node-a").expect("node should parse"),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+            },
+            Vec::new(),
+            Vec::new(),
+            ApplyOptions::default(),
+        );
+
+        let err = result.expect_err("backend start failure must be surfaced");
+        assert!(matches!(
+            err,
+            Phase10Error::Backend(BackendError {
+                kind: BackendErrorKind::Internal,
+                ..
+            })
+        ));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    #[test]
+    fn apply_accepts_already_running_backend_start() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            ControlledStartBackend::new(StartBehavior::AlreadyRunning),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                },
+                Vec::new(),
+                Vec::new(),
+                ApplyOptions::default(),
+            )
+            .expect("already-running start should not block reconcile apply");
+
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+        assert_eq!(controller.generation(), 1);
     }
 
     #[test]

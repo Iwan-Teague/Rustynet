@@ -990,7 +990,15 @@ impl DaemonRuntime {
             }
         };
 
-        let apply = self.controller.apply_dataplane_generation(
+        if let Err(err) = self.ensure_runtime_private_key_material() {
+            self.restrict_recoverable(format!("runtime key preparation failed: {err}"));
+            let _ = self
+                .controller
+                .force_fail_closed("runtime_key_prepare_failed");
+            return;
+        }
+
+        let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
                 local_node,
@@ -1012,10 +1020,30 @@ impl DaemonRuntime {
                 },
             },
         );
-        if apply.is_err() {
-            self.restrict_recoverable("dataplane bootstrap apply failed".to_string());
-            let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
-            return;
+        let cleanup_result = self.scrub_runtime_private_key_material();
+        match (apply_result, cleanup_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(err), Ok(())) => {
+                self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
+                let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
+                return;
+            }
+            (Err(err), Err(cleanup_err)) => {
+                self.restrict_recoverable(format!(
+                    "dataplane bootstrap apply failed: {err}; runtime key cleanup failed: {cleanup_err}"
+                ));
+                let _ = self.controller.force_fail_closed("bootstrap_apply_failed");
+                return;
+            }
+            (Ok(()), Err(cleanup_err)) => {
+                self.restrict_recoverable(format!(
+                    "runtime key cleanup failed after bootstrap apply: {cleanup_err}"
+                ));
+                let _ = self
+                    .controller
+                    .force_fail_closed("runtime_key_cleanup_failed");
+                return;
+            }
         }
         self.membership_state = Some(membership_state);
         self.membership_directory = membership_directory;
@@ -1432,6 +1460,23 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    fn ensure_runtime_private_key_material(&self) -> Result<(), String> {
+        prepare_runtime_wireguard_key_material(
+            self.backend_mode,
+            self.wg_private_key_path.as_deref(),
+            self.wg_encrypted_private_key_path.as_deref(),
+            self.wg_key_passphrase_path.as_deref(),
+        )
+    }
+
+    fn scrub_runtime_private_key_material(&self) -> Result<(), String> {
+        scrub_runtime_wireguard_key_material(
+            self.backend_mode,
+            self.wg_private_key_path.as_deref(),
+            self.wg_encrypted_private_key_path.as_deref(),
+        )
+    }
+
     fn persist_state(&mut self) -> Result<(), String> {
         let snapshot = SessionStateSnapshot {
             timestamp_unix: unix_now(),
@@ -1574,7 +1619,19 @@ impl DaemonRuntime {
                 }
             };
 
-            let apply = self.controller.apply_dataplane_generation(
+            if let Err(err) = self.ensure_runtime_private_key_material() {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("runtime key preparation failed: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                let _ = self
+                    .controller
+                    .force_fail_closed("runtime_key_prepare_failed");
+                self.promote_to_permanent_if_over_limit();
+                return;
+            }
+
+            let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
                     local_node,
@@ -1596,9 +1653,10 @@ impl DaemonRuntime {
                     },
                 },
             );
+            let cleanup_result = self.scrub_runtime_private_key_material();
 
-            match apply {
-                Ok(()) => {
+            match (apply_result, cleanup_result) {
+                (Ok(()), Ok(())) => {
                     self.membership_state = Some(membership_state);
                     self.membership_directory = membership_directory;
                     if self.auto_tunnel_enforce {
@@ -1611,12 +1669,33 @@ impl DaemonRuntime {
                     self.bootstrap_error = None;
                     self.reconcile_failures = 0;
                 }
-                Err(err) => {
+                (Err(err), Ok(())) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
                     let message = format!("reconcile dataplane apply failed: {err}");
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_recoverable(message);
                     let _ = self.controller.force_fail_closed("reconcile_apply_failed");
+                    self.promote_to_permanent_if_over_limit();
+                }
+                (Err(err), Err(cleanup_err)) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message = format!(
+                        "reconcile dataplane apply failed: {err}; runtime key cleanup failed: {cleanup_err}"
+                    );
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_recoverable(message);
+                    let _ = self.controller.force_fail_closed("reconcile_apply_failed");
+                    self.promote_to_permanent_if_over_limit();
+                }
+                (Ok(()), Err(cleanup_err)) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message =
+                        format!("runtime key cleanup failed after reconcile apply: {cleanup_err}");
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_recoverable(message);
+                    let _ = self
+                        .controller
+                        .force_fail_closed("runtime_key_cleanup_failed");
                     self.promote_to_permanent_if_over_limit();
                 }
             }
@@ -1851,53 +1930,73 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 }
 
 fn scrub_runtime_wireguard_key_after_bootstrap(config: &DaemonConfig) -> Result<(), DaemonError> {
-    if !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+    scrub_runtime_wireguard_key_material(
+        config.backend_mode,
+        config.wg_private_key_path.as_deref(),
+        config.wg_encrypted_private_key_path.as_deref(),
+    )
+    .map_err(|err| DaemonError::InvalidConfig(format!("runtime private key cleanup failed: {err}")))
+}
+
+fn scrub_runtime_wireguard_key_material(
+    backend_mode: DaemonBackendMode,
+    runtime_path: Option<&Path>,
+    encrypted_private_key_path: Option<&Path>,
+) -> Result<(), String> {
+    if !matches!(backend_mode, DaemonBackendMode::LinuxWireguard) {
         return Ok(());
     }
-    // Keep runtime key material ephemeral when encrypted custody is configured.
-    if config.wg_encrypted_private_key_path.is_none() {
+    if encrypted_private_key_path.is_none() {
         return Ok(());
     }
-    let Some(runtime_path) = config.wg_private_key_path.as_ref() else {
+    let Some(runtime_path) = runtime_path else {
         return Ok(());
     };
     if !runtime_path.exists() {
         return Ok(());
     }
-    remove_file_if_present(runtime_path).map_err(|err| {
-        DaemonError::InvalidConfig(format!("runtime private key cleanup failed: {err}"))
-    })?;
-    Ok(())
+    remove_file_if_present(runtime_path)
 }
 
 fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonError> {
-    if !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard) {
+    prepare_runtime_wireguard_key_material(
+        config.backend_mode,
+        config.wg_private_key_path.as_deref(),
+        config.wg_encrypted_private_key_path.as_deref(),
+        config.wg_key_passphrase_path.as_deref(),
+    )
+    .map_err(DaemonError::InvalidConfig)
+}
+
+fn prepare_runtime_wireguard_key_material(
+    backend_mode: DaemonBackendMode,
+    runtime_path: Option<&Path>,
+    encrypted_private_key_path: Option<&Path>,
+    passphrase_path: Option<&Path>,
+) -> Result<(), String> {
+    if !matches!(backend_mode, DaemonBackendMode::LinuxWireguard) {
         return Ok(());
     }
 
-    let Some(runtime_path) = config.wg_private_key_path.as_ref() else {
-        return Ok(());
-    };
-    let Some(encrypted_path) = config.wg_encrypted_private_key_path.as_ref() else {
-        return Ok(());
-    };
-    let passphrase_path = config.wg_key_passphrase_path.as_ref().ok_or_else(|| {
-        DaemonError::InvalidConfig(
-            "wg key passphrase path is required when encrypted key path is configured".to_string(),
-        )
-    })?;
+    let runtime_path = runtime_path
+        .ok_or_else(|| "wg private key path is required for linux-wireguard backend".to_string())?;
 
-    let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
-        .map_err(|err| DaemonError::InvalidConfig(format!("wg key decrypt failed: {err}")))?;
-    let write_result = write_runtime_private_key(runtime_path, &decrypted);
-    decrypted.fill(0);
-    if let Err(err) = write_result {
-        let _ = remove_file_if_present(runtime_path);
-        return Err(DaemonError::InvalidConfig(format!(
-            "wg runtime key write failed: {err}"
-        )));
+    if let Some(encrypted_path) = encrypted_private_key_path {
+        let passphrase_path = passphrase_path.ok_or_else(|| {
+            "wg key passphrase path is required when encrypted key path is configured".to_string()
+        })?;
+        let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
+            .map_err(|err| format!("wg key decrypt failed: {err}"))?;
+        let write_result = write_runtime_private_key(runtime_path, &decrypted);
+        decrypted.fill(0);
+        if let Err(err) = write_result {
+            let _ = remove_file_if_present(runtime_path);
+            return Err(format!("wg runtime key write failed: {err}"));
+        }
+        return Ok(());
     }
-    Ok(())
+
+    validate_private_key_permissions(runtime_path).map_err(|err| err.to_string())
 }
 
 fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
@@ -3374,7 +3473,8 @@ mod tests {
     use super::{
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_trust_evidence,
-        load_trust_watermark, persist_auto_tunnel_watermark, persist_trust_watermark, run_daemon,
+        load_trust_watermark, persist_auto_tunnel_watermark, persist_trust_watermark,
+        prepare_runtime_wireguard_key_material, run_daemon, scrub_runtime_wireguard_key_material,
         sha256_digest, trust_evidence_payload, unix_now, validate_daemon_config,
         zeroize_optional_bytes,
     };
@@ -3575,6 +3675,67 @@ mod tests {
         let mut value = Some(vec![7u8, 9u8, 13u8, 17u8]);
         zeroize_optional_bytes(&mut value);
         assert_eq!(value, Some(vec![0u8, 0u8, 0u8, 0u8]));
+    }
+
+    #[test]
+    fn runtime_key_prepare_requires_plaintext_key_when_encrypted_store_disabled() {
+        let test_dir = secure_test_dir("rustynetd-runtime-key-prepare-plaintext");
+        let runtime_key_path = test_dir.join("wireguard.key");
+
+        let err = prepare_runtime_wireguard_key_material(
+            DaemonBackendMode::LinuxWireguard,
+            Some(runtime_key_path.as_path()),
+            None,
+            None,
+        )
+        .expect_err("missing plaintext runtime key must be rejected");
+        assert!(err.contains("wireguard private key"));
+
+        std::fs::write(&runtime_key_path, b"private-key\n")
+            .expect("runtime key should be writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&runtime_key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("runtime key permissions should be restrictive");
+        }
+
+        prepare_runtime_wireguard_key_material(
+            DaemonBackendMode::LinuxWireguard,
+            Some(runtime_key_path.as_path()),
+            None,
+            None,
+        )
+        .expect("existing plaintext runtime key should be accepted");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn runtime_key_scrub_only_removes_ephemeral_file_when_encrypted_store_is_used() {
+        let test_dir = secure_test_dir("rustynetd-runtime-key-scrub");
+        let runtime_key_path = test_dir.join("wireguard.key");
+        let encrypted_key_path = test_dir.join("wireguard.key.enc");
+        std::fs::write(&runtime_key_path, b"private-key\n")
+            .expect("runtime key should be writable");
+
+        scrub_runtime_wireguard_key_material(
+            DaemonBackendMode::LinuxWireguard,
+            Some(runtime_key_path.as_path()),
+            None,
+        )
+        .expect("plaintext key mode should not scrub runtime key");
+        assert!(runtime_key_path.exists());
+
+        scrub_runtime_wireguard_key_material(
+            DaemonBackendMode::LinuxWireguard,
+            Some(runtime_key_path.as_path()),
+            Some(encrypted_key_path.as_path()),
+        )
+        .expect("encrypted key mode should scrub runtime key");
+        assert!(!runtime_key_path.exists());
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
