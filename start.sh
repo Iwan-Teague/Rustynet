@@ -913,7 +913,7 @@ map_package() {
       if [[ "${pm}" == "brew" ]]; then
         echo "vim"
       elif [[ "${pm}" == "apt" ]]; then
-        echo "vim-common"
+        echo "xxd"
       else
         echo "vim-common"
       fi
