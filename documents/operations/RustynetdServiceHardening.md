@@ -3,11 +3,15 @@
 ## Purpose
 Define a production-safe service profile for `rustynetd` with least privilege, fail-closed behavior, and predictable restart semantics.
 
-## Service File
+## Service Files
 - Source: `scripts/systemd/rustynetd.service`
 - Install helper: `scripts/systemd/install_rustynetd_service.sh`
+- Privileged helper unit: `scripts/systemd/rustynetd-privileged-helper.service`
+- Trust refresh unit: `scripts/systemd/rustynetd-trust-refresh.service`
+- Trust refresh timer: `scripts/systemd/rustynetd-trust-refresh.timer`
+- Trust refresh helper script: `scripts/systemd/refresh_trust_evidence.sh` (installed to `/usr/local/libexec/rustynet/refresh_trust_evidence.sh`)
 
-## Hardening Controls
+## Hardening Controls (Daemon)
 - `NoNewPrivileges=true`
 - `ProtectSystem=strict`
 - `ProtectHome=true`
@@ -22,11 +26,29 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `RestrictSUIDSGID=true`
 - `RestrictRealtime=true`
 - `SystemCallArchitectures=native`
-- `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW`
-- `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`
+- `CapabilityBoundingSet=` (empty)
+- `AmbientCapabilities=` (empty)
 - `ReadWritePaths=/run/rustynet /var/lib/rustynet /etc/rustynet`
 - `UMask=0077`
 - `EnvironmentFile=-/etc/default/rustynetd` with validated daemon/runtime values
+
+## Hardening Controls (Privileged Helper)
+- `NoNewPrivileges=true`
+- `ProtectSystem=strict`
+- `ProtectHome=true`
+- `PrivateTmp=true`
+- `PrivateDevices=true`
+- `ProtectKernelTunables=false` (required for controlled sysctl writes)
+- `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN`
+- `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN`
+- `ReadWritePaths=/run/rustynet /proc/sys/net/ipv4 /proc/sys/net/ipv6`
+
+## Hardening Controls (Trust Refresh)
+- Timer-driven one-shot refresh runs via `rustynetd-trust-refresh.service`.
+- Uses `ProtectSystem=full`, `NoNewPrivileges=true`, and only `CAP_DAC_OVERRIDE` + `CAP_CHOWN` to access strict daemon-owned runtime paths and preserve trust evidence owner/group permissions.
+- Reads signer key from `RUSTYNET_TRUST_SIGNER_KEY` and writes trust evidence with atomic install.
+- Enforces signer key ownership/mode guardrails (root-owned, not group/world writable).
+- Uses daemon-group-readable trust evidence (`root:<daemon-group>`, mode `0640`) when daemon group exists.
 
 ## Reliability Controls
 - `Restart=on-failure`
@@ -35,17 +57,26 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `StartLimitIntervalSec=60`
 - `RuntimeDirectory=rustynet` with mode `0700`
 - `StateDirectory=rustynet` with mode `0700`
+- Trust refresh timer cadence:
+  - `OnBootSec=45s`
+  - `OnUnitActiveSec=60s`
+  - `RandomizedDelaySec=10s`
+  - `Persistent=true`
 
 ## Required Runtime Files
-- `/etc/rustynet/wireguard.key.enc` (`0600`, encrypted at rest)
-- `/etc/rustynet/wireguard.passphrase` (`0600`)
+- `/var/lib/rustynet/keys/wireguard.key.enc` (`0600`, encrypted at rest)
+- `/var/lib/rustynet/keys/wireguard.passphrase` (`0600`)
 - `/run/rustynet/wireguard.key` (`0600`, runtime-decrypted key material)
-- `/etc/rustynet/wireguard.pub` (`0644`)
-- `/var/lib/rustynet/rustynetd.trust` (integrity-checked trust evidence)
+- `/var/lib/rustynet/keys/wireguard.pub` (`0644`)
+- `/var/lib/rustynet/rustynetd.trust` (`0640`, integrity-checked trust evidence)
 - `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
+- `/etc/rustynet/trust-evidence.key` (`0600`, signer key; required only when trust auto-refresh is enabled)
 
 ## Verification
 1. `sudo systemctl daemon-reload`
-2. `sudo systemctl enable --now rustynetd.service`
+2. `sudo ./scripts/systemd/install_rustynetd_service.sh`
 3. `sudo systemctl --no-pager --full status rustynetd.service`
-4. `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
+4. `sudo systemctl --no-pager --full status rustynetd-privileged-helper.service`
+5. If `RUSTYNET_TRUST_AUTO_REFRESH=true`: `sudo systemctl --no-pager --full status rustynetd-trust-refresh.timer`
+6. Trigger one refresh cycle: `sudo systemctl start rustynetd-trust-refresh.service`
+7. `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`

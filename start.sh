@@ -1301,47 +1301,22 @@ generate_verifier_key_from_signer() {
 
 refresh_signed_trust_evidence() {
   require_admin_role "refresh_signed_trust_evidence" || return 0
+  local refresh_script="${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
+  if [[ ! -f "${refresh_script}" ]]; then
+    print_err "Missing trust refresh helper: ${refresh_script}"
+    return 1
+  fi
   if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     print_err "Signer key not found at ${TRUST_SIGNER_KEY_PATH}"
     return 1
   fi
 
-  local updated_at
-  local nonce
-  local payload
-  local sig_bin
-  local trust_tmp
-  local sig_hex
-  updated_at="$(date +%s)"
-  nonce="$(date +%s%N)"
-  payload="$(mktemp)"
-  sig_bin="$(mktemp)"
-  trust_tmp="$(mktemp)"
-
-  cat >"${payload}" <<EOF
-version=2
-tls13_valid=true
-signed_control_valid=true
-signed_data_age_secs=0
-clock_skew_secs=0
-updated_at_unix=${updated_at}
-nonce=${nonce}
-EOF
-
-  openssl pkeyutl -sign -inkey "${TRUST_SIGNER_KEY_PATH}" -rawin -in "${payload}" -out "${sig_bin}"
-  sig_hex="$(xxd -p -c 200 "${sig_bin}" | tr -d '\n')"
-  cat "${payload}" >"${trust_tmp}"
-  printf 'signature=%s\n' "${sig_hex}" >>"${trust_tmp}"
-
-  local trust_group="root"
-  local trust_mode="0644"
-  local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
-  if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
-    trust_group="${daemon_group}"
-    trust_mode="0640"
-  fi
-  run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${trust_tmp}" "${TRUST_EVIDENCE_PATH}"
-  rm -f "${payload}" "${sig_bin}" "${trust_tmp}"
+  run_root env \
+    RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+    RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+    RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
+    RUSTYNET_TRUST_AUTO_REFRESH=true \
+    "${refresh_script}"
   print_info "Signed trust evidence refreshed at ${TRUST_EVIDENCE_PATH}"
 }
 
@@ -1357,7 +1332,14 @@ configure_trust_material() {
       run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
     fi
     if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
-      run_root install -m 0600 "${source_trust}" "${TRUST_EVIDENCE_PATH}"
+      local trust_group="root"
+      local trust_mode="0644"
+      local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+      if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
+        trust_group="${daemon_group}"
+        trust_mode="0640"
+      fi
+      run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
     fi
     AUTO_REFRESH_TRUST="0"
     return 0
@@ -1403,10 +1385,15 @@ configure_trust_material() {
     run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
   fi
 
-  if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" ]]; then
-    run_root install -m 0600 "${source_trust}" "${TRUST_EVIDENCE_PATH}"
-  elif [[ ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
-    run_root install -m 0600 "${source_trust}" "${TRUST_EVIDENCE_PATH}"
+  if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
+    local trust_group="root"
+    local trust_mode="0644"
+    local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+    if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
+      trust_group="${daemon_group}"
+      trust_mode="0640"
+    fi
+    run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
   fi
 
   if prompt_yes_no "Do you also have signer key access for auto-refresh?" "n"; then
@@ -1436,6 +1423,8 @@ write_daemon_environment() {
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
     RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
     RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+    RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+    RUSTYNET_TRUST_AUTO_REFRESH="$( [[ "${AUTO_REFRESH_TRUST}" == "1" ]] && echo true || echo false )" \
     RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
     RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
     RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \

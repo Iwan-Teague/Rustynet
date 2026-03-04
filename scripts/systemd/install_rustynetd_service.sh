@@ -9,11 +9,17 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd.service"
 HELPER_SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-privileged-helper.service"
+TRUST_REFRESH_SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-trust-refresh.service"
+TRUST_REFRESH_TIMER_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-trust-refresh.timer"
+TRUST_REFRESH_SCRIPT_SRC="${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
 SERVICE_DST="/etc/systemd/system/rustynetd.service"
 HELPER_SERVICE_DST="/etc/systemd/system/rustynetd-privileged-helper.service"
+TRUST_REFRESH_SERVICE_DST="/etc/systemd/system/rustynetd-trust-refresh.service"
+TRUST_REFRESH_TIMER_DST="/etc/systemd/system/rustynetd-trust-refresh.timer"
+TRUST_REFRESH_SCRIPT_DST="/usr/local/libexec/rustynet/refresh_trust_evidence.sh"
 ENV_DST="/etc/default/rustynetd"
 
-for unit in "${SERVICE_SRC}" "${HELPER_SERVICE_SRC}"; do
+for unit in "${SERVICE_SRC}" "${HELPER_SERVICE_SRC}" "${TRUST_REFRESH_SERVICE_SRC}" "${TRUST_REFRESH_TIMER_SRC}" "${TRUST_REFRESH_SCRIPT_SRC}"; do
   if [[ ! -f "${unit}" ]]; then
     echo "missing service file: ${unit}" >&2
     exit 1
@@ -34,14 +40,20 @@ DAEMON_GID="$(getent group "${SERVICE_GROUP}" | awk -F: '{print $3}')"
 install -d -m 0750 -o root -g "${SERVICE_GROUP}" /etc/rustynet
 install -d -m 0770 -o root -g "${SERVICE_GROUP}" /run/rustynet
 install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" /var/lib/rustynet
+install -d -m 0755 -o root -g root /usr/local/libexec/rustynet
 install -m 0644 "${SERVICE_SRC}" "${SERVICE_DST}"
 install -m 0644 "${HELPER_SERVICE_SRC}" "${HELPER_SERVICE_DST}"
+install -m 0644 "${TRUST_REFRESH_SERVICE_SRC}" "${TRUST_REFRESH_SERVICE_DST}"
+install -m 0644 "${TRUST_REFRESH_TIMER_SRC}" "${TRUST_REFRESH_TIMER_DST}"
+install -m 0755 "${TRUST_REFRESH_SCRIPT_SRC}" "${TRUST_REFRESH_SCRIPT_DST}"
 
 SOCKET_PATH="${RUSTYNET_SOCKET:-/run/rustynet/rustynetd.sock}"
 STATE_PATH="${RUSTYNET_STATE:-/var/lib/rustynet/rustynetd.state}"
 TRUST_EVIDENCE_PATH="${RUSTYNET_TRUST_EVIDENCE:-/var/lib/rustynet/rustynetd.trust}"
 TRUST_VERIFIER_KEY_PATH="${RUSTYNET_TRUST_VERIFIER_KEY:-/etc/rustynet/trust-evidence.pub}"
 TRUST_WATERMARK_PATH="${RUSTYNET_TRUST_WATERMARK:-/var/lib/rustynet/rustynetd.trust.watermark}"
+TRUST_SIGNER_KEY_PATH="${RUSTYNET_TRUST_SIGNER_KEY:-/etc/rustynet/trust-evidence.key}"
+TRUST_AUTO_REFRESH="${RUSTYNET_TRUST_AUTO_REFRESH:-false}"
 MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT:-/var/lib/rustynet/membership.snapshot}"
 MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG:-/var/lib/rustynet/membership.log}"
 MEMBERSHIP_WATERMARK_PATH="${RUSTYNET_MEMBERSHIP_WATERMARK:-/var/lib/rustynet/membership.watermark}"
@@ -81,6 +93,17 @@ case "${FAIL_CLOSED_SSH_ALLOW}" in
     exit 1
     ;;
 esac
+case "${TRUST_AUTO_REFRESH}" in
+  true|false|1|0|yes|no) ;;
+  *)
+    echo "invalid trust auto refresh value: ${TRUST_AUTO_REFRESH} (expected true|false)" >&2
+    exit 1
+    ;;
+esac
+TRUST_AUTO_REFRESH_ENABLED="false"
+if [[ "${TRUST_AUTO_REFRESH}" == "true" || "${TRUST_AUTO_REFRESH}" == "1" || "${TRUST_AUTO_REFRESH}" == "yes" ]]; then
+  TRUST_AUTO_REFRESH_ENABLED="true"
+fi
 if [[ "${FAIL_CLOSED_SSH_ALLOW}" == "true" || "${FAIL_CLOSED_SSH_ALLOW}" == "1" || "${FAIL_CLOSED_SSH_ALLOW}" == "yes" ]]; then
   if [[ -z "${FAIL_CLOSED_SSH_ALLOW_CIDRS// }" ]]; then
     echo "fail-closed ssh allow enabled but no cidrs supplied (RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS)" >&2
@@ -188,6 +211,7 @@ fi
 for readonly_target in \
   "${TRUST_EVIDENCE_PATH}" \
   "${TRUST_VERIFIER_KEY_PATH}" \
+  "${TRUST_SIGNER_KEY_PATH}" \
   "${AUTO_TUNNEL_BUNDLE_PATH}" \
   "${AUTO_TUNNEL_VERIFIER_KEY_PATH}"; do
   ensure_parent_dir "${readonly_target}" root "${SERVICE_GROUP}" 0750
@@ -208,6 +232,7 @@ set_owner_mode_if_exists "${TARGET_FALLBACK_FILE}" "${SERVICE_USER}" "${SERVICE_
 set_owner_mode_if_exists "${TRUST_EVIDENCE_PATH}" root "${SERVICE_GROUP}" 0640
 set_owner_mode_if_exists "${AUTO_TUNNEL_BUNDLE_PATH}" root "${SERVICE_GROUP}" 0640
 set_owner_mode_if_exists "${TRUST_VERIFIER_KEY_PATH}" root root 0644
+set_owner_mode_if_exists "${TRUST_SIGNER_KEY_PATH}" root root 0600
 set_owner_mode_if_exists "${AUTO_TUNNEL_VERIFIER_KEY_PATH}" root root 0644
 
 cat >"${ENV_DST}" <<EOF_ENV
@@ -218,6 +243,8 @@ RUSTYNET_STATE=${STATE_PATH}
 RUSTYNET_TRUST_EVIDENCE=${TRUST_EVIDENCE_PATH}
 RUSTYNET_TRUST_VERIFIER_KEY=${TRUST_VERIFIER_KEY_PATH}
 RUSTYNET_TRUST_WATERMARK=${TRUST_WATERMARK_PATH}
+RUSTYNET_TRUST_SIGNER_KEY=${TRUST_SIGNER_KEY_PATH}
+RUSTYNET_TRUST_AUTO_REFRESH=${TRUST_AUTO_REFRESH_ENABLED}
 RUSTYNET_AUTO_TUNNEL_ENFORCE=${AUTO_TUNNEL_ENFORCE}
 RUSTYNET_AUTO_TUNNEL_BUNDLE=${AUTO_TUNNEL_BUNDLE_PATH}
 RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY=${AUTO_TUNNEL_VERIFIER_KEY_PATH}
@@ -235,6 +262,7 @@ RUSTYNET_PRIVILEGED_HELPER_SOCKET=${PRIVILEGED_HELPER_SOCKET}
 RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS=${PRIVILEGED_HELPER_TIMEOUT_MS}
 RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID=${DAEMON_UID}
 RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID=${DAEMON_GID}
+RUSTYNET_DAEMON_GROUP=${SERVICE_GROUP}
 RUSTYNET_RECONCILE_INTERVAL_MS=${RECONCILE_INTERVAL_MS}
 RUSTYNET_MAX_RECONCILE_FAILURES=${MAX_RECONCILE_FAILURES}
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW=${FAIL_CLOSED_SSH_ALLOW}
@@ -245,8 +273,24 @@ chmod 0644 "${ENV_DST}"
 systemctl daemon-reload
 systemctl enable rustynetd-privileged-helper.service
 systemctl enable rustynetd.service
-systemctl reset-failed rustynetd-privileged-helper.service rustynetd.service || true
+if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+    echo "trust auto-refresh enabled but signer key missing: ${TRUST_SIGNER_KEY_PATH}" >&2
+    exit 1
+  fi
+  systemctl enable rustynetd-trust-refresh.timer
+else
+  systemctl disable --now rustynetd-trust-refresh.timer >/dev/null 2>&1 || true
+fi
+systemctl reset-failed rustynetd-privileged-helper.service rustynetd.service rustynetd-trust-refresh.service rustynetd-trust-refresh.timer || true
 systemctl restart rustynetd-privileged-helper.service
+if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  systemctl start rustynetd-trust-refresh.service
+  systemctl restart rustynetd-trust-refresh.timer
+fi
 systemctl restart rustynetd.service
 systemctl --no-pager --full status rustynetd-privileged-helper.service
+if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  systemctl --no-pager --full status rustynetd-trust-refresh.timer
+fi
 systemctl --no-pager --full status rustynetd.service

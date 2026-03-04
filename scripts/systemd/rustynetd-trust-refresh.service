@@ -1,0 +1,37 @@
+[Unit]
+Description=Rustynet Trust Evidence Refresh
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/libexec/rustynet/refresh_trust_evidence.sh
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
+Environment=RUSTYNET_TRUST_SIGNER_KEY=/etc/rustynet/trust-evidence.key
+Environment=RUSTYNET_TRUST_AUTO_REFRESH=false
+Environment=RUSTYNET_DAEMON_GROUP=rustynetd
+ExecStart=/usr/local/libexec/rustynet/refresh_trust_evidence.sh
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+# Required to read/write trust evidence paths when parent runtime directories are
+# daemon-owned with strict mode (for example /var/lib/rustynet 0700 rustynetd:rustynetd),
+# and to enforce trust evidence owner/group atomically on write.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_CHOWN
+UMask=0077

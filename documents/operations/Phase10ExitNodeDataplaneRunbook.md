@@ -13,6 +13,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Runtime decrypted key at `/run/rustynet/wireguard.key` with mode `0600` (managed by `rustynetd`).
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
 - Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
+- If unattended trust auto-refresh is enabled: signer key present at `/etc/rustynet/trust-evidence.key` (`0600`).
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
@@ -21,13 +22,16 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `sudo ./scripts/systemd/install_rustynetd_service.sh`
 4. Confirm detected daemon environment:
 - `cat /etc/default/rustynetd`
-5. Validate baseline daemon status:
+5. If `RUSTYNET_TRUST_AUTO_REFRESH=true`, verify timer:
+- `sudo systemctl --no-pager --full status rustynetd-trust-refresh.timer`
+- `sudo systemctl start rustynetd-trust-refresh.service`
+6. Validate baseline daemon status:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
-6. Select exit node:
+7. Select exit node:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- exit-node select <node-id>`
-7. Toggle LAN access only when required:
+8. Toggle LAN access only when required:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- lan-access on`
-8. Validate DNS policy state:
+9. Validate DNS policy state:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- dns inspect`
 
 ## 4) Rollback Procedure
@@ -38,11 +42,14 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 3. Restart daemon in restricted-safe mode if trust or state integrity is suspect.
 4. Revert to last-known-safe build and rerun `./scripts/ci/phase10_gates.sh`.
 5. Preserve `artifacts/phase10/state_transition_audit.log` for post-incident analysis.
+6. If auto-refresh signer key is compromised or missing, disable refresh timer until key custody is restored:
+- `sudo systemctl disable --now rustynetd-trust-refresh.timer`
 
 ## 5) Incident Response Checklist
 - Confirm whether daemon entered `FailClosed` state via `status` output.
 - Check for trust-state failures (signed-data freshness, signature validation, clock skew).
 - Check latest `state_transition_audit.log` for transition reason.
+- If stale trust evidence is reported during unattended runtime, verify `rustynetd-trust-refresh.timer` and `rustynetd-trust-refresh.service` journal output before any bypass actions.
 - If DNS leak protection fault is detected, keep fail-closed posture and do not bypass protection.
 - If route/firewall apply failed, enforce rollback and block egress until trusted state recovers.
 
@@ -53,6 +60,8 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- route advertise 192.168.1.0/24`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key rotate`
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key revoke`
+- `sudo systemctl list-timers --all | grep rustynetd-trust-refresh`
+- `sudo journalctl -u rustynetd-trust-refresh.service -n 50 --no-pager`
 - `./scripts/ci/phase10_gates.sh` (validates pre-generated measured artifacts in `artifacts/phase10`)
 
 ## 7) Required Evidence for Sign-Off

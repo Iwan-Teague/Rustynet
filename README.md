@@ -12,6 +12,7 @@ The wizard handles:
 - role selection (`admin` or `client`) during setup, with role-specific console permissions
 - host OS detection on startup with strict host-profile enforcement (`linux` dataplane vs `macos` compatibility)
 - first-run bootstrap (dependencies, keys, trust material, systemd wiring)
+- optional signer-backed trust-evidence auto-refresh timer on Linux to keep trust freshness valid during unattended runtime
 - daemon/service lifecycle
 - centrally signed auto-tunnel defaults with fail-closed enforcement
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
@@ -30,6 +31,10 @@ After first setup, run `./start.sh` again anytime to open the terminal control m
 Role model:
 - `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
+
+Linux trust-refresh behavior:
+- When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
+- Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
 
 ## Release Readiness Evidence (Fail-Closed)
 
