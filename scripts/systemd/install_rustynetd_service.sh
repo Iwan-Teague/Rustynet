@@ -26,6 +26,14 @@ for unit in "${SERVICE_SRC}" "${HELPER_SERVICE_SRC}" "${TRUST_REFRESH_SERVICE_SR
   fi
 done
 
+existing_env_value() {
+  local key="$1"
+  if [[ ! -f "${ENV_DST}" ]]; then
+    return 0
+  fi
+  awk -F= -v key="${key}" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "${ENV_DST}"
+}
+
 SERVICE_USER="${RUSTYNET_DAEMON_USER:-rustynetd}"
 SERVICE_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
 if ! getent group "${SERVICE_GROUP}" >/dev/null 2>&1; then
@@ -58,7 +66,11 @@ MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT:-/var/lib/rustynet/memb
 MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG:-/var/lib/rustynet/membership.log}"
 MEMBERSHIP_WATERMARK_PATH="${RUSTYNET_MEMBERSHIP_WATERMARK:-/var/lib/rustynet/membership.watermark}"
 MEMBERSHIP_OWNER_SIGNING_KEY_PATH="${RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY:-/etc/rustynet/membership.owner.key}"
-AUTO_TUNNEL_ENFORCE="${RUSTYNET_AUTO_TUNNEL_ENFORCE:-true}"
+EXISTING_AUTO_TUNNEL_ENFORCE="$(existing_env_value RUSTYNET_AUTO_TUNNEL_ENFORCE)"
+EXISTING_WG_LISTEN_PORT="$(existing_env_value RUSTYNET_WG_LISTEN_PORT)"
+EXISTING_FAIL_CLOSED_SSH_ALLOW="$(existing_env_value RUSTYNET_FAIL_CLOSED_SSH_ALLOW)"
+EXISTING_FAIL_CLOSED_SSH_ALLOW_CIDRS="$(existing_env_value RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS)"
+AUTO_TUNNEL_ENFORCE="${RUSTYNET_AUTO_TUNNEL_ENFORCE:-${EXISTING_AUTO_TUNNEL_ENFORCE:-true}}"
 AUTO_TUNNEL_BUNDLE_PATH="${RUSTYNET_AUTO_TUNNEL_BUNDLE:-/var/lib/rustynet/rustynetd.assignment}"
 AUTO_TUNNEL_VERIFIER_KEY_PATH="${RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY:-/etc/rustynet/assignment.pub}"
 AUTO_TUNNEL_WATERMARK_PATH="${RUSTYNET_AUTO_TUNNEL_WATERMARK:-/var/lib/rustynet/rustynetd.assignment.watermark}"
@@ -67,7 +79,7 @@ NODE_ID="${RUSTYNET_NODE_ID:-$(hostname -s 2>/dev/null || echo daemon-local)}"
 NODE_ROLE="${RUSTYNET_NODE_ROLE:-client}"
 BACKEND_MODE="${RUSTYNET_BACKEND:-linux-wireguard}"
 WG_INTERFACE="${RUSTYNET_WG_INTERFACE:-rustynet0}"
-WG_LISTEN_PORT="${RUSTYNET_WG_LISTEN_PORT:-51820}"
+WG_LISTEN_PORT="${RUSTYNET_WG_LISTEN_PORT:-${EXISTING_WG_LISTEN_PORT:-51820}}"
 WG_PRIVATE_KEY_PATH="${RUSTYNET_WG_PRIVATE_KEY:-/run/rustynet/wireguard.key}"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY:-/var/lib/rustynet/keys/wireguard.key.enc}"
 WG_KEY_PASSPHRASE_PATH="${RUSTYNET_WG_KEY_PASSPHRASE:-/var/lib/rustynet/keys/wireguard.passphrase}"
@@ -77,8 +89,8 @@ PRIVILEGED_HELPER_SOCKET="${RUSTYNET_PRIVILEGED_HELPER_SOCKET:-/run/rustynet/rus
 PRIVILEGED_HELPER_TIMEOUT_MS="${RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS:-2000}"
 RECONCILE_INTERVAL_MS="${RUSTYNET_RECONCILE_INTERVAL_MS:-1000}"
 MAX_RECONCILE_FAILURES="${RUSTYNET_MAX_RECONCILE_FAILURES:-5}"
-FAIL_CLOSED_SSH_ALLOW="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW:-false}"
-FAIL_CLOSED_SSH_ALLOW_CIDRS="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS:-}"
+FAIL_CLOSED_SSH_ALLOW="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW:-${EXISTING_FAIL_CLOSED_SSH_ALLOW:-false}}"
+FAIL_CLOSED_SSH_ALLOW_CIDRS="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS:-${EXISTING_FAIL_CLOSED_SSH_ALLOW_CIDRS:-}}"
 
 case "${NODE_ROLE}" in
   admin|client) ;;
@@ -92,6 +104,13 @@ case "${FAIL_CLOSED_SSH_ALLOW}" in
   true|false|1|0|yes|no) ;;
   *)
     echo "invalid fail-closed ssh allow value: ${FAIL_CLOSED_SSH_ALLOW} (expected true|false)" >&2
+    exit 1
+    ;;
+esac
+case "${AUTO_TUNNEL_ENFORCE}" in
+  true|false|1|0|yes|no) ;;
+  *)
+    echo "invalid auto tunnel enforce value: ${AUTO_TUNNEL_ENFORCE} (expected true|false)" >&2
     exit 1
     ;;
 esac
