@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::process::Command;
 
 use rustynet_backend_api::{
@@ -1021,10 +1022,19 @@ fn route_delete_args(cidr: &str) -> Result<Vec<String>, BackendError> {
 }
 
 fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError> {
-    let output = Command::new(MACOS_PS_BINARY)
+    let output = match Command::new(MACOS_PS_BINARY)
         .args(["-axo", "pid=,command="])
         .output()
-        .map_err(|err| BackendError::internal(format!("ps spawn failed: {err}")))?;
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            // Sandboxed macOS environments may deny `ps`; return no PIDs and continue teardown.
+            return Ok(Vec::new());
+        }
+        Err(err) => {
+            return Err(BackendError::internal(format!("ps spawn failed: {err}")));
+        }
+    };
     if !output.status.success() {
         return Err(BackendError::internal(format!(
             "ps exited with status {}",

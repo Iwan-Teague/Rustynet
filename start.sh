@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rustynet"
 CONFIG_FILE="${CONFIG_DIR}/wizard.env"
 PEERS_FILE="${CONFIG_DIR}/peers.db"
+LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
 
 # Defaults aligned with rustynetd/systemd profile.
 SOCKET_PATH="/run/rustynet/rustynetd.sock"
@@ -22,6 +23,7 @@ WG_LISTEN_PORT="51820"
 WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
+WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
 WG_PUBLIC_KEY_PATH="/var/lib/rustynet/keys/wireguard.pub"
 EGRESS_INTERFACE=""
 MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
@@ -94,6 +96,7 @@ is_macos_host() {
 apply_host_profile_defaults() {
   if is_linux_host; then
     HOST_PROFILE="linux"
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     return
   fi
 
@@ -111,6 +114,7 @@ apply_host_profile_defaults() {
     WG_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key"
     WG_ENCRYPTED_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
     WG_KEY_PASSPHRASE_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${MACOS_STATE_BASE}/compat/keys/wg_key_passphrase.cred"
     WG_PUBLIC_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
     WG_INTERFACE="utun9"
     MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
@@ -154,6 +158,7 @@ coerce_macos_path_var() {
 enforce_host_storage_policy() {
   if is_linux_host; then
     HOST_PROFILE="linux"
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     return
   fi
 
@@ -174,6 +179,7 @@ enforce_host_storage_policy() {
   coerce_macos_path_var WG_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key"
   coerce_macos_path_var WG_ENCRYPTED_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
   coerce_macos_path_var WG_KEY_PASSPHRASE_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
+  coerce_macos_path_var WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "${MACOS_STATE_BASE}/compat/keys/wg_key_passphrase.cred"
   coerce_macos_path_var WG_PUBLIC_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
   coerce_macos_path_var PRIVILEGED_HELPER_SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
   coerce_macos_path_var MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
@@ -261,7 +267,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -615,6 +621,7 @@ save_config() {
     printf 'WG_PRIVATE_KEY_PATH=%s\n' "${WG_PRIVATE_KEY_PATH}"
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
+    printf 'WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n' "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     printf 'WG_PUBLIC_KEY_PATH=%s\n' "${WG_PUBLIC_KEY_PATH}"
     printf 'EGRESS_INTERFACE=%s\n' "${EGRESS_INTERFACE}"
     printf 'MEMBERSHIP_SNAPSHOT_PATH=%s\n' "${MEMBERSHIP_SNAPSHOT_PATH}"
@@ -1386,10 +1393,21 @@ doctor_preflight() {
     doctor_require_cmd ip "linux dataplane"
     doctor_require_cmd nft "linux dataplane"
     doctor_require_cmd systemctl "linux service"
+    doctor_require_cmd systemd-creds "encrypted credential provisioning"
     doctor_require_cmd python3 "linux e2e/runtime"
+    if [[ "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+      doctor_fail "credential blob path must be ${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH} on Linux"
+    else
+      doctor_ok "credential blob path pinned (${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH})"
+    fi
 
     if [[ "${SETUP_COMPLETE}" == "1" ]]; then
-      doctor_check_mode "${WG_KEY_PASSPHRASE_PATH}" "600" "key custody"
+      doctor_check_mode "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "600" "encrypted passphrase credential blob"
+      if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+        doctor_fail "plaintext passphrase file still present (${WG_KEY_PASSPHRASE_PATH}); remove it"
+      else
+        doctor_ok "no plaintext passphrase file present"
+      fi
       doctor_check_mode "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "600" "encrypted private key"
       if [[ -f "${WG_PRIVATE_KEY_PATH}" ]]; then
         doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
@@ -1467,7 +1485,7 @@ prepare_system_directories() {
     run_root install -d -m 0700 "$(dirname "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
-    run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
     run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
@@ -1486,6 +1504,7 @@ prepare_system_directories() {
     install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
+    install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
     install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
     install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
@@ -1505,8 +1524,52 @@ ensure_wireguard_keys() {
     fi
   }
 
-  if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" && -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+  secure_remove_with_scope() {
+    local target="$1"
+    if [[ ! -f "${target}" ]]; then
+      return
+    fi
+    if is_linux_host; then
+      if run_root command -v shred >/dev/null 2>&1; then
+        run_root shred --force --remove "${target}" >/dev/null 2>&1 || true
+      else
+        run_root sh -c ': > "$1" && rm -f "$1"' -- "${target}" || true
+      fi
+    else
+      : >"${target}" || true
+      rm -f "${target}" || true
+    fi
+  }
+
+  local legacy_linux_passphrase_path="/etc/rustynet/wireguard.passphrase"
+
+  if is_linux_host \
+    && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
+    && [[ ! -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+    print_err "Encrypted key exists but credential blob is missing (${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH})."
+    print_info "Restore the encrypted credential blob from backup or perform an explicit key rotation."
     unset -f run_with_scope >/dev/null 2>&1 || true
+    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+    exit 1
+  fi
+
+  if is_linux_host \
+    && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
+    && [[ -f "${WG_PUBLIC_KEY_PATH}" ]] \
+    && [[ -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    secure_remove_with_scope "${legacy_linux_passphrase_path}"
+    unset -f run_with_scope >/dev/null 2>&1 || true
+    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+    return
+  fi
+
+  if ! is_linux_host \
+    && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
+    && [[ -f "${WG_PUBLIC_KEY_PATH}" ]] \
+    && [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    unset -f run_with_scope >/dev/null 2>&1 || true
+    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
     return
   fi
 
@@ -1515,13 +1578,29 @@ ensure_wireguard_keys() {
     exit 1
   fi
 
-  if [[ ! -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
-    local tmp_passphrase
-    tmp_passphrase="$(mktemp)"
-    openssl rand -hex 48 >"${tmp_passphrase}"
-    run_with_scope install -m 0600 "${tmp_passphrase}" "${WG_KEY_PASSPHRASE_PATH}"
-    rm -f "${tmp_passphrase}"
-    print_info "Generated key passphrase file at ${WG_KEY_PASSPHRASE_PATH}"
+  local passphrase_source_path=""
+  local generated_temp_passphrase="0"
+  if is_linux_host; then
+    if ! command -v systemd-creds >/dev/null 2>&1; then
+      print_err "systemd-creds is required to provision encrypted passphrase credentials."
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+      exit 1
+    fi
+    passphrase_source_path="$(mktemp)"
+    openssl rand -hex 48 >"${passphrase_source_path}"
+    chmod 600 "${passphrase_source_path}"
+    generated_temp_passphrase="1"
+    print_info "Generated ephemeral passphrase material for key bootstrap."
+  else
+    passphrase_source_path="${WG_KEY_PASSPHRASE_PATH}"
+    if [[ ! -f "${passphrase_source_path}" ]]; then
+      passphrase_source_path="$(mktemp)"
+      openssl rand -hex 48 >"${passphrase_source_path}"
+      chmod 600 "${passphrase_source_path}"
+      generated_temp_passphrase="1"
+      print_info "Generated temporary key passphrase material."
+    fi
   fi
 
   local source_private_key=""
@@ -1532,31 +1611,41 @@ ensure_wireguard_keys() {
   fi
 
   if [[ -n "${source_private_key}" ]]; then
-    run_with_scope rustynetd key migrate \
+    run_with_scope env RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH="${passphrase_source_path}" rustynetd key migrate \
       --existing-private-key "${source_private_key}" \
       --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
       --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
       --public-key "${WG_PUBLIC_KEY_PATH}" \
-      --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
+      --passphrase-file "${passphrase_source_path}" \
       --force
     if [[ "${source_private_key}" != "${WG_PRIVATE_KEY_PATH}" ]]; then
       run_with_scope rm -f "${source_private_key}"
       print_info "Removed legacy plaintext private key at ${source_private_key}"
     fi
-    print_info "Existing key migrated to encrypted storage."
-    unset -f run_with_scope >/dev/null 2>&1 || true
-    return
+  else
+    run_with_scope env RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH="${passphrase_source_path}" rustynetd key init \
+      --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
+      --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+      --public-key "${WG_PUBLIC_KEY_PATH}" \
+      --passphrase-file "${passphrase_source_path}" \
+      --force
+    print_info "WireGuard key material initialized (encrypted key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH})"
   fi
 
-  run_with_scope rustynetd key init \
-    --runtime-private-key "${WG_PRIVATE_KEY_PATH}" \
-    --encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-    --public-key "${WG_PUBLIC_KEY_PATH}" \
-    --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
-    --force
+  if is_linux_host; then
+    run_with_scope systemd-creds encrypt --name=wg_key_passphrase "${passphrase_source_path}" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    run_root chown root:root "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    run_root chmod 600 "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    secure_remove_with_scope "${legacy_linux_passphrase_path}"
+    print_info "Encrypted passphrase credential provisioned at ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+  fi
+  if [[ "${generated_temp_passphrase}" == "1" || "${passphrase_source_path}" != "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    secure_remove_with_scope "${passphrase_source_path}"
+  fi
 
-  print_info "WireGuard key material initialized (encrypted key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH})"
   unset -f run_with_scope >/dev/null 2>&1 || true
+  unset -f secure_remove_with_scope >/dev/null 2>&1 || true
 }
 
 ensure_membership_files() {
@@ -1725,6 +1814,10 @@ write_daemon_environment() {
   if is_macos_host; then
     return 0
   fi
+  if [[ "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+    print_err "Linux credential blob path must be ${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
+    exit 1
+  fi
   enforce_auto_tunnel_policy
   require_linux_dataplane "write_daemon_environment" || return 0
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
@@ -1756,7 +1849,7 @@ write_daemon_environment() {
     RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
     RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
     RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-    RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+    RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
     RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
     RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
     RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
@@ -2509,7 +2602,13 @@ configure_values() {
   prompt_default WG_LISTEN_PORT "WireGuard listen port (1-65535)" "${WG_LISTEN_PORT}"
   prompt_default WG_PRIVATE_KEY_PATH "WireGuard runtime private key path" "${WG_PRIVATE_KEY_PATH}"
   prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
-  prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
+  if is_linux_host; then
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    print_info "Linux passphrase credential blob path is pinned to ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
+  else
+    prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
+    prompt_default WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "WireGuard encrypted passphrase credential blob path" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+  fi
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
   prompt_default MEMBERSHIP_SNAPSHOT_PATH "Membership snapshot path" "${MEMBERSHIP_SNAPSHOT_PATH}"
@@ -2589,6 +2688,7 @@ Current Rustynet Wizard Configuration
   wg_runtime_private_key  : ${WG_PRIVATE_KEY_PATH}
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
+  wg_key_passphrase_cred  : ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
   wg_public_key           : ${WG_PUBLIC_KEY_PATH}
   egress_interface        : ${EGRESS_INTERFACE}
   membership_snapshot     : ${MEMBERSHIP_SNAPSHOT_PATH}

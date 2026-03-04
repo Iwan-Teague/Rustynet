@@ -173,6 +173,7 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
         std::path::Path::new(&encrypted_path),
         std::path::Path::new(&public_path),
         std::path::Path::new(&passphrase_path),
+        Some(std::path::Path::new(&passphrase_path)),
         force,
     )?;
 
@@ -260,6 +261,7 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
         std::path::Path::new(&encrypted_path),
         std::path::Path::new(&public_path),
         std::path::Path::new(&passphrase_path),
+        Some(std::path::Path::new(&passphrase_path)),
         force,
     )?;
 

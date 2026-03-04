@@ -35,12 +35,20 @@ const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
-    let source_path = resolve_passphrase_source(path);
-    let allow_root_owner = is_systemd_credential_path(&source_path);
-    validate_secret_file_security(&source_path, "passphrase file", allow_root_owner)?;
+    let source_path = resolve_passphrase_source(path)?;
+    read_passphrase_from_source(&source_path)
+}
+
+pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, String> {
+    read_passphrase_from_source(path)
+}
+
+fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
+    let allow_root_owner = is_systemd_credential_path(source_path);
+    validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
 
     let mut raw =
-        fs::read(&source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+        fs::read(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
     if raw.len() > MAX_PASSPHRASE_BYTES {
         raw.zeroize();
         return Err("passphrase exceeds maximum allowed size".to_string());
@@ -86,7 +94,19 @@ pub fn encrypt_private_key(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
 ) -> Result<(), String> {
-    let passphrase = read_passphrase_file(passphrase_path)?;
+    encrypt_private_key_with_passphrase(private_key, encrypted_key_path, passphrase_path, None)
+}
+
+pub fn encrypt_private_key_with_passphrase(
+    private_key: &[u8],
+    encrypted_key_path: &Path,
+    passphrase_path: &Path,
+    explicit_passphrase_path: Option<&Path>,
+) -> Result<(), String> {
+    let passphrase = match explicit_passphrase_path {
+        Some(path) => read_passphrase_file_explicit(path)?,
+        None => read_passphrase_file(passphrase_path)?,
+    };
     let manager = key_custody_manager(encrypted_key_path, passphrase.clone())?;
     let key_id = key_custody_key_id(encrypted_key_path);
     let _backend = manager
@@ -170,7 +190,7 @@ fn validate_secret_file_security(
     Ok(())
 }
 
-fn resolve_passphrase_source(configured_path: &Path) -> PathBuf {
+fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
     let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
     let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
@@ -180,22 +200,44 @@ fn resolve_passphrase_source_from_env(
     configured_path: &Path,
     explicit_credential_path: Option<&str>,
     credentials_directory: Option<&str>,
-) -> PathBuf {
+) -> Result<PathBuf, String> {
     if let Some(explicit) = explicit_credential_path {
         let explicit_path = PathBuf::from(explicit);
         if explicit_path.exists() {
-            return explicit_path;
+            return Ok(explicit_path);
         }
+        return Err(format!(
+            "passphrase credential path not found ({}={})",
+            PASSPHRASE_CREDENTIAL_PATH_ENV,
+            explicit_path.display()
+        ));
     }
 
     if let Some(directory) = credentials_directory {
         let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
         if candidate.exists() {
-            return candidate;
+            return Ok(candidate);
         }
+        return Err(format!(
+            "passphrase credential not found in {} (expected {})",
+            SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+            candidate.display()
+        ));
     }
 
-    configured_path.to_path_buf()
+    if configured_path.exists() {
+        return Err(format!(
+            "passphrase credential source must be explicitly configured via {} or {}; direct fallback to {} is disallowed",
+            PASSPHRASE_CREDENTIAL_PATH_ENV,
+            SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+            configured_path.display()
+        ));
+    }
+
+    Err(format!(
+        "passphrase credential source is not configured; set {} or {}",
+        PASSPHRASE_CREDENTIAL_PATH_ENV, SYSTEMD_CREDENTIALS_DIRECTORY_ENV
+    ))
 }
 
 fn is_systemd_credential_path(path: &Path) -> bool {
@@ -369,6 +411,7 @@ pub fn initialize_encrypted_key_material(
     encrypted_key_path: &Path,
     public_key_path: &Path,
     passphrase_path: &Path,
+    explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
     if !force
@@ -383,7 +426,12 @@ pub fn initialize_encrypted_key_material(
 
     let (mut private_key, public_key) = generate_wireguard_keypair()?;
     let result = (|| -> Result<String, String> {
-        encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
+        encrypt_private_key_with_passphrase(
+            &private_key,
+            encrypted_key_path,
+            passphrase_path,
+            explicit_passphrase_path,
+        )?;
         if let Err(err) = write_runtime_private_key(runtime_private_key_path, &private_key) {
             let _ = remove_file_if_present(runtime_private_key_path);
             return Err(err);
@@ -404,6 +452,7 @@ pub fn migrate_existing_private_key_material(
     encrypted_key_path: &Path,
     public_key_path: &Path,
     passphrase_path: &Path,
+    explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
     if !existing_private_key_path.exists() {
@@ -434,7 +483,12 @@ pub fn migrate_existing_private_key_material(
 
     let result = (|| -> Result<String, String> {
         let public_key = derive_public_key_from_private_key(&private_key)?;
-        encrypt_private_key(&private_key, encrypted_key_path, passphrase_path)?;
+        encrypt_private_key_with_passphrase(
+            &private_key,
+            encrypted_key_path,
+            passphrase_path,
+            explicit_passphrase_path,
+        )?;
         if let Err(err) = write_runtime_private_key(runtime_private_key_path, &private_key) {
             let _ = remove_file_if_present(runtime_private_key_path);
             return Err(err);
@@ -724,7 +778,8 @@ mod tests {
             &configured,
             Some(&explicit.to_string_lossy()),
             None,
-        );
+        )
+        .expect("explicit credential path should resolve");
         assert_eq!(resolved, explicit);
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -743,19 +798,26 @@ mod tests {
             &configured,
             None,
             Some(&credentials_dir.to_string_lossy()),
-        );
+        )
+        .expect("credential directory path should resolve");
         assert_eq!(resolved, credential);
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
-    fn resolve_passphrase_source_falls_back_to_configured_path() {
+    fn resolve_passphrase_source_rejects_direct_configured_path_fallback() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-fallback");
         let configured = test_dir.join("configured.passphrase");
         std::fs::write(&configured, "configured").expect("configured path should be writable");
 
-        let resolved = resolve_passphrase_source_from_env(&configured, None, None);
-        assert_eq!(resolved, configured);
+        let err = resolve_passphrase_source_from_env(&configured, None, None)
+            .expect_err("direct configured path fallback must be rejected");
+        assert!(err.contains("disallowed"));
+
+        let _ = std::fs::remove_file(&configured);
+        let err = resolve_passphrase_source_from_env(&configured, None, None)
+            .expect_err("missing credential source must be rejected");
+        assert!(err.contains("not configured"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }

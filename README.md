@@ -17,6 +17,9 @@ The wizard handles:
 - centrally signed auto-tunnel defaults with fail-closed enforcement
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
+- Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
+  encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
+  rejects direct plaintext passphrase-file fallback at daemon runtime
 - local key rotation/revocation and peer rotation-bundle apply flow
 - membership bootstrap with persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles

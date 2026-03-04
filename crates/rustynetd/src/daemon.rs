@@ -2517,7 +2517,7 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             validate_private_key_permissions(path)?;
         }
         if let Some(path) = config.wg_key_passphrase_path.as_ref() {
-            validate_private_key_permissions(path)?;
+            validate_passphrase_permissions(path)?;
         }
         if let Some(path) = config.wg_public_key_path.as_ref() {
             validate_public_key_permissions(path)?;
@@ -2593,6 +2593,16 @@ fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
 #[cfg(not(target_os = "linux"))]
 fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "wireguard private key", 0o077, false)
+}
+
+fn validate_passphrase_permissions(path: &Path) -> Result<(), DaemonError> {
+    let allow_root_owner = path.starts_with("/run/credentials/");
+    validate_file_security(
+        path,
+        "wireguard key passphrase credential",
+        0o077,
+        allow_root_owner,
+    )
 }
 
 #[cfg(target_os = "linux")]
