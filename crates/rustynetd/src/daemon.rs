@@ -742,6 +742,7 @@ struct DaemonRuntime {
     last_reconcile_unix: Option<u64>,
     last_reconcile_error: Option<String>,
     last_applied_assignment: Option<AutoTunnelWatermark>,
+    local_route_reconcile_pending: bool,
     max_reconcile_failures: u32,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
@@ -821,6 +822,7 @@ impl DaemonRuntime {
             last_reconcile_unix: None,
             last_reconcile_error: None,
             last_applied_assignment: None,
+            local_route_reconcile_pending: false,
             max_reconcile_failures: config.max_reconcile_failures,
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
@@ -1358,8 +1360,15 @@ impl DaemonRuntime {
                     }
                 }
                 self.advertised_routes.insert(cidr.clone());
+                self.local_route_reconcile_pending = true;
                 if let Err(err) = self.persist_state() {
                     return IpcResponse::err(format!("persist failed: {err}"));
+                }
+                if self.auto_tunnel_enforce && cidr == "0.0.0.0/0" && self.selected_exit_node.is_none() {
+                    // Apply exit-serving dataplane/NAT immediately after advertised default route changes
+                    // so status and forwarding reflect the requested fail-closed policy without waiting
+                    // for the periodic reconcile interval.
+                    self.reconcile();
                 }
                 IpcResponse::ok(format!("route advertised: {cidr}"))
             }
@@ -1717,6 +1726,7 @@ impl DaemonRuntime {
             || self.restriction_mode == RestrictionMode::Recoverable
             || assignment_changed
             || membership_changed
+            || self.local_route_reconcile_pending
         {
             let (mesh_cidr, local_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
                 if let Some(envelope) = auto_bundle {
@@ -1814,6 +1824,7 @@ impl DaemonRuntime {
                     self.restriction_mode = RestrictionMode::None;
                     self.bootstrap_error = None;
                     self.reconcile_failures = 0;
+                    self.local_route_reconcile_pending = false;
                 }
                 (Err(err), Ok(())) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
