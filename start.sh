@@ -3075,8 +3075,19 @@ probe_exit_node_readiness() {
 print_saved_exit_candidates_with_probe() {
   ensure_peer_store
   local name node_id public_key endpoint cidr role probe_result membership_state tunnel_state readiness
+  local status_line current_exit_node marker
+  status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+  current_exit_node="$(extract_status_field "${status_line}" "exit_node")"
+  if [[ "${current_exit_node}" == "none" ]]; then
+    current_exit_node=""
+  fi
   print_info "Running exit-node readiness probe (membership + tunnel)."
   print_warn "Probe temporarily switches exit selection per candidate, then restores it."
+  if [[ -n "${current_exit_node}" ]]; then
+    print_info "Current selection: '${current_exit_node}' (marked with '*')."
+  else
+    print_info "Current selection: none."
+  fi
   while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
     if [[ "${name}" == \#* || -z "${name}" ]]; then
       continue
@@ -3092,8 +3103,12 @@ print_saved_exit_candidates_with_probe() {
     membership_state="$(cut -d'|' -f1 <<<"${probe_result}")"
     tunnel_state="$(cut -d'|' -f2 <<<"${probe_result}")"
     readiness="$(cut -d'|' -f3 <<<"${probe_result}")"
-    printf '  - %s (node=%s endpoint=%s cidr=%s role=%s membership=%s tunnel=%s readiness=%s)\n' \
-      "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" \
+    marker=" "
+    if [[ -n "${current_exit_node}" && "${node_id}" == "${current_exit_node}" ]]; then
+      marker="*"
+    fi
+    printf '  %s %s (node=%s endpoint=%s cidr=%s role=%s membership=%s tunnel=%s readiness=%s)\n' \
+      "${marker}" "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" \
       "${membership_state}" "${tunnel_state}" "${readiness}"
   done <"${PEERS_FILE}"
 }
