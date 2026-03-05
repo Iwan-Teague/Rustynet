@@ -71,10 +71,14 @@ rustynet assignment issue \
 To repeat a full two-node Debian 13 clean install and secure tunnel validation from one operator machine:
 
 ```bash
+umask 077 && printf 'tempo\n' > /tmp/rustynet_sudo.pass
 ./scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh \
-  --exit-host root@192.168.18.37 \
-  --client-host root@192.168.18.40 \
-  --ssh-allow-cidrs 192.168.18.2/32
+  --exit-host 192.168.18.37 \
+  --client-host 192.168.18.40 \
+  --ssh-user debian \
+  --sudo-password-file /tmp/rustynet_sudo.pass \
+  --ssh-allow-cidrs 192.168.18.2/32 \
+  --skip-apt
 ```
 
 What this script does:
@@ -89,6 +93,7 @@ What this script does:
 Important:
 - `--ssh-allow-cidrs` is required and should be your management CIDR(s), not `0.0.0.0/0`.
 - SSH control-master sessions are used; password-based SSH is supported interactively.
+- When SSH user is non-root, provide `--sudo-password-file` (mode `0600`); this keeps sudo secrets out of command arguments.
 
 ## Release Readiness Evidence (Fail-Closed)
 

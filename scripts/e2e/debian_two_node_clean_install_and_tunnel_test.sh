@@ -11,6 +11,8 @@ SSH_USER="root"
 SSH_PORT="22"
 SSH_IDENTITY=""
 SSH_ALLOW_CIDRS=""
+SSH_SUDO_MODE="auto"
+SUDO_PASSWORD_FILE=""
 EXIT_NODE_ID="exit-node"
 CLIENT_NODE_ID="client-node"
 NETWORK_ID="local-net"
@@ -27,6 +29,8 @@ Usage:
     --client-host <host|user@host> \\
     --ssh-allow-cidrs <cidr[,cidr...]> \\
     [--ssh-user <user>] \\
+    [--ssh-sudo <auto|always|never>] \\
+    [--sudo-password-file <path>] \\
     [--ssh-port <port>] \\
     [--ssh-identity <path>] \\
     [--exit-node-id <id>] \\
@@ -39,6 +43,8 @@ Usage:
 
 Notes:
 - The script opens SSH control-master sessions (interactive password prompts are supported).
+- When host SSH user is non-root, sudo is required by default (`--ssh-sudo auto`).
+- For passworded sudo, provide `--sudo-password-file` with mode 0600.
 - Rustynet-only firewall tables are cleaned; non-Rustynet nftables state is preserved.
 - Auto-tunnel enforcement is enabled only after signed bundles are issued and distributed.
 USAGE
@@ -56,6 +62,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssh-user)
       SSH_USER="$2"
+      shift 2
+      ;;
+    --ssh-sudo)
+      SSH_SUDO_MODE="$2"
+      shift 2
+      ;;
+    --sudo-password-file)
+      SUDO_PASSWORD_FILE="$2"
       shift 2
       ;;
     --ssh-port)
@@ -126,10 +140,15 @@ if ! [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); 
   exit 1
 fi
 
+if [[ "${SSH_SUDO_MODE}" != "auto" && "${SSH_SUDO_MODE}" != "always" && "${SSH_SUDO_MODE}" != "never" ]]; then
+  echo "--ssh-sudo must be one of: auto, always, never" >&2
+  exit 1
+fi
+
 require_safe_token() {
   local label="$1"
   local value="$2"
-  if [[ ! "${value}" =~ ^[A-Za-z0-9._:/,@+-]+$ ]]; then
+  if [[ ! "${value}" =~ ^[A-Za-z0-9._:/,@+=-]+$ ]]; then
     echo "${label} contains unsupported characters: ${value}" >&2
     exit 1
   fi
@@ -149,7 +168,7 @@ if [[ -n "${SSH_IDENTITY}" && ! -f "${SSH_IDENTITY}" ]]; then
   exit 1
 fi
 
-for tool in git ssh tar awk sed grep cut mktemp date; do
+for tool in git ssh tar awk sed grep cut mktemp date head stat openssl xxd tr; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     echo "missing required local command: ${tool}" >&2
     exit 1
@@ -181,6 +200,77 @@ CLIENT_TARGET="$(qualify_host "${CLIENT_HOST}")"
 EXIT_ADDR="$(host_address "${EXIT_TARGET}")"
 CLIENT_ADDR="$(host_address "${CLIENT_TARGET}")"
 
+target_user() {
+  local target="$1"
+  printf '%s' "${target%%@*}"
+}
+
+target_needs_sudo() {
+  local target="$1"
+  local user
+  user="$(target_user "${target}")"
+  case "${SSH_SUDO_MODE}" in
+    always)
+      return 0
+      ;;
+    never)
+      return 1
+      ;;
+    auto)
+      [[ "${user}" != "root" ]]
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+PASSWORD_REQUIRED="0"
+if target_needs_sudo "${EXIT_TARGET}" || target_needs_sudo "${CLIENT_TARGET}"; then
+  PASSWORD_REQUIRED="1"
+fi
+
+get_file_mode() {
+  local path="$1"
+  local mode=""
+  if mode="$(stat -f '%Lp' "${path}" 2>/dev/null)"; then
+    printf '%s' "${mode}"
+    return 0
+  fi
+  if mode="$(stat -c '%a' "${path}" 2>/dev/null)"; then
+    printf '%s' "${mode}"
+    return 0
+  fi
+  return 1
+}
+
+SUDO_PASSWORD=""
+if [[ "${PASSWORD_REQUIRED}" == "1" ]]; then
+  if [[ -z "${SUDO_PASSWORD_FILE}" ]]; then
+    echo "sudo is required for non-root SSH targets; provide --sudo-password-file" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SUDO_PASSWORD_FILE}" ]]; then
+    echo "--sudo-password-file does not exist: ${SUDO_PASSWORD_FILE}" >&2
+    exit 1
+  fi
+  if [[ -L "${SUDO_PASSWORD_FILE}" ]]; then
+    echo "--sudo-password-file must not be a symlink: ${SUDO_PASSWORD_FILE}" >&2
+    exit 1
+  fi
+  SUDO_FILE_MODE="$(get_file_mode "${SUDO_PASSWORD_FILE}" || true)"
+  if [[ -n "${SUDO_FILE_MODE}" && "${SUDO_FILE_MODE}" != "600" ]]; then
+    echo "--sudo-password-file must be mode 0600; found ${SUDO_FILE_MODE} (${SUDO_PASSWORD_FILE})" >&2
+    exit 1
+  fi
+  SUDO_PASSWORD="$(head -n 1 "${SUDO_PASSWORD_FILE}")"
+  if [[ -z "${SUDO_PASSWORD}" ]]; then
+    echo "--sudo-password-file must contain a non-empty password on first line" >&2
+    exit 1
+  fi
+fi
+
 TMP_DIR="$(mktemp -d "/tmp/rustynet-remote-e2e.XXXXXX")"
 CONTROL_DIR="${TMP_DIR}/control"
 KNOWN_HOSTS_FILE="${TMP_DIR}/known_hosts"
@@ -188,6 +278,7 @@ mkdir -p "${CONTROL_DIR}"
 touch "${KNOWN_HOSTS_FILE}"
 
 REMOTE_SRC_DIR="${REMOTE_ROOT}/src"
+LOCAL_SOURCE_ARCHIVE="${TMP_DIR}/repo.tar"
 
 SSH_BASE_OPTS=(
   -o ConnectTimeout=20
@@ -219,6 +310,10 @@ log() {
   printf '[debian-pair-e2e] %s\n' "$*"
 }
 
+escape_for_single_quotes() {
+  printf '%s' "$1" | sed "s/'/'\"'\"'/g"
+}
+
 open_master() {
   local host="$1"
   log "Opening SSH control master: ${host}"
@@ -229,19 +324,40 @@ open_master() {
 ssh_run() {
   local host="$1"
   shift
+  if target_needs_sudo "${host}"; then
+    local remote_cmd="$*"
+    local escaped_remote_cmd
+    escaped_remote_cmd="$(escape_for_single_quotes "${remote_cmd}")"
+    ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc '${escaped_remote_cmd}'" <<<"${SUDO_PASSWORD}"
+    return
+  fi
   ssh "${SSH_BASE_OPTS[@]}" "${host}" "$@"
 }
 
 ssh_capture() {
   local host="$1"
   shift
+  if target_needs_sudo "${host}"; then
+    local remote_cmd="$*"
+    local escaped_remote_cmd
+    escaped_remote_cmd="$(escape_for_single_quotes "${remote_cmd}")"
+    ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc '${escaped_remote_cmd}'" <<<"${SUDO_PASSWORD}"
+    return
+  fi
   ssh "${SSH_BASE_OPTS[@]}" "${host}" "$@"
 }
 
 copy_local_archive_to_host() {
   local host="$1"
   log "Syncing source archive to ${host} (${REPO_REF} -> ${REMOTE_SRC_DIR})"
-  git -C "${ROOT_DIR}" archive --format=tar "${REPO_REF}" \
+  if target_needs_sudo "${host}"; then
+    {
+      printf '%s\n' "${SUDO_PASSWORD}"
+      cat "${LOCAL_SOURCE_ARCHIVE}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc 'set -euo pipefail; rm -rf '\''${REMOTE_SRC_DIR}'\''; install -d -m 0755 '\''${REMOTE_SRC_DIR}'\''; tar -xf - -C '\''${REMOTE_SRC_DIR}'\'''"
+    return
+  fi
+  cat "${LOCAL_SOURCE_ARCHIVE}" \
     | ssh "${SSH_BASE_OPTS[@]}" "${host}" "set -euo pipefail; rm -rf '${REMOTE_SRC_DIR}'; install -d -m 0755 '${REMOTE_SRC_DIR}'; tar -xf - -C '${REMOTE_SRC_DIR}'"
 }
 
@@ -485,6 +601,14 @@ run_remote_script_with_args() {
     require_safe_token "remote-arg" "${arg}"
     args+=("'${arg}'")
   done
+  if target_needs_sudo "${host}"; then
+    # shellcheck disable=SC2086
+    {
+      printf '%s\n' "${SUDO_PASSWORD}"
+      cat "${script_path}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -se -- ${args[*]}"
+    return
+  fi
   # shellcheck disable=SC2086
   ssh "${SSH_BASE_OPTS[@]}" "${host}" "bash -se -- ${args[*]}" < "${script_path}"
 }
@@ -503,6 +627,17 @@ copy_local_file_to_remote() {
   local owner_user="$4"
   local owner_group="$5"
   local mode="$6"
+  require_safe_token "remote-path" "${remote_path}"
+  require_safe_token "owner-user" "${owner_user}"
+  require_safe_token "owner-group" "${owner_group}"
+  require_safe_token "mode" "${mode}"
+  if target_needs_sudo "${host}"; then
+    {
+      printf '%s\n' "${SUDO_PASSWORD}"
+      cat "${local_path}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' install -D -m ${mode} -o ${owner_user} -g ${owner_group} /dev/stdin '${remote_path}'"
+    return
+  fi
   cat "${local_path}" | ssh_run "${host}" "install -D -m ${mode} -o ${owner_user} -g ${owner_group} /dev/stdin '${remote_path}'"
 }
 
@@ -522,8 +657,32 @@ retry_ssh_command() {
   return 1
 }
 
+base64_to_hex() {
+  local value="$1"
+  printf '%s' "${value}" \
+    | openssl base64 -d -A 2>/dev/null \
+    | xxd -p -c 256 \
+    | tr -d '\n'
+}
+
+normalize_membership_permissions() {
+  local host="$1"
+  ssh_run "${host}" "set -euo pipefail; chown root:root /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log; chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log"
+}
+
 open_master "${EXIT_TARGET}"
 open_master "${CLIENT_TARGET}"
+
+if target_needs_sudo "${EXIT_TARGET}"; then
+  log "Validating sudo access on ${EXIT_TARGET}"
+  ssh_run "${EXIT_TARGET}" "true"
+fi
+if target_needs_sudo "${CLIENT_TARGET}"; then
+  log "Validating sudo access on ${CLIENT_TARGET}"
+  ssh_run "${CLIENT_TARGET}" "true"
+fi
+
+git -C "${ROOT_DIR}" archive --format=tar "${REPO_REF}" > "${LOCAL_SOURCE_ARCHIVE}"
 
 copy_local_archive_to_host "${EXIT_TARGET}"
 copy_local_archive_to_host "${CLIENT_TARGET}"
@@ -538,31 +697,42 @@ run_remote_script_with_args \
   "${CLIENT_TARGET}" "${BOOTSTRAP_SCRIPT}" \
   "client" "${CLIENT_NODE_ID}" "${NETWORK_ID}" "${REMOTE_SRC_DIR}" "${SSH_ALLOW_CIDRS}" "${SKIP_APT}"
 
+log "Normalizing membership file ownership to root:root before signed updates"
+normalize_membership_permissions "${EXIT_TARGET}"
+normalize_membership_permissions "${CLIENT_TARGET}"
+
 EXIT_WG_PUB="$(ssh_capture "${EXIT_TARGET}" "cat /var/lib/rustynet/keys/wireguard.pub" | tr -d '[:space:]')"
 CLIENT_WG_PUB="$(ssh_capture "${CLIENT_TARGET}" "cat /var/lib/rustynet/keys/wireguard.pub" | tr -d '[:space:]')"
 if [[ -z "${EXIT_WG_PUB}" || -z "${CLIENT_WG_PUB}" ]]; then
   echo "failed to collect wireguard public keys" >&2
   exit 1
 fi
+EXIT_WG_PUB_HEX="$(base64_to_hex "${EXIT_WG_PUB}")"
+CLIENT_WG_PUB_HEX="$(base64_to_hex "${CLIENT_WG_PUB}")"
+if [[ ! "${EXIT_WG_PUB_HEX}" =~ ^[0-9a-f]+$ || ! "${CLIENT_WG_PUB_HEX}" =~ ^[0-9a-f]+$ ]]; then
+  echo "failed to convert WireGuard public key(s) to hex" >&2
+  exit 1
+fi
 
 log "Applying signed membership update for client node"
 run_remote_script_with_args \
   "${EXIT_TARGET}" "${MEMBERSHIP_SCRIPT}" \
-  "${CLIENT_NODE_ID}" "${CLIENT_WG_PUB}" "${EXIT_NODE_ID}-owner"
+  "${CLIENT_NODE_ID}" "${CLIENT_WG_PUB_HEX}" "${EXIT_NODE_ID}-owner"
 
 MEMBERSHIP_SNAPSHOT_LOCAL="${TMP_DIR}/membership.snapshot"
 MEMBERSHIP_LOG_LOCAL="${TMP_DIR}/membership.log"
 copy_remote_file_to_local "${EXIT_TARGET}" "/var/lib/rustynet/membership.snapshot" "${MEMBERSHIP_SNAPSHOT_LOCAL}"
 copy_remote_file_to_local "${EXIT_TARGET}" "/var/lib/rustynet/membership.log" "${MEMBERSHIP_LOG_LOCAL}"
 
-copy_local_file_to_remote "${CLIENT_TARGET}" "${MEMBERSHIP_SNAPSHOT_LOCAL}" "/var/lib/rustynet/membership.snapshot" "rustynetd" "rustynetd" "0600"
-copy_local_file_to_remote "${CLIENT_TARGET}" "${MEMBERSHIP_LOG_LOCAL}" "/var/lib/rustynet/membership.log" "rustynetd" "rustynetd" "0600"
+copy_local_file_to_remote "${CLIENT_TARGET}" "${MEMBERSHIP_SNAPSHOT_LOCAL}" "/var/lib/rustynet/membership.snapshot" "root" "root" "0600"
+copy_local_file_to_remote "${CLIENT_TARGET}" "${MEMBERSHIP_LOG_LOCAL}" "/var/lib/rustynet/membership.log" "root" "root" "0600"
 ssh_run "${CLIENT_TARGET}" "rm -f /var/lib/rustynet/membership.watermark"
+normalize_membership_permissions "${CLIENT_TARGET}"
 
 log "Issuing signed auto-tunnel assignments"
 run_remote_script_with_args \
   "${EXIT_TARGET}" "${ASSIGNMENT_SCRIPT}" \
-  "${EXIT_NODE_ID}" "${CLIENT_NODE_ID}" "${EXIT_ADDR}:51820" "${CLIENT_ADDR}:51820" "${EXIT_WG_PUB}" "${CLIENT_WG_PUB}"
+  "${EXIT_NODE_ID}" "${CLIENT_NODE_ID}" "${EXIT_ADDR}:51820" "${CLIENT_ADDR}:51820" "${EXIT_WG_PUB_HEX}" "${CLIENT_WG_PUB_HEX}"
 
 ASSIGNMENT_PUB_LOCAL="${TMP_DIR}/assignment.pub"
 ASSIGNMENT_EXIT_LOCAL="${TMP_DIR}/exit.assignment"
@@ -590,11 +760,10 @@ run_remote_script_with_args \
   "client" "${CLIENT_NODE_ID}" "${REMOTE_SRC_DIR}" "${SSH_ALLOW_CIDRS}"
 
 log "Applying exit-node routing selection"
+retry_ssh_command "${CLIENT_TARGET}" 20 2 \
+  "test -S /run/rustynet/rustynetd.sock"
 retry_ssh_command "${EXIT_TARGET}" 10 2 \
   "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
-retry_ssh_command "${CLIENT_TARGET}" 10 2 \
-  "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet exit-node select '${EXIT_NODE_ID}'"
-ssh_run "${CLIENT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet lan-access off >/dev/null 2>&1 || true"
 
 sleep 3
 
@@ -603,13 +772,13 @@ CLIENT_STATUS="$(ssh_capture "${CLIENT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rus
 CLIENT_ROUTE="$(ssh_capture "${CLIENT_TARGET}" "ip -4 route get 1.1.1.1 || true")"
 EXIT_WG_SHOW="$(ssh_capture "${EXIT_TARGET}" "wg show rustynet0 || true")"
 EXIT_NFT_RULESET="$(ssh_capture "${EXIT_TARGET}" "nft list ruleset || true")"
-EXIT_TUNNEL_IP="$(ssh_capture "${EXIT_TARGET}" "ip -4 -o addr show dev rustynet0 | awk '{print \\$4}' | cut -d/ -f1 | head -n1" | tr -d '[:space:]')"
+EXIT_TUNNEL_IP="$(ssh_capture "${EXIT_TARGET}" "ip -4 -o addr show dev rustynet0 | sed -n 's/.* inet \\([0-9.]*\\)\\/.*$/\\1/p' | head -n1" | tr -d '[:space:]')"
 
 if [[ -n "${EXIT_TUNNEL_IP}" ]]; then
   ssh_run "${CLIENT_TARGET}" "ping -c 2 -W 2 '${EXIT_TUNNEL_IP}' >/dev/null"
 fi
 
-EXIT_HANDSHAKES="$(ssh_capture "${EXIT_TARGET}" "wg show rustynet0 latest-handshakes | awk '{print \\$2}'")"
+EXIT_HANDSHAKES="$(ssh_capture "${EXIT_TARGET}" "wg show rustynet0 latest-handshakes | sed -n 's/^[^[:space:]]*[[:space:]]\\+\\([0-9][0-9]*\\).*$/\\1/p'")"
 
 CLIENT_PLAINTEXT_KEYS="$(ssh_capture "${CLIENT_TARGET}" "ls -1 /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase 2>/dev/null || true")"
 EXIT_PLAINTEXT_KEYS="$(ssh_capture "${EXIT_TARGET}" "ls -1 /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase 2>/dev/null || true")"

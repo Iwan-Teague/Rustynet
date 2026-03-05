@@ -12,6 +12,7 @@ Status update (verified against current tree on 2026-03-05):
 - Phase9/Phase10 measured evidence generation is now integrated into `phase9_gates.sh` and `phase10_gates.sh` with source freshness checks and fail-closed metadata validation.
 - Membership gate fallback now uses repository-local bootstrap state only when runtime membership files are absent, while preserving strict runtime-path enforcement when `/var/lib/rustynet` state exists.
 - Current gate status in this tree (2026-03-05): `phase10_gates.sh` and `membership_gates.sh` pass end-to-end.
+- Debian two-node remote validation has advanced to signed membership update + signed assignment issuance + enforced tunnel reconcile with strict key/credential checks passing; current remaining blocker is exit-node egress/NAT parity (`state=DataplaneApplied` for exit host and missing nft `masquerade`, with client internet ping still failing).
 - Security risk truth: the primary remaining risk in this document is drift between planned text and current implementation; stale guidance can cause insecure operator assumptions or mis-prioritized engineering work.
 
 ## 1) Goals
