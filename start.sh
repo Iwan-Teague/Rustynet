@@ -2399,14 +2399,77 @@ EOF
   fi
 }
 
+peer_endpoint_host() {
+  local endpoint="$1"
+  if [[ -z "${endpoint}" ]]; then
+    return 1
+  fi
+  if [[ "${endpoint}" =~ ^\[([^]]+)\]:[0-9]+$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${endpoint}" =~ ^([^:]+):[0-9]+$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s' "${endpoint}"
+}
+
+probe_peer_online_status() {
+  local endpoint="$1"
+  local host
+  if ! host="$(peer_endpoint_host "${endpoint}")"; then
+    printf 'unknown'
+    return 0
+  fi
+  if [[ -z "${host}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  if ! command -v ping >/dev/null 2>&1; then
+    printf 'unknown'
+    return 0
+  fi
+  if is_linux_host; then
+    if ping -n -c 1 -W 1 "${host}" >/dev/null 2>&1; then
+      printf 'online'
+    else
+      printf 'offline'
+    fi
+    return 0
+  fi
+  if is_macos_host; then
+    if ping -n -c 1 -W 1000 "${host}" >/dev/null 2>&1; then
+      printf 'online'
+    else
+      printf 'offline'
+    fi
+    return 0
+  fi
+  if ping -n -c 1 "${host}" >/dev/null 2>&1; then
+    printf 'online'
+  else
+    printf 'offline'
+  fi
+}
+
 print_saved_peers() {
   ensure_peer_store
-  awk -F'|' '
-    $0 !~ /^#/ && NF >= 5 {
-      role = (NF >= 6 && $6 != "") ? $6 : "unknown";
-      printf "  - %s (node=%s endpoint=%s cidr=%s role=%s)\n", $1, $2, $4, $5, role
-    }
-  ' "${PEERS_FILE}"
+  local name node_id public_key endpoint cidr role status
+  while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
+    if [[ "${name}" == \#* || -z "${name}" ]]; then
+      continue
+    fi
+    if [[ -z "${node_id}" || -z "${endpoint}" || -z "${cidr}" ]]; then
+      continue
+    fi
+    if [[ -z "${role}" ]]; then
+      role="unknown"
+    fi
+    status="$(probe_peer_online_status "${endpoint}")"
+    printf '  - %s (node=%s endpoint=%s cidr=%s role=%s status=%s)\n' \
+      "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" "${status}"
+  done <"${PEERS_FILE}"
 }
 
 print_saved_admin_peers() {
