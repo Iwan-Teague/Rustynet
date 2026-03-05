@@ -296,20 +296,23 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
 
     fn apply_route_reconciliation(&mut self, next_routes: &[Route]) -> Result<(), BackendError> {
         for route in &self.routes {
-            if !next_routes.iter().any(|candidate| candidate == route)
-                && let Err(err) = self.runner.run(
-                    "ip",
-                    &[
-                        "route".to_string(),
-                        "del".to_string(),
-                        route.destination_cidr.clone(),
-                        "dev".to_string(),
-                        self.interface_name.clone(),
-                    ],
-                )
-                && !Self::is_missing_ip_route_error(&err)
-            {
-                return Err(err);
+            if next_routes.iter().any(|candidate| candidate == route) {
+                continue;
+            }
+
+            if let Err(err) = self.runner.run(
+                "ip",
+                &[
+                    "route".to_string(),
+                    "del".to_string(),
+                    route.destination_cidr.clone(),
+                    "dev".to_string(),
+                    self.interface_name.clone(),
+                ],
+            ) {
+                if !Self::is_missing_ip_route_error(&err) {
+                    return Err(err);
+                }
             }
         }
 
