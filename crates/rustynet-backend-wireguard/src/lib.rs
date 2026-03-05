@@ -527,12 +527,12 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
 
         if self
             .runner
-            .run("wireguard-go", &[self.interface_name.clone()])
+            .run("wireguard-go", std::slice::from_ref(&self.interface_name))
             .is_err()
         {
             let _ = self.remove_interface();
             self.runner
-                .run("wireguard-go", &[self.interface_name.clone()])?;
+                .run("wireguard-go", std::slice::from_ref(&self.interface_name))?;
         }
 
         if let Err(err) = self.runner.run(

@@ -1279,10 +1279,10 @@ impl MacosCommandSystem {
             if !normalized.contains(&proto_token) {
                 return false;
             }
-            if let Some(token) = interface_token.as_ref() {
-                if !normalized.contains(token) {
-                    return false;
-                }
+            if let Some(token) = interface_token.as_ref()
+                && !normalized.contains(token)
+            {
+                return false;
             }
             normalized.contains("port 53") || normalized.contains("port = domain")
         })
@@ -1291,13 +1291,13 @@ impl MacosCommandSystem {
     fn apply_pf_rules(&mut self, strict_fail_closed: bool) -> Result<(), SystemError> {
         self.ensure_pf_enabled()?;
         let next_anchor = self.current_anchor_name();
-        if let Some(previous) = self.anchor_name.clone() {
-            if previous != next_anchor {
-                self.run_allow_failure(
-                    PrivilegedCommandProgram::Pfctl,
-                    &["-a", previous.as_str(), "-F", "all"],
-                );
-            }
+        if let Some(previous) = self.anchor_name.clone()
+            && previous != next_anchor
+        {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", previous.as_str(), "-F", "all"],
+            );
         }
 
         let tmp_path = std::env::temp_dir().join(format!(

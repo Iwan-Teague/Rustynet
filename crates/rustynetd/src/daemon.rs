@@ -1364,7 +1364,10 @@ impl DaemonRuntime {
                 if let Err(err) = self.persist_state() {
                     return IpcResponse::err(format!("persist failed: {err}"));
                 }
-                if self.auto_tunnel_enforce && cidr == "0.0.0.0/0" && self.selected_exit_node.is_none() {
+                if self.auto_tunnel_enforce
+                    && cidr == "0.0.0.0/0"
+                    && self.selected_exit_node.is_none()
+                {
                     // Apply exit-serving dataplane/NAT immediately after advertised default route changes
                     // so status and forwarding reflect the requested fail-closed policy without waiting
                     // for the periodic reconcile interval.
@@ -3753,7 +3756,7 @@ fn read_command(stream: &UnixStream) -> Result<String, String> {
     if bytes.len() > 4096 {
         return Err("command too long".to_string());
     }
-    if bytes.iter().any(|byte| *byte == b'\0') {
+    if bytes.contains(&b'\0') {
         return Err("command contains null byte".to_string());
     }
     let line = String::from_utf8(bytes).map_err(|_| "command is not valid utf-8".to_string())?;

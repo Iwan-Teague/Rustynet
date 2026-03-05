@@ -1069,13 +1069,13 @@ fn validate_assignment_issue_config(
             target_node_id
         ));
     }
-    if let Some(exit_node_id) = exit_node_id {
-        if !node_ids.contains(exit_node_id) {
-            return Err(format!(
-                "exit node {} is not present in --nodes",
-                exit_node_id
-            ));
-        }
+    if let Some(exit_node_id) = exit_node_id
+        && !node_ids.contains(exit_node_id)
+    {
+        return Err(format!(
+            "exit node {} is not present in --nodes",
+            exit_node_id
+        ));
     }
     let mut allow_pair_set = HashSet::new();
     for pair in allow_pairs {
@@ -1124,7 +1124,7 @@ fn load_assignment_signing_secret(path: &Path) -> Result<Vec<u8>, String> {
 
 fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
     let trimmed = encoded.trim();
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err("hex payload must have even length".to_string());
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
