@@ -61,6 +61,30 @@ rustynet assignment issue \
 - Exit-serving mode under enforced auto-tunnel: advertise `0.0.0.0/0` on the serving node (`rustynet route advertise 0.0.0.0/0`). This is the only route mutation allowed while auto-tunnel enforcement is enabled.
 - When `0.0.0.0/0` is advertised and the node is not itself using an exit node, `rustynetd` applies forwarding+NAT for secure exit serving during reconcile.
 
+## Automated Debian Pair Clean Install + Tunnel Validation
+
+To repeat a full two-node Debian 13 clean install and secure tunnel validation from one operator machine:
+
+```bash
+./scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh \
+  --exit-host root@192.168.18.37 \
+  --client-host root@192.168.18.40 \
+  --ssh-allow-cidrs 192.168.18.2/32
+```
+
+What this script does:
+- pushes the selected local git ref (`HEAD` by default) to both hosts as a clean source archive
+- performs clean Rustynet runtime reset on each host (service stop + Rustynet-owned dataplane cleanup)
+- builds and installs `rustynetd` + `rustynet`
+- initializes encrypted key custody using `systemd-creds` credential blob (no persistent plaintext passphrase files)
+- initializes trust + membership state, issues signed assignment bundles, and enables auto-tunnel enforcement
+- configures exit-node routing and validates tunnel/dataplane/security invariants
+- writes a validation report to `artifacts/phase10/debian_two_node_remote_validation.md`
+
+Important:
+- `--ssh-allow-cidrs` is required and should be your management CIDR(s), not `0.0.0.0/0`.
+- SSH control-master sessions are used; password-based SSH is supported interactively.
+
 ## Release Readiness Evidence (Fail-Closed)
 
 Rustynet no longer accepts static/pass-through readiness JSON artifacts.
