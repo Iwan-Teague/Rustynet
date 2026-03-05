@@ -5,7 +5,8 @@ use std::io::ErrorKind;
 use std::process::Command;
 
 use rustynet_backend_api::{
-    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
+    BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
+    RuntimeContext,
     TunnelBackend, TunnelStats,
 };
 
@@ -130,13 +131,21 @@ pub struct LinuxCommandRunner;
 
 impl WireguardCommandRunner for LinuxCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
-        let status = Command::new(program)
+        let output = Command::new(program)
             .args(args)
-            .status()
+            .output()
             .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Err(BackendError::internal(format!(
+                    "{program} exited with status {}",
+                    output.status
+                )));
+            }
             return Err(BackendError::internal(format!(
-                "{program} exited with status {status}"
+                "{program} exited with status {}: {stderr}",
+                output.status
             )));
         }
         Ok(())
@@ -203,6 +212,16 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             ));
         }
         Ok(())
+    }
+
+    fn is_missing_ip_route_error(err: &BackendError) -> bool {
+        if err.kind != BackendErrorKind::Internal {
+            return false;
+        }
+        let message = err.message.to_ascii_lowercase();
+        message.contains("rtnetlink answers: no such process")
+            || message.contains("no such process")
+            || message.contains("no such file or directory")
     }
 
     fn configure_interface(&mut self, context: &RuntimeContext) -> Result<(), BackendError> {
@@ -279,7 +298,7 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
     fn apply_route_reconciliation(&mut self, next_routes: &[Route]) -> Result<(), BackendError> {
         for route in &self.routes {
             if !next_routes.iter().any(|candidate| candidate == route) {
-                self.runner.run(
+                if let Err(err) = self.runner.run(
                     "ip",
                     &[
                         "route".to_string(),
@@ -288,7 +307,11 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                         "dev".to_string(),
                         self.interface_name.clone(),
                     ],
-                )?;
+                ) {
+                    if !Self::is_missing_ip_route_error(&err) {
+                        return Err(err);
+                    }
+                }
             }
         }
 
@@ -1134,6 +1157,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct MissingRouteDeleteRunner;
+
+    impl WireguardCommandRunner for MissingRouteDeleteRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            let is_route_delete = program == "ip"
+                && args.first().map(String::as_str) == Some("route")
+                && args.get(1).map(String::as_str) == Some("del");
+            if is_route_delete {
+                return Err(BackendError::internal(
+                    "privileged helper ip exited with status 2: RTNETLINK answers: No such process",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
@@ -1305,6 +1345,30 @@ mod tests {
             .start(runtime_context())
             .expect_err("runner failure should bubble");
         assert_eq!(err.kind, BackendErrorKind::Internal);
+    }
+
+    #[test]
+    fn linux_backend_ignores_missing_route_delete_during_reconciliation() {
+        let runner = MissingRouteDeleteRunner;
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        let peer = NodeId::new("peer-a").expect("id should parse");
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+            .apply_routes(vec![Route {
+                destination_cidr: "100.100.1.0/24".to_string(),
+                via_node: peer.clone(),
+                kind: RouteKind::Mesh,
+            }])
+            .expect("initial route apply should succeed");
+        backend
+            .apply_routes(Vec::new())
+            .expect("missing route delete should be treated as idempotent");
+
+        assert!(backend.routes.is_empty());
     }
 
     #[test]
