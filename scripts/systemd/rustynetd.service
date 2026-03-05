@@ -50,6 +50,7 @@ Restart=on-failure
 RestartSec=2s
 StateDirectory=rustynet
 StateDirectoryMode=0700
+PermissionsStartOnly=true
 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY}
 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred
 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY}

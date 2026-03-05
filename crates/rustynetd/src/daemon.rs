@@ -2596,13 +2596,28 @@ fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
 }
 
 fn validate_passphrase_permissions(path: &Path) -> Result<(), DaemonError> {
-    let allow_root_owner = path.starts_with("/run/credentials/");
+    let allow_root_owner = is_systemd_runtime_credential_path(path);
+    let disallowed_mode_mask = passphrase_disallowed_mode_mask(path);
     validate_file_security(
         path,
         "wireguard key passphrase credential",
-        0o077,
+        disallowed_mode_mask,
         allow_root_owner,
     )
+}
+
+fn is_systemd_runtime_credential_path(path: &Path) -> bool {
+    path.starts_with("/run/credentials/")
+}
+
+fn passphrase_disallowed_mode_mask(path: &Path) -> u32 {
+    if is_systemd_runtime_credential_path(path) {
+        // systemd runtime credentials are typically provisioned as 0440 root:<service-group>
+        // and should still reject any write/execute bit or any "other" access.
+        0o337
+    } else {
+        0o077
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3792,7 +3807,7 @@ mod tests {
         AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_auto_tunnel_bundle,
         load_auto_tunnel_watermark, load_trust_evidence, load_trust_watermark,
-        persist_auto_tunnel_watermark, persist_trust_watermark,
+        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, run_daemon, scrub_runtime_wireguard_key_material,
         sha256_digest, trust_evidence_payload, unix_now, validate_daemon_config,
         zeroize_optional_bytes,
@@ -3804,6 +3819,22 @@ mod tests {
             out.push_str(&format!("{byte:02x}"));
         }
         out
+    }
+
+    #[test]
+    fn passphrase_permission_mask_accepts_systemd_runtime_credential_mode() {
+        assert_eq!(
+            passphrase_disallowed_mode_mask(Path::new(
+                "/run/credentials/rustynetd.service/wg_key_passphrase"
+            )),
+            0o337
+        );
+        assert_eq!(
+            passphrase_disallowed_mode_mask(Path::new(
+                "/var/lib/rustynet/keys/wireguard.passphrase"
+            )),
+            0o077
+        );
     }
 
     fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
