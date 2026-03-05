@@ -1069,13 +1069,14 @@ fn validate_assignment_issue_config(
             target_node_id
         ));
     }
-    if let Some(exit_node_id) = exit_node_id
-        && !node_ids.contains(exit_node_id)
-    {
-        return Err(format!(
-            "exit node {} is not present in --nodes",
-            exit_node_id
-        ));
+    match exit_node_id {
+        Some(exit_node_id) if !node_ids.contains(exit_node_id) => {
+            return Err(format!(
+                "exit node {} is not present in --nodes",
+                exit_node_id
+            ));
+        }
+        _ => {}
     }
     let mut allow_pair_set = HashSet::new();
     for pair in allow_pairs {
