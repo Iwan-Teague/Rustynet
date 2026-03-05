@@ -1125,7 +1125,7 @@ fn load_assignment_signing_secret(path: &Path) -> Result<Vec<u8>, String> {
 
 fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
     let trimmed = encoded.trim();
-    if !trimmed.len().is_multiple_of(2) {
+    if (trimmed.len() & 1) != 0 {
         return Err("hex payload must have even length".to_string());
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
