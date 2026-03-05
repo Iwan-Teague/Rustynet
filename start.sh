@@ -2528,6 +2528,15 @@ run_rustynet_cli() {
   RUSTYNET_DAEMON_SOCKET="${SOCKET_PATH}" rustynet "$@"
 }
 
+restore_exit_selection() {
+  local original_exit_node="$1"
+  if [[ -n "${original_exit_node}" && "${original_exit_node}" != "none" ]]; then
+    run_rustynet_cli exit-node select "${original_exit_node}" >/dev/null 2>&1 || true
+  else
+    run_rustynet_cli exit-node off >/dev/null 2>&1 || true
+  fi
+}
+
 extract_status_field() {
   local status_line="$1"
   local key="$2"
@@ -2973,9 +2982,125 @@ toggle_lan_access() {
   esac
 }
 
+probe_selected_exit_tunnel_status() {
+  local node_id="$1"
+  local peer_public_key="${2:-}"
+  local attempt status_line selected state restricted netcheck_line handshake_ts
+
+  for attempt in 1 2 3; do
+    status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+    selected="$(extract_status_field "${status_line}" "exit_node")"
+    state="$(extract_status_field "${status_line}" "state")"
+    restricted="$(extract_status_field "${status_line}" "restricted_safe_mode")"
+    netcheck_line="$(run_rustynet_cli netcheck 2>/dev/null || true)"
+
+    if [[ "${selected}" != "${node_id}" ]]; then
+      sleep 1
+      continue
+    fi
+    if [[ "${state}" != "ExitActive" ]]; then
+      sleep 1
+      continue
+    fi
+    if [[ "${restricted}" == "true" ]]; then
+      sleep 1
+      continue
+    fi
+    if [[ "${netcheck_line}" == *"path=fail-closed"* ]]; then
+      sleep 1
+      continue
+    fi
+
+    if [[ -n "${peer_public_key}" ]] && command -v wg >/dev/null 2>&1; then
+      handshake_ts="$(
+        wg show "${WG_INTERFACE}" latest-handshakes 2>/dev/null \
+          | awk -v key="${peer_public_key}" '$1 == key { print $2; exit }'
+      )"
+      if [[ "${handshake_ts}" =~ ^[0-9]+$ ]] && (( handshake_ts > 0 )); then
+        printf 'online'
+        return 0
+      fi
+      sleep 1
+      continue
+    fi
+
+    printf 'online'
+    return 0
+  done
+
+  printf 'offline'
+}
+
+probe_exit_node_readiness() {
+  local node_id="$1"
+  local peer_public_key="${2:-}"
+  local status_line original_exit_node selection_output
+  local membership_state="unknown"
+  local tunnel_state="offline"
+  local readiness="select-failed"
+
+  status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+  original_exit_node="$(extract_status_field "${status_line}" "exit_node")"
+  if [[ "${original_exit_node}" == "none" ]]; then
+    original_exit_node=""
+  fi
+
+  if ! selection_output="$(run_rustynet_cli exit-node select "${node_id}" 2>&1)"; then
+    if [[ "${selection_output}" == *"not active in membership state"* ]]; then
+      membership_state="inactive"
+      tunnel_state="skipped"
+      readiness="membership-inactive"
+    else
+      membership_state="unknown"
+      tunnel_state="offline"
+      readiness="select-failed"
+    fi
+    restore_exit_selection "${original_exit_node}"
+    printf '%s|%s|%s' "${membership_state}" "${tunnel_state}" "${readiness}"
+    return 0
+  fi
+
+  membership_state="active"
+  tunnel_state="$(probe_selected_exit_tunnel_status "${node_id}" "${peer_public_key}")"
+  if [[ "${tunnel_state}" == "online" ]]; then
+    readiness="ready"
+  else
+    readiness="selected-but-no-tunnel"
+  fi
+
+  restore_exit_selection "${original_exit_node}"
+  printf '%s|%s|%s' "${membership_state}" "${tunnel_state}" "${readiness}"
+}
+
+print_saved_exit_candidates_with_probe() {
+  ensure_peer_store
+  local name node_id public_key endpoint cidr role probe_result membership_state tunnel_state readiness
+  print_info "Running exit-node readiness probe (membership + tunnel)."
+  print_warn "Probe temporarily switches exit selection per candidate, then restores it."
+  while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
+    if [[ "${name}" == \#* || -z "${name}" ]]; then
+      continue
+    fi
+    if [[ -z "${node_id}" || -z "${endpoint}" || -z "${cidr}" ]]; then
+      continue
+    fi
+    if [[ -z "${role}" ]]; then
+      role="unknown"
+    fi
+
+    probe_result="$(probe_exit_node_readiness "${node_id}" "${public_key}")"
+    membership_state="$(cut -d'|' -f1 <<<"${probe_result}")"
+    tunnel_state="$(cut -d'|' -f2 <<<"${probe_result}")"
+    readiness="$(cut -d'|' -f3 <<<"${probe_result}")"
+    printf '  - %s (node=%s endpoint=%s cidr=%s role=%s membership=%s tunnel=%s readiness=%s)\n' \
+      "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" \
+      "${membership_state}" "${tunnel_state}" "${readiness}"
+  done <"${PEERS_FILE}"
+}
+
 select_exit_node() {
   local node
-  print_saved_peers
+  print_saved_exit_candidates_with_probe
   prompt_default node "Exit node id to select" ""
   if [[ -z "${node}" ]]; then
     print_err "Exit node id is required."
