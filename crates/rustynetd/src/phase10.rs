@@ -1871,7 +1871,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     ) -> Result<(), Phase10Error> {
         for peer in &peers {
             self.backend.configure_peer(peer.clone())?;
-            self.peer_paths.insert(peer.node_id.clone(), PathMode::Direct);
+            self.peer_paths
+                .insert(peer.node_id.clone(), PathMode::Direct);
             applied_stages.push(StageMarker::PeerApplied);
         }
 

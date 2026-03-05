@@ -6,8 +6,7 @@ use std::process::Command;
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
-    RuntimeContext,
-    TunnelBackend, TunnelStats,
+    RuntimeContext, TunnelBackend, TunnelStats,
 };
 
 const MACOS_ROUTE_BINARY: &str = "/sbin/route";
