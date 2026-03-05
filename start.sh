@@ -3427,6 +3427,23 @@ EOF
   done
 }
 
+main_connection_action_label() {
+  if [[ "${MENU_NETWORK_CONNECTED}" == "yes" ]]; then
+    printf '%s' "DISCONNECT FROM NETWORK"
+  else
+    printf '%s' "CONNECT TO VPN"
+  fi
+}
+
+toggle_vpn_connection_from_main_menu() {
+  refresh_menu_runtime_status
+  if [[ "${MENU_NETWORK_CONNECTED}" == "yes" ]]; then
+    disconnect_vpn
+  else
+    start_or_restart_service
+  fi
+}
+
 main_menu() {
   if is_linux_host || is_macos_host; then
     print_info "Host OS: ${HOST_OS} (full dataplane/runtime mode)."
@@ -3435,27 +3452,39 @@ main_menu() {
   fi
   while true; do
     print_menu_runtime_header
+    local connect_action_label
+    connect_action_label="$(main_connection_action_label)"
     if is_admin_role; then
-      cat <<'EOF'
+      cat <<EOF
 
 Rustynet Admin Console
-  1) Service setup & operations
-  2) Network information & diagnostics
-  3) Peer, exit node & routing
-  4) Security & key management
-  5) Emergency & recovery
-  6) Configuration
+  Quick Actions
+  1) >>> ${connect_action_label} <<<
+  2) >>> SELECT EXIT NODE <<<
+
+  Management Menus
+  3) Service setup & operations
+  4) Network information & diagnostics
+  5) Peer, exit node & routing
+  6) Security & key management
+  7) Emergency & recovery
+  8) Configuration
   0) Exit
 EOF
     else
-      cat <<'EOF'
+      cat <<EOF
 
 Rustynet Client Console
-  1) Service setup & operations
-  2) Network information & diagnostics
-  3) Client connectivity
-  4) Emergency & recovery
-  5) Configuration
+  Quick Actions
+  1) >>> ${connect_action_label} <<<
+  2) >>> SELECT EXIT NODE <<<
+
+  Management Menus
+  3) Service setup & operations
+  4) Network information & diagnostics
+  5) Client connectivity
+  6) Emergency & recovery
+  7) Configuration
   0) Exit
 EOF
     fi
@@ -3466,22 +3495,26 @@ EOF
     fi
     if is_admin_role; then
       case "${choice}" in
-        1) menu_service_setup_operations ;;
-        2) menu_network_information ;;
-        3) menu_peer_exit_routing ;;
-        4) menu_security_key_management ;;
-        5) menu_emergency_recovery ;;
-        6) menu_configuration ;;
+        1) toggle_vpn_connection_from_main_menu ;;
+        2) select_exit_node ;;
+        3) menu_service_setup_operations ;;
+        4) menu_network_information ;;
+        5) menu_peer_exit_routing ;;
+        6) menu_security_key_management ;;
+        7) menu_emergency_recovery ;;
+        8) menu_configuration ;;
         0) exit 0 ;;
         *) print_warn "Unknown option: ${choice}" ;;
       esac
     else
       case "${choice}" in
-        1) menu_service_setup_operations ;;
-        2) menu_network_information ;;
-        3) menu_peer_exit_routing ;;
-        4) menu_emergency_recovery ;;
-        5) menu_configuration ;;
+        1) toggle_vpn_connection_from_main_menu ;;
+        2) select_exit_node ;;
+        3) menu_service_setup_operations ;;
+        4) menu_network_information ;;
+        5) menu_peer_exit_routing ;;
+        6) menu_emergency_recovery ;;
+        7) menu_configuration ;;
         0) exit 0 ;;
         *) print_warn "Unknown option: ${choice}" ;;
       esac
