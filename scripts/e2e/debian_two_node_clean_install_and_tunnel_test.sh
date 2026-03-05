@@ -376,6 +376,26 @@ skip_apt="$6"
 export DEBIAN_FRONTEND=noninteractive
 export PATH="$HOME/.cargo/bin:${PATH}"
 
+primary_allow_cidr="${ssh_allow_cidrs%%,*}"
+primary_allow_cidr="${primary_allow_cidr// /}"
+primary_allow_ip="${primary_allow_cidr%%/*}"
+default_egress_iface="$(ip -o -4 route show to default | awk 'NR==1 { print $5 }')"
+management_iface=""
+if [[ -n "${primary_allow_ip}" ]]; then
+  management_iface="$(
+    ip -o route get "${primary_allow_ip}" 2>/dev/null \
+      | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+  )"
+fi
+service_egress_iface="${default_egress_iface}"
+if [[ "${role}" == "client" && -n "${management_iface}" ]]; then
+  service_egress_iface="${management_iface}"
+fi
+if [[ -z "${service_egress_iface}" ]]; then
+  echo "unable to determine service egress interface" >&2
+  exit 1
+fi
+
 if [[ "${skip_apt}" != "1" ]]; then
   apt-get update
   apt-get install -y --no-install-recommends \
@@ -479,6 +499,7 @@ RUSTYNET_TRUST_AUTO_REFRESH=true \
 RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false \
 RUSTYNET_AUTO_TUNNEL_ENFORCE=false \
 RUSTYNET_WG_LISTEN_PORT=51820 \
+RUSTYNET_EGRESS_INTERFACE="${service_egress_iface}" \
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true \
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${ssh_allow_cidrs}" \
 "${src_dir}/scripts/systemd/install_rustynetd_service.sh"
@@ -504,12 +525,33 @@ if [[ -f /etc/rustynet/assignment.signing.secret && -f /etc/rustynet/assignment-
   assignment_auto_refresh="true"
 fi
 
+primary_allow_cidr="${ssh_allow_cidrs%%,*}"
+primary_allow_cidr="${primary_allow_cidr// /}"
+primary_allow_ip="${primary_allow_cidr%%/*}"
+default_egress_iface="$(ip -o -4 route show to default | awk 'NR==1 { print $5 }')"
+management_iface=""
+if [[ -n "${primary_allow_ip}" ]]; then
+  management_iface="$(
+    ip -o route get "${primary_allow_ip}" 2>/dev/null \
+      | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+  )"
+fi
+service_egress_iface="${default_egress_iface}"
+if [[ "${role}" == "client" && -n "${management_iface}" ]]; then
+  service_egress_iface="${management_iface}"
+fi
+if [[ -z "${service_egress_iface}" ]]; then
+  echo "unable to determine service egress interface" >&2
+  exit 1
+fi
+
 RUSTYNET_NODE_ID="${node_id}" \
 RUSTYNET_NODE_ROLE="${role}" \
 RUSTYNET_TRUST_AUTO_REFRESH="${auto_refresh}" \
 RUSTYNET_ASSIGNMENT_AUTO_REFRESH="${assignment_auto_refresh}" \
 RUSTYNET_AUTO_TUNNEL_ENFORCE=true \
 RUSTYNET_WG_LISTEN_PORT=51820 \
+RUSTYNET_EGRESS_INTERFACE="${service_egress_iface}" \
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true \
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${ssh_allow_cidrs}" \
 "${src_dir}/scripts/systemd/install_rustynetd_service.sh"

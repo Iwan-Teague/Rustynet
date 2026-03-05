@@ -199,6 +199,12 @@ pub trait DataplaneSystem {
         Ok(())
     }
     fn check_prerequisites(&mut self) -> Result<(), SystemError>;
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        _peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError>;
     fn rollback_routes(&mut self) -> Result<(), SystemError>;
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError>;
@@ -219,6 +225,7 @@ pub trait DataplaneSystem {
 enum StageMarker {
     BackendStarted,
     PeerApplied,
+    EndpointBypassApplied,
     BackendRoutesApplied,
     SystemRoutesApplied,
     FirewallApplied,
@@ -499,6 +506,25 @@ impl LinuxCommandSystem {
         args
     }
 
+    fn peer_endpoint_bypass_route_args(addr: IpAddr, egress_interface: &str) -> Vec<String> {
+        let endpoint_cidr = match addr {
+            IpAddr::V4(value) => format!("{value}/32"),
+            IpAddr::V6(value) => format!("{value}/128"),
+        };
+        let mut args = Vec::with_capacity(9);
+        if matches!(addr, IpAddr::V6(_)) {
+            args.push("-6".to_string());
+        }
+        args.push("route".to_string());
+        args.push("replace".to_string());
+        args.push(endpoint_cidr);
+        args.push("dev".to_string());
+        args.push(egress_interface.to_string());
+        args.push("table".to_string());
+        args.push("51820".to_string());
+        args
+    }
+
     fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
         let use_native_write = matches!(self.mode, LinuxDataplaneMode::HybridNative)
             && self.privileged_client.is_none();
@@ -689,6 +715,28 @@ impl DataplaneSystem for LinuxCommandSystem {
         Err(SystemError::PrerequisiteCheckFailed(
             "linux command system is only supported on linux".to_string(),
         ))
+    }
+
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        let mut endpoints = BTreeSet::new();
+        for peer in peers {
+            endpoints.insert(peer.endpoint.addr);
+        }
+        for endpoint in endpoints {
+            let args =
+                Self::peer_endpoint_bypass_route_args(endpoint, self.egress_interface.as_str());
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            self.run(PrivilegedCommandProgram::Ip, &arg_refs)
+                .map_err(|err| {
+                    SystemError::RouteApplyFailed(format!(
+                        "peer endpoint bypass route failed for {endpoint}: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError> {
@@ -1542,6 +1590,17 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.apply_peer_endpoint_bypass_routes(peers),
+            RuntimeSystem::Linux(system) => system.apply_peer_endpoint_bypass_routes(peers),
+            RuntimeSystem::Macos(system) => system.apply_peer_endpoint_bypass_routes(peers),
+        }
+    }
+
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_routes(routes),
@@ -1779,11 +1838,14 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         options: ApplyOptions,
         applied_stages: &mut Vec<StageMarker>,
     ) -> Result<(), Phase10Error> {
-        for peer in peers {
+        for peer in &peers {
             self.backend.configure_peer(peer.clone())?;
-            self.peer_paths.insert(peer.node_id, PathMode::Direct);
+            self.peer_paths.insert(peer.node_id.clone(), PathMode::Direct);
             applied_stages.push(StageMarker::PeerApplied);
         }
+
+        self.system.apply_peer_endpoint_bypass_routes(&peers)?;
+        applied_stages.push(StageMarker::EndpointBypassApplied);
 
         self.backend.apply_routes(routes.clone())?;
         applied_stages.push(StageMarker::BackendRoutesApplied);
@@ -1837,6 +1899,9 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 }
                 StageMarker::FirewallApplied => {
                     self.system.rollback_firewall()?;
+                }
+                StageMarker::EndpointBypassApplied => {
+                    self.system.rollback_routes()?;
                 }
                 StageMarker::SystemRoutesApplied => {
                     self.system.rollback_routes()?;
@@ -2811,6 +2876,47 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "fd00::/64".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_endpoint_bypass_route_args_use_ipv4_host_route() {
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "192.168.18.40".parse().expect("valid ipv4"),
+            "enp0s8",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "route".to_string(),
+                "replace".to_string(),
+                "192.168.18.40/32".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_endpoint_bypass_route_args_use_ipv6_host_route() {
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "fd00::10".parse().expect("valid ipv6"),
+            "enp0s8",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-6".to_string(),
+                "route".to_string(),
+                "replace".to_string(),
+                "fd00::10/128".to_string(),
                 "dev".to_string(),
                 "enp0s8".to_string(),
                 "table".to_string(),
