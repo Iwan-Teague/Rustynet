@@ -759,7 +759,9 @@ run_remote_script_with_args \
   "${CLIENT_TARGET}" "${ENFORCE_SCRIPT}" \
   "client" "${CLIENT_NODE_ID}" "${REMOTE_SRC_DIR}" "${SSH_ALLOW_CIDRS}"
 
-log "Applying exit-node routing selection"
+log "Waiting for post-enforcement daemon sockets"
+retry_ssh_command "${EXIT_TARGET}" 20 2 \
+  "test -S /run/rustynet/rustynetd.sock"
 retry_ssh_command "${CLIENT_TARGET}" 20 2 \
   "test -S /run/rustynet/rustynetd.sock"
 retry_ssh_command "${EXIT_TARGET}" 10 2 \
