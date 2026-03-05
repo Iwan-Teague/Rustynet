@@ -19,6 +19,11 @@
 - [ ] Backend conformance and leakage checks passed with non-simulated backend evidence.
 - [ ] Compatibility/support policy published and enforced.
 
+Current status note (2026-03-05):
+- In-tree backend implementations currently include WireGuard and stub backend paths.
+- The “additional non-simulated backend path” item remains open and requires code implementation work (not only artifact assertions).
+- Security risk truth: until this is complete, backend agility remains constrained and substitution readiness is weaker than target policy.
+
 ## Crypto and Lifecycle
 - [ ] Crypto deprecation schedule published.
 - [ ] Insecure compatibility exceptions disabled by default with auto-expiry policy.

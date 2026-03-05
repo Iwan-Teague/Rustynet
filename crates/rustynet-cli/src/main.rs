@@ -820,9 +820,17 @@ fn detect_tampered_log(source_path: &Path, output_dir: &Path) -> Result<bool, St
     let original = fs::read_to_string(&tampered_path).map_err(|err| err.to_string())?;
     let tampered = if let Some((head, tail)) = original.split_once("entry=") {
         format!("{head}entry=999{tail}")
+    } else if let Some((version_line, remainder)) = original.split_once('\n') {
+        if !version_line.starts_with("version=") {
+            fs::remove_file(&tampered_path).ok();
+            return Err("membership log missing version line".to_string());
+        }
+        format!("version=255\n{remainder}")
+    } else if original.starts_with("version=") {
+        "version=255\n".to_string()
     } else {
         fs::remove_file(&tampered_path).ok();
-        return Err("membership log does not contain expected entry markers".to_string());
+        return Err("membership log missing version line".to_string());
     };
     fs::write(&tampered_path, tampered).map_err(|err| err.to_string())?;
     let detected = load_membership_log(&tampered_path).is_err();
@@ -1341,7 +1349,7 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, load_signing_key, parse_command};
+    use super::{detect_tampered_log, execute, load_signing_key, parse_command};
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
@@ -1489,5 +1497,36 @@ mod tests {
         assert!(output.is_err());
         let message = output.expect_err("daemon-unreachable path should fail");
         assert!(message.starts_with("daemon unreachable:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_tampered_log_handles_empty_membership_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-membership-log-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let source_log = std::env::temp_dir().join(format!("{unique}.log"));
+        let output_dir = std::env::temp_dir().join(format!("{unique}.out"));
+
+        std::fs::write(&source_log, "version=1\n").expect("source log should exist");
+        std::fs::set_permissions(&source_log, std::fs::Permissions::from_mode(0o600))
+            .expect("source log permissions should be owner-only");
+        std::fs::create_dir_all(&output_dir).expect("output dir should exist");
+
+        let detected =
+            detect_tampered_log(&source_log, &output_dir).expect("tamper detection should run");
+        assert!(
+            detected,
+            "empty log tampering should be detected fail-closed"
+        );
+
+        let _ = std::fs::remove_file(source_log);
+        let _ = std::fs::remove_dir_all(output_dir);
     }
 }

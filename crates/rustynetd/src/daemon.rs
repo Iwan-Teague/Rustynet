@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
 use crate::key_material::{
     apply_interface_private_key, decrypt_private_key, encrypt_private_key,
-    generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
-    write_runtime_private_key,
+    generate_wireguard_keypair, read_passphrase_file, remove_file_if_present, set_interface_down,
+    write_public_key, write_runtime_private_key,
 };
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
@@ -2596,6 +2596,22 @@ fn validate_private_key_permissions(path: &Path) -> Result<(), DaemonError> {
 }
 
 fn validate_passphrase_permissions(path: &Path) -> Result<(), DaemonError> {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var("RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT")
+            .ok()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            read_passphrase_file(path).map_err(|err| {
+                DaemonError::InvalidConfig(format!(
+                    "wireguard key passphrase source invalid: {err}"
+                ))
+            })?;
+            return Ok(());
+        }
+    }
+
     let allow_root_owner = is_systemd_runtime_credential_path(path);
     let disallowed_mode_mask = passphrase_disallowed_mode_mask(path);
     validate_file_security(

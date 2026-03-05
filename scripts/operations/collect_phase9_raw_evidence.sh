@@ -80,6 +80,8 @@ raw_dir = Path(os.environ["RAW_DIR"])
 conformance_wireguard = os.environ["CONFORMANCE_WIREGUARD"] == "true"
 conformance_backend_api = os.environ["CONFORMANCE_BACKEND_API"] == "true"
 protocol_leakage_detected = os.environ["PROTOCOL_LEAKAGE_DETECTED"] == "true"
+max_source_age_seconds = 31 * 24 * 60 * 60
+now_utc = datetime.now(timezone.utc)
 
 
 def load_json(path: Path):
@@ -115,6 +117,21 @@ def parse_utc(value: str, field: str) -> datetime:
         raise SystemExit(f"invalid UTC timestamp for {field}: {value}") from exc
 
 
+def enforce_measured_mode(payload: dict, label: str):
+    if "evidence_mode" in payload and payload.get("evidence_mode") != "measured":
+        raise SystemExit(
+            f"{label} must be measured evidence when evidence_mode is present; got {payload.get('evidence_mode')!r}"
+        )
+
+
+def enforce_timestamp_freshness(ts: datetime, label: str):
+    age_seconds = (now_utc - ts).total_seconds()
+    if age_seconds < -300:
+        raise SystemExit(f"{label} timestamp is too far in the future")
+    if age_seconds > max_source_age_seconds:
+        raise SystemExit(f"{label} evidence is stale; recollect measured source data")
+
+
 def pick_latest(entries, key):
     return max(entries, key=lambda entry: parse_utc(entry.get(key, ""), key))
 
@@ -130,6 +147,7 @@ def numeric(entry, keys, label):
 compat = load_json(source_dir / "compatibility_policy.json")
 if not isinstance(compat, dict):
     raise SystemExit("compatibility_policy.json must be an object")
+enforce_measured_mode(compat, "compatibility_policy.json")
 
 for required in ("policy_version", "minimum_supported_client", "latest_server", "deprecation_window_days", "insecure_compatibility_mode"):
     if required not in compat:
@@ -138,13 +156,23 @@ for required in ("policy_version", "minimum_supported_client", "latest_server", 
 crypto = load_json(source_dir / "crypto_deprecation_schedule.json")
 if not isinstance(crypto, dict):
     raise SystemExit("crypto_deprecation_schedule.json must be an object")
+enforce_measured_mode(crypto, "crypto_deprecation_schedule.json")
 if not isinstance(crypto.get("entries"), list) or not crypto.get("entries"):
     raise SystemExit("crypto deprecation schedule requires non-empty entries")
 
 slo_entries = load_ndjson(source_dir / "slo_windows.ndjson")
+for index, entry in enumerate(slo_entries):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"slo_windows.ndjson entry {index} must be an object")
+    enforce_measured_mode(entry, f"slo_windows.ndjson entry {index}")
 slo_latest = pick_latest(slo_entries, "window_end_utc")
+enforce_timestamp_freshness(parse_utc(slo_latest.get("window_end_utc", ""), "slo latest window_end_utc"), "latest slo window")
 
 performance_entries = load_ndjson(source_dir / "performance_samples.ndjson")
+for index, entry in enumerate(performance_entries):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"performance_samples.ndjson entry {index} must be an object")
+    enforce_measured_mode(entry, f"performance_samples.ndjson entry {index}")
 performance_entries_sorted = sorted(
     performance_entries,
     key=lambda entry: parse_utc(entry.get("measured_at_utc") or entry.get("timestamp_utc") or "", "performance timestamp"),
@@ -157,6 +185,7 @@ end_time = parse_utc(
     performance_entries_sorted[-1].get("measured_at_utc") or performance_entries_sorted[-1].get("timestamp_utc"),
     "performance end timestamp",
 )
+enforce_timestamp_freshness(end_time, "latest performance sample")
 soak_test_hours = (end_time - start_time).total_seconds() / 3600.0
 
 perf = {
@@ -179,14 +208,25 @@ perf = {
 }
 
 incident_entries = load_ndjson(source_dir / "incident_drills.ndjson")
+for index, entry in enumerate(incident_entries):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"incident_drills.ndjson entry {index} must be an object")
+    enforce_measured_mode(entry, f"incident_drills.ndjson entry {index}")
 incident_latest = pick_latest(incident_entries, "executed_at_utc")
+enforce_timestamp_freshness(parse_utc(incident_latest.get("executed_at_utc", ""), "incident latest executed_at_utc"), "latest incident drill")
 
 dr_entries = load_ndjson(source_dir / "dr_drills.ndjson")
+for index, entry in enumerate(dr_entries):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"dr_drills.ndjson entry {index} must be an object")
+    enforce_measured_mode(entry, f"dr_drills.ndjson entry {index}")
 dr_latest = pick_latest(dr_entries, "executed_at_utc")
+enforce_timestamp_freshness(parse_utc(dr_latest.get("executed_at_utc", ""), "dr latest executed_at_utc"), "latest dr drill")
 
 backend_review = load_json(source_dir / "backend_security_review.json")
 if not isinstance(backend_review, dict):
     raise SystemExit("backend_security_review.json must be an object")
+enforce_measured_mode(backend_review, "backend_security_review.json")
 
 additional_paths = backend_review.get("additional_backend_paths")
 if not isinstance(additional_paths, list) or not additional_paths:

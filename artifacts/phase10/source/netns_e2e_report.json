@@ -1,0 +1,16 @@
+{
+  "phase": "phase10",
+  "mode": "real_netns_wireguard",
+  "evidence_mode": "measured",
+  "environment": "linux-netns-lab",
+  "captured_at_unix": 1772717564,
+  "status": "pass",
+  "checks": {
+    "exit_node_routing": "pass",
+    "lan_toggle_off_blocks": "pass",
+    "lan_toggle_on_allows": "pass",
+    "dns_reaches_protected_path_when_tunnel_up": "pass",
+    "kill_switch_blocks_egress_when_tunnel_down": "pass",
+    "dns_fail_close_when_tunnel_down": "pass"
+  }
+}

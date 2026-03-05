@@ -23,6 +23,9 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo check --workspace --all-targets --all-features
           cargo test --workspace --all-targets --all-features
+      - name: macOS dataplane smoke gates
+        run: |
+          ./scripts/ci/macos_dataplane_smoke.sh
       - name: Security gates
         run: |
           cargo audit --deny warnings

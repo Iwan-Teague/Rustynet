@@ -60,6 +60,48 @@ if not isinstance(platform_results, list) or not platform_results:
 
 required_platforms = {"linux", "macos", "windows"}
 seen = set()
+source_by_platform = {}
+for source in source_artifacts:
+    source_path = Path(source)
+    if not source_path.is_absolute():
+        source_path = root / source
+    with source_path.open("r", encoding="utf-8") as source_fh:
+        source_payload = json.load(source_fh)
+    if not isinstance(source_payload, dict):
+        raise SystemExit(f"platform parity source artifact must be JSON object: {source}")
+    if source_payload.get("evidence_mode") != "measured":
+        raise SystemExit(f"platform parity source artifact must set evidence_mode=measured: {source}")
+    source_platform = source_payload.get("platform")
+    if not isinstance(source_platform, str) or not source_platform.strip():
+        raise SystemExit(f"platform parity source artifact missing platform field: {source}")
+    source_platform = source_platform.strip().lower()
+    if source_platform not in required_platforms:
+        raise SystemExit(f"platform parity source artifact has unsupported platform: {source}")
+    if source_platform in source_by_platform:
+        raise SystemExit(f"duplicate platform parity source artifact for platform: {source_platform}")
+
+    probe_time_unix = source_payload.get("probe_time_unix")
+    if not isinstance(probe_time_unix, int) or probe_time_unix <= 0:
+        raise SystemExit(f"platform parity source artifact requires positive integer probe_time_unix: {source}")
+    if probe_time_unix > now_unix + 300:
+        raise SystemExit(f"platform parity source artifact probe_time_unix is too far in the future: {source}")
+    if now_unix - probe_time_unix > 31 * 24 * 60 * 60:
+        raise SystemExit(f"platform parity source artifact is stale; recollect probe evidence: {source}")
+
+    probe_host = source_payload.get("probe_host")
+    if not isinstance(probe_host, str) or not probe_host.strip():
+        raise SystemExit(f"platform parity source artifact requires non-empty probe_host: {source}")
+
+    probe_sources = source_payload.get("probe_sources")
+    if not isinstance(probe_sources, dict):
+        raise SystemExit(f"platform parity source artifact requires probe_sources object: {source}")
+    for key in ("route", "dns", "firewall", "leak_report"):
+        value = probe_sources.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"platform parity source artifact missing probe source '{key}': {source}")
+
+    source_by_platform[source_platform] = source_payload
+
 for result in platform_results:
     if not isinstance(result, dict):
         raise SystemExit("platform parity report has invalid platform_results entry")
@@ -71,6 +113,10 @@ for result in platform_results:
     if platform_lc not in required_platforms:
         raise SystemExit(f"unexpected platform in parity report: {platform}")
     seen.add(platform_lc)
+    if platform_lc not in source_by_platform:
+        raise SystemExit(f"platform parity report missing source artifact for platform: {platform_lc}")
+
+    source_payload = source_by_platform[platform_lc]
 
     for key in (
         "route_hook_ready",
@@ -82,6 +128,11 @@ for result in platform_results:
         if value is not True:
             raise SystemExit(
                 f"platform parity requirement failed for {platform}: {key} must be true"
+            )
+        source_value = source_payload.get(key)
+        if source_value is not True:
+            raise SystemExit(
+                f"platform parity source requirement failed for {platform}: {key} must be true"
             )
 
 if seen != required_platforms:

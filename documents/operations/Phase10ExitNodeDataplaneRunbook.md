@@ -1,5 +1,10 @@
 # Phase 10 Exit-Node Dataplane Runbook
 
+Status correction (verified 2026-03-05):
+- Legacy `/etc/rustynet/wireguard.*` path assumptions are stale for current Linux runtime.
+- Current Linux hardened runtime uses encrypted key material under `/var/lib/rustynet/keys/` and encrypted systemd credential blob `/etc/rustynet/credentials/wg_key_passphrase.cred`.
+- Security risk truth: relying on legacy plaintext passphrase-file assumptions weakens key-custody posture and can cause unsafe operator workflows.
+
 ## 1) Purpose
 This runbook defines deployment, validation, rollback, and incident procedures for Rustynet Phase 10 Linux dataplane enablement (exit-node full tunnel + LAN-toggle controls + DNS/tunnel fail-close behavior).
 
@@ -8,8 +13,9 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `rustynetd` and `rustynet` binaries built from current workspace.
 - `scripts/ci/phase10_gates.sh` completed and artifacts present in `artifacts/phase10/`.
 - Trust state and signed control data validation path healthy.
-- WireGuard encrypted key present at `/etc/rustynet/wireguard.key.enc` with mode `0600`.
-- WireGuard passphrase file present at `/etc/rustynet/wireguard.passphrase` with mode `0600`.
+- WireGuard encrypted key present at `/var/lib/rustynet/keys/wireguard.key.enc` with mode `0600`.
+- Encrypted passphrase credential blob present at `/etc/rustynet/credentials/wg_key_passphrase.cred` with mode `0600`.
+- Persistent plaintext passphrase file is absent at `/var/lib/rustynet/keys/wireguard.passphrase`.
 - Runtime decrypted key at `/run/rustynet/wireguard.key` with mode `0600` (managed by `rustynetd`).
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
 - Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
@@ -70,6 +76,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/phase10/direct_relay_failover_report.json`
 - `artifacts/phase10/state_transition_audit.log`
+- Limitation note: current failover artifact demonstrates path-mode transition/audit evidence; full relay transport failover integration remains open code work.
 
 ## 8) Security Invariants
 - Default-deny policy remains active.

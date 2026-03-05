@@ -13,6 +13,7 @@ use rustynetd::daemon::{
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
+    store_passphrase_in_os_secure_store,
 };
 use rustynetd::perf;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
@@ -50,11 +51,14 @@ fn run() -> Result<(), String> {
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        return Err("key subcommand is required (supported: init, migrate)".to_string());
+        return Err(
+            "key subcommand is required (supported: init, migrate, store-passphrase)".to_string(),
+        );
     }
     match args[0].as_str() {
         "init" => run_key_init(&args[1..]),
         "migrate" => run_key_migrate(&args[1..]),
+        "store-passphrase" => run_key_store_passphrase(&args[1..]),
         other => Err(format!("unknown key subcommand: {other}")),
     }
 }
@@ -268,6 +272,52 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
     println!(
         "key migrate complete: existing_private_key={} runtime_private_key={} encrypted_private_key={} public_key={}",
         existing_private_key_path, runtime_path, encrypted_path, public_path
+    );
+    Ok(())
+}
+
+fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
+    let mut passphrase_path = String::new();
+    let mut keychain_account: Option<String> = None;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--passphrase-file") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--passphrase-file requires a value".to_string())?;
+                passphrase_path = value.clone();
+                index += 2;
+            }
+            Some("--keychain-account") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--keychain-account requires a value".to_string())?;
+                keychain_account = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => return Err(format!("unknown key store-passphrase argument: {flag}")),
+            None => break,
+        }
+    }
+
+    if passphrase_path.is_empty() {
+        return Err("--passphrase-file is required".to_string());
+    }
+    if !passphrase_path.starts_with('/') {
+        return Err(format!("path must be absolute: {passphrase_path}"));
+    }
+
+    store_passphrase_in_os_secure_store(
+        std::path::Path::new(&passphrase_path),
+        keychain_account.as_deref(),
+    )?;
+
+    println!(
+        "key passphrase store complete: passphrase_file={} keychain_account={}",
+        passphrase_path,
+        keychain_account.as_deref().unwrap_or("<env>")
     );
     Ok(())
 }
@@ -854,6 +904,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
+        "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",

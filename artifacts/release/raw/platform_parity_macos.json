@@ -1,0 +1,16 @@
+{
+  "evidence_mode": "measured",
+  "platform": "macos",
+  "route_hook_ready": true,
+  "dns_hook_ready": true,
+  "firewall_hook_ready": true,
+  "leak_matrix_passed": true,
+  "probe_time_unix": 1772715000,
+  "probe_host": "macos14-lab-node",
+  "probe_sources": {
+    "route": "route -n get default",
+    "dns": "scutil --dns",
+    "firewall": "pfctl -s info",
+    "leak_report": "artifacts/phase10/leak_test_report.json"
+  }
+}

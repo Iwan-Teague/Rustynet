@@ -28,9 +28,14 @@ The wizard handles:
 Host-profile behavior:
 - Linux host: full runtime/dataplane provisioning.
 - macOS host: full client/runtime dataplane provisioning using userspace WireGuard (`wireguard-go`) with privileged-helper mediated system operations.
-- macOS non-admin fallback: when Homebrew cannot be installed (no admin rights), `start.sh` can bootstrap `wg` and `wireguard-go` into `~/.local/rustynet-tools/bin` and pins daemon/helper binary paths to those absolute locations.
+- macOS service lifecycle hardening: daemon and privileged helper are managed through `launchd` (`launchctl bootstrap`/`kickstart`) rather than ad-hoc background processes.
+- macOS dependency hardening: privileged networking tools (`wg`, `wireguard-go`) must be installed with admin privileges in root-owned paths; non-admin local fallback is intentionally blocked.
+- macOS key custody hardening: WireGuard passphrase custody is Keychain-backed (`rustynet.wg_passphrase` service); persistent plaintext passphrase files are rejected by startup preflight.
 - macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
 - macOS PF safety: stale Rustynet PF anchors (`com.apple/rustynet_g*`) are pruned on dataplane generation apply to prevent residual fail-closed anchors after crashes/restarts.
+
+Current implementation support/security matrix:
+- [`documents/operations/PlatformSupportMatrix.md`](./documents/operations/PlatformSupportMatrix.md)
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 
@@ -89,7 +94,7 @@ Important:
 
 Rustynet no longer accepts static/pass-through readiness JSON artifacts.
 
-Before Phase 6/9 gates can pass, generate measured evidence artifacts from real inputs:
+Before Phase 6/9/10 gates can pass, generate measured evidence artifacts from real inputs:
 
 ```bash
 # Phase 6 probe collection + parity evidence
@@ -105,6 +110,10 @@ RUSTYNET_PHASE6_PARITY_ENVIRONMENT=lab \
 # Phase 9 operational evidence
 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase9_artifacts.sh
+
+# Phase 10 operational evidence
+RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
+./scripts/operations/generate_phase10_artifacts.sh
 ```
 
 Raw measured inputs must exist first:
@@ -119,6 +128,12 @@ Raw measured inputs must exist first:
   - `incident_drills.ndjson`
   - `dr_drills.ndjson`
   - `backend_security_review.json`
+- `artifacts/phase10/source/*.json|*.log` phase10 source evidence:
+  - `netns_e2e_report.json`
+  - `leak_test_report.json`
+  - `perf_budget_report.json`
+  - `direct_relay_failover_report.json`
+  - `state_transition_audit.log`
 
 Then run gates:
 
@@ -142,3 +157,6 @@ Generate them from measured evidence sources (fail-closed, no synthetic fallback
 `run_phase1_baseline.sh` will auto-run the collector when env vars are missing.
 If present, the collector can use `artifacts/operations/performance_budget_report.json`
 as measured Phase1 input source.
+The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`
+for first-run CI/bootstrap resolution; refresh this with current measured samples
+for release evidence.

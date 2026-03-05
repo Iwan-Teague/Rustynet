@@ -40,12 +40,13 @@ cargo test -p rustynet-control ga::tests --all-features
 cargo test -p rustynet-backend-wireguard --test conformance --all-features
 cargo test -p rustynet-backend-api --all-targets --all-features
 
-if [[ "${RUSTYNET_PHASE9_COLLECT_RAW:-0}" == "1" ]]; then
+if [[ "${RUSTYNET_PHASE9_COLLECT_RAW:-1}" == "1" ]]; then
   ./scripts/operations/collect_phase9_raw_evidence.sh
 fi
 
-if [[ "${RUSTYNET_PHASE9_GENERATE_ARTIFACTS:-0}" == "1" ]]; then
-  ./scripts/operations/generate_phase9_artifacts.sh
+if [[ "${RUSTYNET_PHASE9_GENERATE_ARTIFACTS:-1}" == "1" ]]; then
+  RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT="${RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT:-ci}" \
+    ./scripts/operations/generate_phase9_artifacts.sh
 fi
 
 ./scripts/ci/check_phase9_readiness.sh

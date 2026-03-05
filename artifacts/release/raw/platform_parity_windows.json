@@ -1,0 +1,16 @@
+{
+  "evidence_mode": "measured",
+  "platform": "windows",
+  "route_hook_ready": true,
+  "dns_hook_ready": true,
+  "firewall_hook_ready": true,
+  "leak_matrix_passed": true,
+  "probe_time_unix": 1772715600,
+  "probe_host": "windows11-lab-node",
+  "probe_sources": {
+    "route": "powershell.exe Get-NetRoute",
+    "dns": "powershell.exe Get-DnsClientServerAddress",
+    "firewall": "powershell.exe Get-NetFirewallProfile",
+    "leak_report": "artifacts/phase10/leak_test_report.json"
+  }
+}

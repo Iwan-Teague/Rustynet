@@ -399,17 +399,16 @@ fn is_valid_key_identifier(value: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
-    set_generic_password(
+    store_macos_generic_password(
         format!("rustynet.{key_id}").as_str(),
         "rustynet",
         key_material,
     )
-    .map_err(|_| CryptoError::OsStoreUnavailable)
 }
 
 #[cfg(target_os = "macos")]
 fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
-    let mut value = get_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
+    let mut value = load_macos_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
 
     if let Ok(text) = std::str::from_utf8(&value) {
@@ -426,6 +425,26 @@ fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
     }
 
     Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+pub fn store_macos_generic_password(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<(), CryptoError> {
+    if service.trim().is_empty() || account.trim().is_empty() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    set_generic_password(service, account, secret).map_err(|_| CryptoError::OsStoreUnavailable)
+}
+
+#[cfg(target_os = "macos")]
+pub fn load_macos_generic_password(service: &str, account: &str) -> Result<Vec<u8>, CryptoError> {
+    if service.trim().is_empty() || account.trim().is_empty() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    get_generic_password(service, account).map_err(|_| CryptoError::OsStoreUnavailable)
 }
 
 #[cfg(target_os = "linux")]

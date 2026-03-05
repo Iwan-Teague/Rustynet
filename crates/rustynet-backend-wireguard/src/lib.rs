@@ -777,7 +777,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
             supports_roaming: true,
             supports_exit_nodes: true,
             supports_lan_routes: true,
-            supports_ipv6: true,
+            supports_ipv6: false,
         }
     }
 
@@ -1318,6 +1318,19 @@ mod tests {
         )
         .expect_err("non-utun interface names must be rejected");
         assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn macos_backend_reports_ipv6_not_supported_until_parity_is_implemented() {
+        let backend = MacosWireguardBackend::new(
+            RecordingRunner::default(),
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should be constructed");
+        assert!(!backend.capabilities().supports_ipv6);
     }
 
     #[test]

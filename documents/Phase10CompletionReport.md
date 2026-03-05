@@ -1,5 +1,10 @@
 # Rustynet Phase 10 Completion Report
 
+Status correction (verified 2026-03-05):
+- This report includes historical completion assertions.
+- Current code discrepancy: direct/relay failover in `Phase10Controller` is path-state signaling (`Direct`/`Relay`) plus audit evidence, not full relay dataplane transport switching.
+- Security risk truth: resilience claims are overstated if this is interpreted as complete transport-level failover.
+
 ## 1) Deliverable-by-Deliverable Completion Summary
 1. Real Linux WireGuard adapter path behind `TunnelBackend` completed.
 - Implemented in `crates/rustynet-backend-wireguard/src/lib.rs` with `LinuxWireguardBackend<R: WireguardCommandRunner>`.
@@ -31,6 +36,7 @@
   - `perf_budget_report.json`
   - `direct_relay_failover_report.json`
   - `state_transition_audit.log`
+- Current limitation note: `direct_relay_failover_report.json` presently demonstrates path-mode transition/audit coverage; full relay transport failover integration in runtime remains pending.
 
 8. Operations runbook update completed.
 - Added `documents/operations/Phase10ExitNodeDataplaneRunbook.md` with deployment, rollback, and incident procedures.
@@ -59,5 +65,6 @@ Outcome:
 - Phase 10 gate chain passed with required artifacts generated and validated.
 - One operational note: `cargo audit` needed elevated execution to acquire advisory database lock under `~/.cargo`.
 
-## 4) Explicit Non-Deferred Statement
-No Phase 10 scope items were deferred.
+## 4) Current Deferment Status (Supersedes Historical Statement)
+- Historical statement "No Phase 10 scope items were deferred" is no longer accurate against current code.
+- Open deferred item requiring code work: full relay dataplane transport failover/failback integration in Phase10 runtime path.

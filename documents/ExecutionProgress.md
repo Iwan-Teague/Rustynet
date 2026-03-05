@@ -1,5 +1,10 @@
 # Rustynet Execution Progress
 
+Status correction (verified 2026-03-05):
+- This file contains historical phase sign-off claims.
+- Current discrepancy requiring code work: policy requires at least one additional non-simulated backend path, but current in-tree implementations are WireGuard plus stub backend.
+- Security risk truth: backend agility/substitution readiness is weaker than earlier completion wording implies.
+
 ## 1) Project Objective
 Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, honoring `Requirements.md` as source of truth and `SecurityMinimumBar.md` as release-blocking.
 
@@ -26,7 +31,7 @@ Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, hono
 - [x] Phase 6 complete and signed off.
 - [x] Phase 7 complete and signed off.
 - [x] Phase 8 complete and signed off.
-- [x] Phase 9 complete and signed off.
+- [ ] Phase 9 complete and signed off (status correction: additional non-simulated backend path remains open).
 
 ## 5) Per-Phase Task Checklists (Derived From Phase Docs + Requirements)
 
@@ -108,7 +113,7 @@ Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, hono
 - [x] Implement compatibility/versioning policy and deprecation lifecycle controls.
 - [x] Implement SLO/error-budget operational release gates and incident drill artifacts.
 - [x] Implement DR/failover validation artifacts against RPO/RTO targets.
-- [x] Implement backend agility validation with at least one additional backend path/stub.
+- [ ] Implement backend agility validation with at least one additional non-simulated backend path (currently open in code).
 - [x] Publish crypto deprecation cadence and PQ transition/hybrid evaluation plan.
 - [x] Validate final launch checklist with engineering/security/operations sign-off.
 
@@ -128,7 +133,7 @@ Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, hono
 ### High Controls
 - [x] API abuse detection/anomaly alerting.
 - [x] Backup/restore validation with integrity checks.
-- [x] Relay failover tested under faults.
+- [x] Relay failover tested under faults (status nuance: full Phase10 relay transport failover integration remains open).
 - [x] Tenant boundary isolation tests.
 - [x] Incident runbooks and drills.
 - [x] Patch SLA tracking/reporting.
@@ -184,7 +189,7 @@ Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, hono
 | 2026-02-27T05:15:00Z | Phase 8 assurance/compliance implementation | `crates/rustynet-crypto/src/lib.rs`, `crates/rustynet-crypto/Cargo.toml`, `scripts/ci/verify_release_attestation.sh`, `scripts/ci/check_dependency_exceptions.sh`, `scripts/ci/phase8_gates.sh`, `documents/operations/*` | `cargo fmt --all`, `cargo test -p rustynet-crypto --all-targets --all-features`, `./scripts/ci/phase8_gates.sh` | Success | Added KMS/HSM-ready signing-provider abstraction + attestation verification tests, dependency exception governance checks, release attestation verification gate, and security/privacy/compliance operations artifacts |
 | 2026-02-27T09:40:00Z | Phase 9 GA policy and readiness artifacts implementation | `crates/rustynet-control/src/lib.rs`, `crates/rustynet-control/src/ga.rs`, `artifacts/operations/*`, `documents/operations/*`, `scripts/ci/check_phase9_readiness.sh`, `scripts/ci/phase9_gates.sh` | `cargo fmt --all`, `rg '^## ' documents/Requirements.md documents/SecurityMinimumBar.md` | Success | Added fail-closed GA readiness model, compatibility/deprecation lifecycle controls, operational evidence artifacts, and Phase 9 CI/readiness checks |
 | 2026-02-27T09:55:00Z | Full Phase 9 gate execution and closure | `crates/rustynet-policy/src/lib.rs`, perf/release artifacts refreshed | `./scripts/ci/phase9_gates.sh` | Success | Resolved `cargo audit` sandbox lock issue via escalated run; fixed unsafe-regex false-positive by renaming test identifiers; Phase 9 gates PASS including audit/deny, boundary checks, and readiness checks |
-| 2026-02-27T09:58:00Z | Final reporting and sign-off documentation | `documents/ExecutionProgress.md`, `documents/FinalImplementationReport.md` | file updates + final trace review | Success | Final compliance/reporting artifacts completed and project marked complete with no deferred phase-scope TODOs |
+| 2026-02-27T09:58:00Z | Final reporting and sign-off documentation | `documents/ExecutionProgress.md`, `documents/FinalImplementationReport.md` | file updates + final trace review | Success | Historical sign-off record (superseded by 2026-03-05 status corrections for open backend-agility code gap) |
 
 ## 9) Blockers and Resolutions
 | Timestamp (UTC) | Blocker | Impact | Resolution | Status |
@@ -194,9 +199,9 @@ Implement Rustynet end-to-end across Phases 1 through 9 in strict sequence, hono
 | 2026-02-27T09:50:00Z | `phase1_gates.sh` unsafe-token regex false-positive on policy-test variable/string names | Phase 9 chain failed at unsafe gate despite no unsafe code usage | Renamed test identifiers (`unsafe_policy`, `unsafe_result`, `rev-unsafe`) to non-triggering names and re-ran full Phase 9 gates | Resolved |
 
 ## 10) Final Completion Ledger
-- [x] All phases completed with evidence.
+- [ ] All phases completed with evidence (status correction: backend agility code requirement remains open).
 - [x] All mandatory gates pass.
-- [x] No unresolved blockers.
+- [ ] No unresolved blockers (status correction: backend agility code requirement remains open).
 - [x] No remaining phase-scope TODO/FIXME/placeholders.
 - [x] Final implementation report created (`documents/FinalImplementationReport.md`).
 - [x] Engineering/security/operations sign-off records attached.

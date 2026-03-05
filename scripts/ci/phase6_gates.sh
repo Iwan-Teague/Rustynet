@@ -30,6 +30,11 @@ if [[ "${RUSTYNET_PHASE6_COLLECT_PARITY:-0}" == "1" ]]; then
   ./scripts/release/collect_platform_parity_bundle.sh
 fi
 
+if [[ "${RUSTYNET_PHASE6_GENERATE_PARITY_REPORT:-1}" == "1" ]]; then
+  RUSTYNET_PHASE6_PARITY_ENVIRONMENT="${RUSTYNET_PHASE6_PARITY_ENVIRONMENT:-ci}" \
+    ./scripts/release/generate_platform_parity_report.sh
+fi
+
 cargo test -p rustynetd platform::tests --all-features
 ./scripts/ci/check_phase6_platform_parity.sh
 

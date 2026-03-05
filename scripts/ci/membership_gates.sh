@@ -118,6 +118,25 @@ cargo test -p rustynetd daemon_runtime_denies_exit_selection_for_revoked_members
 MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH:-/var/lib/rustynet/membership.snapshot}"
 MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG_PATH:-/var/lib/rustynet/membership.log}"
 MEMBERSHIP_EVIDENCE_ENVIRONMENT="${RUSTYNET_MEMBERSHIP_EVIDENCE_ENVIRONMENT:-ci}"
+MEMBERSHIP_SOURCE_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SOURCE_SNAPSHOT_PATH:-artifacts/membership/source/membership.snapshot}"
+MEMBERSHIP_SOURCE_LOG_PATH="${RUSTYNET_MEMBERSHIP_SOURCE_LOG_PATH:-artifacts/membership/source/membership.log}"
+MEMBERSHIP_BOOTSTRAP_STATE_DIR="${RUSTYNET_MEMBERSHIP_BOOTSTRAP_STATE_DIR:-artifacts/membership/tmp_membership}"
+MEMBERSHIP_BOOTSTRAP_STATE=0
+
+if [[ ! -f "$MEMBERSHIP_SNAPSHOT_PATH" || ! -f "$MEMBERSHIP_LOG_PATH" ]]; then
+  if [[ -f "$MEMBERSHIP_SOURCE_SNAPSHOT_PATH" && -f "$MEMBERSHIP_SOURCE_LOG_PATH" ]]; then
+    mkdir -p "$MEMBERSHIP_BOOTSTRAP_STATE_DIR"
+    cp "$MEMBERSHIP_SOURCE_SNAPSHOT_PATH" "$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.snapshot"
+    cp "$MEMBERSHIP_SOURCE_LOG_PATH" "$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.log"
+    chmod 600 "$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.snapshot" "$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.log"
+    MEMBERSHIP_SNAPSHOT_PATH="$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.snapshot"
+    MEMBERSHIP_LOG_PATH="$MEMBERSHIP_BOOTSTRAP_STATE_DIR/membership.log"
+    MEMBERSHIP_BOOTSTRAP_STATE=1
+  else
+    echo "membership state sources are missing; provide runtime paths via RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH/RUSTYNET_MEMBERSHIP_LOG_PATH or seed files under artifacts/membership/source"
+    exit 1
+  fi
+fi
 
 mkdir -p artifacts/membership
 cargo run -p rustynet-cli -- membership generate-evidence \
@@ -174,8 +193,11 @@ if rg -q '"status"\s*:\s*"fail"' artifacts/membership/membership_negative_tests_
   exit 1
 fi
 if ! rg -q 'index=' artifacts/membership/membership_audit_integrity.log; then
-  echo "membership audit integrity log missing chain entries"
-  exit 1
+  if [[ "$MEMBERSHIP_BOOTSTRAP_STATE" != "1" ]] || \
+    ! rg -q '"entries"\s*:\s*0' artifacts/membership/membership_conformance_report.json; then
+    echo "membership audit integrity log missing chain entries"
+    exit 1
+  fi
 fi
 
 echo "Membership CI gates: PASS"

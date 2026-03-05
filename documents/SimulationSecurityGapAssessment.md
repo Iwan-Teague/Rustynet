@@ -3,6 +3,11 @@
 Date: 2026-03-01
 Scope: Repository-wide findings on simulated/fake paths, non-authentic evidence generation, and permissive fallbacks that can mask real security or reliability failures.
 
+Status update (verified 2026-03-05):
+- This file is a point-in-time assessment and includes historical findings that may no longer represent current code.
+- At least one finding (F5) is now remediated in the current tree.
+- Security risk truth: stale findings can cause teams to focus on already-fixed controls while missing current, active risks. Treat this document as historical unless each finding is re-verified.
+
 ## 1) Executive Summary
 Rustynet currently contains multiple simulation and synthetic-evidence paths that can produce passing CI/reports without proving real secure dataplane behavior. This is a direct conflict with the project’s stated security-first and fail-closed principles.
 
@@ -85,39 +90,45 @@ Why this is an issue:
 Guideline conflict:
 - Conflicts with Requirements §12 testing/validation rigor and SecurityMinimumBar §5 performance bar.
 
-### F4 - High: Custom peer-map signing construction in control plane
-Evidence:
-- Peer-map signing uses ad hoc `SHA256(secret || payload)` construction and equality checks.
+### F4 - High (Mostly Superseded 2026-03-05): Custom peer-map signing construction in control plane
+Historical evidence (2026-03-01):
+- Peer-map signing used ad hoc `SHA256(secret || payload)` style construction.
 
-Key references:
-- `crates/rustynet-control/src/lib.rs:1449`
-- `crates/rustynet-control/src/lib.rs:1474`
-- `crates/rustynet-control/src/lib.rs:1665`
+Current status (verified 2026-03-05):
+- Control-plane signed payloads now use Ed25519 signing and verification paths.
+- Relevant references:
+  - `crates/rustynet-control/src/lib.rs:1952`
+  - `crates/rustynet-control/src/lib.rs:1953`
+  - `crates/rustynet-control/src/lib.rs:1966`
+  - `crates/rustynet-control/src/lib.rs:1976`
 
-Why this is an issue:
-- This is custom cryptographic construction rather than standard signature/HMAC API usage.
-- Risk of subtle security flaws and non-interoperable trust semantics.
+Residual review note:
+- Signing seed derivation remains domain-separated SHA-256-based key material derivation (`derive_signing_seed`), which should continue to receive explicit cryptographic design review.
+- Reference:
+  - `crates/rustynet-control/src/lib.rs:2005`
 
-Guideline conflict:
-- Direct conflict with Requirements §5 and SecurityMinimumBar §3.1 ("no custom cryptography/protocol design in production paths").
+Security risk truth:
+- The original "custom payload signing" finding is no longer accurate as stated.
+- Residual risk is narrowed to key-derivation design scrutiny, not signature primitive misuse.
 
-### F5 - High: Runtime supports in-memory backend mode in production entrypoints
-Evidence:
-- CLI/setup and daemon accept `in-memory` backend mode.
-- In-memory backend does not execute real system dataplane operations.
+### F5 - High (Superseded 2026-03-05): Runtime supports in-memory backend mode in production entrypoints
+Historical evidence (2026-03-01):
+- CLI/setup and daemon accepted `in-memory` backend mode.
+- In-memory backend did not execute real system dataplane operations.
 
-Key references:
-- `start.sh:654`
-- `crates/rustynetd/src/main.rs:354`
-- `crates/rustynetd/src/daemon.rs:368`
-- `crates/rustynet-backend-wireguard/src/lib.rs:50`
+Current status (verified 2026-03-05):
+- CLI backend parsing now accepts only `linux-wireguard` and `macos-wireguard`.
+- `InMemory` backend is rejected in non-test builds.
 
-Why this is an issue:
-- Production operators can misconfigure into non-real dataplane mode.
-- Can cause silent mismatch between expected security behavior and actual enforcement.
+Current references:
+- `crates/rustynetd/src/main.rs:399`
+- `crates/rustynetd/src/main.rs:401`
+- `crates/rustynetd/src/daemon.rs:526`
+- `crates/rustynetd/src/daemon.rs:529`
 
-Guideline conflict:
-- Conflicts with security-first defaults and real validation intent in Requirements §4/§5.
+Security risk truth:
+- This specific production-path risk is currently remediated.
+- Residual risk remains if future changes reintroduce non-production backend options in runtime entrypoints.
 
 ### F6 - High: Setup wizard offers direct manual peer/route programming path
 Evidence:
@@ -226,4 +237,3 @@ Remediation is complete only when:
 - Custom cryptographic constructions are removed from production paths.
 - Production defaults are secure/fail-closed and non-simulated.
 - Security controls have explicit enforcement and verification coverage.
-

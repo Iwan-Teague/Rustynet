@@ -1,7 +1,12 @@
 # Rustynet Phase 10 Execution Progress
 
+Status correction (verified 2026-03-05):
+- This progress log contains historical completion claims.
+- Current code discrepancy: direct/relay failover in `Phase10Controller` is currently path-state recording (`Direct`/`Relay`) and audit behavior, not full relay dataplane transport switching. This needs further code implementation for full parity with Phase 10 wording.
+- Security risk truth: this can overstate resilience claims if interpreted as complete relay transport failover under real network conditions.
+
 ## 1) Objective and Scope Lock
-Implement Phase 10 end-to-end exactly as defined in [phase10.md](./phase10.md), with no deferred scope and no unresolved phase-scope TODO/FIXME/placeholders.
+Historical objective at implementation time: implement Phase 10 end-to-end exactly as defined in [phase10.md](./phase10.md), with no deferred scope and no unresolved phase-scope TODO/FIXME/placeholders.
 
 Scope lock:
 - In scope: real Linux WireGuard backend execution behind `TunnelBackend`, persistent `rustynetd` + authenticated local IPC, route/rule/firewall/NAT and DNS fail-closed controls, exit-node full-tunnel + LAN-toggle enforcement, direct/relay failover behavior, Linux-focused E2E evidence pipeline, and Phase 10 gate automation.
@@ -48,7 +53,7 @@ Scope lock:
 ### High
 - [x] API/IPC abuse detection signals for repeated failed mutation attempts.
 - [x] Backup/restore/state-integrity behavior validated for daemon state.
-- [x] Direct/relay fallback/failback behavior validated.
+- [ ] Direct/relay fallback/failback behavior validated end-to-end in real dataplane transport path (currently partial: path-state recording and audit are implemented).
 - [x] Incident/runbook updates completed for Phase 10 operations.
 
 ### Performance
@@ -81,7 +86,7 @@ Scope lock:
 
 ### E) E2E Harness and Operationalization
 - [x] Added Linux-focused evidence harness (`--emit-phase10-evidence`).
-- [x] Added fail-close leak tests and direct/relay failover/failback validation.
+- [ ] Added fail-close leak tests and direct/relay failover/failback validation (currently partial for relay transport integration).
 - [x] Added Phase 10 runbook (`documents/operations/Phase10ExitNodeDataplaneRunbook.md`).
 - [x] Emitted mandatory artifacts under `artifacts/phase10/`.
 
@@ -111,7 +116,7 @@ Scope lock:
 | 2026-02-27T18:20:00Z | `cargo audit` advisory-db lock failed in sandboxed `~/.cargo` | Security gate blocked | Re-ran Phase 10 gates with escalated permissions | Resolved |
 
 ## 10) Final Completion Ledger
-- [x] All Phase 10 workstream tasks completed.
+- [ ] All Phase 10 workstream tasks completed (status correction: full relay transport failover/failback integration remains open code work).
 - [x] All mandatory gates passed (`fmt/clippy/check/test/audit/deny/phase9/phase10`).
 - [x] Required Phase 10 artifacts exist and validate:
   - [x] `artifacts/phase10/netns_e2e_report.json`
@@ -119,6 +124,6 @@ Scope lock:
   - [x] `artifacts/phase10/perf_budget_report.json`
   - [x] `artifacts/phase10/direct_relay_failover_report.json`
   - [x] `artifacts/phase10/state_transition_audit.log`
-- [x] No unresolved blockers remain.
+- [ ] No unresolved blockers remain (status correction: relay transport failover depth gap remains open).
 - [x] No unresolved Phase 10 TODO/FIXME/placeholders remain.
-- [x] `documents/Phase10CompletionReport.md` completed with explicit non-deferred statement.
+- [x] `documents/Phase10CompletionReport.md` updated with explicit current deferment status.

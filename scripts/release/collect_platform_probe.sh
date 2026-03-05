@@ -170,6 +170,7 @@ import sys
 
 out = Path(sys.argv[1])
 payload = {
+    "evidence_mode": "measured",
     "platform": os.environ["PLATFORM"],
     "route_hook_ready": os.environ["ROUTE_HOOK_READY"] == "true",
     "dns_hook_ready": os.environ["DNS_HOOK_READY"] == "true",

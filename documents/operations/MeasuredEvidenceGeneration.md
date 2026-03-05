@@ -19,6 +19,10 @@ Supported measured sources (checked in order unless overridden):
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/operations/raw/performance_budget_report.json`
 
+Repository bootstrap source:
+- `artifacts/perf/phase1/source/performance_samples.ndjson` is populated so fresh workspaces do not fail immediately on missing measured source resolution.
+- Treat this as seed evidence and replace/refresh it with your current environment measurements before release sign-off.
+
 Override source explicitly:
 ```bash
 RUSTYNET_PHASE1_PERF_SAMPLES_PATH=/absolute/path/to/performance_samples.ndjson \
@@ -58,6 +62,10 @@ Create these files before generation:
 - `artifacts/release/raw/platform_parity_linux.json`
 - `artifacts/release/raw/platform_parity_macos.json`
 - `artifacts/release/raw/platform_parity_windows.json`
+
+Repository bootstrap note:
+- The repo seeds `artifacts/release/raw/platform_parity_{linux,macos,windows}.json` so Phase 6 parity report generation can run on fresh workspaces.
+- Keep these as measured probe records and refresh them from current host probes/inbox evidence before release sign-off.
 
 Each raw file must be a JSON object with boolean fields:
 - `route_hook_ready`
@@ -153,14 +161,73 @@ Generated artifacts:
 - `artifacts/operations/backend_agility_report.json`
 - `artifacts/operations/crypto_deprecation_schedule.json`
 
+## Phase 10: Dataplane Readiness Reports
+
+Generate measured phase10 artifacts from measured source evidence:
+```bash
+RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
+./scripts/operations/generate_phase10_artifacts.sh
+```
+
+Required source files:
+- `artifacts/phase10/source/netns_e2e_report.json`
+- `artifacts/phase10/source/leak_test_report.json`
+- `artifacts/phase10/source/perf_budget_report.json`
+- `artifacts/phase10/source/direct_relay_failover_report.json`
+- `artifacts/phase10/source/state_transition_audit.log`
+
+Source evidence requirements:
+- each JSON source must set `evidence_mode=measured`
+- each JSON source must include positive integer `captured_at_unix`
+- source timestamps must be fresh (default max age: 31 days)
+- netns/leak/direct reports must have `status=pass`
+- perf report must have `soak_status=pass` and no failing metric entries
+- state transition log must include `generation=` entries
+
+Generated artifacts:
+- `artifacts/phase10/netns_e2e_report.json`
+- `artifacts/phase10/leak_test_report.json`
+- `artifacts/phase10/perf_budget_report.json`
+- `artifacts/phase10/direct_relay_failover_report.json`
+- `artifacts/phase10/state_transition_audit.log`
+
+## Membership: Governance Evidence Reports
+
+Generate membership measured evidence from runtime membership snapshot/log:
+```bash
+cargo run -p rustynet-cli -- membership generate-evidence \
+  --snapshot /var/lib/rustynet/membership.snapshot \
+  --log /var/lib/rustynet/membership.log \
+  --output-dir artifacts/membership \
+  --environment prod-lab
+```
+
+Bootstrap behavior in CI/dev workspaces:
+- when `/var/lib/rustynet/membership.snapshot` and `/var/lib/rustynet/membership.log` are absent, `membership_gates.sh` uses seed files under `artifacts/membership/source/`.
+- seed files are copied into `artifacts/membership/tmp_membership/` with mode `0600` before evidence generation.
+- runtime paths remain preferred and unchanged on Debian hosts where `/var/lib/rustynet/*` exists.
+
+Bootstrap source files:
+- `artifacts/membership/source/membership.snapshot`
+- `artifacts/membership/source/membership.log`
+
+Generated artifacts:
+- `artifacts/membership/membership_conformance_report.json`
+- `artifacts/membership/membership_negative_tests_report.json`
+- `artifacts/membership/membership_recovery_report.json`
+- `artifacts/membership/membership_audit_integrity.log`
+
 ## CI validation
 ```bash
 ./scripts/ci/check_phase6_platform_parity.sh
 ./scripts/ci/check_phase9_readiness.sh
+./scripts/ci/check_phase10_readiness.sh
 ```
 
 Optional CI automation flags:
 ```bash
 RUSTYNET_PHASE6_COLLECT_PARITY=1 ./scripts/ci/phase6_gates.sh
 RUSTYNET_PHASE9_COLLECT_RAW=1 RUSTYNET_PHASE9_GENERATE_ARTIFACTS=1 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=ci ./scripts/ci/phase9_gates.sh
+RUSTYNET_PHASE10_GENERATE_ARTIFACTS=1 RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=ci ./scripts/ci/phase10_gates.sh
+./scripts/ci/membership_gates.sh
 ```

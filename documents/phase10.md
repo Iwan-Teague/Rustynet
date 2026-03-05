@@ -5,6 +5,8 @@
 - [Requirements.md](./Requirements.md) remains normative source of truth.
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) remains release-blocking.
 - If conflict exists, the stricter security interpretation applies and lower-precedence docs must be updated.
+- Status note (2026-03-05): this document defines **Phase 10 Linux scope**. Current repository behavior now includes additional macOS dataplane hardening and CI coverage beyond Phase 10 scope. For current platform truth, see [operations/PlatformSupportMatrix.md](./operations/PlatformSupportMatrix.md) and [operations/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md).
+- Status discrepancy (2026-03-05): direct/relay failover in current `Phase10Controller` is path-state signaling and audit coverage; full relay dataplane transport switching is not yet integrated in this runtime path and needs code work.
 
 ## 1) Phase 10 Objective
 Deliver real Linux dataplane execution so one enrolled device can act as an authorized exit node and securely route another enrolled device's traffic through encrypted transport, with mandatory fail-closed behavior for traffic and DNS.

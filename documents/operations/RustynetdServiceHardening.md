@@ -1,5 +1,10 @@
 # Rustynetd Systemd Hardening Profile
 
+Status correction (verified 2026-03-05):
+- Legacy requirement text that expects a persistent plaintext passphrase file is stale for current Linux hardened runtime.
+- Runtime passphrase custody is credential-only via encrypted systemd credential blob (`LoadCredentialEncrypted=wg_key_passphrase:/etc/rustynet/credentials/wg_key_passphrase.cred`).
+- Security risk truth: documenting plaintext passphrase files as required can lead to weaker key handling than current code policy.
+
 ## Purpose
 Define a production-safe service profile for `rustynetd` with least privilege, fail-closed behavior, and predictable restart semantics.
 
@@ -65,12 +70,13 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 
 ## Required Runtime Files
 - `/var/lib/rustynet/keys/wireguard.key.enc` (`0600`, encrypted at rest)
-- `/var/lib/rustynet/keys/wireguard.passphrase` (`0600`)
+- `/etc/rustynet/credentials/wg_key_passphrase.cred` (`0600`, encrypted credential blob for passphrase custody)
 - `/run/rustynet/wireguard.key` (`0600`, runtime-decrypted key material)
 - `/var/lib/rustynet/keys/wireguard.pub` (`0644`)
 - `/var/lib/rustynet/rustynetd.trust` (`0640`, integrity-checked trust evidence)
 - `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
 - `/etc/rustynet/trust-evidence.key` (`0600`, signer key; required only when trust auto-refresh is enabled)
+- `/var/lib/rustynet/keys/wireguard.passphrase` should be absent in hardened Linux runtime (persistent plaintext passphrase files are rejected by preflight).
 
 ## Verification
 1. `sudo systemctl daemon-reload`

@@ -16,12 +16,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use rustynet_crypto::{
     KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
 };
+#[cfg(target_os = "macos")]
+use rustynet_crypto::{load_macos_generic_password, store_macos_generic_password};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 const PASSPHRASE_CREDENTIAL_PATH_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH";
 const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
 const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
+#[cfg(target_os = "macos")]
+const PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT";
+#[cfg(target_os = "macos")]
+const MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "rustynet.wg_passphrase";
+#[cfg(target_os = "macos")]
+const ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV: &str =
+    "RUSTYNET_ALLOW_MACOS_PASSPHRASE_FILE_FALLBACK";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 #[cfg(not(target_os = "macos"))]
@@ -35,6 +44,10 @@ const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(account) = resolve_macos_keychain_account_from_env()? {
+        return read_passphrase_from_macos_keychain(&account);
+    }
     let source_path = resolve_passphrase_source(path)?;
     read_passphrase_from_source(&source_path)
 }
@@ -43,12 +56,49 @@ pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, S
     read_passphrase_from_source(path)
 }
 
+pub fn store_passphrase_in_os_secure_store(
+    passphrase_path: &Path,
+    keychain_account: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let account = match keychain_account {
+            Some(value) => normalize_macos_keychain_account(value)?,
+            None => resolve_macos_keychain_account_from_env()?.ok_or_else(|| {
+                format!(
+                    "missing {}; configure a macOS keychain account for passphrase custody",
+                    PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+                )
+            })?,
+        };
+        let passphrase = read_passphrase_file_explicit(passphrase_path)?;
+        store_macos_generic_password(
+            MACOS_PASSPHRASE_KEYCHAIN_SERVICE,
+            account.as_str(),
+            passphrase.as_bytes(),
+        )
+        .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (passphrase_path, keychain_account);
+        Err("passphrase secure-store provisioning is only supported on macOS".to_string())
+    }
+}
+
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
     validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
 
-    let mut raw =
-        fs::read(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    let raw = fs::read(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    parse_passphrase_bytes(raw, "passphrase file")
+}
+
+fn parse_passphrase_bytes(
+    mut raw: Vec<u8>,
+    source_label: &str,
+) -> Result<Zeroizing<String>, String> {
     if raw.len() > MAX_PASSPHRASE_BYTES {
         raw.zeroize();
         return Err("passphrase exceeds maximum allowed size".to_string());
@@ -57,7 +107,7 @@ fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, 
         Ok(value) => value,
         Err(_) => {
             raw.zeroize();
-            return Err("passphrase file contains non-utf8 bytes".to_string());
+            return Err(format!("{source_label} contains non-utf8 bytes"));
         }
     };
     let trimmed = decoded.trim();
@@ -68,6 +118,73 @@ fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, 
     let value = Zeroizing::new(trimmed.to_string());
     raw.zeroize();
     Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+fn read_passphrase_from_macos_keychain(account: &str) -> Result<Zeroizing<String>, String> {
+    let value =
+        load_macos_generic_password(MACOS_PASSPHRASE_KEYCHAIN_SERVICE, account).map_err(|err| {
+            format!(
+                "load macOS keychain passphrase failed for service '{}' account '{}': {err}",
+                MACOS_PASSPHRASE_KEYCHAIN_SERVICE, account
+            )
+        })?;
+    parse_passphrase_bytes(value, "macOS keychain passphrase")
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_keychain_account_from_env() -> Result<Option<String>, String> {
+    let account = match std::env::var(PASSPHRASE_KEYCHAIN_ACCOUNT_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "{} must be valid utf-8",
+                PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+            ));
+        }
+    };
+    Ok(Some(normalize_macos_keychain_account(&account)?))
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
+    let account = raw.trim();
+    if account.is_empty() {
+        return Err(format!(
+            "{} must not be empty",
+            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+        ));
+    }
+    if account.len() > 128 {
+        return Err(format!(
+            "{} exceeds max length (128)",
+            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+        ));
+    }
+    if !account
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        return Err(format!(
+            "{} contains invalid characters; allowed: [A-Za-z0-9._-]",
+            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+        ));
+    }
+    Ok(account.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_passphrase_fallback_allowed() -> bool {
+    std::env::var(ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV)
+        .ok()
+        .map(|value| {
+            let normalized = value.trim();
+            normalized == "1"
+                || normalized.eq_ignore_ascii_case("true")
+                || normalized.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
 }
 
 pub fn decrypt_private_key(
@@ -201,6 +318,30 @@ fn resolve_passphrase_source_from_env(
     explicit_credential_path: Option<&str>,
     credentials_directory: Option<&str>,
 ) -> Result<PathBuf, String> {
+    resolve_passphrase_source_from_env_with_policy(
+        configured_path,
+        explicit_credential_path,
+        credentials_directory,
+        true,
+    )
+}
+
+fn resolve_passphrase_source_from_env_with_policy(
+    configured_path: &Path,
+    explicit_credential_path: Option<&str>,
+    credentials_directory: Option<&str>,
+    enforce_macos_file_fallback_policy: bool,
+) -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if enforce_macos_file_fallback_policy && !macos_file_passphrase_fallback_allowed() {
+            return Err(format!(
+                "macOS passphrase file fallback is disabled; set {} for keychain-backed custody (or set {}=1 for time-bounded emergency fallback)",
+                PASSPHRASE_KEYCHAIN_ACCOUNT_ENV, ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV
+            ));
+        }
+    }
+
     if let Some(explicit) = explicit_credential_path {
         let explicit_path = PathBuf::from(explicit);
         if explicit_path.exists() {
@@ -753,7 +894,7 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 mod tests {
     use super::{
         DEFAULT_PASSPHRASE_CREDENTIAL_NAME, remove_file_if_present,
-        resolve_passphrase_source_from_env, validate_binary_path,
+        resolve_passphrase_source_from_env_with_policy, validate_binary_path,
     };
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
@@ -774,10 +915,11 @@ mod tests {
         std::fs::write(&configured, "configured").expect("configured path should be writable");
         std::fs::write(&explicit, "explicit").expect("explicit path should be writable");
 
-        let resolved = resolve_passphrase_source_from_env(
+        let resolved = resolve_passphrase_source_from_env_with_policy(
             &configured,
             Some(&explicit.to_string_lossy()),
             None,
+            false,
         )
         .expect("explicit credential path should resolve");
         assert_eq!(resolved, explicit);
@@ -794,10 +936,11 @@ mod tests {
         std::fs::write(&configured, "configured").expect("configured path should be writable");
         std::fs::write(&credential, "credential").expect("credential path should be writable");
 
-        let resolved = resolve_passphrase_source_from_env(
+        let resolved = resolve_passphrase_source_from_env_with_policy(
             &configured,
             None,
             Some(&credentials_dir.to_string_lossy()),
+            false,
         )
         .expect("credential directory path should resolve");
         assert_eq!(resolved, credential);
@@ -810,12 +953,12 @@ mod tests {
         let configured = test_dir.join("configured.passphrase");
         std::fs::write(&configured, "configured").expect("configured path should be writable");
 
-        let err = resolve_passphrase_source_from_env(&configured, None, None)
+        let err = resolve_passphrase_source_from_env_with_policy(&configured, None, None, false)
             .expect_err("direct configured path fallback must be rejected");
         assert!(err.contains("disallowed"));
 
         let _ = std::fs::remove_file(&configured);
-        let err = resolve_passphrase_source_from_env(&configured, None, None)
+        let err = resolve_passphrase_source_from_env_with_policy(&configured, None, None, false)
             .expect_err("missing credential source must be rejected");
         assert!(err.contains("not configured"));
 

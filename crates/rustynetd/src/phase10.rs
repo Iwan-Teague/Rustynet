@@ -1100,6 +1100,7 @@ pub struct MacosCommandSystem {
     anchor_name: Option<String>,
     allow_egress_interface: bool,
     ipv6_blocked: bool,
+    dns_protected: bool,
 }
 
 impl MacosCommandSystem {
@@ -1132,6 +1133,7 @@ impl MacosCommandSystem {
             anchor_name: None,
             allow_egress_interface: false,
             ipv6_blocked: false,
+            dns_protected: false,
         })
     }
 
@@ -1218,6 +1220,18 @@ impl MacosCommandSystem {
         rules.push_str("set block-policy drop\n");
         if !strict_fail_closed {
             rules.push_str("pass out quick inet on lo0 all keep state\n");
+            if self.dns_protected {
+                rules.push_str(&format!(
+                    "pass out quick inet proto udp on {} to any port 53 keep state\n",
+                    self.interface_name
+                ));
+                rules.push_str(&format!(
+                    "pass out quick inet proto tcp on {} to any port 53 keep state\n",
+                    self.interface_name
+                ));
+                rules.push_str("block drop out quick inet proto udp to any port 53\n");
+                rules.push_str("block drop out quick inet proto tcp to any port 53\n");
+            }
             rules.push_str(&format!(
                 "pass out quick inet on {} all keep state\n",
                 self.interface_name
@@ -1243,6 +1257,35 @@ impl MacosCommandSystem {
         }
         rules.push_str("block drop out quick all\n");
         Ok(rules)
+    }
+
+    fn ruleset_contains_dns_rule(
+        rules: &str,
+        action_token: &str,
+        proto: &str,
+        interface: Option<&str>,
+    ) -> bool {
+        let action = action_token.to_ascii_lowercase();
+        let proto_token = format!("proto {proto}");
+        let interface_token = interface.map(|value| format!("on {}", value.to_ascii_lowercase()));
+        rules.lines().any(|line| {
+            let normalized = line.trim().to_ascii_lowercase();
+            if !normalized.contains(&action) {
+                return false;
+            }
+            if !normalized.contains("inet") {
+                return false;
+            }
+            if !normalized.contains(&proto_token) {
+                return false;
+            }
+            if let Some(token) = interface_token.as_ref() {
+                if !normalized.contains(token) {
+                    return false;
+                }
+            }
+            normalized.contains("port 53") || normalized.contains("port = domain")
+        })
     }
 
     fn apply_pf_rules(&mut self, strict_fail_closed: bool) -> Result<(), SystemError> {
@@ -1377,11 +1420,18 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        self.dns_protected = true;
+        if let Err(err) = self.apply_pf_rules(false) {
+            self.dns_protected = false;
+            return Err(SystemError::DnsApplyFailed(err.to_string()));
+        }
         Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
-        Ok(())
+        self.dns_protected = false;
+        self.apply_pf_rules(false)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
@@ -1414,6 +1464,40 @@ impl DataplaneSystem for MacosCommandSystem {
             return Err(SystemError::KillSwitchAssertionFailed(
                 "pf killswitch rule missing".to_string(),
             ));
+        }
+        if self.dns_protected {
+            if !Self::ruleset_contains_dns_rule(
+                &output.stdout,
+                "pass out quick",
+                "udp",
+                Some(self.interface_name.as_str()),
+            ) {
+                return Err(SystemError::KillSwitchAssertionFailed(
+                    "pf dns udp allow rule missing".to_string(),
+                ));
+            }
+            if !Self::ruleset_contains_dns_rule(
+                &output.stdout,
+                "pass out quick",
+                "tcp",
+                Some(self.interface_name.as_str()),
+            ) {
+                return Err(SystemError::KillSwitchAssertionFailed(
+                    "pf dns tcp allow rule missing".to_string(),
+                ));
+            }
+            if !Self::ruleset_contains_dns_rule(&output.stdout, "block drop out quick", "udp", None)
+            {
+                return Err(SystemError::KillSwitchAssertionFailed(
+                    "pf dns udp block rule missing".to_string(),
+                ));
+            }
+            if !Self::ruleset_contains_dns_rule(&output.stdout, "block drop out quick", "tcp", None)
+            {
+                return Err(SystemError::KillSwitchAssertionFailed(
+                    "pf dns tcp block rule missing".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -2782,5 +2866,50 @@ mod tests {
                 "com.apple/rustynet_g77".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn macos_render_pf_rules_enforces_dns_fail_closed_when_enabled() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = true;
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+        assert!(rules.contains("pass out quick inet proto udp on utun9 to any port 53 keep state"));
+        assert!(rules.contains("pass out quick inet proto tcp on utun9 to any port 53 keep state"));
+        assert!(rules.contains("block drop out quick inet proto udp to any port 53"));
+        assert!(rules.contains("block drop out quick inet proto tcp to any port 53"));
+    }
+
+    #[test]
+    fn macos_render_pf_rules_omits_dns_fail_closed_rules_when_disabled() {
+        let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+        assert!(!rules.contains("proto udp on utun9 to any port 53"));
+        assert!(!rules.contains("proto tcp on utun9 to any port 53"));
+        assert!(!rules.contains("block drop out quick inet proto udp to any port 53"));
+        assert!(!rules.contains("block drop out quick inet proto tcp to any port 53"));
+    }
+
+    #[test]
+    fn macos_dns_rule_parser_accepts_port_alias_output() {
+        let rules = "pass out quick inet proto udp on utun9 to any port = domain keep state\n\
+                     block drop out quick inet proto udp to any port = domain\n";
+        assert!(MacosCommandSystem::ruleset_contains_dns_rule(
+            rules,
+            "pass out quick",
+            "udp",
+            Some("utun9"),
+        ));
+        assert!(MacosCommandSystem::ruleset_contains_dns_rule(
+            rules,
+            "block drop out quick",
+            "udp",
+            None,
+        ));
     }
 }

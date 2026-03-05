@@ -24,6 +24,7 @@ WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
 WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=""
 WG_PUBLIC_KEY_PATH="/var/lib/rustynet/keys/wireguard.pub"
 EGRESS_INTERFACE=""
 MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
@@ -60,14 +61,15 @@ HOST_PROFILE="unknown"
 MACOS_STATE_BASE="${HOME}/Library/Application Support/rustynet"
 MACOS_RUNTIME_BASE="${HOME}/Library/Caches/rustynet"
 MACOS_LOG_BASE="${HOME}/Library/Logs/rustynet"
-MACOS_DAEMON_PID_PATH="${MACOS_RUNTIME_BASE}/rustynetd.pid"
-MACOS_HELPER_PID_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.pid"
 MACOS_DAEMON_LOG_PATH="${MACOS_LOG_BASE}/rustynetd.log"
 MACOS_HELPER_LOG_PATH="${MACOS_LOG_BASE}/rustynetd-privileged.log"
 MACOS_LOCAL_TOOLS_BASE="${HOME}/.local/rustynet-tools"
 MACOS_LOCAL_TOOLS_BIN="${MACOS_LOCAL_TOOLS_BASE}/bin"
-MACOS_LOCAL_GO_VERSION="1.23.1"
-MACOS_WIREGUARD_TOOLS_VERSION="1.0.20210914"
+MACOS_LAUNCHD_DAEMON_LABEL="com.rustynet.rustynetd"
+MACOS_LAUNCHD_HELPER_LABEL="com.rustynet.rustynetd-privileged"
+MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="rustynet.wg_passphrase"
+MACOS_LAUNCHD_DAEMON_PLIST_PATH="${HOME}/Library/LaunchAgents/${MACOS_LAUNCHD_DAEMON_LABEL}.plist"
+MACOS_LAUNCHD_HELPER_PLIST_PATH="/Library/LaunchDaemons/${MACOS_LAUNCHD_HELPER_LABEL}.plist"
 export PATH="/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/sbin:/sbin:${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
@@ -124,6 +126,7 @@ apply_host_profile_defaults() {
     TRUST_SIGNER_KEY_PATH="${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
     PRIVILEGED_HELPER_SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
     MANUAL_PEER_AUDIT_LOG="${MACOS_LOG_BASE}/manual-peer-override.log"
+    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
     MANUAL_PEER_OVERRIDE="0"
     return
   fi
@@ -153,6 +156,40 @@ coerce_macos_path_var() {
     print_warn "Path '${var_name}' points to Linux runtime storage on macOS; resetting to '${fallback}'."
     printf -v "${var_name}" '%s' "${fallback}"
   fi
+}
+
+sanitize_macos_keychain_account() {
+  local value="$1"
+  value="${value//[^A-Za-z0-9._-]/-}"
+  value="${value#-}"
+  value="${value%-}"
+  if [[ -z "${value}" ]]; then
+    value="rustynet-passphrase"
+  fi
+  printf '%s' "${value}"
+}
+
+ensure_macos_keychain_passphrase_account() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
+  else
+    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}")"
+  fi
+}
+
+macos_keychain_passphrase_exists() {
+  if ! is_macos_host; then
+    return 1
+  fi
+  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+    return 1
+  fi
+  security find-generic-password \
+    -s "${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+    -a "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" >/dev/null 2>&1
 }
 
 enforce_host_storage_policy() {
@@ -188,6 +225,7 @@ enforce_host_storage_policy() {
   coerce_macos_path_var MEMBERSHIP_OWNER_SIGNING_KEY_PATH "${MACOS_STATE_BASE}/compat/membership/membership.owner.key"
   coerce_macos_path_var TRUST_SIGNER_KEY_PATH "${MACOS_STATE_BASE}/compat/trust/trust-evidence.key"
   coerce_macos_path_var MANUAL_PEER_AUDIT_LOG "${MACOS_LOG_BASE}/manual-peer-override.log"
+  ensure_macos_keychain_passphrase_account
 
   if [[ ! "${WG_INTERFACE}" =~ ^utun[0-9]+$ ]]; then
     print_warn "WG_INTERFACE '${WG_INTERFACE}' is not valid on macOS; resetting to 'utun9'."
@@ -267,7 +305,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -452,27 +490,6 @@ run_root() {
   fi
 }
 
-run_root_background() {
-  if [[ "${EUID}" -eq 0 ]]; then
-    "$@" &
-    return 0
-  fi
-
-  if [[ -t 0 && -t 1 ]]; then
-    sudo -b "$@"
-    return
-  fi
-
-  if sudo -n true >/dev/null 2>&1; then
-    sudo -n -b "$@"
-    return
-  fi
-
-  print_err "A TTY sudo prompt is unavailable and cached sudo credentials were not found."
-  print_info "Run 'sudo -v' in an interactive shell, then rerun this action."
-  return 1
-}
-
 prompt_default() {
   local __var_name="$1"
   local __prompt="$2"
@@ -622,6 +639,7 @@ save_config() {
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
     printf 'WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n' "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf 'WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=%s\n' "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
     printf 'WG_PUBLIC_KEY_PATH=%s\n' "${WG_PUBLIC_KEY_PATH}"
     printf 'EGRESS_INTERFACE=%s\n' "${EGRESS_INTERFACE}"
     printf 'MEMBERSHIP_SNAPSHOT_PATH=%s\n' "${MEMBERSHIP_SNAPSHOT_PATH}"
@@ -696,16 +714,6 @@ add_macos_homebrew_to_path() {
   if ! is_macos_host; then
     return 0
   fi
-  if [[ -d "${MACOS_LOCAL_TOOLS_BIN}" ]]; then
-    case ":${PATH}:" in
-      *":${MACOS_LOCAL_TOOLS_BIN}:"*) ;;
-      *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BIN}" ;;
-    esac
-    case ":${PATH}:" in
-      *":${MACOS_LOCAL_TOOLS_BASE}/go/bin:"*) ;;
-      *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BASE}/go/bin" ;;
-    esac
-  fi
   if [[ -x /opt/homebrew/bin/brew ]]; then
     export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
     return 0
@@ -721,92 +729,6 @@ is_macos_admin_user() {
     return 1
   fi
   id -Gn 2>/dev/null | tr ' ' '\n' | grep -qx 'admin'
-}
-
-ensure_macos_local_go_toolchain() {
-  if command -v go >/dev/null 2>&1; then
-    return 0
-  fi
-
-  local arch go_arch tarball_url tmp_tar
-  arch="$(uname -m)"
-  case "${arch}" in
-    arm64|aarch64) go_arch="arm64" ;;
-    x86_64|amd64) go_arch="amd64" ;;
-    *)
-      print_err "Unsupported macOS architecture for local Go bootstrap: ${arch}"
-      return 1
-      ;;
-  esac
-
-  install -d -m 0700 "${MACOS_LOCAL_TOOLS_BASE}"
-  tmp_tar="$(mktemp)"
-  tarball_url="https://go.dev/dl/go${MACOS_LOCAL_GO_VERSION}.darwin-${go_arch}.tar.gz"
-  print_info "Installing local Go toolchain (${MACOS_LOCAL_GO_VERSION}) to ${MACOS_LOCAL_TOOLS_BASE}/go."
-  if ! curl --proto '=https' --tlsv1.2 -fsSL "${tarball_url}" -o "${tmp_tar}"; then
-    rm -f "${tmp_tar}"
-    print_err "Failed to download Go toolchain from ${tarball_url}"
-    return 1
-  fi
-  rm -rf "${MACOS_LOCAL_TOOLS_BASE}/go"
-  tar -xzf "${tmp_tar}" -C "${MACOS_LOCAL_TOOLS_BASE}"
-  rm -f "${tmp_tar}"
-  export PATH="${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
-}
-
-install_macos_unprivileged_wireguard_tools() {
-  if ! is_macos_host; then
-    return 0
-  fi
-
-  install -d -m 0700 "${MACOS_LOCAL_TOOLS_BIN}"
-  export PATH="${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
-
-  if [[ ! -x "/usr/local/bin/wireguard-go" ]]; then
-    ensure_macos_local_go_toolchain || return 1
-    local wg_go_src_dir
-    wg_go_src_dir="$(mktemp -d)"
-    if command -v git >/dev/null 2>&1; then
-      git clone --depth 1 https://git.zx2c4.com/wireguard-go "${wg_go_src_dir}"
-    else
-      local wg_go_tar
-      wg_go_tar="$(mktemp)"
-      curl --proto '=https' --tlsv1.2 -fsSL \
-        "https://git.zx2c4.com/wireguard-go/snapshot/wireguard-go-master.tar.xz" \
-        -o "${wg_go_tar}"
-      tar -xf "${wg_go_tar}" -C "${wg_go_src_dir}" --strip-components=1
-      rm -f "${wg_go_tar}"
-    fi
-    make -C "${wg_go_src_dir}"
-    if run_root install -d -m 0755 /usr/local/bin \
-      && run_root install -m 0755 "${wg_go_src_dir}/wireguard-go" /usr/local/bin/wireguard-go; then
-      print_info "Installed wireguard-go to /usr/local/bin/wireguard-go"
-    else
-      install -m 0755 "${wg_go_src_dir}/wireguard-go" "${MACOS_LOCAL_TOOLS_BIN}/wireguard-go"
-      print_warn "Installed fallback wireguard-go at ${MACOS_LOCAL_TOOLS_BIN}/wireguard-go (not root-owned)."
-    fi
-    rm -rf "${wg_go_src_dir}"
-  fi
-
-  if [[ ! -x "/usr/local/bin/wg" ]]; then
-    local wg_tools_src_dir wg_tools_tar
-    wg_tools_src_dir="$(mktemp -d)"
-    wg_tools_tar="$(mktemp)"
-    curl --proto '=https' --tlsv1.2 -fsSL \
-      "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-${MACOS_WIREGUARD_TOOLS_VERSION}.tar.xz" \
-      -o "${wg_tools_tar}"
-    tar -xf "${wg_tools_tar}" -C "${wg_tools_src_dir}" --strip-components=1
-    rm -f "${wg_tools_tar}"
-    make -C "${wg_tools_src_dir}/src"
-    if run_root install -d -m 0755 /usr/local/bin \
-      && run_root install -m 0755 "${wg_tools_src_dir}/src/wg" /usr/local/bin/wg; then
-      print_info "Installed wg to /usr/local/bin/wg"
-    else
-      install -m 0755 "${wg_tools_src_dir}/src/wg" "${MACOS_LOCAL_TOOLS_BIN}/wg"
-      print_warn "Installed fallback wg at ${MACOS_LOCAL_TOOLS_BIN}/wg (not root-owned)."
-    fi
-    rm -rf "${wg_tools_src_dir}"
-  fi
 }
 
 ensure_macos_command_line_tools() {
@@ -1191,30 +1113,9 @@ install_runtime_dependencies() {
     fi
 
     if [[ "${requires_wireguard_tools}" == "1" ]] && ! is_macos_admin_user; then
-      print_warn "Homebrew is unavailable and current user is not in the macOS admin group."
-      print_info "Falling back to unprivileged local install for wireguard-go and wg."
-      install_macos_unprivileged_wireguard_tools
-      export PATH="${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
-      missing=()
-      for cmd in "${required[@]}"; do
-        if ! command -v "${cmd}" >/dev/null 2>&1; then
-          missing+=("${cmd}")
-        fi
-      done
-      if [[ "${#missing[@]}" -eq 0 ]]; then
-        return
-      fi
-      if [[ "${#missing[@]}" -eq 1 && "${missing[0]}" == "rg" ]]; then
-        if ! command -v cargo >/dev/null 2>&1 || ! check_rust_min_version; then
-          ensure_rust_toolchain
-        fi
-        cargo install --locked ripgrep
-        export PATH="${HOME}/.cargo/bin:${PATH}"
-        if command -v rg >/dev/null 2>&1; then
-          return
-        fi
-      fi
-      print_err "Missing commands after unprivileged macOS fallback: ${missing[*]}"
+      print_err "Homebrew is unavailable and current user is not in the macOS admin group."
+      print_info "Admin privileges are required to install root-owned wg/wireguard-go binaries."
+      print_info "Ask an admin to install Homebrew and wireguard-tools, then rerun ./start.sh."
       exit 1
     fi
 
@@ -1299,13 +1200,9 @@ ensure_binaries_available() {
       run_root install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" "${install_dir}/rustynet"
       return
     fi
-    install_dir="${MACOS_LOCAL_TOOLS_BIN}"
-    print_warn "No admin write access to /usr/local/bin; installing rustynet binaries to ${install_dir}."
-    install -d -m 0700 "${install_dir}"
-    install -m 0755 "${ROOT_DIR}/target/release/rustynetd" "${install_dir}/rustynetd"
-    install -m 0755 "${ROOT_DIR}/target/release/rustynet-cli" "${install_dir}/rustynet"
-    export PATH="${install_dir}:${PATH}"
-    return
+    print_err "No admin write access to /usr/local/bin on macOS."
+    print_info "Admin privileges are required so rustynetd can remain root-owned for privileged-helper launchd service."
+    exit 1
   fi
 
   run_root install -d -m 0755 "${install_dir}"
@@ -1356,6 +1253,28 @@ doctor_preflight() {
       doctor_ok "${label}: ${path} mode ${mode}"
     else
       doctor_fail "${label}: ${path} mode ${mode:-unknown} (expected ${expected})"
+    fi
+  }
+  doctor_check_owner_uid() {
+    local path="$1"
+    local expected_uid="$2"
+    local label="$3"
+    if [[ ! -e "${path}" ]]; then
+      doctor_fail "${label}: ${path} missing"
+      return
+    fi
+    local owner_uid=""
+    if stat -c '%u' "${path}" >/dev/null 2>&1; then
+      owner_uid="$(stat -c '%u' "${path}")"
+    elif stat -f '%u' "${path}" >/dev/null 2>&1; then
+      owner_uid="$(stat -f '%u' "${path}")"
+    fi
+    if [[ -z "${owner_uid}" ]]; then
+      doctor_fail "${label}: unable to determine owner for ${path}"
+    elif [[ "${owner_uid}" == "${expected_uid}" ]]; then
+      doctor_ok "${label}: ${path} owner uid ${owner_uid}"
+    else
+      doctor_fail "${label}: ${path} owner uid ${owner_uid} (expected ${expected_uid})"
     fi
   }
 
@@ -1430,6 +1349,8 @@ doctor_preflight() {
     doctor_require_cmd ifconfig "macOS dataplane"
     doctor_require_cmd route "macOS dataplane"
     doctor_require_cmd pfctl "macOS dataplane"
+    doctor_require_cmd launchctl "macOS service manager"
+    doctor_require_cmd security "macOS keychain custody"
     if command -v brew >/dev/null 2>&1; then
       doctor_ok "homebrew present for macOS dependency management"
     else
@@ -1444,7 +1365,32 @@ doctor_preflight() {
       doctor_ok "macOS path policy enforced (no Linux runtime roots)"
     fi
     if [[ "${SETUP_COMPLETE}" == "1" ]]; then
-      doctor_check_mode "${WG_KEY_PASSPHRASE_PATH}" "600" "key custody"
+      if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+        doctor_fail "macOS keychain account for passphrase custody is empty"
+      elif ! [[ "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        doctor_fail "macOS keychain account has invalid characters (${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})"
+      elif ! macos_keychain_passphrase_exists; then
+        doctor_fail "macOS keychain passphrase item missing (service=${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}, account=${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})"
+      else
+        doctor_ok "macOS keychain passphrase source configured (service=${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}, account=${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})"
+      fi
+      if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+        doctor_fail "persistent plaintext passphrase file is present on macOS (${WG_KEY_PASSPHRASE_PATH})"
+      else
+        doctor_ok "no persistent plaintext passphrase file present on macOS"
+      fi
+      if [[ -f "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" ]]; then
+        doctor_check_mode "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "644" "launchd daemon plist"
+        doctor_check_owner_uid "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "$(id -u)" "launchd daemon plist"
+      else
+        doctor_warn "launchd daemon plist missing (${MACOS_LAUNCHD_DAEMON_PLIST_PATH}); start will reinstall it"
+      fi
+      if [[ -f "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" ]]; then
+        doctor_check_mode "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "644" "launchd privileged helper plist"
+        doctor_check_owner_uid "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "0" "launchd privileged helper plist"
+      else
+        doctor_warn "launchd privileged helper plist missing (${MACOS_LAUNCHD_HELPER_PLIST_PATH}); start will reinstall it"
+      fi
       doctor_check_mode "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "600" "encrypted private key"
       if [[ -f "${WG_PRIVATE_KEY_PATH}" ]]; then
         doctor_check_mode "${WG_PRIVATE_KEY_PATH}" "600" "runtime private key"
@@ -1542,6 +1488,15 @@ ensure_wireguard_keys() {
   }
 
   local legacy_linux_passphrase_path="/etc/rustynet/wireguard.passphrase"
+  if is_macos_host; then
+    ensure_macos_keychain_passphrase_account
+    if ! command -v security >/dev/null 2>&1; then
+      print_err "macOS keychain tooling is missing ('security' command not found)."
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+      exit 1
+    fi
+  fi
 
   if is_linux_host \
     && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
@@ -1564,13 +1519,30 @@ ensure_wireguard_keys() {
     return
   fi
 
-  if ! is_linux_host \
+  if is_macos_host \
     && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
-    && [[ -f "${WG_PUBLIC_KEY_PATH}" ]] \
-    && [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    && [[ -f "${WG_PUBLIC_KEY_PATH}" ]]; then
+    if macos_keychain_passphrase_exists; then
+      secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+      return
+    fi
+    if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+      print_warn "Migrating existing macOS passphrase file into Keychain custody."
+      run_with_scope rustynetd key store-passphrase \
+        --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
+        --keychain-account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
+      secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
+      return
+    fi
+    print_err "Encrypted key exists but macOS keychain passphrase item is missing."
+    print_info "Restore keychain entry for account '${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}' or rotate keys."
     unset -f run_with_scope >/dev/null 2>&1 || true
     unset -f secure_remove_with_scope >/dev/null 2>&1 || true
-    return
+    exit 1
   fi
 
   if ! prompt_yes_no "Encrypted WireGuard key material is missing. Initialize now?" "y"; then
@@ -1593,14 +1565,11 @@ ensure_wireguard_keys() {
     generated_temp_passphrase="1"
     print_info "Generated ephemeral passphrase material for key bootstrap."
   else
-    passphrase_source_path="${WG_KEY_PASSPHRASE_PATH}"
-    if [[ ! -f "${passphrase_source_path}" ]]; then
-      passphrase_source_path="$(mktemp)"
-      openssl rand -hex 48 >"${passphrase_source_path}"
-      chmod 600 "${passphrase_source_path}"
-      generated_temp_passphrase="1"
-      print_info "Generated temporary key passphrase material."
-    fi
+    passphrase_source_path="$(mktemp)"
+    openssl rand -hex 48 >"${passphrase_source_path}"
+    chmod 600 "${passphrase_source_path}"
+    generated_temp_passphrase="1"
+    print_info "Generated temporary key passphrase material for macOS Keychain custody."
   fi
 
   local source_private_key=""
@@ -1639,6 +1608,12 @@ ensure_wireguard_keys() {
     secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
     secure_remove_with_scope "${legacy_linux_passphrase_path}"
     print_info "Encrypted passphrase credential provisioned at ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+  elif is_macos_host; then
+    run_with_scope rustynetd key store-passphrase \
+      --passphrase-file "${passphrase_source_path}" \
+      --keychain-account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
+    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    print_info "macOS passphrase custody provisioned in Keychain (service=${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}, account=${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})."
   fi
   if [[ "${generated_temp_passphrase}" == "1" || "${passphrase_source_path}" != "${WG_KEY_PASSPHRASE_PATH}" ]]; then
     secure_remove_with_scope "${passphrase_source_path}"
@@ -1907,22 +1882,48 @@ require_root_owned_binary_path() {
   fi
 }
 
+validate_macos_passphrase_source_contract() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  ensure_macos_keychain_passphrase_account
+  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+    print_err "macOS keychain account for passphrase custody is empty."
+    return 1
+  fi
+  if ! [[ "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    print_err "macOS keychain account has invalid characters: ${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
+    return 1
+  fi
+  if [[ "${WG_KEY_PASSPHRASE_PATH}" != /* ]]; then
+    print_err "macOS passphrase placeholder path must be absolute: ${WG_KEY_PASSPHRASE_PATH}"
+    return 1
+  fi
+  if ! command -v security >/dev/null 2>&1; then
+    print_err "macOS keychain tooling is unavailable: security command not found."
+    return 1
+  fi
+  if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
+    print_err "Persistent plaintext passphrase file is not allowed on macOS: ${WG_KEY_PASSPHRASE_PATH}"
+    print_info "Delete the file and rerun setup to keep passphrase custody in Keychain only."
+    return 1
+  fi
+  if ! macos_keychain_passphrase_exists; then
+    print_err "macOS keychain passphrase item is missing (service=${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}, account=${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})."
+    print_info "Run first-run setup to provision Keychain-backed passphrase custody."
+    return 1
+  fi
+  return 0
+}
+
 configure_macos_binary_path_env() {
   if ! is_macos_host; then
     return 0
   fi
 
   add_macos_homebrew_to_path
-  case ":${PATH}:" in
-    *":${MACOS_LOCAL_TOOLS_BIN}:"*) ;;
-    *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BIN}" ;;
-  esac
-  case ":${PATH}:" in
-    *":${MACOS_LOCAL_TOOLS_BASE}/go/bin:"*) ;;
-    *) export PATH="${PATH}:${MACOS_LOCAL_TOOLS_BASE}/go/bin" ;;
-  esac
 
-  local wg_bin wireguard_go_bin ifconfig_bin route_bin pfctl_bin kill_bin
+  local wg_bin wireguard_go_bin ifconfig_bin route_bin pfctl_bin kill_bin rustynetd_bin
   wg_bin="$(resolve_absolute_command_path wg)" || {
     print_err "Unable to resolve absolute path for wg."
     return 1
@@ -1947,6 +1948,10 @@ configure_macos_binary_path_env() {
     print_err "Unable to resolve absolute path for kill."
     return 1
   }
+  rustynetd_bin="$(resolve_absolute_command_path rustynetd)" || {
+    print_err "Unable to resolve absolute path for rustynetd."
+    return 1
+  }
 
   require_root_owned_binary_path "${wg_bin}" "wg" || return 1
   require_root_owned_binary_path "${wireguard_go_bin}" "wireguard-go" || return 1
@@ -1954,6 +1959,7 @@ configure_macos_binary_path_env() {
   require_root_owned_binary_path "${route_bin}" "route" || return 1
   require_root_owned_binary_path "${pfctl_bin}" "pfctl" || return 1
   require_root_owned_binary_path "${kill_bin}" "kill" || return 1
+  require_root_owned_binary_path "${rustynetd_bin}" "rustynetd" || return 1
 
   export RUSTYNET_WG_BINARY_PATH="${wg_bin}"
   export RUSTYNET_WIREGUARD_GO_BINARY_PATH="${wireguard_go_bin}"
@@ -1961,109 +1967,272 @@ configure_macos_binary_path_env() {
   export RUSTYNET_ROUTE_BINARY_PATH="${route_bin}"
   export RUSTYNET_PFCTL_BINARY_PATH="${pfctl_bin}"
   export RUSTYNET_KILL_BINARY_PATH="${kill_bin}"
+  export RUSTYNET_DAEMON_BINARY_PATH="${rustynetd_bin}"
 }
 
-macos_stop_daemon_process() {
-  if [[ -f "${MACOS_DAEMON_PID_PATH}" ]]; then
-    local pid
-    pid="$(cat "${MACOS_DAEMON_PID_PATH}" 2>/dev/null || true)"
-    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-      kill "${pid}" 2>/dev/null || true
-      sleep 0.5
-      if kill -0 "${pid}" 2>/dev/null; then
-        kill -9 "${pid}" 2>/dev/null || true
-      fi
-    fi
-    rm -f "${MACOS_DAEMON_PID_PATH}"
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  value="${value//\'/&apos;}"
+  printf '%s' "${value}"
+}
+
+macos_launchd_domain() {
+  local uid
+  uid="$(id -u)"
+  if launchctl print "gui/${uid}" >/dev/null 2>&1; then
+    printf 'gui/%s' "${uid}"
+  else
+    printf 'user/%s' "${uid}"
   fi
-  rm -f "${SOCKET_PATH}"
 }
 
-macos_stop_privileged_helper_process() {
-  run_root pkill -f "rustynetd privileged-helper --socket ${PRIVILEGED_HELPER_SOCKET_PATH}" 2>/dev/null || true
-  rm -f "${PRIVILEGED_HELPER_SOCKET_PATH}"
+macos_launchd_bootout_unit() {
+  local domain="$1"
+  local label="$2"
+  local plist_path="$3"
+  local use_root="${4:-0}"
+  if [[ "${use_root}" == "1" ]]; then
+    run_root launchctl bootout "${domain}/${label}" 2>/dev/null \
+      || run_root launchctl bootout "${domain}" "${plist_path}" 2>/dev/null \
+      || true
+  else
+    launchctl bootout "${domain}/${label}" 2>/dev/null \
+      || launchctl bootout "${domain}" "${plist_path}" 2>/dev/null \
+      || true
+  fi
 }
 
-macos_start_privileged_helper_process() {
-  macos_stop_privileged_helper_process
+macos_install_launchd_units() {
   configure_macos_binary_path_env || return 1
+  validate_macos_passphrase_source_contract || return 1
+
   local uid gid
   uid="$(id -u)"
   gid="$(id -g)"
-  run_root_background env \
-    RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
-    RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
-    RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
-    RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
-    RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
-    RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
-    rustynetd privileged-helper \
-    --socket "${PRIVILEGED_HELPER_SOCKET_PATH}" \
-    --allowed-uid "${uid}" \
-    --allowed-gid "${gid}" \
-    --timeout-ms "${PRIVILEGED_HELPER_TIMEOUT_MS}"
+
+  run_root install -d -m 0700 "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
+  run_root chown "${uid}:${gid}" "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
+  install -d -m 0700 "$(dirname "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}")"
+  run_root install -d -m 0755 /Library/LaunchDaemons
+
+  local helper_plist_tmp daemon_plist_tmp
+  helper_plist_tmp="$(mktemp)"
+  daemon_plist_tmp="$(mktemp)"
+
+  local bool_auto_tunnel bool_fail_closed_ssh
+  bool_auto_tunnel="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )"
+  bool_fail_closed_ssh="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )"
+
+  local esc_rustynetd esc_helper_socket esc_timeout esc_uid esc_gid esc_keychain_account
+  local esc_wg_bin esc_wg_go_bin esc_ifconfig_bin esc_route_bin esc_pfctl_bin esc_kill_bin
+  esc_rustynetd="$(xml_escape "${RUSTYNET_DAEMON_BINARY_PATH}")"
+  esc_helper_socket="$(xml_escape "${PRIVILEGED_HELPER_SOCKET_PATH}")"
+  esc_timeout="$(xml_escape "${PRIVILEGED_HELPER_TIMEOUT_MS}")"
+  esc_uid="$(xml_escape "${uid}")"
+  esc_gid="$(xml_escape "${gid}")"
+  esc_wg_bin="$(xml_escape "${RUSTYNET_WG_BINARY_PATH}")"
+  esc_wg_go_bin="$(xml_escape "${RUSTYNET_WIREGUARD_GO_BINARY_PATH}")"
+  esc_ifconfig_bin="$(xml_escape "${RUSTYNET_IFCONFIG_BINARY_PATH}")"
+  esc_route_bin="$(xml_escape "${RUSTYNET_ROUTE_BINARY_PATH}")"
+  esc_pfctl_bin="$(xml_escape "${RUSTYNET_PFCTL_BINARY_PATH}")"
+  esc_kill_bin="$(xml_escape "${RUSTYNET_KILL_BINARY_PATH}")"
+  esc_keychain_account="$(xml_escape "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}")"
+
+  cat >"${helper_plist_tmp}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${MACOS_LAUNCHD_HELPER_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${esc_rustynetd}</string>
+    <string>privileged-helper</string>
+    <string>--socket</string>
+    <string>${esc_helper_socket}</string>
+    <string>--allowed-uid</string>
+    <string>${esc_uid}</string>
+    <string>--allowed-gid</string>
+    <string>${esc_gid}</string>
+    <string>--timeout-ms</string>
+    <string>${esc_timeout}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUSTYNET_WG_BINARY_PATH</key>
+    <string>${esc_wg_bin}</string>
+    <key>RUSTYNET_WIREGUARD_GO_BINARY_PATH</key>
+    <string>${esc_wg_go_bin}</string>
+    <key>RUSTYNET_IFCONFIG_BINARY_PATH</key>
+    <string>${esc_ifconfig_bin}</string>
+    <key>RUSTYNET_ROUTE_BINARY_PATH</key>
+    <string>${esc_route_bin}</string>
+    <key>RUSTYNET_PFCTL_BINARY_PATH</key>
+    <string>${esc_pfctl_bin}</string>
+    <key>RUSTYNET_KILL_BINARY_PATH</key>
+    <string>${esc_kill_bin}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "${MACOS_HELPER_LOG_PATH}")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "${MACOS_HELPER_LOG_PATH}")</string>
+</dict>
+</plist>
+EOF
+
+  cat >"${daemon_plist_tmp}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${MACOS_LAUNCHD_DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${esc_rustynetd}</string>
+    <string>daemon</string>
+    <string>--node-id</string>
+    <string>$(xml_escape "${DEVICE_NODE_ID}")</string>
+    <string>--node-role</string>
+    <string>$(xml_escape "${NODE_ROLE}")</string>
+    <string>--socket</string>
+    <string>$(xml_escape "${SOCKET_PATH}")</string>
+    <string>--state</string>
+    <string>$(xml_escape "${STATE_PATH}")</string>
+    <string>--trust-evidence</string>
+    <string>$(xml_escape "${TRUST_EVIDENCE_PATH}")</string>
+    <string>--trust-verifier-key</string>
+    <string>$(xml_escape "${TRUST_VERIFIER_KEY_PATH}")</string>
+    <string>--trust-watermark</string>
+    <string>$(xml_escape "${TRUST_WATERMARK_PATH}")</string>
+    <string>--membership-snapshot</string>
+    <string>$(xml_escape "${MEMBERSHIP_SNAPSHOT_PATH}")</string>
+    <string>--membership-log</string>
+    <string>$(xml_escape "${MEMBERSHIP_LOG_PATH}")</string>
+    <string>--membership-watermark</string>
+    <string>$(xml_escape "${MEMBERSHIP_WATERMARK_PATH}")</string>
+    <string>--auto-tunnel-enforce</string>
+    <string>$(xml_escape "${bool_auto_tunnel}")</string>
+    <string>--auto-tunnel-bundle</string>
+    <string>$(xml_escape "${AUTO_TUNNEL_BUNDLE_PATH}")</string>
+    <string>--auto-tunnel-verifier-key</string>
+    <string>$(xml_escape "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")</string>
+    <string>--auto-tunnel-watermark</string>
+    <string>$(xml_escape "${AUTO_TUNNEL_WATERMARK_PATH}")</string>
+    <string>--auto-tunnel-max-age-secs</string>
+    <string>$(xml_escape "${AUTO_TUNNEL_MAX_AGE_SECS}")</string>
+    <string>--backend</string>
+    <string>$(xml_escape "${BACKEND_MODE}")</string>
+    <string>--wg-interface</string>
+    <string>$(xml_escape "${WG_INTERFACE}")</string>
+    <string>--wg-listen-port</string>
+    <string>$(xml_escape "${WG_LISTEN_PORT}")</string>
+    <string>--wg-private-key</string>
+    <string>$(xml_escape "${WG_PRIVATE_KEY_PATH}")</string>
+    <string>--wg-encrypted-private-key</string>
+    <string>$(xml_escape "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")</string>
+    <string>--wg-key-passphrase</string>
+    <string>$(xml_escape "${WG_KEY_PASSPHRASE_PATH}")</string>
+    <string>--wg-public-key</string>
+    <string>$(xml_escape "${WG_PUBLIC_KEY_PATH}")</string>
+    <string>--egress-interface</string>
+    <string>$(xml_escape "${EGRESS_INTERFACE}")</string>
+    <string>--dataplane-mode</string>
+    <string>$(xml_escape "${DATAPLANE_MODE}")</string>
+    <string>--privileged-helper-socket</string>
+    <string>${esc_helper_socket}</string>
+    <string>--privileged-helper-timeout-ms</string>
+    <string>${esc_timeout}</string>
+    <string>--reconcile-interval-ms</string>
+    <string>$(xml_escape "${RECONCILE_INTERVAL_MS}")</string>
+    <string>--max-reconcile-failures</string>
+    <string>$(xml_escape "${MAX_RECONCILE_FAILURES}")</string>
+    <string>--fail-closed-ssh-allow</string>
+    <string>$(xml_escape "${bool_fail_closed_ssh}")</string>
+    <string>--fail-closed-ssh-allow-cidrs</string>
+    <string>$(xml_escape "${FAIL_CLOSED_SSH_ALLOW_CIDRS}")</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUSTYNET_WG_BINARY_PATH</key>
+    <string>${esc_wg_bin}</string>
+    <key>RUSTYNET_WIREGUARD_GO_BINARY_PATH</key>
+    <string>${esc_wg_go_bin}</string>
+    <key>RUSTYNET_IFCONFIG_BINARY_PATH</key>
+    <string>${esc_ifconfig_bin}</string>
+    <key>RUSTYNET_ROUTE_BINARY_PATH</key>
+    <string>${esc_route_bin}</string>
+    <key>RUSTYNET_PFCTL_BINARY_PATH</key>
+    <string>${esc_pfctl_bin}</string>
+    <key>RUSTYNET_KILL_BINARY_PATH</key>
+    <string>${esc_kill_bin}</string>
+    <key>RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT</key>
+    <string>${esc_keychain_account}</string>
+    <key>RUSTYNET_ALLOW_MACOS_PASSPHRASE_FILE_FALLBACK</key>
+    <string>0</string>
+    <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
+    <string>$(xml_escape "${WG_KEY_PASSPHRASE_PATH}")</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "${MACOS_DAEMON_LOG_PATH}")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "${MACOS_DAEMON_LOG_PATH}")</string>
+</dict>
+</plist>
+EOF
+
+  run_root install -m 0644 "${helper_plist_tmp}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
+  if ! run_root chown root:wheel "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" 2>/dev/null; then
+    run_root chown root:root "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
+  fi
+  install -m 0644 "${daemon_plist_tmp}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}"
+
+  rm -f "${helper_plist_tmp}" "${daemon_plist_tmp}"
+}
+
+macos_start_launchd_services() {
+  macos_install_launchd_units || return 1
+  local daemon_domain
+  daemon_domain="$(macos_launchd_domain)"
+
+  macos_launchd_bootout_unit "system" "${MACOS_LAUNCHD_HELPER_LABEL}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "1"
+  macos_launchd_bootout_unit "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_LABEL}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "0"
+
+  run_root launchctl bootstrap system "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
+  run_root launchctl kickstart -k "system/${MACOS_LAUNCHD_HELPER_LABEL}"
+  launchctl bootstrap "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}"
+  launchctl kickstart -k "${daemon_domain}/${MACOS_LAUNCHD_DAEMON_LABEL}"
+
   if ! macos_wait_for_socket "${PRIVILEGED_HELPER_SOCKET_PATH}"; then
     print_err "Timed out waiting for macOS privileged helper socket at ${PRIVILEGED_HELPER_SOCKET_PATH}."
     return 1
   fi
-}
-
-macos_start_daemon_process() {
-  macos_stop_daemon_process
-  configure_macos_binary_path_env || return 1
-  local uid gid
-  uid="$(id -u)"
-  gid="$(id -g)"
-  run_root install -d -m 0700 "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
-  run_root chown "${uid}:${gid}" "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
-  env \
-    RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
-    RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
-    RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
-    RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
-    RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
-    RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
-    rustynetd daemon \
-    --node-id "${DEVICE_NODE_ID}" \
-    --node-role "${NODE_ROLE}" \
-    --socket "${SOCKET_PATH}" \
-    --state "${STATE_PATH}" \
-    --trust-evidence "${TRUST_EVIDENCE_PATH}" \
-    --trust-verifier-key "${TRUST_VERIFIER_KEY_PATH}" \
-    --trust-watermark "${TRUST_WATERMARK_PATH}" \
-    --membership-snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
-    --membership-log "${MEMBERSHIP_LOG_PATH}" \
-    --membership-watermark "${MEMBERSHIP_WATERMARK_PATH}" \
-    --auto-tunnel-enforce "$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
-    --auto-tunnel-bundle "${AUTO_TUNNEL_BUNDLE_PATH}" \
-    --auto-tunnel-verifier-key "${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
-    --auto-tunnel-watermark "${AUTO_TUNNEL_WATERMARK_PATH}" \
-    --auto-tunnel-max-age-secs "${AUTO_TUNNEL_MAX_AGE_SECS}" \
-    --backend "${BACKEND_MODE}" \
-    --wg-interface "${WG_INTERFACE}" \
-    --wg-listen-port "${WG_LISTEN_PORT}" \
-    --wg-private-key "${WG_PRIVATE_KEY_PATH}" \
-    --wg-encrypted-private-key "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-    --wg-key-passphrase "${WG_KEY_PASSPHRASE_PATH}" \
-    --wg-public-key "${WG_PUBLIC_KEY_PATH}" \
-    --egress-interface "${EGRESS_INTERFACE}" \
-    --dataplane-mode "${DATAPLANE_MODE}" \
-    --privileged-helper-socket "${PRIVILEGED_HELPER_SOCKET_PATH}" \
-    --privileged-helper-timeout-ms "${PRIVILEGED_HELPER_TIMEOUT_MS}" \
-    --reconcile-interval-ms "${RECONCILE_INTERVAL_MS}" \
-    --max-reconcile-failures "${MAX_RECONCILE_FAILURES}" \
-    --fail-closed-ssh-allow "$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
-    --fail-closed-ssh-allow-cidrs "${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
-    >"${MACOS_DAEMON_LOG_PATH}" 2>&1 &
-  local daemon_pid=$!
-  printf '%s\n' "${daemon_pid}" >"${MACOS_DAEMON_PID_PATH}"
-  chmod 600 "${MACOS_DAEMON_PID_PATH}"
-
   if ! macos_wait_for_socket "${SOCKET_PATH}"; then
     print_err "Timed out waiting for rustynetd socket at ${SOCKET_PATH}."
     tail -n 40 "${MACOS_DAEMON_LOG_PATH}" 2>/dev/null || true
     return 1
   fi
+}
+
+macos_stop_launchd_services() {
+  local daemon_domain
+  daemon_domain="$(macos_launchd_domain)"
+  macos_launchd_bootout_unit "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_LABEL}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "0"
+  macos_launchd_bootout_unit "system" "${MACOS_LAUNCHD_HELPER_LABEL}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "1"
+  rm -f "${SOCKET_PATH}" "${PRIVILEGED_HELPER_SOCKET_PATH}"
 }
 
 start_or_restart_service() {
@@ -2087,8 +2256,7 @@ start_or_restart_service() {
   fi
 
   if is_macos_host; then
-    macos_start_privileged_helper_process
-    macos_start_daemon_process
+    macos_start_launchd_services
     show_service_status
     return
   fi
@@ -2102,8 +2270,7 @@ stop_service() {
     return
   fi
   if is_macos_host; then
-    macos_stop_daemon_process
-    macos_stop_privileged_helper_process
+    macos_stop_launchd_services
     return
   fi
   require_linux_dataplane "stop_service" || return 0
@@ -2195,12 +2362,19 @@ show_service_status() {
     return
   fi
   if is_macos_host; then
-    local daemon_pid=""
-    daemon_pid="$(cat "${MACOS_DAEMON_PID_PATH}" 2>/dev/null || true)"
-    if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
-      print_info "rustynetd running (pid ${daemon_pid})"
+    local daemon_domain daemon_target helper_target
+    daemon_domain="$(macos_launchd_domain)"
+    daemon_target="${daemon_domain}/${MACOS_LAUNCHD_DAEMON_LABEL}"
+    helper_target="system/${MACOS_LAUNCHD_HELPER_LABEL}"
+    if launchctl print "${daemon_target}" >/dev/null 2>&1; then
+      print_info "rustynetd launchd unit loaded (${daemon_target})"
     else
-      print_warn "rustynetd is not running."
+      print_warn "rustynetd launchd unit is not loaded (${daemon_target})."
+    fi
+    if run_root launchctl print "${helper_target}" >/dev/null 2>&1; then
+      print_info "privileged helper launchd unit loaded (${helper_target})"
+    else
+      print_warn "privileged helper launchd unit is not loaded (${helper_target})."
     fi
     if [[ -S "${SOCKET_PATH}" ]]; then
       print_info "daemon IPC socket present (${SOCKET_PATH})"
@@ -2605,9 +2779,13 @@ configure_values() {
   if is_linux_host; then
     WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     print_info "Linux passphrase credential blob path is pinned to ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
+  elif is_macos_host; then
+    prompt_default WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT "WireGuard passphrase Keychain account" "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
+    ensure_macos_keychain_passphrase_account
+    print_info "macOS passphrase custody uses Keychain service '${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}'."
+    print_info "Persistent plaintext passphrase files are disabled by default."
   else
     prompt_default WG_KEY_PASSPHRASE_PATH "WireGuard key passphrase file path" "${WG_KEY_PASSPHRASE_PATH}"
-    prompt_default WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "WireGuard encrypted passphrase credential blob path" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
   fi
   prompt_default WG_PUBLIC_KEY_PATH "WireGuard public key path" "${WG_PUBLIC_KEY_PATH}"
   prompt_default EGRESS_INTERFACE "Egress interface" "${EGRESS_INTERFACE}"
@@ -2689,6 +2867,7 @@ Current Rustynet Wizard Configuration
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
   wg_key_passphrase_cred  : ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
+  wg_key_passphrase_keychain_account: ${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}
   wg_public_key           : ${WG_PUBLIC_KEY_PATH}
   egress_interface        : ${EGRESS_INTERFACE}
   membership_snapshot     : ${MEMBERSHIP_SNAPSHOT_PATH}
