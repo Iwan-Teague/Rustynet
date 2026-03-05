@@ -580,8 +580,13 @@ impl LinuxCommandSystem {
     }
 
     fn ensure_failclosed_table(&mut self) -> Result<String, SystemError> {
-        if let Some(table) = &self.firewall_table {
-            return Ok(table.clone());
+        if let Some(table) = self.firewall_table.clone() {
+            if self.killswitch_chain_exists(table.as_str())? {
+                return Ok(table);
+            }
+            // A prior generation table can be pruned before fail-closed recovery runs.
+            // Drop stale state so we can recreate a valid fail-closed table/chain.
+            self.firewall_table = None;
         }
 
         let table = self.firewall_table_name();
@@ -665,6 +670,9 @@ impl LinuxCommandSystem {
             &["list", "chain", "inet", table, "killswitch"],
         )?;
         if !output.success() {
+            if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+                return Ok(false);
+            }
             return Err(SystemError::BlockEgressFailed(format!(
                 "nft list chain exited unsuccessfully: status={} stderr={}",
                 output.status, output.stderr
@@ -673,6 +681,29 @@ impl LinuxCommandSystem {
         Ok(output
             .stdout
             .contains("comment \"rustynet_fail_closed_drop\""))
+    }
+
+    fn killswitch_chain_exists(&self, table: &str) -> Result<bool, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "chain", "inet", table, "killswitch"],
+        )?;
+        if output.success() {
+            return Ok(true);
+        }
+        if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+            return Ok(false);
+        }
+        Err(SystemError::Io(format!(
+            "nft list chain exited unsuccessfully: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
+    fn is_nft_missing_object_error(stderr: &str) -> bool {
+        stderr
+            .to_ascii_lowercase()
+            .contains("no such file or directory")
     }
 }
 
