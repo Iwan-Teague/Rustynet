@@ -841,7 +841,7 @@ EXIT_ASSIGNMENT_GENERATED_BEFORE="$(extract_last_assignment_generated "${EXIT_ST
 CLIENT_ASSIGNMENT_GENERATED_BEFORE="$(extract_last_assignment_generated "${CLIENT_STATUS}")"
 
 log "Waiting for assignment refresh timer to rotate signed bundles"
-sleep 170
+sleep 230
 
 EXIT_STATUS_AFTER_REFRESH="$(ssh_capture "${EXIT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status")"
 CLIENT_STATUS_AFTER_REFRESH="$(ssh_capture "${CLIENT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status")"
