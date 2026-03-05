@@ -33,6 +33,7 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 SystemCallArchitectures=native
+ReadWritePaths=/etc/rustynet /var/lib/rustynet
 # Required for strict ownership/mode enforcement on assignment artifacts when
 # parent runtime directories are daemon-owned with restrictive permissions.
 CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN
