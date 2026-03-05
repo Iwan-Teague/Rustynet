@@ -498,10 +498,15 @@ auto_refresh="false"
 if [[ -f /etc/rustynet/trust-evidence.key ]]; then
   auto_refresh="true"
 fi
+assignment_auto_refresh="false"
+if [[ -f /etc/rustynet/assignment.signing.secret && -f /etc/rustynet/assignment-refresh.env ]]; then
+  assignment_auto_refresh="true"
+fi
 
 RUSTYNET_NODE_ID="${node_id}" \
 RUSTYNET_NODE_ROLE="${role}" \
 RUSTYNET_TRUST_AUTO_REFRESH="${auto_refresh}" \
+RUSTYNET_ASSIGNMENT_AUTO_REFRESH="${assignment_auto_refresh}" \
 RUSTYNET_AUTO_TUNNEL_ENFORCE=true \
 RUSTYNET_WG_LISTEN_PORT=51820 \
 RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true \
@@ -578,7 +583,7 @@ rustynet assignment issue \
   --signing-secret "${secret_path}" \
   --output /tmp/rustynet-exit.assignment \
   --verifier-key-output /tmp/rustynet-assignment.pub \
-  --ttl-secs 900
+  --ttl-secs 300
 
 rustynet assignment issue \
   --target-node-id "${client_node_id}" \
@@ -588,7 +593,7 @@ rustynet assignment issue \
   --output /tmp/rustynet-client.assignment \
   --verifier-key-output /tmp/rustynet-assignment.pub \
   --exit-node-id "${exit_node_id}" \
-  --ttl-secs 900
+  --ttl-secs 300
 REMOTE_ASSIGNMENT
 chmod 0700 "${ASSIGNMENT_SCRIPT}"
 
@@ -713,6 +718,8 @@ if [[ ! "${EXIT_WG_PUB_HEX}" =~ ^[0-9a-f]+$ || ! "${CLIENT_WG_PUB_HEX}" =~ ^[0-9
   echo "failed to convert WireGuard public key(s) to hex" >&2
   exit 1
 fi
+ASSIGNMENT_NODES_SPEC="${EXIT_NODE_ID}|${EXIT_ADDR}:51820|${EXIT_WG_PUB_HEX};${CLIENT_NODE_ID}|${CLIENT_ADDR}:51820|${CLIENT_WG_PUB_HEX}"
+ASSIGNMENT_ALLOW_SPEC="${CLIENT_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${CLIENT_NODE_ID}"
 
 log "Applying signed membership update for client node"
 run_remote_script_with_args \
@@ -751,6 +758,40 @@ copy_local_file_to_remote "${CLIENT_TARGET}" "${ASSIGNMENT_CLIENT_LOCAL}" "/var/
 ssh_run "${EXIT_TARGET}" "rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rustynet-assignment.pub /tmp/rustynet-exit.assignment /tmp/rustynet-client.assignment"
 ssh_run "${CLIENT_TARGET}" "rm -f /var/lib/rustynet/rustynetd.assignment.watermark"
 
+log "Configuring assignment auto-refresh signer custody and refresh environment"
+ssh_run "${EXIT_TARGET}" "set -euo pipefail; if [[ ! -f /etc/rustynet/assignment.signing.secret ]]; then openssl rand -hex 32 > /etc/rustynet/assignment.signing.secret; fi; chown root:root /etc/rustynet/assignment.signing.secret; chmod 0600 /etc/rustynet/assignment.signing.secret"
+ssh_run "${CLIENT_TARGET}" "set -euo pipefail; if [[ ! -f /etc/rustynet/assignment.signing.secret ]]; then openssl rand -hex 32 > /etc/rustynet/assignment.signing.secret; fi; chown root:root /etc/rustynet/assignment.signing.secret; chmod 0600 /etc/rustynet/assignment.signing.secret"
+
+ASSIGNMENT_REFRESH_EXIT_LOCAL="${TMP_DIR}/assignment-refresh-exit.env"
+ASSIGNMENT_REFRESH_CLIENT_LOCAL="${TMP_DIR}/assignment-refresh-client.env"
+cat > "${ASSIGNMENT_REFRESH_EXIT_LOCAL}" <<EOF_ASSIGN_REFRESH_EXIT
+RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true
+RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=${EXIT_NODE_ID}
+RUSTYNET_ASSIGNMENT_NODES=${ASSIGNMENT_NODES_SPEC}
+RUSTYNET_ASSIGNMENT_ALLOW=${ASSIGNMENT_ALLOW_SPEC}
+RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
+RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment
+RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub
+RUSTYNET_ASSIGNMENT_TTL_SECS=300
+RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS=180
+EOF_ASSIGN_REFRESH_EXIT
+
+cat > "${ASSIGNMENT_REFRESH_CLIENT_LOCAL}" <<EOF_ASSIGN_REFRESH_CLIENT
+RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true
+RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=${CLIENT_NODE_ID}
+RUSTYNET_ASSIGNMENT_NODES=${ASSIGNMENT_NODES_SPEC}
+RUSTYNET_ASSIGNMENT_ALLOW=${ASSIGNMENT_ALLOW_SPEC}
+RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
+RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment
+RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub
+RUSTYNET_ASSIGNMENT_TTL_SECS=300
+RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS=180
+RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=${EXIT_NODE_ID}
+EOF_ASSIGN_REFRESH_CLIENT
+
+copy_local_file_to_remote "${EXIT_TARGET}" "${ASSIGNMENT_REFRESH_EXIT_LOCAL}" "/etc/rustynet/assignment-refresh.env" "root" "root" "0600"
+copy_local_file_to_remote "${CLIENT_TARGET}" "${ASSIGNMENT_REFRESH_CLIENT_LOCAL}" "/etc/rustynet/assignment-refresh.env" "root" "root" "0600"
+
 log "Enabling auto-tunnel enforcement on both hosts"
 run_remote_script_with_args \
   "${EXIT_TARGET}" "${ENFORCE_SCRIPT}" \
@@ -775,6 +816,8 @@ CLIENT_ROUTE="$(ssh_capture "${CLIENT_TARGET}" "ip -4 route get 1.1.1.1 || true"
 EXIT_WG_SHOW="$(ssh_capture "${EXIT_TARGET}" "wg show rustynet0 || true")"
 EXIT_NFT_RULESET="$(ssh_capture "${EXIT_TARGET}" "nft list ruleset || true")"
 EXIT_TUNNEL_IP="$(ssh_capture "${EXIT_TARGET}" "ip -4 -o addr show dev rustynet0 | sed -n 's/.* inet \\([0-9.]*\\)\\/.*$/\\1/p' | head -n1" | tr -d '[:space:]')"
+EXIT_ASSIGNMENT_TIMER_STATE="$(ssh_capture "${EXIT_TARGET}" "systemctl is-active rustynetd-assignment-refresh.timer || true" | tr -d '[:space:]')"
+CLIENT_ASSIGNMENT_TIMER_STATE="$(ssh_capture "${CLIENT_TARGET}" "systemctl is-active rustynetd-assignment-refresh.timer || true" | tr -d '[:space:]')"
 
 if [[ -n "${EXIT_TUNNEL_IP}" ]]; then
   ssh_run "${CLIENT_TARGET}" "ping -c 2 -W 2 '${EXIT_TUNNEL_IP}' >/dev/null"
@@ -788,6 +831,22 @@ CLIENT_CRED_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /etc/rust
 EXIT_CRED_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/credentials/wg_key_passphrase.cred")"
 CLIENT_KEY_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /var/lib/rustynet/keys/wireguard.key.enc")"
 EXIT_KEY_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /var/lib/rustynet/keys/wireguard.key.enc")"
+
+extract_last_assignment_generated() {
+  local status_line="$1"
+  sed -n 's/.*last_assignment=\([0-9][0-9]*\):.*/\1/p' <<<"${status_line}" | head -n1
+}
+
+EXIT_ASSIGNMENT_GENERATED_BEFORE="$(extract_last_assignment_generated "${EXIT_STATUS}")"
+CLIENT_ASSIGNMENT_GENERATED_BEFORE="$(extract_last_assignment_generated "${CLIENT_STATUS}")"
+
+log "Waiting for assignment refresh timer to rotate signed bundles"
+sleep 170
+
+EXIT_STATUS_AFTER_REFRESH="$(ssh_capture "${EXIT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status")"
+CLIENT_STATUS_AFTER_REFRESH="$(ssh_capture "${CLIENT_TARGET}" "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status")"
+EXIT_ASSIGNMENT_GENERATED_AFTER="$(extract_last_assignment_generated "${EXIT_STATUS_AFTER_REFRESH}")"
+CLIENT_ASSIGNMENT_GENERATED_AFTER="$(extract_last_assignment_generated "${CLIENT_STATUS_AFTER_REFRESH}")"
 
 FAIL_COUNT=0
 CHECK_LINES=()
@@ -822,6 +881,16 @@ contains_or_fail "client-not-restricted" "${CLIENT_STATUS}" "restricted_safe_mod
 contains_or_fail "client-route-via-tunnel" "${CLIENT_ROUTE}" "dev rustynet0"
 contains_or_fail "exit-nat-masquerade" "${EXIT_NFT_RULESET}" "masquerade"
 contains_or_fail "exit-forward-from-tunnel" "${EXIT_NFT_RULESET}" "iifname \"rustynet0\""
+if [[ "${EXIT_ASSIGNMENT_TIMER_STATE}" == "active" ]]; then
+  add_check "exit-assignment-refresh-timer" "PASS" "rustynetd-assignment-refresh.timer is active"
+else
+  add_check "exit-assignment-refresh-timer" "FAIL" "timer state=${EXIT_ASSIGNMENT_TIMER_STATE:-unknown}"
+fi
+if [[ "${CLIENT_ASSIGNMENT_TIMER_STATE}" == "active" ]]; then
+  add_check "client-assignment-refresh-timer" "PASS" "rustynetd-assignment-refresh.timer is active"
+else
+  add_check "client-assignment-refresh-timer" "FAIL" "timer state=${CLIENT_ASSIGNMENT_TIMER_STATE:-unknown}"
+fi
 
 if [[ -n "${EXIT_TUNNEL_IP}" ]]; then
   add_check "exit-tunnel-ip" "PASS" "${EXIT_TUNNEL_IP}"
@@ -853,6 +922,20 @@ else
   add_check "encrypted-key-permissions" "FAIL" "client=${CLIENT_KEY_MODE}; exit=${EXIT_KEY_MODE}"
 fi
 
+if [[ "${EXIT_ASSIGNMENT_GENERATED_BEFORE}" =~ ^[0-9]+$ && "${EXIT_ASSIGNMENT_GENERATED_AFTER}" =~ ^[0-9]+$ ]] \
+  && (( EXIT_ASSIGNMENT_GENERATED_AFTER > EXIT_ASSIGNMENT_GENERATED_BEFORE )); then
+  add_check "exit-assignment-refresh-rotation" "PASS" "generated_at advanced from ${EXIT_ASSIGNMENT_GENERATED_BEFORE} to ${EXIT_ASSIGNMENT_GENERATED_AFTER}"
+else
+  add_check "exit-assignment-refresh-rotation" "FAIL" "generated_at before=${EXIT_ASSIGNMENT_GENERATED_BEFORE:-none} after=${EXIT_ASSIGNMENT_GENERATED_AFTER:-none}"
+fi
+
+if [[ "${CLIENT_ASSIGNMENT_GENERATED_BEFORE}" =~ ^[0-9]+$ && "${CLIENT_ASSIGNMENT_GENERATED_AFTER}" =~ ^[0-9]+$ ]] \
+  && (( CLIENT_ASSIGNMENT_GENERATED_AFTER > CLIENT_ASSIGNMENT_GENERATED_BEFORE )); then
+  add_check "client-assignment-refresh-rotation" "PASS" "generated_at advanced from ${CLIENT_ASSIGNMENT_GENERATED_BEFORE} to ${CLIENT_ASSIGNMENT_GENERATED_AFTER}"
+else
+  add_check "client-assignment-refresh-rotation" "FAIL" "generated_at before=${CLIENT_ASSIGNMENT_GENERATED_BEFORE:-none} after=${CLIENT_ASSIGNMENT_GENERATED_AFTER:-none}"
+fi
+
 mkdir -p "$(dirname "${REPORT_PATH}")"
 {
   echo "# Debian Two-Node Clean Install + Tunnel Validation"
@@ -880,10 +963,22 @@ mkdir -p "$(dirname "${REPORT_PATH}")"
   echo "${EXIT_STATUS}"
   echo '```'
   echo
+  echo "## Exit Status After Assignment Refresh Window"
+  echo
+  echo '```text'
+  echo "${EXIT_STATUS_AFTER_REFRESH}"
+  echo '```'
+  echo
   echo "## Client Status"
   echo
   echo '```text'
   echo "${CLIENT_STATUS}"
+  echo '```'
+  echo
+  echo "## Client Status After Assignment Refresh Window"
+  echo
+  echo '```text'
+  echo "${CLIENT_STATUS_AFTER_REFRESH}"
   echo '```'
   echo
   echo "## Client Route Check"

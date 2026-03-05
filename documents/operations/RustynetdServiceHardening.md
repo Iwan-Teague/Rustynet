@@ -15,6 +15,9 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Trust refresh unit: `scripts/systemd/rustynetd-trust-refresh.service`
 - Trust refresh timer: `scripts/systemd/rustynetd-trust-refresh.timer`
 - Trust refresh helper script: `scripts/systemd/refresh_trust_evidence.sh` (installed to `/usr/local/libexec/rustynet/refresh_trust_evidence.sh`)
+- Assignment refresh unit: `scripts/systemd/rustynetd-assignment-refresh.service`
+- Assignment refresh timer: `scripts/systemd/rustynetd-assignment-refresh.timer`
+- Assignment refresh helper script: `scripts/systemd/refresh_assignment_bundle.sh` (installed to `/usr/local/libexec/rustynet/refresh_assignment_bundle.sh`)
 
 ## Hardening Controls (Daemon)
 - `NoNewPrivileges=true`
@@ -55,6 +58,15 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Enforces signer key ownership/mode guardrails (root-owned, not group/world writable).
 - Uses daemon-group-readable trust evidence (`root:<daemon-group>`, mode `0640`) when daemon group exists.
 
+## Hardening Controls (Assignment Refresh)
+- Timer-driven one-shot refresh runs via `rustynetd-assignment-refresh.service`.
+- Auto-refresh remains fail-closed: stale/invalid signed assignment bundles are still rejected at daemon reconcile.
+- Requires explicit enable (`RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true`) and root-owned refresh config (`/etc/rustynet/assignment-refresh.env`).
+- Reads signing secret from `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` (default `/etc/rustynet/assignment.signing.secret`) and enforces root ownership/non-writable permissions.
+- Reissues signed bundle with bounded TTL and rewrites artifacts atomically:
+  - `/var/lib/rustynet/rustynetd.assignment` (`0640 root:<daemon-group>`)
+  - `/etc/rustynet/assignment.pub` (`0644 root:root`)
+
 ## Reliability Controls
 - `Restart=on-failure`
 - `RestartSec=2s`
@@ -63,6 +75,11 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `RuntimeDirectory=rustynet` with mode `0700`
 - `StateDirectory=rustynet` with mode `0700`
 - Trust refresh timer cadence:
+  - `OnBootSec=45s`
+  - `OnUnitActiveSec=60s`
+  - `RandomizedDelaySec=10s`
+  - `Persistent=true`
+- Assignment refresh timer cadence:
   - `OnBootSec=45s`
   - `OnUnitActiveSec=60s`
   - `RandomizedDelaySec=10s`
@@ -76,6 +93,10 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - `/var/lib/rustynet/rustynetd.trust` (`0640`, integrity-checked trust evidence)
 - `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
 - `/etc/rustynet/trust-evidence.key` (`0600`, signer key; required only when trust auto-refresh is enabled)
+- `/var/lib/rustynet/rustynetd.assignment` (`0640`, signed auto-tunnel bundle)
+- `/etc/rustynet/assignment.pub` (`0644`, assignment verifier key)
+- `/etc/rustynet/assignment.signing.secret` (`0600`, signer key; required only when assignment auto-refresh is enabled)
+- `/etc/rustynet/assignment-refresh.env` (`0600`, root-owned assignment refresh input map)
 - `/var/lib/rustynet/keys/wireguard.passphrase` should be absent in hardened Linux runtime (persistent plaintext passphrase files are rejected by preflight).
 
 ## Verification
@@ -85,4 +106,6 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 4. `sudo systemctl --no-pager --full status rustynetd-privileged-helper.service`
 5. If `RUSTYNET_TRUST_AUTO_REFRESH=true`: `sudo systemctl --no-pager --full status rustynetd-trust-refresh.timer`
 6. Trigger one refresh cycle: `sudo systemctl start rustynetd-trust-refresh.service`
-7. `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
+7. If `RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true`: `sudo systemctl --no-pager --full status rustynetd-assignment-refresh.timer`
+8. Trigger one assignment refresh cycle: `sudo systemctl start rustynetd-assignment-refresh.service`
+9. `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`

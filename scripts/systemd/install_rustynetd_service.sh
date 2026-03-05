@@ -12,14 +12,28 @@ HELPER_SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-privileged-helper.serv
 TRUST_REFRESH_SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-trust-refresh.service"
 TRUST_REFRESH_TIMER_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-trust-refresh.timer"
 TRUST_REFRESH_SCRIPT_SRC="${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
+ASSIGNMENT_REFRESH_SERVICE_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-assignment-refresh.service"
+ASSIGNMENT_REFRESH_TIMER_SRC="${ROOT_DIR}/scripts/systemd/rustynetd-assignment-refresh.timer"
+ASSIGNMENT_REFRESH_SCRIPT_SRC="${ROOT_DIR}/scripts/systemd/refresh_assignment_bundle.sh"
 SERVICE_DST="/etc/systemd/system/rustynetd.service"
 HELPER_SERVICE_DST="/etc/systemd/system/rustynetd-privileged-helper.service"
 TRUST_REFRESH_SERVICE_DST="/etc/systemd/system/rustynetd-trust-refresh.service"
 TRUST_REFRESH_TIMER_DST="/etc/systemd/system/rustynetd-trust-refresh.timer"
 TRUST_REFRESH_SCRIPT_DST="/usr/local/libexec/rustynet/refresh_trust_evidence.sh"
+ASSIGNMENT_REFRESH_SERVICE_DST="/etc/systemd/system/rustynetd-assignment-refresh.service"
+ASSIGNMENT_REFRESH_TIMER_DST="/etc/systemd/system/rustynetd-assignment-refresh.timer"
+ASSIGNMENT_REFRESH_SCRIPT_DST="/usr/local/libexec/rustynet/refresh_assignment_bundle.sh"
 ENV_DST="/etc/default/rustynetd"
 
-for unit in "${SERVICE_SRC}" "${HELPER_SERVICE_SRC}" "${TRUST_REFRESH_SERVICE_SRC}" "${TRUST_REFRESH_TIMER_SRC}" "${TRUST_REFRESH_SCRIPT_SRC}"; do
+for unit in \
+  "${SERVICE_SRC}" \
+  "${HELPER_SERVICE_SRC}" \
+  "${TRUST_REFRESH_SERVICE_SRC}" \
+  "${TRUST_REFRESH_TIMER_SRC}" \
+  "${TRUST_REFRESH_SCRIPT_SRC}" \
+  "${ASSIGNMENT_REFRESH_SERVICE_SRC}" \
+  "${ASSIGNMENT_REFRESH_TIMER_SRC}" \
+  "${ASSIGNMENT_REFRESH_SCRIPT_SRC}"; do
   if [[ ! -f "${unit}" ]]; then
     echo "missing service file: ${unit}" >&2
     exit 1
@@ -54,6 +68,7 @@ for key in \
   RUSTYNET_TRUST_WATERMARK \
   RUSTYNET_TRUST_SIGNER_KEY \
   RUSTYNET_TRUST_AUTO_REFRESH \
+  RUSTYNET_ASSIGNMENT_AUTO_REFRESH \
   RUSTYNET_MEMBERSHIP_SNAPSHOT \
   RUSTYNET_MEMBERSHIP_LOG \
   RUSTYNET_MEMBERSHIP_WATERMARK \
@@ -103,6 +118,9 @@ install -m 0644 "${HELPER_SERVICE_SRC}" "${HELPER_SERVICE_DST}"
 install -m 0644 "${TRUST_REFRESH_SERVICE_SRC}" "${TRUST_REFRESH_SERVICE_DST}"
 install -m 0644 "${TRUST_REFRESH_TIMER_SRC}" "${TRUST_REFRESH_TIMER_DST}"
 install -m 0755 "${TRUST_REFRESH_SCRIPT_SRC}" "${TRUST_REFRESH_SCRIPT_DST}"
+install -m 0644 "${ASSIGNMENT_REFRESH_SERVICE_SRC}" "${ASSIGNMENT_REFRESH_SERVICE_DST}"
+install -m 0644 "${ASSIGNMENT_REFRESH_TIMER_SRC}" "${ASSIGNMENT_REFRESH_TIMER_DST}"
+install -m 0755 "${ASSIGNMENT_REFRESH_SCRIPT_SRC}" "${ASSIGNMENT_REFRESH_SCRIPT_DST}"
 
 SOCKET_PATH="${RUSTYNET_SOCKET:-/run/rustynet/rustynetd.sock}"
 STATE_PATH="${RUSTYNET_STATE:-/var/lib/rustynet/rustynetd.state}"
@@ -111,6 +129,7 @@ TRUST_VERIFIER_KEY_PATH="${RUSTYNET_TRUST_VERIFIER_KEY:-/etc/rustynet/trust-evid
 TRUST_WATERMARK_PATH="${RUSTYNET_TRUST_WATERMARK:-/var/lib/rustynet/rustynetd.trust.watermark}"
 TRUST_SIGNER_KEY_PATH="${RUSTYNET_TRUST_SIGNER_KEY:-/etc/rustynet/trust-evidence.key}"
 TRUST_AUTO_REFRESH="${RUSTYNET_TRUST_AUTO_REFRESH:-false}"
+ASSIGNMENT_AUTO_REFRESH="${RUSTYNET_ASSIGNMENT_AUTO_REFRESH:-false}"
 MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT:-/var/lib/rustynet/membership.snapshot}"
 MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG:-/var/lib/rustynet/membership.log}"
 MEMBERSHIP_WATERMARK_PATH="${RUSTYNET_MEMBERSHIP_WATERMARK:-/var/lib/rustynet/membership.watermark}"
@@ -172,9 +191,20 @@ case "${TRUST_AUTO_REFRESH}" in
     exit 1
     ;;
 esac
+case "${ASSIGNMENT_AUTO_REFRESH}" in
+  true|false|1|0|yes|no) ;;
+  *)
+    echo "invalid assignment auto refresh value: ${ASSIGNMENT_AUTO_REFRESH} (expected true|false)" >&2
+    exit 1
+    ;;
+esac
 TRUST_AUTO_REFRESH_ENABLED="false"
 if [[ "${TRUST_AUTO_REFRESH}" == "true" || "${TRUST_AUTO_REFRESH}" == "1" || "${TRUST_AUTO_REFRESH}" == "yes" ]]; then
   TRUST_AUTO_REFRESH_ENABLED="true"
+fi
+ASSIGNMENT_AUTO_REFRESH_ENABLED="false"
+if [[ "${ASSIGNMENT_AUTO_REFRESH}" == "true" || "${ASSIGNMENT_AUTO_REFRESH}" == "1" || "${ASSIGNMENT_AUTO_REFRESH}" == "yes" ]]; then
+  ASSIGNMENT_AUTO_REFRESH_ENABLED="true"
 fi
 if [[ "${FAIL_CLOSED_SSH_ALLOW}" == "true" || "${FAIL_CLOSED_SSH_ALLOW}" == "1" || "${FAIL_CLOSED_SSH_ALLOW}" == "yes" ]]; then
   if [[ -z "${FAIL_CLOSED_SSH_ALLOW_CIDRS// }" ]]; then
@@ -349,6 +379,7 @@ RUSTYNET_TRUST_VERIFIER_KEY=${TRUST_VERIFIER_KEY_PATH}
 RUSTYNET_TRUST_WATERMARK=${TRUST_WATERMARK_PATH}
 RUSTYNET_TRUST_SIGNER_KEY=${TRUST_SIGNER_KEY_PATH}
 RUSTYNET_TRUST_AUTO_REFRESH=${TRUST_AUTO_REFRESH_ENABLED}
+RUSTYNET_ASSIGNMENT_AUTO_REFRESH=${ASSIGNMENT_AUTO_REFRESH_ENABLED}
 RUSTYNET_MEMBERSHIP_SNAPSHOT=${MEMBERSHIP_SNAPSHOT_PATH}
 RUSTYNET_MEMBERSHIP_LOG=${MEMBERSHIP_LOG_PATH}
 RUSTYNET_MEMBERSHIP_WATERMARK=${MEMBERSHIP_WATERMARK_PATH}
@@ -392,15 +423,37 @@ if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
 else
   systemctl disable --now rustynetd-trust-refresh.timer >/dev/null 2>&1 || true
 fi
-systemctl reset-failed rustynetd-privileged-helper.service rustynetd.service rustynetd-trust-refresh.service rustynetd-trust-refresh.timer >/dev/null 2>&1 || true
+if [[ "${ASSIGNMENT_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  if [[ ! -f "${AUTO_TUNNEL_VERIFIER_KEY_PATH}" ]]; then
+    echo "assignment auto-refresh enabled but verifier key missing: ${AUTO_TUNNEL_VERIFIER_KEY_PATH}" >&2
+    exit 1
+  fi
+  systemctl enable rustynetd-assignment-refresh.timer
+else
+  systemctl disable --now rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
+fi
+systemctl reset-failed \
+  rustynetd-privileged-helper.service \
+  rustynetd.service \
+  rustynetd-trust-refresh.service \
+  rustynetd-trust-refresh.timer \
+  rustynetd-assignment-refresh.service \
+  rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
 systemctl restart rustynetd-privileged-helper.service
 if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
   systemctl start rustynetd-trust-refresh.service
   systemctl restart rustynetd-trust-refresh.timer
 fi
+if [[ "${ASSIGNMENT_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  systemctl start rustynetd-assignment-refresh.service
+  systemctl restart rustynetd-assignment-refresh.timer
+fi
 systemctl restart rustynetd.service
 systemctl --no-pager --full status rustynetd-privileged-helper.service
 if [[ "${TRUST_AUTO_REFRESH_ENABLED}" == "true" ]]; then
   systemctl --no-pager --full status rustynetd-trust-refresh.timer
+fi
+if [[ "${ASSIGNMENT_AUTO_REFRESH_ENABLED}" == "true" ]]; then
+  systemctl --no-pager --full status rustynetd-assignment-refresh.timer
 fi
 systemctl --no-pager --full status rustynetd.service

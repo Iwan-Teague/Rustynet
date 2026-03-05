@@ -47,6 +47,22 @@ Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
 
+Linux assignment-refresh behavior:
+- Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
+- For unattended runtime, enable signer-backed assignment refresh with:
+  - `RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true` in `/etc/default/rustynetd`
+  - `/etc/rustynet/assignment-refresh.env` containing:
+    - `RUSTYNET_ASSIGNMENT_TARGET_NODE_ID`
+    - `RUSTYNET_ASSIGNMENT_NODES`
+    - `RUSTYNET_ASSIGNMENT_ALLOW`
+    - optional `RUSTYNET_ASSIGNMENT_EXIT_NODE_ID`
+    - `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` (default `/etc/rustynet/assignment.signing.secret`, `0600 root:root`)
+    - `RUSTYNET_ASSIGNMENT_TTL_SECS` and `RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS`
+- Installer enables `rustynetd-assignment-refresh.timer` when assignment auto-refresh is enabled.
+- Refresh jobs rewrite assignment artifacts with strict custody:
+  - bundle: `/var/lib/rustynet/rustynetd.assignment` (`0640 root:<daemon-group>`)
+  - verifier key: `/etc/rustynet/assignment.pub` (`0644 root:root`)
+
 Signed auto-tunnel assignment issuance:
 - Issue centrally signed per-node assignment bundles with explicit allow rules:
 ```bash
@@ -65,6 +81,7 @@ rustynet assignment issue \
 - Endpoint stability: set a fixed WireGuard listen port on each node (`RUSTYNET_WG_LISTEN_PORT`, default `51820`) so signed assignment endpoints remain valid across daemon restarts.
 - Exit-serving mode under enforced auto-tunnel: advertise `0.0.0.0/0` on the serving node (`rustynet route advertise 0.0.0.0/0`). This is the only route mutation allowed while auto-tunnel enforcement is enabled.
 - When `0.0.0.0/0` is advertised and the node is not itself using an exit node, `rustynetd` applies forwarding+NAT for secure exit serving during reconcile.
+- Keep assignment TTL aligned to `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS` (default max-age is 300s). If TTL exceeds max-age, max-age still enforces fail-closed expiration.
 
 ## Automated Debian Pair Clean Install + Tunnel Validation
 
