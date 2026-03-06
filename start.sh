@@ -610,7 +610,7 @@ secure_remove_file_with_scope() {
   fi
 
   if ! run_rustynet_ops_with_scope secure-remove --path "${target}" >/dev/null 2>&1; then
-    print_err "Secure remove failed for ${target}; refusing insecure fallback path."
+    print_err "Secure remove failed for ${target}; cleanup is fail-closed."
     return 1
   fi
   return 0
@@ -649,7 +649,7 @@ ensure_signing_passphrase_material() {
   fi
 
   if [[ "${rust_ops_status}" != "0" ]]; then
-    print_err "Rust-backed signing passphrase ensure flow failed; refusing legacy shell fallback."
+    print_err "Rust-backed signing passphrase ensure flow failed; setup is fail-closed."
     return 1
   fi
   return 0
@@ -698,7 +698,7 @@ materialize_signing_passphrase_file() {
 
   if [[ "${rust_ops_status}" != "0" ]]; then
     secure_remove_file_with_scope "${tmp_passphrase}" || true
-    print_err "Rust-backed signing passphrase materialization failed; refusing legacy shell fallback."
+    print_err "Rust-backed signing passphrase materialization failed; setup is fail-closed."
     return 1
   fi
 
@@ -1705,7 +1705,7 @@ prepare_system_directories() {
   fi
 
   if [[ "${rust_ops_status}" -ne 0 ]]; then
-    print_err "Rust-backed directory preparation failed; refusing shell fallback."
+    print_err "Rust-backed directory preparation failed; setup is fail-closed."
     return 1
   fi
   return 0
@@ -1781,7 +1781,7 @@ ensure_wireguard_keys() {
     RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
     RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
     rustynet ops bootstrap-wireguard-custody 2>&1)"; then
-    print_err "Rust-backed WireGuard custody bootstrap failed; refusing legacy shell fallback."
+    print_err "Rust-backed WireGuard custody bootstrap failed; setup is fail-closed."
     [[ -n "${rust_wg_bootstrap_output}" ]] && print_err "${rust_wg_bootstrap_output}"
     unset -f run_with_scope >/dev/null 2>&1 || true
     exit 1
@@ -1854,7 +1854,7 @@ ensure_membership_files() {
   fi
 
   if [[ "${rust_ops_status}" != "0" ]]; then
-    print_err "Rust-backed membership initialization failed; refusing legacy shell fallback."
+    print_err "Rust-backed membership initialization failed; setup is fail-closed."
     return 1
   fi
 
@@ -1884,7 +1884,7 @@ lockdown_blind_exit_local_material() {
     RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH="${ASSIGNMENT_REFRESH_ENV_PATH}" \
     RUSTYNET_SYSTEMD_ENV_PATH="/etc/default/rustynetd" \
     rustynet ops apply-blind-exit-lockdown 2>&1)"; then
-    print_err "Rust-backed blind_exit lockdown failed; refusing shell fallback."
+    print_err "Rust-backed blind_exit lockdown failed; setup is fail-closed."
     [[ -n "${rust_lockdown_output}" ]] && print_err "${rust_lockdown_output}"
     return 1
   fi
@@ -1934,7 +1934,7 @@ refresh_signed_trust_evidence() {
       RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
       rustynet ops refresh-signed-trust 2>&1)"; then
-      print_err "Rust-backed signed trust refresh failed; refusing legacy shell fallback."
+      print_err "Rust-backed signed trust refresh failed; setup is fail-closed."
       [[ -n "${rust_refresh_output}" ]] && print_err "${rust_refresh_output}"
       return 1
     fi
@@ -1951,7 +1951,7 @@ refresh_signed_trust_evidence() {
       RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
       rustynet ops refresh-signed-trust 2>&1)"; then
-      print_err "Rust-backed signed trust refresh failed; refusing legacy shell fallback."
+      print_err "Rust-backed signed trust refresh failed; setup is fail-closed."
       [[ -n "${rust_refresh_output}" ]] && print_err "${rust_refresh_output}"
       return 1
     fi
@@ -2159,7 +2159,7 @@ write_daemon_environment() {
   if ! run_systemd_installer_with_env \
     RUSTYNET_INSTALL_SOURCE_ROOT="${ROOT_DIR}" \
     rustynet ops install-systemd; then
-    print_err "Rust-backed systemd installer invocation failed; refusing wrapper fallback."
+    print_err "Rust-backed systemd installer invocation failed; setup is fail-closed."
     unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
     exit 1
   fi
@@ -2999,13 +2999,13 @@ set_local_assignment_refresh_exit_node() {
     if ! run_root rustynet ops set-assignment-refresh-exit-node \
       --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}" \
       --exit-node-id "${exit_node_id}" >/dev/null 2>&1; then
-      print_err "Rust-backed assignment refresh env update failed; refusing shell fallback."
+      print_err "Rust-backed assignment refresh env update failed; setup is fail-closed."
       return 1
     fi
   else
     if ! run_root rustynet ops set-assignment-refresh-exit-node \
       --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}" >/dev/null 2>&1; then
-      print_err "Rust-backed assignment refresh env update failed; refusing shell fallback."
+      print_err "Rust-backed assignment refresh env update failed; setup is fail-closed."
       return 1
     fi
   fi
@@ -3132,7 +3132,7 @@ switch_node_role_mode() {
       RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
       RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
       "${role_coupling_cmd[@]}"; then
-      print_err "Rust-backed role coupling failed; refusing legacy shell fallback."
+      print_err "Rust-backed role coupling failed; setup is fail-closed."
       return 1
     fi
   else

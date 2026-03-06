@@ -190,6 +190,11 @@ RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase10_artifacts.sh
 ```
 
+Phase 6 release scripts are thin wrappers to Rust-only ops commands:
+- `rustynet ops collect-platform-probe`
+- `rustynet ops generate-platform-parity-report`
+- `rustynet ops collect-platform-parity-bundle`
+
 Raw measured inputs must exist first:
 - `artifacts/release/raw/platform_parity_linux.json`
 - `artifacts/release/raw/platform_parity_macos.json`

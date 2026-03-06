@@ -40,6 +40,7 @@ use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
+use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +161,9 @@ enum OpsCommand {
     RefreshSignedTrust,
     BootstrapTunnelCustody,
     RefreshAssignment,
+    CollectPlatformProbe,
+    GeneratePlatformParityReport,
+    CollectPlatformParityBundle,
     InstallSystemd,
     PrepareSystemDirs,
     ApplyBlindExitLockdown,
@@ -298,6 +302,28 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops refresh-assignment does not accept options".to_string());
             }
             Ok(OpsCommand::RefreshAssignment)
+        }
+        "collect-platform-probe" => {
+            if args.len() != 1 {
+                return Err("ops collect-platform-probe does not accept options".to_string());
+            }
+            Ok(OpsCommand::CollectPlatformProbe)
+        }
+        "generate-platform-parity-report" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops generate-platform-parity-report does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::GeneratePlatformParityReport)
+        }
+        "collect-platform-parity-bundle" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops collect-platform-parity-bundle does not accept options".to_string()
+                );
+            }
+            Ok(OpsCommand::CollectPlatformParityBundle)
         }
         "install-systemd" => {
             if args.len() != 1 {
@@ -1094,6 +1120,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
         OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),
         OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
+        OpsCommand::CollectPlatformProbe => execute_ops_collect_platform_probe(),
+        OpsCommand::GeneratePlatformParityReport => execute_ops_generate_platform_parity_report(),
+        OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
         OpsCommand::ApplyBlindExitLockdown => execute_ops_apply_blind_exit_lockdown(),
@@ -1438,6 +1467,685 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Phase6Platform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl Phase6Platform {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+            Self::Windows => "windows",
+        }
+    }
+
+    fn raw_filename(self) -> &'static str {
+        match self {
+            Self::Linux => "platform_parity_linux.json",
+            Self::Macos => "platform_parity_macos.json",
+            Self::Windows => "platform_parity_windows.json",
+        }
+    }
+
+    fn all() -> [Self; 3] {
+        [Self::Linux, Self::Macos, Self::Windows]
+    }
+}
+
+fn execute_ops_collect_platform_probe() -> Result<String, String> {
+    let out_path = collect_platform_probe_artifact()?;
+    Ok(format!("wrote platform probe: {}", out_path.display()))
+}
+
+fn execute_ops_generate_platform_parity_report() -> Result<String, String> {
+    let out_path = generate_platform_parity_report_artifact()?;
+    phase6_validate_platform_parity_report(out_path.as_path())?;
+    Ok(format!(
+        "wrote platform parity report: {}",
+        out_path.display()
+    ))
+}
+
+fn execute_ops_collect_platform_parity_bundle() -> Result<String, String> {
+    let raw_dir = env_path_or_default(
+        "RUSTYNET_PHASE6_PARITY_RAW_DIR",
+        DEFAULT_PHASE6_PARITY_RAW_DIR,
+    )?;
+    let inbox_dir = env_path_or_default(
+        "RUSTYNET_PHASE6_PARITY_INBOX_DIR",
+        DEFAULT_PHASE6_PARITY_INBOX_DIR,
+    )?;
+
+    fs::create_dir_all(&raw_dir).map_err(|err| {
+        format!(
+            "create parity raw directory failed ({}): {err}",
+            raw_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&inbox_dir).map_err(|err| {
+        format!(
+            "create parity inbox directory failed ({}): {err}",
+            inbox_dir.display()
+        )
+    })?;
+
+    collect_platform_probe_artifact()?;
+
+    for platform in Phase6Platform::all() {
+        let raw_path = raw_dir.join(platform.raw_filename());
+        let inbox_path = inbox_dir.join(platform.raw_filename());
+        if !raw_path.exists() && inbox_path.exists() {
+            fs::copy(&inbox_path, &raw_path).map_err(|err| {
+                format!(
+                    "copy platform probe from inbox failed ({} -> {}): {err}",
+                    inbox_path.display(),
+                    raw_path.display()
+                )
+            })?;
+        }
+        if !raw_path.exists() {
+            return Err(format!(
+                "missing platform parity probe for {}: expected {} or {}",
+                platform.as_str(),
+                raw_path.display(),
+                inbox_path.display()
+            ));
+        }
+    }
+
+    let report_path = generate_platform_parity_report_artifact()?;
+    phase6_validate_platform_parity_report(report_path.as_path())?;
+
+    Ok("phase6 platform parity bundle generated from probes".to_string())
+}
+
+fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
+    let raw_dir = env_path_or_default(
+        "RUSTYNET_PHASE6_PARITY_RAW_DIR",
+        DEFAULT_PHASE6_PARITY_RAW_DIR,
+    )?;
+    fs::create_dir_all(&raw_dir).map_err(|err| {
+        format!(
+            "create parity raw directory failed ({}): {err}",
+            raw_dir.display()
+        )
+    })?;
+
+    let platform = phase6_detect_probe_platform()?;
+
+    let (
+        route_hook_ready,
+        dns_hook_ready,
+        firewall_hook_ready,
+        route_probe_cmd,
+        dns_probe_cmd,
+        firewall_probe_cmd,
+    ) = match platform {
+        Phase6Platform::Linux => {
+            let route_probe_cmd = "ip -o route show default".to_string();
+            let route_hook_ready =
+                phase6_command_succeeds("ip", &["-o", "route", "show", "default"]);
+
+            let (dns_hook_ready, dns_probe_cmd) = if phase6_command_available("resolvectl") {
+                (
+                    phase6_command_succeeds("resolvectl", &["status"]),
+                    "resolvectl status".to_string(),
+                )
+            } else {
+                (
+                    phase6_nonempty_file(Path::new("/etc/resolv.conf")),
+                    "test -s /etc/resolv.conf".to_string(),
+                )
+            };
+
+            let (firewall_hook_ready, firewall_probe_cmd) = if phase6_command_available("nft") {
+                (
+                    phase6_command_succeeds("nft", &["list", "tables"]),
+                    "nft list tables".to_string(),
+                )
+            } else if phase6_command_available("iptables") {
+                (
+                    phase6_command_succeeds("iptables", &["-S"]),
+                    "iptables -S".to_string(),
+                )
+            } else {
+                (false, "nft|iptables unavailable".to_string())
+            };
+
+            (
+                route_hook_ready,
+                dns_hook_ready,
+                firewall_hook_ready,
+                route_probe_cmd,
+                dns_probe_cmd,
+                firewall_probe_cmd,
+            )
+        }
+        Phase6Platform::Macos => (
+            phase6_command_succeeds("route", &["-n", "get", "default"]),
+            phase6_command_succeeds("scutil", &["--dns"]),
+            phase6_command_succeeds("pfctl", &["-s", "info"]),
+            "route -n get default".to_string(),
+            "scutil --dns".to_string(),
+            "pfctl -s info".to_string(),
+        ),
+        Phase6Platform::Windows => (
+            phase6_command_succeeds(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1 | Out-Null",
+                ],
+            ),
+            phase6_command_succeeds(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-DnsClientServerAddress | Out-Null",
+                ],
+            ),
+            phase6_command_succeeds(
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetFirewallProfile | Out-Null",
+                ],
+            ),
+            "powershell.exe Get-NetRoute".to_string(),
+            "powershell.exe Get-DnsClientServerAddress".to_string(),
+            "powershell.exe Get-NetFirewallProfile".to_string(),
+        ),
+    };
+
+    let leak_source = phase6_leak_report_source(platform)?;
+    let leak_matrix_passed = phase6_leak_report_passed(Path::new(leak_source.as_str()));
+
+    let out_path = raw_dir.join(platform.raw_filename());
+    let payload = json!({
+        "evidence_mode": "measured",
+        "platform": platform.as_str(),
+        "route_hook_ready": route_hook_ready,
+        "dns_hook_ready": dns_hook_ready,
+        "firewall_hook_ready": firewall_hook_ready,
+        "leak_matrix_passed": leak_matrix_passed,
+        "probe_time_unix": unix_now(),
+        "probe_host": phase6_probe_host(),
+        "probe_sources": {
+            "route": route_probe_cmd,
+            "dns": dns_probe_cmd,
+            "firewall": firewall_probe_cmd,
+            "leak_report": leak_source,
+        },
+    });
+    write_json_pretty_file(&out_path, &payload)?;
+
+    let strict_mode = env_string_or_default("RUSTYNET_PHASE6_PARITY_STRICT", "1")?;
+    if strict_mode == "1"
+        && (!route_hook_ready || !dns_hook_ready || !firewall_hook_ready || !leak_matrix_passed)
+    {
+        return Err(format!(
+            "platform parity probe recorded failing controls in {}",
+            out_path.display()
+        ));
+    }
+
+    Ok(out_path)
+}
+
+fn generate_platform_parity_report_artifact() -> Result<PathBuf, String> {
+    let raw_dir = env_path_or_default(
+        "RUSTYNET_PHASE6_PARITY_RAW_DIR",
+        DEFAULT_PHASE6_PARITY_RAW_DIR,
+    )?;
+    let out_path = env_path_or_default(
+        "RUSTYNET_PHASE6_PARITY_OUT",
+        DEFAULT_PHASE6_PARITY_REPORT_PATH,
+    )?;
+    let environment = env_required_nonempty(
+        "RUSTYNET_PHASE6_PARITY_ENVIRONMENT",
+        "phase6 parity environment",
+    )?;
+
+    let mut results = Vec::new();
+    let mut source_artifacts = Vec::new();
+    for platform in Phase6Platform::all() {
+        let source = raw_dir.join(platform.raw_filename());
+        if !source.exists() {
+            return Err(format!(
+                "missing raw platform parity input: {}",
+                source.display()
+            ));
+        }
+        let payload = read_json_value(&source, "raw platform parity payload")?;
+        if !payload.is_object() {
+            return Err(format!(
+                "raw platform parity payload must be object: {}",
+                source.display()
+            ));
+        }
+
+        let result = json!({
+            "platform": platform.as_str(),
+            "route_hook_ready": phase6_require_bool_field(&payload, "route_hook_ready", &source)?,
+            "dns_hook_ready": phase6_require_bool_field(&payload, "dns_hook_ready", &source)?,
+            "firewall_hook_ready": phase6_require_bool_field(&payload, "firewall_hook_ready", &source)?,
+            "leak_matrix_passed": phase6_require_bool_field(&payload, "leak_matrix_passed", &source)?,
+        });
+        results.push(result);
+        source_artifacts.push(source.display().to_string());
+    }
+
+    let report = json!({
+        "evidence_mode": "measured",
+        "captured_at_unix": unix_now(),
+        "environment": environment,
+        "source_artifacts": source_artifacts,
+        "platform_results": results,
+    });
+    write_json_pretty_file(&out_path, &report)?;
+    Ok(out_path)
+}
+
+fn phase6_detect_probe_platform() -> Result<Phase6Platform, String> {
+    if let Some(override_platform) = env_optional_string("RUSTYNET_PHASE6_PLATFORM_OVERRIDE")? {
+        return match override_platform.to_ascii_lowercase().as_str() {
+            "linux" => Ok(Phase6Platform::Linux),
+            "macos" => Ok(Phase6Platform::Macos),
+            "windows" => Ok(Phase6Platform::Windows),
+            _ => Err(format!(
+                "unsupported platform override: {}",
+                override_platform
+            )),
+        };
+    }
+
+    match detect_host_profile() {
+        "linux" => Ok(Phase6Platform::Linux),
+        "macos" => Ok(Phase6Platform::Macos),
+        other => Err(format!("unsupported platform for parity probe: {other}")),
+    }
+}
+
+fn phase6_leak_report_source(platform: Phase6Platform) -> Result<String, String> {
+    let default_source = env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT")?
+        .unwrap_or_else(|| DEFAULT_PHASE10_LEAK_REPORT_PATH.to_string());
+    let platform_source = match platform {
+        Phase6Platform::Linux => env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT_LINUX")?,
+        Phase6Platform::Macos => env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT_MACOS")?,
+        Phase6Platform::Windows => env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT_WINDOWS")?,
+    };
+    Ok(platform_source.unwrap_or(default_source))
+}
+
+fn phase6_leak_report_passed(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let payload = match read_json_value(path, "phase6 leak report") {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    payload
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "pass")
+        && payload
+            .get("evidence_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode == "measured")
+}
+
+fn phase6_probe_host() -> String {
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && !hostname.trim().is_empty()
+    {
+        return hostname;
+    }
+    let output = Command::new("hostname")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(output) = output {
+        let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !hostname.is_empty() {
+            return hostname;
+        }
+    }
+    "unknown".to_string()
+}
+
+fn phase6_command_available(command: &str) -> bool {
+    if command.contains('/') {
+        return Path::new(command).is_file();
+    }
+
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for directory in std::env::split_paths(&path_env) {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn phase6_command_succeeds(command: &str, args: &[&str]) -> bool {
+    if !phase6_command_available(command) {
+        return false;
+    }
+    Command::new(command)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn phase6_nonempty_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+fn write_json_pretty_file(path: &Path, payload: &Value) -> Result<(), String> {
+    let mut body = serde_json::to_string_pretty(payload)
+        .map_err(|err| format!("serialize json failed: {err}"))?;
+    body.push('\n');
+    write_text_file(path, &body)
+}
+
+fn read_json_value(path: &Path, label: &str) -> Result<Value, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
+    serde_json::from_str(body.as_str())
+        .map_err(|err| format!("parse {label} failed ({}): {err}", path.display()))
+}
+
+fn phase6_require_bool_field(payload: &Value, key: &str, source: &Path) -> Result<bool, String> {
+    payload
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{} requires boolean field: {key}", source.display()))
+}
+
+fn phase6_validate_platform_parity_report(report_path: &Path) -> Result<(), String> {
+    if !report_path.exists() {
+        return Err(format!(
+            "missing platform parity report: {}",
+            report_path.display()
+        ));
+    }
+    let report = read_json_value(report_path, "platform parity report")?;
+    let report_obj = report
+        .as_object()
+        .ok_or_else(|| "platform parity report must be a JSON object".to_string())?;
+
+    if report_obj
+        .get("evidence_mode")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value != "measured")
+    {
+        return Err("platform parity report must set evidence_mode=measured".to_string());
+    }
+
+    let captured_at_unix = report_obj
+        .get("captured_at_unix")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "platform parity report requires positive integer captured_at_unix".to_string()
+        })?;
+    if captured_at_unix == 0 {
+        return Err(
+            "platform parity report requires positive integer captured_at_unix".to_string(),
+        );
+    }
+
+    let now_unix = unix_now();
+    if captured_at_unix > now_unix.saturating_add(300) {
+        return Err("platform parity report captured_at_unix is too far in the future".to_string());
+    }
+    if now_unix.saturating_sub(captured_at_unix) > PHASE6_MAX_EVIDENCE_AGE_SECS {
+        return Err(
+            "platform parity report is stale; regenerate with fresh measurements".to_string(),
+        );
+    }
+
+    let environment = report_obj
+        .get("environment")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "platform parity report requires non-empty environment".to_string())?;
+    if environment.trim().is_empty() {
+        return Err("platform parity report requires non-empty environment".to_string());
+    }
+
+    if report_obj.contains_key("gate_passed") {
+        return Err("platform parity report must not include gate_passed toggle".to_string());
+    }
+
+    let source_artifacts = report_obj
+        .get("source_artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "platform parity report requires non-empty source_artifacts list".to_string()
+        })?;
+    if source_artifacts.is_empty() {
+        return Err("platform parity report requires non-empty source_artifacts list".to_string());
+    }
+
+    let required_platforms = Phase6Platform::all()
+        .iter()
+        .map(|platform| platform.as_str().to_string())
+        .collect::<HashSet<_>>();
+    let mut source_by_platform = HashMap::new();
+
+    for source in source_artifacts {
+        let source_str = source.as_str().ok_or_else(|| {
+            "platform parity report has invalid source_artifacts entry".to_string()
+        })?;
+        if source_str.trim().is_empty() {
+            return Err("platform parity report has invalid source_artifacts entry".to_string());
+        }
+        let mut source_path = PathBuf::from(source_str);
+        if !source_path.is_absolute() {
+            source_path = PathBuf::from(".").join(source_path);
+        }
+        if !source_path.exists() {
+            return Err(format!(
+                "platform parity source artifact missing: {source_str}"
+            ));
+        }
+
+        let source_payload = read_json_value(&source_path, "platform parity source artifact")?;
+        let source_obj = source_payload.as_object().ok_or_else(|| {
+            format!("platform parity source artifact must be JSON object: {source_str}")
+        })?;
+        if source_obj
+            .get("evidence_mode")
+            .and_then(Value::as_str)
+            .is_none_or(|mode| mode != "measured")
+        {
+            return Err(format!(
+                "platform parity source artifact must set evidence_mode=measured: {source_str}"
+            ));
+        }
+
+        let source_platform = source_obj
+            .get("platform")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("platform parity source artifact missing platform field: {source_str}")
+            })?
+            .trim()
+            .to_ascii_lowercase();
+        if source_platform.is_empty() {
+            return Err(format!(
+                "platform parity source artifact missing platform field: {source_str}"
+            ));
+        }
+        if !required_platforms.contains(&source_platform) {
+            return Err(format!(
+                "platform parity source artifact has unsupported platform: {source_str}"
+            ));
+        }
+        if source_by_platform.contains_key(&source_platform) {
+            return Err(format!(
+                "duplicate platform parity source artifact for platform: {source_platform}"
+            ));
+        }
+
+        let probe_time_unix = source_obj
+            .get("probe_time_unix")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "platform parity source artifact requires positive integer probe_time_unix: {source_str}"
+                )
+            })?;
+        if probe_time_unix == 0 {
+            return Err(format!(
+                "platform parity source artifact requires positive integer probe_time_unix: {source_str}"
+            ));
+        }
+        if probe_time_unix > now_unix.saturating_add(300) {
+            return Err(format!(
+                "platform parity source artifact probe_time_unix is too far in the future: {source_str}"
+            ));
+        }
+        if now_unix.saturating_sub(probe_time_unix) > PHASE6_MAX_EVIDENCE_AGE_SECS {
+            return Err(format!(
+                "platform parity source artifact is stale; recollect probe evidence: {source_str}"
+            ));
+        }
+
+        let probe_host = source_obj
+            .get("probe_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "platform parity source artifact requires non-empty probe_host: {source_str}"
+                )
+            })?;
+        if probe_host.trim().is_empty() {
+            return Err(format!(
+                "platform parity source artifact requires non-empty probe_host: {source_str}"
+            ));
+        }
+
+        let probe_sources = source_obj
+            .get("probe_sources")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                format!(
+                    "platform parity source artifact requires probe_sources object: {source_str}"
+                )
+            })?;
+        for key in ["route", "dns", "firewall", "leak_report"] {
+            let value = probe_sources
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "platform parity source artifact missing probe source '{key}': {source_str}"
+                    )
+                })?;
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "platform parity source artifact missing probe source '{key}': {source_str}"
+                ));
+            }
+        }
+
+        source_by_platform.insert(source_platform, source_payload);
+    }
+
+    let platform_results = report_obj
+        .get("platform_results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "platform parity report requires non-empty platform_results list".to_string()
+        })?;
+    if platform_results.is_empty() {
+        return Err("platform parity report requires non-empty platform_results list".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    for result in platform_results {
+        let result_obj = result.as_object().ok_or_else(|| {
+            "platform parity report has invalid platform_results entry".to_string()
+        })?;
+        let platform = result_obj
+            .get("platform")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "platform parity report entry missing platform".to_string())?
+            .trim()
+            .to_ascii_lowercase();
+        if !required_platforms.contains(&platform) {
+            return Err(format!("unexpected platform in parity report: {platform}"));
+        }
+        seen.insert(platform.clone());
+        let Some(source_payload) = source_by_platform.get(&platform) else {
+            return Err(format!(
+                "platform parity report missing source artifact for platform: {platform}"
+            ));
+        };
+        for key in [
+            "route_hook_ready",
+            "dns_hook_ready",
+            "firewall_hook_ready",
+            "leak_matrix_passed",
+        ] {
+            let value = result_obj
+                .get(key)
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    format!("platform parity requirement failed for {platform}: {key} must be true")
+                })?;
+            if !value {
+                return Err(format!(
+                    "platform parity requirement failed for {platform}: {key} must be true"
+                ));
+            }
+            let source_value = source_payload.get(key).and_then(Value::as_bool).ok_or_else(|| {
+                format!(
+                    "platform parity source requirement failed for {platform}: {key} must be true"
+                )
+            })?;
+            if !source_value {
+                return Err(format!(
+                    "platform parity source requirement failed for {platform}: {key} must be true"
+                ));
+            }
+        }
+    }
+
+    if seen != required_platforms {
+        let mut missing = required_platforms
+            .difference(&seen)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        return Err(format!(
+            "platform parity report missing platforms: {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 const DEFAULT_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
 const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
@@ -1450,6 +2158,11 @@ const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assig
 const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.assignment.watermark";
 const DEFAULT_DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
+const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
+const DEFAULT_PHASE6_PARITY_INBOX_DIR: &str = "artifacts/release/inbox";
+const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
+const DEFAULT_PHASE10_LEAK_REPORT_PATH: &str = "artifacts/phase10/leak_test_report.json";
+const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
 const DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key";
@@ -4131,6 +4844,9 @@ fn help_text() -> String {
         "  ops refresh-signed-trust",
         "  ops bootstrap-wireguard-custody",
         "  ops refresh-assignment",
+        "  ops collect-platform-probe",
+        "  ops generate-platform-parity-report",
+        "  ops collect-platform-parity-bundle",
         "  ops install-systemd",
         "  ops prepare-system-dirs",
         "  ops apply-blind-exit-lockdown",
@@ -4148,8 +4864,9 @@ fn help_text() -> String {
 mod tests {
     use super::{
         detect_tampered_log, execute, load_signing_key, parse_bool_value, parse_bundle_u64_field,
-        parse_command, persist_encrypted_secret_material, required_macos_tunnel_keychain_account,
-        rewrite_assignment_refresh_exit_node, rewrite_env_key_value,
+        parse_command, persist_encrypted_secret_material, phase6_validate_platform_parity_report,
+        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
+        rewrite_env_key_value,
     };
 
     #[test]
@@ -4169,6 +4886,94 @@ mod tests {
 
         let revoke = parse_command(&["key".to_string(), "revoke".to_string()]);
         assert!(format!("{revoke:?}").contains("KeyRevoke"));
+    }
+
+    #[test]
+    fn parse_supports_phase6_parity_ops_commands() {
+        let probe = parse_command(&["ops".to_string(), "collect-platform-probe".to_string()]);
+        assert!(format!("{probe:?}").contains("CollectPlatformProbe"));
+
+        let report = parse_command(&[
+            "ops".to_string(),
+            "generate-platform-parity-report".to_string(),
+        ]);
+        assert!(format!("{report:?}").contains("GeneratePlatformParityReport"));
+
+        let bundle = parse_command(&[
+            "ops".to_string(),
+            "collect-platform-parity-bundle".to_string(),
+        ]);
+        assert!(format!("{bundle:?}").contains("CollectPlatformParityBundle"));
+    }
+
+    #[test]
+    fn phase6_parity_validation_rejects_false_readiness_control() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp validation dir");
+
+        let write_json = |path: &std::path::Path, payload: serde_json::Value| {
+            let mut body = serde_json::to_string_pretty(&payload).expect("serialize json");
+            body.push('\n');
+            std::fs::write(path, body).expect("write json payload");
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs();
+
+        let mut sources = Vec::new();
+        for platform in ["linux", "macos", "windows"] {
+            let source = base.join(format!("platform_parity_{platform}.json"));
+            let route_ok = platform != "macos";
+            write_json(
+                source.as_path(),
+                serde_json::json!({
+                    "evidence_mode": "measured",
+                    "platform": platform,
+                    "route_hook_ready": route_ok,
+                    "dns_hook_ready": true,
+                    "firewall_hook_ready": true,
+                    "leak_matrix_passed": true,
+                    "probe_time_unix": now,
+                    "probe_host": format!("host-{platform}"),
+                    "probe_sources": {
+                        "route": "route probe",
+                        "dns": "dns probe",
+                        "firewall": "firewall probe",
+                        "leak_report": "/tmp/leak.json",
+                    },
+                }),
+            );
+            sources.push(source.display().to_string());
+        }
+
+        let report_path = base.join("platform_parity_report.json");
+        write_json(
+            report_path.as_path(),
+            serde_json::json!({
+                "evidence_mode": "measured",
+                "captured_at_unix": now,
+                "environment": "ci",
+                "source_artifacts": sources,
+                "platform_results": [
+                    {"platform": "linux", "route_hook_ready": true, "dns_hook_ready": true, "firewall_hook_ready": true, "leak_matrix_passed": true},
+                    {"platform": "macos", "route_hook_ready": false, "dns_hook_ready": true, "firewall_hook_ready": true, "leak_matrix_passed": true},
+                    {"platform": "windows", "route_hook_ready": true, "dns_hook_ready": true, "firewall_hook_ready": true, "leak_matrix_passed": true}
+                ],
+            }),
+        );
+
+        let error = phase6_validate_platform_parity_report(report_path.as_path())
+            .expect_err("expected fail-closed parity validation error");
+        assert!(error.contains("route_hook_ready must be true"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -15,10 +15,11 @@ Success criteria:
 ## Status Update (2026-03-06)
 - Phase A complete: `refresh_trust_evidence.sh` and `refresh_assignment_bundle.sh` are thin wrappers to Rust ops commands.
 - Phase B complete: `install_rustynetd_service.sh` is now a thin wrapper to `rustynet ops install-systemd`; core installer logic (idempotent user/group/dir setup, credential-path pinning, env file generation, legacy cleanup/migration, systemd orchestration) is implemented in Rust.
-- Phase C complete: `rustynet-cli` now provides Rust-backed ops for secure file scrubbing/removal, signing-passphrase material ensure/materialization, trust-refresh helper invocation, assignment-refresh exit-node env mutation, and role-switch coupling (`ops apply-role-coupling`); `start.sh` now prefers these Rust ops paths with shell fallbacks.
+- Phase C complete: `rustynet-cli` now provides Rust-backed ops for secure file scrubbing/removal, signing-passphrase material ensure/materialization, trust-refresh helper invocation, assignment-refresh exit-node env mutation, and role-switch coupling (`ops apply-role-coupling`); migrated `start.sh` paths are Rust-only and fail closed.
 - Phase D baseline complete: added optional Rust operator UX entrypoint via `rustynet operator menu` while retaining `start.sh` as compatibility UI wrapper.
-- Phase E started: added Rust ops `prepare-system-dirs`, `apply-blind-exit-lockdown`, `init-membership`, and `refresh-signed-trust`; `start.sh` now prefers these Rust paths with shell fallbacks and directly invokes `rustynet ops install-systemd` (wrapper fallback retained).
-- Phase E progress: `ensure_wireguard_keys` now prefers `rustynet ops bootstrap-wireguard-custody`; if the installed `rustynet` supports the command and it fails, setup now fails closed (no automatic downgrade to legacy shell path). Legacy shell fallback is only used when the command is unavailable in older binaries.
+- Phase E started: added Rust ops `prepare-system-dirs`, `apply-blind-exit-lockdown`, `init-membership`, and `refresh-signed-trust`; migrated `start.sh` privilege paths are Rust-only and fail closed.
+- Phase E progress: `ensure_wireguard_keys` is enforced through `rustynet ops bootstrap-wireguard-custody` with fail-closed behavior.
+- Phase F complete: Phase 6 parity probe/report/bundle generators are Rust-backed (`rustynet ops collect-platform-probe`, `rustynet ops generate-platform-parity-report`, `rustynet ops collect-platform-parity-bundle`); release scripts are thin wrappers that only dispatch to Rust commands.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
@@ -40,7 +41,7 @@ High-impact scripts by privilege + secret handling + size:
 - High impact due to system-wide mutation and policy wiring.
 
 Lower priority (keep shell for now):
-- `scripts/ci/*.sh`, `scripts/e2e/*.sh`, release/evidence generation scripts.
+- `scripts/ci/*.sh`, `scripts/e2e/*.sh`.
 - These are mostly orchestration/test glue and should remain thin shell wrappers.
 
 ## 3) Migration Strategy
@@ -224,21 +225,16 @@ Priority is based on: `privilege level` + `secret handling` + `state mutation ri
 - `start_or_restart_service`
 - `disconnect_vpn`
 
-2. Release evidence/parity pipeline
-- `scripts/release/collect_platform_probe.sh`
-- `scripts/release/generate_platform_parity_report.sh`
-- `scripts/release/collect_platform_parity_bundle.sh`
-
-3. Operations evidence pipeline
+2. Operations evidence pipeline
 - `scripts/operations/collect_phase9_raw_evidence.sh`
 - `scripts/operations/generate_phase9_artifacts.sh`
 - `scripts/operations/generate_phase10_artifacts.sh`
 
-4. Performance measured-input pipeline
+3. Performance measured-input pipeline
 - `scripts/perf/collect_phase1_measured_env.sh`
 - `scripts/perf/run_phase1_baseline.sh`
 
-5. Optional later (test harness hardening)
+4. Optional later (test harness hardening)
 - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh`
 
 Keep as shell wrappers for now:
@@ -282,9 +278,9 @@ Scope:
 - Remove shell + Python-heredoc JSON construction in release path.
 
 Recommended Rust command additions:
-- `rustynet release collect-platform-probe`
-- `rustynet release generate-platform-parity-report`
-- `rustynet release collect-platform-parity-bundle`
+- `rustynet ops collect-platform-probe`
+- `rustynet ops generate-platform-parity-report`
+- `rustynet ops collect-platform-parity-bundle`
 
 Security controls:
 - strict schema validation with typed structs,

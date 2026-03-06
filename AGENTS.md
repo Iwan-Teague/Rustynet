@@ -27,6 +27,7 @@ Rules:
 - Default-deny policy is mandatory across ACL, routes, and trust-sensitive flows.
 - Fail closed when trust/security state is missing, invalid, stale, or unavailable.
 - Do not defer in-scope requirements behind TODO/FIXME/placeholders in completed deliverables.
+- Enforce one hardened execution path per security-sensitive workflow: no runtime fallback/downgrade/legacy branches in production paths.
 
 ## 4) Security Baseline Requirements
 - Enforce signed control/trust state validation before mutation.
@@ -37,6 +38,7 @@ Rules:
 - Never log secrets or private key material.
 - Preserve privileged-boundary hardening: argv-only exec for helpers, strict input validation, no shell construction with untrusted values.
 - Preserve tunnel/DNS fail-closed behavior in protected modes.
+- During shell-to-Rust migration, remove superseded shell implementations from active paths; wrappers may only dispatch to the Rust command and fail closed on error.
 
 Each security control implemented must include:
 1. enforcement point in code, and
