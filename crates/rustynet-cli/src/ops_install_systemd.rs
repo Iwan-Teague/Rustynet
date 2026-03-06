@@ -1132,10 +1132,10 @@ fn detect_default_egress_interface() -> Result<String, String> {
     for line in output.lines() {
         let tokens = line.split_whitespace().collect::<Vec<_>>();
         for (idx, token) in tokens.iter().enumerate() {
-            if *token == "dev"
-                && let Some(name) = tokens.get(idx + 1)
-            {
-                return Ok((*name).to_string());
+            if *token == "dev" {
+                if let Some(name) = tokens.get(idx + 1) {
+                    return Ok((*name).to_string());
+                }
             }
         }
         if let Some(name) = tokens.get(4) {

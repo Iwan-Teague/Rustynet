@@ -1011,13 +1011,13 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     let nodes_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_NODES", "assignment node map")?;
     let allow_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_ALLOW", "assignment allow rules")?;
     let exit_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
-    if let Some(exit_node_id) = exit_node_id.as_deref()
-        && !is_valid_node_id(exit_node_id)
-    {
-        return Err(format!(
-            "exit node id contains unsupported characters: {}",
-            exit_node_id
-        ));
+    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
+        if !is_valid_node_id(exit_node_id_value) {
+            return Err(format!(
+                "exit node id contains unsupported characters: {}",
+                exit_node_id_value
+            ));
+        }
     }
 
     let signing_secret_path = env_path_or_default(
@@ -1052,16 +1052,18 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
 
     let now_unix = unix_now();
-    if bundle_path.exists()
-        && let Some(current_expires_at) =
+    if bundle_path.exists() {
+        if let Some(current_expires_at) =
             read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
-    {
-        let remaining_secs = current_expires_at.saturating_sub(now_unix);
-        return Ok(format!(
-            "[assignment-refresh] current assignment expires in {}s; skip refresh.",
-            remaining_secs
-        ));
+        {
+            if current_expires_at > now_unix.saturating_add(min_remaining_secs) {
+                let remaining_secs = current_expires_at.saturating_sub(now_unix);
+                return Ok(format!(
+                    "[assignment-refresh] current assignment expires in {}s; skip refresh.",
+                    remaining_secs
+                ));
+            }
+        }
     }
 
     let bundle_group_gid = group_gid_or_root(daemon_group.as_str())?;
