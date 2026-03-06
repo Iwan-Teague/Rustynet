@@ -489,7 +489,7 @@ impl LinuxCommandSystem {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
-            let args = Self::management_bypass_route_args(cidr, self.egress_interface.as_str());
+            let args = Self::management_bypass_route_args(cidr);
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
             result.map_err(|err| {
@@ -501,35 +501,31 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    fn management_bypass_route_args(cidr: &str, egress_interface: &str) -> Vec<String> {
-        let mut args = Vec::with_capacity(9);
+    fn management_bypass_route_args(cidr: &str) -> Vec<String> {
+        let mut args = Vec::with_capacity(7);
         if cidr.contains(':') {
             args.push("-6".to_string());
         }
         args.push("route".to_string());
         args.push("replace".to_string());
         args.push(cidr.to_string());
-        args.push("dev".to_string());
-        args.push(egress_interface.to_string());
         args.push("table".to_string());
         args.push("51820".to_string());
         args
     }
 
-    fn peer_endpoint_bypass_route_args(addr: IpAddr, egress_interface: &str) -> Vec<String> {
+    fn peer_endpoint_bypass_route_args(addr: IpAddr) -> Vec<String> {
         let endpoint_cidr = match addr {
             IpAddr::V4(value) => format!("{value}/32"),
             IpAddr::V6(value) => format!("{value}/128"),
         };
-        let mut args = Vec::with_capacity(9);
+        let mut args = Vec::with_capacity(7);
         if matches!(addr, IpAddr::V6(_)) {
             args.push("-6".to_string());
         }
         args.push("route".to_string());
         args.push("replace".to_string());
         args.push(endpoint_cidr);
-        args.push("dev".to_string());
-        args.push(egress_interface.to_string());
         args.push("table".to_string());
         args.push("51820".to_string());
         args
@@ -771,8 +767,7 @@ impl DataplaneSystem for LinuxCommandSystem {
             endpoints.insert(peer.endpoint.addr);
         }
         for endpoint in endpoints {
-            let args =
-                Self::peer_endpoint_bypass_route_args(endpoint, self.egress_interface.as_str());
+            let args = Self::peer_endpoint_bypass_route_args(endpoint);
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             self.run(PrivilegedCommandProgram::Ip, &arg_refs)
                 .map_err(|err| {
@@ -2995,15 +2990,13 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv4_routing_for_ipv4_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24", "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24");
         assert_eq!(
             args,
             vec![
                 "route".to_string(),
                 "replace".to_string(),
                 "192.168.18.0/24".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3012,7 +3005,7 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64", "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64");
         assert_eq!(
             args,
             vec![
@@ -3020,8 +3013,6 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "fd00::/64".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3032,7 +3023,6 @@ mod tests {
     fn peer_endpoint_bypass_route_args_use_ipv4_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "192.168.18.40".parse().expect("valid ipv4"),
-            "enp0s8",
         );
         assert_eq!(
             args,
@@ -3040,8 +3030,6 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "192.168.18.40/32".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3052,7 +3040,6 @@ mod tests {
     fn peer_endpoint_bypass_route_args_use_ipv6_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "fd00::10".parse().expect("valid ipv6"),
-            "enp0s8",
         );
         assert_eq!(
             args,
@@ -3061,8 +3048,6 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "fd00::10/128".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
