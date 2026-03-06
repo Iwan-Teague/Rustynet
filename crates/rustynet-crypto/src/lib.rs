@@ -158,6 +158,9 @@ pub struct AlgorithmPolicy {
 
 impl AlgorithmPolicy {
     pub fn with_exceptions(exceptions: Vec<CompatibilityException>) -> Result<Self, CryptoError> {
+        if !exceptions.is_empty() {
+            return Err(CryptoError::InvalidException);
+        }
         for exception in &exceptions {
             if !is_denylisted(exception.algorithm) {
                 return Err(CryptoError::InvalidException);
@@ -511,7 +514,7 @@ impl Default for SigningProviderPolicy {
     fn default() -> Self {
         Self {
             require_hardware_backed_primary: true,
-            allow_local_fallback: true,
+            allow_local_fallback: false,
         }
     }
 }
@@ -684,7 +687,7 @@ pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
     (salt, nonce)
 }
 
-pub fn encrypt_private_key_fallback(
+pub fn encrypt_private_key_envelope(
     plaintext: &[u8],
     passphrase: &str,
     salt: [u8; 16],
@@ -713,7 +716,7 @@ pub fn encrypt_private_key_fallback(
     })
 }
 
-pub fn decrypt_private_key_fallback(
+pub fn decrypt_private_key_envelope(
     blob: &EncryptedKeyBlob,
     passphrase: &str,
 ) -> Result<Vec<u8>, CryptoError> {
@@ -745,7 +748,7 @@ pub fn write_encrypted_key_file(
     policy: KeyCustodyPermissionPolicy,
 ) -> Result<(), CryptoError> {
     let (salt, nonce) = generate_key_custody_material();
-    let blob = encrypt_private_key_fallback(plaintext, passphrase, salt, nonce)?;
+    let blob = encrypt_private_key_envelope(plaintext, passphrase, salt, nonce)?;
     let encoded = encode_encrypted_blob(&blob);
 
     if directory.exists() {
@@ -836,7 +839,7 @@ pub fn read_encrypted_key_file(
     validate_key_custody_permissions(directory, file, policy)?;
     let encoded = std::fs::read(file).map_err(|_| CryptoError::Io)?;
     let blob = decode_encrypted_blob(&encoded)?;
-    decrypt_private_key_fallback(&blob, passphrase)
+    decrypt_private_key_envelope(&blob, passphrase)
 }
 
 fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Vec<u8> {
@@ -935,7 +938,7 @@ mod tests {
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
         NodeKeyPair, SigningProviderKind, SigningProviderPolicy, create_provider_attestation,
-        decrypt_private_key_fallback, encrypt_private_key_fallback, generate_key_custody_material,
+        decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
         read_encrypted_key_file, validate_key_custody_permissions,
         validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
     };
@@ -967,27 +970,19 @@ mod tests {
     }
 
     #[test]
-    fn denylisted_algorithm_with_active_exception_is_temporarily_accepted() {
-        let policy = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
+    fn denylisted_algorithm_exceptions_are_rejected() {
+        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
             algorithm: CryptoAlgorithm::Sha1,
             expires_unix_seconds: 200,
-        }])
-        .expect("exception should be valid for denylisted algorithm");
-
-        let result = policy.validate(CryptoAlgorithm::Sha1, 150);
-        assert!(result.is_ok());
+        }]);
+        assert_eq!(result.err(), Some(CryptoError::InvalidException));
     }
 
     #[test]
-    fn denylisted_algorithm_exception_expires() {
-        let policy = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Sha1,
-            expires_unix_seconds: 200,
-        }])
-        .expect("exception should be valid for denylisted algorithm");
-
+    fn denylisted_algorithm_remains_denied_without_exceptions() {
+        let policy = AlgorithmPolicy::default();
         let result = policy.validate(CryptoAlgorithm::Sha1, 201);
-        assert_eq!(result.err(), Some(CryptoError::ExceptionExpired));
+        assert_eq!(result.err(), Some(CryptoError::DeniedAlgorithm));
     }
 
     #[test]
@@ -1001,25 +996,25 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_fallback_roundtrip_succeeds() {
+    fn encrypted_envelope_roundtrip_succeeds() {
         let (salt, nonce) = generate_key_custody_material();
         let blob =
-            encrypt_private_key_fallback(b"private-material", "phase2-passphrase", salt, nonce)
+            encrypt_private_key_envelope(b"private-material", "phase2-passphrase", salt, nonce)
                 .expect("encryption should succeed");
 
-        let plaintext = decrypt_private_key_fallback(&blob, "phase2-passphrase")
+        let plaintext = decrypt_private_key_envelope(&blob, "phase2-passphrase")
             .expect("decryption should succeed");
         assert_eq!(plaintext, b"private-material");
     }
 
     #[test]
-    fn encrypted_fallback_rejects_wrong_passphrase() {
+    fn encrypted_envelope_rejects_wrong_passphrase() {
         let (salt, nonce) = generate_key_custody_material();
         let blob =
-            encrypt_private_key_fallback(b"private-material", "phase2-passphrase", salt, nonce)
+            encrypt_private_key_envelope(b"private-material", "phase2-passphrase", salt, nonce)
                 .expect("encryption should succeed");
 
-        let result = decrypt_private_key_fallback(&blob, "wrong-passphrase");
+        let result = decrypt_private_key_envelope(&blob, "wrong-passphrase");
         assert_eq!(result.err(), Some(CryptoError::DecryptionFailed));
     }
 

@@ -1224,12 +1224,8 @@ fn refresh_trust_record_with_inputs(
                 trust_signing_key_passphrase_path,
                 "trust signer key passphrase file",
             )?;
-            let trust_group_gid = group_gid_or_root(daemon_group)?;
-            let trust_mode = if trust_group_gid == Gid::from_raw(0) {
-                0o644
-            } else {
-                0o640
-            };
+            let trust_group_gid = group_gid_required(daemon_group)?;
+            let trust_mode = 0o640;
             ensure_directory_exists(target_dir, 0o750, Uid::from_raw(0), trust_group_gid)?;
             (Uid::from_raw(0), trust_group_gid, trust_mode)
         }
@@ -1350,7 +1346,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         ));
     }
 
-    let bundle_group_gid = group_gid_or_root(daemon_group.as_str())?;
+    let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
 
     let bundle_dir = bundle_path.parent().ok_or_else(|| {
         format!(
@@ -3292,12 +3288,14 @@ fn validate_root_owned_passphrase_file(path: &Path, label: &str) -> Result<(), S
     Ok(())
 }
 
-fn group_gid_or_root(group_name: &str) -> Result<Gid, String> {
+fn group_gid_required(group_name: &str) -> Result<Gid, String> {
     match Group::from_name(group_name)
         .map_err(|err| format!("resolve group {group_name} failed: {err}"))?
     {
         Some(group) => Ok(group.gid),
-        None => Ok(Gid::from_raw(0)),
+        None => Err(format!(
+            "required group '{group_name}' is missing; run systemd install/bootstrap first"
+        )),
     }
 }
 

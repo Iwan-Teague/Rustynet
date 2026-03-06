@@ -514,37 +514,47 @@ pub fn set_interface_down(interface_name: &str) -> Result<(), String> {
 }
 
 pub fn remove_file_if_present(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("inspect {} failed: {err}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .map_err(|err| format!("remove symlink {} failed: {err}", path.display()));
     }
-    best_effort_scrub_file_contents(path);
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "secure remove requires a regular file: {}",
+            path.display()
+        ));
+    }
+    scrub_file_contents(path)?;
     fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))
 }
 
-fn best_effort_scrub_file_contents(path: &Path) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if !metadata.is_file() {
-        return;
-    }
-    let mut file = match OpenOptions::new().write(true).open(path) {
-        Ok(file) => file,
-        Err(_) => return,
-    };
+fn scrub_file_contents(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
     let mut remaining = metadata.len();
-    if remaining == 0 {
-        return;
-    }
     let zero_block = [0u8; 8192];
     while remaining > 0 {
         let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
-        if file.write_all(&zero_block[..chunk_len]).is_err() {
-            return;
-        }
+        file.write_all(&zero_block[..chunk_len])
+            .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
         remaining -= chunk_len as u64;
     }
-    let _ = file.sync_all();
+    file.sync_all()
+        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+    file.set_len(0)
+        .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    Ok(())
 }
 
 pub fn initialize_encrypted_key_material(

@@ -2361,15 +2361,15 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_policy_expiry_behavior_is_enforced() {
-        let policy = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
+    fn algorithm_policy_rejects_compatibility_exceptions() {
+        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
             algorithm: CryptoAlgorithm::Sha1,
             expires_unix_seconds: 150,
-        }])
-        .expect("exception should be valid");
+        }]);
+        assert!(result.is_err());
 
-        assert!(policy.validate(CryptoAlgorithm::Sha1, 149).is_ok());
-        assert!(policy.validate(CryptoAlgorithm::Sha1, 151).is_err());
+        let policy = AlgorithmPolicy::default();
+        assert!(policy.validate(CryptoAlgorithm::Sha1, 149).is_err());
     }
 
     #[test]

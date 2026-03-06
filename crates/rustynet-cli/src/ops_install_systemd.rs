@@ -229,11 +229,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     let auto_tunnel_max_age_secs =
         env_string_or_existing_default("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", "300", &existing_env)?;
-    let node_id = env_string_or_existing_default(
-        "RUSTYNET_NODE_ID",
-        hostname_fallback().as_str(),
-        &existing_env,
-    )?;
+    let node_id = env_string_or_existing_required("RUSTYNET_NODE_ID", &existing_env)?;
     let node_role = env_string_or_existing_default("RUSTYNET_NODE_ROLE", "client", &existing_env)?;
     let backend_mode =
         env_string_or_existing_default("RUSTYNET_BACKEND", "linux-wireguard", &existing_env)?;
@@ -1053,6 +1049,21 @@ fn env_string_or_existing_default(
     }
 }
 
+fn env_string_or_existing_required(
+    key: &str,
+    existing: &HashMap<String, String>,
+) -> Result<String, String> {
+    match env_optional_string(key)? {
+        Some(value) => Ok(value),
+        None => match existing.get(key) {
+            Some(value) if !value.is_empty() => Ok(value.clone()),
+            _ => Err(format!(
+                "missing required environment value: {key} (set it explicitly before install)"
+            )),
+        },
+    }
+}
+
 fn env_string_or_default_process(key: &str, default: &str) -> Result<String, String> {
     match env_optional_string(key)? {
         Some(value) => Ok(value),
@@ -1393,21 +1404,6 @@ fn migrate_legacy_key_path_if_needed(
     Ok(())
 }
 
-fn command_exists(binary: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|path| {
-        let candidate = path.join(binary);
-        match fs::metadata(candidate) {
-            Ok(metadata) => {
-                metadata.file_type().is_file() && (metadata.permissions().mode() & 0o111) != 0
-            }
-            Err(_) => false,
-        }
-    })
-}
-
 fn secure_remove_file(path: &Path) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1422,28 +1418,39 @@ fn secure_remove_file(path: &Path) -> Result<(), String> {
     }
 
     if !metadata.file_type().is_file() {
-        return Ok(());
+        return Err(format!(
+            "secure remove requires a regular file: {}",
+            path.display()
+        ));
     }
 
-    if command_exists("shred") {
-        match Command::new("shred")
-            .arg("--force")
-            .arg("--remove")
-            .arg(path)
-            .output()
-        {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(_) | Err(_) => {}
-        }
-    }
+    scrub_file_contents(path)?;
+    fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))?;
+    Ok(())
+}
 
-    let file = OpenOptions::new()
+fn scrub_file_contents(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+    let mut file = OpenOptions::new()
         .write(true)
         .open(path)
-        .map_err(|err| format!("open {} for truncate failed: {err}", path.display()))?;
+        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
+    let mut remaining = metadata.len();
+    let zero_chunk = [0u8; 8192];
+    while remaining > 0 {
+        let write_len = usize::try_from(std::cmp::min(remaining, zero_chunk.len() as u64))
+            .map_err(|_| "internal length conversion failed".to_string())?;
+        file.write_all(&zero_chunk[..write_len])
+            .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+        remaining = remaining.saturating_sub(write_len as u64);
+    }
+    file.sync_all()
+        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
     file.set_len(0)
         .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
-    fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
     Ok(())
 }
 
@@ -1601,20 +1608,6 @@ fn format_command(command: &str, args: &[&str]) -> String {
         return command.to_string();
     }
     format!("{} {}", command, args.join(" "))
-}
-
-fn hostname_fallback() -> String {
-    match run_command_capture("hostname", &["-s"]) {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                "daemon-local".to_string()
-            } else {
-                trimmed.to_string()
-            }
-        }
-        Err(_) => "daemon-local".to_string(),
-    }
 }
 
 fn display_path(path: &Path) -> String {

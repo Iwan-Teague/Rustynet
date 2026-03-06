@@ -24,8 +24,11 @@ The wizard handles:
 - centrally signed auto-tunnel defaults with fail-closed enforcement
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
-- Rust-backed WireGuard custody bootstrap (`rustynet ops bootstrap-wireguard-custody`) with fail-closed behavior; shell fallback is allowed only for legacy binaries that do not yet support this ops command
+- Rust-backed WireGuard custody bootstrap (`rustynet ops bootstrap-wireguard-custody`) is mandatory in setup paths; unsupported/failed ops invocation is fail-closed (no shell fallback)
 - sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
+- startup config integrity is strict for security-critical fields: invalid persisted role/chain/backend/interface/port values are fail-closed errors (no silent coercion)
+- macOS canonical storage paths are enforced (`.../trust`, `.../assignment`, `.../keys`, `.../membership`); non-canonical legacy path values are fail-closed
+- dependency bootstrap is single-route hardening: `start.sh` no longer runs remote installer scripts for Homebrew/rustup
 - Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
   encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
   rejects direct plaintext passphrase-file fallback at daemon runtime
@@ -48,6 +51,7 @@ Host-profile behavior:
 - macOS dependency hardening: privileged networking tools (`wg`, `wireguard-go`) must be installed with admin privileges in root-owned paths; non-admin local fallback is intentionally blocked.
 - macOS key custody hardening: WireGuard passphrase custody is Keychain-backed (`rustynet.wg_passphrase` service); persistent plaintext passphrase files are rejected by startup preflight.
 - macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
+- macOS dependency hardening: Homebrew must already be installed via approved operator workflow; automated remote-script install fallback is blocked.
 - macOS PF safety: stale Rustynet PF anchors (`com.apple/rustynet_g*`) are pruned on dataplane generation apply to prevent residual fail-closed anchors after crashes/restarts.
 
 Current implementation support/security matrix:
@@ -69,7 +73,8 @@ Two-hop chain notes:
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
 - Linux trust refresh service path is Rust-backed: `scripts/systemd/refresh_trust_evidence.sh` is a thin wrapper to `rustynet ops refresh-trust`.
-- `start.sh` manual trust refresh path is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup), with shell fallback retained for compatibility.
+- systemd wrappers now require an absolute pinned `RUSTYNET_BIN` (default `/usr/local/bin/rustynet`) with root-owned/non-group-writable binary custody; PATH lookup fallback is disabled.
+- `start.sh` manual trust refresh path is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup) with fail-closed behavior (no shell fallback).
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
 - If a node is switched to `client` mode without signer-key access, `AUTO_REFRESH_TRUST` is disabled with an explicit warning.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
@@ -209,6 +214,9 @@ Then run gates:
 ./scripts/ci/phase10_gates.sh
 ./scripts/ci/membership_gates.sh
 ```
+
+Security gate toolchain note:
+- phase gate scripts require the pinned Rust security toolchain (`RUSTYNET_SECURITY_TOOLCHAIN`, default `1.88.0`) to be installed; ambient cargo toolchain fallback is disabled.
 
 ## Phase 1 Measured Baseline Inputs
 

@@ -22,6 +22,7 @@ require_cargo_subcommand() {
 }
 
 require_command cargo
+require_command rustup
 require_command rg
 require_cargo_subcommand fmt
 require_cargo_subcommand clippy
@@ -79,12 +80,14 @@ else
 fi
 
 cargo_with_security_toolchain() {
-  if cargo +"${SECURITY_TOOLCHAIN}" --version >/dev/null 2>&1; then
-    cargo +"${SECURITY_TOOLCHAIN}" "$@"
-  else
-    cargo "$@"
-  fi
+  rustup run "${SECURITY_TOOLCHAIN}" cargo "$@"
 }
+
+if ! rustup run "${SECURITY_TOOLCHAIN}" cargo --version >/dev/null 2>&1; then
+  echo "missing required pinned security toolchain: ${SECURITY_TOOLCHAIN}" >&2
+  echo "install with: rustup toolchain install ${SECURITY_TOOLCHAIN}" >&2
+  exit 1
+fi
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
