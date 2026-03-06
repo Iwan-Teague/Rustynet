@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -489,7 +489,13 @@ impl LinuxCommandSystem {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
-            let args = Self::management_bypass_route_args(cidr);
+            let probe_ip = Self::management_probe_ip(cidr).map_err(|message| {
+                SystemError::RouteApplyFailed(format!(
+                    "management ssh bypass route probe failed for {cidr}: {message}"
+                ))
+            })?;
+            let route_interface = self.resolve_route_interface_for_ip(probe_ip)?;
+            let args = Self::management_bypass_route_args(cidr, route_interface.as_str());
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
             result.map_err(|err| {
@@ -501,31 +507,110 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    fn management_bypass_route_args(cidr: &str) -> Vec<String> {
-        let mut args = Vec::with_capacity(7);
+    fn management_probe_ip(cidr: &str) -> Result<IpAddr, String> {
+        let (base, prefix_str) = cidr
+            .split_once('/')
+            .ok_or_else(|| format!("invalid management cidr: {cidr}"))?;
+        let prefix = prefix_str
+            .parse::<u8>()
+            .map_err(|_| format!("invalid management cidr prefix: {cidr}"))?;
+        let ip = base
+            .parse::<IpAddr>()
+            .map_err(|_| format!("invalid management cidr address: {cidr}"))?;
+        match ip {
+            IpAddr::V4(value) => {
+                if prefix > 32 {
+                    return Err(format!("invalid management cidr prefix: {cidr}"));
+                }
+                if prefix == 32 {
+                    return Ok(IpAddr::V4(value));
+                }
+                let candidate = if prefix < 31 {
+                    u32::from(value).saturating_add(1)
+                } else {
+                    u32::from(value)
+                };
+                Ok(IpAddr::V4(Ipv4Addr::from(candidate)))
+            }
+            IpAddr::V6(value) => {
+                if prefix > 128 {
+                    return Err(format!("invalid management cidr prefix: {cidr}"));
+                }
+                if prefix == 128 {
+                    return Ok(IpAddr::V6(value));
+                }
+                let candidate = u128::from(value).saturating_add(1);
+                Ok(IpAddr::V6(Ipv6Addr::from(candidate)))
+            }
+        }
+    }
+
+    fn resolve_route_interface_for_ip(&self, target_ip: IpAddr) -> Result<String, SystemError> {
+        let mut args = Vec::with_capacity(4);
+        if matches!(target_ip, IpAddr::V6(_)) {
+            args.push("-6".to_string());
+        }
+        args.push("route".to_string());
+        args.push("get".to_string());
+        args.push(target_ip.to_string());
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.run_capture(PrivilegedCommandProgram::Ip, &arg_refs)?;
+        if !output.success() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route interface resolution failed for {target_ip}: status={} stderr={}",
+                output.status,
+                output.stderr.trim()
+            )));
+        }
+        let tokens = output.stdout.split_whitespace().collect::<Vec<_>>();
+        for (index, token) in tokens.iter().enumerate() {
+            if *token == "dev" {
+                let Some(interface) = tokens.get(index + 1) else {
+                    break;
+                };
+                validate_net_device_name(interface).map_err(|message| {
+                    SystemError::RouteApplyFailed(format!(
+                        "route interface resolution returned invalid interface for {target_ip}: {message}"
+                    ))
+                })?;
+                return Ok((*interface).to_string());
+            }
+        }
+        Err(SystemError::RouteApplyFailed(format!(
+            "route interface resolution failed for {target_ip}: missing dev in output={}",
+            output.stdout.trim()
+        )))
+    }
+
+    fn management_bypass_route_args(cidr: &str, route_interface: &str) -> Vec<String> {
+        let mut args = Vec::with_capacity(9);
         if cidr.contains(':') {
             args.push("-6".to_string());
         }
         args.push("route".to_string());
         args.push("replace".to_string());
         args.push(cidr.to_string());
+        args.push("dev".to_string());
+        args.push(route_interface.to_string());
         args.push("table".to_string());
         args.push("51820".to_string());
         args
     }
 
-    fn peer_endpoint_bypass_route_args(addr: IpAddr) -> Vec<String> {
+    fn peer_endpoint_bypass_route_args(addr: IpAddr, route_interface: &str) -> Vec<String> {
         let endpoint_cidr = match addr {
             IpAddr::V4(value) => format!("{value}/32"),
             IpAddr::V6(value) => format!("{value}/128"),
         };
-        let mut args = Vec::with_capacity(7);
+        let mut args = Vec::with_capacity(9);
         if matches!(addr, IpAddr::V6(_)) {
             args.push("-6".to_string());
         }
         args.push("route".to_string());
         args.push("replace".to_string());
         args.push(endpoint_cidr);
+        args.push("dev".to_string());
+        args.push(route_interface.to_string());
         args.push("table".to_string());
         args.push("51820".to_string());
         args
@@ -767,7 +852,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             endpoints.insert(peer.endpoint.addr);
         }
         for endpoint in endpoints {
-            let args = Self::peer_endpoint_bypass_route_args(endpoint);
+            let route_interface = self.resolve_route_interface_for_ip(endpoint)?;
+            let args = Self::peer_endpoint_bypass_route_args(endpoint, route_interface.as_str());
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             self.run(PrivilegedCommandProgram::Ip, &arg_refs)
                 .map_err(|err| {
@@ -2990,13 +3076,15 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv4_routing_for_ipv4_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24");
+        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24", "enp0s8");
         assert_eq!(
             args,
             vec![
                 "route".to_string(),
                 "replace".to_string(),
                 "192.168.18.0/24".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3005,7 +3093,7 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64");
+        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64", "enp0s8");
         assert_eq!(
             args,
             vec![
@@ -3013,6 +3101,8 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "fd00::/64".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3023,6 +3113,7 @@ mod tests {
     fn peer_endpoint_bypass_route_args_use_ipv4_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "192.168.18.40".parse().expect("valid ipv4"),
+            "enp0s8",
         );
         assert_eq!(
             args,
@@ -3030,6 +3121,8 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "192.168.18.40/32".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
@@ -3040,6 +3133,7 @@ mod tests {
     fn peer_endpoint_bypass_route_args_use_ipv6_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "fd00::10".parse().expect("valid ipv6"),
+            "enp0s8",
         );
         assert_eq!(
             args,
@@ -3048,6 +3142,8 @@ mod tests {
                 "route".to_string(),
                 "replace".to_string(),
                 "fd00::10/128".to_string(),
+                "dev".to_string(),
+                "enp0s8".to_string(),
                 "table".to_string(),
                 "51820".to_string(),
             ]
