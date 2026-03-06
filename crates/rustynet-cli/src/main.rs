@@ -2,14 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Group, Uid, chown};
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::membership::{
     MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
@@ -47,6 +49,7 @@ enum CliCommand {
     Assignment(Box<AssignmentCommand>),
     Membership(Box<MembershipCommand>),
     Trust(Box<TrustCommand>),
+    Ops(Box<OpsCommand>),
     Help,
 }
 
@@ -142,6 +145,12 @@ enum TrustCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum OpsCommand {
+    RefreshTrust,
+    RefreshAssignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AssignmentNodeSpec {
     node_id: String,
     endpoint: String,
@@ -217,7 +226,20 @@ fn parse_command(args: &[String]) -> CliCommand {
             Ok(command) => CliCommand::Trust(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
+        [cmd, rest @ ..] if cmd == "ops" => match parse_ops_command(rest) {
+            Ok(command) => CliCommand::Ops(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
         _ => CliCommand::Help,
+    }
+}
+
+fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
+    match args {
+        [subcmd] if subcmd == "refresh-trust" => Ok(OpsCommand::RefreshTrust),
+        [subcmd] if subcmd == "refresh-assignment" => Ok(OpsCommand::RefreshAssignment),
+        [subcmd, ..] => Err(format!("unknown ops subcommand: {subcmd}")),
+        _ => Err("ops subcommand is required".to_string()),
     }
 }
 
@@ -517,6 +539,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
+        CliCommand::Ops(command) => execute_ops(*command),
         other => {
             let ipc_command = to_ipc_command(other);
             match send_command(ipc_command) {
@@ -881,6 +904,492 @@ fn execute_trust(command: TrustCommand) -> Result<String, String> {
             ))
         }
     }
+}
+
+fn execute_ops(command: OpsCommand) -> Result<String, String> {
+    match command {
+        OpsCommand::RefreshTrust => execute_ops_refresh_trust(),
+        OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
+    }
+}
+
+fn execute_ops_refresh_trust() -> Result<String, String> {
+    require_root_execution()?;
+
+    if !parse_env_bool_with_default("RUSTYNET_TRUST_AUTO_REFRESH", "true")? {
+        return Ok("[trust-refresh] auto-refresh disabled; skipping.".to_string());
+    }
+
+    let trust_evidence_path = env_path_or_default(
+        "RUSTYNET_TRUST_EVIDENCE",
+        "/var/lib/rustynet/rustynetd.trust",
+    )?;
+    let trust_signer_key_path = env_path_or_default(
+        "RUSTYNET_TRUST_SIGNER_KEY",
+        "/etc/rustynet/trust-evidence.key",
+    )?;
+    let trust_signing_key_passphrase_path =
+        env_required_path("RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE")?;
+    let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
+
+    validate_root_owned_encrypted_signing_file(&trust_signer_key_path, "trust signer key")?;
+    validate_root_owned_passphrase_file(
+        &trust_signing_key_passphrase_path,
+        "trust signer key passphrase file",
+    )?;
+
+    let target_dir = trust_evidence_path.parent().ok_or_else(|| {
+        format!(
+            "trust evidence path has no parent: {}",
+            trust_evidence_path.display()
+        )
+    })?;
+
+    let trust_group_gid = group_gid_or_root(daemon_group.as_str())?;
+    let trust_mode = if trust_group_gid == Gid::from_raw(0) {
+        0o644
+    } else {
+        0o640
+    };
+    ensure_directory_exists(target_dir, 0o750, Uid::from_raw(0), trust_group_gid)?;
+
+    let record_tmp = create_secure_temp_file(target_dir, "rustynetd-trust-record.")?;
+    let issue_result = execute_trust(TrustCommand::Issue {
+        signing_key_path: trust_signer_key_path,
+        signing_key_passphrase_path: trust_signing_key_passphrase_path,
+        output_path: record_tmp.clone(),
+        updated_at_unix: unix_now(),
+        nonce: generate_assignment_nonce(),
+    });
+    if let Err(err) = issue_result {
+        let _ = remove_file_if_present(&record_tmp);
+        return Err(err);
+    }
+
+    if let Err(err) = publish_file_with_owner_mode(
+        &record_tmp,
+        &trust_evidence_path,
+        Uid::from_raw(0),
+        trust_group_gid,
+        trust_mode,
+        "trust evidence",
+    ) {
+        let _ = remove_file_if_present(&record_tmp);
+        return Err(err);
+    }
+
+    Ok(format!(
+        "[trust-refresh] refreshed signed trust evidence at {}",
+        trust_evidence_path.display()
+    ))
+}
+
+fn execute_ops_refresh_assignment() -> Result<String, String> {
+    require_root_execution()?;
+
+    if !parse_env_bool_with_default("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false")? {
+        return Ok("[assignment-refresh] auto-refresh disabled; skipping.".to_string());
+    }
+
+    let target_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")?
+        .or_else(|| std::env::var("RUSTYNET_NODE_ID").ok())
+        .ok_or_else(|| {
+            "assignment target node id is required (RUSTYNET_ASSIGNMENT_TARGET_NODE_ID or RUSTYNET_NODE_ID)".to_string()
+        })?;
+    if !is_valid_node_id(target_node_id.as_str()) {
+        return Err(format!(
+            "target node id contains unsupported characters: {}",
+            target_node_id
+        ));
+    }
+
+    let nodes_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_NODES", "assignment node map")?;
+    let allow_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_ALLOW", "assignment allow rules")?;
+    let exit_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
+    if let Some(exit_node_id) = exit_node_id.as_deref()
+        && !is_valid_node_id(exit_node_id)
+    {
+        return Err(format!(
+            "exit node id contains unsupported characters: {}",
+            exit_node_id
+        ));
+    }
+
+    let signing_secret_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
+        "/etc/rustynet/assignment.signing.secret",
+    )?;
+    let signing_secret_passphrase_path =
+        env_required_path("RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE")?;
+    let bundle_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_OUTPUT",
+        "/var/lib/rustynet/rustynetd.assignment",
+    )?;
+    let verifier_key_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+        "/etc/rustynet/assignment.pub",
+    )?;
+    let ttl_secs = parse_env_u64_with_default("RUSTYNET_ASSIGNMENT_TTL_SECS", 300)?;
+    if !(60..=86_400).contains(&ttl_secs) {
+        return Err(format!(
+            "assignment ttl must be an integer in range 60-86400 seconds: {}",
+            ttl_secs
+        ));
+    }
+    let min_remaining_secs =
+        parse_env_u64_with_default("RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS", 180)?;
+    let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
+
+    validate_root_owned_encrypted_signing_file(&signing_secret_path, "assignment signing secret")?;
+    validate_root_owned_passphrase_file(
+        &signing_secret_passphrase_path,
+        "assignment signing secret passphrase file",
+    )?;
+
+    let now_unix = unix_now();
+    if bundle_path.exists()
+        && let Some(current_expires_at) =
+            read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
+        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
+    {
+        let remaining_secs = current_expires_at.saturating_sub(now_unix);
+        return Ok(format!(
+            "[assignment-refresh] current assignment expires in {}s; skip refresh.",
+            remaining_secs
+        ));
+    }
+
+    let bundle_group_gid = group_gid_or_root(daemon_group.as_str())?;
+
+    let bundle_dir = bundle_path.parent().ok_or_else(|| {
+        format!(
+            "assignment bundle output path has no parent: {}",
+            bundle_path.display()
+        )
+    })?;
+    let verifier_dir = verifier_key_path.parent().ok_or_else(|| {
+        format!(
+            "assignment verifier key output path has no parent: {}",
+            verifier_key_path.display()
+        )
+    })?;
+    ensure_directory_exists(bundle_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
+    ensure_directory_exists(verifier_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
+
+    let bundle_tmp = create_secure_temp_file(bundle_dir, "rustynetd.assignment.tmp.")?;
+    let verifier_tmp = create_secure_temp_file(verifier_dir, "assignment.pub.tmp.")?;
+
+    let nodes = parse_assignment_nodes(nodes_spec.as_str())?;
+    let allow_pairs = parse_assignment_allow_pairs(allow_spec.as_str())?;
+    validate_assignment_issue_config(
+        nodes.as_slice(),
+        allow_pairs.as_slice(),
+        target_node_id.as_str(),
+        exit_node_id.as_deref(),
+    )?;
+
+    let issue_result =
+        execute_assignment(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
+            signing_secret_path,
+            signing_secret_passphrase_path,
+            target_node_id,
+            output_path: bundle_tmp.clone(),
+            verifier_key_output_path: Some(verifier_tmp.clone()),
+            nodes,
+            allow_pairs,
+            mesh_cidr: "100.64.0.0/10".to_string(),
+            exit_node_id,
+            lan_routes: Vec::new(),
+            generated_at_unix: unix_now(),
+            ttl_secs,
+            nonce: generate_assignment_nonce(),
+        })));
+    if let Err(err) = issue_result {
+        let _ = remove_file_if_present(&bundle_tmp);
+        let _ = remove_file_if_present(&verifier_tmp);
+        return Err(err);
+    }
+
+    let generated_at_unix = read_bundle_u64_field_required(&bundle_tmp, "generated_at_unix")?;
+    let expires_at_unix = read_bundle_u64_field_required(&bundle_tmp, "expires_at_unix")?;
+    if generated_at_unix >= expires_at_unix {
+        let _ = remove_file_if_present(&bundle_tmp);
+        let _ = remove_file_if_present(&verifier_tmp);
+        return Err("issued assignment bundle has invalid expiry window".to_string());
+    }
+
+    if let Err(err) = publish_file_with_owner_mode(
+        &bundle_tmp,
+        &bundle_path,
+        Uid::from_raw(0),
+        bundle_group_gid,
+        0o640,
+        "assignment bundle",
+    ) {
+        let _ = remove_file_if_present(&bundle_tmp);
+        let _ = remove_file_if_present(&verifier_tmp);
+        return Err(err);
+    }
+
+    if let Err(err) = publish_file_with_owner_mode(
+        &verifier_tmp,
+        &verifier_key_path,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+        "assignment verifier key",
+    ) {
+        let _ = remove_file_if_present(&verifier_tmp);
+        return Err(err);
+    }
+
+    Ok(format!(
+        "[assignment-refresh] refreshed signed assignment bundle at {} (generated_at_unix={} expires_at_unix={})",
+        bundle_path.display(),
+        generated_at_unix,
+        expires_at_unix
+    ))
+}
+
+fn require_root_execution() -> Result<(), String> {
+    if Uid::effective().is_root() {
+        return Ok(());
+    }
+    Err("run as root".to_string())
+}
+
+fn parse_env_bool_with_default(key: &str, default: &str) -> Result<bool, String> {
+    let value = env_string_or_default(key, default)?;
+    parse_bool_value(key, value.as_str())
+}
+
+fn parse_bool_value(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" | "TRUE" | "yes" | "YES" | "1" | "on" | "ON" => Ok(true),
+        "false" | "FALSE" | "no" | "NO" | "0" | "off" | "OFF" | "" => Ok(false),
+        _ => Err(format!("invalid boolean value for {key}: {value}")),
+    }
+}
+
+fn parse_env_u64_with_default(key: &str, default: u64) -> Result<u64, String> {
+    match env_optional_string(key)? {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|err| format!("invalid integer value for {key}: {err}")),
+        None => Ok(default),
+    }
+}
+
+fn env_optional_string(key: &str) -> Result<Option<String>, String> {
+    match std::env::var(key) {
+        Ok(value) => {
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("environment variable {key} contains non-utf8 data"))
+        }
+    }
+}
+
+fn env_string_or_default(key: &str, default: &str) -> Result<String, String> {
+    Ok(env_optional_string(key)?.unwrap_or_else(|| default.to_string()))
+}
+
+fn env_required_nonempty(key: &str, label: &str) -> Result<String, String> {
+    env_optional_string(key)?.ok_or_else(|| format!("{label} is required ({key})"))
+}
+
+fn env_path_or_default(key: &str, default: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(env_string_or_default(key, default)?);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn env_required_path(key: &str) -> Result<PathBuf, String> {
+    let path =
+        PathBuf::from(env_optional_string(key)?.ok_or_else(|| format!("{key} is required"))?);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn is_valid_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+}
+
+fn validate_root_owned_encrypted_signing_file(path: &Path, label: &str) -> Result<(), String> {
+    validate_encrypted_secret_file_security(path, label)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.uid() != 0 {
+        return Err(format!("{label} must be owned by root: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn validate_root_owned_passphrase_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must reference a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!("{label} must be owned by root: {}", path.display()));
+    }
+    let mode = metadata.mode() & 0o777;
+    let disallowed_mode_mask = if path.starts_with("/run/credentials/") {
+        0o037
+    } else {
+        0o077
+    };
+    if (mode & disallowed_mode_mask) != 0 {
+        let expected = if path.starts_with("/run/credentials/") {
+            "owner-only or systemd credential mode"
+        } else {
+            "owner-only (0600)"
+        };
+        return Err(format!(
+            "{label} permissions too broad ({mode:03o}); expected {expected}: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn group_gid_or_root(group_name: &str) -> Result<Gid, String> {
+    match Group::from_name(group_name)
+        .map_err(|err| format!("resolve group {group_name} failed: {err}"))?
+    {
+        Some(group) => Ok(group.gid),
+        None => Ok(Gid::from_raw(0)),
+    }
+}
+
+fn ensure_directory_exists(path: &Path, mode: u32, owner: Uid, group: Gid) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "directory must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(format!("path must be a directory: {}", path.display()));
+            }
+            return Ok(());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect directory {} failed: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    fs::create_dir_all(path)
+        .map_err(|err| format!("create directory {} failed: {err}", path.display()))?;
+    chown(path, Some(owner), Some(group))
+        .map_err(|err| format!("set directory owner {} failed: {err}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("set directory mode {} failed: {err}", path.display()))?;
+    Ok(())
+}
+
+fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let mut random_bytes = [0u8; 8];
+    for _ in 0..32 {
+        OsRng.fill_bytes(&mut random_bytes);
+        let candidate = dir.join(format!("{prefix}{}", hex_bytes(&random_bytes)));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "create temporary file {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "unable to allocate secure temporary file in {}",
+        dir.display()
+    ))
+}
+
+fn publish_file_with_owner_mode(
+    source_tmp_path: &Path,
+    destination_path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    chown(source_tmp_path, Some(owner), Some(group)).map_err(|err| {
+        format!(
+            "set {label} owner {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    fs::set_permissions(source_tmp_path, fs::Permissions::from_mode(mode)).map_err(|err| {
+        format!(
+            "set {label} mode {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    fs::rename(source_tmp_path, destination_path).map_err(|err| {
+        format!(
+            "publish {label} to {} failed: {err}",
+            destination_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn read_bundle_u64_field_optional(path: &Path, key: &str) -> Result<Option<u64>, String> {
+    let body =
+        fs::read_to_string(path).map_err(|err| format!("read {} failed: {err}", path.display()))?;
+    Ok(parse_bundle_u64_field(body.as_str(), key))
+}
+
+fn read_bundle_u64_field_required(path: &Path, key: &str) -> Result<u64, String> {
+    read_bundle_u64_field_optional(path, key)?
+        .ok_or_else(|| format!("issued assignment bundle missing {key} field"))
+}
+
+fn parse_bundle_u64_field(body: &str, key: &str) -> Option<u64> {
+    let prefix = format!("{key}=");
+    for line in body.lines() {
+        if let Some(value) = line.strip_prefix(prefix.as_str()) {
+            let normalized = value
+                .chars()
+                .filter(|ch| !ch.is_ascii_whitespace())
+                .collect::<String>();
+            return normalized.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 fn replay_cache_from_entries(
@@ -1533,7 +2042,8 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Help
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
-        | CliCommand::Trust(_) => IpcCommand::Unknown("unsupported".to_string()),
+        | CliCommand::Trust(_)
+        | CliCommand::Ops(_) => IpcCommand::Unknown("unsupported".to_string()),
     }
 }
 
@@ -1600,6 +2110,8 @@ fn help_text() -> String {
         "  trust keygen --signing-key-output <path> --signing-key-passphrase-file <path> --verifier-key-output <path> [--force]",
         "  trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>",
         "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
+        "  ops refresh-trust",
+        "  ops refresh-assignment",
     ]
     .join("\n")
 }
@@ -1607,8 +2119,8 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_tampered_log, execute, load_signing_key, parse_command,
-        persist_encrypted_secret_material,
+        detect_tampered_log, execute, load_signing_key, parse_bool_value, parse_bundle_u64_field,
+        parse_command, persist_encrypted_secret_material,
     };
 
     #[test]
@@ -1675,6 +2187,30 @@ mod tests {
             "/tmp/assignment.bundle".to_string(),
         ]);
         assert!(format!("{command:?}").contains("Assignment"));
+    }
+
+    #[test]
+    fn parse_supports_ops_commands() {
+        let trust = parse_command(&["ops".to_string(), "refresh-trust".to_string()]);
+        assert!(format!("{trust:?}").contains("RefreshTrust"));
+
+        let assignment = parse_command(&["ops".to_string(), "refresh-assignment".to_string()]);
+        assert!(format!("{assignment:?}").contains("RefreshAssignment"));
+    }
+
+    #[test]
+    fn parse_bool_value_matches_systemd_script_contract() {
+        assert!(parse_bool_value("TEST_BOOL", "true").expect("true should parse"));
+        assert!(!parse_bool_value("TEST_BOOL", "off").expect("off should parse"));
+        assert!(!parse_bool_value("TEST_BOOL", "").expect("empty should parse"));
+        assert!(parse_bool_value("TEST_BOOL", "bogus").is_err());
+    }
+
+    #[test]
+    fn parse_bundle_field_ignores_whitespace() {
+        let body = "version=1\nexpires_at_unix=  12345  \n";
+        assert_eq!(parse_bundle_u64_field(body, "expires_at_unix"), Some(12345));
+        assert_eq!(parse_bundle_u64_field(body, "generated_at_unix"), None);
     }
 
     #[cfg(unix)]

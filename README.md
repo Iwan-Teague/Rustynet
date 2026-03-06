@@ -61,6 +61,7 @@ Two-hop chain notes:
 
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
+- Linux trust refresh service path is Rust-backed: `scripts/systemd/refresh_trust_evidence.sh` is a thin wrapper to `rustynet ops refresh-trust`.
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
 - If a node is switched to `client` mode without signer-key access, `AUTO_REFRESH_TRUST` is disabled with an explicit warning.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
@@ -68,6 +69,7 @@ Linux trust-refresh behavior:
 
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
+- Linux assignment refresh service path is Rust-backed: `scripts/systemd/refresh_assignment_bundle.sh` is a thin wrapper to `rustynet ops refresh-assignment`.
 - Linux signing artifact custody expects `/etc/rustynet` parent directory mode
   `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
 - For unattended runtime, enable signer-backed assignment refresh with:
