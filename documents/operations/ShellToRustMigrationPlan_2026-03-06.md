@@ -12,6 +12,10 @@ Success criteria:
 - no regression in key custody controls,
 - all current gates and VM validation scenarios still pass.
 
+## Status Update (2026-03-06)
+- Phase A complete: `refresh_trust_evidence.sh` and `refresh_assignment_bundle.sh` are thin wrappers to Rust ops commands.
+- Phase B complete: `install_rustynetd_service.sh` is now a thin wrapper to `rustynet ops install-systemd`; core installer logic (idempotent user/group/dir setup, credential-path pinning, env file generation, legacy cleanup/migration, systemd orchestration) is implemented in Rust.
+
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
 

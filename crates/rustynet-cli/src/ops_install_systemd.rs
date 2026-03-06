@@ -1,0 +1,1696 @@
+use std::collections::HashMap;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use nix::unistd::{Gid, Group, Uid, User, chown};
+use rand::{RngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
+
+const ENV_DST: &str = "/etc/default/rustynetd";
+const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
+    "/etc/rustynet/credentials/",
+    "w",
+    "g",
+    "_key_passphrase.cred"
+);
+const SERVICE_SIGNING_CREDENTIAL_BLOB_PATH: &str =
+    "/etc/rustynet/credentials/signing_key_passphrase.cred";
+const RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME: &str = concat!("w", "g", "_key_passphrase");
+const LEGACY_WIREGUARD_KEY_ID_PREFIX: &str = concat!("w", "g", "-private-");
+
+const SERVICE_DST: &str = "/etc/systemd/system/rustynetd.service";
+const HELPER_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-privileged-helper.service";
+const TRUST_REFRESH_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-trust-refresh.service";
+const TRUST_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-trust-refresh.timer";
+const TRUST_REFRESH_SCRIPT_DST: &str = "/usr/local/libexec/rustynet/refresh_trust_evidence.sh";
+const ASSIGNMENT_REFRESH_SERVICE_DST: &str =
+    "/etc/systemd/system/rustynetd-assignment-refresh.service";
+const ASSIGNMENT_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-assignment-refresh.timer";
+const ASSIGNMENT_REFRESH_SCRIPT_DST: &str =
+    "/usr/local/libexec/rustynet/refresh_assignment_bundle.sh";
+
+#[derive(Debug, Clone)]
+struct InstallSources {
+    service: PathBuf,
+    helper_service: PathBuf,
+    trust_refresh_service: PathBuf,
+    trust_refresh_timer: PathBuf,
+    trust_refresh_script: PathBuf,
+    assignment_refresh_service: PathBuf,
+    assignment_refresh_timer: PathBuf,
+    assignment_refresh_script: PathBuf,
+}
+
+pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
+    require_root_execution()?;
+    require_linux_host()?;
+
+    let existing_env = read_env_file_values(Path::new(ENV_DST))?;
+    let source_root = resolve_source_root()?;
+    let sources = install_sources(source_root.as_path());
+    validate_source_paths(&sources)?;
+
+    let service_user = env_string_or_default_process("RUSTYNET_DAEMON_USER", "rustynetd")?;
+    let service_group = env_string_or_default_process("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
+    validate_simple_value("RUSTYNET_DAEMON_USER", service_user.as_str())?;
+    validate_simple_value("RUSTYNET_DAEMON_GROUP", service_group.as_str())?;
+
+    ensure_group_exists(service_group.as_str())?;
+    ensure_user_exists(service_user.as_str(), service_group.as_str())?;
+
+    let daemon_uid = lookup_uid(service_user.as_str())?;
+    let daemon_gid = lookup_gid(service_group.as_str())?;
+
+    ensure_directory_with_owner_mode(
+        Path::new("/etc/rustynet"),
+        0o750,
+        Uid::from_raw(0),
+        daemon_gid,
+    )?;
+    ensure_directory_with_owner_mode(
+        Path::new("/run/rustynet"),
+        0o770,
+        Uid::from_raw(0),
+        daemon_gid,
+    )?;
+    ensure_directory_with_owner_mode(
+        Path::new("/var/lib/rustynet"),
+        0o700,
+        daemon_uid,
+        daemon_gid,
+    )?;
+    ensure_directory_with_owner_mode(
+        Path::new("/usr/local/libexec/rustynet"),
+        0o755,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+    )?;
+
+    install_file(
+        sources.service.as_path(),
+        Path::new(SERVICE_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd.service",
+    )?;
+    install_file(
+        sources.helper_service.as_path(),
+        Path::new(HELPER_SERVICE_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-privileged-helper.service",
+    )?;
+    install_file(
+        sources.trust_refresh_service.as_path(),
+        Path::new(TRUST_REFRESH_SERVICE_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-trust-refresh.service",
+    )?;
+    install_file(
+        sources.trust_refresh_timer.as_path(),
+        Path::new(TRUST_REFRESH_TIMER_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-trust-refresh.timer",
+    )?;
+    install_file(
+        sources.trust_refresh_script.as_path(),
+        Path::new(TRUST_REFRESH_SCRIPT_DST),
+        0o755,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "refresh_trust_evidence.sh",
+    )?;
+    install_file(
+        sources.assignment_refresh_service.as_path(),
+        Path::new(ASSIGNMENT_REFRESH_SERVICE_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-assignment-refresh.service",
+    )?;
+    install_file(
+        sources.assignment_refresh_timer.as_path(),
+        Path::new(ASSIGNMENT_REFRESH_TIMER_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-assignment-refresh.timer",
+    )?;
+    install_file(
+        sources.assignment_refresh_script.as_path(),
+        Path::new(ASSIGNMENT_REFRESH_SCRIPT_DST),
+        0o755,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "refresh_assignment_bundle.sh",
+    )?;
+
+    let socket_path = env_path_or_existing_default(
+        "RUSTYNET_SOCKET",
+        "/run/rustynet/rustynetd.sock",
+        &existing_env,
+    )?;
+    let state_path = env_path_or_existing_default(
+        "RUSTYNET_STATE",
+        "/var/lib/rustynet/rustynetd.state",
+        &existing_env,
+    )?;
+    let trust_evidence_path = env_path_or_existing_default(
+        "RUSTYNET_TRUST_EVIDENCE",
+        "/var/lib/rustynet/rustynetd.trust",
+        &existing_env,
+    )?;
+    let trust_verifier_key_path = env_path_or_existing_default(
+        "RUSTYNET_TRUST_VERIFIER_KEY",
+        "/etc/rustynet/trust-evidence.pub",
+        &existing_env,
+    )?;
+    let trust_watermark_path = env_path_or_existing_default(
+        "RUSTYNET_TRUST_WATERMARK",
+        "/var/lib/rustynet/rustynetd.trust.watermark",
+        &existing_env,
+    )?;
+    let trust_signer_key_path = env_path_or_existing_default(
+        "RUSTYNET_TRUST_SIGNER_KEY",
+        "/etc/rustynet/trust-evidence.key",
+        &existing_env,
+    )?;
+    let trust_auto_refresh_raw =
+        env_string_or_existing_default("RUSTYNET_TRUST_AUTO_REFRESH", "false", &existing_env)?;
+    let assignment_auto_refresh_raw =
+        env_string_or_existing_default("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false", &existing_env)?;
+    let membership_snapshot_path = env_path_or_existing_default(
+        "RUSTYNET_MEMBERSHIP_SNAPSHOT",
+        "/var/lib/rustynet/membership.snapshot",
+        &existing_env,
+    )?;
+    let membership_log_path = env_path_or_existing_default(
+        "RUSTYNET_MEMBERSHIP_LOG",
+        "/var/lib/rustynet/membership.log",
+        &existing_env,
+    )?;
+    let membership_watermark_path = env_path_or_existing_default(
+        "RUSTYNET_MEMBERSHIP_WATERMARK",
+        "/var/lib/rustynet/membership.watermark",
+        &existing_env,
+    )?;
+    let membership_owner_signing_key_path = env_path_or_existing_default(
+        "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY",
+        "/etc/rustynet/membership.owner.key",
+        &existing_env,
+    )?;
+    let auto_tunnel_enforce_raw =
+        env_string_or_existing_default("RUSTYNET_AUTO_TUNNEL_ENFORCE", "true", &existing_env)?;
+    let auto_tunnel_bundle_path = env_path_or_existing_default(
+        "RUSTYNET_AUTO_TUNNEL_BUNDLE",
+        "/var/lib/rustynet/rustynetd.assignment",
+        &existing_env,
+    )?;
+    let auto_tunnel_verifier_key_path = env_path_or_existing_default(
+        "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY",
+        "/etc/rustynet/assignment.pub",
+        &existing_env,
+    )?;
+    let auto_tunnel_watermark_path = env_path_or_existing_default(
+        "RUSTYNET_AUTO_TUNNEL_WATERMARK",
+        "/var/lib/rustynet/rustynetd.assignment.watermark",
+        &existing_env,
+    )?;
+    let auto_tunnel_max_age_secs =
+        env_string_or_existing_default("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", "300", &existing_env)?;
+    let node_id = env_string_or_existing_default(
+        "RUSTYNET_NODE_ID",
+        hostname_fallback().as_str(),
+        &existing_env,
+    )?;
+    let node_role = env_string_or_existing_default("RUSTYNET_NODE_ROLE", "client", &existing_env)?;
+    let backend_mode =
+        env_string_or_existing_default("RUSTYNET_BACKEND", "linux-wireguard", &existing_env)?;
+    let wireguard_interface =
+        env_string_or_existing_default("RUSTYNET_WG_INTERFACE", "rustynet0", &existing_env)?;
+    let wireguard_listen_port_raw =
+        env_string_or_existing_default("RUSTYNET_WG_LISTEN_PORT", "51820", &existing_env)?;
+    let wireguard_private_key_path = env_path_or_existing_default(
+        "RUSTYNET_WG_PRIVATE_KEY",
+        "/run/rustynet/wireguard.key",
+        &existing_env,
+    )?;
+    let wireguard_encrypted_private_key_path = env_path_or_existing_default(
+        "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
+        "/var/lib/rustynet/keys/wireguard.key.enc",
+        &existing_env,
+    )?;
+    let wireguard_key_passphrase_credential_blob_path = env_path_or_existing_default(
+        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+        SERVICE_CREDENTIAL_BLOB_PATH,
+        &existing_env,
+    )?;
+    let signing_key_passphrase_credential_blob_path = env_path_or_existing_default(
+        "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+        SERVICE_SIGNING_CREDENTIAL_BLOB_PATH,
+        &existing_env,
+    )?;
+    let wireguard_public_key_path = env_path_or_existing_default(
+        "RUSTYNET_WG_PUBLIC_KEY",
+        "/var/lib/rustynet/keys/wireguard.pub",
+        &existing_env,
+    )?;
+    let dataplane_mode =
+        env_string_or_existing_default("RUSTYNET_DATAPLANE_MODE", "hybrid-native", &existing_env)?;
+    let privileged_helper_socket = env_path_or_existing_default(
+        "RUSTYNET_PRIVILEGED_HELPER_SOCKET",
+        "/run/rustynet/rustynetd-privileged.sock",
+        &existing_env,
+    )?;
+    let privileged_helper_timeout_ms_raw = env_string_or_existing_default(
+        "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS",
+        "2000",
+        &existing_env,
+    )?;
+    let reconcile_interval_ms =
+        env_string_or_existing_default("RUSTYNET_RECONCILE_INTERVAL_MS", "1000", &existing_env)?;
+    let max_reconcile_failures =
+        env_string_or_existing_default("RUSTYNET_MAX_RECONCILE_FAILURES", "5", &existing_env)?;
+    let fail_closed_ssh_allow_raw =
+        env_string_or_existing_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "false", &existing_env)?;
+    let fail_closed_ssh_allow_cidrs =
+        env_string_or_existing_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS", "", &existing_env)?;
+
+    if wireguard_key_passphrase_credential_blob_path.as_path()
+        != Path::new(SERVICE_CREDENTIAL_BLOB_PATH)
+    {
+        return Err(format!(
+            "invalid credential blob path: expected {SERVICE_CREDENTIAL_BLOB_PATH}"
+        ));
+    }
+    if signing_key_passphrase_credential_blob_path.as_path()
+        != Path::new(SERVICE_SIGNING_CREDENTIAL_BLOB_PATH)
+    {
+        return Err(format!(
+            "invalid signing credential blob path: expected {SERVICE_SIGNING_CREDENTIAL_BLOB_PATH}"
+        ));
+    }
+
+    validate_node_role(node_role.as_str())?;
+    let fail_closed_ssh_allow_enabled = parse_install_bool(
+        "RUSTYNET_FAIL_CLOSED_SSH_ALLOW",
+        fail_closed_ssh_allow_raw.as_str(),
+    )?;
+    let trust_auto_refresh_enabled = parse_install_bool(
+        "RUSTYNET_TRUST_AUTO_REFRESH",
+        trust_auto_refresh_raw.as_str(),
+    )?;
+    let assignment_auto_refresh_enabled = parse_install_bool(
+        "RUSTYNET_ASSIGNMENT_AUTO_REFRESH",
+        assignment_auto_refresh_raw.as_str(),
+    )?;
+    parse_install_bool(
+        "RUSTYNET_AUTO_TUNNEL_ENFORCE",
+        auto_tunnel_enforce_raw.as_str(),
+    )?;
+
+    if fail_closed_ssh_allow_enabled && fail_closed_ssh_allow_cidrs.trim().is_empty() {
+        return Err(
+            "fail-closed ssh allow enabled but no cidrs supplied (RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS)"
+                .to_string(),
+        );
+    }
+
+    let privileged_helper_timeout_ms = parse_nonzero_u64(
+        "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS",
+        privileged_helper_timeout_ms_raw.as_str(),
+    )?;
+    let wireguard_listen_port = parse_wireguard_port(wireguard_listen_port_raw.as_str())?;
+
+    let egress_interface = match env_optional_string("RUSTYNET_EGRESS_INTERFACE")? {
+        Some(value) => value,
+        None => match existing_env.get("RUSTYNET_EGRESS_INTERFACE") {
+            Some(value) if !value.is_empty() => value.clone(),
+            _ => detect_default_egress_interface()?,
+        },
+    };
+    if egress_interface.trim().is_empty() {
+        return Err(
+            "unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string(),
+        );
+    }
+    ensure_interface_exists(egress_interface.as_str())?;
+
+    for mutable_target in [
+        state_path.as_path(),
+        membership_snapshot_path.as_path(),
+        membership_log_path.as_path(),
+        trust_watermark_path.as_path(),
+        membership_watermark_path.as_path(),
+        auto_tunnel_watermark_path.as_path(),
+        wireguard_private_key_path.as_path(),
+    ] {
+        ensure_parent_dir_if_missing(mutable_target, daemon_uid, daemon_gid, 0o750)?;
+    }
+
+    for key_material_target in [
+        wireguard_encrypted_private_key_path.as_path(),
+        wireguard_public_key_path.as_path(),
+    ] {
+        let parent = key_material_target.parent().ok_or_else(|| {
+            format!(
+                "key material path has no parent: {}",
+                key_material_target.display()
+            )
+        })?;
+        ensure_directory_with_owner_mode(parent, 0o700, daemon_uid, daemon_gid)?;
+    }
+
+    let wireguard_cred_dir = wireguard_key_passphrase_credential_blob_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "wireguard credential blob has no parent: {}",
+                wireguard_key_passphrase_credential_blob_path.display()
+            )
+        })?;
+    ensure_directory_with_owner_mode(
+        wireguard_cred_dir,
+        0o700,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+    )?;
+
+    let signing_cred_dir = signing_key_passphrase_credential_blob_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "signing credential blob has no parent: {}",
+                signing_key_passphrase_credential_blob_path.display()
+            )
+        })?;
+    ensure_directory_with_owner_mode(signing_cred_dir, 0o700, Uid::from_raw(0), Gid::from_raw(0))?;
+
+    ensure_parent_dir_if_missing(socket_path.as_path(), daemon_uid, daemon_gid, 0o750)?;
+    ensure_parent_dir_if_missing(
+        privileged_helper_socket.as_path(),
+        Uid::from_raw(0),
+        daemon_gid,
+        0o750,
+    )?;
+
+    migrate_legacy_key_path_if_needed(
+        Path::new("/etc/rustynet/wireguard.key.enc"),
+        wireguard_encrypted_private_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    migrate_legacy_key_path_if_needed(
+        Path::new("/etc/rustynet/wireguard.pub"),
+        wireguard_public_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o644,
+    )?;
+
+    let legacy_passphrase_path = Path::new("/etc/rustynet/wireguard.passphrase");
+    let bootstrap_passphrase_path = Path::new("/var/lib/rustynet/keys/wireguard.passphrase");
+
+    if !wireguard_key_passphrase_credential_blob_path.is_file() {
+        return Err(format!(
+            "missing encrypted credential blob: {}\nrun ./start.sh first-run setup to regenerate secure key custody artifacts",
+            wireguard_key_passphrase_credential_blob_path.display()
+        ));
+    }
+    if !signing_key_passphrase_credential_blob_path.is_file() {
+        return Err(format!(
+            "missing encrypted signing credential blob: {}\nrun ./start.sh first-run setup to regenerate secure signing custody artifacts",
+            signing_key_passphrase_credential_blob_path.display()
+        ));
+    }
+
+    set_owner_mode_if_exists(
+        wireguard_key_passphrase_credential_blob_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        signing_key_passphrase_credential_blob_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+    )?;
+
+    secure_remove_file(bootstrap_passphrase_path)?;
+    if legacy_passphrase_path != wireguard_key_passphrase_credential_blob_path.as_path() {
+        secure_remove_file(legacy_passphrase_path)?;
+    }
+
+    let legacy_encrypted_key_path = Path::new("/etc/rustynet/wireguard.key.enc");
+    let legacy_key_id = key_id_for_encrypted_path(legacy_encrypted_key_path);
+    let target_key_id = key_id_for_encrypted_path(wireguard_encrypted_private_key_path.as_path());
+    let legacy_fallback_file = legacy_encrypted_key_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "legacy encrypted key path has no parent: {}",
+                legacy_encrypted_key_path.display()
+            )
+        })?
+        .join(format!("{legacy_key_id}.enc"));
+    let target_fallback_file = wireguard_encrypted_private_key_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "wireguard encrypted key path has no parent: {}",
+                wireguard_encrypted_private_key_path.display()
+            )
+        })?
+        .join(format!("{target_key_id}.enc"));
+
+    if legacy_fallback_file != target_fallback_file
+        && !target_fallback_file.exists()
+        && legacy_fallback_file.is_file()
+    {
+        copy_file_with_owner_mode(
+            legacy_fallback_file.as_path(),
+            target_fallback_file.as_path(),
+            daemon_uid,
+            daemon_gid,
+            0o600,
+            "legacy wireguard fallback key",
+        )?;
+        secure_remove_file(legacy_fallback_file.as_path())?;
+    }
+
+    for readonly_target in [
+        trust_evidence_path.as_path(),
+        trust_verifier_key_path.as_path(),
+        trust_signer_key_path.as_path(),
+        auto_tunnel_bundle_path.as_path(),
+        auto_tunnel_verifier_key_path.as_path(),
+        membership_owner_signing_key_path.as_path(),
+    ] {
+        ensure_parent_dir_if_missing(readonly_target, Uid::from_raw(0), daemon_gid, 0o750)?;
+    }
+
+    set_owner_mode_if_exists(state_path.as_path(), daemon_uid, daemon_gid, 0o600)?;
+    set_owner_mode_if_exists(
+        membership_snapshot_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(membership_log_path.as_path(), daemon_uid, daemon_gid, 0o600)?;
+    set_owner_mode_if_exists(
+        trust_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        membership_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        auto_tunnel_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        wireguard_private_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        wireguard_encrypted_private_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        wireguard_public_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o644,
+    )?;
+    set_owner_mode_if_exists(
+        target_fallback_file.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+
+    set_owner_mode_if_exists(
+        trust_evidence_path.as_path(),
+        Uid::from_raw(0),
+        daemon_gid,
+        0o640,
+    )?;
+    set_owner_mode_if_exists(
+        auto_tunnel_bundle_path.as_path(),
+        Uid::from_raw(0),
+        daemon_gid,
+        0o640,
+    )?;
+    set_owner_mode_if_exists(
+        trust_verifier_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+    )?;
+    set_owner_mode_if_exists(
+        trust_signer_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        auto_tunnel_verifier_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+    )?;
+    set_owner_mode_if_exists(
+        membership_owner_signing_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+    )?;
+
+    let trust_auto_refresh_normalized = if trust_auto_refresh_enabled {
+        "true"
+    } else {
+        "false"
+    };
+    let assignment_auto_refresh_normalized = if assignment_auto_refresh_enabled {
+        "true"
+    } else {
+        "false"
+    };
+
+    let env_entries = vec![
+        ("RUSTYNET_NODE_ID".to_string(), node_id),
+        ("RUSTYNET_NODE_ROLE".to_string(), node_role.clone()),
+        (
+            "RUSTYNET_SOCKET".to_string(),
+            display_path(socket_path.as_path()),
+        ),
+        (
+            "RUSTYNET_STATE".to_string(),
+            display_path(state_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRUST_EVIDENCE".to_string(),
+            display_path(trust_evidence_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRUST_VERIFIER_KEY".to_string(),
+            display_path(trust_verifier_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRUST_WATERMARK".to_string(),
+            display_path(trust_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRUST_SIGNER_KEY".to_string(),
+            display_path(trust_signer_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRUST_AUTO_REFRESH".to_string(),
+            trust_auto_refresh_normalized.to_string(),
+        ),
+        (
+            "RUSTYNET_ASSIGNMENT_AUTO_REFRESH".to_string(),
+            assignment_auto_refresh_normalized.to_string(),
+        ),
+        (
+            "RUSTYNET_MEMBERSHIP_SNAPSHOT".to_string(),
+            display_path(membership_snapshot_path.as_path()),
+        ),
+        (
+            "RUSTYNET_MEMBERSHIP_LOG".to_string(),
+            display_path(membership_log_path.as_path()),
+        ),
+        (
+            "RUSTYNET_MEMBERSHIP_WATERMARK".to_string(),
+            display_path(membership_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY".to_string(),
+            display_path(membership_owner_signing_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_AUTO_TUNNEL_ENFORCE".to_string(),
+            auto_tunnel_enforce_raw,
+        ),
+        (
+            "RUSTYNET_AUTO_TUNNEL_BUNDLE".to_string(),
+            display_path(auto_tunnel_bundle_path.as_path()),
+        ),
+        (
+            "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY".to_string(),
+            display_path(auto_tunnel_verifier_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_AUTO_TUNNEL_WATERMARK".to_string(),
+            display_path(auto_tunnel_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS".to_string(),
+            auto_tunnel_max_age_secs,
+        ),
+        ("RUSTYNET_BACKEND".to_string(), backend_mode),
+        ("RUSTYNET_WG_INTERFACE".to_string(), wireguard_interface),
+        (
+            "RUSTYNET_WG_LISTEN_PORT".to_string(),
+            wireguard_listen_port_raw,
+        ),
+        (
+            "RUSTYNET_WG_PRIVATE_KEY".to_string(),
+            display_path(wireguard_private_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY".to_string(),
+            display_path(wireguard_encrypted_private_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_WG_KEY_PASSPHRASE".to_string(),
+            format!(
+                "/run/credentials/rustynetd.service/{}",
+                RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME
+            ),
+        ),
+        (
+            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_string(),
+            display_path(wireguard_key_passphrase_credential_blob_path.as_path()),
+        ),
+        (
+            "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_string(),
+            display_path(signing_key_passphrase_credential_blob_path.as_path()),
+        ),
+        (
+            "RUSTYNET_WG_PUBLIC_KEY".to_string(),
+            display_path(wireguard_public_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_EGRESS_INTERFACE".to_string(),
+            egress_interface.clone(),
+        ),
+        ("RUSTYNET_DATAPLANE_MODE".to_string(), dataplane_mode),
+        (
+            "RUSTYNET_PRIVILEGED_HELPER_SOCKET".to_string(),
+            display_path(privileged_helper_socket.as_path()),
+        ),
+        (
+            "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS".to_string(),
+            privileged_helper_timeout_ms_raw,
+        ),
+        (
+            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID".to_string(),
+            daemon_uid.as_raw().to_string(),
+        ),
+        (
+            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID".to_string(),
+            daemon_gid.as_raw().to_string(),
+        ),
+        ("RUSTYNET_DAEMON_GROUP".to_string(), service_group),
+        (
+            "RUSTYNET_RECONCILE_INTERVAL_MS".to_string(),
+            reconcile_interval_ms,
+        ),
+        (
+            "RUSTYNET_MAX_RECONCILE_FAILURES".to_string(),
+            max_reconcile_failures,
+        ),
+        (
+            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW".to_string(),
+            fail_closed_ssh_allow_raw,
+        ),
+        (
+            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS".to_string(),
+            fail_closed_ssh_allow_cidrs,
+        ),
+    ];
+
+    let mut rendered_env = String::new();
+    for (key, value) in env_entries {
+        validate_env_line(key.as_str(), value.as_str())?;
+        rendered_env.push_str(key.as_str());
+        rendered_env.push('=');
+        rendered_env.push_str(value.as_str());
+        rendered_env.push('\n');
+    }
+    write_atomic_text_file(
+        Path::new(ENV_DST),
+        rendered_env.as_str(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+    )?;
+
+    run_command_checked("systemctl", &["daemon-reload"])?;
+    run_command_checked(
+        "systemctl",
+        &["enable", "rustynetd-privileged-helper.service"],
+    )?;
+    run_command_checked("systemctl", &["enable", "rustynetd.service"])?;
+
+    if trust_auto_refresh_enabled {
+        if !trust_signer_key_path.is_file() {
+            return Err(format!(
+                "trust auto-refresh enabled but signer key missing: {}",
+                trust_signer_key_path.display()
+            ));
+        }
+        run_command_checked("systemctl", &["enable", "rustynetd-trust-refresh.timer"])?;
+    } else {
+        let _ = run_command_checked(
+            "systemctl",
+            &["disable", "--now", "rustynetd-trust-refresh.timer"],
+        );
+    }
+
+    if assignment_auto_refresh_enabled {
+        if !auto_tunnel_verifier_key_path.is_file() {
+            return Err(format!(
+                "assignment auto-refresh enabled but verifier key missing: {}",
+                auto_tunnel_verifier_key_path.display()
+            ));
+        }
+        run_command_checked(
+            "systemctl",
+            &["enable", "rustynetd-assignment-refresh.timer"],
+        )?;
+    } else {
+        let _ = run_command_checked(
+            "systemctl",
+            &["disable", "--now", "rustynetd-assignment-refresh.timer"],
+        );
+    }
+
+    let _ = run_command_checked(
+        "systemctl",
+        &[
+            "reset-failed",
+            "rustynetd-privileged-helper.service",
+            "rustynetd.service",
+            "rustynetd-trust-refresh.service",
+            "rustynetd-trust-refresh.timer",
+            "rustynetd-assignment-refresh.service",
+            "rustynetd-assignment-refresh.timer",
+        ],
+    );
+
+    run_command_checked(
+        "systemctl",
+        &["restart", "rustynetd-privileged-helper.service"],
+    )?;
+    if trust_auto_refresh_enabled {
+        run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"])?;
+        run_command_checked("systemctl", &["restart", "rustynetd-trust-refresh.timer"])?;
+    }
+    if assignment_auto_refresh_enabled {
+        run_command_checked(
+            "systemctl",
+            &["start", "rustynetd-assignment-refresh.service"],
+        )?;
+        run_command_checked(
+            "systemctl",
+            &["restart", "rustynetd-assignment-refresh.timer"],
+        )?;
+    }
+    run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
+
+    run_command_stream(
+        "systemctl",
+        &[
+            "--no-pager",
+            "--full",
+            "status",
+            "rustynetd-privileged-helper.service",
+        ],
+    )?;
+    if trust_auto_refresh_enabled {
+        run_command_stream(
+            "systemctl",
+            &[
+                "--no-pager",
+                "--full",
+                "status",
+                "rustynetd-trust-refresh.timer",
+            ],
+        )?;
+    }
+    if assignment_auto_refresh_enabled {
+        run_command_stream(
+            "systemctl",
+            &[
+                "--no-pager",
+                "--full",
+                "status",
+                "rustynetd-assignment-refresh.timer",
+            ],
+        )?;
+    }
+    run_command_stream(
+        "systemctl",
+        &["--no-pager", "--full", "status", "rustynetd.service"],
+    )?;
+
+    Ok(format!(
+        "systemd installer completed: role={} wireguard_listen_port={} egress_interface={} timeout_ms={}",
+        node_role, wireguard_listen_port, egress_interface, privileged_helper_timeout_ms
+    ))
+}
+
+fn require_root_execution() -> Result<(), String> {
+    if Uid::effective().is_root() {
+        return Ok(());
+    }
+    Err("run as root".to_string())
+}
+
+fn require_linux_host() -> Result<(), String> {
+    if cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    Err("ops install-systemd is only supported on Linux hosts".to_string())
+}
+
+fn resolve_source_root() -> Result<PathBuf, String> {
+    if let Some(candidate) = env_optional_string("RUSTYNET_INSTALL_SOURCE_ROOT")? {
+        let path = PathBuf::from(candidate);
+        if !path.is_absolute() {
+            return Err(format!(
+                "RUSTYNET_INSTALL_SOURCE_ROOT must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        if has_install_sources(path.as_path()) {
+            return Ok(path);
+        }
+        return Err(format!(
+            "RUSTYNET_INSTALL_SOURCE_ROOT missing required systemd files: {}",
+            path.display()
+        ));
+    }
+
+    let cwd = std::env::current_dir().map_err(|err| format!("resolve cwd failed: {err}"))?;
+    if has_install_sources(cwd.as_path()) {
+        return Ok(cwd);
+    }
+
+    Err(
+        "unable to resolve installer source root; set RUSTYNET_INSTALL_SOURCE_ROOT to repository root"
+            .to_string(),
+    )
+}
+
+fn install_sources(root: &Path) -> InstallSources {
+    InstallSources {
+        service: root.join("scripts/systemd/rustynetd.service"),
+        helper_service: root.join("scripts/systemd/rustynetd-privileged-helper.service"),
+        trust_refresh_service: root.join("scripts/systemd/rustynetd-trust-refresh.service"),
+        trust_refresh_timer: root.join("scripts/systemd/rustynetd-trust-refresh.timer"),
+        trust_refresh_script: root.join("scripts/systemd/refresh_trust_evidence.sh"),
+        assignment_refresh_service: root
+            .join("scripts/systemd/rustynetd-assignment-refresh.service"),
+        assignment_refresh_timer: root.join("scripts/systemd/rustynetd-assignment-refresh.timer"),
+        assignment_refresh_script: root.join("scripts/systemd/refresh_assignment_bundle.sh"),
+    }
+}
+
+fn has_install_sources(root: &Path) -> bool {
+    let sources = install_sources(root);
+    [
+        sources.service,
+        sources.helper_service,
+        sources.trust_refresh_service,
+        sources.trust_refresh_timer,
+        sources.trust_refresh_script,
+        sources.assignment_refresh_service,
+        sources.assignment_refresh_timer,
+        sources.assignment_refresh_script,
+    ]
+    .iter()
+    .all(|path| path.is_file())
+}
+
+fn validate_source_paths(paths: &InstallSources) -> Result<(), String> {
+    for (label, path) in [
+        ("rustynetd.service", paths.service.as_path()),
+        (
+            "rustynetd-privileged-helper.service",
+            paths.helper_service.as_path(),
+        ),
+        (
+            "rustynetd-trust-refresh.service",
+            paths.trust_refresh_service.as_path(),
+        ),
+        (
+            "rustynetd-trust-refresh.timer",
+            paths.trust_refresh_timer.as_path(),
+        ),
+        (
+            "refresh_trust_evidence.sh",
+            paths.trust_refresh_script.as_path(),
+        ),
+        (
+            "rustynetd-assignment-refresh.service",
+            paths.assignment_refresh_service.as_path(),
+        ),
+        (
+            "rustynetd-assignment-refresh.timer",
+            paths.assignment_refresh_timer.as_path(),
+        ),
+        (
+            "refresh_assignment_bundle.sh",
+            paths.assignment_refresh_script.as_path(),
+        ),
+    ] {
+        validate_regular_file_non_symlink(path, label)?;
+    }
+    Ok(())
+}
+
+fn validate_regular_file_non_symlink(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("missing {label}: {} ({err})", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_env_file_values(path: &Path) -> Result<HashMap<String, String>, String> {
+    let mut values = HashMap::new();
+    if !path.exists() {
+        return Ok(values);
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("read environment file {} failed: {err}", path.display()))?;
+    for raw_line in content.lines() {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = raw_line.split_once('=') {
+            if key.is_empty() || values.contains_key(key) {
+                continue;
+            }
+            values.insert(key.to_string(), value.to_string());
+        }
+    }
+    Ok(values)
+}
+
+fn env_optional_string(key: &str) -> Result<Option<String>, String> {
+    match std::env::var(key) {
+        Ok(value) => {
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("environment variable {key} contains non-utf8 data"))
+        }
+    }
+}
+
+fn env_string_or_existing_default(
+    key: &str,
+    default: &str,
+    existing: &HashMap<String, String>,
+) -> Result<String, String> {
+    match env_optional_string(key)? {
+        Some(value) => Ok(value),
+        None => match existing.get(key) {
+            Some(value) if !value.is_empty() => Ok(value.clone()),
+            _ => Ok(default.to_string()),
+        },
+    }
+}
+
+fn env_string_or_default_process(key: &str, default: &str) -> Result<String, String> {
+    match env_optional_string(key)? {
+        Some(value) => Ok(value),
+        None => Ok(default.to_string()),
+    }
+}
+
+fn env_path_or_existing_default(
+    key: &str,
+    default: &str,
+    existing: &HashMap<String, String>,
+) -> Result<PathBuf, String> {
+    let value = env_string_or_existing_default(key, default, existing)?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{key} must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn validate_node_role(value: &str) -> Result<(), String> {
+    match value {
+        "admin" | "client" | "blind_exit" => Ok(()),
+        _ => Err(format!(
+            "invalid node role: {value} (expected admin|client|blind_exit)"
+        )),
+    }
+}
+
+fn parse_install_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(format!(
+            "invalid {} value: {} (expected true|false)",
+            key.to_lowercase().replace('_', " "),
+            value
+        )),
+    }
+}
+
+fn parse_nonzero_u64(key: &str, value: &str) -> Result<u64, String> {
+    let parsed = value.parse::<u64>().map_err(|_| {
+        format!(
+            "invalid {}: {}",
+            key.to_lowercase().replace('_', " "),
+            value
+        )
+    })?;
+    if parsed == 0 {
+        return Err(format!(
+            "invalid {}: {}",
+            key.to_lowercase().replace('_', " "),
+            value
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_wireguard_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid wireguard listen port: {value} (expected 1-65535)"))?;
+    if port == 0 {
+        return Err(format!(
+            "invalid wireguard listen port: {value} (expected 1-65535)"
+        ));
+    }
+    Ok(port)
+}
+
+fn detect_default_egress_interface() -> Result<String, String> {
+    let output = run_command_capture("ip", &["-o", "-4", "route", "show", "to", "default"])?;
+    for line in output.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        for (idx, token) in tokens.iter().enumerate() {
+            if *token == "dev"
+                && let Some(name) = tokens.get(idx + 1)
+            {
+                return Ok((*name).to_string());
+            }
+        }
+        if let Some(name) = tokens.get(4) {
+            return Ok((*name).to_string());
+        }
+    }
+    Err("unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string())
+}
+
+fn ensure_interface_exists(interface: &str) -> Result<(), String> {
+    run_command_checked("ip", &["link", "show", interface])
+        .map_err(|_| format!("egress interface does not exist: {interface}"))
+}
+
+fn ensure_group_exists(group_name: &str) -> Result<(), String> {
+    if lookup_gid_optional(group_name)?.is_some() {
+        return Ok(());
+    }
+    run_command_checked("groupadd", &["--system", group_name])?;
+    if lookup_gid_optional(group_name)?.is_none() {
+        return Err(format!("failed to create system group: {group_name}"));
+    }
+    Ok(())
+}
+
+fn ensure_user_exists(user_name: &str, group_name: &str) -> Result<(), String> {
+    if lookup_uid_optional(user_name)?.is_some() {
+        return Ok(());
+    }
+    run_command_checked(
+        "useradd",
+        &[
+            "--system",
+            "--gid",
+            group_name,
+            "--home-dir",
+            "/nonexistent",
+            "--shell",
+            "/usr/sbin/nologin",
+            user_name,
+        ],
+    )?;
+    if lookup_uid_optional(user_name)?.is_none() {
+        return Err(format!("failed to create system user: {user_name}"));
+    }
+    Ok(())
+}
+
+fn lookup_gid_optional(group_name: &str) -> Result<Option<Gid>, String> {
+    Group::from_name(group_name)
+        .map_err(|err| format!("resolve group {group_name} failed: {err}"))
+        .map(|group| group.map(|entry| entry.gid))
+}
+
+fn lookup_gid(group_name: &str) -> Result<Gid, String> {
+    lookup_gid_optional(group_name)?
+        .ok_or_else(|| format!("group not found after setup: {group_name}"))
+}
+
+fn lookup_uid_optional(user_name: &str) -> Result<Option<Uid>, String> {
+    User::from_name(user_name)
+        .map_err(|err| format!("resolve user {user_name} failed: {err}"))
+        .map(|user| user.map(|entry| entry.uid))
+}
+
+fn lookup_uid(user_name: &str) -> Result<Uid, String> {
+    lookup_uid_optional(user_name)?
+        .ok_or_else(|| format!("user not found after setup: {user_name}"))
+}
+
+fn ensure_directory_with_owner_mode(
+    path: &Path,
+    mode: u32,
+    owner: Uid,
+    group: Gid,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "directory must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(format!("path must be a directory: {}", path.display()));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|create_err| {
+                format!("create directory {} failed: {create_err}", path.display())
+            })?;
+        }
+        Err(err) => {
+            return Err(format!(
+                "inspect directory {} failed: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    chown(path, Some(owner), Some(group))
+        .map_err(|err| format!("set directory owner {} failed: {err}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("set directory mode {} failed: {err}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_parent_dir_if_missing(
+    target: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("target path has no parent directory: {}", target.display()))?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "parent directory must not be a symlink: {}",
+                    parent.display()
+                ));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "parent path is not a directory: {}",
+                    parent.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent).map_err(|create_err| {
+                format!("create directory {} failed: {create_err}", parent.display())
+            })?;
+            chown(parent, Some(owner), Some(group)).map_err(|chown_err| {
+                format!(
+                    "set directory owner {} failed: {chown_err}",
+                    parent.display()
+                )
+            })?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(mode)).map_err(|perm_err| {
+                format!("set directory mode {} failed: {perm_err}", parent.display())
+            })?;
+            Ok(())
+        }
+        Err(err) => Err(format!(
+            "inspect directory {} failed: {err}",
+            parent.display()
+        )),
+    }
+}
+
+fn install_file(
+    source: &Path,
+    destination: &Path,
+    mode: u32,
+    owner: Uid,
+    group: Gid,
+    label: &str,
+) -> Result<(), String> {
+    copy_file_with_owner_mode(source, destination, owner, group, mode, label)
+}
+
+fn copy_file_with_owner_mode(
+    source: &Path,
+    destination: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    validate_regular_file_non_symlink(source, label)?;
+
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "destination must not be a symlink: {}",
+                    destination.display()
+                ));
+            }
+            if metadata.file_type().is_dir() {
+                return Err(format!(
+                    "destination must be a file path: {}",
+                    destination.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect destination {} failed: {err}",
+                destination.display()
+            ));
+        }
+    }
+
+    fs::copy(source, destination).map_err(|err| {
+        format!(
+            "install {label} {} -> {} failed: {err}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    chown(destination, Some(owner), Some(group))
+        .map_err(|err| format!("set {label} owner {} failed: {err}", destination.display()))?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("set {label} mode {} failed: {err}", destination.display()))?;
+    Ok(())
+}
+
+fn set_owner_mode_if_exists(path: &Path, owner: Uid, group: Gid, mode: u32) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("path must not be a symlink: {}", path.display()));
+            }
+            chown(path, Some(owner), Some(group))
+                .map_err(|err| format!("set owner {} failed: {err}", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|err| format!("set mode {} failed: {err}", path.display()))?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("inspect {} failed: {err}", path.display())),
+    }
+}
+
+fn migrate_legacy_key_path_if_needed(
+    legacy_path: &Path,
+    target_path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), String> {
+    if legacy_path == target_path {
+        return Ok(());
+    }
+    if target_path.exists() || !legacy_path.is_file() {
+        return Ok(());
+    }
+    copy_file_with_owner_mode(
+        legacy_path,
+        target_path,
+        owner,
+        group,
+        mode,
+        "legacy key material",
+    )?;
+    secure_remove_file(legacy_path)?;
+    Ok(())
+}
+
+fn command_exists(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|path| {
+        let candidate = path.join(binary);
+        match fs::metadata(candidate) {
+            Ok(metadata) => {
+                metadata.file_type().is_file() && (metadata.permissions().mode() & 0o111) != 0
+            }
+            Err(_) => false,
+        }
+    })
+}
+
+fn secure_remove_file(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("inspect {} failed: {err}", path.display())),
+    };
+
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(path)
+            .map_err(|err| format!("remove symlink {} failed: {err}", path.display()))?;
+        return Ok(());
+    }
+
+    if !metadata.file_type().is_file() {
+        return Ok(());
+    }
+
+    if command_exists("shred") {
+        match Command::new("shred")
+            .arg("--force")
+            .arg("--remove")
+            .arg(path)
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("open {} for truncate failed: {err}", path.display()))?;
+    file.set_len(0)
+        .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+    fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))?;
+    Ok(())
+}
+
+fn key_id_for_encrypted_path(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().as_bytes());
+    let digest = hasher.finalize();
+    let hex = bytes_to_hex(digest.as_slice());
+    format!("{}{}", LEGACY_WIREGUARD_KEY_ID_PREFIX, &hex[..16])
+}
+
+fn bytes_to_hex(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(input.len() * 2);
+    for byte in input {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let mut random_bytes = [0u8; 8];
+    for _ in 0..32 {
+        OsRng.fill_bytes(&mut random_bytes);
+        let candidate = dir.join(format!("{prefix}{}", bytes_to_hex(&random_bytes)));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "create temporary file {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "unable to allocate secure temporary file in {}",
+        dir.display()
+    ))
+}
+
+fn publish_file_with_owner_mode(
+    source_tmp_path: &Path,
+    destination_path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    chown(source_tmp_path, Some(owner), Some(group)).map_err(|err| {
+        format!(
+            "set {label} owner {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    fs::set_permissions(source_tmp_path, fs::Permissions::from_mode(mode)).map_err(|err| {
+        format!(
+            "set {label} mode {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    fs::rename(source_tmp_path, destination_path).map_err(|err| {
+        format!(
+            "publish {label} to {} failed: {err}",
+            destination_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_atomic_text_file(
+    target: &Path,
+    body: &str,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("target path has no parent: {}", target.display()))?;
+    ensure_directory_with_owner_mode(parent, 0o755, Uid::from_raw(0), Gid::from_raw(0))?;
+
+    let tmp = create_secure_temp_file(parent, "rustynetd.env.tmp.")?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(tmp.as_path())
+            .map_err(|err| format!("open temporary file {} failed: {err}", tmp.display()))?;
+        file.write_all(body.as_bytes())
+            .map_err(|err| format!("write temporary file {} failed: {err}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync temporary file {} failed: {err}", tmp.display()))?;
+    }
+    publish_file_with_owner_mode(
+        tmp.as_path(),
+        target,
+        owner,
+        group,
+        mode,
+        "environment file",
+    )
+}
+
+fn run_command_capture(command: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "command failed ({}): {}",
+            format_command(command, args),
+            details
+        ));
+    }
+
+    String::from_utf8(output.stdout).map_err(|err| {
+        format!(
+            "decode output for {} failed: {err}",
+            format_command(command, args)
+        )
+    })
+}
+
+fn run_command_checked(command: &str, args: &[&str]) -> Result<(), String> {
+    run_command_capture(command, args).map(|_| ())
+}
+
+fn run_command_stream(command: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(command)
+        .args(args)
+        .status()
+        .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "command failed: {} (exit={})",
+        format_command(command, args),
+        status
+    ))
+}
+
+fn format_command(command: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        return command.to_string();
+    }
+    format!("{} {}", command, args.join(" "))
+}
+
+fn hostname_fallback() -> String {
+    match run_command_capture("hostname", &["-s"]) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                "daemon-local".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Err(_) => "daemon-local".to_string(),
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn validate_simple_value(key: &str, value: &str) -> Result<(), String> {
+    validate_env_line(key, value)
+}
+
+fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("environment key must not be empty".to_string());
+    }
+    if key.contains('\n') || key.contains('\r') || key.contains('\0') {
+        return Err(format!("environment key contains unsafe characters: {key}"));
+    }
+    if value.contains('\n') || value.contains('\r') || value.contains('\0') {
+        return Err(format!(
+            "environment value contains unsafe characters: {key}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LEGACY_WIREGUARD_KEY_ID_PREFIX, bytes_to_hex, key_id_for_encrypted_path,
+        parse_install_bool, read_env_file_values,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn parse_install_bool_accepts_expected_variants() {
+        assert!(parse_install_bool("TEST", "true").expect("true should parse"));
+        assert!(parse_install_bool("TEST", "1").expect("1 should parse"));
+        assert!(parse_install_bool("TEST", "yes").expect("yes should parse"));
+        assert!(!parse_install_bool("TEST", "false").expect("false should parse"));
+        assert!(!parse_install_bool("TEST", "0").expect("0 should parse"));
+        assert!(!parse_install_bool("TEST", "no").expect("no should parse"));
+        assert!(parse_install_bool("TEST", "TRUE").is_err());
+    }
+
+    #[test]
+    fn read_env_file_values_takes_first_assignment_only() {
+        let unique = format!(
+            "rustynet-cli-env-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(format!("{unique}.env"));
+        std::fs::write(
+            &path,
+            "# comment\nRUSTYNET_NODE_ID=a\nRUSTYNET_NODE_ID=b\nRUSTYNET_NODE_ROLE=client\n",
+        )
+        .expect("env file should be written");
+
+        let values = read_env_file_values(path.as_path()).expect("env should parse");
+        assert_eq!(values.get("RUSTYNET_NODE_ID").expect("node id"), "a");
+        assert_eq!(
+            values.get("RUSTYNET_NODE_ROLE").expect("node role"),
+            "client"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn key_id_derivation_matches_expected_shape() {
+        let key_id = key_id_for_encrypted_path(Path::new("/etc/rustynet/wireguard.key.enc"));
+        assert!(key_id.starts_with(LEGACY_WIREGUARD_KEY_ID_PREFIX));
+        assert_eq!(key_id.len(), LEGACY_WIREGUARD_KEY_ID_PREFIX.len() + 16);
+
+        assert_eq!(bytes_to_hex(&[0x00, 0xab, 0xff]), "00abff");
+    }
+}

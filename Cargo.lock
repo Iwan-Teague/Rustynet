@@ -534,6 +534,7 @@ dependencies = [
  "rustynet-crypto",
  "rustynet-policy",
  "rustynetd",
+ "sha2",
  "zeroize",
 ]
 

@@ -70,6 +70,7 @@ Linux trust-refresh behavior:
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
 - Linux assignment refresh service path is Rust-backed: `scripts/systemd/refresh_assignment_bundle.sh` is a thin wrapper to `rustynet ops refresh-assignment`.
+- Linux service installer path is Rust-backed: `scripts/systemd/install_rustynetd_service.sh` is a thin wrapper to `rustynet ops install-systemd` (with `RUSTYNET_INSTALL_SOURCE_ROOT` pinned by the wrapper).
 - Linux signing artifact custody expects `/etc/rustynet` parent directory mode
   `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
 - For unattended runtime, enable signer-backed assignment refresh with:

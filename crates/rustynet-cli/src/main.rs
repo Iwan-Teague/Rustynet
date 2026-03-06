@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod ops_install_systemd;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -148,6 +150,7 @@ enum TrustCommand {
 enum OpsCommand {
     RefreshTrust,
     RefreshAssignment,
+    InstallSystemd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +241,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     match args {
         [subcmd] if subcmd == "refresh-trust" => Ok(OpsCommand::RefreshTrust),
         [subcmd] if subcmd == "refresh-assignment" => Ok(OpsCommand::RefreshAssignment),
+        [subcmd] if subcmd == "install-systemd" => Ok(OpsCommand::InstallSystemd),
         [subcmd, ..] => Err(format!("unknown ops subcommand: {subcmd}")),
         _ => Err("ops subcommand is required".to_string()),
     }
@@ -910,6 +914,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
     match command {
         OpsCommand::RefreshTrust => execute_ops_refresh_trust(),
         OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
+        OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
     }
 }
 
@@ -2112,6 +2117,7 @@ fn help_text() -> String {
         "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
         "  ops refresh-trust",
         "  ops refresh-assignment",
+        "  ops install-systemd",
     ]
     .join("\n")
 }
@@ -2196,6 +2202,9 @@ mod tests {
 
         let assignment = parse_command(&["ops".to_string(), "refresh-assignment".to_string()]);
         assert!(format!("{assignment:?}").contains("RefreshAssignment"));
+
+        let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
+        assert!(format!("{installer:?}").contains("InstallSystemd"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 
 ## Service Files
 - Source: `scripts/systemd/rustynetd.service`
-- Install helper: `scripts/systemd/install_rustynetd_service.sh`
+- Install helper: `scripts/systemd/install_rustynetd_service.sh` (compatibility wrapper to `rustynet ops install-systemd`)
 - Privileged helper unit: `scripts/systemd/rustynetd-privileged-helper.service`
 - Trust refresh unit: `scripts/systemd/rustynetd-trust-refresh.service`
 - Trust refresh timer: `scripts/systemd/rustynetd-trust-refresh.timer`
@@ -21,8 +21,8 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Assignment refresh timer: `scripts/systemd/rustynetd-assignment-refresh.timer`
 - Assignment refresh helper script: `scripts/systemd/refresh_assignment_bundle.sh` (installed to `/usr/local/libexec/rustynet/refresh_assignment_bundle.sh`)
 
-Implementation note (Phase A migration):
-- Both helper scripts above are now compatibility wrappers that execute hardened Rust ops commands (`rustynet ops refresh-trust` and `rustynet ops refresh-assignment`) so privileged validation/signing logic runs in Rust rather than shell.
+Implementation note (Phase A/B migration):
+- Trust/assignment refresh helpers and the systemd installer helper are now compatibility wrappers that execute hardened Rust ops commands (`rustynet ops refresh-trust`, `rustynet ops refresh-assignment`, `rustynet ops install-systemd`) so privileged validation/signing/install logic runs in Rust rather than shell.
 
 ## Hardening Controls (Daemon)
 - `NoNewPrivileges=true`
