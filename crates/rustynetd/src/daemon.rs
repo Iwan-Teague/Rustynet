@@ -1970,13 +1970,14 @@ impl DaemonRuntime {
             return Ok(());
         }
         if selected_exit_node.is_some() {
-            return Err(
-                "blind_exit role rejects selected_exit_node assignments and cannot operate as a client"
-                    .to_string(),
+            eprintln!(
+                "rustynetd: ignoring selected_exit_node assignment for blind_exit role"
             );
         }
         if lan_access_enabled {
-            return Err("blind_exit role rejects LAN route advertisement assignments".to_string());
+            eprintln!(
+                "rustynetd: ignoring LAN route assignment for blind_exit role"
+            );
         }
         Ok(())
     }
@@ -4773,6 +4774,78 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_blind_exit_ignores_client_assignment_fields() {
+        let test_dir = secure_test_dir("rustynetd-runtime-blind-exit-assignment");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        // Includes an exit-default route that would map to selected_exit_node for clients.
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            9,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::BlindExit,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("node_role=blind_exit"));
+        assert!(status.message.contains("serving_exit_node=true"));
+        assert!(status.message.contains("exit_node=none"));
+        assert!(status.message.contains("restricted_safe_mode=false"));
+
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(!denied.ok);
+        assert!(denied.message.contains("node role"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
