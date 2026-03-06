@@ -300,7 +300,7 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 continue;
             }
 
-            if let Err(err) = self.runner.run(
+            match self.runner.run(
                 "ip",
                 &[
                     "route".to_string(),
@@ -309,9 +309,13 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                     "dev".to_string(),
                     self.interface_name.clone(),
                 ],
-            ) && !Self::is_missing_ip_route_error(&err)
-            {
-                return Err(err);
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    if !Self::is_missing_ip_route_error(&err) {
+                        return Err(err);
+                    }
+                }
             }
         }
 
