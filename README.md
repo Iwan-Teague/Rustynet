@@ -25,9 +25,13 @@ The wizard handles:
 - Linux signing-key passphrase handling is also credential-only for unattended jobs:
   `/etc/rustynet/credentials/signing_key_passphrase.cred` is loaded into refresh
   services via `LoadCredentialEncrypted` (no persistent plaintext passphrase files)
+- signing credential decrypt flows pin embedded credential name for cross-distro
+  systemd compatibility: `systemd-creds decrypt --name=signing_key_passphrase ...`
 - local key rotation/revocation and peer rotation-bundle apply flow
 - membership bootstrap with encrypted persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
+- main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
+- `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
 - route advertisement and status checks
 
 Host-profile behavior:
@@ -64,6 +68,8 @@ Linux trust-refresh behavior:
 
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
+- Linux signing artifact custody expects `/etc/rustynet` parent directory mode
+  `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
 - For unattended runtime, enable signer-backed assignment refresh with:
   - `RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true` in `/etc/default/rustynetd`
   - `/etc/rustynet/assignment-refresh.env` containing:
@@ -127,6 +133,8 @@ What this script does:
 - performs clean Rustynet runtime reset on each host (service stop + Rustynet-owned dataplane cleanup)
 - builds and installs `rustynetd` + `rustynet`
 - initializes encrypted key custody using `systemd-creds` credential blob (no persistent plaintext passphrase files)
+- decrypts signing credential blobs with explicit embedded-name pinning
+  (`systemd-creds decrypt --name=signing_key_passphrase`) for distro portability
 - initializes trust + membership state, issues signed assignment bundles, and enables auto-tunnel enforcement
 - configures exit-node routing and validates tunnel/dataplane/security invariants
 - writes a validation report to `artifacts/phase10/debian_two_node_remote_validation.md`

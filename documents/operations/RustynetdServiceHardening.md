@@ -4,6 +4,8 @@ Status correction (verified 2026-03-05):
 - Legacy requirement text that expects a persistent plaintext passphrase file is stale for current Linux hardened runtime.
 - Runtime passphrase custody is credential-only via encrypted systemd credential blob (`LoadCredentialEncrypted=wg_key_passphrase:/etc/rustynet/credentials/wg_key_passphrase.cred`).
 - Security risk truth: documenting plaintext passphrase files as required can lead to weaker key handling than current code policy.
+- When decrypting signing credentials outside unit-injected `%d/...` paths, use explicit credential-name pinning for portability:
+  `systemd-creds decrypt --name=signing_key_passphrase /etc/rustynet/credentials/signing_key_passphrase.cred <output>`.
 
 ## Purpose
 Define a production-safe service profile for `rustynetd` with least privilege, fail-closed behavior, and predictable restart semantics.
@@ -56,6 +58,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Uses `ProtectSystem=full`, `NoNewPrivileges=true`, and only `CAP_DAC_OVERRIDE` + `CAP_CHOWN` to access strict daemon-owned runtime paths and preserve trust evidence owner/group permissions.
 - Reads encrypted signer key from `RUSTYNET_TRUST_SIGNER_KEY` and uses explicit passphrase input (`RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE`) loaded via `LoadCredentialEncrypted`.
 - Enforces signer key ownership/mode guardrails (root-owned, owner-only) plus passphrase file ownership/mode checks.
+- Encrypted signing artifacts under `/etc/rustynet` require parent directory mode `0750` (`root:<daemon-group>`) and file mode `0600`.
 - Uses daemon-group-readable trust evidence (`root:<daemon-group>`, mode `0640`) when daemon group exists.
 - Startup/migration cleanup paths for trust/signing artifacts use scrub+remove semantics (best-effort overwrite before unlink).
 
@@ -65,6 +68,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Requires explicit enable (`RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true`) and root-owned refresh config (`/etc/rustynet/assignment-refresh.env`).
 - Reads encrypted signing secret from `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` with explicit passphrase input (`RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE`) loaded via `LoadCredentialEncrypted`.
 - Enforces root ownership/strict mode checks on both encrypted signing secret and passphrase source.
+- Encrypted signing artifacts under `/etc/rustynet` require parent directory mode `0750` (`root:<daemon-group>`) and file mode `0600`.
 - Reissues signed bundle with bounded TTL and rewrites artifacts atomically:
   - `/var/lib/rustynet/rustynetd.assignment` (`0640 root:<daemon-group>`)
   - `/etc/rustynet/assignment.pub` (`0644 root:root`)
@@ -89,6 +93,8 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
   - `Persistent=true`
 
 ## Required Runtime Files
+- `/etc/rustynet` directory (`0750`, `root:<daemon-group>`) for verifier + encrypted signing artifacts
+- `/etc/rustynet/credentials` directory (`0700`, `root:root`) for encrypted credential blobs
 - `/var/lib/rustynet/keys/wireguard.key.enc` (`0600`, encrypted at rest)
 - `/etc/rustynet/credentials/wg_key_passphrase.cred` (`0600`, encrypted credential blob for passphrase custody)
 - `/etc/rustynet/credentials/signing_key_passphrase.cred` (`0600`, encrypted credential blob for signing-key passphrase custody)

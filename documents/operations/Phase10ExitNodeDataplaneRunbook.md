@@ -14,6 +14,8 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `scripts/ci/phase10_gates.sh` completed and artifacts present in `artifacts/phase10/`.
 - Trust state and signed control data validation path healthy.
 - WireGuard encrypted key present at `/var/lib/rustynet/keys/wireguard.key.enc` with mode `0600`.
+- `/etc/rustynet` directory present with mode `0750` (`root:<daemon-group>`).
+- `/etc/rustynet/credentials` directory present with mode `0700` (`root:root`).
 - Encrypted passphrase credential blob present at `/etc/rustynet/credentials/wg_key_passphrase.cred` with mode `0600`.
 - Encrypted signing-passphrase credential blob present at `/etc/rustynet/credentials/signing_key_passphrase.cred` with mode `0600`.
 - Persistent plaintext passphrase file is absent at `/var/lib/rustynet/keys/wireguard.passphrase`.
@@ -69,6 +71,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- key revoke`
 - `sudo systemctl list-timers --all | grep rustynetd-trust-refresh`
 - `sudo journalctl -u rustynetd-trust-refresh.service -n 50 --no-pager`
+- `sudo systemd-creds decrypt --name=signing_key_passphrase /etc/rustynet/credentials/signing_key_passphrase.cred /tmp/signing_key_passphrase.test && sudo rm -f /tmp/signing_key_passphrase.test`
 - `./scripts/ci/phase10_gates.sh` (validates pre-generated measured artifacts in `artifacts/phase10`)
 
 ## 7) Required Evidence for Sign-Off
