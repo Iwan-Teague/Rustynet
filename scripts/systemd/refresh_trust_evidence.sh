@@ -24,7 +24,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   die "run as root"
 fi
 
-for tool in date install mktemp openssl xxd; do
+for tool in date getent install mktemp rustynet stat; do
   if ! command -v "${tool}" >/dev/null 2>&1; then
     die "required command not found: ${tool}"
   fi
@@ -32,6 +32,7 @@ done
 
 trust_evidence_path="${RUSTYNET_TRUST_EVIDENCE:-/var/lib/rustynet/rustynetd.trust}"
 trust_signer_key_path="${RUSTYNET_TRUST_SIGNER_KEY:-/etc/rustynet/trust-evidence.key}"
+trust_signer_key_passphrase_path="${RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE:-}"
 daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
 trust_auto_refresh="${RUSTYNET_TRUST_AUTO_REFRESH:-true}"
 
@@ -40,11 +41,17 @@ if ! bool_enabled "${trust_auto_refresh}"; then
   exit 0
 fi
 
+if [[ -z "${trust_signer_key_passphrase_path}" ]]; then
+  die "trust signing key passphrase path is required (RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE)"
+fi
 if [[ "${trust_evidence_path}" != /* ]]; then
   die "trust evidence path must be absolute: ${trust_evidence_path}"
 fi
 if [[ "${trust_signer_key_path}" != /* ]]; then
   die "trust signer key path must be absolute: ${trust_signer_key_path}"
+fi
+if [[ "${trust_signer_key_passphrase_path}" != /* ]]; then
+  die "trust signer key passphrase path must be absolute: ${trust_signer_key_passphrase_path}"
 fi
 if [[ ! -f "${trust_signer_key_path}" ]]; then
   die "trust signer key missing: ${trust_signer_key_path}"
@@ -52,16 +59,35 @@ fi
 if [[ -L "${trust_signer_key_path}" ]]; then
   die "trust signer key must not be a symlink: ${trust_signer_key_path}"
 fi
+if [[ ! -f "${trust_signer_key_passphrase_path}" ]]; then
+  die "trust signer key passphrase file missing: ${trust_signer_key_passphrase_path}"
+fi
+if [[ -L "${trust_signer_key_passphrase_path}" ]]; then
+  die "trust signer key passphrase file must not be a symlink: ${trust_signer_key_passphrase_path}"
+fi
 
-if stat -c '%u' "${trust_signer_key_path}" >/dev/null 2>&1; then
-  owner_uid="$(stat -c '%u' "${trust_signer_key_path}")"
-  mode_octal="$(stat -c '%a' "${trust_signer_key_path}")"
-  if [[ "${owner_uid}" != "0" ]]; then
-    die "trust signer key must be owned by root: ${trust_signer_key_path}"
-  fi
-  if (( (8#${mode_octal}) & 8#022 )); then
-    die "trust signer key must not be group/world writable: ${trust_signer_key_path}"
-  fi
+owner_uid="$(stat -c '%u' "${trust_signer_key_path}")"
+mode_octal="$(stat -c '%a' "${trust_signer_key_path}")"
+if [[ "${owner_uid}" != "0" ]]; then
+  die "trust signer key must be owned by root: ${trust_signer_key_path}"
+fi
+if (( (8#${mode_octal}) & 8#077 )); then
+  die "trust signer key must be owner-only (0600): ${trust_signer_key_path}"
+fi
+
+passphrase_owner_uid="$(stat -c '%u' "${trust_signer_key_passphrase_path}")"
+passphrase_mode_octal="$(stat -c '%a' "${trust_signer_key_passphrase_path}")"
+if [[ "${passphrase_owner_uid}" != "0" ]]; then
+  die "trust signer key passphrase file must be owned by root: ${trust_signer_key_passphrase_path}"
+fi
+passphrase_disallowed_mask="077"
+passphrase_expected="owner-only (0600)"
+if [[ "${trust_signer_key_passphrase_path}" == /run/credentials/* ]]; then
+  passphrase_disallowed_mask="037"
+  passphrase_expected="owner-only or systemd credential mode"
+fi
+if (( (8#${passphrase_mode_octal}) & (8#${passphrase_disallowed_mask}) )); then
+  die "trust signer key passphrase file permissions too broad (${passphrase_mode_octal}); expected ${passphrase_expected}: ${trust_signer_key_passphrase_path}"
 fi
 
 updated_at="$(date +%s)"
@@ -69,29 +95,19 @@ nonce="$(date +%s%N)"
 
 target_dir="$(dirname "${trust_evidence_path}")"
 mkdir -p "${target_dir}"
-payload_tmp="$(mktemp "${target_dir}/rustynetd-trust-payload.XXXXXX")"
-sig_tmp="$(mktemp "${target_dir}/rustynetd-trust-signature.XXXXXX")"
 record_tmp="$(mktemp "${target_dir}/rustynetd-trust-record.XXXXXX")"
 
 cleanup() {
-  rm -f "${payload_tmp}" "${sig_tmp}" "${record_tmp}"
+  rm -f "${record_tmp}"
 }
 trap cleanup EXIT
 
-cat >"${payload_tmp}" <<EOF
-version=2
-tls13_valid=true
-signed_control_valid=true
-signed_data_age_secs=0
-clock_skew_secs=0
-updated_at_unix=${updated_at}
-nonce=${nonce}
-EOF
-
-openssl pkeyutl -sign -inkey "${trust_signer_key_path}" -rawin -in "${payload_tmp}" -out "${sig_tmp}"
-sig_hex="$(xxd -p -c 200 "${sig_tmp}" | tr -d '\n')"
-cat "${payload_tmp}" >"${record_tmp}"
-printf 'signature=%s\n' "${sig_hex}" >>"${record_tmp}"
+rustynet trust issue \
+  --signing-key "${trust_signer_key_path}" \
+  --signing-key-passphrase-file "${trust_signer_key_passphrase_path}" \
+  --output "${record_tmp}" \
+  --updated-at-unix "${updated_at}" \
+  --nonce "${nonce}" >/dev/null
 
 trust_group="root"
 trust_mode="0644"

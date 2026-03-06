@@ -469,6 +469,9 @@ rustynetd key init \
 systemd-creds encrypt --name=wg_key_passphrase "${passphrase_tmp}" /etc/rustynet/credentials/wg_key_passphrase.cred
 chown root:root /etc/rustynet/credentials/wg_key_passphrase.cred
 chmod 0600 /etc/rustynet/credentials/wg_key_passphrase.cred
+systemd-creds encrypt --name=signing_key_passphrase "${passphrase_tmp}" /etc/rustynet/credentials/signing_key_passphrase.cred
+chown root:root /etc/rustynet/credentials/signing_key_passphrase.cred
+chmod 0600 /etc/rustynet/credentials/signing_key_passphrase.cred
 rm -f /run/rustynet/wireguard.key
 
 rustynetd membership init \
@@ -476,19 +479,26 @@ rustynetd membership init \
   --log /var/lib/rustynet/membership.log \
   --watermark /var/lib/rustynet/membership.watermark \
   --owner-signing-key /etc/rustynet/membership.owner.key \
+  --owner-signing-key-passphrase-file "${passphrase_tmp}" \
   --node-id "${node_id}" \
   --network-id "${network_id}" \
   --force
 
-openssl genpkey -algorithm ED25519 -out /etc/rustynet/trust-evidence.key
-chmod 0600 /etc/rustynet/trust-evidence.key
-openssl pkey -in /etc/rustynet/trust-evidence.key -pubout -outform DER 2>/dev/null \
-  | tail -c 32 \
-  | xxd -p -c 32 >/etc/rustynet/trust-evidence.pub
+rustynet trust keygen \
+  --signing-key-output /etc/rustynet/trust-evidence.key \
+  --signing-key-passphrase-file "${passphrase_tmp}" \
+  --verifier-key-output /etc/rustynet/trust-evidence.pub \
+  --force
 chmod 0644 /etc/rustynet/trust-evidence.pub
+
+rustynet assignment init-signing-secret \
+  --output /etc/rustynet/assignment.signing.secret \
+  --signing-secret-passphrase-file "${passphrase_tmp}" \
+  --force
 
 RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust \
 RUSTYNET_TRUST_SIGNER_KEY=/etc/rustynet/trust-evidence.key \
+RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE="${passphrase_tmp}" \
 RUSTYNET_DAEMON_GROUP=rustynetd \
 RUSTYNET_TRUST_AUTO_REFRESH=true \
 "${src_dir}/scripts/systemd/refresh_trust_evidence.sh"
@@ -568,13 +578,30 @@ client_pubkey="$2"
 owner_approver_id="$3"
 
 work_dir="$(mktemp -d /tmp/rustynet-membership-update.XXXXXX)"
+passphrase_tmp="$(mktemp /tmp/rustynet-membership-passphrase.XXXXXX)"
+scrub_file() {
+  local target="$1"
+  if [[ ! -f "${target}" ]]; then
+    return
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred --force --remove "${target}" >/dev/null 2>&1 || true
+  else
+    : >"${target}" || true
+    rm -f "${target}" || true
+  fi
+}
 cleanup() {
+  scrub_file "${passphrase_tmp}"
   rm -rf "${work_dir}"
 }
 trap cleanup EXIT
 
 record_path="${work_dir}/add.record"
 signed_path="${work_dir}/add.signed"
+
+systemd-creds decrypt /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
+chmod 0600 "${passphrase_tmp}"
 
 rustynet membership propose-add \
   --node-id "${client_node_id}" \
@@ -588,6 +615,7 @@ rustynet membership sign-update \
   --record "${record_path}" \
   --approver-id "${owner_approver_id}" \
   --signing-key /etc/rustynet/membership.owner.key \
+  --signing-key-passphrase-file "${passphrase_tmp}" \
   --output "${signed_path}"
 
 rustynet membership apply-update \
@@ -610,10 +638,31 @@ exit_pubkey="$5"
 client_pubkey="$6"
 
 secret_path="/etc/rustynet/assignment.signing.secret"
+passphrase_tmp="$(mktemp /tmp/rustynet-assignment-passphrase.XXXXXX)"
+scrub_file() {
+  local target="$1"
+  if [[ ! -f "${target}" ]]; then
+    return
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred --force --remove "${target}" >/dev/null 2>&1 || true
+  else
+    : >"${target}" || true
+    rm -f "${target}" || true
+  fi
+}
+cleanup() {
+  scrub_file "${passphrase_tmp}"
+}
+trap cleanup EXIT
+
+systemd-creds decrypt /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
+chmod 0600 "${passphrase_tmp}"
 if [[ ! -f "${secret_path}" ]]; then
-  openssl rand -hex 32 >"${secret_path}"
-  chown root:root "${secret_path}"
-  chmod 0600 "${secret_path}"
+  rustynet assignment init-signing-secret \
+    --output "${secret_path}" \
+    --signing-secret-passphrase-file "${passphrase_tmp}" \
+    --force
 fi
 
 nodes_spec="${exit_node_id}|${exit_endpoint}|${exit_pubkey};${client_node_id}|${client_endpoint}|${client_pubkey}"
@@ -624,6 +673,7 @@ rustynet assignment issue \
   --nodes "${nodes_spec}" \
   --allow "${allow_spec}" \
   --signing-secret "${secret_path}" \
+  --signing-secret-passphrase-file "${passphrase_tmp}" \
   --output /tmp/rustynet-exit.assignment \
   --verifier-key-output /tmp/rustynet-assignment.pub \
   --ttl-secs 300
@@ -633,6 +683,7 @@ rustynet assignment issue \
   --nodes "${nodes_spec}" \
   --allow "${allow_spec}" \
   --signing-secret "${secret_path}" \
+  --signing-secret-passphrase-file "${passphrase_tmp}" \
   --output /tmp/rustynet-client.assignment \
   --verifier-key-output /tmp/rustynet-assignment.pub \
   --exit-node-id "${exit_node_id}" \
@@ -802,8 +853,8 @@ ssh_run "${EXIT_TARGET}" "rm -f /var/lib/rustynet/rustynetd.assignment.watermark
 ssh_run "${CLIENT_TARGET}" "rm -f /var/lib/rustynet/rustynetd.assignment.watermark"
 
 log "Configuring assignment auto-refresh signer custody and refresh environment"
-ssh_run "${EXIT_TARGET}" "set -euo pipefail; if [[ ! -f /etc/rustynet/assignment.signing.secret ]]; then openssl rand -hex 32 > /etc/rustynet/assignment.signing.secret; fi; chown root:root /etc/rustynet/assignment.signing.secret; chmod 0600 /etc/rustynet/assignment.signing.secret"
-ssh_run "${CLIENT_TARGET}" "set -euo pipefail; if [[ ! -f /etc/rustynet/assignment.signing.secret ]]; then openssl rand -hex 32 > /etc/rustynet/assignment.signing.secret; fi; chown root:root /etc/rustynet/assignment.signing.secret; chmod 0600 /etc/rustynet/assignment.signing.secret"
+ssh_run "${EXIT_TARGET}" "set -euo pipefail; test -f /etc/rustynet/assignment.signing.secret; test -f /etc/rustynet/credentials/signing_key_passphrase.cred"
+ssh_run "${CLIENT_TARGET}" "set -euo pipefail; test -f /etc/rustynet/assignment.signing.secret; test -f /etc/rustynet/credentials/signing_key_passphrase.cred"
 
 ASSIGNMENT_REFRESH_EXIT_LOCAL="${TMP_DIR}/assignment-refresh-exit.env"
 ASSIGNMENT_REFRESH_CLIENT_LOCAL="${TMP_DIR}/assignment-refresh-client.env"
@@ -813,6 +864,7 @@ RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=${EXIT_NODE_ID}
 RUSTYNET_ASSIGNMENT_NODES=${ASSIGNMENT_NODES_SPEC}
 RUSTYNET_ASSIGNMENT_ALLOW=${ASSIGNMENT_ALLOW_SPEC}
 RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
+RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE=/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase
 RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment
 RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub
 RUSTYNET_ASSIGNMENT_TTL_SECS=300
@@ -825,6 +877,7 @@ RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=${CLIENT_NODE_ID}
 RUSTYNET_ASSIGNMENT_NODES=${ASSIGNMENT_NODES_SPEC}
 RUSTYNET_ASSIGNMENT_ALLOW=${ASSIGNMENT_ALLOW_SPEC}
 RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
+RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE=/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase
 RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment
 RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub
 RUSTYNET_ASSIGNMENT_TTL_SECS=300
@@ -872,8 +925,14 @@ CLIENT_PLAINTEXT_KEYS="$(ssh_capture "${CLIENT_TARGET}" "ls -1 /var/lib/rustynet
 EXIT_PLAINTEXT_KEYS="$(ssh_capture "${EXIT_TARGET}" "ls -1 /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase 2>/dev/null || true")"
 CLIENT_CRED_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/credentials/wg_key_passphrase.cred")"
 EXIT_CRED_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/credentials/wg_key_passphrase.cred")"
+CLIENT_SIGNING_CRED_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/credentials/signing_key_passphrase.cred")"
+EXIT_SIGNING_CRED_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/credentials/signing_key_passphrase.cred")"
 CLIENT_KEY_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /var/lib/rustynet/keys/wireguard.key.enc")"
 EXIT_KEY_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /var/lib/rustynet/keys/wireguard.key.enc")"
+CLIENT_ASSIGNMENT_SECRET_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/assignment.signing.secret")"
+EXIT_ASSIGNMENT_SECRET_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/assignment.signing.secret")"
+CLIENT_TRUST_SIGNER_MODE="$(ssh_capture "${CLIENT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/trust-evidence.key")"
+EXIT_TRUST_SIGNER_MODE="$(ssh_capture "${EXIT_TARGET}" "stat -c '%U:%G %a' /etc/rustynet/trust-evidence.key")"
 
 extract_last_assignment_generated() {
   local status_line="$1"
@@ -959,10 +1018,28 @@ else
   add_check "credential-blob-permissions" "FAIL" "client=${CLIENT_CRED_MODE}; exit=${EXIT_CRED_MODE}"
 fi
 
+if [[ "${CLIENT_SIGNING_CRED_MODE}" == "root:root 600" && "${EXIT_SIGNING_CRED_MODE}" == "root:root 600" ]]; then
+  add_check "signing-credential-blob-permissions" "PASS" "signing credential blob mode is 0600 root:root on both hosts"
+else
+  add_check "signing-credential-blob-permissions" "FAIL" "client=${CLIENT_SIGNING_CRED_MODE}; exit=${EXIT_SIGNING_CRED_MODE}"
+fi
+
 if [[ "${CLIENT_KEY_MODE}" == "rustynetd:rustynetd 600" && "${EXIT_KEY_MODE}" == "rustynetd:rustynetd 600" ]]; then
   add_check "encrypted-key-permissions" "PASS" "encrypted key mode is 0600 rustynetd:rustynetd on both hosts"
 else
   add_check "encrypted-key-permissions" "FAIL" "client=${CLIENT_KEY_MODE}; exit=${EXIT_KEY_MODE}"
+fi
+
+if [[ "${CLIENT_ASSIGNMENT_SECRET_MODE}" == "root:root 600" && "${EXIT_ASSIGNMENT_SECRET_MODE}" == "root:root 600" ]]; then
+  add_check "assignment-signing-secret-permissions" "PASS" "encrypted assignment signing secret mode is 0600 root:root on both hosts"
+else
+  add_check "assignment-signing-secret-permissions" "FAIL" "client=${CLIENT_ASSIGNMENT_SECRET_MODE}; exit=${EXIT_ASSIGNMENT_SECRET_MODE}"
+fi
+
+if [[ "${CLIENT_TRUST_SIGNER_MODE}" == "root:root 600" && "${EXIT_TRUST_SIGNER_MODE}" == "root:root 600" ]]; then
+  add_check "trust-signer-key-permissions" "PASS" "encrypted trust signer key mode is 0600 root:root on both hosts"
+else
+  add_check "trust-signer-key-permissions" "FAIL" "client=${CLIENT_TRUST_SIGNER_MODE}; exit=${EXIT_TRUST_SIGNER_MODE}"
 fi
 
 if [[ "${EXIT_ASSIGNMENT_GENERATED_BEFORE}" =~ ^[0-9]+$ && "${EXIT_ASSIGNMENT_GENERATED_AFTER}" =~ ^[0-9]+$ ]] \

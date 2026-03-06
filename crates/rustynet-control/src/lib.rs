@@ -1503,15 +1503,17 @@ pub struct ControlPlaneCore {
 
 impl ControlPlaneCore {
     pub fn new(mut signing_secret: Vec<u8>, policy: PolicySet) -> Self {
-        let assignment_seed =
+        let mut assignment_seed =
             derive_signing_seed(b"rustynet-control-assignment-signing-v1", &signing_secret);
-        let access_token_seed =
+        let mut access_token_seed =
             derive_signing_seed(b"rustynet-control-access-token-signing-v1", &signing_secret);
         signing_secret.zeroize();
 
         let assignment_signing_key = SigningKey::from_bytes(&assignment_seed);
+        assignment_seed.zeroize();
         let assignment_verifying_key = *assignment_signing_key.verifying_key().as_bytes();
         let access_token_signing_key = SigningKey::from_bytes(&access_token_seed);
+        access_token_seed.zeroize();
         let access_token_verifying_key = *access_token_signing_key.verifying_key().as_bytes();
         Self {
             auth_guard: AuthSurfaceGuard::default(),

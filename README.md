@@ -18,11 +18,15 @@ The wizard handles:
 - centrally signed auto-tunnel defaults with fail-closed enforcement
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
+- sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
 - Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
   encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
   rejects direct plaintext passphrase-file fallback at daemon runtime
+- Linux signing-key passphrase handling is also credential-only for unattended jobs:
+  `/etc/rustynet/credentials/signing_key_passphrase.cred` is loaded into refresh
+  services via `LoadCredentialEncrypted` (no persistent plaintext passphrase files)
 - local key rotation/revocation and peer rotation-bundle apply flow
-- membership bootstrap with persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
+- membership bootstrap with encrypted persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - route advertisement and status checks
 
@@ -56,6 +60,7 @@ Linux trust-refresh behavior:
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
 - If a node is switched to `client` mode without signer-key access, `AUTO_REFRESH_TRUST` is disabled with an explicit warning.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
+- Trust signer keys are encrypted-at-rest and are signed/refreshed with explicit passphrase-file input (credential-injected under systemd).
 
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
@@ -67,6 +72,7 @@ Linux assignment-refresh behavior:
     - `RUSTYNET_ASSIGNMENT_ALLOW`
     - optional `RUSTYNET_ASSIGNMENT_EXIT_NODE_ID`
     - `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` (default `/etc/rustynet/assignment.signing.secret`, `0600 root:root`)
+    - `RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE` (default credential path injected by `rustynetd-assignment-refresh.service`)
     - `RUSTYNET_ASSIGNMENT_TTL_SECS` and `RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS`
 - Installer enables `rustynetd-assignment-refresh.timer` when assignment auto-refresh is enabled.
 - Refresh jobs rewrite assignment artifacts with strict custody:
@@ -81,10 +87,18 @@ rustynet assignment issue \
   --nodes "client-40|192.168.18.40:51820|<client_pubkey_hex>;exit-37|192.168.18.37:51820|<exit_pubkey_hex>" \
   --allow "client-40|exit-37" \
   --signing-secret /etc/rustynet/assignment.signing.secret \
+  --signing-secret-passphrase-file /run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase \
   --output /tmp/client-40.assignment \
   --verifier-key-output /tmp/assignment.pub \
   --exit-node-id exit-37 \
   --ttl-secs 300
+```
+- Initialize an encrypted assignment signing secret:
+```bash
+rustynet assignment init-signing-secret \
+  --output /etc/rustynet/assignment.signing.secret \
+  --signing-secret-passphrase-file /run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase \
+  --force
 ```
 - `--nodes` format: `node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]` entries separated by `;`.
 - `--allow` format: `source_node_id|destination_node_id` entries separated by `;` (default-deny unless explicitly allowed).

@@ -309,10 +309,9 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                     "dev".to_string(),
                     self.interface_name.clone(),
                 ],
-            ) {
-                if !Self::is_missing_ip_route_error(&err) {
-                    return Err(err);
-                }
+            ) && !Self::is_missing_ip_route_error(&err)
+            {
+                return Err(err);
             }
         }
 

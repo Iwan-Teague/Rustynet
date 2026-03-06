@@ -10,8 +10,10 @@ Type=oneshot
 EnvironmentFile=-/etc/default/rustynetd
 Environment=RUSTYNET_TRUST_EVIDENCE=/var/lib/rustynet/rustynetd.trust
 Environment=RUSTYNET_TRUST_SIGNER_KEY=/etc/rustynet/trust-evidence.key
+Environment=RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE=%d/signing_key_passphrase
 Environment=RUSTYNET_TRUST_AUTO_REFRESH=false
 Environment=RUSTYNET_DAEMON_GROUP=rustynetd
+LoadCredentialEncrypted=signing_key_passphrase:/etc/rustynet/credentials/signing_key_passphrase.cred
 ExecStart=/usr/local/libexec/rustynet/refresh_trust_evidence.sh
 User=root
 Group=root

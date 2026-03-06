@@ -54,18 +54,21 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 ## Hardening Controls (Trust Refresh)
 - Timer-driven one-shot refresh runs via `rustynetd-trust-refresh.service`.
 - Uses `ProtectSystem=full`, `NoNewPrivileges=true`, and only `CAP_DAC_OVERRIDE` + `CAP_CHOWN` to access strict daemon-owned runtime paths and preserve trust evidence owner/group permissions.
-- Reads signer key from `RUSTYNET_TRUST_SIGNER_KEY` and writes trust evidence with atomic install.
-- Enforces signer key ownership/mode guardrails (root-owned, not group/world writable).
+- Reads encrypted signer key from `RUSTYNET_TRUST_SIGNER_KEY` and uses explicit passphrase input (`RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE`) loaded via `LoadCredentialEncrypted`.
+- Enforces signer key ownership/mode guardrails (root-owned, owner-only) plus passphrase file ownership/mode checks.
 - Uses daemon-group-readable trust evidence (`root:<daemon-group>`, mode `0640`) when daemon group exists.
+- Startup/migration cleanup paths for trust/signing artifacts use scrub+remove semantics (best-effort overwrite before unlink).
 
 ## Hardening Controls (Assignment Refresh)
 - Timer-driven one-shot refresh runs via `rustynetd-assignment-refresh.service`.
 - Auto-refresh remains fail-closed: stale/invalid signed assignment bundles are still rejected at daemon reconcile.
 - Requires explicit enable (`RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true`) and root-owned refresh config (`/etc/rustynet/assignment-refresh.env`).
-- Reads signing secret from `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` (default `/etc/rustynet/assignment.signing.secret`) and enforces root ownership/non-writable permissions.
+- Reads encrypted signing secret from `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` with explicit passphrase input (`RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE`) loaded via `LoadCredentialEncrypted`.
+- Enforces root ownership/strict mode checks on both encrypted signing secret and passphrase source.
 - Reissues signed bundle with bounded TTL and rewrites artifacts atomically:
   - `/var/lib/rustynet/rustynetd.assignment` (`0640 root:<daemon-group>`)
   - `/etc/rustynet/assignment.pub` (`0644 root:root`)
+- Legacy encrypted-key migration cleanup uses scrub+remove semantics (best-effort overwrite before unlink).
 
 ## Reliability Controls
 - `Restart=on-failure`
@@ -88,14 +91,15 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 ## Required Runtime Files
 - `/var/lib/rustynet/keys/wireguard.key.enc` (`0600`, encrypted at rest)
 - `/etc/rustynet/credentials/wg_key_passphrase.cred` (`0600`, encrypted credential blob for passphrase custody)
+- `/etc/rustynet/credentials/signing_key_passphrase.cred` (`0600`, encrypted credential blob for signing-key passphrase custody)
 - `/run/rustynet/wireguard.key` (`0600`, runtime-decrypted key material)
 - `/var/lib/rustynet/keys/wireguard.pub` (`0644`)
 - `/var/lib/rustynet/rustynetd.trust` (`0640`, integrity-checked trust evidence)
 - `/etc/rustynet/trust-evidence.pub` (pinned trust verifier key)
-- `/etc/rustynet/trust-evidence.key` (`0600`, signer key; required only when trust auto-refresh is enabled)
+- `/etc/rustynet/trust-evidence.key` (`0600`, encrypted signer key; required only when trust auto-refresh is enabled)
 - `/var/lib/rustynet/rustynetd.assignment` (`0640`, signed auto-tunnel bundle)
 - `/etc/rustynet/assignment.pub` (`0644`, assignment verifier key)
-- `/etc/rustynet/assignment.signing.secret` (`0600`, signer key; required only when assignment auto-refresh is enabled)
+- `/etc/rustynet/assignment.signing.secret` (`0600`, encrypted assignment signer secret; required only when assignment auto-refresh is enabled)
 - `/etc/rustynet/assignment-refresh.env` (`0600`, root-owned assignment refresh input map)
 - `/var/lib/rustynet/keys/wireguard.passphrase` should be absent in hardened Linux runtime (persistent plaintext passphrase files are rejected by preflight).
 

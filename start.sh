@@ -6,6 +6,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rustynet"
 CONFIG_FILE="${CONFIG_DIR}/wizard.env"
 PEERS_FILE="${CONFIG_DIR}/peers.db"
 LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
+LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/signing_key_passphrase.cred"
 ASSIGNMENT_REFRESH_ENV_PATH="/etc/rustynet/assignment-refresh.env"
 
 # Defaults aligned with rustynetd/systemd profile.
@@ -25,6 +26,7 @@ WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
 WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
 WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=""
 WG_PUBLIC_KEY_PATH="/var/lib/rustynet/keys/wireguard.pub"
 EGRESS_INTERFACE=""
@@ -103,6 +105,7 @@ apply_host_profile_defaults() {
   if is_linux_host; then
     HOST_PROFILE="linux"
     WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     return
   fi
 
@@ -121,6 +124,7 @@ apply_host_profile_defaults() {
     WG_ENCRYPTED_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
     WG_KEY_PASSPHRASE_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
     WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${MACOS_STATE_BASE}/compat/keys/wg_key_passphrase.cred"
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${MACOS_STATE_BASE}/compat/keys/signing_key_passphrase.cred"
     WG_PUBLIC_KEY_PATH="${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
     WG_INTERFACE="utun9"
     MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
@@ -200,6 +204,7 @@ enforce_host_storage_policy() {
   if is_linux_host; then
     HOST_PROFILE="linux"
     WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     return
   fi
 
@@ -221,6 +226,7 @@ enforce_host_storage_policy() {
   coerce_macos_path_var WG_ENCRYPTED_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.key.enc"
   coerce_macos_path_var WG_KEY_PASSPHRASE_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.passphrase"
   coerce_macos_path_var WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "${MACOS_STATE_BASE}/compat/keys/wg_key_passphrase.cred"
+  coerce_macos_path_var SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "${MACOS_STATE_BASE}/compat/keys/signing_key_passphrase.cred"
   coerce_macos_path_var WG_PUBLIC_KEY_PATH "${MACOS_STATE_BASE}/compat/keys/wireguard.pub"
   coerce_macos_path_var PRIVILEGED_HELPER_SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
   coerce_macos_path_var MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/compat/membership/membership.snapshot"
@@ -350,7 +356,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -535,6 +541,119 @@ run_root() {
   fi
 }
 
+secure_remove_file_with_scope() {
+  local target="$1"
+  if [[ ! -f "${target}" ]]; then
+    return 0
+  fi
+  if is_linux_host; then
+    if run_root command -v shred >/dev/null 2>&1; then
+      run_root shred --force --remove "${target}" >/dev/null 2>&1 || true
+    else
+      run_root sh -c ': > "$1" && rm -f "$1"' -- "${target}" || true
+    fi
+  else
+    : >"${target}" || true
+    rm -f "${target}" || true
+  fi
+}
+
+ensure_signing_passphrase_material() {
+  if is_linux_host; then
+    if [[ -f "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+      return 0
+    fi
+    local existing_material=0
+    local path
+    for path in \
+      "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+      "${TRUST_SIGNER_KEY_PATH}" \
+      "/etc/rustynet/assignment.signing.secret"; do
+      if run_root test -f "${path}" >/dev/null 2>&1; then
+        existing_material=1
+        break
+      fi
+    done
+    if [[ "${existing_material}" == "1" ]]; then
+      print_err "Signing key passphrase credential blob is missing (${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}) while encrypted signing material already exists."
+      print_info "Restore the signing credential blob from backup or regenerate signing material with fresh keys."
+      return 1
+    fi
+    if ! command -v systemd-creds >/dev/null 2>&1; then
+      print_err "systemd-creds is required to provision encrypted signing passphrase credentials."
+      return 1
+    fi
+    local tmp_passphrase
+    tmp_passphrase="$(mktemp)"
+    openssl rand -hex 48 >"${tmp_passphrase}"
+    chmod 600 "${tmp_passphrase}"
+    run_root systemd-creds encrypt --name=signing_key_passphrase "${tmp_passphrase}" "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    run_root chown root:root "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    run_root chmod 600 "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    secure_remove_file_with_scope "${tmp_passphrase}"
+    print_info "Encrypted signing passphrase credential provisioned at ${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    return 0
+  fi
+
+  if is_macos_host; then
+    ensure_macos_keychain_passphrase_account
+    if ! macos_keychain_passphrase_exists; then
+      print_err "macOS keychain passphrase item is missing for signing-key custody operations."
+      print_info "Run first-run setup to provision Keychain-backed passphrase custody."
+      return 1
+    fi
+    return 0
+  fi
+
+  print_err "Unsupported host profile for signing passphrase materialization: ${HOST_PROFILE}"
+  return 1
+}
+
+materialize_signing_passphrase_file() {
+  local __out_var="$1"
+  local tmp_passphrase
+  tmp_passphrase="$(mktemp)"
+  chmod 600 "${tmp_passphrase}"
+
+  if is_linux_host; then
+    ensure_signing_passphrase_material || {
+      secure_remove_file_with_scope "${tmp_passphrase}"
+      return 1
+    }
+    if ! run_root systemd-creds decrypt "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "${tmp_passphrase}"; then
+      secure_remove_file_with_scope "${tmp_passphrase}"
+      print_err "Failed to decrypt signing passphrase credential blob."
+      return 1
+    fi
+    run_root chown root:root "${tmp_passphrase}" >/dev/null 2>&1 || true
+    run_root chmod 600 "${tmp_passphrase}"
+    printf -v "${__out_var}" '%s' "${tmp_passphrase}"
+    return 0
+  fi
+
+  if is_macos_host; then
+    ensure_signing_passphrase_material || {
+      secure_remove_file_with_scope "${tmp_passphrase}"
+      return 1
+    }
+    if ! security find-generic-password \
+      -s "${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+      -a "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+      -w >"${tmp_passphrase}"; then
+      secure_remove_file_with_scope "${tmp_passphrase}"
+      print_err "Failed to load signing passphrase from macOS Keychain."
+      return 1
+    fi
+    chmod 600 "${tmp_passphrase}"
+    printf -v "${__out_var}" '%s' "${tmp_passphrase}"
+    return 0
+  fi
+
+  secure_remove_file_with_scope "${tmp_passphrase}"
+  print_err "Unsupported host profile for signing passphrase materialization: ${HOST_PROFILE}"
+  return 1
+}
+
 prompt_default() {
   local __var_name="$1"
   local __prompt="$2"
@@ -717,6 +836,7 @@ save_config() {
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
     printf 'WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n' "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf 'SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n' "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     printf 'WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=%s\n' "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
     printf 'WG_PUBLIC_KEY_PATH=%s\n' "${WG_PUBLIC_KEY_PATH}"
     printf 'EGRESS_INTERFACE=%s\n' "${EGRESS_INTERFACE}"
@@ -1400,9 +1520,15 @@ doctor_preflight() {
     else
       doctor_ok "credential blob path pinned (${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH})"
     fi
+    if [[ "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+      doctor_fail "signing credential blob path must be ${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH} on Linux"
+    else
+      doctor_ok "signing credential blob path pinned (${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH})"
+    fi
 
     if [[ "${SETUP_COMPLETE}" == "1" ]]; then
       doctor_check_mode "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "600" "encrypted passphrase credential blob"
+      doctor_check_mode "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "600" "encrypted signing passphrase credential blob"
       if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
         doctor_fail "plaintext passphrase file still present (${WG_KEY_PASSPHRASE_PATH}); remove it"
       else
@@ -1532,6 +1658,7 @@ prepare_system_directories() {
     run_root install -d -m 0700 "$(dirname "${WG_PRIVATE_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
+    run_root install -d -m 0700 "$(dirname "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
     run_root install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
     run_root install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
@@ -1551,6 +1678,7 @@ prepare_system_directories() {
     install -d -m 0700 "$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_PATH}")"
     install -d -m 0700 "$(dirname "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
+    install -d -m 0700 "$(dirname "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
     install -d -m 0700 "$(dirname "${WG_PUBLIC_KEY_PATH}")"
     install -d -m 0700 "$(dirname "${MEMBERSHIP_WATERMARK_PATH}")"
     install -d -m 0700 "$(dirname "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}")"
@@ -1570,30 +1698,12 @@ ensure_wireguard_keys() {
     fi
   }
 
-  secure_remove_with_scope() {
-    local target="$1"
-    if [[ ! -f "${target}" ]]; then
-      return
-    fi
-    if is_linux_host; then
-      if run_root command -v shred >/dev/null 2>&1; then
-        run_root shred --force --remove "${target}" >/dev/null 2>&1 || true
-      else
-        run_root sh -c ': > "$1" && rm -f "$1"' -- "${target}" || true
-      fi
-    else
-      : >"${target}" || true
-      rm -f "${target}" || true
-    fi
-  }
-
   local legacy_linux_passphrase_path="/etc/rustynet/wireguard.passphrase"
   if is_macos_host; then
     ensure_macos_keychain_passphrase_account
     if ! command -v security >/dev/null 2>&1; then
       print_err "macOS keychain tooling is missing ('security' command not found)."
       unset -f run_with_scope >/dev/null 2>&1 || true
-      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
       exit 1
     fi
   fi
@@ -1604,7 +1714,6 @@ ensure_wireguard_keys() {
     print_err "Encrypted key exists but credential blob is missing (${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH})."
     print_info "Restore the encrypted credential blob from backup or perform an explicit key rotation."
     unset -f run_with_scope >/dev/null 2>&1 || true
-    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
     exit 1
   fi
 
@@ -1612,10 +1721,9 @@ ensure_wireguard_keys() {
     && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
     && [[ -f "${WG_PUBLIC_KEY_PATH}" ]] \
     && [[ -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
-    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
-    secure_remove_with_scope "${legacy_linux_passphrase_path}"
+    secure_remove_file_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    secure_remove_file_with_scope "${legacy_linux_passphrase_path}"
     unset -f run_with_scope >/dev/null 2>&1 || true
-    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
     return
   fi
 
@@ -1623,9 +1731,8 @@ ensure_wireguard_keys() {
     && [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" ]] \
     && [[ -f "${WG_PUBLIC_KEY_PATH}" ]]; then
     if macos_keychain_passphrase_exists; then
-      secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+      secure_remove_file_with_scope "${WG_KEY_PASSPHRASE_PATH}"
       unset -f run_with_scope >/dev/null 2>&1 || true
-      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
       return
     fi
     if [[ -f "${WG_KEY_PASSPHRASE_PATH}" ]]; then
@@ -1633,15 +1740,13 @@ ensure_wireguard_keys() {
       run_with_scope rustynetd key store-passphrase \
         --passphrase-file "${WG_KEY_PASSPHRASE_PATH}" \
         --keychain-account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
-      secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+      secure_remove_file_with_scope "${WG_KEY_PASSPHRASE_PATH}"
       unset -f run_with_scope >/dev/null 2>&1 || true
-      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
       return
     fi
     print_err "Encrypted key exists but macOS keychain passphrase item is missing."
     print_info "Restore keychain entry for account '${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}' or rotate keys."
     unset -f run_with_scope >/dev/null 2>&1 || true
-    unset -f secure_remove_with_scope >/dev/null 2>&1 || true
     exit 1
   fi
 
@@ -1656,7 +1761,6 @@ ensure_wireguard_keys() {
     if ! command -v systemd-creds >/dev/null 2>&1; then
       print_err "systemd-creds is required to provision encrypted passphrase credentials."
       unset -f run_with_scope >/dev/null 2>&1 || true
-      unset -f secure_remove_with_scope >/dev/null 2>&1 || true
       exit 1
     fi
     passphrase_source_path="$(mktemp)"
@@ -1688,7 +1792,7 @@ ensure_wireguard_keys() {
       --passphrase-file "${passphrase_source_path}" \
       --force
     if [[ "${source_private_key}" != "${WG_PRIVATE_KEY_PATH}" ]]; then
-      run_with_scope rm -f "${source_private_key}"
+      secure_remove_file_with_scope "${source_private_key}"
       print_info "Removed legacy plaintext private key at ${source_private_key}"
     fi
   else
@@ -1705,22 +1809,21 @@ ensure_wireguard_keys() {
     run_with_scope systemd-creds encrypt --name=wg_key_passphrase "${passphrase_source_path}" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     run_root chown root:root "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     run_root chmod 600 "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
-    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
-    secure_remove_with_scope "${legacy_linux_passphrase_path}"
+    secure_remove_file_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    secure_remove_file_with_scope "${legacy_linux_passphrase_path}"
     print_info "Encrypted passphrase credential provisioned at ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
   elif is_macos_host; then
     run_with_scope rustynetd key store-passphrase \
       --passphrase-file "${passphrase_source_path}" \
       --keychain-account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
-    secure_remove_with_scope "${WG_KEY_PASSPHRASE_PATH}"
+    secure_remove_file_with_scope "${WG_KEY_PASSPHRASE_PATH}"
     print_info "macOS passphrase custody provisioned in Keychain (service=${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}, account=${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT})."
   fi
   if [[ "${generated_temp_passphrase}" == "1" || "${passphrase_source_path}" != "${WG_KEY_PASSPHRASE_PATH}" ]]; then
-    secure_remove_with_scope "${passphrase_source_path}"
+    secure_remove_file_with_scope "${passphrase_source_path}"
   fi
 
   unset -f run_with_scope >/dev/null 2>&1 || true
-  unset -f secure_remove_with_scope >/dev/null 2>&1 || true
 }
 
 ensure_membership_files() {
@@ -1734,23 +1837,34 @@ ensure_membership_files() {
   if [[ -f "${MEMBERSHIP_SNAPSHOT_PATH}" && -f "${MEMBERSHIP_LOG_PATH}" ]]; then
     print_info "Membership files already present."
     if is_blind_exit_role && [[ -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" ]]; then
-      run_root rm -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
+      secure_remove_file_with_scope "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
       print_info "Removed local membership owner signing key for blind_exit least-knowledge role."
     fi
     unset -f run_with_scope >/dev/null 2>&1 || true
     return
   fi
+  local signing_passphrase_file=""
+  if ! materialize_signing_passphrase_file signing_passphrase_file; then
+    unset -f run_with_scope >/dev/null 2>&1 || true
+    return 1
+  fi
   print_info "Initializing membership files for node '${DEVICE_NODE_ID}'."
-  run_with_scope rustynetd membership init \
+  if ! run_with_scope rustynetd membership init \
     --snapshot "${MEMBERSHIP_SNAPSHOT_PATH}" \
     --log "${MEMBERSHIP_LOG_PATH}" \
     --watermark "${MEMBERSHIP_WATERMARK_PATH}" \
     --owner-signing-key "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+    --owner-signing-key-passphrase-file "${signing_passphrase_file}" \
     --node-id "${DEVICE_NODE_ID}" \
     --network-id "local-net" \
-    --force
+    --force; then
+    secure_remove_file_with_scope "${signing_passphrase_file}"
+    unset -f run_with_scope >/dev/null 2>&1 || true
+    return 1
+  fi
+  secure_remove_file_with_scope "${signing_passphrase_file}"
   if is_blind_exit_role && [[ -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" ]]; then
-    run_root rm -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
+    secure_remove_file_with_scope "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
     print_info "Removed local membership owner signing key for blind_exit least-knowledge role."
   fi
   unset -f run_with_scope >/dev/null 2>&1 || true
@@ -1767,7 +1881,11 @@ lockdown_blind_exit_local_material() {
   local path
   for path in /etc/rustynet/assignment.signing.secret /etc/rustynet/assignment-refresh.env; do
     if run_root test -e "${path}" >/dev/null 2>&1; then
-      run_root rm -f "${path}"
+      if [[ "${path}" == "/etc/rustynet/assignment.signing.secret" ]]; then
+        secure_remove_file_with_scope "${path}"
+      else
+        secure_remove_file_with_scope "${path}"
+      fi
       removed_any="1"
     fi
   done
@@ -1779,18 +1897,25 @@ lockdown_blind_exit_local_material() {
 }
 
 generate_verifier_key_from_signer() {
-  local tmp_pub
-  tmp_pub="$(mktemp)"
-  openssl pkey -in "${TRUST_SIGNER_KEY_PATH}" -pubout -outform DER 2>/dev/null \
-    | tail -c 32 \
-    | xxd -p -c 32 >"${tmp_pub}"
-  run_root install -m 0644 "${tmp_pub}" "${TRUST_VERIFIER_KEY_PATH}"
-  rm -f "${tmp_pub}"
+  local signing_passphrase_file="$1"
+  run_root rustynet trust export-verifier-key \
+    --signing-key "${TRUST_SIGNER_KEY_PATH}" \
+    --signing-key-passphrase-file "${signing_passphrase_file}" \
+    --output "${TRUST_VERIFIER_KEY_PATH}"
+  run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
+  if is_macos_host; then
+    run_root chown "$(id -u):$(id -g)" "${TRUST_VERIFIER_KEY_PATH}"
+  fi
 }
 
 refresh_signed_trust_evidence() {
-  require_admin_role "refresh_signed_trust_evidence" || return 0
+  if ! is_admin_role && ! is_blind_exit_role; then
+    print_err "refresh_signed_trust_evidence requires node role 'admin' or 'blind_exit'."
+    print_info "This device is configured as role '${NODE_ROLE}'."
+    return 0
+  fi
   local refresh_script="${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
+  local signing_passphrase_file=""
   if [[ ! -f "${refresh_script}" ]]; then
     print_err "Missing trust refresh helper: ${refresh_script}"
     return 1
@@ -1799,13 +1924,21 @@ refresh_signed_trust_evidence() {
     print_err "Signer key not found at ${TRUST_SIGNER_KEY_PATH}"
     return 1
   fi
+  if ! materialize_signing_passphrase_file signing_passphrase_file; then
+    return 1
+  fi
 
-  run_root env \
+  if ! run_root env \
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
     RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+    RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE="${signing_passphrase_file}" \
     RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
     RUSTYNET_TRUST_AUTO_REFRESH=true \
-    "${refresh_script}"
+    "${refresh_script}"; then
+    secure_remove_file_with_scope "${signing_passphrase_file}"
+    return 1
+  fi
+  secure_remove_file_with_scope "${signing_passphrase_file}"
   if is_macos_host; then
     local current_uid current_gid
     current_uid="$(id -u)"
@@ -1819,18 +1952,23 @@ refresh_signed_trust_evidence() {
 configure_trust_material() {
   if is_blind_exit_role; then
     print_info "blind_exit role detected: provisioning local trust material for unattended operation."
-    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
-      run_root openssl genpkey -algorithm ED25519 -out "${TRUST_SIGNER_KEY_PATH}"
-      run_root chmod 600 "${TRUST_SIGNER_KEY_PATH}"
-      print_warn "Generated local trust signer key at ${TRUST_SIGNER_KEY_PATH} for blind_exit role."
+    local signing_passphrase_file=""
+    if ! materialize_signing_passphrase_file signing_passphrase_file; then
+      return 1
     fi
-    generate_verifier_key_from_signer
-    run_root env \
-      RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
-      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
-      RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
-      RUSTYNET_TRUST_AUTO_REFRESH=true \
-      "${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
+    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+      run_root rustynet trust keygen \
+        --signing-key-output "${TRUST_SIGNER_KEY_PATH}" \
+        --signing-key-passphrase-file "${signing_passphrase_file}" \
+        --verifier-key-output "${TRUST_VERIFIER_KEY_PATH}" \
+        --force
+      run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
+      print_warn "Generated local trust signer key at ${TRUST_SIGNER_KEY_PATH} for blind_exit role."
+    else
+      generate_verifier_key_from_signer "${signing_passphrase_file}"
+    fi
+    secure_remove_file_with_scope "${signing_passphrase_file}"
+    refresh_signed_trust_evidence
     AUTO_REFRESH_TRUST="1"
     return 0
   fi
@@ -1882,12 +2020,22 @@ configure_trust_material() {
       print_err "Lab mode confirmation mismatch."
       return 1
     fi
-    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
-      run_root openssl genpkey -algorithm ED25519 -out "${TRUST_SIGNER_KEY_PATH}"
-      run_root chmod 600 "${TRUST_SIGNER_KEY_PATH}"
-      print_warn "Generated local signer key at ${TRUST_SIGNER_KEY_PATH} (lab/dev only)."
+    local signing_passphrase_file=""
+    if ! materialize_signing_passphrase_file signing_passphrase_file; then
+      return 1
     fi
-    generate_verifier_key_from_signer
+    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+      run_root rustynet trust keygen \
+        --signing-key-output "${TRUST_SIGNER_KEY_PATH}" \
+        --signing-key-passphrase-file "${signing_passphrase_file}" \
+        --verifier-key-output "${TRUST_VERIFIER_KEY_PATH}" \
+        --force
+      run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
+      print_warn "Generated local signer key at ${TRUST_SIGNER_KEY_PATH} (lab/dev only)."
+    else
+      generate_verifier_key_from_signer "${signing_passphrase_file}"
+    fi
+    secure_remove_file_with_scope "${signing_passphrase_file}"
     refresh_signed_trust_evidence
     AUTO_REFRESH_TRUST="1"
     return
@@ -1941,6 +2089,10 @@ write_daemon_environment() {
     print_err "Linux credential blob path must be ${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
     exit 1
   fi
+  if [[ "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+    print_err "Linux signing credential blob path must be ${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
+    exit 1
+  fi
   enforce_auto_tunnel_policy
   require_linux_dataplane "write_daemon_environment" || return 0
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
@@ -1973,6 +2125,7 @@ write_daemon_environment() {
     RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
     RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
     RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+    RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
     RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
     RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
     RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
@@ -3321,7 +3474,9 @@ configure_values() {
   prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
   if is_linux_host; then
     WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
     print_info "Linux passphrase credential blob path is pinned to ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
+    print_info "Linux signing passphrase credential blob path is pinned to ${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
   elif is_macos_host; then
     prompt_default WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT "WireGuard passphrase Keychain account" "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}"
     ensure_macos_keychain_passphrase_account
@@ -3382,6 +3537,7 @@ first_run_setup() {
   ensure_binaries_available
   prepare_system_directories
   ensure_wireguard_keys
+  ensure_signing_passphrase_material
   ensure_membership_files
   configure_trust_material
   write_daemon_environment
@@ -3418,6 +3574,7 @@ Current Rustynet Wizard Configuration
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
   wg_key_passphrase_cred  : ${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
+  signing_key_passphrase_cred: ${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
   wg_key_passphrase_keychain_account: ${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}
   wg_public_key           : ${WG_PUBLIC_KEY_PATH}
   egress_interface        : ${EGRESS_INTERFACE}

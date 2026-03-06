@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
 use rustynetd::daemon::{
     DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES,
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
@@ -13,10 +14,13 @@ use rustynetd::daemon::{
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
-    store_passphrase_in_os_secure_store,
+    read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
 use rustynetd::perf;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
+
+const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
+    "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
 
 fn main() {
     if let Err(err) = run() {
@@ -639,6 +643,8 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
     let mut watermark_path = DEFAULT_MEMBERSHIP_WATERMARK_PATH.to_string();
     let mut owner_signing_key_path = DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH.to_string();
+    let mut owner_signing_key_passphrase_path =
+        std::env::var(MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV).ok();
     let mut node_id = read_hostname_short();
     let mut network_id = "local-net".to_string();
     let mut force = false;
@@ -669,6 +675,14 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                     .get(index + 1)
                     .ok_or("--owner-signing-key requires a value")?
                     .clone();
+                index += 2;
+            }
+            Some("--owner-signing-key-passphrase-file") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or("--owner-signing-key-passphrase-file requires a value")?
+                    .clone();
+                owner_signing_key_passphrase_path = Some(value);
                 index += 2;
             }
             Some("--node-id") => {
@@ -706,6 +720,18 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     if !owner_signing_key_path.starts_with('/') {
         return Err(format!(
             "owner signing key path must be absolute: {owner_signing_key_path}"
+        ));
+    }
+    let owner_signing_key_passphrase_path =
+        owner_signing_key_passphrase_path.ok_or_else(|| {
+            format!(
+                "owner signing key passphrase path is required; pass --owner-signing-key-passphrase-file or set {}",
+                MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV
+            )
+        })?;
+    if !owner_signing_key_passphrase_path.starts_with('/') {
+        return Err(format!(
+            "owner signing key passphrase path must be absolute: {owner_signing_key_passphrase_path}"
         ));
     }
 
@@ -750,9 +776,10 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         let node_pubkey_hex = encode_hex(&node_key_bytes);
         let owner_approver_id = format!("{node_id}-owner");
 
-        persist_owner_signing_key(
+        persist_owner_signing_key_encrypted(
             std::path::Path::new(&owner_signing_key_path),
             &approver_key_bytes,
+            std::path::Path::new(&owner_signing_key_passphrase_path),
             force,
         )?;
 
@@ -823,14 +850,13 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn persist_owner_signing_key(
+fn persist_owner_signing_key_encrypted(
     path: &std::path::Path,
     key_bytes: &[u8; 32],
+    passphrase_path: &std::path::Path,
     force: bool,
 ) -> Result<(), String> {
-    use std::io::{ErrorKind, Write};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use zeroize::Zeroize;
+    use std::io::ErrorKind;
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -852,12 +878,7 @@ fn persist_owner_signing_key(
                     path.display()
                 ));
             }
-            std::fs::remove_file(path).map_err(|err| {
-                format!(
-                    "failed to remove existing owner signing key {}: {err}",
-                    path.display()
-                )
-            })?;
+            remove_file_if_present(path)?;
         }
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
@@ -868,28 +889,25 @@ fn persist_owner_signing_key(
         }
     }
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(path).map_err(|err| {
+    let passphrase = read_passphrase_file_explicit(passphrase_path).map_err(|err| {
         format!(
-            "failed to create owner signing key {}: {err}",
-            path.display()
+            "owner signing key passphrase source invalid ({}): {err}",
+            passphrase_path.display()
         )
     })?;
-    let mut encoded = encode_hex(key_bytes);
-    encoded.push('\n');
-    file.write_all(encoded.as_bytes()).map_err(|err| {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("owner signing key path has no parent: {}", path.display()))?;
+    write_encrypted_key_file(
+        parent,
+        path,
+        key_bytes,
+        passphrase.as_str(),
+        KeyCustodyPermissionPolicy::default(),
+    )
+    .map_err(|err| {
         format!(
-            "failed to write owner signing key {}: {err}",
-            path.display()
-        )
-    })?;
-    file.sync_all()
-        .map_err(|err| format!("failed to sync owner signing key {}: {err}", path.display()))?;
-    encoded.zeroize();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
-        format!(
-            "failed to set owner signing key permissions {}: {err}",
+            "failed to persist encrypted owner signing key {}: {err}",
             path.display()
         )
     })?;
@@ -912,7 +930,7 @@ fn help_text() -> String {
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
-        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--node-id <id>] [--network-id <id>] [--force]",
+        "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",

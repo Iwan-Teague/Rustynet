@@ -8,8 +8,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::Uid;
+use rand::{RngCore, rngs::OsRng};
 use rustynet_control::membership::{
     MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
     MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipUpdateRecord,
@@ -19,11 +20,15 @@ use rustynet_control::membership::{
     sign_update_record, write_membership_audit_log,
 };
 use rustynet_control::{AutoTunnelBundleRequest, ControlPlaneCore, NodeMetadata};
+use rustynet_crypto::{
+    KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
+};
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse};
+use rustynetd::key_material::{read_passphrase_file_explicit, remove_file_if_present};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,7 @@ enum CliCommand {
     KeyRevoke,
     Assignment(Box<AssignmentCommand>),
     Membership(Box<MembershipCommand>),
+    Trust(Box<TrustCommand>),
     Help,
 }
 
@@ -56,6 +62,7 @@ enum MembershipCommand {
         record_path: PathBuf,
         approver_id: String,
         signing_key_path: PathBuf,
+        signing_key_passphrase_path: PathBuf,
         output_path: PathBuf,
         merge_from: Option<PathBuf>,
     },
@@ -86,18 +93,50 @@ enum MembershipCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AssignmentCommand {
-    Issue {
-        signing_secret_path: PathBuf,
-        target_node_id: String,
+    Issue(Box<AssignmentIssueCommand>),
+    InitSigningSecret {
         output_path: PathBuf,
-        verifier_key_output_path: Option<PathBuf>,
-        nodes: Vec<AssignmentNodeSpec>,
-        allow_pairs: Vec<AssignmentAllowPair>,
-        mesh_cidr: String,
-        exit_node_id: Option<String>,
-        lan_routes: Vec<String>,
-        generated_at_unix: u64,
-        ttl_secs: u64,
+        signing_secret_passphrase_path: PathBuf,
+        length_bytes: usize,
+        force: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentIssueCommand {
+    signing_secret_path: PathBuf,
+    signing_secret_passphrase_path: PathBuf,
+    target_node_id: String,
+    output_path: PathBuf,
+    verifier_key_output_path: Option<PathBuf>,
+    nodes: Vec<AssignmentNodeSpec>,
+    allow_pairs: Vec<AssignmentAllowPair>,
+    mesh_cidr: String,
+    exit_node_id: Option<String>,
+    lan_routes: Vec<String>,
+    generated_at_unix: u64,
+    ttl_secs: u64,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustCommand {
+    Keygen {
+        signing_key_path: PathBuf,
+        signing_key_passphrase_path: PathBuf,
+        verifier_key_output_path: PathBuf,
+        force: bool,
+    },
+    ExportVerifierKey {
+        signing_key_path: PathBuf,
+        signing_key_passphrase_path: PathBuf,
+        output_path: PathBuf,
+    },
+    Issue {
+        signing_key_path: PathBuf,
+        signing_key_passphrase_path: PathBuf,
+        output_path: PathBuf,
+        updated_at_unix: u64,
         nonce: u64,
     },
 }
@@ -172,6 +211,10 @@ fn parse_command(args: &[String]) -> CliCommand {
         },
         [cmd, rest @ ..] if cmd == "membership" => match parse_membership_command(rest) {
             Ok(command) => CliCommand::Membership(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "trust" => match parse_trust_command(rest) {
+            Ok(command) => CliCommand::Trust(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
         _ => CliCommand::Help,
@@ -323,6 +366,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             record_path: parser.required_path("--record")?,
             approver_id: parser.required("--approver-id")?,
             signing_key_path: parser.required_path("--signing-key")?,
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
             output_path: parser.required_path("--output")?,
             merge_from: parser.optional_path("--merge-from"),
         }),
@@ -353,6 +397,8 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
             let target_node_id = parser.required("--target-node-id")?;
             let output_path = parser.required_path("--output")?;
             let signing_secret_path = parser.required_path("--signing-secret")?;
+            let signing_secret_passphrase_path =
+                parser.required_path("--signing-secret-passphrase-file")?;
             let verifier_key_output_path = parser.optional_path("--verifier-key-output");
             let nodes = parse_assignment_nodes(parser.required("--nodes")?.as_str())?;
             let allow_pairs = parse_assignment_allow_pairs(parser.required("--allow")?.as_str())?;
@@ -375,8 +421,9 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
                 exit_node_id.as_deref(),
             )?;
 
-            Ok(AssignmentCommand::Issue {
+            Ok(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
                 signing_secret_path,
+                signing_secret_passphrase_path,
                 target_node_id,
                 output_path,
                 verifier_key_output_path,
@@ -388,9 +435,56 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
                 generated_at_unix,
                 ttl_secs,
                 nonce,
+            })))
+        }
+        "init-signing-secret" => {
+            let output_path = parser.required_path("--output")?;
+            let signing_secret_passphrase_path =
+                parser.required_path("--signing-secret-passphrase-file")?;
+            let length_bytes = parser.parse_u64_or_default("--length-bytes", 32)?;
+            if length_bytes < 32 {
+                return Err("signing secret length must be >= 32 bytes".to_string());
+            }
+            if length_bytes > 4096 {
+                return Err("signing secret length must be <= 4096 bytes".to_string());
+            }
+            Ok(AssignmentCommand::InitSigningSecret {
+                output_path,
+                signing_secret_passphrase_path,
+                length_bytes: length_bytes as usize,
+                force: parser.has_flag("--force"),
             })
         }
         _ => Err(format!("unknown assignment subcommand: {subcommand}")),
+    }
+}
+
+fn parse_trust_command(args: &[String]) -> Result<TrustCommand, String> {
+    if args.is_empty() {
+        return Err("trust subcommand is required".to_string());
+    }
+    let subcommand = args[0].as_str();
+    let parser = OptionParser::parse(&args[1..])?;
+    match subcommand {
+        "keygen" => Ok(TrustCommand::Keygen {
+            signing_key_path: parser.required_path("--signing-key-output")?,
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
+            verifier_key_output_path: parser.required_path("--verifier-key-output")?,
+            force: parser.has_flag("--force"),
+        }),
+        "export-verifier-key" => Ok(TrustCommand::ExportVerifierKey {
+            signing_key_path: parser.required_path("--signing-key")?,
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
+            output_path: parser.required_path("--output")?,
+        }),
+        "issue" => Ok(TrustCommand::Issue {
+            signing_key_path: parser.required_path("--signing-key")?,
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
+            output_path: parser.required_path("--output")?,
+            updated_at_unix: parser.parse_u64_or_default("--updated-at-unix", unix_now())?,
+            nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
+        }),
+        _ => Err(format!("unknown trust subcommand: {subcommand}")),
     }
 }
 
@@ -422,6 +516,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
+        CliCommand::Trust(command) => execute_trust(*command),
         other => {
             let ipc_command = to_ipc_command(other);
             match send_command(ipc_command) {
@@ -440,21 +535,26 @@ fn execute(command: CliCommand) -> Result<String, String> {
 
 fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
     match command {
-        AssignmentCommand::Issue {
-            signing_secret_path,
-            target_node_id,
-            output_path,
-            verifier_key_output_path,
-            nodes,
-            allow_pairs,
-            mesh_cidr,
-            exit_node_id,
-            lan_routes,
-            generated_at_unix,
-            ttl_secs,
-            nonce,
-        } => {
-            let signing_secret = load_assignment_signing_secret(&signing_secret_path)?;
+        AssignmentCommand::Issue(issue) => {
+            let AssignmentIssueCommand {
+                signing_secret_path,
+                signing_secret_passphrase_path,
+                target_node_id,
+                output_path,
+                verifier_key_output_path,
+                nodes,
+                allow_pairs,
+                mesh_cidr,
+                exit_node_id,
+                lan_routes,
+                generated_at_unix,
+                ttl_secs,
+                nonce,
+            } = *issue;
+            let signing_secret = load_assignment_signing_secret(
+                &signing_secret_path,
+                &signing_secret_passphrase_path,
+            )?;
 
             let policy = PolicySet {
                 rules: allow_pairs
@@ -514,6 +614,28 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "<not_written>".to_string())
+            ))
+        }
+        AssignmentCommand::InitSigningSecret {
+            output_path,
+            signing_secret_passphrase_path,
+            length_bytes,
+            force,
+        } => {
+            let mut secret = vec![0u8; length_bytes];
+            OsRng.fill_bytes(secret.as_mut_slice());
+            persist_encrypted_secret_material(
+                &output_path,
+                secret.as_slice(),
+                &signing_secret_passphrase_path,
+                "assignment signing secret",
+                force,
+            )?;
+            secret.zeroize();
+            Ok(format!(
+                "assignment signing secret initialized: output={} length_bytes={}",
+                output_path.display(),
+                length_bytes
             ))
         }
     }
@@ -577,13 +699,14 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             record_path,
             approver_id,
             signing_key_path,
+            signing_key_passphrase_path,
             output_path,
             merge_from,
         } => {
             let record_payload = fs::read_to_string(&record_path)
                 .map_err(|err| format!("read record failed: {err}"))?;
             let record = decode_update_record(&record_payload).map_err(|err| err.to_string())?;
-            let signing_key = load_signing_key(&signing_key_path)?;
+            let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
             let signature = sign_update_record(&record, approver_id.as_str(), &signing_key)
                 .map_err(|err| format!("sign update failed: {err}"))?;
 
@@ -692,6 +815,71 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             output_dir,
             environment,
         } => emit_membership_evidence(paths, now_unix, output_dir, environment),
+    }
+}
+
+fn execute_trust(command: TrustCommand) -> Result<String, String> {
+    match command {
+        TrustCommand::Keygen {
+            signing_key_path,
+            signing_key_passphrase_path,
+            verifier_key_output_path,
+            force,
+        } => {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            persist_encrypted_secret_material(
+                &signing_key_path,
+                &seed,
+                &signing_key_passphrase_path,
+                "trust signing key",
+                force,
+            )?;
+            let signing_key = SigningKey::from_bytes(&seed);
+            seed.zeroize();
+            let verifier_key_hex = hex_bytes(signing_key.verifying_key().as_bytes());
+            write_text_file(&verifier_key_output_path, &format!("{verifier_key_hex}\n"))?;
+            Ok(format!(
+                "trust signing key initialized: signing_key={} verifier_key_output={}",
+                signing_key_path.display(),
+                verifier_key_output_path.display()
+            ))
+        }
+        TrustCommand::ExportVerifierKey {
+            signing_key_path,
+            signing_key_passphrase_path,
+            output_path,
+        } => {
+            let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
+            let verifier_key_hex = hex_bytes(signing_key.verifying_key().as_bytes());
+            write_text_file(&output_path, &format!("{verifier_key_hex}\n"))?;
+            Ok(format!(
+                "trust verifier key exported: signing_key={} output={}",
+                signing_key_path.display(),
+                output_path.display()
+            ))
+        }
+        TrustCommand::Issue {
+            signing_key_path,
+            signing_key_passphrase_path,
+            output_path,
+            updated_at_unix,
+            nonce,
+        } => {
+            let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
+            let payload = format!(
+                "version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={updated_at_unix}\nnonce={nonce}\n"
+            );
+            let signature = signing_key.sign(payload.as_bytes());
+            let body = format!("{payload}signature={}\n", hex_bytes(&signature.to_bytes()));
+            write_text_file(&output_path, &body)?;
+            Ok(format!(
+                "trust evidence issued: output={} updated_at_unix={} nonce={}",
+                output_path.display(),
+                updated_at_unix,
+                nonce
+            ))
+        }
     }
 }
 
@@ -884,37 +1072,33 @@ fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
     fs::write(path, body).map_err(|err| format!("write file failed: {err}"))
 }
 
-fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
-    validate_signing_key_file_security(path)?;
-    let mut content = fs::read_to_string(path).map_err(|err| format!("read key failed: {err}"))?;
-    let key_line = content
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| "signing key file is empty".to_string())?
-        .to_string();
-    content.zeroize();
-
-    let key_line = Zeroizing::new(key_line);
-    let bytes = decode_hex_to_32(key_line.as_str())?;
-    Ok(SigningKey::from_bytes(&bytes))
+fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, String> {
+    let secret = load_encrypted_secret_material(path, passphrase_path, "signing key")?;
+    if secret.len() != 32 {
+        return Err("decrypted signing key must be exactly 32 bytes".to_string());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(secret.as_slice());
+    let key = SigningKey::from_bytes(&bytes);
+    bytes.zeroize();
+    Ok(key)
 }
 
-fn validate_signing_key_file_security(path: &Path) -> Result<(), String> {
+fn validate_encrypted_secret_file_security(path: &Path, label: &str) -> Result<(), String> {
     let metadata =
-        fs::symlink_metadata(path).map_err(|err| format!("inspect signing key failed: {err}"))?;
+        fs::symlink_metadata(path).map_err(|err| format!("inspect {label} failed: {err}"))?;
     if metadata.file_type().is_symlink() {
-        return Err("signing key path must not be a symlink".to_string());
+        return Err(format!("{label} path must not be a symlink"));
     }
     if !metadata.file_type().is_file() {
-        return Err("signing key path must reference a regular file".to_string());
+        return Err(format!("{label} path must reference a regular file"));
     }
 
     let mode = metadata.mode() & 0o777;
     if (mode & 0o077) != 0 {
         return Err(format!(
-            "signing key file permissions must be owner-only (0600); found {:03o}",
-            mode
+            "{label} file permissions must be owner-only (0600); found {:03o}",
+            mode,
         ));
     }
 
@@ -922,10 +1106,95 @@ fn validate_signing_key_file_security(path: &Path) -> Result<(), String> {
     let owner_uid = metadata.uid();
     if owner_uid != expected_uid {
         return Err(format!(
-            "signing key file owner mismatch: expected uid {expected_uid}, found {owner_uid}"
+            "{label} file owner mismatch: expected uid {expected_uid}, found {owner_uid}"
         ));
     }
     Ok(())
+}
+
+fn load_encrypted_secret_material(
+    path: &Path,
+    passphrase_path: &Path,
+    label: &str,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    if !passphrase_path.is_absolute() {
+        return Err(format!(
+            "{label} passphrase file path must be absolute: {}",
+            passphrase_path.display()
+        ));
+    }
+    validate_encrypted_secret_file_security(path, label)?;
+    let passphrase = read_passphrase_file_explicit(passphrase_path).map_err(|err| {
+        format!(
+            "{label} passphrase source invalid ({}): {err}",
+            passphrase_path.display()
+        )
+    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
+    let secret = read_encrypted_key_file(
+        parent,
+        path,
+        passphrase.as_str(),
+        KeyCustodyPermissionPolicy::default(),
+    )
+    .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
+    Ok(Zeroizing::new(secret))
+}
+
+fn persist_encrypted_secret_material(
+    path: &Path,
+    secret: &[u8],
+    passphrase_path: &Path,
+    label: &str,
+    force: bool,
+) -> Result<(), String> {
+    if !passphrase_path.is_absolute() {
+        return Err(format!(
+            "{label} passphrase file path must be absolute: {}",
+            passphrase_path.display()
+        ));
+    }
+    if path.exists() {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|err| format!("inspect {label} failed: {err}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{label} path must not be a symlink"));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!("{label} path must reference a regular file"));
+        }
+        if !force {
+            return Err(format!(
+                "{label} already exists at {}; use --force to overwrite",
+                path.display()
+            ));
+        }
+        remove_file_if_present(path)?;
+    }
+    let passphrase = read_passphrase_file_explicit(passphrase_path).map_err(|err| {
+        format!(
+            "{label} passphrase source invalid ({}): {err}",
+            passphrase_path.display()
+        )
+    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
+    write_encrypted_key_file(
+        parent,
+        path,
+        secret,
+        passphrase.as_str(),
+        KeyCustodyPermissionPolicy::default(),
+    )
+    .map_err(|err| {
+        format!(
+            "persist encrypted {label} failed ({}): {err}",
+            path.display()
+        )
+    })
 }
 
 fn decode_hex_to_32(encoded: &str) -> Result<[u8; 32], String> {
@@ -952,6 +1221,14 @@ fn decode_hex_nibble(value: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err("invalid hex character in signing key".to_string()),
     }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn split_csv(value: String) -> Vec<String> {
@@ -1103,41 +1380,13 @@ fn validate_assignment_issue_config(
     Ok(())
 }
 
-fn load_assignment_signing_secret(path: &Path) -> Result<Vec<u8>, String> {
-    validate_signing_key_file_security(path)?;
-    let mut content =
-        fs::read_to_string(path).map_err(|err| format!("read signing secret failed: {err}"))?;
-    let secret_line = content
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| "signing secret file is empty".to_string())?
-        .to_string();
-    content.zeroize();
-
-    let secret_line = Zeroizing::new(secret_line);
-    let secret = decode_hex(secret_line.as_str())?;
+fn load_assignment_signing_secret(path: &Path, passphrase_path: &Path) -> Result<Vec<u8>, String> {
+    let secret =
+        load_encrypted_secret_material(path, passphrase_path, "assignment signing secret")?;
     if secret.len() < 32 {
-        return Err("signing secret must be at least 32 bytes (64 hex chars)".to_string());
+        return Err("assignment signing secret must be at least 32 bytes".to_string());
     }
-    Ok(secret)
-}
-
-fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
-    let trimmed = encoded.trim();
-    if (trimmed.len() & 1) != 0 {
-        return Err("hex payload must have even length".to_string());
-    }
-    let mut out = Vec::with_capacity(trimmed.len() / 2);
-    let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < raw.len() {
-        let hi = decode_hex_nibble(raw[index])?;
-        let lo = decode_hex_nibble(raw[index + 1])?;
-        out.push((hi << 4) | lo);
-        index += 2;
-    }
-    Ok(out)
+    Ok(secret.to_vec())
 }
 
 fn generate_update_id() -> String {
@@ -1281,7 +1530,8 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::Login
         | CliCommand::Help
         | CliCommand::Assignment(_)
-        | CliCommand::Membership(_) => IpcCommand::Unknown("unsupported".to_string()),
+        | CliCommand::Membership(_)
+        | CliCommand::Trust(_) => IpcCommand::Unknown("unsupported".to_string()),
     }
 }
 
@@ -1328,7 +1578,8 @@ fn help_text() -> String {
         "  route advertise <cidr>",
         "  key rotate",
         "  key revoke",
-        "  assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]",
+        "  assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --signing-secret-passphrase-file <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]",
+        "  assignment init-signing-secret --output <path> --signing-secret-passphrase-file <path> [--length-bytes <n>] [--force]",
         "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv];... ",
         "    allow_specs format: source_node_id|destination_node_id;...",
         "  membership status [--snapshot <path>] [--log <path>]",
@@ -1339,18 +1590,24 @@ fn help_text() -> String {
         "  membership propose-rotate-key --node-id <id> --new-pubkey <hex> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
-        "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --output <path> [--merge-from <signed-update-path>]",
+        "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
         "  membership verify-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership verify-log [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
         "  membership generate-evidence [--snapshot <path>] [--log <path>] [--output-dir <dir>] [--environment <label>] [--now <unix>]",
+        "  trust keygen --signing-key-output <path> --signing-key-passphrase-file <path> --verifier-key-output <path> [--force]",
+        "  trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>",
+        "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
     ]
     .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_tampered_log, execute, load_signing_key, parse_command};
+    use super::{
+        detect_tampered_log, execute, load_signing_key, parse_command,
+        persist_encrypted_secret_material,
+    };
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
@@ -1410,6 +1667,8 @@ mod tests {
             "client-40|exit-37".to_string(),
             "--signing-secret".to_string(),
             "/tmp/assignment.secret".to_string(),
+            "--signing-secret-passphrase-file".to_string(),
+            "/tmp/signing.passphrase".to_string(),
             "--output".to_string(),
             "/tmp/assignment.bundle".to_string(),
         ]);
@@ -1428,17 +1687,33 @@ mod tests {
                 .expect("clock should be valid")
                 .as_nanos()
         );
-        let path = std::env::temp_dir().join(format!("{unique}.key"));
-        std::fs::write(&path, format!("{}\n", "11".repeat(32))).expect("key file should exist");
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("signing.key.enc");
+        let passphrase_path = dir.join("passphrase.txt");
+        std::fs::write(&passphrase_path, "00112233445566778899aabbccddeeff\n")
+            .expect("passphrase file should exist");
+        std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
+            .expect("passphrase permissions should be set");
+        persist_encrypted_secret_material(
+            &path,
+            &[0x11; 32],
+            &passphrase_path,
+            "signing key",
+            false,
+        )
+        .expect("encrypted signing key should be written");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
             .expect("permissions should be set");
 
-        let result = load_signing_key(&path);
+        let result = load_signing_key(&path, &passphrase_path);
         assert!(result.is_err());
         let message = result.expect_err("weak file permissions must fail");
         assert!(message.contains("owner-only"));
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
@@ -1453,20 +1728,33 @@ mod tests {
                 .expect("clock should be valid")
                 .as_nanos()
         );
-        let target = std::env::temp_dir().join(format!("{unique}.target.key"));
-        let link = std::env::temp_dir().join(format!("{unique}.key"));
-        std::fs::write(&target, format!("{}\n", "22".repeat(32))).expect("target key exists");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-            .expect("permissions should be set");
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let target = dir.join("signing.target.key.enc");
+        let link = dir.join("signing.key.enc");
+        let passphrase_path = dir.join("passphrase.txt");
+        std::fs::write(&passphrase_path, "00112233445566778899aabbccddeeff\n")
+            .expect("passphrase file should exist");
+        std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
+            .expect("passphrase permissions should be set");
+        persist_encrypted_secret_material(
+            &target,
+            &[0x22; 32],
+            &passphrase_path,
+            "signing key",
+            false,
+        )
+        .expect("encrypted signing key should be written");
         symlink(&target, &link).expect("symlink should be created");
 
-        let result = load_signing_key(&link);
+        let result = load_signing_key(&link, &passphrase_path);
         assert!(result.is_err());
         let message = result.expect_err("symlink key path must fail");
         assert!(message.contains("must not be a symlink"));
 
-        let _ = std::fs::remove_file(link);
-        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
@@ -1481,15 +1769,31 @@ mod tests {
                 .expect("clock should be valid")
                 .as_nanos()
         );
-        let path = std::env::temp_dir().join(format!("{unique}.key"));
-        std::fs::write(&path, format!("{}\n", "33".repeat(32))).expect("key file should exist");
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("signing.key.enc");
+        let passphrase_path = dir.join("passphrase.txt");
+        std::fs::write(&passphrase_path, "00112233445566778899aabbccddeeff\n")
+            .expect("passphrase file should exist");
+        std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
+            .expect("passphrase permissions should be set");
+        persist_encrypted_secret_material(
+            &path,
+            &[0x33; 32],
+            &passphrase_path,
+            "signing key",
+            false,
+        )
+        .expect("encrypted signing key should be written");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("permissions should be set");
 
-        let result = load_signing_key(&path);
+        let result = load_signing_key(&path, &passphrase_path);
         assert!(result.is_ok());
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -15,11 +15,12 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Trust state and signed control data validation path healthy.
 - WireGuard encrypted key present at `/var/lib/rustynet/keys/wireguard.key.enc` with mode `0600`.
 - Encrypted passphrase credential blob present at `/etc/rustynet/credentials/wg_key_passphrase.cred` with mode `0600`.
+- Encrypted signing-passphrase credential blob present at `/etc/rustynet/credentials/signing_key_passphrase.cred` with mode `0600`.
 - Persistent plaintext passphrase file is absent at `/var/lib/rustynet/keys/wireguard.passphrase`.
 - Runtime decrypted key at `/run/rustynet/wireguard.key` with mode `0600` (managed by `rustynetd`).
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
 - Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
-- If unattended trust auto-refresh is enabled: signer key present at `/etc/rustynet/trust-evidence.key` (`0600`).
+- If unattended trust auto-refresh is enabled: encrypted signer key present at `/etc/rustynet/trust-evidence.key` (`0600`) and passphrase injected via systemd credential (`%d/signing_key_passphrase`).
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.

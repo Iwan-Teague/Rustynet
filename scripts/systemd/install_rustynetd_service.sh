@@ -86,6 +86,7 @@ for key in \
   RUSTYNET_WG_PRIVATE_KEY \
   RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY \
   RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB \
+  RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB \
   RUSTYNET_WG_PUBLIC_KEY \
   RUSTYNET_EGRESS_INTERFACE \
   RUSTYNET_DATAPLANE_MODE \
@@ -147,6 +148,7 @@ WG_LISTEN_PORT="${RUSTYNET_WG_LISTEN_PORT:-51820}"
 WG_PRIVATE_KEY_PATH="${RUSTYNET_WG_PRIVATE_KEY:-/run/rustynet/wireguard.key}"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY:-/var/lib/rustynet/keys/wireguard.key.enc}"
 WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB:-/etc/rustynet/credentials/wg_key_passphrase.cred}"
+SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB:-/etc/rustynet/credentials/signing_key_passphrase.cred}"
 WG_PUBLIC_KEY_PATH="${RUSTYNET_WG_PUBLIC_KEY:-/var/lib/rustynet/keys/wireguard.pub}"
 DATAPLANE_MODE="${RUSTYNET_DATAPLANE_MODE:-hybrid-native}"
 PRIVILEGED_HELPER_SOCKET="${RUSTYNET_PRIVILEGED_HELPER_SOCKET:-/run/rustynet/rustynetd-privileged.sock}"
@@ -156,9 +158,14 @@ MAX_RECONCILE_FAILURES="${RUSTYNET_MAX_RECONCILE_FAILURES:-5}"
 FAIL_CLOSED_SSH_ALLOW="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW:-false}"
 FAIL_CLOSED_SSH_ALLOW_CIDRS="${RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS:-}"
 SERVICE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
+SERVICE_SIGNING_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/signing_key_passphrase.cred"
 
 if [[ "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${SERVICE_CREDENTIAL_BLOB_PATH}" ]]; then
   echo "invalid credential blob path: expected ${SERVICE_CREDENTIAL_BLOB_PATH}" >&2
+  exit 1
+fi
+if [[ "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${SERVICE_SIGNING_CREDENTIAL_BLOB_PATH}" ]]; then
+  echo "invalid signing credential blob path: expected ${SERVICE_SIGNING_CREDENTIAL_BLOB_PATH}" >&2
   exit 1
 fi
 
@@ -271,7 +278,7 @@ migrate_legacy_key_path_if_needed() {
     return
   fi
   install -m "${mode}" -o "${owner}" -g "${group}" "${legacy_path}" "${target_path}"
-  rm -f "${legacy_path}"
+  secure_remove_file "${legacy_path}"
 }
 
 secure_remove_file() {
@@ -310,6 +317,7 @@ for key_material_target in \
   install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "$(dirname "${key_material_target}")"
 done
 install -d -m 0700 -o root -g root "$(dirname "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
+install -d -m 0700 -o root -g root "$(dirname "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}")"
 ensure_parent_dir "${SOCKET_PATH}" "${SERVICE_USER}" "${SERVICE_GROUP}" 0750
 ensure_parent_dir "${PRIVILEGED_HELPER_SOCKET}" root "${SERVICE_GROUP}" 0750
 
@@ -323,8 +331,15 @@ if [[ ! -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
   echo "run ./start.sh first-run setup to regenerate secure key custody artifacts" >&2
   exit 1
 fi
+if [[ ! -f "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+  echo "missing encrypted signing credential blob: ${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" >&2
+  echo "run ./start.sh first-run setup to regenerate secure signing custody artifacts" >&2
+  exit 1
+fi
 chown root:root "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
 chmod 0600 "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+chown root:root "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+chmod 0600 "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
 secure_remove_file "${BOOTSTRAP_PASSPHRASE_PATH}"
 if [[ "${LEGACY_PASSPHRASE_PATH}" != "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
   secure_remove_file "${LEGACY_PASSPHRASE_PATH}"
@@ -337,7 +352,7 @@ LEGACY_FALLBACK_FILE="$(dirname "${LEGACY_ENCRYPTED_KEY_PATH}")/${LEGACY_KEY_ID}
 TARGET_FALLBACK_FILE="$(dirname "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")/${TARGET_KEY_ID}.enc"
 if [[ "${LEGACY_FALLBACK_FILE}" != "${TARGET_FALLBACK_FILE}" && ! -e "${TARGET_FALLBACK_FILE}" && -f "${LEGACY_FALLBACK_FILE}" ]]; then
   install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${LEGACY_FALLBACK_FILE}" "${TARGET_FALLBACK_FILE}"
-  rm -f "${LEGACY_FALLBACK_FILE}"
+  secure_remove_file "${LEGACY_FALLBACK_FILE}"
 fi
 
 for readonly_target in \
@@ -361,6 +376,7 @@ set_owner_mode_if_exists "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" "${SERVICE_USER}" "$
 set_owner_mode_if_exists "${WG_PUBLIC_KEY_PATH}" "${SERVICE_USER}" "${SERVICE_GROUP}" 0644
 set_owner_mode_if_exists "${TARGET_FALLBACK_FILE}" "${SERVICE_USER}" "${SERVICE_GROUP}" 0600
 set_owner_mode_if_exists "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" root root 0600
+set_owner_mode_if_exists "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" root root 0600
 
 set_owner_mode_if_exists "${TRUST_EVIDENCE_PATH}" root "${SERVICE_GROUP}" 0640
 set_owner_mode_if_exists "${AUTO_TUNNEL_BUNDLE_PATH}" root "${SERVICE_GROUP}" 0640
@@ -396,6 +412,7 @@ RUSTYNET_WG_PRIVATE_KEY=${WG_PRIVATE_KEY_PATH}
 RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY=${WG_ENCRYPTED_PRIVATE_KEY_PATH}
 RUSTYNET_WG_KEY_PASSPHRASE=/run/credentials/rustynetd.service/wg_key_passphrase
 RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB=${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
+RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB=${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}
 RUSTYNET_WG_PUBLIC_KEY=${WG_PUBLIC_KEY_PATH}
 RUSTYNET_EGRESS_INTERFACE=${EGRESS_IFACE}
 RUSTYNET_DATAPLANE_MODE=${DATAPLANE_MODE}

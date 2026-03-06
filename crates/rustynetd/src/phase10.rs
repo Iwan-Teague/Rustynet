@@ -1021,8 +1021,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
-        if self.allow_tunnel_relay_forward {
-            if let Err(err) = self.run(
+        if self.allow_tunnel_relay_forward
+            && let Err(err) = self.run(
                 PrivilegedCommandProgram::Nft,
                 &[
                     "add",
@@ -1036,14 +1036,14 @@ impl DataplaneSystem for LinuxCommandSystem {
                     self.interface_name.as_str(),
                     "masquerade",
                 ],
-            ) {
-                self.run_allow_failure(
-                    PrivilegedCommandProgram::Nft,
-                    &["delete", "table", "ip", nat_table.as_str()],
-                );
-                let _ = self.restore_ipv4_forwarding();
-                return Err(SystemError::NatApplyFailed(err.to_string()));
-            }
+            )
+        {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "ip", nat_table.as_str()],
+            );
+            let _ = self.restore_ipv4_forwarding();
+            return Err(SystemError::NatApplyFailed(err.to_string()));
         }
         // Collect firewall table name and egress interface before moving nat_table.
         let egress_allow = self

@@ -1971,14 +1971,10 @@ impl DaemonRuntime {
             return Ok(());
         }
         if selected_exit_node.is_some() {
-            eprintln!(
-                "rustynetd: ignoring selected_exit_node assignment for blind_exit role"
-            );
+            eprintln!("rustynetd: ignoring selected_exit_node assignment for blind_exit role");
         }
         if lan_access_enabled {
-            eprintln!(
-                "rustynetd: ignoring LAN route assignment for blind_exit role"
-            );
+            eprintln!("rustynetd: ignoring LAN route assignment for blind_exit role");
         }
         Ok(())
     }
@@ -4741,9 +4737,7 @@ mod tests {
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
-        runtime
-            .advertised_routes
-            .insert("0.0.0.0/0".to_string());
+        runtime.advertised_routes.insert("0.0.0.0/0".to_string());
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("node_role=client"));

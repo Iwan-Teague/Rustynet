@@ -41,6 +41,7 @@ nodes_spec="${RUSTYNET_ASSIGNMENT_NODES:-}"
 allow_spec="${RUSTYNET_ASSIGNMENT_ALLOW:-}"
 exit_node_id="${RUSTYNET_ASSIGNMENT_EXIT_NODE_ID:-}"
 signing_secret_path="${RUSTYNET_ASSIGNMENT_SIGNING_SECRET:-/etc/rustynet/assignment.signing.secret}"
+signing_secret_passphrase_path="${RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE:-}"
 bundle_path="${RUSTYNET_ASSIGNMENT_OUTPUT:-/var/lib/rustynet/rustynetd.assignment}"
 verifier_key_path="${RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT:-/etc/rustynet/assignment.pub}"
 ttl_secs="${RUSTYNET_ASSIGNMENT_TTL_SECS:-300}"
@@ -56,6 +57,9 @@ fi
 if [[ -z "${allow_spec}" ]]; then
   die "assignment allow rules are required (RUSTYNET_ASSIGNMENT_ALLOW)"
 fi
+if [[ -z "${signing_secret_passphrase_path}" ]]; then
+  die "assignment signing secret passphrase path is required (RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE)"
+fi
 
 if [[ ! "${target_node_id}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
   die "target node id contains unsupported characters: ${target_node_id}"
@@ -64,7 +68,7 @@ if [[ -n "${exit_node_id}" && ! "${exit_node_id}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
   die "exit node id contains unsupported characters: ${exit_node_id}"
 fi
 
-for path_value in "${signing_secret_path}" "${bundle_path}" "${verifier_key_path}"; do
+for path_value in "${signing_secret_path}" "${signing_secret_passphrase_path}" "${bundle_path}" "${verifier_key_path}"; do
   if [[ "${path_value}" != /* ]]; then
     die "path must be absolute: ${path_value}"
   fi
@@ -86,14 +90,35 @@ fi
 if [[ -L "${signing_secret_path}" ]]; then
   die "assignment signing secret must not be a symlink: ${signing_secret_path}"
 fi
+if [[ ! -f "${signing_secret_passphrase_path}" ]]; then
+  die "assignment signing secret passphrase file missing: ${signing_secret_passphrase_path}"
+fi
+if [[ -L "${signing_secret_passphrase_path}" ]]; then
+  die "assignment signing secret passphrase file must not be a symlink: ${signing_secret_passphrase_path}"
+fi
 
 owner_uid="$(stat -c '%u' "${signing_secret_path}")"
 mode_octal="$(stat -c '%a' "${signing_secret_path}")"
 if [[ "${owner_uid}" != "0" ]]; then
   die "assignment signing secret must be owned by root: ${signing_secret_path}"
 fi
-if (( (8#${mode_octal}) & 8#022 )); then
-  die "assignment signing secret must not be group/world writable: ${signing_secret_path}"
+if (( (8#${mode_octal}) & 8#077 )); then
+  die "assignment signing secret must be owner-only (0600): ${signing_secret_path}"
+fi
+
+passphrase_owner_uid="$(stat -c '%u' "${signing_secret_passphrase_path}")"
+passphrase_mode_octal="$(stat -c '%a' "${signing_secret_passphrase_path}")"
+if [[ "${passphrase_owner_uid}" != "0" ]]; then
+  die "assignment signing secret passphrase file must be owned by root: ${signing_secret_passphrase_path}"
+fi
+passphrase_disallowed_mask="077"
+passphrase_expected="owner-only (0600)"
+if [[ "${signing_secret_passphrase_path}" == /run/credentials/* ]]; then
+  passphrase_disallowed_mask="037"
+  passphrase_expected="owner-only or systemd credential mode"
+fi
+if (( (8#${passphrase_mode_octal}) & (8#${passphrase_disallowed_mask}) )); then
+  die "assignment signing secret passphrase file permissions too broad (${passphrase_mode_octal}); expected ${passphrase_expected}: ${signing_secret_passphrase_path}"
 fi
 
 now_unix="$(date +%s)"
@@ -126,6 +151,7 @@ issue_cmd=(
   --nodes "${nodes_spec}"
   --allow "${allow_spec}"
   --signing-secret "${signing_secret_path}"
+  --signing-secret-passphrase-file "${signing_secret_passphrase_path}"
   --output "${bundle_tmp}"
   --verifier-key-output "${verifier_tmp}"
   --ttl-secs "${ttl_secs}"

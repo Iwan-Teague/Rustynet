@@ -11,11 +11,13 @@ EnvironmentFile=-/etc/default/rustynetd
 EnvironmentFile=-/etc/rustynet/assignment-refresh.env
 Environment=RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false
 Environment=RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
+Environment=RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE=%d/signing_key_passphrase
 Environment=RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment
 Environment=RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub
 Environment=RUSTYNET_ASSIGNMENT_TTL_SECS=300
 Environment=RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS=180
 Environment=RUSTYNET_DAEMON_GROUP=rustynetd
+LoadCredentialEncrypted=signing_key_passphrase:/etc/rustynet/credentials/signing_key_passphrase.cred
 ExecStart=/usr/local/libexec/rustynet/refresh_assignment_bundle.sh
 User=root
 Group=root
