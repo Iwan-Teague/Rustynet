@@ -620,7 +620,7 @@ materialize_signing_passphrase_file() {
       secure_remove_file_with_scope "${tmp_passphrase}"
       return 1
     }
-    if ! run_root systemd-creds decrypt "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "${tmp_passphrase}"; then
+    if ! run_root systemd-creds decrypt --name=signing_key_passphrase "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" "${tmp_passphrase}"; then
       secure_remove_file_with_scope "${tmp_passphrase}"
       print_err "Failed to decrypt signing passphrase credential blob."
       return 1

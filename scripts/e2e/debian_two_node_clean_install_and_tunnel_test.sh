@@ -600,7 +600,7 @@ trap cleanup EXIT
 record_path="${work_dir}/add.record"
 signed_path="${work_dir}/add.signed"
 
-systemd-creds decrypt /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
+systemd-creds decrypt --name=signing_key_passphrase /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
 chmod 0600 "${passphrase_tmp}"
 
 rustynet membership propose-add \
@@ -656,7 +656,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-systemd-creds decrypt /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
+systemd-creds decrypt --name=signing_key_passphrase /etc/rustynet/credentials/signing_key_passphrase.cred "${passphrase_tmp}"
 chmod 0600 "${passphrase_tmp}"
 if [[ ! -f "${secret_path}" ]]; then
   rustynet assignment init-signing-secret \
