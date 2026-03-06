@@ -520,6 +520,12 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         daemon_gid,
         0o600,
     )?;
+    set_owner_mode_on_key_custody_artifacts(
+        wireguard_encrypted_private_key_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
     set_owner_mode_if_exists(
         wireguard_public_key_path.as_path(),
         daemon_uid,
@@ -1355,6 +1361,51 @@ fn set_owner_mode_if_exists(path: &Path, owner: Uid, group: Gid, mode: u32) -> R
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("inspect {} failed: {err}", path.display())),
     }
+}
+
+fn set_owner_mode_on_key_custody_artifacts(
+    encrypted_key_path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), String> {
+    let parent = encrypted_key_path.parent().ok_or_else(|| {
+        format!(
+            "encrypted key path has no parent directory: {}",
+            encrypted_key_path.display()
+        )
+    })?;
+    let entries = fs::read_dir(parent)
+        .map_err(|err| format!("read key custody directory {} failed: {err}", parent.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| format!("read key custody entry in {} failed: {err}", parent.display()))?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with("wg-private-") || !file_name.ends_with(".enc") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path.as_path())
+            .map_err(|err| format!("inspect key custody artifact {} failed: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "key custody artifact must not be a symlink: {}",
+                path.display()
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "key custody artifact must be a regular file: {}",
+                path.display()
+            ));
+        }
+        chown(path.as_path(), Some(owner), Some(group))
+            .map_err(|err| format!("set key custody artifact owner {} failed: {err}", path.display()))?;
+        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("set key custody artifact mode {} failed: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn secure_remove_file(path: &Path) -> Result<(), String> {
