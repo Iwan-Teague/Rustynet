@@ -338,9 +338,13 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
     }
 
     fn set_exit_tables(&mut self, mode: ExitMode) -> Result<(), BackendError> {
-        match mode {
-            ExitMode::Off => {
-                let _ = self.runner.run(
+        const EXIT_RULE_PRIORITY: &str = "10000";
+        // Remove any legacy full-tunnel rules for table 51820 first. Older builds added
+        // duplicate unprioritized rules on each reconcile loop.
+        for _ in 0..64 {
+            if self
+                .runner
+                .run(
                     "ip",
                     &[
                         "rule".to_string(),
@@ -348,18 +352,40 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                         "table".to_string(),
                         "51820".to_string(),
                     ],
-                );
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
+        let delete_args = [
+            "rule".to_string(),
+            "del".to_string(),
+            "priority".to_string(),
+            EXIT_RULE_PRIORITY.to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ];
+        match mode {
+            ExitMode::Off => {
+                let _ = self.runner.run("ip", &delete_args);
                 Ok(())
             }
-            ExitMode::FullTunnel => self.runner.run(
-                "ip",
-                &[
-                    "rule".to_string(),
-                    "add".to_string(),
-                    "table".to_string(),
-                    "51820".to_string(),
-                ],
-            ),
+            ExitMode::FullTunnel => {
+                // Ensure full-tunnel rule application is idempotent across reconcile loops.
+                let _ = self.runner.run("ip", &delete_args);
+                self.runner.run(
+                    "ip",
+                    &[
+                        "rule".to_string(),
+                        "add".to_string(),
+                        "priority".to_string(),
+                        EXIT_RULE_PRIORITY.to_string(),
+                        "table".to_string(),
+                        "51820".to_string(),
+                    ],
+                )
+            }
         }
     }
 }
@@ -1251,6 +1277,52 @@ mod tests {
 
         let stats = backend.stats();
         assert!(stats.is_err());
+    }
+
+    #[test]
+    fn linux_backend_full_tunnel_rule_uses_fixed_priority() {
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("exit mode should work");
+
+        let delete_rule = vec![
+            "rule".to_string(),
+            "del".to_string(),
+            "priority".to_string(),
+            "10000".to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ];
+        let add_rule = vec![
+            "rule".to_string(),
+            "add".to_string(),
+            "priority".to_string(),
+            "10000".to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ];
+
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "ip" && args == &delete_rule)
+        );
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "ip" && args == &add_rule)
+        );
     }
 
     #[test]

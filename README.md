@@ -48,6 +48,7 @@ Role model:
 Two-hop chain notes:
 - Client chain selection supports `1-hop` (`client -> exit`) and `2-hop` (`client -> entry relay -> final exit`) in `start.sh` under `SELECT EXIT NODE`.
 - For secure two-hop operation, the entry relay must be configured to use its upstream exit and advertise `0.0.0.0/0` (exit-serving) so it can relay downstream client traffic while tunneling upstream.
+- In relay-with-upstream mode, Linux dataplane enforcement now explicitly allows `rustynet0 -> rustynet0` forwarding and applies scoped tunnel-to-tunnel NAT (`iif rustynet0`, `oif rustynet0`) on the entry relay so return traffic from the final hop stays fail-closed and routable.
 - `blind_exit` remains final-hop oriented: it can serve exit but cannot be configured to select an upstream exit.
 
 Linux trust-refresh behavior:

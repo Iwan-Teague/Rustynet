@@ -195,6 +195,7 @@ impl From<SystemError> for Phase10Error {
 
 pub trait DataplaneSystem {
     fn set_generation(&mut self, _generation: u64) {}
+    fn set_relay_forwarding(&mut self, _enabled: bool) {}
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         Ok(())
     }
@@ -240,6 +241,7 @@ pub struct DryRunSystem {
     pub operations: Vec<String>,
     fail_operation: Option<String>,
     generation: u64,
+    relay_forwarding_enabled: bool,
 }
 
 impl DryRunSystem {
@@ -266,6 +268,12 @@ impl DataplaneSystem for DryRunSystem {
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
         self.operations.push(format!("set_generation:{generation}"));
+    }
+
+    fn set_relay_forwarding(&mut self, enabled: bool) {
+        self.relay_forwarding_enabled = enabled;
+        self.operations
+            .push(format!("set_relay_forwarding:{enabled}"));
     }
 
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
@@ -338,6 +346,7 @@ pub struct LinuxCommandSystem {
     nat_table: Option<String>,
     prior_ipv4_forwarding: Option<bool>,
     prior_ipv6_disabled: Option<bool>,
+    allow_tunnel_relay_forward: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +389,7 @@ impl LinuxCommandSystem {
             nat_table: None,
             prior_ipv4_forwarding: None,
             prior_ipv6_disabled: None,
+            allow_tunnel_relay_forward: false,
         })
     }
 
@@ -712,6 +722,10 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.generation = generation;
     }
 
+    fn set_relay_forwarding(&mut self, enabled: bool) {
+        self.allow_tunnel_relay_forward = enabled;
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         let keep_firewall = self.firewall_table_name();
         let keep_nat = self.nat_table_name();
@@ -904,7 +918,26 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "accept",
             ],
         )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        if self.allow_tunnel_relay_forward {
+            self.run(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    table.as_str(),
+                    "forward",
+                    "iifname",
+                    self.interface_name.as_str(),
+                    "oifname",
+                    self.interface_name.as_str(),
+                    "accept",
+                ],
+            )
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        }
+        Ok(())
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -987,6 +1020,30 @@ impl DataplaneSystem for LinuxCommandSystem {
             );
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
+        }
+        if self.allow_tunnel_relay_forward {
+            if let Err(err) = self.run(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "ip",
+                    nat_table.as_str(),
+                    "postrouting",
+                    "iifname",
+                    self.interface_name.as_str(),
+                    "oifname",
+                    self.interface_name.as_str(),
+                    "masquerade",
+                ],
+            ) {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "ip", nat_table.as_str()],
+                );
+                let _ = self.restore_ipv4_forwarding();
+                return Err(SystemError::NatApplyFailed(err.to_string()));
+            }
         }
         // Collect firewall table name and egress interface before moving nat_table.
         let egress_allow = self
@@ -1605,6 +1662,14 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn set_relay_forwarding(&mut self, enabled: bool) {
+        match self {
+            RuntimeSystem::DryRun(system) => system.set_relay_forwarding(enabled),
+            RuntimeSystem::Linux(system) => system.set_relay_forwarding(enabled),
+            RuntimeSystem::Macos(system) => system.set_relay_forwarding(enabled),
+        }
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.prune_owned_tables(),
@@ -1885,6 +1950,9 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system.apply_routes(&routes)?;
         applied_stages.push(StageMarker::SystemRoutesApplied);
 
+        let relay_with_upstream =
+            options.exit_mode == ExitMode::FullTunnel && options.serve_exit_node;
+        self.system.set_relay_forwarding(relay_with_upstream);
         self.system.apply_firewall_killswitch()?;
         applied_stages.push(StageMarker::FirewallApplied);
 
@@ -2571,6 +2639,47 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::ExitActive);
         assert_eq!(controller.generation(), 1);
         assert_eq!(controller.last_safe_generation(), 1);
+    }
+
+    #[test]
+    fn relay_with_upstream_enables_tunnel_forwarding_path() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("relay-with-upstream apply should succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "set_relay_forwarding:true")
+        );
     }
 
     #[test]
