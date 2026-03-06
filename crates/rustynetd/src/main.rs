@@ -850,6 +850,16 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn encrypted_secret_permission_policy(path: &std::path::Path) -> KeyCustodyPermissionPolicy {
+    let mut policy = KeyCustodyPermissionPolicy::default();
+    if matches!(path.parent(), Some(parent) if parent == std::path::Path::new("/etc/rustynet")) {
+        // Encrypted signing artifacts currently coexist with daemon-readable verifier
+        // material under /etc/rustynet on Linux.
+        policy.required_directory_mode = 0o750;
+    }
+    policy
+}
+
 fn persist_owner_signing_key_encrypted(
     path: &std::path::Path,
     key_bytes: &[u8; 32],
@@ -898,12 +908,13 @@ fn persist_owner_signing_key_encrypted(
     let parent = path
         .parent()
         .ok_or_else(|| format!("owner signing key path has no parent: {}", path.display()))?;
+    let permission_policy = encrypted_secret_permission_policy(path);
     write_encrypted_key_file(
         parent,
         path,
         key_bytes,
         passphrase.as_str(),
-        KeyCustodyPermissionPolicy::default(),
+        permission_policy,
     )
     .map_err(|err| {
         format!(

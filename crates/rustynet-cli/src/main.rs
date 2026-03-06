@@ -1072,6 +1072,16 @@ fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
     fs::write(path, body).map_err(|err| format!("write file failed: {err}"))
 }
 
+fn encrypted_secret_permission_policy(path: &Path) -> KeyCustodyPermissionPolicy {
+    let mut policy = KeyCustodyPermissionPolicy::default();
+    if matches!(path.parent(), Some(parent) if parent == Path::new("/etc/rustynet")) {
+        // Encrypted signing artifacts currently coexist with daemon-readable verifier
+        // material under /etc/rustynet on Linux.
+        policy.required_directory_mode = 0o750;
+    }
+    policy
+}
+
 fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, String> {
     let secret = load_encrypted_secret_material(path, passphrase_path, "signing key")?;
     if secret.len() != 32 {
@@ -1133,11 +1143,12 @@ fn load_encrypted_secret_material(
     let parent = path
         .parent()
         .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
+    let permission_policy = encrypted_secret_permission_policy(path);
     let secret = read_encrypted_key_file(
         parent,
         path,
         passphrase.as_str(),
-        KeyCustodyPermissionPolicy::default(),
+        permission_policy,
     )
     .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
     Ok(Zeroizing::new(secret))
@@ -1182,12 +1193,13 @@ fn persist_encrypted_secret_material(
     let parent = path
         .parent()
         .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
+    let permission_policy = encrypted_secret_permission_policy(path);
     write_encrypted_key_file(
         parent,
         path,
         secret,
         passphrase.as_str(),
-        KeyCustodyPermissionPolicy::default(),
+        permission_policy,
     )
     .map_err(|err| {
         format!(
