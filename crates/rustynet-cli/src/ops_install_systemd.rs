@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{RngCore, rngs::OsRng};
-use sha2::{Digest, Sha256};
 
 const ENV_DST: &str = "/etc/default/rustynetd";
 const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
@@ -21,7 +19,6 @@ const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
 const SERVICE_SIGNING_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
 const RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME: &str = concat!("w", "g", "_key_passphrase");
-const LEGACY_WIREGUARD_KEY_ID_PREFIX: &str = concat!("w", "g", "-private-");
 
 const SERVICE_DST: &str = "/etc/systemd/system/rustynetd.service";
 const HELPER_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-privileged-helper.service";
@@ -401,23 +398,45 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         0o750,
     )?;
 
-    migrate_legacy_key_path_if_needed(
-        Path::new("/etc/rustynet/wireguard.key.enc"),
-        wireguard_encrypted_private_key_path.as_path(),
-        daemon_uid,
-        daemon_gid,
-        0o600,
-    )?;
-    migrate_legacy_key_path_if_needed(
-        Path::new("/etc/rustynet/wireguard.pub"),
-        wireguard_public_key_path.as_path(),
-        daemon_uid,
-        daemon_gid,
-        0o644,
-    )?;
-
+    let legacy_encrypted_key_path = Path::new("/etc/rustynet/wireguard.key.enc");
+    let legacy_public_key_path = Path::new("/etc/rustynet/wireguard.pub");
     let legacy_passphrase_path = Path::new("/etc/rustynet/wireguard.passphrase");
     let bootstrap_passphrase_path = Path::new("/var/lib/rustynet/keys/wireguard.passphrase");
+
+    let legacy_encrypted_exists = match fs::symlink_metadata(legacy_encrypted_key_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(format!(
+                "inspect legacy encrypted key path {} failed: {err}",
+                legacy_encrypted_key_path.display()
+            ));
+        }
+    };
+    let legacy_public_exists = match fs::symlink_metadata(legacy_public_key_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(format!(
+                "inspect legacy public key path {} failed: {err}",
+                legacy_public_key_path.display()
+            ));
+        }
+    };
+    if legacy_encrypted_exists && !wireguard_encrypted_private_key_path.exists() {
+        return Err(format!(
+            "legacy encrypted key path detected at {} while canonical path {} is missing; implicit migration is disabled. Move/re-encrypt key material explicitly before running install-systemd",
+            legacy_encrypted_key_path.display(),
+            wireguard_encrypted_private_key_path.display()
+        ));
+    }
+    if legacy_public_exists && !wireguard_public_key_path.exists() {
+        return Err(format!(
+            "legacy public key path detected at {} while canonical path {} is missing; implicit migration is disabled. Move/recreate key material explicitly before running install-systemd",
+            legacy_public_key_path.display(),
+            wireguard_public_key_path.display()
+        ));
+    }
 
     if !wireguard_key_passphrase_credential_blob_path.is_file() {
         return Err(format!(
@@ -449,43 +468,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     if legacy_passphrase_path != wireguard_key_passphrase_credential_blob_path.as_path() {
         secure_remove_file(legacy_passphrase_path)?;
     }
-
-    let legacy_encrypted_key_path = Path::new("/etc/rustynet/wireguard.key.enc");
-    let legacy_key_id = key_id_for_encrypted_path(legacy_encrypted_key_path);
-    let target_key_id = key_id_for_encrypted_path(wireguard_encrypted_private_key_path.as_path());
-    let legacy_fallback_file = legacy_encrypted_key_path
-        .parent()
-        .ok_or_else(|| {
-            format!(
-                "legacy encrypted key path has no parent: {}",
-                legacy_encrypted_key_path.display()
-            )
-        })?
-        .join(format!("{legacy_key_id}.enc"));
-    let target_fallback_file = wireguard_encrypted_private_key_path
-        .parent()
-        .ok_or_else(|| {
-            format!(
-                "wireguard encrypted key path has no parent: {}",
-                wireguard_encrypted_private_key_path.display()
-            )
-        })?
-        .join(format!("{target_key_id}.enc"));
-
-    if legacy_fallback_file != target_fallback_file
-        && !target_fallback_file.exists()
-        && legacy_fallback_file.is_file()
-    {
-        copy_file_with_owner_mode(
-            legacy_fallback_file.as_path(),
-            target_fallback_file.as_path(),
-            daemon_uid,
-            daemon_gid,
-            0o600,
-            "legacy wireguard fallback key",
-        )?;
-        secure_remove_file(legacy_fallback_file.as_path())?;
-    }
+    secure_remove_file(legacy_encrypted_key_path)?;
+    secure_remove_file(legacy_public_key_path)?;
 
     for readonly_target in [
         trust_evidence_path.as_path(),
@@ -541,12 +525,6 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         daemon_uid,
         daemon_gid,
         0o644,
-    )?;
-    set_owner_mode_if_exists(
-        target_fallback_file.as_path(),
-        daemon_uid,
-        daemon_gid,
-        0o600,
     )?;
 
     set_owner_mode_if_exists(
@@ -1379,31 +1357,6 @@ fn set_owner_mode_if_exists(path: &Path, owner: Uid, group: Gid, mode: u32) -> R
     }
 }
 
-fn migrate_legacy_key_path_if_needed(
-    legacy_path: &Path,
-    target_path: &Path,
-    owner: Uid,
-    group: Gid,
-    mode: u32,
-) -> Result<(), String> {
-    if legacy_path == target_path {
-        return Ok(());
-    }
-    if target_path.exists() || !legacy_path.is_file() {
-        return Ok(());
-    }
-    copy_file_with_owner_mode(
-        legacy_path,
-        target_path,
-        owner,
-        group,
-        mode,
-        "legacy key material",
-    )?;
-    secure_remove_file(legacy_path)?;
-    Ok(())
-}
-
 fn secure_remove_file(path: &Path) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1452,14 +1405,6 @@ fn scrub_file_contents(path: &Path) -> Result<(), String> {
     file.sync_all()
         .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
     Ok(())
-}
-
-fn key_id_for_encrypted_path(path: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(path.as_os_str().as_bytes());
-    let digest = hasher.finalize();
-    let hex = bytes_to_hex(digest.as_slice());
-    format!("{}{}", LEGACY_WIREGUARD_KEY_ID_PREFIX, &hex[..16])
 }
 
 fn bytes_to_hex(input: &[u8]) -> String {
@@ -1635,11 +1580,7 @@ fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LEGACY_WIREGUARD_KEY_ID_PREFIX, bytes_to_hex, key_id_for_encrypted_path,
-        parse_install_bool, read_env_file_values,
-    };
-    use std::path::Path;
+    use super::{bytes_to_hex, parse_install_bool, read_env_file_values};
 
     #[test]
     fn parse_install_bool_accepts_expected_variants() {
@@ -1679,11 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn key_id_derivation_matches_expected_shape() {
-        let key_id = key_id_for_encrypted_path(Path::new("/etc/rustynet/wireguard.key.enc"));
-        assert!(key_id.starts_with(LEGACY_WIREGUARD_KEY_ID_PREFIX));
-        assert_eq!(key_id.len(), LEGACY_WIREGUARD_KEY_ID_PREFIX.len() + 16);
-
+    fn bytes_to_hex_encodes_expected_value() {
         assert_eq!(bytes_to_hex(&[0x00, 0xab, 0xff]), "00abff");
     }
 }

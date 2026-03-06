@@ -314,6 +314,14 @@ pub struct KeyCustodyManager<S: OsSecureStore> {
     fallback_directory: PathBuf,
     fallback_passphrase: Zeroizing<String>,
     permission_policy: KeyCustodyPermissionPolicy,
+    fallback_policy: OsStoreFallbackPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OsStoreFallbackPolicy {
+    #[default]
+    AllowEncryptedFileFallback,
+    RequireOsSecureStore,
 }
 
 impl<S: OsSecureStore> KeyCustodyManager<S> {
@@ -342,7 +350,13 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
             fallback_directory,
             fallback_passphrase,
             permission_policy,
+            fallback_policy: OsStoreFallbackPolicy::default(),
         }
+    }
+
+    pub fn with_fallback_policy(mut self, policy: OsStoreFallbackPolicy) -> Self {
+        self.fallback_policy = policy;
+        self
     }
 
     pub fn store_private_key(
@@ -353,6 +367,12 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         match self.os_store.store_key(key_id, key_material) {
             Ok(()) => Ok(KeyCustodyBackend::OsSecureStore),
             Err(CryptoError::OsStoreUnavailable) => {
+                if matches!(
+                    self.fallback_policy,
+                    OsStoreFallbackPolicy::RequireOsSecureStore
+                ) {
+                    return Err(CryptoError::OsStoreUnavailable);
+                }
                 let file_path = self.fallback_file_path(key_id)?;
                 write_encrypted_key_file(
                     &self.fallback_directory,
@@ -371,6 +391,12 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         match self.os_store.load_key(key_id) {
             Ok(key) => Ok(key),
             Err(CryptoError::OsStoreUnavailable) => {
+                if matches!(
+                    self.fallback_policy,
+                    OsStoreFallbackPolicy::RequireOsSecureStore
+                ) {
+                    return Err(CryptoError::OsStoreUnavailable);
+                }
                 let file_path = self.fallback_file_path(key_id)?;
                 read_encrypted_key_file(
                     &self.fallback_directory,
@@ -937,9 +963,9 @@ mod tests {
     use super::{
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, SigningProviderKind, SigningProviderPolicy, create_provider_attestation,
-        decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
-        read_encrypted_key_file, validate_key_custody_permissions,
+        NodeKeyPair, OsStoreFallbackPolicy, SigningProviderKind, SigningProviderPolicy,
+        create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
+        generate_key_custody_material, read_encrypted_key_file, validate_key_custody_permissions,
         validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
     };
 
@@ -1160,6 +1186,35 @@ mod tests {
 
         let key_file = fallback_directory.join("node_identity.enc");
         let _ = std::fs::remove_file(key_file);
+        let _ = std::fs::remove_dir(fallback_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_custody_manager_strict_mode_rejects_encrypted_file_fallback() {
+        let unique = format!(
+            "rustynet-key-custody-manager-strict-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let fallback_directory = std::env::temp_dir().join(unique);
+        let manager = KeyCustodyManager::new(
+            NoOsSecureStore,
+            fallback_directory.clone(),
+            "phase2-passphrase".to_string(),
+            KeyCustodyPermissionPolicy::default(),
+        )
+        .with_fallback_policy(OsStoreFallbackPolicy::RequireOsSecureStore);
+
+        let store_result = manager.store_private_key("node_identity", b"node-private-key");
+        assert_eq!(store_result.err(), Some(CryptoError::OsStoreUnavailable));
+        assert!(!fallback_directory.join("node_identity.enc").exists());
+
+        let load_result = manager.load_private_key("node_identity");
+        assert_eq!(load_result.err(), Some(CryptoError::OsStoreUnavailable));
+
         let _ = std::fs::remove_dir(fallback_directory);
     }
 

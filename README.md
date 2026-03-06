@@ -50,6 +50,7 @@ Host-profile behavior:
 - macOS service lifecycle hardening: daemon and privileged helper are managed through `launchd` (`launchctl bootstrap`/`kickstart`) rather than ad-hoc background processes.
 - macOS dependency hardening: privileged networking tools (`wg`, `wireguard-go`) must be installed with admin privileges in root-owned paths; non-admin local fallback is intentionally blocked.
 - macOS key custody hardening: WireGuard passphrase custody is Keychain-backed (`rustynet.wg_passphrase` service); persistent plaintext passphrase files are rejected by startup preflight.
+- macOS passphrase-file runtime fallback is removed; daemon runtime requires keychain-backed passphrase custody (`RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT` + keychain item).
 - macOS path policy: Linux runtime roots (`/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet`) are not used; user-space paths are enforced instead.
 - macOS dependency hardening: Homebrew must already be installed via approved operator workflow; automated remote-script install fallback is blocked.
 - macOS PF safety: stale Rustynet PF anchors (`com.apple/rustynet_g*`) are pruned on dataplane generation apply to prevent residual fail-closed anchors after crashes/restarts.
@@ -82,8 +83,10 @@ Linux trust-refresh behavior:
 
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
+- Trust and auto-tunnel watermark parsers are strict: only digest-bound `version=2` watermark files are accepted (legacy `version=1` is rejected fail-closed).
 - Linux assignment refresh service path is Rust-backed: `scripts/systemd/refresh_assignment_bundle.sh` is a thin wrapper to `rustynet ops refresh-assignment`.
 - Linux service installer path is Rust-backed: `scripts/systemd/install_rustynetd_service.sh` is a thin wrapper to `rustynet ops install-systemd` (with `RUSTYNET_INSTALL_SOURCE_ROOT` pinned by the wrapper).
+- Legacy Linux WireGuard key paths are no longer implicitly migrated in custody bootstrap/install flows; canonical paths must be present, or operators must perform explicit key re-enrollment/rotation.
 - Linux signing artifact custody expects `/etc/rustynet` parent directory mode
   `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
 - For unattended runtime, enable signer-backed assignment refresh with:

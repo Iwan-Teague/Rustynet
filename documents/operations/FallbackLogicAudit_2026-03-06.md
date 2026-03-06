@@ -5,17 +5,19 @@ Date: 2026-03-06
 ## Scope
 Code-path audit for fallback, downgrade, compatibility, and legacy behavior in runtime and setup logic.
 
-## Implementation Status (2026-03-06 Pass 2)
+## Implementation Status (2026-03-06 Pass 3)
 - Implemented in prior pass:
   - `FL-001`, `FL-002`, `FL-003`, `FL-004`, `FL-005`
   - `FL-017`, `FL-018`, `FL-020`, `FL-021`, `FL-025`, `FL-028`
-- Implemented in this pass:
+- Implemented in pass 2:
   - `FL-007`, `FL-009`
   - `FL-012`, `FL-013`, `FL-014`, `FL-015`, `FL-016`
   - `FL-019`
   - `FL-022`, `FL-023`, `FL-024`, `FL-026`, `FL-027`
-- Remaining for next passes:
+- Implemented in pass 3:
   - `FL-006`, `FL-008`, `FL-010`, `FL-011`
+- Remaining for next passes:
+  - none
 
 ## Priority 1: Runtime Downgrade Paths (Most Important)
 

@@ -17,20 +17,20 @@ use rustynet_crypto::{
     KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
 };
 #[cfg(target_os = "macos")]
-use rustynet_crypto::{load_macos_generic_password, store_macos_generic_password};
+use rustynet_crypto::{
+    OsStoreFallbackPolicy, load_macos_generic_password, store_macos_generic_password,
+};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 const PASSPHRASE_CREDENTIAL_PATH_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH";
 const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
 #[cfg(target_os = "macos")]
 const PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT";
 #[cfg(target_os = "macos")]
 const MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "rustynet.wg_passphrase";
-#[cfg(target_os = "macos")]
-const ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV: &str =
-    "RUSTYNET_ALLOW_MACOS_PASSPHRASE_FILE_FALLBACK";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 #[cfg(not(target_os = "macos"))]
@@ -174,19 +174,6 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
     Ok(account.to_string())
 }
 
-#[cfg(target_os = "macos")]
-fn macos_file_passphrase_fallback_allowed() -> bool {
-    std::env::var(ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV)
-        .ok()
-        .map(|value| {
-            let normalized = value.trim();
-            normalized == "1"
-                || normalized.eq_ignore_ascii_case("true")
-                || normalized.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
-}
-
 pub fn decrypt_private_key(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
@@ -252,12 +239,15 @@ fn key_custody_manager(
     let parent = encrypted_key_path
         .parent()
         .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
-    Ok(KeyCustodyManager::new_zeroizing(
+    let manager = KeyCustodyManager::new_zeroizing(
         PlatformOsSecureStore,
         parent.to_path_buf(),
         passphrase,
         KeyCustodyPermissionPolicy::default(),
-    ))
+    );
+    #[cfg(target_os = "macos")]
+    let manager = manager.with_fallback_policy(OsStoreFallbackPolicy::RequireOsSecureStore);
+    Ok(manager)
 }
 
 fn validate_secret_file_security(
@@ -318,67 +308,58 @@ fn resolve_passphrase_source_from_env(
     explicit_credential_path: Option<&str>,
     credentials_directory: Option<&str>,
 ) -> Result<PathBuf, String> {
-    resolve_passphrase_source_from_env_with_policy(
-        configured_path,
-        explicit_credential_path,
-        credentials_directory,
-        true,
-    )
-}
-
-fn resolve_passphrase_source_from_env_with_policy(
-    configured_path: &Path,
-    explicit_credential_path: Option<&str>,
-    credentials_directory: Option<&str>,
-    enforce_macos_file_fallback_policy: bool,
-) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
-        if enforce_macos_file_fallback_policy && !macos_file_passphrase_fallback_allowed() {
+        let _ = (
+            configured_path,
+            explicit_credential_path,
+            credentials_directory,
+        );
+        Err(format!(
+            "macOS passphrase file custody is disabled; set {} and provision the passphrase in keychain",
+            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(explicit) = explicit_credential_path {
+            let explicit_path = PathBuf::from(explicit);
+            if explicit_path.exists() {
+                return Ok(explicit_path);
+            }
             return Err(format!(
-                "macOS passphrase file fallback is disabled; set {} for keychain-backed custody (or set {}=1 for time-bounded emergency fallback)",
-                PASSPHRASE_KEYCHAIN_ACCOUNT_ENV, ALLOW_MACOS_FILE_PASSPHRASE_FALLBACK_ENV
+                "passphrase credential path not found ({}={})",
+                PASSPHRASE_CREDENTIAL_PATH_ENV,
+                explicit_path.display()
             ));
         }
-    }
 
-    if let Some(explicit) = explicit_credential_path {
-        let explicit_path = PathBuf::from(explicit);
-        if explicit_path.exists() {
-            return Ok(explicit_path);
+        if let Some(directory) = credentials_directory {
+            let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            return Err(format!(
+                "passphrase credential not found in {} (expected {})",
+                SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+                candidate.display()
+            ));
         }
-        return Err(format!(
-            "passphrase credential path not found ({}={})",
-            PASSPHRASE_CREDENTIAL_PATH_ENV,
-            explicit_path.display()
-        ));
-    }
 
-    if let Some(directory) = credentials_directory {
-        let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
-        if candidate.exists() {
-            return Ok(candidate);
+        if configured_path.exists() {
+            return Err(format!(
+                "passphrase credential source must be explicitly configured via {} or {}; direct fallback to {} is disallowed",
+                PASSPHRASE_CREDENTIAL_PATH_ENV,
+                SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+                configured_path.display()
+            ));
         }
+
         return Err(format!(
-            "passphrase credential not found in {} (expected {})",
-            SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
-            candidate.display()
+            "passphrase credential source is not configured; set {} or {}",
+            PASSPHRASE_CREDENTIAL_PATH_ENV, SYSTEMD_CREDENTIALS_DIRECTORY_ENV
         ));
     }
-
-    if configured_path.exists() {
-        return Err(format!(
-            "passphrase credential source must be explicitly configured via {} or {}; direct fallback to {} is disallowed",
-            PASSPHRASE_CREDENTIAL_PATH_ENV,
-            SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
-            configured_path.display()
-        ));
-    }
-
-    Err(format!(
-        "passphrase credential source is not configured; set {} or {}",
-        PASSPHRASE_CREDENTIAL_PATH_ENV, SYSTEMD_CREDENTIALS_DIRECTORY_ENV
-    ))
 }
 
 fn is_systemd_credential_path(path: &Path) -> bool {
@@ -902,10 +883,9 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_PASSPHRASE_CREDENTIAL_NAME, remove_file_if_present,
-        resolve_passphrase_source_from_env_with_policy, validate_binary_path,
-    };
+    #[cfg(not(target_os = "macos"))]
+    use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
+    use super::{remove_file_if_present, resolve_passphrase_source_from_env, validate_binary_path};
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -918,6 +898,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn resolve_passphrase_source_prefers_explicit_credential_path_env() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-explicit");
         let configured = test_dir.join("configured.passphrase");
@@ -925,11 +906,10 @@ mod tests {
         std::fs::write(&configured, "configured").expect("configured path should be writable");
         std::fs::write(&explicit, "explicit").expect("explicit path should be writable");
 
-        let resolved = resolve_passphrase_source_from_env_with_policy(
+        let resolved = resolve_passphrase_source_from_env(
             &configured,
             Some(&explicit.to_string_lossy()),
             None,
-            false,
         )
         .expect("explicit credential path should resolve");
         assert_eq!(resolved, explicit);
@@ -937,6 +917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn resolve_passphrase_source_uses_credentials_directory_when_present() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-credentials-dir");
         let configured = test_dir.join("configured.passphrase");
@@ -946,11 +927,10 @@ mod tests {
         std::fs::write(&configured, "configured").expect("configured path should be writable");
         std::fs::write(&credential, "credential").expect("credential path should be writable");
 
-        let resolved = resolve_passphrase_source_from_env_with_policy(
+        let resolved = resolve_passphrase_source_from_env(
             &configured,
             None,
             Some(&credentials_dir.to_string_lossy()),
-            false,
         )
         .expect("credential directory path should resolve");
         assert_eq!(resolved, credential);
@@ -958,20 +938,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn resolve_passphrase_source_rejects_direct_configured_path_fallback() {
         let test_dir = unique_test_dir("rustynet-passphrase-source-fallback");
         let configured = test_dir.join("configured.passphrase");
         std::fs::write(&configured, "configured").expect("configured path should be writable");
 
-        let err = resolve_passphrase_source_from_env_with_policy(&configured, None, None, false)
+        let err = resolve_passphrase_source_from_env(&configured, None, None)
             .expect_err("direct configured path fallback must be rejected");
         assert!(err.contains("disallowed"));
 
         let _ = std::fs::remove_file(&configured);
-        let err = resolve_passphrase_source_from_env_with_policy(&configured, None, None, false)
+        let err = resolve_passphrase_source_from_env(&configured, None, None)
             .expect_err("missing credential source must be rejected");
         assert!(err.contains("not configured"));
 
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn resolve_passphrase_source_rejects_file_custody_on_macos() {
+        let test_dir = unique_test_dir("rustynet-passphrase-source-macos");
+        let configured = test_dir.join("configured.passphrase");
+        let err = resolve_passphrase_source_from_env(&configured, None, None)
+            .expect_err("macOS must reject passphrase file custody");
+        assert!(err.contains("disabled"));
         let _ = std::fs::remove_dir_all(test_dir);
     }
 

@@ -3074,33 +3074,27 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
             }
         }
     }
-    match version {
-        Some(1) => Ok(Some(TrustWatermark {
-            updated_at_unix: updated_at_unix.ok_or_else(|| {
-                TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
-            })?,
-            nonce: nonce.ok_or_else(|| {
-                TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
-            })?,
-            payload_digest: None,
-        })),
-        Some(2) => Ok(Some(TrustWatermark {
-            updated_at_unix: updated_at_unix.ok_or_else(|| {
-                TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
-            })?,
-            nonce: nonce.ok_or_else(|| {
-                TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
-            })?,
-            payload_digest: Some(payload_digest.ok_or_else(|| {
-                TrustBootstrapError::InvalidFormat(
-                    "missing watermark payload_digest_sha256".to_string(),
-                )
-            })?),
-        })),
-        _ => Err(TrustBootstrapError::InvalidFormat(
-            "unsupported watermark version".to_string(),
-        )),
+    let version = version.ok_or_else(|| {
+        TrustBootstrapError::InvalidFormat("missing watermark version".to_string())
+    })?;
+    if version != 2 {
+        return Err(TrustBootstrapError::InvalidFormat(
+            "unsupported watermark version; expected version=2".to_string(),
+        ));
     }
+    Ok(Some(TrustWatermark {
+        updated_at_unix: updated_at_unix.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
+        })?,
+        nonce: nonce.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        })?,
+        payload_digest: Some(payload_digest.ok_or_else(|| {
+            TrustBootstrapError::InvalidFormat(
+                "missing watermark payload_digest_sha256".to_string(),
+            )
+        })?),
+    }))
 }
 
 fn persist_trust_watermark(
@@ -3640,19 +3634,16 @@ fn load_auto_tunnel_watermark(
     let version = version.ok_or_else(|| {
         AutoTunnelBootstrapError::InvalidFormat("missing watermark version".to_string())
     })?;
-    let payload_digest = match version {
-        1 => None,
-        2 => Some(payload_digest.ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat(
-                "missing watermark payload_digest_sha256".to_string(),
-            )
-        })?),
-        _ => {
-            return Err(AutoTunnelBootstrapError::InvalidFormat(
-                "unsupported watermark version".to_string(),
-            ));
-        }
-    };
+    if version != 2 {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "unsupported watermark version; expected version=2".to_string(),
+        ));
+    }
+    let payload_digest = Some(payload_digest.ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat(
+            "missing watermark payload_digest_sha256".to_string(),
+        )
+    })?);
     Ok(Some(AutoTunnelWatermark {
         generated_at_unix,
         nonce,
@@ -4291,22 +4282,14 @@ mod tests {
     }
 
     #[test]
-    fn load_trust_watermark_supports_legacy_version_without_digest() {
+    fn load_trust_watermark_rejects_legacy_version_without_digest() {
         let test_dir = secure_test_dir("rustynetd-trust-watermark-v1");
         let watermark_path = test_dir.join("trust.watermark");
         std::fs::write(&watermark_path, "version=1\nupdated_at_unix=100\nnonce=7\n")
             .expect("legacy watermark should be written");
-        let loaded = load_trust_watermark(&watermark_path)
-            .expect("legacy watermark should load")
-            .expect("legacy watermark should exist");
-        assert_eq!(
-            loaded,
-            TrustWatermark {
-                updated_at_unix: 100,
-                nonce: 7,
-                payload_digest: None,
-            }
-        );
+        let err = load_trust_watermark(&watermark_path)
+            .expect_err("legacy watermark format must fail closed");
+        assert!(matches!(err, super::TrustBootstrapError::InvalidFormat(_)));
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
@@ -4429,7 +4412,7 @@ mod tests {
     }
 
     #[test]
-    fn load_auto_tunnel_watermark_supports_legacy_version_without_digest() {
+    fn load_auto_tunnel_watermark_rejects_legacy_version_without_digest() {
         let test_dir = secure_test_dir("rustynetd-auto-watermark-v1");
         let watermark_path = test_dir.join("assignment.watermark");
         std::fs::write(
@@ -4437,17 +4420,12 @@ mod tests {
             "version=1\ngenerated_at_unix=10\nnonce=2\n",
         )
         .expect("legacy auto tunnel watermark should be written");
-        let loaded = load_auto_tunnel_watermark(&watermark_path)
-            .expect("legacy auto tunnel watermark should load")
-            .expect("legacy auto tunnel watermark should exist");
-        assert_eq!(
-            loaded,
-            AutoTunnelWatermark {
-                generated_at_unix: 10,
-                nonce: 2,
-                payload_digest: None,
-            }
-        );
+        let err = load_auto_tunnel_watermark(&watermark_path)
+            .expect_err("legacy auto tunnel watermark format must fail closed");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
         let _ = std::fs::remove_dir_all(test_dir);
     }
 

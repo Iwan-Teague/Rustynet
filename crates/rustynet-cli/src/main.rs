@@ -1453,7 +1453,6 @@ const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
 const DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key";
-const DEFAULT_LEGACY_LINUX_WG_PASSPHRASE_PATH: &str = "/etc/rustynet/wireguard.passphrase";
 const DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str =
     concat!("rustynet.", "wg", "_passphrase");
 
@@ -1482,8 +1481,6 @@ struct TunnelCustodyOpsConfig {
     public_key_path: PathBuf,
     passphrase_path: PathBuf,
     passphrase_credential_blob_path: PathBuf,
-    legacy_private_key_path: PathBuf,
-    legacy_passphrase_path: PathBuf,
     macos_keychain_service: String,
     macos_keychain_account: String,
     allow_init: bool,
@@ -1563,6 +1560,19 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
     let encrypted_present = config.encrypted_private_key_path.exists();
     let public_present = config.public_key_path.exists();
     let credential_present = config.passphrase_credential_blob_path.exists();
+    let legacy_plaintext_private_key_path = Path::new(DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH);
+    let legacy_plaintext_passphrase_path = Path::new("/etc/rustynet/wireguard.passphrase");
+
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
+        && !config.runtime_private_key_path.exists()
+        && legacy_plaintext_private_key_path.exists()
+    {
+        return Err(format!(
+            "legacy plaintext WireGuard key detected at {}; implicit migration is disabled. Move it to canonical runtime path {} and rerun, or rotate/reinitialize keys explicitly",
+            legacy_plaintext_private_key_path.display(),
+            config.runtime_private_key_path.display()
+        ));
+    }
 
     if matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
         && encrypted_present
@@ -1585,14 +1595,17 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                     let removed_runtime_plaintext =
                         secure_remove_if_present(config.passphrase_path.as_path())?;
                     let removed_legacy_plaintext =
-                        secure_remove_if_present(config.legacy_passphrase_path.as_path())?;
+                        secure_remove_if_present(legacy_plaintext_passphrase_path)?;
+                    let removed_legacy_plaintext_private_key =
+                        secure_remove_if_present(legacy_plaintext_private_key_path)?;
                     return Ok(format!(
-                        "tunnel custody already initialized: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={}",
+                        "tunnel custody already initialized: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={} removed_legacy_plaintext_private_key={}",
                         config.encrypted_private_key_path.display(),
                         config.public_key_path.display(),
                         config.passphrase_credential_blob_path.display(),
                         removed_runtime_plaintext,
-                        removed_legacy_plaintext
+                        removed_legacy_plaintext,
+                        removed_legacy_plaintext_private_key
                     ));
                 }
             }
@@ -1656,14 +1669,9 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
         return Err(err);
     }
 
-    let mut removed_legacy_private_key = false;
     let bootstrap_result = (|| -> Result<String, String> {
         let source_private_key_path = if config.runtime_private_key_path.exists() {
             Some(config.runtime_private_key_path.clone())
-        } else if matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
-            && config.legacy_private_key_path.exists()
-        {
-            Some(config.legacy_private_key_path.clone())
         } else {
             None
         };
@@ -1683,10 +1691,6 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                 Some(passphrase_tmp.as_path()),
                 true,
             )?;
-            if source_private_key_path != config.runtime_private_key_path {
-                secure_remove_if_present(source_private_key_path.as_path())?;
-                removed_legacy_private_key = true;
-            }
             "migrated"
         } else {
             initialize_encrypted_key_material(
@@ -1709,15 +1713,17 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                 let removed_runtime_plaintext =
                     secure_remove_if_present(config.passphrase_path.as_path())?;
                 let removed_legacy_plaintext =
-                    secure_remove_if_present(config.legacy_passphrase_path.as_path())?;
+                    secure_remove_if_present(legacy_plaintext_passphrase_path)?;
+                let removed_legacy_plaintext_private_key =
+                    secure_remove_if_present(legacy_plaintext_private_key_path)?;
                 Ok(format!(
-                    "tunnel custody {operation}: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={} removed_legacy_private_key={}",
+                    "tunnel custody {operation}: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={} removed_legacy_plaintext_private_key={}",
                     config.encrypted_private_key_path.display(),
                     config.public_key_path.display(),
                     config.passphrase_credential_blob_path.display(),
                     removed_runtime_plaintext,
                     removed_legacy_plaintext,
-                    removed_legacy_private_key
+                    removed_legacy_plaintext_private_key
                 ))
             }
             SigningPassphraseHostProfile::Macos => {
@@ -2820,14 +2826,6 @@ fn wireguard_custody_ops_config_from_env() -> Result<TunnelCustodyOpsConfig, Str
         passphrase_credential_blob_path: env_path_or_default(
             "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB",
             DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH,
-        )?,
-        legacy_private_key_path: env_path_or_default(
-            "RUSTYNET_WG_LEGACY_PRIVATE_KEY",
-            DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH,
-        )?,
-        legacy_passphrase_path: env_path_or_default(
-            "RUSTYNET_WG_LEGACY_PASSPHRASE_PATH",
-            DEFAULT_LEGACY_LINUX_WG_PASSPHRASE_PATH,
         )?,
         macos_keychain_service: env_string_or_default(
             "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE",
