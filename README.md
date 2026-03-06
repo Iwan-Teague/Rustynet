@@ -23,7 +23,7 @@ The wizard handles:
   rejects direct plaintext passphrase-file fallback at daemon runtime
 - local key rotation/revocation and peer rotation-bundle apply flow
 - membership bootstrap with persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
-- exit-node and LAN-access toggles (re-selecting the active exit node disconnects/clears selection)
+- exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - route advertisement and status checks
 
 Host-profile behavior:
@@ -44,6 +44,11 @@ Role model:
 - `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
 - `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, auto-enforces exit-serving posture, and sanitizes client-only assignment fields (selected exit/LAN flags) instead of fail-closing on role conversion.
+
+Two-hop chain notes:
+- Client chain selection supports `1-hop` (`client -> exit`) and `2-hop` (`client -> entry relay -> final exit`) in `start.sh` under `SELECT EXIT NODE`.
+- For secure two-hop operation, the entry relay must be configured to use its upstream exit and advertise `0.0.0.0/0` (exit-serving) so it can relay downstream client traffic while tunneling upstream.
+- `blind_exit` remains final-hop oriented: it can serve exit but cannot be configured to select an upstream exit.
 
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.

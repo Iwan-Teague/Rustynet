@@ -50,6 +50,9 @@ DEFAULT_LAUNCH_PROFILE="menu"
 AUTO_LAUNCH_ON_START="0"
 AUTO_LAUNCH_EXIT_NODE_ID=""
 AUTO_LAUNCH_LAN_MODE="skip"
+EXIT_CHAIN_HOPS="1"
+EXIT_CHAIN_ENTRY_NODE_ID=""
+EXIT_CHAIN_FINAL_NODE_ID=""
 REQUESTED_LAUNCH_PROFILE=""
 REQUESTED_EXIT_NODE_ID=""
 REQUESTED_LAN_MODE=""
@@ -333,6 +336,9 @@ enforce_role_policy_defaults() {
       print_warn "blind_exit role enforces default launch profile 'quick-exit-node'."
       DEFAULT_LAUNCH_PROFILE="quick-exit-node"
     fi
+    EXIT_CHAIN_HOPS="1"
+    EXIT_CHAIN_ENTRY_NODE_ID=""
+    EXIT_CHAIN_FINAL_NODE_ID=""
     AUTO_LAUNCH_ON_START="1"
     AUTO_LAUNCH_EXIT_NODE_ID=""
     AUTO_LAUNCH_LAN_MODE="off"
@@ -344,7 +350,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -566,8 +572,39 @@ is_valid_lan_mode() {
   esac
 }
 
+is_valid_exit_chain_hops() {
+  case "$1" in
+    1|2) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sanitize_exit_chain_defaults() {
+  if ! is_valid_exit_chain_hops "${EXIT_CHAIN_HOPS}"; then
+    print_warn "Invalid EXIT_CHAIN_HOPS='${EXIT_CHAIN_HOPS}', reverting to '1'."
+    EXIT_CHAIN_HOPS="1"
+  fi
+  if [[ -n "${EXIT_CHAIN_ENTRY_NODE_ID}" ]] && ! is_valid_node_id_value "${EXIT_CHAIN_ENTRY_NODE_ID}"; then
+    print_warn "Invalid EXIT_CHAIN_ENTRY_NODE_ID='${EXIT_CHAIN_ENTRY_NODE_ID}', clearing."
+    EXIT_CHAIN_ENTRY_NODE_ID=""
+  fi
+  if [[ -n "${EXIT_CHAIN_FINAL_NODE_ID}" ]] && ! is_valid_node_id_value "${EXIT_CHAIN_FINAL_NODE_ID}"; then
+    print_warn "Invalid EXIT_CHAIN_FINAL_NODE_ID='${EXIT_CHAIN_FINAL_NODE_ID}', clearing."
+    EXIT_CHAIN_FINAL_NODE_ID=""
+  fi
+  if [[ "${EXIT_CHAIN_HOPS}" != "2" ]]; then
+    EXIT_CHAIN_FINAL_NODE_ID=""
+  fi
+  if is_blind_exit_role; then
+    EXIT_CHAIN_HOPS="1"
+    EXIT_CHAIN_ENTRY_NODE_ID=""
+    EXIT_CHAIN_FINAL_NODE_ID=""
+  fi
+}
+
 sanitize_launch_defaults() {
   enforce_role_policy_defaults
+  sanitize_exit_chain_defaults
   if ! is_valid_launch_profile "${DEFAULT_LAUNCH_PROFILE}"; then
     print_warn "Invalid DEFAULT_LAUNCH_PROFILE='${DEFAULT_LAUNCH_PROFILE}', reverting to 'menu'."
     DEFAULT_LAUNCH_PROFILE="menu"
@@ -586,6 +623,7 @@ print_start_help() {
 Rustynet startup options:
   ./start.sh
     Interactive menu mode.
+    Exit-node selection supports 1-hop and 2-hop chain prompts.
 
   ./start.sh --profile <menu|quick-connect|quick-exit-node|quick-hybrid>
     Apply a launch profile once. Non-menu profiles apply and exit.
@@ -706,6 +744,9 @@ save_config() {
     printf 'AUTO_LAUNCH_ON_START=%s\n' "${AUTO_LAUNCH_ON_START}"
     printf 'AUTO_LAUNCH_EXIT_NODE_ID=%s\n' "${AUTO_LAUNCH_EXIT_NODE_ID}"
     printf 'AUTO_LAUNCH_LAN_MODE=%s\n' "${AUTO_LAUNCH_LAN_MODE}"
+    printf 'EXIT_CHAIN_HOPS=%s\n' "${EXIT_CHAIN_HOPS}"
+    printf 'EXIT_CHAIN_ENTRY_NODE_ID=%s\n' "${EXIT_CHAIN_ENTRY_NODE_ID}"
+    printf 'EXIT_CHAIN_FINAL_NODE_ID=%s\n' "${EXIT_CHAIN_FINAL_NODE_ID}"
   } >"${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
@@ -2873,6 +2914,71 @@ extract_status_field() {
   }' <<<"${status_line}"
 }
 
+current_exit_node_from_status() {
+  local status_line
+  status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+  local current_exit
+  current_exit="$(extract_status_field "${status_line}" "exit_node")"
+  if [[ "${current_exit}" == "none" ]]; then
+    current_exit=""
+  fi
+  printf '%s' "${current_exit}"
+}
+
+wait_for_exit_node_state() {
+  local expected_node="$1"
+  local attempts="${2:-12}"
+  local current
+  while (( attempts > 0 )); do
+    current="$(current_exit_node_from_status)"
+    if [[ "${current}" == "${expected_node}" ]]; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+apply_exit_selection_change() {
+  local target_node="${1:-}"
+  if [[ -n "${target_node}" ]] && ! is_valid_node_id_value "${target_node}"; then
+    print_err "Invalid exit node id '${target_node}'. Allowed characters: letters, numbers, dot, underscore, hyphen."
+    return 1
+  fi
+
+  if is_linux_host && local_assignment_refresh_available; then
+    set_local_assignment_refresh_exit_node "${target_node}" || return 1
+    force_local_assignment_refresh_now || return 1
+    if ! wait_for_exit_node_state "${target_node}" 12; then
+      if [[ -n "${target_node}" ]]; then
+        print_warn "Daemon did not report exit node '${target_node}' after signed assignment refresh."
+      else
+        print_warn "Daemon did not report cleared exit selection after signed assignment refresh."
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ -n "${target_node}" ]]; then
+    run_rustynet_cli exit-node select "${target_node}"
+  else
+    run_rustynet_cli exit-node off
+  fi
+}
+
+exit_chain_label() {
+  if [[ "${EXIT_CHAIN_HOPS}" == "2" && -n "${EXIT_CHAIN_ENTRY_NODE_ID}" && -n "${EXIT_CHAIN_FINAL_NODE_ID}" ]]; then
+    printf '2-hop(%s->%s)' "${EXIT_CHAIN_ENTRY_NODE_ID}" "${EXIT_CHAIN_FINAL_NODE_ID}"
+    return
+  fi
+  if [[ -n "${EXIT_CHAIN_ENTRY_NODE_ID}" ]]; then
+    printf '1-hop(%s)' "${EXIT_CHAIN_ENTRY_NODE_ID}"
+    return
+  fi
+  printf 'none'
+}
+
 refresh_menu_runtime_status() {
   MENU_NETWORK_STATE="unknown"
   MENU_NETWORK_CONNECTED="unknown"
@@ -2937,15 +3043,18 @@ print_menu_runtime_header() {
   local node_role_display
   local state_display
   local exit_display
+  local chain_display
   connected_display="$(printf '%s' "${MENU_NETWORK_CONNECTED}" | tr '[:lower:]' '[:upper:]')"
   node_role_display="$(printf '%s' "${MENU_NODE_ROLE}" | tr '[:lower:]' '[:upper:]')"
   state_display="$(printf '%s' "${MENU_NETWORK_STATE}" | tr '[:lower:]' '[:upper:]')"
   exit_display="$(printf '%s' "${MENU_EXIT_ROLE}" | tr '[:lower:]' '[:upper:]')"
-  printf '[status] Node role: %s | Connected: %s (state=%s) | Exit role: %s\n' \
+  chain_display="$(printf '%s' "$(exit_chain_label)" | tr '[:lower:]' '[:upper:]')"
+  printf '[status] Node role: %s | Connected: %s (state=%s) | Exit role: %s | Chain: %s\n' \
     "${node_role_display}" \
     "${connected_display}" \
     "${state_display}" \
-    "${exit_display}"
+    "${exit_display}" \
+    "${chain_display}"
 }
 
 connect_to_device() {
@@ -3332,6 +3441,9 @@ Current Rustynet Wizard Configuration
   auto_launch_on_start    : ${AUTO_LAUNCH_ON_START}
   auto_launch_exit_node_id: ${AUTO_LAUNCH_EXIT_NODE_ID}
   auto_launch_lan_mode    : ${AUTO_LAUNCH_LAN_MODE}
+  exit_chain_hops         : ${EXIT_CHAIN_HOPS}
+  exit_chain_entry_node_id: ${EXIT_CHAIN_ENTRY_NODE_ID}
+  exit_chain_final_node_id: ${EXIT_CHAIN_FINAL_NODE_ID}
 EOF
 }
 
@@ -3488,31 +3600,138 @@ print_saved_exit_candidates_with_probe() {
 }
 
 select_exit_node() {
-  local node status_line current_exit_node
+  local hop_count first_hop final_hop status_line current_exit_node
+  local known_entry known_final
   if is_blind_exit_role; then
     print_err "Exit node selection is disabled for blind_exit role."
     return 1
   fi
+
+  sanitize_exit_chain_defaults
   print_saved_exit_candidates_with_probe
   status_line="$(run_rustynet_cli status 2>/dev/null || true)"
   current_exit_node="$(extract_status_field "${status_line}" "exit_node")"
   if [[ "${current_exit_node}" == "none" ]]; then
     current_exit_node=""
   fi
+
+  print_info "Current chain mode: $(exit_chain_label)"
   if [[ -n "${current_exit_node}" ]]; then
     print_info "Selecting current exit node '${current_exit_node}' will disconnect and clear selection."
   fi
-  prompt_default node "Exit node id to select" ""
-  if [[ -z "${node}" ]]; then
-    print_err "Exit node id is required."
+
+  prompt_default hop_count "Routing depth (1=one-hop, 2=two-hop)" "${EXIT_CHAIN_HOPS}"
+  if ! is_valid_exit_chain_hops "${hop_count}"; then
+    print_err "Invalid routing depth '${hop_count}'. Expected 1 or 2."
     return 1
   fi
-  if [[ -n "${current_exit_node}" && "${node}" == "${current_exit_node}" ]]; then
-    print_info "Exit node '${node}' is already selected. Disconnecting from exit node."
-    run_rustynet_cli exit-node off
-    return $?
+
+  if [[ "${hop_count}" == "1" ]]; then
+    prompt_default first_hop "Exit node id to select" "${EXIT_CHAIN_ENTRY_NODE_ID}"
+    if [[ -z "${first_hop}" ]]; then
+      print_err "Exit node id is required."
+      return 1
+    fi
+    if ! is_valid_node_id_value "${first_hop}"; then
+      print_err "Invalid exit node id '${first_hop}'. Allowed characters: letters, numbers, dot, underscore, hyphen."
+      return 1
+    fi
+
+    if [[ -n "${current_exit_node}" && "${first_hop}" == "${current_exit_node}" ]]; then
+      if [[ "${EXIT_CHAIN_HOPS}" == "1" && "${EXIT_CHAIN_ENTRY_NODE_ID}" == "${first_hop}" ]]; then
+        print_info "Exit node '${first_hop}' is already selected. Disconnecting from exit node."
+        if ! apply_exit_selection_change ""; then
+          return 1
+        fi
+        EXIT_CHAIN_HOPS="1"
+        EXIT_CHAIN_ENTRY_NODE_ID=""
+        EXIT_CHAIN_FINAL_NODE_ID=""
+        save_config
+        return 0
+      fi
+      print_info "Exit node '${first_hop}' is already selected. Updating chain mode to one-hop."
+    else
+      if ! apply_exit_selection_change "${first_hop}"; then
+        return 1
+      fi
+    fi
+
+    EXIT_CHAIN_HOPS="1"
+    EXIT_CHAIN_ENTRY_NODE_ID="${first_hop}"
+    EXIT_CHAIN_FINAL_NODE_ID=""
+    save_config
+    print_info "One-hop exit selected: ${first_hop}"
+    return 0
   fi
-  run_rustynet_cli exit-node select "${node}"
+
+  prompt_default first_hop "First-hop entry relay node id" "${EXIT_CHAIN_ENTRY_NODE_ID}"
+  prompt_default final_hop "Final exit node id" "${EXIT_CHAIN_FINAL_NODE_ID}"
+  if [[ -z "${first_hop}" || -z "${final_hop}" ]]; then
+    print_err "Both first-hop and final exit node ids are required for two-hop mode."
+    return 1
+  fi
+  if ! is_valid_node_id_value "${first_hop}" || ! is_valid_node_id_value "${final_hop}"; then
+    print_err "Invalid node id in two-hop chain. Allowed characters: letters, numbers, dot, underscore, hyphen."
+    return 1
+  fi
+  if [[ "${first_hop}" == "${final_hop}" ]]; then
+    print_err "Two-hop chain requires distinct first-hop and final exit nodes."
+    return 1
+  fi
+
+  known_entry="$(find_peer_record_by_node_id "${first_hop}" || true)"
+  known_final="$(find_peer_record_by_node_id "${final_hop}" || true)"
+  if [[ -z "${known_entry}" ]]; then
+    print_warn "First-hop node '${first_hop}' is not present in local peer records."
+  fi
+  if [[ -z "${known_final}" ]]; then
+    print_warn "Final exit node '${final_hop}' is not present in local peer records."
+  fi
+
+  if [[ "${first_hop}" == "${DEVICE_NODE_ID}" ]]; then
+    require_admin_role "configure local entry relay chain" || return 1
+    print_info "Configuring this node as entry relay with upstream exit '${final_hop}'."
+    if ! apply_exit_selection_change "${final_hop}"; then
+      return 1
+    fi
+    if ! run_rustynet_cli route advertise 0.0.0.0/0; then
+      print_err "Failed to advertise 0.0.0.0/0 while configuring entry relay mode."
+      return 1
+    fi
+  else
+    if [[ -n "${current_exit_node}" \
+      && "${current_exit_node}" == "${first_hop}" \
+      && "${EXIT_CHAIN_HOPS}" == "2" \
+      && "${EXIT_CHAIN_ENTRY_NODE_ID}" == "${first_hop}" \
+      && "${EXIT_CHAIN_FINAL_NODE_ID}" == "${final_hop}" ]]; then
+      print_info "Two-hop chain '${first_hop} -> ${final_hop}' is already selected. Disconnecting and clearing chain."
+      if ! apply_exit_selection_change ""; then
+        return 1
+      fi
+      EXIT_CHAIN_HOPS="1"
+      EXIT_CHAIN_ENTRY_NODE_ID=""
+      EXIT_CHAIN_FINAL_NODE_ID=""
+      save_config
+      return 0
+    fi
+
+    if [[ "${current_exit_node}" != "${first_hop}" ]]; then
+      if ! apply_exit_selection_change "${first_hop}"; then
+        return 1
+      fi
+    else
+      print_info "First-hop '${first_hop}' already selected; updating final-hop metadata only."
+    fi
+
+    print_warn "Two-hop chain metadata recorded: ${first_hop} -> ${final_hop}."
+    print_warn "Ensure entry relay '${first_hop}' is configured to use upstream exit '${final_hop}' and advertises 0.0.0.0/0."
+  fi
+
+  EXIT_CHAIN_HOPS="2"
+  EXIT_CHAIN_ENTRY_NODE_ID="${first_hop}"
+  EXIT_CHAIN_FINAL_NODE_ID="${final_hop}"
+  save_config
+  print_info "Two-hop chain selection saved: ${first_hop} -> ${final_hop}"
 }
 
 advertise_route() {
