@@ -114,6 +114,7 @@ rustynet assignment init-signing-secret \
 - Endpoint stability: set a fixed WireGuard listen port on each node (`RUSTYNET_WG_LISTEN_PORT`, default `51820`) so signed assignment endpoints remain valid across daemon restarts.
 - Exit-serving mode under enforced auto-tunnel: advertise `0.0.0.0/0` on the serving node (`rustynet route advertise 0.0.0.0/0`). This is the only route mutation allowed while auto-tunnel enforcement is enabled.
 - When `0.0.0.0/0` is advertised and the node is not itself using an exit node, `rustynetd` applies forwarding+NAT for secure exit serving during reconcile.
+- Linux fail-closed management and peer-endpoint bypass routes resolve interface per destination (`ip route get`) before installing table `51820` host/CIDR routes. This prevents dual-NIC lockouts when management and internet egress interfaces differ.
 - Keep assignment TTL aligned to `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS` (default max-age is 300s). If TTL exceeds max-age, max-age still enforces fail-closed expiration.
 
 ## Automated Debian Pair Clean Install + Tunnel Validation
