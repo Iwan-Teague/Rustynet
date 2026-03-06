@@ -6,6 +6,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rustynet"
 CONFIG_FILE="${CONFIG_DIR}/wizard.env"
 PEERS_FILE="${CONFIG_DIR}/peers.db"
 LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
+ASSIGNMENT_REFRESH_ENV_PATH="/etc/rustynet/assignment-refresh.env"
 
 # Defaults aligned with rustynetd/systemd profile.
 SOCKET_PATH="/run/rustynet/rustynetd.sock"
@@ -292,7 +293,10 @@ enforce_role_policy_defaults() {
   normalize_node_role
   if is_client_role; then
     MANUAL_PEER_OVERRIDE="0"
-    AUTO_REFRESH_TRUST="0"
+    if [[ "${AUTO_REFRESH_TRUST}" == "1" && ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+      print_warn "Trust signer key ${TRUST_SIGNER_KEY_PATH} is unavailable; disabling AUTO_REFRESH_TRUST for client role."
+      AUTO_REFRESH_TRUST="0"
+    fi
     case "${DEFAULT_LAUNCH_PROFILE}" in
       quick-exit-node|quick-hybrid)
         print_warn "Launch profile '${DEFAULT_LAUNCH_PROFILE}' is admin-only; forcing 'quick-connect' for client role."
@@ -1333,7 +1337,26 @@ doctor_preflight() {
       else
         doctor_warn "runtime private key not present (${WG_PRIVATE_KEY_PATH}); it will be derived at daemon startup"
       fi
-      doctor_check_mode "${TRUST_EVIDENCE_PATH}" "600" "trust evidence"
+      if [[ ! -e "${TRUST_EVIDENCE_PATH}" ]]; then
+        doctor_fail "trust evidence: ${TRUST_EVIDENCE_PATH} missing"
+      else
+        local trust_mode trust_group daemon_group
+        trust_mode="$(stat_mode "${TRUST_EVIDENCE_PATH}")"
+        daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
+        trust_group=""
+        if stat -c '%G' "${TRUST_EVIDENCE_PATH}" >/dev/null 2>&1; then
+          trust_group="$(stat -c '%G' "${TRUST_EVIDENCE_PATH}")"
+        elif stat -f '%Sg' "${TRUST_EVIDENCE_PATH}" >/dev/null 2>&1; then
+          trust_group="$(stat -f '%Sg' "${TRUST_EVIDENCE_PATH}")"
+        fi
+        if [[ "${trust_mode}" == "600" ]]; then
+          doctor_ok "trust evidence: ${TRUST_EVIDENCE_PATH} mode ${trust_mode}"
+        elif [[ "${trust_mode}" == "640" && "${trust_group}" == "${daemon_group}" ]]; then
+          doctor_ok "trust evidence: ${TRUST_EVIDENCE_PATH} mode ${trust_mode} group ${trust_group}"
+        else
+          doctor_fail "trust evidence: ${TRUST_EVIDENCE_PATH} mode ${trust_mode:-unknown} group ${trust_group:-unknown} (expected 600 or 640 with group ${daemon_group})"
+        fi
+      fi
       doctor_check_mode "${TRUST_WATERMARK_PATH}" "600" "trust watermark"
       if [[ -S "${SOCKET_PATH}" ]]; then
         doctor_ok "daemon IPC socket present (${SOCKET_PATH})"
@@ -2528,6 +2551,215 @@ run_rustynet_cli() {
   RUSTYNET_DAEMON_SOCKET="${SOCKET_PATH}" rustynet "$@"
 }
 
+wait_for_daemon_socket_ready() {
+  local attempts="${1:-20}"
+  if [[ -z "${SOCKET_PATH}" ]]; then
+    return 1
+  fi
+  while (( attempts > 0 )); do
+    if [[ -S "${SOCKET_PATH}" ]]; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+is_valid_node_id_value() {
+  local node_id="$1"
+  [[ "${node_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+local_assignment_refresh_available() {
+  if ! is_linux_host; then
+    return 1
+  fi
+  run_root test -f "${ASSIGNMENT_REFRESH_ENV_PATH}" >/dev/null 2>&1 || return 1
+  run_root systemctl cat rustynetd-assignment-refresh.service >/dev/null 2>&1 || return 1
+  return 0
+}
+
+set_local_assignment_refresh_exit_node() {
+  local exit_node_id="${1:-}"
+  local escaped_exit_node_id
+  escaped_exit_node_id="${exit_node_id}"
+
+  if ! is_linux_host; then
+    return 0
+  fi
+  if ! local_assignment_refresh_available; then
+    print_warn "Assignment refresh is not configured locally; skipping persisted exit-node update."
+    return 1
+  fi
+  if [[ -n "${exit_node_id}" ]] && ! is_valid_node_id_value "${exit_node_id}"; then
+    print_err "Invalid exit node id '${exit_node_id}'. Allowed characters: letters, numbers, dot, underscore, hyphen."
+    return 1
+  fi
+
+  run_root bash -lc "
+set -euo pipefail
+path='${ASSIGNMENT_REFRESH_ENV_PATH}'
+tmp=\$(mktemp)
+if [[ -n '${escaped_exit_node_id}' ]]; then
+  awk -v exit_id='${escaped_exit_node_id}' '
+    BEGIN { seen = 0 }
+    /^RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=/ {
+      if (!seen) {
+        print \"RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\" exit_id
+        seen = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!seen) {
+        print \"RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\" exit_id
+      }
+    }
+  ' \"\$path\" >\"\$tmp\"
+else
+  awk '!/^RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=/' \"\$path\" >\"\$tmp\"
+fi
+install -m 0600 -o root -g root \"\$tmp\" \"\$path\"
+rm -f \"\$tmp\"
+"
+
+  if [[ -n "${exit_node_id}" ]]; then
+    print_info "Persisted preferred exit node in ${ASSIGNMENT_REFRESH_ENV_PATH}: ${exit_node_id}"
+  else
+    print_info "Cleared preferred exit node from ${ASSIGNMENT_REFRESH_ENV_PATH}."
+  fi
+}
+
+force_local_assignment_refresh_now() {
+  if ! is_linux_host; then
+    return 0
+  fi
+  if ! local_assignment_refresh_available; then
+    print_warn "Assignment refresh service is unavailable; skipping forced local assignment refresh."
+    return 1
+  fi
+
+  print_info "Forcing local assignment bundle refresh (signed) to apply role/exit changes immediately."
+  run_root rm -f "${AUTO_TUNNEL_BUNDLE_PATH}" "${AUTO_TUNNEL_WATERMARK_PATH}"
+  if ! run_root systemctl start rustynetd-assignment-refresh.service; then
+    print_warn "Failed to run rustynetd-assignment-refresh.service."
+    return 1
+  fi
+  if ! run_root systemctl restart rustynetd.service; then
+    print_warn "Failed to restart rustynetd.service after forced assignment refresh."
+    return 1
+  fi
+  if ! wait_for_daemon_socket_ready 20; then
+    print_warn "Daemon socket did not become ready after assignment refresh restart."
+    return 1
+  fi
+  return 0
+}
+
+switch_node_role_mode() {
+  local previous_role target_role preferred_exit_node enable_exit_advertise
+  local role_confirm_default
+
+  normalize_node_role
+  previous_role="${NODE_ROLE}"
+  print_info "Current node role: ${previous_role}"
+  prompt_default target_role "Target node role (admin|client)" "${NODE_ROLE}"
+
+  case "${target_role}" in
+    admin|client) ;;
+    *)
+      print_err "Unsupported role '${target_role}'. Expected 'admin' or 'client'."
+      return 1
+      ;;
+  esac
+
+  if [[ "${target_role}" == "${previous_role}" ]]; then
+    print_info "Node is already configured as '${target_role}'."
+    return 0
+  fi
+
+  preferred_exit_node=""
+  enable_exit_advertise="0"
+  if [[ "${target_role}" == "admin" ]]; then
+    role_confirm_default="n"
+    if [[ "${previous_role}" == "admin" ]]; then
+      role_confirm_default="y"
+    fi
+    if ! prompt_yes_no "Confirm switch to admin role (full control-plane privileges)" "${role_confirm_default}"; then
+      print_info "Role switch cancelled."
+      return 0
+    fi
+    if prompt_yes_no "Enable exit serving now (advertise 0.0.0.0/0 after switch)?" "y"; then
+      enable_exit_advertise="1"
+    fi
+  else
+    prompt_default preferred_exit_node "Preferred exit node id after switch (blank for none)" ""
+    if [[ -n "${preferred_exit_node}" ]] && ! is_valid_node_id_value "${preferred_exit_node}"; then
+      print_err "Invalid exit node id '${preferred_exit_node}'. Allowed characters: letters, numbers, dot, underscore, hyphen."
+      return 1
+    fi
+  fi
+
+  NODE_ROLE="${target_role}"
+  enforce_role_policy_defaults
+  save_config
+
+  if [[ "${SETUP_COMPLETE}" != "1" ]]; then
+    print_warn "Setup is not complete; role updated in config only."
+    return 0
+  fi
+
+  write_daemon_environment
+  if ! start_or_restart_service; then
+    print_err "Role switch aborted because service restart failed."
+    return 1
+  fi
+  if ! wait_for_daemon_socket_ready 20; then
+    print_warn "Daemon socket did not become ready after role switch; deferred actions may fail."
+  fi
+
+  if is_linux_host; then
+    if [[ "${target_role}" == "client" ]]; then
+      set_local_assignment_refresh_exit_node "${preferred_exit_node}" || true
+      force_local_assignment_refresh_now || true
+      if [[ -n "${preferred_exit_node}" ]]; then
+        if run_rustynet_cli exit-node select "${preferred_exit_node}"; then
+          print_info "Selected exit node: ${preferred_exit_node}"
+        else
+          print_warn "Failed to select exit node '${preferred_exit_node}'."
+        fi
+      else
+        run_rustynet_cli exit-node off >/dev/null 2>&1 || true
+      fi
+    else
+      set_local_assignment_refresh_exit_node "" || true
+      force_local_assignment_refresh_now || true
+      run_rustynet_cli exit-node off >/dev/null 2>&1 || true
+      if [[ "${enable_exit_advertise}" == "1" ]]; then
+        if run_rustynet_cli route advertise 0.0.0.0/0; then
+          print_info "Exit route advertised (0.0.0.0/0)."
+        else
+          print_warn "Failed to advertise default exit route."
+        fi
+      fi
+    fi
+  else
+    if [[ "${target_role}" == "client" && -n "${preferred_exit_node}" ]]; then
+      run_rustynet_cli exit-node select "${preferred_exit_node}" || true
+    elif [[ "${target_role}" == "admin" && "${enable_exit_advertise}" == "1" ]]; then
+      offer_device_as_exit_node || true
+    fi
+  fi
+
+  refresh_menu_runtime_status
+  print_info "Node role switched: ${previous_role} -> ${target_role}"
+  if [[ "${target_role}" == "admin" ]]; then
+    print_warn "Peers can route through this node only when signed assignments include this node and allow rules."
+  fi
+}
+
 restore_exit_selection() {
   local original_exit_node="$1"
   if [[ -n "${original_exit_node}" && "${original_exit_node}" != "none" ]]; then
@@ -3114,12 +3346,25 @@ print_saved_exit_candidates_with_probe() {
 }
 
 select_exit_node() {
-  local node
+  local node status_line current_exit_node
   print_saved_exit_candidates_with_probe
+  status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+  current_exit_node="$(extract_status_field "${status_line}" "exit_node")"
+  if [[ "${current_exit_node}" == "none" ]]; then
+    current_exit_node=""
+  fi
+  if [[ -n "${current_exit_node}" ]]; then
+    print_info "Selecting current exit node '${current_exit_node}' will disconnect and clear selection."
+  fi
   prompt_default node "Exit node id to select" ""
   if [[ -z "${node}" ]]; then
     print_err "Exit node id is required."
     return 1
+  fi
+  if [[ -n "${current_exit_node}" && "${node}" == "${current_exit_node}" ]]; then
+    print_info "Exit node '${node}' is already selected. Disconnecting from exit node."
+    run_rustynet_cli exit-node off
+    return $?
   fi
   run_rustynet_cli exit-node select "${node}"
 }
@@ -3410,6 +3655,7 @@ Configuration
   3) Save configuration now
   4) Configure launch defaults
   5) Apply default launch profile now
+  6) Switch node role (guided client/admin transition)
   0) Back
 EOF
     local choice
@@ -3436,6 +3682,7 @@ EOF
       5)
         apply_launch_profile "${DEFAULT_LAUNCH_PROFILE}" "${AUTO_LAUNCH_EXIT_NODE_ID}" "${AUTO_LAUNCH_LAN_MODE}"
         ;;
+      6) switch_node_role_mode ;;
       0) return ;;
       *) print_warn "Unknown option: ${choice}" ;;
     esac
