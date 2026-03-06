@@ -147,6 +147,10 @@ impl NodeRole {
         matches!(self, NodeRole::BlindExit)
     }
 
+    fn is_admin(self) -> bool {
+        matches!(self, NodeRole::Admin)
+    }
+
     fn allows_command(self, command: &IpcCommand) -> bool {
         match self {
             NodeRole::Admin => true,
@@ -1989,14 +1993,14 @@ impl DaemonRuntime {
 
     fn is_serving_exit_node(&self, _selected_exit_node: Option<&str>) -> bool {
         self.node_role.is_blind_exit()
-            || self
-                .advertised_routes
-                .contains(BLIND_EXIT_DEFAULT_ROUTE_CIDR)
+            || (self.node_role.is_admin()
+                && self
+                    .advertised_routes
+                    .contains(BLIND_EXIT_DEFAULT_ROUTE_CIDR))
     }
 
     fn allow_auto_tunnel_exit_advertisement(&self, cidr: &str) -> bool {
-        !self.node_role.is_blind_exit()
-            && cidr == BLIND_EXIT_DEFAULT_ROUTE_CIDR
+        self.node_role.is_admin() && cidr == BLIND_EXIT_DEFAULT_ROUTE_CIDR
     }
 
     fn is_restricted(&self) -> bool {
@@ -4693,6 +4697,57 @@ mod tests {
         let key_rotate = runtime.handle_command(IpcCommand::KeyRotate);
         assert!(!key_rotate.ok);
         assert!(key_rotate.message.contains("node role"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_client_role_never_reports_exit_serving() {
+        let test_dir = secure_test_dir("rustynetd-runtime-client-no-exit-serving");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::Client,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        runtime
+            .advertised_routes
+            .insert("0.0.0.0/0".to_string());
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("node_role=client"));
+        assert!(status.message.contains("serving_exit_node=false"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
