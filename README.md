@@ -43,7 +43,7 @@ After first setup, run `./start.sh` again anytime to open the terminal control m
 Role model:
 - `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
-- `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, and auto-enforces exit-serving posture.
+- `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, auto-enforces exit-serving posture, and sanitizes client-only assignment fields (selected exit/LAN flags) instead of fail-closing on role conversion.
 
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
