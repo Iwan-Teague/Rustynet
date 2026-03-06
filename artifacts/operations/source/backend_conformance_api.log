@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_api-641ed518a7802bbb)
+
+running 2 tests
+test tests::node_id_rejects_empty_or_whitespace_only_values ... ok
+test tests::node_id_trims_outer_whitespace ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/backend_contract.rs (target/debug/deps/backend_contract-c8b9f88df26ec18e)
+
+running 3 tests
+test backend_contract_rejects_double_start_and_resets_on_shutdown ... ok
+test backend_contract_requires_running_state_for_mutations ... ok
+test backend_contract_replaces_route_set_deterministically ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/backend_contract_perf.rs (target/debug/deps/backend_contract_perf-81deac4cb99761c6)
+
+running 1 test
+test phase1_backend_contract_perf_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

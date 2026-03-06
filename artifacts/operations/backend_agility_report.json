@@ -1,0 +1,21 @@
+{
+  "default_backend": "wireguard",
+  "additional_backend_paths": [
+    "rustynet-backend-api"
+  ],
+  "conformance_passed": true,
+  "security_review_complete": true,
+  "wireguard_is_adapter_boundary": true,
+  "protocol_leakage_detected": false,
+  "evidence_commands": [
+    "cargo test -p rustynet-backend-wireguard --test conformance --all-features",
+    "cargo test -p rustynet-backend-api --all-targets --all-features",
+    "rg -n '(Wireguard|WireGuard|wg[-_]|wgctrl)' crates/rustynet-control crates/rustynet-policy crates/rustynet-crypto crates/rustynet-backend-api crates/rustynet-cli crates/rustynet-relay"
+  ],
+  "evidence_mode": "measured",
+  "captured_at_unix": 1772814044,
+  "environment": "ci",
+  "source_artifacts": [
+    "artifacts/operations/raw/backend_agility_report.json"
+  ]
+}

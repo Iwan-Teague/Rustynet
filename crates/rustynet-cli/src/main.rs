@@ -5,11 +5,13 @@ mod ops_install_systemd;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -30,9 +32,14 @@ use rustynet_crypto::{
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse};
-use rustynetd::key_material::{read_passphrase_file_explicit, remove_file_if_present};
+use rustynetd::key_material::{
+    initialize_encrypted_key_material, migrate_existing_private_key_material,
+    read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +47,7 @@ enum CliCommand {
     Status,
     Login,
     Netcheck,
+    OperatorMenu,
     ExitNodeSelect(String),
     ExitNodeOff,
     LanAccessOn,
@@ -149,8 +157,30 @@ enum TrustCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpsCommand {
     RefreshTrust,
+    RefreshSignedTrust,
+    BootstrapTunnelCustody,
     RefreshAssignment,
     InstallSystemd,
+    PrepareSystemDirs,
+    ApplyBlindExitLockdown,
+    InitMembership,
+    SecureRemove {
+        path: PathBuf,
+    },
+    EnsureSigningPassphraseMaterial,
+    MaterializeSigningPassphrase {
+        output_path: PathBuf,
+    },
+    SetAssignmentRefreshExitNode {
+        env_path: PathBuf,
+        exit_node_id: Option<String>,
+    },
+    ApplyRoleCoupling {
+        target_role: String,
+        preferred_exit_node_id: Option<String>,
+        enable_exit_advertise: bool,
+        assignment_refresh_env_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +235,7 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "status" => CliCommand::Status,
         [cmd] if cmd == "login" => CliCommand::Login,
         [cmd] if cmd == "netcheck" => CliCommand::Netcheck,
+        [cmd, subcmd] if cmd == "operator" && subcmd == "menu" => CliCommand::OperatorMenu,
         [cmd, subcmd, node] if cmd == "exit-node" && subcmd == "select" => {
             CliCommand::ExitNodeSelect(node.clone())
         }
@@ -238,12 +269,109 @@ fn parse_command(args: &[String]) -> CliCommand {
 }
 
 fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
-    match args {
-        [subcmd] if subcmd == "refresh-trust" => Ok(OpsCommand::RefreshTrust),
-        [subcmd] if subcmd == "refresh-assignment" => Ok(OpsCommand::RefreshAssignment),
-        [subcmd] if subcmd == "install-systemd" => Ok(OpsCommand::InstallSystemd),
-        [subcmd, ..] => Err(format!("unknown ops subcommand: {subcmd}")),
-        _ => Err("ops subcommand is required".to_string()),
+    if args.is_empty() {
+        return Err("ops subcommand is required".to_string());
+    }
+    let subcommand = args[0].as_str();
+    let parser = OptionParser::parse(&args[1..])?;
+    match subcommand {
+        "refresh-trust" => {
+            if args.len() != 1 {
+                return Err("ops refresh-trust does not accept options".to_string());
+            }
+            Ok(OpsCommand::RefreshTrust)
+        }
+        "refresh-signed-trust" => {
+            if args.len() != 1 {
+                return Err("ops refresh-signed-trust does not accept options".to_string());
+            }
+            Ok(OpsCommand::RefreshSignedTrust)
+        }
+        "bootstrap-wireguard-custody" => {
+            if args.len() != 1 {
+                return Err("ops bootstrap-wireguard-custody does not accept options".to_string());
+            }
+            Ok(OpsCommand::BootstrapTunnelCustody)
+        }
+        "refresh-assignment" => {
+            if args.len() != 1 {
+                return Err("ops refresh-assignment does not accept options".to_string());
+            }
+            Ok(OpsCommand::RefreshAssignment)
+        }
+        "install-systemd" => {
+            if args.len() != 1 {
+                return Err("ops install-systemd does not accept options".to_string());
+            }
+            Ok(OpsCommand::InstallSystemd)
+        }
+        "prepare-system-dirs" => {
+            if args.len() != 1 {
+                return Err("ops prepare-system-dirs does not accept options".to_string());
+            }
+            Ok(OpsCommand::PrepareSystemDirs)
+        }
+        "apply-blind-exit-lockdown" => {
+            if args.len() != 1 {
+                return Err("ops apply-blind-exit-lockdown does not accept options".to_string());
+            }
+            Ok(OpsCommand::ApplyBlindExitLockdown)
+        }
+        "init-membership" => {
+            if args.len() != 1 {
+                return Err("ops init-membership does not accept options".to_string());
+            }
+            Ok(OpsCommand::InitMembership)
+        }
+        "secure-remove" => Ok(OpsCommand::SecureRemove {
+            path: parser.required_path("--path")?,
+        }),
+        "ensure-signing-passphrase-material" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops ensure-signing-passphrase-material does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::EnsureSigningPassphraseMaterial)
+        }
+        "materialize-signing-passphrase" => Ok(OpsCommand::MaterializeSigningPassphrase {
+            output_path: parser.required_path("--output")?,
+        }),
+        "set-assignment-refresh-exit-node" => Ok(OpsCommand::SetAssignmentRefreshExitNode {
+            env_path: parser.path_or_default(
+                "--env-path",
+                PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
+            ),
+            exit_node_id: parser.value("--exit-node-id").and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }),
+        }),
+        "apply-role-coupling" => Ok(OpsCommand::ApplyRoleCoupling {
+            target_role: parser.required("--target-role")?,
+            preferred_exit_node_id: parser.value("--preferred-exit-node-id").and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }),
+            enable_exit_advertise: parse_bool_value(
+                "--enable-exit-advertise",
+                parser
+                    .value("--enable-exit-advertise")
+                    .unwrap_or_else(|| "false".to_string())
+                    .as_str(),
+            )?,
+            assignment_refresh_env_path: parser.path_or_default(
+                "--env-path",
+                PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
+            ),
+        }),
+        _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
 }
 
@@ -540,6 +668,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
     match command {
         CliCommand::Help => Ok(help_text()),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
+        CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
@@ -665,6 +794,55 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                 length_bytes
             ))
         }
+    }
+}
+
+fn execute_operator_menu() -> Result<String, String> {
+    let stdin = io::stdin();
+    loop {
+        println!();
+        println!("Rustynet Operator Menu");
+        println!("  1) Status");
+        println!("  2) Netcheck");
+        println!("  3) Exit node off");
+        println!("  4) Advertise default exit route (0.0.0.0/0)");
+        println!("  5) LAN access on");
+        println!("  6) LAN access off");
+        println!("  0) Exit");
+        print!("Choose an option: ");
+        io::stdout()
+            .flush()
+            .map_err(|err| format!("flush stdout failed: {err}"))?;
+
+        let mut choice = String::new();
+        stdin
+            .read_line(&mut choice)
+            .map_err(|err| format!("read menu input failed: {err}"))?;
+        if choice.is_empty() {
+            return Ok("operator menu exited (stdin closed)".to_string());
+        }
+
+        match choice.trim() {
+            "1" => render_operator_action("status", send_command(IpcCommand::Status)),
+            "2" => render_operator_action("netcheck", send_command(IpcCommand::Netcheck)),
+            "3" => render_operator_action("exit-node off", send_command(IpcCommand::ExitNodeOff)),
+            "4" => render_operator_action(
+                "route advertise 0.0.0.0/0",
+                send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string())),
+            ),
+            "5" => render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn)),
+            "6" => render_operator_action("lan-access off", send_command(IpcCommand::LanAccessOff)),
+            "0" => return Ok("operator menu exited".to_string()),
+            _ => println!("unknown option"),
+        }
+    }
+}
+
+fn render_operator_action(action: &str, result: Result<IpcResponse, String>) {
+    match result {
+        Ok(response) if response.ok => println!("{action}: {}", response.message),
+        Ok(response) => println!("{action}: failed: {}", response.message),
+        Err(err) => println!("{action}: daemon unreachable: {err}"),
     }
 }
 
@@ -913,8 +1091,35 @@ fn execute_trust(command: TrustCommand) -> Result<String, String> {
 fn execute_ops(command: OpsCommand) -> Result<String, String> {
     match command {
         OpsCommand::RefreshTrust => execute_ops_refresh_trust(),
+        OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
+        OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),
         OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
+        OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
+        OpsCommand::ApplyBlindExitLockdown => execute_ops_apply_blind_exit_lockdown(),
+        OpsCommand::InitMembership => execute_ops_init_membership(),
+        OpsCommand::SecureRemove { path } => execute_ops_secure_remove(path),
+        OpsCommand::EnsureSigningPassphraseMaterial => {
+            execute_ops_ensure_signing_passphrase_material()
+        }
+        OpsCommand::MaterializeSigningPassphrase { output_path } => {
+            execute_ops_materialize_signing_passphrase(output_path)
+        }
+        OpsCommand::SetAssignmentRefreshExitNode {
+            env_path,
+            exit_node_id,
+        } => execute_ops_set_assignment_refresh_exit_node(env_path, exit_node_id),
+        OpsCommand::ApplyRoleCoupling {
+            target_role,
+            preferred_exit_node_id,
+            enable_exit_advertise,
+            assignment_refresh_env_path,
+        } => execute_ops_apply_role_coupling(
+            target_role,
+            preferred_exit_node_id,
+            enable_exit_advertise,
+            assignment_refresh_env_path,
+        ),
     }
 }
 
@@ -936,13 +1141,75 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
     let trust_signing_key_passphrase_path =
         env_required_path("RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE")?;
     let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
+    refresh_trust_record_with_inputs(
+        SigningPassphraseHostProfile::Linux,
+        trust_evidence_path.as_path(),
+        trust_signer_key_path.as_path(),
+        trust_signing_key_passphrase_path.as_path(),
+        daemon_group.as_str(),
+    )
+}
 
-    validate_root_owned_encrypted_signing_file(&trust_signer_key_path, "trust signer key")?;
-    validate_root_owned_passphrase_file(
-        &trust_signing_key_passphrase_path,
-        "trust signer key passphrase file",
+fn execute_ops_refresh_signed_trust() -> Result<String, String> {
+    let config = signing_passphrase_ops_config_from_env()?;
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
+        require_root_execution()?;
+    }
+
+    let node_role = env_optional_string("RUSTYNET_NODE_ROLE")?
+        .unwrap_or_else(|| "admin".to_string())
+        .to_ascii_lowercase();
+    if node_role != "admin" && node_role != "blind_exit" {
+        return Err(format!(
+            "refresh-signed-trust requires node role admin or blind_exit; got {node_role}"
+        ));
+    }
+
+    let trust_evidence_path = env_path_or_default(
+        "RUSTYNET_TRUST_EVIDENCE",
+        "/var/lib/rustynet/rustynetd.trust",
     )?;
+    let trust_signer_key_path =
+        env_path_or_default("RUSTYNET_TRUST_SIGNER_KEY", DEFAULT_TRUST_SIGNER_KEY_PATH)?;
+    if !trust_signer_key_path.exists() {
+        return Err(format!(
+            "signer key not found at {}",
+            trust_signer_key_path.display()
+        ));
+    }
+    let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
 
+    ensure_signing_passphrase_material_ops(&config)?;
+    let passphrase_tmp =
+        create_secure_temp_file(std::env::temp_dir().as_path(), "trust-passphrase.")?;
+    if let Err(err) = materialize_signing_passphrase_ops(&config, passphrase_tmp.as_path()) {
+        let _ = secure_remove_file(passphrase_tmp.as_path());
+        return Err(err);
+    }
+
+    let refresh_result = refresh_trust_record_with_inputs(
+        config.host_profile,
+        trust_evidence_path.as_path(),
+        trust_signer_key_path.as_path(),
+        passphrase_tmp.as_path(),
+        daemon_group.as_str(),
+    );
+    let cleanup_result = secure_remove_file(passphrase_tmp.as_path());
+    match (refresh_result, cleanup_result) {
+        (Ok(message), Ok(())) => Ok(message),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+        (Err(err), Err(cleanup_err)) => Err(format!("{err}; cleanup failed: {cleanup_err}")),
+    }
+}
+
+fn refresh_trust_record_with_inputs(
+    host_profile: SigningPassphraseHostProfile,
+    trust_evidence_path: &Path,
+    trust_signer_key_path: &Path,
+    trust_signing_key_passphrase_path: &Path,
+    daemon_group: &str,
+) -> Result<String, String> {
     let target_dir = trust_evidence_path.parent().ok_or_else(|| {
         format!(
             "trust evidence path has no parent: {}",
@@ -950,18 +1217,37 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
         )
     })?;
 
-    let trust_group_gid = group_gid_or_root(daemon_group.as_str())?;
-    let trust_mode = if trust_group_gid == Gid::from_raw(0) {
-        0o644
-    } else {
-        0o640
+    let (owner_uid, owner_gid, trust_mode) = match host_profile {
+        SigningPassphraseHostProfile::Linux => {
+            validate_root_owned_encrypted_signing_file(trust_signer_key_path, "trust signer key")?;
+            validate_root_owned_passphrase_file(
+                trust_signing_key_passphrase_path,
+                "trust signer key passphrase file",
+            )?;
+            let trust_group_gid = group_gid_or_root(daemon_group)?;
+            let trust_mode = if trust_group_gid == Gid::from_raw(0) {
+                0o644
+            } else {
+                0o640
+            };
+            ensure_directory_exists(target_dir, 0o750, Uid::from_raw(0), trust_group_gid)?;
+            (Uid::from_raw(0), trust_group_gid, trust_mode)
+        }
+        SigningPassphraseHostProfile::Macos => {
+            validate_encrypted_secret_file_security(trust_signer_key_path, "trust signer key")?;
+            validate_encrypted_secret_file_security(
+                trust_signing_key_passphrase_path,
+                "trust signer key passphrase file",
+            )?;
+            ensure_directory_with_mode_owner(target_dir, 0o700, None, None)?;
+            (Uid::effective(), Gid::effective(), 0o600)
+        }
     };
-    ensure_directory_exists(target_dir, 0o750, Uid::from_raw(0), trust_group_gid)?;
 
     let record_tmp = create_secure_temp_file(target_dir, "rustynetd-trust-record.")?;
     let issue_result = execute_trust(TrustCommand::Issue {
-        signing_key_path: trust_signer_key_path,
-        signing_key_passphrase_path: trust_signing_key_passphrase_path,
+        signing_key_path: trust_signer_key_path.to_path_buf(),
+        signing_key_passphrase_path: trust_signing_key_passphrase_path.to_path_buf(),
         output_path: record_tmp.clone(),
         updated_at_unix: unix_now(),
         nonce: generate_assignment_nonce(),
@@ -973,9 +1259,9 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
 
     if let Err(err) = publish_file_with_owner_mode(
         &record_tmp,
-        &trust_evidence_path,
-        Uid::from_raw(0),
-        trust_group_gid,
+        trust_evidence_path,
+        owner_uid,
+        owner_gid,
         trust_mode,
         "trust evidence",
     ) {
@@ -1011,13 +1297,13 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     let nodes_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_NODES", "assignment node map")?;
     let allow_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_ALLOW", "assignment allow rules")?;
     let exit_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
-    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
-        if !is_valid_node_id(exit_node_id_value) {
-            return Err(format!(
-                "exit node id contains unsupported characters: {}",
-                exit_node_id_value
-            ));
-        }
+    if let Some(exit_node_id_value) = exit_node_id.as_deref()
+        && !is_valid_node_id(exit_node_id_value)
+    {
+        return Err(format!(
+            "exit node id contains unsupported characters: {}",
+            exit_node_id_value
+        ));
     }
 
     let signing_secret_path = env_path_or_default(
@@ -1052,18 +1338,16 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
 
     let now_unix = unix_now();
-    if bundle_path.exists() {
-        if let Some(current_expires_at) =
+    if bundle_path.exists()
+        && let Some(current_expires_at) =
             read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        {
-            if current_expires_at > now_unix.saturating_add(min_remaining_secs) {
-                let remaining_secs = current_expires_at.saturating_sub(now_unix);
-                return Ok(format!(
-                    "[assignment-refresh] current assignment expires in {}s; skip refresh.",
-                    remaining_secs
-                ));
-            }
-        }
+        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
+    {
+        let remaining_secs = current_expires_at.saturating_sub(now_unix);
+        return Ok(format!(
+            "[assignment-refresh] current assignment expires in {}s; skip refresh.",
+            remaining_secs
+        ));
     }
 
     let bundle_group_gid = group_gid_or_root(daemon_group.as_str())?;
@@ -1156,6 +1440,1734 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         generated_at_unix,
         expires_at_unix
     ))
+}
+
+const DEFAULT_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
+    "/etc/rustynet/credentials/signing_key_passphrase.cred";
+const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
+const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
+const DEFAULT_TRUST_SIGNER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.key";
+const DEFAULT_ASSIGNMENT_SIGNING_SECRET_PATH: &str = "/etc/rustynet/assignment.signing.secret";
+const DEFAULT_MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "rustynet.signing_passphrase";
+const DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
+const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
+const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.assignment.watermark";
+const DEFAULT_DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
+const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
+    concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
+const DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key";
+const DEFAULT_LEGACY_LINUX_WG_PASSPHRASE_PATH: &str = "/etc/rustynet/wireguard.passphrase";
+const DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str =
+    concat!("rustynet.", "wg", "_passphrase");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigningPassphraseHostProfile {
+    Linux,
+    Macos,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SigningPassphraseOpsConfig {
+    host_profile: SigningPassphraseHostProfile,
+    signing_credential_blob_path: PathBuf,
+    membership_owner_signing_key_path: PathBuf,
+    trust_signer_key_path: PathBuf,
+    assignment_signing_secret_path: PathBuf,
+    macos_keychain_service: String,
+    macos_keychain_account: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TunnelCustodyOpsConfig {
+    host_profile: SigningPassphraseHostProfile,
+    runtime_private_key_path: PathBuf,
+    encrypted_private_key_path: PathBuf,
+    public_key_path: PathBuf,
+    passphrase_path: PathBuf,
+    passphrase_credential_blob_path: PathBuf,
+    legacy_private_key_path: PathBuf,
+    legacy_passphrase_path: PathBuf,
+    macos_keychain_service: String,
+    macos_keychain_account: String,
+    allow_init: bool,
+}
+
+fn execute_ops_secure_remove(path: PathBuf) -> Result<String, String> {
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    secure_remove_file(path.as_path())?;
+    Ok(format!("secure remove complete: {}", path.display()))
+}
+
+fn execute_ops_ensure_signing_passphrase_material() -> Result<String, String> {
+    let config = signing_passphrase_ops_config_from_env()?;
+    ensure_signing_passphrase_material_ops(&config)?;
+    Ok("signing passphrase material verified".to_string())
+}
+
+fn execute_ops_materialize_signing_passphrase(output_path: PathBuf) -> Result<String, String> {
+    if !output_path.is_absolute() {
+        return Err(format!(
+            "output path must be absolute: {}",
+            output_path.display()
+        ));
+    }
+    let config = signing_passphrase_ops_config_from_env()?;
+    ensure_signing_passphrase_material_ops(&config)?;
+    materialize_signing_passphrase_ops(&config, output_path.as_path())?;
+    Ok(format!(
+        "signing passphrase materialized at {}",
+        output_path.display()
+    ))
+}
+
+fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
+    let config = wireguard_custody_ops_config_from_env()?;
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
+        require_root_execution()?;
+    }
+
+    ensure_parent_directory_for_wireguard_path(
+        config.runtime_private_key_path.as_path(),
+        config.host_profile,
+    )?;
+    ensure_parent_directory_for_wireguard_path(
+        config.encrypted_private_key_path.as_path(),
+        config.host_profile,
+    )?;
+    ensure_parent_directory_for_wireguard_path(
+        config.public_key_path.as_path(),
+        config.host_profile,
+    )?;
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
+        ensure_parent_directory_for_wireguard_path(
+            config.passphrase_credential_blob_path.as_path(),
+            config.host_profile,
+        )?;
+    }
+
+    if config.encrypted_private_key_path.exists() {
+        validate_encrypted_secret_file_security(
+            config.encrypted_private_key_path.as_path(),
+            "tunnel encrypted private key",
+        )?;
+    }
+    if config.public_key_path.exists() {
+        ensure_regular_file_no_symlink(config.public_key_path.as_path(), "tunnel public key")?;
+    }
+    if config.passphrase_credential_blob_path.exists() {
+        ensure_regular_file_no_symlink(
+            config.passphrase_credential_blob_path.as_path(),
+            "tunnel passphrase credential blob",
+        )?;
+    }
+
+    let encrypted_present = config.encrypted_private_key_path.exists();
+    let public_present = config.public_key_path.exists();
+    let credential_present = config.passphrase_credential_blob_path.exists();
+
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
+        && encrypted_present
+        && !credential_present
+    {
+        return Err(format!(
+            "encrypted key exists but credential blob is missing ({}); restore the encrypted credential blob from backup or perform explicit key rotation",
+            config.passphrase_credential_blob_path.display()
+        ));
+    }
+
+    if encrypted_present && public_present {
+        match config.host_profile {
+            SigningPassphraseHostProfile::Linux => {
+                if credential_present {
+                    validate_root_owned_private_file(
+                        config.passphrase_credential_blob_path.as_path(),
+                        "tunnel passphrase credential blob",
+                    )?;
+                    let removed_runtime_plaintext =
+                        secure_remove_if_present(config.passphrase_path.as_path())?;
+                    let removed_legacy_plaintext =
+                        secure_remove_if_present(config.legacy_passphrase_path.as_path())?;
+                    return Ok(format!(
+                        "tunnel custody already initialized: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={}",
+                        config.encrypted_private_key_path.display(),
+                        config.public_key_path.display(),
+                        config.passphrase_credential_blob_path.display(),
+                        removed_runtime_plaintext,
+                        removed_legacy_plaintext
+                    ));
+                }
+            }
+            SigningPassphraseHostProfile::Macos => {
+                let account =
+                    required_macos_tunnel_keychain_account(config.macos_keychain_account.as_str())?;
+                if macos_generic_password_exists(
+                    config.macos_keychain_service.as_str(),
+                    account.as_str(),
+                )? {
+                    let removed_runtime_plaintext =
+                        secure_remove_if_present(config.passphrase_path.as_path())?;
+                    return Ok(format!(
+                        "tunnel custody already initialized on macOS: encrypted_private_key={} public_key={} keychain_service={} keychain_account={} removed_runtime_plaintext_passphrase={}",
+                        config.encrypted_private_key_path.display(),
+                        config.public_key_path.display(),
+                        config.macos_keychain_service,
+                        account,
+                        removed_runtime_plaintext
+                    ));
+                }
+                if config.passphrase_path.exists() {
+                    store_passphrase_in_os_secure_store(
+                        config.passphrase_path.as_path(),
+                        Some(account.as_str()),
+                    )?;
+                    secure_remove_if_present(config.passphrase_path.as_path())?;
+                    return Ok(format!(
+                        "tunnel passphrase migrated to macOS keychain custody: keychain_service={} keychain_account={} encrypted_private_key={} public_key={}",
+                        config.macos_keychain_service,
+                        account,
+                        config.encrypted_private_key_path.display(),
+                        config.public_key_path.display()
+                    ));
+                }
+                return Err(format!(
+                    "encrypted key exists but macOS keychain passphrase item is missing (service={}, account={}); restore keychain entry or rotate keys",
+                    config.macos_keychain_service, account
+                ));
+            }
+        }
+    }
+
+    if !config.allow_init {
+        return Err(
+            "encrypted tunnel key material is missing and initialization is not approved; set RUSTYNET_WG_CUSTODY_ALLOW_INIT=true".to_string(),
+        );
+    }
+
+    let passphrase_tmp =
+        create_secure_temp_file(std::env::temp_dir().as_path(), "tunnel-passphrase.")?;
+    let mut random_bytes = [0u8; 48];
+    OsRng.fill_bytes(&mut random_bytes);
+    let mut passphrase_hex = Zeroizing::new(hex_bytes(&random_bytes));
+    random_bytes.zeroize();
+    passphrase_hex.push('\n');
+    if let Err(err) =
+        write_private_bytes_to_file(passphrase_tmp.as_path(), passphrase_hex.as_bytes())
+    {
+        let _ = secure_remove_file(passphrase_tmp.as_path());
+        return Err(err);
+    }
+
+    let mut removed_legacy_private_key = false;
+    let bootstrap_result = (|| -> Result<String, String> {
+        let source_private_key_path = if config.runtime_private_key_path.exists() {
+            Some(config.runtime_private_key_path.clone())
+        } else if matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
+            && config.legacy_private_key_path.exists()
+        {
+            Some(config.legacy_private_key_path.clone())
+        } else {
+            None
+        };
+
+        let operation = if let Some(source_private_key_path) = source_private_key_path {
+            validate_private_key_source_file(
+                source_private_key_path.as_path(),
+                config.host_profile,
+                "tunnel plaintext private key source",
+            )?;
+            migrate_existing_private_key_material(
+                source_private_key_path.as_path(),
+                config.runtime_private_key_path.as_path(),
+                config.encrypted_private_key_path.as_path(),
+                config.public_key_path.as_path(),
+                passphrase_tmp.as_path(),
+                Some(passphrase_tmp.as_path()),
+                true,
+            )?;
+            if source_private_key_path != config.runtime_private_key_path {
+                secure_remove_if_present(source_private_key_path.as_path())?;
+                removed_legacy_private_key = true;
+            }
+            "migrated"
+        } else {
+            initialize_encrypted_key_material(
+                config.runtime_private_key_path.as_path(),
+                config.encrypted_private_key_path.as_path(),
+                config.public_key_path.as_path(),
+                passphrase_tmp.as_path(),
+                Some(passphrase_tmp.as_path()),
+                true,
+            )?;
+            "initialized"
+        };
+
+        match config.host_profile {
+            SigningPassphraseHostProfile::Linux => {
+                provision_linux_tunnel_passphrase_credential_blob(
+                    passphrase_tmp.as_path(),
+                    config.passphrase_credential_blob_path.as_path(),
+                )?;
+                let removed_runtime_plaintext =
+                    secure_remove_if_present(config.passphrase_path.as_path())?;
+                let removed_legacy_plaintext =
+                    secure_remove_if_present(config.legacy_passphrase_path.as_path())?;
+                Ok(format!(
+                    "tunnel custody {operation}: encrypted_private_key={} public_key={} credential_blob={} removed_runtime_plaintext_passphrase={} removed_legacy_plaintext_passphrase={} removed_legacy_private_key={}",
+                    config.encrypted_private_key_path.display(),
+                    config.public_key_path.display(),
+                    config.passphrase_credential_blob_path.display(),
+                    removed_runtime_plaintext,
+                    removed_legacy_plaintext,
+                    removed_legacy_private_key
+                ))
+            }
+            SigningPassphraseHostProfile::Macos => {
+                let account =
+                    required_macos_tunnel_keychain_account(config.macos_keychain_account.as_str())?;
+                store_passphrase_in_os_secure_store(
+                    passphrase_tmp.as_path(),
+                    Some(account.as_str()),
+                )?;
+                let removed_runtime_plaintext =
+                    secure_remove_if_present(config.passphrase_path.as_path())?;
+                Ok(format!(
+                    "tunnel custody {operation} on macOS: encrypted_private_key={} public_key={} keychain_service={} keychain_account={} removed_runtime_plaintext_passphrase={}",
+                    config.encrypted_private_key_path.display(),
+                    config.public_key_path.display(),
+                    config.macos_keychain_service,
+                    account,
+                    removed_runtime_plaintext
+                ))
+            }
+        }
+    })();
+
+    let cleanup_result = secure_remove_file(passphrase_tmp.as_path());
+    match (bootstrap_result, cleanup_result) {
+        (Ok(message), Ok(())) => Ok(message),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+        (Err(err), Err(cleanup_err)) => Err(format!("{err}; cleanup failed: {cleanup_err}")),
+    }
+}
+
+fn execute_ops_set_assignment_refresh_exit_node(
+    env_path: PathBuf,
+    exit_node_id: Option<String>,
+) -> Result<String, String> {
+    require_root_execution()?;
+    if !env_path.is_absolute() {
+        return Err(format!(
+            "assignment refresh env path must be absolute: {}",
+            env_path.display()
+        ));
+    }
+    if cfg!(target_os = "linux") {
+        // Expected runtime for assignment-refresh coupling mutation.
+    } else {
+        return Err("set-assignment-refresh-exit-node is supported on Linux only".to_string());
+    }
+    if let Some(exit_node_id_value) = exit_node_id.as_deref()
+        && !is_valid_assignment_refresh_exit_node_id(exit_node_id_value)
+    {
+        return Err(format!(
+            "invalid exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id_value}"
+        ));
+    }
+
+    ensure_regular_file_no_symlink(&env_path, "assignment refresh env file")?;
+    let existing = fs::read_to_string(&env_path)
+        .map_err(|err| format!("read assignment refresh env failed: {err}"))?;
+    let rewritten =
+        rewrite_assignment_refresh_exit_node(existing.as_str(), exit_node_id.as_deref());
+
+    let parent = env_path.parent().ok_or_else(|| {
+        format!(
+            "assignment refresh env path has no parent: {}",
+            env_path.display()
+        )
+    })?;
+    let tmp = create_secure_temp_file(parent, "assignment-refresh.env.tmp.")?;
+    if let Err(err) = write_private_bytes_to_file(tmp.as_path(), rewritten.as_bytes()) {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = publish_file_with_owner_mode(
+        &tmp,
+        &env_path,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+        "assignment refresh env",
+    ) {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+
+    Ok(match exit_node_id {
+        Some(exit_node_id_value) => format!(
+            "assignment refresh exit node set: {} ({exit_node_id_value})",
+            env_path.display()
+        ),
+        None => format!(
+            "assignment refresh exit node cleared: {}",
+            env_path.display()
+        ),
+    })
+}
+
+fn execute_ops_apply_role_coupling(
+    target_role: String,
+    preferred_exit_node_id: Option<String>,
+    enable_exit_advertise: bool,
+    assignment_refresh_env_path: PathBuf,
+) -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("apply-role-coupling is supported on Linux only".to_string());
+    }
+    if !assignment_refresh_env_path.is_absolute() {
+        return Err(format!(
+            "assignment refresh env path must be absolute: {}",
+            assignment_refresh_env_path.display()
+        ));
+    }
+    if target_role != "admin" && target_role != "client" {
+        return Err(format!(
+            "unsupported target role for coupling: {target_role} (expected admin|client)"
+        ));
+    }
+    if let Some(exit_node_id) = preferred_exit_node_id.as_deref()
+        && !is_valid_assignment_refresh_exit_node_id(exit_node_id)
+    {
+        return Err(format!(
+            "invalid preferred exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id}"
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    let assignment_refresh_available =
+        assignment_refresh_available_ops(assignment_refresh_env_path.as_path())?;
+    if assignment_refresh_available {
+        if target_role == "client" {
+            if let Err(err) = execute_ops_set_assignment_refresh_exit_node(
+                assignment_refresh_env_path.clone(),
+                preferred_exit_node_id.clone(),
+            ) {
+                warnings.push(format!("set assignment refresh exit node failed: {err}"));
+            }
+        } else if let Err(err) =
+            execute_ops_set_assignment_refresh_exit_node(assignment_refresh_env_path.clone(), None)
+        {
+            warnings.push(format!("clear assignment refresh exit node failed: {err}"));
+        }
+
+        if let Err(err) = force_local_assignment_refresh_now_ops() {
+            warnings.push(format!("forced local assignment refresh failed: {err}"));
+        }
+    } else {
+        warnings.push(format!(
+            "assignment refresh is unavailable ({}); skipped persisted exit-node mutation and forced refresh",
+            assignment_refresh_env_path.display()
+        ));
+    }
+
+    if target_role == "client" {
+        if let Some(exit_node_id) = preferred_exit_node_id.as_deref() {
+            if let Err(err) =
+                send_role_coupling_ipc(IpcCommand::ExitNodeSelect(exit_node_id.to_string()))
+            {
+                warnings.push(format!("select exit node {exit_node_id} failed: {err}"));
+            }
+        } else if let Err(err) = send_role_coupling_ipc(IpcCommand::ExitNodeOff) {
+            warnings.push(format!("clear exit node selection failed: {err}"));
+        }
+    } else {
+        if let Err(err) = send_role_coupling_ipc(IpcCommand::ExitNodeOff) {
+            warnings.push(format!("clear exit node selection failed: {err}"));
+        }
+        if enable_exit_advertise
+            && let Err(err) =
+                send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))
+        {
+            warnings.push(format!("advertise default exit route failed: {err}"));
+        }
+    }
+
+    if warnings.is_empty() {
+        Ok(format!(
+            "role coupling applied for target role {target_role}"
+        ))
+    } else {
+        Ok(format!(
+            "role coupling applied for target role {target_role} with warnings: {}",
+            warnings.join(" | ")
+        ))
+    }
+}
+
+fn execute_ops_prepare_system_dirs() -> Result<String, String> {
+    let host_profile =
+        env_string_or_default("RUSTYNET_HOST_PROFILE", detect_host_profile())?.to_ascii_lowercase();
+    let is_linux = host_profile == "linux";
+    let is_macos = host_profile == "macos" || host_profile == "darwin";
+    if !is_linux && !is_macos {
+        return Err(format!(
+            "unsupported host profile for prepare-system-dirs: {host_profile}"
+        ));
+    }
+    if is_linux {
+        require_root_execution()?;
+    }
+
+    let mut directories = HashSet::new();
+    if is_linux {
+        directories.insert(PathBuf::from("/etc/rustynet"));
+        directories.insert(PathBuf::from("/run/rustynet"));
+        directories.insert(PathBuf::from("/var/lib/rustynet"));
+    }
+    if is_macos {
+        insert_absolute_directory_from_env(
+            "RUSTYNET_MACOS_STATE_BASE",
+            &mut directories,
+            "macOS state base",
+        )?;
+        insert_absolute_directory_from_env(
+            "RUSTYNET_MACOS_RUNTIME_BASE",
+            &mut directories,
+            "macOS runtime base",
+        )?;
+        insert_absolute_directory_from_env(
+            "RUSTYNET_MACOS_LOG_BASE",
+            &mut directories,
+            "macOS log base",
+        )?;
+    }
+
+    for key in [
+        "RUSTYNET_STATE",
+        "RUSTYNET_TRUST_EVIDENCE",
+        "RUSTYNET_TRUST_VERIFIER_KEY",
+        "RUSTYNET_TRUST_WATERMARK",
+        "RUSTYNET_AUTO_TUNNEL_BUNDLE",
+        "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY",
+        "RUSTYNET_AUTO_TUNNEL_WATERMARK",
+        "RUSTYNET_WG_PRIVATE_KEY",
+        "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
+        "RUSTYNET_WG_KEY_PASSPHRASE",
+        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+        "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+        "RUSTYNET_WG_PUBLIC_KEY",
+        "RUSTYNET_MEMBERSHIP_SNAPSHOT",
+        "RUSTYNET_MEMBERSHIP_LOG",
+        "RUSTYNET_MEMBERSHIP_WATERMARK",
+        "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY",
+        "RUSTYNET_PRIVILEGED_HELPER_SOCKET",
+    ] {
+        insert_parent_dir_from_env_path(key, &mut directories)?;
+    }
+
+    let mut ordered = directories.into_iter().collect::<Vec<_>>();
+    ordered.sort();
+    for directory in ordered.as_slice() {
+        if is_linux {
+            ensure_directory_with_mode_owner(
+                directory.as_path(),
+                0o700,
+                Some(Uid::from_raw(0)),
+                Some(Gid::from_raw(0)),
+            )?;
+        } else {
+            ensure_directory_with_mode_owner(directory.as_path(), 0o700, None, None)?;
+        }
+    }
+
+    Ok(format!(
+        "prepared {} runtime directory path(s) for {}",
+        ordered.len(),
+        host_profile
+    ))
+}
+
+fn execute_ops_apply_blind_exit_lockdown() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("apply-blind-exit-lockdown is supported on Linux only".to_string());
+    }
+
+    let assignment_signing_secret_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
+        DEFAULT_ASSIGNMENT_SIGNING_SECRET_PATH,
+    )?;
+    let assignment_refresh_env_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
+        DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH,
+    )?;
+    let systemd_env_path =
+        env_path_or_default("RUSTYNET_SYSTEMD_ENV_PATH", DEFAULT_SYSTEMD_ENV_PATH)?;
+
+    let mut removed = Vec::new();
+    if secure_remove_root_owned_file_if_present(
+        assignment_signing_secret_path.as_path(),
+        "assignment signing secret",
+    )? {
+        removed.push(assignment_signing_secret_path.display().to_string());
+    }
+    if secure_remove_root_owned_file_if_present(
+        assignment_refresh_env_path.as_path(),
+        "assignment refresh env file",
+    )? {
+        removed.push(assignment_refresh_env_path.display().to_string());
+    }
+
+    let mut warnings = Vec::new();
+    if let Err(err) = set_assignment_auto_refresh_disabled(systemd_env_path.as_path()) {
+        warnings.push(err);
+    }
+    if let Err(err) = disable_assignment_refresh_timer() {
+        warnings.push(err);
+    }
+
+    let mut summary = format!(
+        "blind-exit lockdown applied: removed_sensitive_files={}",
+        removed.len()
+    );
+    if !removed.is_empty() {
+        summary.push_str(" [");
+        summary.push_str(removed.join(", ").as_str());
+        summary.push(']');
+    }
+    if !warnings.is_empty() {
+        summary.push_str(" warnings=");
+        summary.push_str(warnings.join(" | ").as_str());
+    }
+    Ok(summary)
+}
+
+fn execute_ops_init_membership() -> Result<String, String> {
+    let config = signing_passphrase_ops_config_from_env()?;
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
+        require_root_execution()?;
+    }
+
+    let node_role = env_string_or_default("RUSTYNET_NODE_ROLE", "client")?.to_ascii_lowercase();
+    if node_role != "admin" && node_role != "client" && node_role != "blind_exit" {
+        return Err(format!(
+            "unsupported node role for membership init: {node_role} (expected admin|client|blind_exit)"
+        ));
+    }
+    if node_role == "blind_exit"
+        && !matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
+    {
+        return Err("blind_exit role is supported on Linux only".to_string());
+    }
+
+    let snapshot_path = env_path_or_default(
+        "RUSTYNET_MEMBERSHIP_SNAPSHOT",
+        DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
+    )?;
+    let log_path = env_path_or_default("RUSTYNET_MEMBERSHIP_LOG", DEFAULT_MEMBERSHIP_LOG_PATH)?;
+    let watermark_path = env_path_or_default(
+        "RUSTYNET_MEMBERSHIP_WATERMARK",
+        DEFAULT_MEMBERSHIP_WATERMARK_PATH,
+    )?;
+    let owner_signing_key_path = env_path_or_default(
+        "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY",
+        DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+    )?;
+    let node_id = env_required_nonempty("RUSTYNET_NODE_ID", "membership node id")?;
+    if !is_valid_assignment_refresh_exit_node_id(node_id.as_str()) {
+        return Err(format!(
+            "membership node id contains unsupported characters: {node_id}"
+        ));
+    }
+    let network_id = env_string_or_default("RUSTYNET_NETWORK_ID", "local-net")?;
+    if network_id.trim().is_empty() {
+        return Err("membership network id must not be empty".to_string());
+    }
+    let rustynetd_bin = env_string_or_default("RUSTYNET_RUSTYNETD_BIN", "rustynetd")?;
+    if rustynetd_bin.trim().is_empty() {
+        return Err("RUSTYNET_RUSTYNETD_BIN must not be empty".to_string());
+    }
+
+    for path in [
+        &snapshot_path,
+        &log_path,
+        &watermark_path,
+        &owner_signing_key_path,
+    ] {
+        ensure_parent_directory_for_membership_path(path, config.host_profile)?;
+    }
+
+    if snapshot_path.exists() {
+        ensure_regular_file_no_symlink(&snapshot_path, "membership snapshot")?;
+    }
+    if log_path.exists() {
+        ensure_regular_file_no_symlink(&log_path, "membership log")?;
+    }
+
+    if snapshot_path.exists() && log_path.exists() {
+        let removed_owner_key = maybe_remove_blind_exit_owner_signing_key(
+            node_role.as_str(),
+            config.host_profile,
+            owner_signing_key_path.as_path(),
+        )?;
+        return Ok(format!(
+            "membership files already present: snapshot={} log={} owner_signing_key_removed={removed_owner_key}",
+            snapshot_path.display(),
+            log_path.display(),
+        ));
+    }
+
+    ensure_signing_passphrase_material_ops(&config)?;
+    let passphrase_tmp =
+        create_secure_temp_file(std::env::temp_dir().as_path(), "membership-passphrase.")?;
+    if let Err(err) = materialize_signing_passphrase_ops(&config, passphrase_tmp.as_path()) {
+        let _ = secure_remove_file(passphrase_tmp.as_path());
+        return Err(err);
+    }
+
+    let output = Command::new(rustynetd_bin.as_str())
+        .arg("membership")
+        .arg("init")
+        .arg("--snapshot")
+        .arg(snapshot_path.as_os_str())
+        .arg("--log")
+        .arg(log_path.as_os_str())
+        .arg("--watermark")
+        .arg(watermark_path.as_os_str())
+        .arg("--owner-signing-key")
+        .arg(owner_signing_key_path.as_os_str())
+        .arg("--owner-signing-key-passphrase-file")
+        .arg(passphrase_tmp.as_os_str())
+        .arg("--node-id")
+        .arg(node_id.as_str())
+        .arg("--network-id")
+        .arg(network_id.as_str())
+        .arg("--force")
+        .output()
+        .map_err(|err| format!("execute rustynetd membership init failed: {err}"))?;
+
+    let cleanup_result = secure_remove_file(passphrase_tmp.as_path());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("rustynetd membership init failed: {detail}"));
+    }
+    cleanup_result?;
+
+    let removed_owner_key = maybe_remove_blind_exit_owner_signing_key(
+        node_role.as_str(),
+        config.host_profile,
+        owner_signing_key_path.as_path(),
+    )?;
+
+    Ok(format!(
+        "membership initialized: node_id={} snapshot={} log={} owner_signing_key_removed={removed_owner_key}",
+        node_id,
+        snapshot_path.display(),
+        log_path.display()
+    ))
+}
+
+fn ensure_parent_directory_for_membership_path(
+    path: &Path,
+    host_profile: SigningPassphraseHostProfile,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "membership path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    match host_profile {
+        SigningPassphraseHostProfile::Linux => ensure_directory_with_mode_owner(
+            parent,
+            0o700,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        ),
+        SigningPassphraseHostProfile::Macos => {
+            ensure_directory_with_mode_owner(parent, 0o700, None, None)
+        }
+    }
+}
+
+fn maybe_remove_blind_exit_owner_signing_key(
+    node_role: &str,
+    host_profile: SigningPassphraseHostProfile,
+    owner_signing_key_path: &Path,
+) -> Result<bool, String> {
+    if node_role != "blind_exit" {
+        return Ok(false);
+    }
+    if !owner_signing_key_path.exists() {
+        return Ok(false);
+    }
+    match host_profile {
+        SigningPassphraseHostProfile::Linux => secure_remove_root_owned_file_if_present(
+            owner_signing_key_path,
+            "membership owner signing key",
+        ),
+        SigningPassphraseHostProfile::Macos => {
+            secure_remove_file(owner_signing_key_path)?;
+            Ok(true)
+        }
+    }
+}
+
+fn ensure_parent_directory_for_wireguard_path(
+    path: &Path,
+    host_profile: SigningPassphraseHostProfile,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "tunnel key path has no parent directory: {}",
+            path.display()
+        )
+    })?;
+    match host_profile {
+        SigningPassphraseHostProfile::Linux => ensure_directory_with_mode_owner(
+            parent,
+            0o700,
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(0)),
+        ),
+        SigningPassphraseHostProfile::Macos => {
+            ensure_directory_with_mode_owner(parent, 0o700, None, None)
+        }
+    }
+}
+
+fn secure_remove_if_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            secure_remove_file(path)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("inspect {} failed: {err}", path.display())),
+    }
+}
+
+fn validate_root_owned_private_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!("{label} must be root-owned: {}", path.display()));
+    }
+    let mode = metadata.mode() & 0o777;
+    if (mode & 0o077) != 0 {
+        return Err(format!(
+            "{label} permissions too broad ({mode:03o}); expected owner-only (0600): {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_key_source_file(
+    path: &Path,
+    host_profile: SigningPassphraseHostProfile,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    if (mode & 0o077) != 0 {
+        return Err(format!(
+            "{label} permissions too broad ({mode:03o}); expected owner-only (0600): {}",
+            path.display()
+        ));
+    }
+    match host_profile {
+        SigningPassphraseHostProfile::Linux => {
+            if metadata.uid() != 0 {
+                return Err(format!("{label} must be root-owned: {}", path.display()));
+            }
+        }
+        SigningPassphraseHostProfile::Macos => {
+            let expected_uid = Uid::effective().as_raw();
+            if metadata.uid() != expected_uid {
+                return Err(format!(
+                    "{label} owner mismatch: expected uid {expected_uid}, found {} ({})",
+                    metadata.uid(),
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_macos_tunnel_keychain_account(account: &str) -> Result<String, String> {
+    let normalized = account.trim();
+    if normalized.is_empty() {
+        return Err(
+            "macOS tunnel keychain account is required (RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)"
+                .to_string(),
+        );
+    }
+    if normalized.len() > 128 {
+        return Err("macOS tunnel keychain account exceeds max length (128)".to_string());
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(
+            "macOS tunnel keychain account contains invalid characters; allowed: [A-Za-z0-9._-]"
+                .to_string(),
+        );
+    }
+    Ok(normalized.to_string())
+}
+
+fn macos_generic_password_exists(service: &str, account: &str) -> Result<bool, String> {
+    let normalized_service = service.trim();
+    if normalized_service.is_empty() {
+        return Err(
+            "macOS tunnel keychain service is required (RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE)"
+                .to_string(),
+        );
+    }
+    let status = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(normalized_service)
+        .arg("-a")
+        .arg(account)
+        .status()
+        .map_err(|err| format!("invoke security keychain query failed: {err}"))?;
+    Ok(status.success())
+}
+
+fn provision_linux_tunnel_passphrase_credential_blob(
+    passphrase_source_path: &Path,
+    credential_blob_path: &Path,
+) -> Result<(), String> {
+    require_root_execution()?;
+    let parent = credential_blob_path.parent().ok_or_else(|| {
+        format!(
+            "credential blob path has no parent: {}",
+            credential_blob_path.display()
+        )
+    })?;
+    ensure_directory_exists(parent, 0o700, Uid::from_raw(0), Gid::from_raw(0))?;
+    if credential_blob_path.exists() {
+        ensure_regular_file_no_symlink(credential_blob_path, "tunnel passphrase credential blob")?;
+    }
+
+    let credential_name = format!("{}{}", "wg", "_key_passphrase");
+    let status = Command::new("systemd-creds")
+        .arg("encrypt")
+        .arg(format!("--name={credential_name}"))
+        .arg(passphrase_source_path.as_os_str())
+        .arg(credential_blob_path.as_os_str())
+        .status()
+        .map_err(|err| format!("invoke systemd-creds encrypt failed: {err}"))?;
+    if !status.success() {
+        return Err(format!("systemd-creds encrypt failed with status {status}"));
+    }
+    chown(
+        credential_blob_path,
+        Some(Uid::from_raw(0)),
+        Some(Gid::from_raw(0)),
+    )
+    .map_err(|err| {
+        format!(
+            "set credential blob owner failed ({}): {err}",
+            credential_blob_path.display()
+        )
+    })?;
+    fs::set_permissions(credential_blob_path, fs::Permissions::from_mode(0o600)).map_err(
+        |err| {
+            format!(
+                "set credential blob mode failed ({}): {err}",
+                credential_blob_path.display()
+            )
+        },
+    )?;
+    Ok(())
+}
+
+fn disable_assignment_refresh_timer() -> Result<(), String> {
+    let status = Command::new("systemctl")
+        .arg("disable")
+        .arg("--now")
+        .arg("rustynetd-assignment-refresh.timer")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("disable assignment-refresh timer invocation failed: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "disable assignment-refresh timer returned non-zero status: {status}"
+        ));
+    }
+    Ok(())
+}
+
+fn set_assignment_auto_refresh_disabled(systemd_env_path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(systemd_env_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "inspect rustynet systemd env failed ({}): {err}",
+                systemd_env_path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "rustynet systemd env must not be a symlink: {}",
+            systemd_env_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "rustynet systemd env must be a regular file: {}",
+            systemd_env_path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "rustynet systemd env must be root-owned: {}",
+            systemd_env_path.display()
+        ));
+    }
+
+    let body = fs::read_to_string(systemd_env_path)
+        .map_err(|err| format!("read rustynet systemd env failed: {err}"))?;
+    let rewritten =
+        rewrite_env_key_value(body.as_str(), "RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false");
+    if rewritten == body {
+        return Ok(());
+    }
+
+    let owner = Uid::from_raw(metadata.uid());
+    let group = Gid::from_raw(metadata.gid());
+    let mode = metadata.mode() & 0o777;
+    write_atomic_text_file_with_owner_mode(systemd_env_path, rewritten.as_str(), owner, group, mode)
+}
+
+fn write_atomic_text_file_with_owner_mode(
+    target_path: &Path,
+    body: &str,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+) -> Result<(), String> {
+    let parent = target_path.parent().ok_or_else(|| {
+        format!(
+            "target file has no parent directory: {}",
+            target_path.display()
+        )
+    })?;
+    if let Ok(parent_metadata) = fs::symlink_metadata(parent)
+        && parent_metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "target parent must not be a symlink: {}",
+            parent.display()
+        ));
+    }
+    let tmp = create_secure_temp_file(parent, "rustynet.ops.tmp.")?;
+    if let Err(err) = write_private_bytes_to_file(tmp.as_path(), body.as_bytes()) {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+    if let Err(err) =
+        publish_file_with_owner_mode(&tmp, target_path, owner, group, mode, "systemd env file")
+    {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn secure_remove_root_owned_file_if_present(path: &Path, label: &str) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "inspect {label} failed ({}): {err}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!("{label} must be root-owned: {}", path.display()));
+    }
+    secure_remove_file(path)?;
+    Ok(true)
+}
+
+fn rewrite_env_key_value(body: &str, key: &str, value: &str) -> String {
+    let mut rewritten_lines = Vec::new();
+    let mut inserted = false;
+    let prefix = format!("{key}=");
+    for line in body.lines() {
+        if line.starts_with(prefix.as_str()) {
+            if !inserted {
+                rewritten_lines.push(format!("{key}={value}"));
+                inserted = true;
+            }
+            continue;
+        }
+        rewritten_lines.push(line.to_string());
+    }
+    if !inserted {
+        rewritten_lines.push(format!("{key}={value}"));
+    }
+    if rewritten_lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", rewritten_lines.join("\n"))
+}
+
+fn insert_absolute_directory_from_env(
+    env_key: &str,
+    out: &mut HashSet<PathBuf>,
+    label: &str,
+) -> Result<(), String> {
+    if let Some(raw) = env_optional_string(env_key)? {
+        let directory = PathBuf::from(raw);
+        if !directory.is_absolute() {
+            return Err(format!(
+                "{label} from {env_key} must be an absolute path: {}",
+                directory.display()
+            ));
+        }
+        out.insert(directory);
+    }
+    Ok(())
+}
+
+fn insert_parent_dir_from_env_path(
+    env_key: &str,
+    out: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
+    if let Some(raw) = env_optional_string(env_key)? {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{env_key} must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{env_key} has no parent directory: {}", path.display()))?;
+        out.insert(parent.to_path_buf());
+    }
+    Ok(())
+}
+
+fn ensure_directory_with_mode_owner(
+    path: &Path,
+    mode: u32,
+    owner: Option<Uid>,
+    group: Option<Gid>,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "directory path must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "directory path must be a directory: {}",
+                    path.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|create_err| {
+                format!("create directory {} failed: {create_err}", path.display())
+            })?;
+        }
+        Err(err) => {
+            return Err(format!(
+                "inspect directory {} failed: {err}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(owner_uid) = owner {
+        chown(path, Some(owner_uid), group).map_err(|err| {
+            format!(
+                "set directory owner/group failed ({}): {err}",
+                path.display()
+            )
+        })?;
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("set directory mode failed ({}): {err}", path.display()))?;
+    Ok(())
+}
+
+fn assignment_refresh_available_ops(env_path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(env_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "assignment refresh env file must not be a symlink: {}",
+                    env_path.display()
+                ));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "assignment refresh env path must be a regular file: {}",
+                    env_path.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(format!(
+                "inspect assignment refresh env failed ({}): {err}",
+                env_path.display()
+            ));
+        }
+    }
+
+    let status = Command::new("systemctl")
+        .arg("cat")
+        .arg("rustynetd-assignment-refresh.service")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("invoke systemctl cat failed: {err}"))?;
+    Ok(status.success())
+}
+
+fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
+    let bundle_path = env_path_or_default(
+        "RUSTYNET_AUTO_TUNNEL_BUNDLE",
+        DEFAULT_AUTO_TUNNEL_BUNDLE_PATH,
+    )?;
+    let watermark_path = env_path_or_default(
+        "RUSTYNET_AUTO_TUNNEL_WATERMARK",
+        DEFAULT_AUTO_TUNNEL_WATERMARK_PATH,
+    )?;
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+
+    remove_file_if_present(bundle_path.as_path())?;
+    remove_file_if_present(watermark_path.as_path())?;
+    run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
+    run_systemctl_action("restart", "rustynetd.service")?;
+    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(20))?;
+    Ok(())
+}
+
+fn run_systemctl_action(action: &str, unit: &str) -> Result<(), String> {
+    let status = Command::new("systemctl")
+        .arg(action)
+        .arg(unit)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| format!("invoke systemctl {action} {unit} failed: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "systemctl {action} {unit} failed with status {status}"
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_socket_path(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_socket() {
+                    return Ok(());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "inspect socket path {} failed: {err}",
+                    path.display()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon socket did not become ready: {}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn send_role_coupling_ipc(command: IpcCommand) -> Result<(), String> {
+    let response = send_command(command)?;
+    if response.ok {
+        Ok(())
+    } else {
+        Err(response.message)
+    }
+}
+
+fn signing_passphrase_ops_config_from_env() -> Result<SigningPassphraseOpsConfig, String> {
+    let host_profile = match env_string_or_default("RUSTYNET_HOST_PROFILE", detect_host_profile())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "linux" => SigningPassphraseHostProfile::Linux,
+        "macos" | "darwin" => SigningPassphraseHostProfile::Macos,
+        other => {
+            return Err(format!(
+                "unsupported host profile for signing passphrase ops: {other}"
+            ));
+        }
+    };
+
+    Ok(SigningPassphraseOpsConfig {
+        host_profile,
+        signing_credential_blob_path: env_path_or_default(
+            "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+            DEFAULT_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH,
+        )?,
+        membership_owner_signing_key_path: env_path_or_default(
+            "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY",
+            DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+        )?,
+        trust_signer_key_path: env_path_or_default(
+            "RUSTYNET_TRUST_SIGNER_KEY",
+            DEFAULT_TRUST_SIGNER_KEY_PATH,
+        )?,
+        assignment_signing_secret_path: env_path_or_default(
+            "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
+            DEFAULT_ASSIGNMENT_SIGNING_SECRET_PATH,
+        )?,
+        macos_keychain_service: env_string_or_default(
+            "RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE",
+            DEFAULT_MACOS_PASSPHRASE_KEYCHAIN_SERVICE,
+        )?,
+        macos_keychain_account: env_string_or_default(
+            "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT",
+            "",
+        )?,
+    })
+}
+
+fn wireguard_custody_ops_config_from_env() -> Result<TunnelCustodyOpsConfig, String> {
+    let host_profile = match env_string_or_default("RUSTYNET_HOST_PROFILE", detect_host_profile())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "linux" => SigningPassphraseHostProfile::Linux,
+        "macos" | "darwin" => SigningPassphraseHostProfile::Macos,
+        other => {
+            return Err(format!(
+                "unsupported host profile for tunnel custody ops: {other}"
+            ));
+        }
+    };
+
+    Ok(TunnelCustodyOpsConfig {
+        host_profile,
+        runtime_private_key_path: env_path_or_default(
+            "RUSTYNET_WG_PRIVATE_KEY",
+            DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+        )?,
+        encrypted_private_key_path: env_path_or_default(
+            "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
+            DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+        )?,
+        public_key_path: env_path_or_default("RUSTYNET_WG_PUBLIC_KEY", DEFAULT_WG_PUBLIC_KEY_PATH)?,
+        passphrase_path: env_path_or_default(
+            "RUSTYNET_WG_KEY_PASSPHRASE",
+            DEFAULT_WG_KEY_PASSPHRASE_PATH,
+        )?,
+        passphrase_credential_blob_path: env_path_or_default(
+            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB",
+            DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH,
+        )?,
+        legacy_private_key_path: env_path_or_default(
+            "RUSTYNET_WG_LEGACY_PRIVATE_KEY",
+            DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH,
+        )?,
+        legacy_passphrase_path: env_path_or_default(
+            "RUSTYNET_WG_LEGACY_PASSPHRASE_PATH",
+            DEFAULT_LEGACY_LINUX_WG_PASSPHRASE_PATH,
+        )?,
+        macos_keychain_service: env_string_or_default(
+            "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE",
+            DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
+        )?,
+        macos_keychain_account: env_string_or_default(
+            "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT",
+            "",
+        )?,
+        allow_init: parse_env_bool_with_default("RUSTYNET_WG_CUSTODY_ALLOW_INIT", "false")?,
+    })
+}
+
+fn detect_host_profile() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "unsupported"
+    }
+}
+
+fn ensure_signing_passphrase_material_ops(
+    config: &SigningPassphraseOpsConfig,
+) -> Result<(), String> {
+    match config.host_profile {
+        SigningPassphraseHostProfile::Linux => ensure_signing_passphrase_material_linux(config),
+        SigningPassphraseHostProfile::Macos => ensure_signing_passphrase_material_macos(config),
+    }
+}
+
+fn ensure_signing_passphrase_material_linux(
+    config: &SigningPassphraseOpsConfig,
+) -> Result<(), String> {
+    require_root_execution()?;
+    if config.signing_credential_blob_path.exists() {
+        ensure_regular_file_no_symlink(
+            &config.signing_credential_blob_path,
+            "signing passphrase credential blob",
+        )?;
+        return Ok(());
+    }
+
+    let mut existing_signing_material = false;
+    for path in [
+        &config.membership_owner_signing_key_path,
+        &config.trust_signer_key_path,
+        &config.assignment_signing_secret_path,
+    ] {
+        if fs::symlink_metadata(path).is_ok() {
+            existing_signing_material = true;
+            break;
+        }
+    }
+    if existing_signing_material {
+        return Err(format!(
+            "signing credential blob is missing ({}) while encrypted signing material exists",
+            config.signing_credential_blob_path.display()
+        ));
+    }
+
+    let parent = config
+        .signing_credential_blob_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "signing credential blob path has no parent: {}",
+                config.signing_credential_blob_path.display()
+            )
+        })?;
+    ensure_directory_exists(parent, 0o700, Uid::from_raw(0), Gid::from_raw(0))?;
+
+    let tmp_passphrase =
+        create_secure_temp_file(std::env::temp_dir().as_path(), "signing-passphrase.")?;
+    let mut random_bytes = [0u8; 48];
+    OsRng.fill_bytes(&mut random_bytes);
+    let mut passphrase_hex = Zeroizing::new(hex_bytes(&random_bytes));
+    random_bytes.zeroize();
+    passphrase_hex.push('\n');
+    if let Err(err) =
+        write_private_bytes_to_file(tmp_passphrase.as_path(), passphrase_hex.as_bytes())
+    {
+        let _ = secure_remove_file(tmp_passphrase.as_path());
+        return Err(err);
+    }
+
+    let encrypt_status = Command::new("systemd-creds")
+        .arg("encrypt")
+        .arg("--name=signing_key_passphrase")
+        .arg(tmp_passphrase.as_os_str())
+        .arg(config.signing_credential_blob_path.as_os_str())
+        .status()
+        .map_err(|err| format!("invoke systemd-creds encrypt failed: {err}"))?;
+    let cleanup_result = secure_remove_file(tmp_passphrase.as_path());
+    if !encrypt_status.success() {
+        return Err(format!(
+            "systemd-creds encrypt failed with status {encrypt_status}"
+        ));
+    }
+    cleanup_result?;
+
+    chown(
+        config.signing_credential_blob_path.as_path(),
+        Some(Uid::from_raw(0)),
+        Some(Gid::from_raw(0)),
+    )
+    .map_err(|err| {
+        format!(
+            "set credential blob owner failed ({}): {err}",
+            config.signing_credential_blob_path.display()
+        )
+    })?;
+    fs::set_permissions(
+        config.signing_credential_blob_path.as_path(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .map_err(|err| {
+        format!(
+            "set credential blob mode failed ({}): {err}",
+            config.signing_credential_blob_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_signing_passphrase_material_macos(
+    config: &SigningPassphraseOpsConfig,
+) -> Result<(), String> {
+    if config.macos_keychain_account.trim().is_empty() {
+        return Err(
+            "macOS keychain account is required (RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)"
+                .to_string(),
+        );
+    }
+    let status = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(config.macos_keychain_service.as_str())
+        .arg("-a")
+        .arg(config.macos_keychain_account.as_str())
+        .status()
+        .map_err(|err| format!("invoke security keychain query failed: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "macOS keychain passphrase item missing (service={}, account={})",
+            config.macos_keychain_service, config.macos_keychain_account
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_signing_passphrase_ops(
+    config: &SigningPassphraseOpsConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    match config.host_profile {
+        SigningPassphraseHostProfile::Linux => {
+            materialize_signing_passphrase_linux(config, output_path)
+        }
+        SigningPassphraseHostProfile::Macos => {
+            materialize_signing_passphrase_macos(config, output_path)
+        }
+    }
+}
+
+fn materialize_signing_passphrase_linux(
+    config: &SigningPassphraseOpsConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    require_root_execution()?;
+    let decrypt_status = Command::new("systemd-creds")
+        .arg("decrypt")
+        .arg("--name=signing_key_passphrase")
+        .arg(config.signing_credential_blob_path.as_os_str())
+        .arg(output_path.as_os_str())
+        .status()
+        .map_err(|err| format!("invoke systemd-creds decrypt failed: {err}"))?;
+    if !decrypt_status.success() {
+        let _ = secure_remove_file(output_path);
+        return Err(format!(
+            "systemd-creds decrypt failed with status {decrypt_status}"
+        ));
+    }
+    chown(output_path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+        .map_err(|err| format!("set output owner failed ({}): {err}", output_path.display()))?;
+    fs::set_permissions(output_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("set output mode failed ({}): {err}", output_path.display()))?;
+    Ok(())
+}
+
+fn materialize_signing_passphrase_macos(
+    config: &SigningPassphraseOpsConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(config.macos_keychain_service.as_str())
+        .arg("-a")
+        .arg(config.macos_keychain_account.as_str())
+        .arg("-w")
+        .output()
+        .map_err(|err| format!("invoke security keychain read failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to materialize passphrase from keychain (service={}, account={})",
+            config.macos_keychain_service, config.macos_keychain_account
+        ));
+    }
+    let passphrase = Zeroizing::new(output.stdout);
+    write_private_bytes_to_file(output_path, passphrase.as_slice())?;
+    Ok(())
+}
+
+fn write_private_bytes_to_file(path: &Path, body: &[u8]) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!("path must not be a symlink: {}", path.display()));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(format!("path must be a regular file: {}", path.display()));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true).create(true).mode(0o600);
+    let mut file = options
+        .open(path)
+        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
+    file.write_all(body)
+        .map_err(|err| format!("write {} failed: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("set mode {} failed: {err}", path.display()))?;
+    Ok(())
+}
+
+fn secure_remove_file(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("inspect {} failed: {err}", path.display())),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .map_err(|err| format!("remove symlink {} failed: {err}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "secure remove requires a regular file: {}",
+            path.display()
+        ));
+    }
+
+    scrub_file_contents(path)?;
+    fs::remove_file(path).map_err(|err| format!("remove {} failed: {err}", path.display()))
+}
+
+fn scrub_file_contents(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
+    let mut remaining = metadata.len();
+    let zero_chunk = [0u8; 8192];
+    while remaining > 0 {
+        let write_len = usize::try_from(std::cmp::min(remaining, zero_chunk.len() as u64))
+            .map_err(|_| "internal length conversion failed".to_string())?;
+        file.write_all(&zero_chunk[..write_len])
+            .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+        remaining = remaining.saturating_sub(write_len as u64);
+    }
+    file.sync_all()
+        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+    file.set_len(0)
+        .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_regular_file_no_symlink(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} must be a regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn is_valid_assignment_refresh_exit_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) -> String {
+    let mut rewritten_lines = Vec::new();
+    let mut inserted = false;
+    for line in body.lines() {
+        if line.starts_with("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=") {
+            if !inserted {
+                if let Some(exit_node_id_value) = exit_node_id {
+                    rewritten_lines.push(format!(
+                        "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID={exit_node_id_value}"
+                    ));
+                }
+                inserted = true;
+            }
+            continue;
+        }
+        rewritten_lines.push(line.to_string());
+    }
+    if !inserted && let Some(exit_node_id_value) = exit_node_id {
+        rewritten_lines.push(format!(
+            "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID={exit_node_id_value}"
+        ));
+    }
+    if rewritten_lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", rewritten_lines.join("\n"))
 }
 
 fn require_root_execution() -> Result<(), String> {
@@ -2047,6 +4059,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::KeyRevoke => IpcCommand::KeyRevoke,
         CliCommand::Login
         | CliCommand::Help
+        | CliCommand::OperatorMenu
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
         | CliCommand::Trust(_)
@@ -2090,6 +4103,7 @@ fn help_text() -> String {
         "  status",
         "  login",
         "  netcheck",
+        "  operator menu",
         "  exit-node select <node>",
         "  exit-node off",
         "  lan-access on|off",
@@ -2118,8 +4132,18 @@ fn help_text() -> String {
         "  trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>",
         "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
         "  ops refresh-trust",
+        "  ops refresh-signed-trust",
+        "  ops bootstrap-wireguard-custody",
         "  ops refresh-assignment",
         "  ops install-systemd",
+        "  ops prepare-system-dirs",
+        "  ops apply-blind-exit-lockdown",
+        "  ops init-membership",
+        "  ops secure-remove --path <absolute-path>",
+        "  ops ensure-signing-passphrase-material",
+        "  ops materialize-signing-passphrase --output <absolute-path>",
+        "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
+        "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
     ]
     .join("\n")
 }
@@ -2128,7 +4152,8 @@ fn help_text() -> String {
 mod tests {
     use super::{
         detect_tampered_log, execute, load_signing_key, parse_bool_value, parse_bundle_u64_field,
-        parse_command, persist_encrypted_secret_material,
+        parse_command, persist_encrypted_secret_material, required_macos_tunnel_keychain_account,
+        rewrite_assignment_refresh_exit_node, rewrite_env_key_value,
     };
 
     #[test]
@@ -2148,6 +4173,12 @@ mod tests {
 
         let revoke = parse_command(&["key".to_string(), "revoke".to_string()]);
         assert!(format!("{revoke:?}").contains("KeyRevoke"));
+    }
+
+    #[test]
+    fn parse_supports_operator_menu_command() {
+        let menu = parse_command(&["operator".to_string(), "menu".to_string()]);
+        assert!(format!("{menu:?}").contains("OperatorMenu"));
     }
 
     #[test]
@@ -2202,11 +4233,104 @@ mod tests {
         let trust = parse_command(&["ops".to_string(), "refresh-trust".to_string()]);
         assert!(format!("{trust:?}").contains("RefreshTrust"));
 
+        let signed_trust = parse_command(&["ops".to_string(), "refresh-signed-trust".to_string()]);
+        assert!(format!("{signed_trust:?}").contains("RefreshSignedTrust"));
+
+        let bootstrap_wg =
+            parse_command(&["ops".to_string(), "bootstrap-wireguard-custody".to_string()]);
+        assert!(format!("{bootstrap_wg:?}").contains("BootstrapTunnelCustody"));
+
         let assignment = parse_command(&["ops".to_string(), "refresh-assignment".to_string()]);
         assert!(format!("{assignment:?}").contains("RefreshAssignment"));
 
         let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));
+
+        let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
+        assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
+
+        let blind_exit_lockdown =
+            parse_command(&["ops".to_string(), "apply-blind-exit-lockdown".to_string()]);
+        assert!(format!("{blind_exit_lockdown:?}").contains("ApplyBlindExitLockdown"));
+
+        let init_membership = parse_command(&["ops".to_string(), "init-membership".to_string()]);
+        assert!(format!("{init_membership:?}").contains("InitMembership"));
+
+        let secure_remove = parse_command(&[
+            "ops".to_string(),
+            "secure-remove".to_string(),
+            "--path".to_string(),
+            "/tmp/secret.txt".to_string(),
+        ]);
+        assert!(format!("{secure_remove:?}").contains("SecureRemove"));
+
+        let ensure_signing = parse_command(&[
+            "ops".to_string(),
+            "ensure-signing-passphrase-material".to_string(),
+        ]);
+        assert!(format!("{ensure_signing:?}").contains("EnsureSigningPassphraseMaterial"));
+
+        let materialize_signing = parse_command(&[
+            "ops".to_string(),
+            "materialize-signing-passphrase".to_string(),
+            "--output".to_string(),
+            "/tmp/signing-passphrase".to_string(),
+        ]);
+        assert!(format!("{materialize_signing:?}").contains("MaterializeSigningPassphrase"));
+
+        let set_exit = parse_command(&[
+            "ops".to_string(),
+            "set-assignment-refresh-exit-node".to_string(),
+            "--env-path".to_string(),
+            "/etc/rustynet/assignment-refresh.env".to_string(),
+            "--exit-node-id".to_string(),
+            "exit-40".to_string(),
+        ]);
+        assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
+
+        let role_coupling = parse_command(&[
+            "ops".to_string(),
+            "apply-role-coupling".to_string(),
+            "--target-role".to_string(),
+            "client".to_string(),
+            "--preferred-exit-node-id".to_string(),
+            "exit-40".to_string(),
+            "--enable-exit-advertise".to_string(),
+            "false".to_string(),
+        ]);
+        assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
+    }
+
+    #[test]
+    fn rewrite_assignment_refresh_exit_node_updates_and_clears() {
+        let existing = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=node-40\nRUSTYNET_ASSIGNMENT_EXIT_NODE_ID=old\nRUSTYNET_ASSIGNMENT_ALLOW=a|b\n";
+        let updated = rewrite_assignment_refresh_exit_node(existing, Some("exit-new"));
+        assert!(updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=exit-new"));
+        assert!(!updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=old"));
+
+        let cleared = rewrite_assignment_refresh_exit_node(existing, None);
+        assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID="));
+    }
+
+    #[test]
+    fn rewrite_env_key_value_replaces_or_appends() {
+        let existing = "RUSTYNET_NODE_ID=node-40\nRUSTYNET_ASSIGNMENT_AUTO_REFRESH=true\nRUSTYNET_STATE=/var/lib/rustynet/rustynetd.state\n";
+        let rewritten =
+            rewrite_env_key_value(existing, "RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false");
+        assert!(rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false"));
+        assert!(!rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true"));
+
+        let without_key = "RUSTYNET_NODE_ID=node-40\n";
+        let appended =
+            rewrite_env_key_value(without_key, "RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false");
+        assert!(appended.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false"));
+    }
+
+    #[test]
+    fn macos_keychain_account_validation_rejects_invalid_values() {
+        assert!(required_macos_tunnel_keychain_account("tunnel-passphrase-node").is_ok());
+        assert!(required_macos_tunnel_keychain_account("").is_err());
+        assert!(required_macos_tunnel_keychain_account("bad account with spaces").is_err());
     }
 
     #[test]

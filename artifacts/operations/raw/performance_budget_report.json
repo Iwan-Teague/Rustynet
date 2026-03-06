@@ -1,0 +1,13 @@
+{
+  "benchmark_matrix": {
+    "os": "debian-13",
+    "cpu_class": "x86_64-vm",
+    "network_profile": "lan"
+  },
+  "idle_cpu_percent": 1.31,
+  "idle_memory_mb": 87.6,
+  "reconnect_seconds": 2.04,
+  "route_apply_p95_seconds": 1.11,
+  "throughput_overhead_percent": 12.1,
+  "soak_test_hours": 58.833
+}

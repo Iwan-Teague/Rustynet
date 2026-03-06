@@ -8,6 +8,12 @@ Run the interactive setup/menu wizard:
 ./start.sh
 ```
 
+Optional Rust-native operator menu (baseline UX path):
+
+```bash
+rustynet operator menu
+```
+
 The wizard handles:
 - role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions
 - guided in-menu role switching (`client` <-> `admin`) with local signed assignment refresh support on Linux
@@ -18,6 +24,7 @@ The wizard handles:
 - centrally signed auto-tunnel defaults with fail-closed enforcement
 - break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
 - encrypted key custody at rest + runtime key management
+- Rust-backed WireGuard custody bootstrap (`rustynet ops bootstrap-wireguard-custody`) with fail-closed behavior; shell fallback is allowed only for legacy binaries that do not yet support this ops command
 - sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
 - Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
   encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
@@ -62,6 +69,7 @@ Two-hop chain notes:
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
 - Linux trust refresh service path is Rust-backed: `scripts/systemd/refresh_trust_evidence.sh` is a thin wrapper to `rustynet ops refresh-trust`.
+- `start.sh` manual trust refresh path is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup), with shell fallback retained for compatibility.
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
 - If a node is switched to `client` mode without signer-key access, `AUTO_REFRESH_TRUST` is disabled with an explicit warning.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.

@@ -1,0 +1,33 @@
+{
+  "evidence_mode": "measured",
+  "captured_at_unix": 1772814039,
+  "environment": "ci",
+  "source_artifacts": [
+    "artifacts/release/raw/platform_parity_linux.json",
+    "artifacts/release/raw/platform_parity_macos.json",
+    "artifacts/release/raw/platform_parity_windows.json"
+  ],
+  "platform_results": [
+    {
+      "platform": "linux",
+      "route_hook_ready": true,
+      "dns_hook_ready": true,
+      "firewall_hook_ready": true,
+      "leak_matrix_passed": true
+    },
+    {
+      "platform": "macos",
+      "route_hook_ready": true,
+      "dns_hook_ready": true,
+      "firewall_hook_ready": true,
+      "leak_matrix_passed": true
+    },
+    {
+      "platform": "windows",
+      "route_hook_ready": true,
+      "dns_hook_ready": true,
+      "firewall_hook_ready": true,
+      "leak_matrix_passed": true
+    }
+  ]
+}

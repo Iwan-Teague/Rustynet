@@ -1,0 +1,19 @@
+{
+  "evidence_mode": "measured",
+  "policy_version": "2026.03",
+  "minimum_supported_client": {
+    "major": 1,
+    "minor": 0
+  },
+  "latest_server": {
+    "major": 1,
+    "minor": 3
+  },
+  "deprecation_window_days": 90,
+  "insecure_compatibility_mode": {
+    "default_enabled": false,
+    "risk_acceptance_required": true,
+    "auto_expiry_required": true
+  },
+  "measured_at_utc": "2026-03-05T11:05:00Z"
+}

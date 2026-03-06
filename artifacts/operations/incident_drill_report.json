@@ -1,0 +1,17 @@
+{
+  "drill_id": "incident-2026-03-05-b",
+  "executed_at_utc": "2026-03-05T09:10:00Z",
+  "scenario": "relay path degradation",
+  "detection_minutes": 6.0,
+  "containment_minutes": 12.0,
+  "recovery_minutes": 18.0,
+  "postmortem_completed": true,
+  "action_items_closed": true,
+  "oncall_readiness_confirmed": true,
+  "evidence_mode": "measured",
+  "captured_at_unix": 1772814044,
+  "environment": "ci",
+  "source_artifacts": [
+    "artifacts/operations/raw/incident_drill_report.json"
+  ]
+}

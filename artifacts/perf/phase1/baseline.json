@@ -1,0 +1,11 @@
+{
+  "phase": "phase1",
+  "suite": "runtime_baseline",
+  "metrics": [
+    {"name":"idle_cpu_percent","value":1.34,"unit":"percent_of_one_core","threshold":"<=2","status":"pass","reason":"measured"},
+    {"name":"idle_memory_mb","value":87,"unit":"mb_rss","threshold":"<=120","status":"pass","reason":"measured"},
+    {"name":"reconnect_seconds","value":1.95,"unit":"seconds","threshold":"<=5","status":"pass","reason":"measured"},
+    {"name":"route_policy_apply_p95_seconds","value":1.02,"unit":"seconds","threshold":"<=2","status":"pass","reason":"measured"},
+    {"name":"throughput_overhead_vs_wireguard_percent","value":11.4,"unit":"percent","threshold":"<=15","status":"pass","reason":"measured"}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "phase": "phase10",
+  "suite": "leak_prevention",
+  "evidence_mode": "measured",
+  "environment": "ci",
+  "captured_at_unix": 1772814044,
+  "status": "pass",
+  "checks": {
+    "tunnel_fail_closed": "pass",
+    "dns_fail_closed": "pass"
+  },
+  "source_artifacts": [
+    "artifacts/phase10/source/leak_test_report.json"
+  ]
+}

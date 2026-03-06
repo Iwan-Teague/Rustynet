@@ -15,6 +15,10 @@ Success criteria:
 ## Status Update (2026-03-06)
 - Phase A complete: `refresh_trust_evidence.sh` and `refresh_assignment_bundle.sh` are thin wrappers to Rust ops commands.
 - Phase B complete: `install_rustynetd_service.sh` is now a thin wrapper to `rustynet ops install-systemd`; core installer logic (idempotent user/group/dir setup, credential-path pinning, env file generation, legacy cleanup/migration, systemd orchestration) is implemented in Rust.
+- Phase C complete: `rustynet-cli` now provides Rust-backed ops for secure file scrubbing/removal, signing-passphrase material ensure/materialization, trust-refresh helper invocation, assignment-refresh exit-node env mutation, and role-switch coupling (`ops apply-role-coupling`); `start.sh` now prefers these Rust ops paths with shell fallbacks.
+- Phase D baseline complete: added optional Rust operator UX entrypoint via `rustynet operator menu` while retaining `start.sh` as compatibility UI wrapper.
+- Phase E started: added Rust ops `prepare-system-dirs`, `apply-blind-exit-lockdown`, `init-membership`, and `refresh-signed-trust`; `start.sh` now prefers these Rust paths with shell fallbacks and directly invokes `rustynet ops install-systemd` (wrapper fallback retained).
+- Phase E progress: `ensure_wireguard_keys` now prefers `rustynet ops bootstrap-wireguard-custody`; if the installed `rustynet` supports the command and it fails, setup now fails closed (no automatic downgrade to legacy shell path). Legacy shell fallback is only used when the command is unavailable in older binaries.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
@@ -205,3 +209,168 @@ Reason:
 - highest security impact,
 - smallest migration surface compared with `start.sh`,
 - easiest to validate with existing timers/gates.
+
+## 10) Remaining Migration Scope (Current Snapshot)
+Priority is based on: `privilege level` + `secret handling` + `state mutation risk` + `blast radius`.
+
+1. `start.sh` remaining privileged/secret subflows (highest priority)
+- `prepare_system_directories`
+- `ensure_wireguard_keys`
+- `ensure_membership_files`
+- `lockdown_blind_exit_local_material`
+- `configure_trust_material`
+- `refresh_signed_trust_evidence`
+- `write_daemon_environment`
+- `start_or_restart_service`
+- `disconnect_vpn`
+
+2. Release evidence/parity pipeline
+- `scripts/release/collect_platform_probe.sh`
+- `scripts/release/generate_platform_parity_report.sh`
+- `scripts/release/collect_platform_parity_bundle.sh`
+
+3. Operations evidence pipeline
+- `scripts/operations/collect_phase9_raw_evidence.sh`
+- `scripts/operations/generate_phase9_artifacts.sh`
+- `scripts/operations/generate_phase10_artifacts.sh`
+
+4. Performance measured-input pipeline
+- `scripts/perf/collect_phase1_measured_env.sh`
+- `scripts/perf/run_phase1_baseline.sh`
+
+5. Optional later (test harness hardening)
+- `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh`
+
+Keep as shell wrappers for now:
+- `scripts/ci/*` gate wrappers, `scripts/fuzz/smoke.sh` (orchestration glue; lower security ROI).
+
+## 11) Next Phases (Security-First)
+## Phase E: `start.sh` Privileged Core Extraction
+Scope:
+- Move remaining high-risk `start.sh` flows into Rust ops commands.
+- Keep `start.sh` as terminal UX/menu wrapper only.
+
+Recommended Rust command additions:
+- `rustynet ops prepare-system-dirs`
+- `rustynet ops bootstrap-wireguard-custody`
+- `rustynet ops init-membership`
+- `rustynet ops configure-trust`
+- `rustynet ops apply-blind-exit-lockdown`
+- `rustynet ops install-or-update-runtime`
+- `rustynet ops disconnect-cleanup`
+
+Security controls:
+- enforce absolute-path + symlink rejection on all sensitive file paths,
+- enforce owner/group/mode invariants before read/write,
+- replace shell temp-file handling with Rust tempfiles + explicit zeroization where possible,
+- move all credential materialization into Rust typed flows,
+- no secret-bearing values in logs, env echoes, or error strings.
+
+Validation:
+- full compile/test gates,
+- `phase10_gates` + `membership_gates`,
+- Linux matrix (Debian 13/Mint/Ubuntu/Fedora) role setup and role-switch checks,
+- macOS sanity run to confirm no launchd/keychain regressions.
+
+Exit criteria:
+- these `start.sh` functions are wrappers around Rust commands,
+- no direct shell handling of passphrase/key material in these paths.
+
+## Phase F: Release/Parity Pipeline Migration
+Scope:
+- Port phase6 parity probe/report bundle scripts to Rust.
+- Remove shell + Python-heredoc JSON construction in release path.
+
+Recommended Rust command additions:
+- `rustynet release collect-platform-probe`
+- `rustynet release generate-platform-parity-report`
+- `rustynet release collect-platform-parity-bundle`
+
+Security controls:
+- strict schema validation with typed structs,
+- fail closed on stale/future timestamps and malformed source paths,
+- deterministic artifact generation (canonical field handling and explicit metadata).
+
+Validation:
+- `./scripts/ci/check_phase6_platform_parity.sh`
+- `./scripts/ci/phase6_gates.sh`
+- cross-platform probe replay on Linux + macOS source artifacts.
+
+Exit criteria:
+- release parity artifacts are generated/validated by Rust command path only.
+
+## Phase G: Phase9/Phase10 Evidence Pipeline Migration
+Scope:
+- Port operations evidence collection/generation scripts to Rust.
+- keep gates unchanged; only swap artifact producer implementation.
+
+Recommended Rust command additions:
+- `rustynet ops collect-phase9-raw-evidence`
+- `rustynet ops generate-phase9-artifacts`
+- `rustynet ops generate-phase10-artifacts`
+
+Security controls:
+- typed, fail-closed validation for all required source artifacts,
+- explicit freshness windows and replay protections retained,
+- no trust in static pass/fail toggles (`gate_passed` remains rejected),
+- preserve measured-evidence-only model.
+
+Validation:
+- `./scripts/ci/check_phase9_readiness.sh`
+- `./scripts/ci/check_phase10_readiness.sh`
+- `./scripts/ci/phase9_gates.sh`
+- `./scripts/ci/phase10_gates.sh`
+
+Exit criteria:
+- operations evidence generation is Rust-backed with parity outputs.
+
+## Phase H: Phase1 Performance Measured Input Migration
+Scope:
+- replace shell+python measured env collector and baseline launcher logic with Rust.
+
+Recommended Rust command additions:
+- `rustynet perf collect-phase1-measured-env`
+- `rustynet perf run-phase1-baseline`
+
+Security controls:
+- remove `source` of generated shell files from baseline flow,
+- validate numeric ranges and required metrics with strict typed parsing,
+- produce deterministic output files with explicit permissions.
+
+Validation:
+- `./scripts/perf/run_phase1_baseline.sh` parity (during transition),
+- `./scripts/ci/phase1_gates.sh`,
+- `./scripts/ci/perf_regression_gate.sh`.
+
+Exit criteria:
+- measured-input derivation and phase1 baseline orchestration are Rust-backed.
+
+## Phase I (Optional): E2E Remote Orchestrator Migration
+Scope:
+- port `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` into Rust test harness tooling.
+
+Why optional:
+- high complexity but lower production-runtime risk than phases E-H,
+- still useful for secure remote orchestration and reproducibility.
+
+## 12) Implementation Pattern (Apply To Every Phase)
+1. Add Rust command with strict typed argument/env parsing.
+2. Add unit tests for parsing/validation + negative permission/path cases.
+3. Preserve current interface via thin shell wrapper (`exec rustynet ...`).
+4. Run mandatory gates and VM matrix for the impacted scope.
+5. Document behavior and rollback in README/operations docs.
+6. Keep wrapper for one release cycle, then remove dead shell logic.
+
+## 13) Sequencing Recommendation
+Execute in this order:
+1. Phase E
+2. Phase F
+3. Phase G
+4. Phase H
+5. Phase I (optional)
+
+Rationale:
+- starts with highest secret/privileged runtime risk,
+- then secures release/evidence integrity pipeline,
+- then removes remaining shell/Python evidence glue,
+- finally addresses less critical but complex e2e orchestration.

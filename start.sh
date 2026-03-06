@@ -541,11 +541,27 @@ run_root() {
   fi
 }
 
+run_rustynet_ops_with_scope() {
+  if ! command -v rustynet >/dev/null 2>&1; then
+    return 127
+  fi
+  if is_linux_host; then
+    run_root rustynet ops "$@"
+  else
+    rustynet ops "$@"
+  fi
+}
+
 secure_remove_file_with_scope() {
   local target="$1"
-  if [[ ! -f "${target}" ]]; then
+  if [[ ! -f "${target}" && ! -L "${target}" ]]; then
     return 0
   fi
+
+  if run_rustynet_ops_with_scope secure-remove --path "${target}" >/dev/null 2>&1; then
+    return 0
+  fi
+
   if is_linux_host; then
     if run_root command -v shred >/dev/null 2>&1; then
       run_root shred --force --remove "${target}" >/dev/null 2>&1 || true
@@ -559,6 +575,35 @@ secure_remove_file_with_scope() {
 }
 
 ensure_signing_passphrase_material() {
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_ops_status=1
+    if is_linux_host; then
+      run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops ensure-signing-passphrase-material >/dev/null 2>&1 || rust_ops_status=$?
+    elif is_macos_host; then
+      env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops ensure-signing-passphrase-material >/dev/null 2>&1 || rust_ops_status=$?
+    fi
+    if [[ "${rust_ops_status}" == "0" ]]; then
+      return 0
+    fi
+    print_warn "Rust-backed signing passphrase ensure flow failed; using legacy shell fallback."
+  fi
+
   if is_linux_host; then
     if [[ -f "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
       return 0
@@ -614,6 +659,46 @@ materialize_signing_passphrase_file() {
   local tmp_passphrase
   tmp_passphrase="$(mktemp)"
   chmod 600 "${tmp_passphrase}"
+
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_ops_status=1
+    if is_linux_host; then
+      run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops materialize-signing-passphrase --output "${tmp_passphrase}" >/dev/null 2>&1 || rust_ops_status=$?
+      if [[ "${rust_ops_status}" == "0" ]]; then
+        run_root chown root:root "${tmp_passphrase}" >/dev/null 2>&1 || true
+        run_root chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || true
+        printf -v "${__out_var}" '%s' "${tmp_passphrase}"
+        return 0
+      fi
+    elif is_macos_host; then
+      env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops materialize-signing-passphrase --output "${tmp_passphrase}" >/dev/null 2>&1 || rust_ops_status=$?
+      if [[ "${rust_ops_status}" == "0" ]]; then
+        chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || true
+        printf -v "${__out_var}" '%s' "${tmp_passphrase}"
+        return 0
+      fi
+    fi
+    secure_remove_file_with_scope "${tmp_passphrase}"
+    tmp_passphrase="$(mktemp)"
+    chmod 600 "${tmp_passphrase}"
+    print_warn "Rust-backed signing passphrase materialization failed; using legacy shell fallback."
+  fi
 
   if is_linux_host; then
     ensure_signing_passphrase_material || {
@@ -1647,6 +1732,62 @@ doctor_preflight() {
 }
 
 prepare_system_directories() {
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_ops_status=1
+    if is_linux_host; then
+      run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_STATE="${STATE_PATH}" \
+        RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+        RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+        RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+        RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+        RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+        RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+        RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+        rustynet ops prepare-system-dirs >/dev/null 2>&1 || rust_ops_status=$?
+    elif is_macos_host; then
+      env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_MACOS_STATE_BASE="${MACOS_STATE_BASE}" \
+        RUSTYNET_MACOS_RUNTIME_BASE="${MACOS_RUNTIME_BASE}" \
+        RUSTYNET_MACOS_LOG_BASE="${MACOS_LOG_BASE}" \
+        RUSTYNET_STATE="${STATE_PATH}" \
+        RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+        RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+        RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+        RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+        RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+        RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+        RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+        rustynet ops prepare-system-dirs >/dev/null 2>&1 || rust_ops_status=$?
+    fi
+
+    if [[ "${rust_ops_status}" -eq 0 ]]; then
+      return 0
+    fi
+    print_warn "Rust-backed directory preparation failed; using shell fallback."
+  fi
+
   if is_linux_host; then
     run_root install -d -m 0700 /etc/rustynet /run/rustynet /var/lib/rustynet
     run_root install -d -m 0700 "$(dirname "${STATE_PATH}")"
@@ -1699,6 +1840,34 @@ ensure_wireguard_keys() {
   }
 
   local legacy_linux_passphrase_path="/etc/rustynet/wireguard.passphrase"
+  local wg_init_prompt_approved="0"
+  local wg_init_required="0"
+
+  if is_linux_host; then
+    if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" && -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+      wg_init_required="0"
+    elif [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && ! -f "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
+      wg_init_required="0"
+    else
+      wg_init_required="1"
+    fi
+  elif is_macos_host; then
+    if [[ -f "${WG_ENCRYPTED_PRIVATE_KEY_PATH}" && -f "${WG_PUBLIC_KEY_PATH}" ]]; then
+      wg_init_required="0"
+    else
+      wg_init_required="1"
+    fi
+  fi
+
+  if [[ "${wg_init_required}" == "1" ]]; then
+    if ! prompt_yes_no "Encrypted WireGuard key material is missing. Initialize now?" "y"; then
+      print_err "Encrypted WireGuard key material is required."
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      exit 1
+    fi
+    wg_init_prompt_approved="1"
+  fi
+
   if is_macos_host; then
     ensure_macos_keychain_passphrase_account
     if ! command -v security >/dev/null 2>&1; then
@@ -1706,6 +1875,64 @@ ensure_wireguard_keys() {
       unset -f run_with_scope >/dev/null 2>&1 || true
       exit 1
     fi
+  fi
+
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_wg_bootstrap_output=""
+    local rust_allow_init="false"
+    local rust_wg_bootstrap_supported="1"
+    if [[ "${wg_init_prompt_approved}" == "1" ]]; then
+      rust_allow_init="true"
+    fi
+    if is_linux_host; then
+      if rust_wg_bootstrap_output="$(run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_WG_LEGACY_PRIVATE_KEY="/etc/rustynet/wireguard.key" \
+        RUSTYNET_WG_LEGACY_PASSPHRASE_PATH="${legacy_linux_passphrase_path}" \
+        RUSTYNET_WG_CUSTODY_ALLOW_INIT="${rust_allow_init}" \
+        RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops bootstrap-wireguard-custody 2>&1)"; then
+        [[ -n "${rust_wg_bootstrap_output}" ]] && print_info "${rust_wg_bootstrap_output}"
+        unset -f run_with_scope >/dev/null 2>&1 || true
+        return 0
+      fi
+    elif is_macos_host; then
+      if rust_wg_bootstrap_output="$(env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+        RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_WG_LEGACY_PRIVATE_KEY="/etc/rustynet/wireguard.key" \
+        RUSTYNET_WG_LEGACY_PASSPHRASE_PATH="${legacy_linux_passphrase_path}" \
+        RUSTYNET_WG_CUSTODY_ALLOW_INIT="${rust_allow_init}" \
+        RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops bootstrap-wireguard-custody 2>&1)"; then
+        [[ -n "${rust_wg_bootstrap_output}" ]] && print_info "${rust_wg_bootstrap_output}"
+        unset -f run_with_scope >/dev/null 2>&1 || true
+        return 0
+      fi
+    fi
+    if [[ "${rust_wg_bootstrap_output}" == *"unknown ops subcommand: bootstrap-wireguard-custody"* ]] \
+      || [[ "${rust_wg_bootstrap_output}" == *"unknown command: ops"* ]] \
+      || [[ "${rust_wg_bootstrap_output}" == *"unknown command: bootstrap-wireguard-custody"* ]]; then
+      rust_wg_bootstrap_supported="0"
+    fi
+    if [[ "${rust_wg_bootstrap_supported}" == "1" ]]; then
+      print_err "Rust-backed WireGuard custody bootstrap failed; refusing shell fallback to preserve fail-closed security posture."
+      [[ -n "${rust_wg_bootstrap_output}" ]] && print_err "${rust_wg_bootstrap_output}"
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      exit 1
+    fi
+    print_warn "Installed rustynet binary does not support bootstrap-wireguard-custody; using legacy shell fallback."
   fi
 
   if is_linux_host \
@@ -1750,9 +1977,12 @@ ensure_wireguard_keys() {
     exit 1
   fi
 
-  if ! prompt_yes_no "Encrypted WireGuard key material is missing. Initialize now?" "y"; then
-    print_err "Encrypted WireGuard key material is required."
-    exit 1
+  if [[ "${wg_init_prompt_approved}" != "1" ]]; then
+    if ! prompt_yes_no "Encrypted WireGuard key material is missing. Initialize now?" "y"; then
+      print_err "Encrypted WireGuard key material is required."
+      unset -f run_with_scope >/dev/null 2>&1 || true
+      exit 1
+    fi
   fi
 
   local passphrase_source_path=""
@@ -1827,6 +2057,47 @@ ensure_wireguard_keys() {
 }
 
 ensure_membership_files() {
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_ops_status=1
+    if is_linux_host; then
+      run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+        RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
+        RUSTYNET_NETWORK_ID="local-net" \
+        RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+        RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+        RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops init-membership >/dev/null 2>&1 || rust_ops_status=$?
+    elif is_macos_host; then
+      env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+        RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
+        RUSTYNET_NETWORK_ID="local-net" \
+        RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+        RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+        RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops init-membership >/dev/null 2>&1 || rust_ops_status=$?
+    fi
+    if [[ "${rust_ops_status}" == "0" ]]; then
+      return 0
+    fi
+    print_warn "Rust-backed membership initialization failed; using legacy shell fallback."
+  fi
+
   run_with_scope() {
     if is_linux_host; then
       run_root "$@"
@@ -1877,6 +2148,20 @@ lockdown_blind_exit_local_material() {
   if ! is_linux_host; then
     return 0
   fi
+
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_lockdown_output=""
+    if rust_lockdown_output="$(run_root env \
+      RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+      RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH="${ASSIGNMENT_REFRESH_ENV_PATH}" \
+      RUSTYNET_SYSTEMD_ENV_PATH="/etc/default/rustynetd" \
+      rustynet ops apply-blind-exit-lockdown 2>&1)"; then
+      [[ -n "${rust_lockdown_output}" ]] && print_info "${rust_lockdown_output}"
+      return 0
+    fi
+    print_warn "Rust-backed blind_exit lockdown failed; using shell fallback."
+  fi
+
   local removed_any="0"
   local path
   for path in /etc/rustynet/assignment.signing.secret /etc/rustynet/assignment-refresh.env; do
@@ -1914,27 +2199,62 @@ refresh_signed_trust_evidence() {
     print_info "This device is configured as role '${NODE_ROLE}'."
     return 0
   fi
-  local refresh_script="${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
-  local signing_passphrase_file=""
-  if [[ ! -f "${refresh_script}" ]]; then
-    print_err "Missing trust refresh helper: ${refresh_script}"
-    return 1
-  fi
   if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     print_err "Signer key not found at ${TRUST_SIGNER_KEY_PATH}"
     return 1
   fi
+
+  if command -v rustynet >/dev/null 2>&1; then
+    local rust_refresh_output=""
+    if is_linux_host; then
+      if rust_refresh_output="$(run_root env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+        RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops refresh-signed-trust 2>&1)"; then
+        [[ -n "${rust_refresh_output}" ]] && print_info "${rust_refresh_output}"
+        print_info "Signed trust evidence refreshed at ${TRUST_EVIDENCE_PATH}"
+        return 0
+      fi
+    elif is_macos_host; then
+      if rust_refresh_output="$(env \
+        RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+        RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+        RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+        RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+        RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+        RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+        RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
+        RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+        RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+        rustynet ops refresh-signed-trust 2>&1)"; then
+        [[ -n "${rust_refresh_output}" ]] && print_info "${rust_refresh_output}"
+        print_info "Signed trust evidence refreshed at ${TRUST_EVIDENCE_PATH}"
+        return 0
+      fi
+    fi
+    print_warn "Rust-backed signed trust refresh failed; using legacy shell fallback."
+  fi
+
+  local signing_passphrase_file=""
   if ! materialize_signing_passphrase_file signing_passphrase_file; then
     return 1
   fi
-
   if ! run_root env \
     RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
     RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
     RUSTYNET_TRUST_SIGNING_KEY_PASSPHRASE_FILE="${signing_passphrase_file}" \
     RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
     RUSTYNET_TRUST_AUTO_REFRESH=true \
-    "${refresh_script}"; then
+    rustynet ops refresh-trust; then
     secure_remove_file_with_scope "${signing_passphrase_file}"
     return 1
   fi
@@ -2095,47 +2415,64 @@ write_daemon_environment() {
   fi
   enforce_auto_tunnel_policy
   require_linux_dataplane "write_daemon_environment" || return 0
+
+  run_systemd_installer_with_env() {
+    run_root env \
+      RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
+      RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+      RUSTYNET_SOCKET="${SOCKET_PATH}" \
+      RUSTYNET_STATE="${STATE_PATH}" \
+      RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+      RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+      RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+      RUSTYNET_TRUST_AUTO_REFRESH="$( [[ "${AUTO_REFRESH_TRUST}" == "1" ]] && echo true || echo false )" \
+      RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+      RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+      RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+      RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
+      RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
+      RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+      RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+      RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+      RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
+      RUSTYNET_BACKEND="${BACKEND_MODE}" \
+      RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
+      RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
+      RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+      RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+      RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+      RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
+      RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+      RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
+      RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
+      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+      RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
+      RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
+      RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
+      RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
+      RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
+      "$@"
+  }
+
+  if command -v rustynet >/dev/null 2>&1; then
+    if run_systemd_installer_with_env \
+      RUSTYNET_INSTALL_SOURCE_ROOT="${ROOT_DIR}" \
+      rustynet ops install-systemd; then
+      unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
+      return 0
+    fi
+    print_warn "Rust-backed systemd installer invocation failed; using wrapper fallback."
+  fi
+
   local service_installer="${ROOT_DIR}/scripts/systemd/install_rustynetd_service.sh"
   if [[ ! -f "${service_installer}" ]]; then
     print_err "Missing installer script: ${service_installer}"
+    unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
     exit 1
   fi
-  run_root env \
-    RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
-    RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
-    RUSTYNET_SOCKET="${SOCKET_PATH}" \
-    RUSTYNET_STATE="${STATE_PATH}" \
-    RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
-    RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
-    RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
-    RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
-    RUSTYNET_TRUST_AUTO_REFRESH="$( [[ "${AUTO_REFRESH_TRUST}" == "1" ]] && echo true || echo false )" \
-    RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
-    RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
-    RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
-    RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
-    RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
-    RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
-    RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
-    RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
-    RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
-    RUSTYNET_BACKEND="${BACKEND_MODE}" \
-    RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
-    RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
-    RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
-    RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-    RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
-    RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
-    RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
-    RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
-    RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
-    RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
-    RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
-    RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
-    RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
-    RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
-    RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
-    "${service_installer}"
+  run_systemd_installer_with_env "${service_installer}"
+  unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
 }
 
 macos_wait_for_socket() {
@@ -2863,8 +3200,6 @@ local_assignment_refresh_available() {
 
 set_local_assignment_refresh_exit_node() {
   local exit_node_id="${1:-}"
-  local escaped_exit_node_id
-  escaped_exit_node_id="${exit_node_id}"
 
   if ! is_linux_host; then
     return 0
@@ -2878,6 +3213,26 @@ set_local_assignment_refresh_exit_node() {
     return 1
   fi
 
+  if command -v rustynet >/dev/null 2>&1; then
+    if [[ -n "${exit_node_id}" ]]; then
+      if run_root rustynet ops set-assignment-refresh-exit-node \
+        --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}" \
+        --exit-node-id "${exit_node_id}" >/dev/null 2>&1; then
+        print_info "Persisted preferred exit node in ${ASSIGNMENT_REFRESH_ENV_PATH}: ${exit_node_id}"
+        return 0
+      fi
+    else
+      if run_root rustynet ops set-assignment-refresh-exit-node \
+        --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}" >/dev/null 2>&1; then
+        print_info "Cleared preferred exit node from ${ASSIGNMENT_REFRESH_ENV_PATH}."
+        return 0
+      fi
+    fi
+    print_warn "Rust-backed assignment refresh env update failed; using shell fallback."
+  fi
+
+  local escaped_exit_node_id
+  escaped_exit_node_id="${exit_node_id}"
   run_root bash -lc "
 set -euo pipefail
 path='${ASSIGNMENT_REFRESH_ENV_PATH}'
@@ -2941,6 +3296,7 @@ force_local_assignment_refresh_now() {
 
 switch_node_role_mode() {
   local previous_role target_role preferred_exit_node enable_exit_advertise
+  local enable_exit_advertise_bool rust_role_coupling_done
   local role_confirm_default
 
   normalize_node_role
@@ -3006,27 +3362,54 @@ switch_node_role_mode() {
   fi
 
   if is_linux_host; then
-    if [[ "${target_role}" == "client" ]]; then
-      set_local_assignment_refresh_exit_node "${preferred_exit_node}" || true
-      force_local_assignment_refresh_now || true
+    enable_exit_advertise_bool="false"
+    if [[ "${enable_exit_advertise}" == "1" ]]; then
+      enable_exit_advertise_bool="true"
+    fi
+    rust_role_coupling_done="0"
+
+    if command -v rustynet >/dev/null 2>&1; then
+      local role_coupling_cmd=(rustynet ops apply-role-coupling \
+        --target-role "${target_role}" \
+        --enable-exit-advertise "${enable_exit_advertise_bool}" \
+        --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}")
       if [[ -n "${preferred_exit_node}" ]]; then
-        if run_rustynet_cli exit-node select "${preferred_exit_node}"; then
-          print_info "Selected exit node: ${preferred_exit_node}"
+        role_coupling_cmd+=(--preferred-exit-node-id "${preferred_exit_node}")
+      fi
+      if run_root env \
+        RUSTYNET_SOCKET="${SOCKET_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+        RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+        "${role_coupling_cmd[@]}"; then
+        rust_role_coupling_done="1"
+      else
+        print_warn "Rust-backed role coupling failed; using legacy shell fallback."
+      fi
+    fi
+
+    if [[ "${rust_role_coupling_done}" != "1" ]]; then
+      if [[ "${target_role}" == "client" ]]; then
+        set_local_assignment_refresh_exit_node "${preferred_exit_node}" || true
+        force_local_assignment_refresh_now || true
+        if [[ -n "${preferred_exit_node}" ]]; then
+          if run_rustynet_cli exit-node select "${preferred_exit_node}"; then
+            print_info "Selected exit node: ${preferred_exit_node}"
+          else
+            print_warn "Failed to select exit node '${preferred_exit_node}'."
+          fi
         else
-          print_warn "Failed to select exit node '${preferred_exit_node}'."
+          run_rustynet_cli exit-node off >/dev/null 2>&1 || true
         fi
       else
+        set_local_assignment_refresh_exit_node "" || true
+        force_local_assignment_refresh_now || true
         run_rustynet_cli exit-node off >/dev/null 2>&1 || true
-      fi
-    else
-      set_local_assignment_refresh_exit_node "" || true
-      force_local_assignment_refresh_now || true
-      run_rustynet_cli exit-node off >/dev/null 2>&1 || true
-      if [[ "${enable_exit_advertise}" == "1" ]]; then
-        if run_rustynet_cli route advertise 0.0.0.0/0; then
-          print_info "Exit route advertised (0.0.0.0/0)."
-        else
-          print_warn "Failed to advertise default exit route."
+        if [[ "${enable_exit_advertise}" == "1" ]]; then
+          if run_rustynet_cli route advertise 0.0.0.0/0; then
+            print_info "Exit route advertised (0.0.0.0/0)."
+          else
+            print_warn "Failed to advertise default exit route."
+          fi
         fi
       fi
     fi
