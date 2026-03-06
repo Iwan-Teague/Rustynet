@@ -163,9 +163,9 @@ if [[ "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${SERVICE_CREDENTIAL_BLOB_
 fi
 
 case "${NODE_ROLE}" in
-  admin|client) ;;
+  admin|client|blind_exit) ;;
   *)
-    echo "invalid node role: ${NODE_ROLE} (expected admin|client)" >&2
+    echo "invalid node role: ${NODE_ROLE} (expected admin|client|blind_exit)" >&2
     exit 1
     ;;
 esac

@@ -94,6 +94,7 @@ pub const DEFAULT_NODE_ID: &str = "daemon-local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
+const BLIND_EXIT_DEFAULT_ROUTE_CIDR: &str = "0.0.0.0/0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -130,6 +131,7 @@ pub enum NodeRole {
     #[default]
     Admin,
     Client,
+    BlindExit,
 }
 
 impl NodeRole {
@@ -137,7 +139,12 @@ impl NodeRole {
         match self {
             NodeRole::Admin => "admin",
             NodeRole::Client => "client",
+            NodeRole::BlindExit => "blind_exit",
         }
+    }
+
+    fn is_blind_exit(self) -> bool {
+        matches!(self, NodeRole::BlindExit)
     }
 
     fn allows_command(self, command: &IpcCommand) -> bool {
@@ -153,6 +160,10 @@ impl NodeRole {
                     | IpcCommand::LanAccessOff
                     | IpcCommand::DnsInspect
             ),
+            NodeRole::BlindExit => matches!(
+                command,
+                IpcCommand::Status | IpcCommand::Netcheck | IpcCommand::DnsInspect
+            ),
         }
     }
 }
@@ -164,7 +175,8 @@ impl std::str::FromStr for NodeRole {
         match value {
             "admin" => Ok(NodeRole::Admin),
             "client" => Ok(NodeRole::Client),
-            _ => Err("invalid node role: expected admin or client".to_string()),
+            "blind_exit" | "blind-exit" => Ok(NodeRole::BlindExit),
+            _ => Err("invalid node role: expected admin, client, or blind_exit".to_string()),
         }
     }
 }
@@ -1008,6 +1020,15 @@ impl DaemonRuntime {
                 return;
             }
         }
+        if let Err(err) = self.enforce_blind_exit_invariants() {
+            self.restrict_permanent(format!(
+                "blind-exit role invariants failed during bootstrap: {err}"
+            ));
+            let _ = self
+                .controller
+                .force_fail_closed("blind_exit_invariants_failed");
+            return;
+        }
 
         let trust = match self.load_verified_trust() {
             Ok(evidence) => evidence,
@@ -1072,6 +1093,14 @@ impl DaemonRuntime {
                     None,
                 )
             };
+        if let Err(err) = self.validate_blind_exit_assignment(auto_exit.as_deref(), auto_lan_access)
+        {
+            self.restrict_recoverable(err);
+            let _ = self
+                .controller
+                .force_fail_closed("blind_exit_assignment_rejected");
+            return;
+        }
 
         let local_node = match NodeId::new(self.local_node_id.clone()) {
             Ok(node_id) => node_id,
@@ -1090,7 +1119,9 @@ impl DaemonRuntime {
             return;
         }
 
-        let serve_exit_node = if self.auto_tunnel_enforce {
+        let serve_exit_node = if self.node_role.is_blind_exit() {
+            true
+        } else if self.auto_tunnel_enforce {
             self.is_serving_exit_node(auto_exit.as_deref())
         } else {
             self.is_serving_exit_node(self.selected_exit_node.as_deref())
@@ -1109,7 +1140,9 @@ impl DaemonRuntime {
                 protected_dns: true,
                 ipv6_parity_supported: false,
                 serve_exit_node,
-                exit_mode: if self.auto_tunnel_enforce {
+                exit_mode: if self.node_role.is_blind_exit() {
+                    ExitMode::Off
+                } else if self.auto_tunnel_enforce {
                     if auto_exit.is_some() {
                         ExitMode::FullTunnel
                     } else {
@@ -1149,9 +1182,15 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory;
 
         if self.auto_tunnel_enforce {
-            self.selected_exit_node = auto_exit;
-            self.lan_access_enabled = auto_lan_access;
-            self.controller.set_lan_access(auto_lan_access);
+            if self.node_role.is_blind_exit() {
+                self.selected_exit_node = None;
+                self.lan_access_enabled = false;
+                self.controller.set_lan_access(false);
+            } else {
+                self.selected_exit_node = auto_exit;
+                self.lan_access_enabled = auto_lan_access;
+                self.controller.set_lan_access(auto_lan_access);
+            }
             self.last_applied_assignment = auto_watermark;
         } else if let Some(exit_node) = &self.selected_exit_node {
             if let Ok(node_id) = NodeId::new(exit_node.clone()) {
@@ -1664,6 +1703,16 @@ impl DaemonRuntime {
     fn reconcile(&mut self) {
         self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
         self.last_reconcile_unix = Some(unix_now());
+        if let Err(err) = self.enforce_blind_exit_invariants() {
+            self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+            let message = format!("blind-exit role invariants failed during reconcile: {err}");
+            self.last_reconcile_error = Some(message.clone());
+            self.restrict_permanent(message);
+            let _ = self
+                .controller
+                .force_fail_closed("blind_exit_invariants_failed");
+            return;
+        }
 
         let trust = match self.load_verified_trust() {
             Ok(evidence) => evidence,
@@ -1758,6 +1807,18 @@ impl DaemonRuntime {
                         None,
                     )
                 };
+            if let Err(err) =
+                self.validate_blind_exit_assignment(auto_exit.as_deref(), auto_lan_access)
+            {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                self.last_reconcile_error = Some(err.clone());
+                self.restrict_recoverable(err);
+                let _ = self
+                    .controller
+                    .force_fail_closed("blind_exit_assignment_rejected");
+                self.promote_to_permanent_if_over_limit();
+                return;
+            }
             let local_node = match NodeId::new(self.local_node_id.clone()) {
                 Ok(node_id) => node_id,
                 Err(err) => {
@@ -1782,7 +1843,9 @@ impl DaemonRuntime {
                 return;
             }
 
-            let serve_exit_node = if self.auto_tunnel_enforce {
+            let serve_exit_node = if self.node_role.is_blind_exit() {
+                true
+            } else if self.auto_tunnel_enforce {
                 self.is_serving_exit_node(auto_exit.as_deref())
             } else {
                 self.is_serving_exit_node(self.selected_exit_node.as_deref())
@@ -1801,7 +1864,9 @@ impl DaemonRuntime {
                     protected_dns: true,
                     ipv6_parity_supported: false,
                     serve_exit_node,
-                    exit_mode: if self.auto_tunnel_enforce {
+                    exit_mode: if self.node_role.is_blind_exit() {
+                        ExitMode::Off
+                    } else if self.auto_tunnel_enforce {
                         if auto_exit.is_some() {
                             ExitMode::FullTunnel
                         } else {
@@ -1819,9 +1884,15 @@ impl DaemonRuntime {
                     self.membership_state = Some(membership_state);
                     self.membership_directory = membership_directory;
                     if self.auto_tunnel_enforce {
-                        self.selected_exit_node = auto_exit;
-                        self.lan_access_enabled = auto_lan_access;
-                        self.controller.set_lan_access(auto_lan_access);
+                        if self.node_role.is_blind_exit() {
+                            self.selected_exit_node = None;
+                            self.lan_access_enabled = false;
+                            self.controller.set_lan_access(false);
+                        } else {
+                            self.selected_exit_node = auto_exit;
+                            self.lan_access_enabled = auto_lan_access;
+                            self.controller.set_lan_access(auto_lan_access);
+                        }
                         self.last_applied_assignment = auto_watermark;
                     }
                     self.restriction_mode = RestrictionMode::None;
@@ -1862,6 +1933,54 @@ impl DaemonRuntime {
         }
     }
 
+    fn enforce_blind_exit_invariants(&mut self) -> Result<(), String> {
+        if !self.node_role.is_blind_exit() {
+            return Ok(());
+        }
+        let mut changed = false;
+        if self.selected_exit_node.take().is_some() {
+            changed = true;
+        }
+        if self.lan_access_enabled {
+            self.lan_access_enabled = false;
+            self.controller.set_lan_access(false);
+            changed = true;
+        }
+        if !self
+            .advertised_routes
+            .contains(BLIND_EXIT_DEFAULT_ROUTE_CIDR)
+        {
+            self.advertised_routes
+                .insert(BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_string());
+            self.local_route_reconcile_pending = true;
+            changed = true;
+        }
+        if changed {
+            self.persist_state()?;
+        }
+        Ok(())
+    }
+
+    fn validate_blind_exit_assignment(
+        &self,
+        selected_exit_node: Option<&str>,
+        lan_access_enabled: bool,
+    ) -> Result<(), String> {
+        if !self.node_role.is_blind_exit() {
+            return Ok(());
+        }
+        if selected_exit_node.is_some() {
+            return Err(
+                "blind_exit role rejects selected_exit_node assignments and cannot operate as a client"
+                    .to_string(),
+            );
+        }
+        if lan_access_enabled {
+            return Err("blind_exit role rejects LAN route advertisement assignments".to_string());
+        }
+        Ok(())
+    }
+
     fn desired_exit_mode(&self) -> ExitMode {
         if self.selected_exit_node.is_some() {
             ExitMode::FullTunnel
@@ -1871,11 +1990,17 @@ impl DaemonRuntime {
     }
 
     fn is_serving_exit_node(&self, selected_exit_node: Option<&str>) -> bool {
-        selected_exit_node.is_none() && self.advertised_routes.contains("0.0.0.0/0")
+        self.node_role.is_blind_exit()
+            || (selected_exit_node.is_none()
+                && self
+                    .advertised_routes
+                    .contains(BLIND_EXIT_DEFAULT_ROUTE_CIDR))
     }
 
     fn allow_auto_tunnel_exit_advertisement(&self, cidr: &str) -> bool {
-        cidr == "0.0.0.0/0" && self.selected_exit_node.is_none()
+        !self.node_role.is_blind_exit()
+            && cidr == BLIND_EXIT_DEFAULT_ROUTE_CIDR
+            && self.selected_exit_node.is_none()
     }
 
     fn is_restricted(&self) -> bool {
@@ -4566,6 +4691,74 @@ mod tests {
 
         let route =
             runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
+        assert!(!route.ok);
+        assert!(route.message.contains("node role"));
+
+        let key_rotate = runtime.handle_command(IpcCommand::KeyRotate);
+        assert!(!key_rotate.ok);
+        assert!(key_rotate.message.contains("node role"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_blind_exit_role_is_least_privilege() {
+        let test_dir = secure_test_dir("rustynetd-runtime-blind-exit-role");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::BlindExit,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("node_role=blind_exit"));
+        assert!(status.message.contains("serving_exit_node=true"));
+
+        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        assert!(!select.ok);
+        assert!(select.message.contains("node role"));
+
+        let exit_off = runtime.handle_command(IpcCommand::ExitNodeOff);
+        assert!(!exit_off.ok);
+        assert!(exit_off.message.contains("node role"));
+
+        let lan_on = runtime.handle_command(IpcCommand::LanAccessOn);
+        assert!(!lan_on.ok);
+        assert!(lan_on.message.contains("node role"));
+
+        let route = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()));
         assert!(!route.ok);
         assert!(route.message.contains("node role"));
 

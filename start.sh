@@ -263,12 +263,16 @@ normalize_node_role() {
   fi
 
   case "${NODE_ROLE}" in
-    admin|client) ;;
+    admin|client|blind_exit) ;;
     *)
       print_warn "Invalid NODE_ROLE='${NODE_ROLE}', defaulting to 'client'."
       NODE_ROLE="client"
       ;;
   esac
+  if [[ "${NODE_ROLE}" == "blind_exit" ]] && ! is_linux_host; then
+    print_warn "blind_exit role is supported only on Linux hosts. Reverting to client role."
+    NODE_ROLE="client"
+  fi
 }
 
 is_admin_role() {
@@ -277,6 +281,19 @@ is_admin_role() {
 
 is_client_role() {
   [[ "${NODE_ROLE}" == "client" ]]
+}
+
+is_blind_exit_role() {
+  [[ "${NODE_ROLE}" == "blind_exit" ]]
+}
+
+blind_exit_role_locked() {
+  is_blind_exit_role && [[ "${SETUP_COMPLETE}" == "1" ]]
+}
+
+print_blind_exit_lock_notice() {
+  print_warn "blind_exit role is immutable after setup."
+  print_info "To change role, perform a factory reset and provision fresh key material on this device."
 }
 
 require_admin_role() {
@@ -291,18 +308,36 @@ require_admin_role() {
 
 enforce_role_policy_defaults() {
   normalize_node_role
+  if is_admin_role; then
+    return 0
+  fi
+
+  MANUAL_PEER_OVERRIDE="0"
+  if [[ "${AUTO_REFRESH_TRUST}" == "1" && ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+    print_warn "Trust signer key ${TRUST_SIGNER_KEY_PATH} is unavailable; disabling AUTO_REFRESH_TRUST for role '${NODE_ROLE}'."
+    AUTO_REFRESH_TRUST="0"
+  fi
+
   if is_client_role; then
-    MANUAL_PEER_OVERRIDE="0"
-    if [[ "${AUTO_REFRESH_TRUST}" == "1" && ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
-      print_warn "Trust signer key ${TRUST_SIGNER_KEY_PATH} is unavailable; disabling AUTO_REFRESH_TRUST for client role."
-      AUTO_REFRESH_TRUST="0"
-    fi
     case "${DEFAULT_LAUNCH_PROFILE}" in
       quick-exit-node|quick-hybrid)
         print_warn "Launch profile '${DEFAULT_LAUNCH_PROFILE}' is admin-only; forcing 'quick-connect' for client role."
         DEFAULT_LAUNCH_PROFILE="quick-connect"
         ;;
     esac
+    return 0
+  fi
+
+  if is_blind_exit_role; then
+    if [[ "${DEFAULT_LAUNCH_PROFILE}" != "quick-exit-node" ]]; then
+      print_warn "blind_exit role enforces default launch profile 'quick-exit-node'."
+      DEFAULT_LAUNCH_PROFILE="quick-exit-node"
+    fi
+    AUTO_LAUNCH_ON_START="1"
+    AUTO_LAUNCH_EXIT_NODE_ID=""
+    AUTO_LAUNCH_LAN_MODE="off"
+    FAIL_CLOSED_SSH_ALLOW="0"
+    FAIL_CLOSED_SSH_ALLOW_CIDRS=""
   fi
 }
 
@@ -554,6 +589,7 @@ Rustynet startup options:
 
   ./start.sh --profile <menu|quick-connect|quick-exit-node|quick-hybrid>
     Apply a launch profile once. Non-menu profiles apply and exit.
+    blind_exit role accepts only 'menu' or 'quick-exit-node'.
 
   ./start.sh --auto
     Apply saved default launch profile once and exit.
@@ -1656,6 +1692,10 @@ ensure_membership_files() {
   }
   if [[ -f "${MEMBERSHIP_SNAPSHOT_PATH}" && -f "${MEMBERSHIP_LOG_PATH}" ]]; then
     print_info "Membership files already present."
+    if is_blind_exit_role && [[ -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" ]]; then
+      run_root rm -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
+      print_info "Removed local membership owner signing key for blind_exit least-knowledge role."
+    fi
     unset -f run_with_scope >/dev/null 2>&1 || true
     return
   fi
@@ -1668,7 +1708,33 @@ ensure_membership_files() {
     --node-id "${DEVICE_NODE_ID}" \
     --network-id "local-net" \
     --force
+  if is_blind_exit_role && [[ -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" ]]; then
+    run_root rm -f "${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
+    print_info "Removed local membership owner signing key for blind_exit least-knowledge role."
+  fi
   unset -f run_with_scope >/dev/null 2>&1 || true
+}
+
+lockdown_blind_exit_local_material() {
+  if ! is_blind_exit_role; then
+    return 0
+  fi
+  if ! is_linux_host; then
+    return 0
+  fi
+  local removed_any="0"
+  local path
+  for path in /etc/rustynet/assignment.signing.secret /etc/rustynet/assignment-refresh.env; do
+    if run_root test -e "${path}" >/dev/null 2>&1; then
+      run_root rm -f "${path}"
+      removed_any="1"
+    fi
+  done
+  run_root sed -i 's/^RUSTYNET_ASSIGNMENT_AUTO_REFRESH=.*/RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false/' /etc/default/rustynetd >/dev/null 2>&1 || true
+  run_root systemctl disable --now rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
+  if [[ "${removed_any}" == "1" ]]; then
+    print_info "Removed local assignment-signing material for blind_exit least-knowledge role."
+  fi
 }
 
 generate_verifier_key_from_signer() {
@@ -1710,6 +1776,24 @@ refresh_signed_trust_evidence() {
 }
 
 configure_trust_material() {
+  if is_blind_exit_role; then
+    print_info "blind_exit role detected: provisioning local trust material for unattended operation."
+    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
+      run_root openssl genpkey -algorithm ED25519 -out "${TRUST_SIGNER_KEY_PATH}"
+      run_root chmod 600 "${TRUST_SIGNER_KEY_PATH}"
+      print_warn "Generated local trust signer key at ${TRUST_SIGNER_KEY_PATH} for blind_exit role."
+    fi
+    generate_verifier_key_from_signer
+    run_root env \
+      RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+      RUSTYNET_DAEMON_GROUP="${RUSTYNET_DAEMON_GROUP:-rustynetd}" \
+      RUSTYNET_TRUST_AUTO_REFRESH=true \
+      "${ROOT_DIR}/scripts/systemd/refresh_trust_evidence.sh"
+    AUTO_REFRESH_TRUST="1"
+    return 0
+  fi
+
   if is_client_role; then
     print_info "Client role detected: trust signer operations are disabled."
     local source_verifier
@@ -2263,6 +2347,9 @@ start_or_restart_service() {
     print_err "Refusing to start service until preflight doctor passes."
     return 1
   fi
+  if is_blind_exit_role; then
+    lockdown_blind_exit_local_material || true
+  fi
   write_daemon_environment
   if [[ "${AUTO_REFRESH_TRUST}" == "1" && -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
     refresh_signed_trust_evidence || print_warn "Failed to refresh trust evidence before start."
@@ -2663,6 +2750,10 @@ switch_node_role_mode() {
   local role_confirm_default
 
   normalize_node_role
+  if blind_exit_role_locked; then
+    print_blind_exit_lock_notice
+    return 1
+  fi
   previous_role="${NODE_ROLE}"
   print_info "Current node role: ${previous_role}"
   prompt_default target_role "Target node role (admin|client)" "${NODE_ROLE}"
@@ -2867,9 +2958,9 @@ connect_to_device() {
   prompt_default endpoint_ip "Peer endpoint IP or DNS" ""
   prompt_default endpoint_port "Peer endpoint port" "51820"
   prompt_default cidr "Peer tunnel CIDR" "100.64.0.2/32"
-  prompt_default peer_role "Peer role (admin|client)" "client"
+  prompt_default peer_role "Peer role (admin|client|blind_exit)" "client"
   case "${peer_role}" in
-    admin|client) ;;
+    admin|client|blind_exit) ;;
     *)
       print_warn "Unsupported peer role '${peer_role}', storing as client."
       peer_role="client"
@@ -3011,8 +3102,15 @@ apply_rotation_bundle() {
 
 configure_launch_defaults() {
   local profile_prompt
+  if blind_exit_role_locked; then
+    print_blind_exit_lock_notice
+    print_info "Launch defaults are locked for blind_exit role."
+    return 1
+  fi
   if is_admin_role; then
     profile_prompt="Default launch profile (menu|quick-connect|quick-exit-node|quick-hybrid)"
+  elif is_blind_exit_role; then
+    profile_prompt="Default launch profile (menu|quick-exit-node)"
   else
     profile_prompt="Default launch profile (menu|quick-connect)"
   fi
@@ -3034,7 +3132,7 @@ configure_launch_defaults() {
 configure_values() {
   local detected_egress
   local fallback_egress="eth0"
-  local previous_role selected_role confirm_default
+  local previous_role selected_role confirm_default role_prompt
   if is_macos_host; then
     fallback_egress="en0"
   fi
@@ -3045,8 +3143,35 @@ configure_values() {
 
   normalize_node_role
   previous_role="${NODE_ROLE}"
+  if blind_exit_role_locked; then
+    print_blind_exit_lock_notice
+    return 1
+  fi
   prompt_default DEVICE_NODE_ID "Local device node id (used for display)" "${DEVICE_NODE_ID}"
-  prompt_default selected_role "Node role (admin|client)" "${NODE_ROLE}"
+  role_prompt="Node role (admin|client)"
+  if [[ "${SETUP_COMPLETE}" != "1" ]]; then
+    role_prompt="Node role (admin|client|blind_exit)"
+  fi
+  prompt_default selected_role "${role_prompt}" "${NODE_ROLE}"
+  case "${selected_role}" in
+    admin|client|blind_exit) ;;
+    *)
+      print_err "Unsupported node role '${selected_role}'. Expected admin, client, or blind_exit."
+      return 1
+      ;;
+  esac
+  if [[ "${selected_role}" == "blind_exit" ]] && ! is_linux_host; then
+    print_err "blind_exit role is supported only on Linux hosts."
+    return 1
+  fi
+  if [[ "${SETUP_COMPLETE}" == "1" && "${selected_role}" != "${previous_role}" ]]; then
+    if [[ "${selected_role}" == "blind_exit" || "${previous_role}" == "blind_exit" ]]; then
+      print_blind_exit_lock_notice
+      return 1
+    fi
+    print_warn "Role changes after setup must use 'Switch node role (guided client/admin transition)'."
+    selected_role="${previous_role}"
+  fi
   NODE_ROLE="${selected_role}"
   normalize_node_role
   if is_admin_role; then
@@ -3056,6 +3181,11 @@ configure_values() {
     fi
     if ! prompt_yes_no "Confirm admin role for this node (full control-plane privileges)" "${confirm_default}"; then
       print_warn "Admin role confirmation declined. Reverting to client role."
+      NODE_ROLE="client"
+    fi
+  elif is_blind_exit_role && [[ "${SETUP_COMPLETE}" != "1" ]]; then
+    if ! prompt_yes_no "Confirm blind_exit role (immutable after setup; least-knowledge mode)" "n"; then
+      print_warn "Blind-exit role confirmation declined. Reverting to client role."
       NODE_ROLE="client"
     fi
   fi
@@ -3133,7 +3263,10 @@ configure_values() {
 
 first_run_setup() {
   print_info "Starting first-run Rustynet setup wizard."
-  configure_values
+  if ! configure_values; then
+    print_err "First-run setup aborted."
+    return 1
+  fi
   install_runtime_dependencies
   ensure_rust_toolchain
   ensure_ci_security_tools
@@ -3143,9 +3276,14 @@ first_run_setup() {
   ensure_membership_files
   configure_trust_material
   write_daemon_environment
+  lockdown_blind_exit_local_material || true
   start_or_restart_service
   SETUP_COMPLETE="1"
   save_config
+  if is_blind_exit_role; then
+    print_warn "blind_exit role setup complete: this role is now immutable until factory reset."
+    print_info "Local control-plane mutation commands are disabled; exit serving is maintained automatically."
+  fi
   print_info "First-run setup complete."
 }
 
@@ -3206,6 +3344,10 @@ offer_device_as_exit_node() {
 
 toggle_lan_access() {
   local choice
+  if is_blind_exit_role; then
+    print_err "LAN access toggles are disabled for blind_exit role."
+    return 1
+  fi
   read -r -p "LAN access [on/off]: " choice
   case "${choice}" in
     on) run_rustynet_cli lan-access on ;;
@@ -3347,6 +3489,10 @@ print_saved_exit_candidates_with_probe() {
 
 select_exit_node() {
   local node status_line current_exit_node
+  if is_blind_exit_role; then
+    print_err "Exit node selection is disabled for blind_exit role."
+    return 1
+  fi
   print_saved_exit_candidates_with_probe
   status_line="$(run_rustynet_cli status 2>/dev/null || true)"
   current_exit_node="$(extract_status_field "${status_line}" "exit_node")"
@@ -3403,6 +3549,10 @@ apply_launch_profile() {
     print_err "Unsupported launch profile '${profile}'."
     return 1
   fi
+  if is_blind_exit_role && [[ "${profile}" != "menu" && "${profile}" != "quick-exit-node" ]]; then
+    print_err "Launch profile '${profile}' is not permitted for blind_exit role."
+    return 1
+  fi
   if is_client_role && [[ "${profile}" == "quick-exit-node" || "${profile}" == "quick-hybrid" ]]; then
     print_err "Launch profile '${profile}' is admin-only for serving exit traffic."
     return 1
@@ -3430,12 +3580,16 @@ apply_launch_profile() {
       fi
       ;;
     quick-exit-node)
-      if run_rustynet_cli route advertise 0.0.0.0/0; then
-        print_info "Exit route advertised (0.0.0.0/0)."
+      if is_blind_exit_role; then
+        print_info "blind_exit role enforces exit-serving mode without exposing manual route mutation."
       else
-        print_warn "Failed to advertise exit route. Check auto-tunnel policy restrictions."
+        if run_rustynet_cli route advertise 0.0.0.0/0; then
+          print_info "Exit route advertised (0.0.0.0/0)."
+        else
+          print_warn "Failed to advertise exit route. Check auto-tunnel policy restrictions."
+        fi
+        apply_lan_mode_noninteractive "${lan_mode}"
       fi
-      apply_lan_mode_noninteractive "${lan_mode}"
       ;;
     quick-hybrid)
       if [[ -n "${exit_node_id}" ]]; then
@@ -3475,9 +3629,10 @@ EOF
     case "${choice}" in
       1) first_run_setup ;;
       2)
-        configure_values
-        save_config
-        write_daemon_environment
+        if configure_values; then
+          save_config
+          write_daemon_environment
+        fi
         ;;
       3) start_or_restart_service ;;
       4) show_service_status ;;
@@ -3619,7 +3774,18 @@ EOF
 menu_emergency_recovery() {
   while true; do
     print_menu_runtime_header
-    cat <<'EOF'
+    if is_blind_exit_role; then
+      cat <<'EOF'
+
+Emergency & Recovery
+  1) Disconnect VPN (stop service + restore normal network)
+  2) Reassert blind-exit mode (restart service)
+  3) Show service status
+  4) Preflight doctor (security + prerequisites)
+  0) Back
+EOF
+    else
+      cat <<'EOF'
 
 Emergency & Recovery
   1) Disconnect VPN (stop service + restore normal network)
@@ -3628,6 +3794,7 @@ Emergency & Recovery
   4) Preflight doctor (security + prerequisites)
   0) Back
 EOF
+    fi
     local choice
     if ! read -r -p "Choose an option: " choice; then
       print_info "Input closed; returning to main menu."
@@ -3635,7 +3802,13 @@ EOF
     fi
     case "${choice}" in
       1) disconnect_vpn ;;
-      2) run_rustynet_cli exit-node off ;;
+      2)
+        if is_blind_exit_role; then
+          start_or_restart_service
+        else
+          run_rustynet_cli exit-node off
+        fi
+        ;;
       3) show_service_status ;;
       4) doctor_preflight ;;
       0) return ;;
@@ -3647,7 +3820,16 @@ EOF
 menu_configuration() {
   while true; do
     print_menu_runtime_header
-    cat <<'EOF'
+    if blind_exit_role_locked; then
+      cat <<'EOF'
+
+Configuration (Read-Only: blind_exit role lock)
+  1) Show current configuration
+  2) Show blind-exit lock policy
+  0) Back
+EOF
+    else
+      cat <<'EOF'
 
 Configuration
   1) Reconfigure daemon values
@@ -3658,16 +3840,27 @@ Configuration
   6) Switch node role (guided client/admin transition)
   0) Back
 EOF
+    fi
     local choice
     if ! read -r -p "Choose an option: " choice; then
       print_info "Input closed; returning to main menu."
       return
     fi
+    if blind_exit_role_locked; then
+      case "${choice}" in
+        1) show_runtime_config ;;
+        2) print_blind_exit_lock_notice ;;
+        0) return ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+      continue
+    fi
     case "${choice}" in
       1)
-        configure_values
-        save_config
-        write_daemon_environment
+        if configure_values; then
+          save_config
+          write_daemon_environment
+        fi
         ;;
       2) show_runtime_config ;;
       3)
@@ -3733,6 +3926,21 @@ Rustynet Admin Console
   8) Configuration
   0) Exit
 EOF
+    elif is_blind_exit_role; then
+      cat <<EOF
+
+Rustynet Blind Exit Console
+  Quick Actions
+  1) >>> ${connect_action_label} <<<
+  2) >>> SHOW BLIND EXIT STATUS <<<
+
+  Management Menus
+  3) Service setup & operations
+  4) Network information & diagnostics
+  5) Emergency & recovery
+  6) Configuration
+  0) Exit
+EOF
     else
       cat <<EOF
 
@@ -3765,6 +3973,17 @@ EOF
         6) menu_security_key_management ;;
         7) menu_emergency_recovery ;;
         8) menu_configuration ;;
+        0) exit 0 ;;
+        *) print_warn "Unknown option: ${choice}" ;;
+      esac
+    elif is_blind_exit_role; then
+      case "${choice}" in
+        1) toggle_vpn_connection_from_main_menu ;;
+        2) run_rustynet_cli status ;;
+        3) menu_service_setup_operations ;;
+        4) menu_network_information ;;
+        5) menu_emergency_recovery ;;
+        6) menu_configuration ;;
         0) exit 0 ;;
         *) print_warn "Unknown option: ${choice}" ;;
       esac

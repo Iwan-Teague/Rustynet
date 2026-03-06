@@ -9,7 +9,7 @@ Run the interactive setup/menu wizard:
 ```
 
 The wizard handles:
-- role selection (`admin` or `client`) during setup, with role-specific console permissions
+- role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions
 - guided in-menu role switching (`client` <-> `admin`) with local signed assignment refresh support on Linux
 - host OS detection on startup with strict host-profile enforcement (`linux` dataplane vs `macos` compatibility)
 - first-run bootstrap (dependencies, keys, trust material, systemd wiring)
@@ -43,6 +43,7 @@ After first setup, run `./start.sh` again anytime to open the terminal control m
 Role model:
 - `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
+- `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, and auto-enforces exit-serving posture.
 
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
