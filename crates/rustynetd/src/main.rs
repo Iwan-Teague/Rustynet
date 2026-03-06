@@ -588,16 +588,23 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 index += 2;
             }
             Some("--fail-closed-ssh-allow-cidrs") => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--fail-closed-ssh-allow-cidrs requires a value".to_string())?;
-                config.fail_closed_ssh_allow_cidrs = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                index += 2;
+                if let Some(value) = args.get(index + 1) {
+                    if value.starts_with("--") {
+                        config.fail_closed_ssh_allow_cidrs.clear();
+                        index += 1;
+                    } else {
+                        config.fail_closed_ssh_allow_cidrs = value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|entry| !entry.is_empty())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        index += 2;
+                    }
+                } else {
+                    config.fail_closed_ssh_allow_cidrs.clear();
+                    index += 1;
+                }
             }
             Some(flag) => {
                 return Err(format!("unknown daemon argument: {flag}"));
@@ -944,4 +951,41 @@ fn help_text() -> String {
         "  fail_closed_ssh_allow_cidrs=<empty>",
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_daemon_config;
+
+    #[test]
+    fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_value_is_omitted() {
+        let args = vec!["--fail-closed-ssh-allow-cidrs".to_string()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.fail_closed_ssh_allow_cidrs.is_empty());
+    }
+
+    #[test]
+    fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_next_flag_follows() {
+        let args = vec![
+            "--fail-closed-ssh-allow-cidrs".to_string(),
+            "--node-id".to_string(),
+            "node-a".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.fail_closed_ssh_allow_cidrs.is_empty());
+        assert_eq!(config.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_explicit_fail_closed_cidrs() {
+        let args = vec![
+            "--fail-closed-ssh-allow-cidrs".to_string(),
+            "192.168.0.0/24,fd00::/64".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config.fail_closed_ssh_allow_cidrs,
+            vec!["192.168.0.0/24".to_string(), "fd00::/64".to_string()]
+        );
+    }
 }
