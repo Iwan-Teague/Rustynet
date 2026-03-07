@@ -2896,6 +2896,10 @@ fn execute_ops_apply_lan_access_coupling(
     ensure_regular_file_no_symlink(&assignment_refresh_env_path, "assignment refresh env file")?;
     let existing = fs::read_to_string(&assignment_refresh_env_path)
         .map_err(|err| format!("read assignment refresh env failed: {err}"))?;
+    let previous_lan_routes =
+        assignment_refresh_env_value(existing.as_str(), "RUSTYNET_ASSIGNMENT_LAN_ROUTES")?
+            .map(split_csv)
+            .unwrap_or_default();
 
     let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
     let status = send_command_with_socket(IpcCommand::Status, socket_path.clone())?;
@@ -2962,6 +2966,9 @@ fn execute_ops_apply_lan_access_coupling(
         return Err(err);
     }
 
+    if !enable {
+        apply_lan_blackhole_routes(previous_lan_routes.as_slice(), true)?;
+    }
     force_local_assignment_refresh_now_ops()?;
     wait_for_daemon_status_field(
         socket_path.as_path(),
@@ -2969,6 +2976,9 @@ fn execute_ops_apply_lan_access_coupling(
         if enable { "on" } else { "off" },
         Duration::from_secs(20),
     )?;
+    if enable {
+        apply_lan_blackhole_routes(lan_routes.as_slice(), false)?;
+    }
 
     Ok(if enable {
         format!(
@@ -4489,6 +4499,46 @@ fn wait_for_daemon_status_field(
     Err(format!(
         "timed out waiting for daemon status field {key}={expected_value}"
     ))
+}
+
+fn apply_lan_blackhole_routes(
+    lan_routes: &[String],
+    install_blackhole: bool,
+) -> Result<(), String> {
+    for cidr in lan_routes {
+        let is_ipv6 = cidr.contains(':');
+        let mut command = Command::new("ip");
+        if is_ipv6 {
+            command.arg("-6");
+        } else {
+            command.arg("-4");
+        }
+        command.arg("route");
+        if install_blackhole {
+            command.arg("replace").arg("blackhole").arg(cidr.as_str());
+        } else {
+            command.arg("del").arg(cidr.as_str());
+        }
+        let output = command
+            .arg("table")
+            .arg("51820")
+            .output()
+            .map_err(|err| format!("invoke ip route update for {cidr} failed: {err}"))?;
+        if output.status.success() {
+            continue;
+        }
+        if !install_blackhole {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("No such process") || stderr.contains("No such file") {
+                continue;
+            }
+        }
+        return Err(format!(
+            "ip route update failed for {cidr}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 fn parse_env_u64_with_default(key: &str, default: u64) -> Result<u64, String> {
