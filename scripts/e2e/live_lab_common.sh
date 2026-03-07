@@ -157,11 +157,26 @@ live_lab_capture() {
   local raw
   raw="$(live_lab_ssh "$target" "printf '__CAP_BEGIN__\\n'; { ${body}; }; printf '\\n__CAP_END__\\n'" "$timeout")"
   printf '%s\n' "$raw" | awk '
-    /__CAP_BEGIN__/ {capture=1; next}
-    /__CAP_END__/ {capture=0}
+    /__CAP_BEGIN__/ {
+      capture=1
+      prev_set=0
+      next
+    }
+    /__CAP_END__/ {
+      if (prev_set && prev != "") {
+        print prev
+      }
+      capture=0
+      prev_set=0
+      next
+    }
     capture && tolower($0) !~ /password:/ {
       gsub(/\r/, "", $0)
-      print $0
+      if (prev_set) {
+        print prev
+      }
+      prev=$0
+      prev_set=1
     }
   '
 }
