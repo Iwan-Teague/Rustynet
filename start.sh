@@ -28,6 +28,7 @@ WG_INTERFACE="rustynet0"
 WG_LISTEN_PORT="51820"
 AUTO_PORT_FORWARD_EXIT="0"
 AUTO_PORT_FORWARD_LEASE_SECS="1200"
+DEFAULT_EXIT_LAN_CIDRS="192.168.1.0/24"
 WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
@@ -3824,6 +3825,45 @@ query_lan_access_status() {
   printf '%s|%s\n' "${selected_exit}" "${lan_access}"
 }
 
+apply_linux_lan_access_coupling() {
+  local mode="$1"
+  local enable_bool
+
+  if ! is_linux_host; then
+    print_err "apply_linux_lan_access_coupling is supported on Linux only."
+    return 1
+  fi
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_err "rustynet CLI is required for LAN access coupling operations."
+    return 1
+  fi
+
+  case "${mode}" in
+    on) enable_bool="true" ;;
+    off) enable_bool="false" ;;
+    *)
+      print_err "Unsupported LAN access mode '${mode}'."
+      return 1
+      ;;
+  esac
+
+  local lan_coupling_cmd=(rustynet ops apply-lan-access-coupling \
+    --enable "${enable_bool}" \
+    --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}")
+  if [[ "${mode}" == "on" ]]; then
+    lan_coupling_cmd+=(--lan-routes "${DEFAULT_EXIT_LAN_CIDRS}")
+  fi
+  if ! run_root env \
+    RUSTYNET_SOCKET="${SOCKET_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+    "${lan_coupling_cmd[@]}"; then
+    print_err "Signed LAN access coupling failed; setup is fail-closed."
+    return 1
+  fi
+  return 0
+}
+
 enable_lan_access_for_selected_exit() {
   local status_pair selected_exit lan_access
   if is_blind_exit_role; then
@@ -3847,11 +3887,17 @@ enable_lan_access_for_selected_exit() {
   fi
 
   print_info "Enabling local LAN access through exit node '${selected_exit}'."
+  if is_linux_host; then
+    if ! apply_linux_lan_access_coupling "on"; then
+      return 1
+    fi
+    print_info "LAN access enabled for ${DEFAULT_EXIT_LAN_CIDRS}."
+    return 0
+  fi
   if ! run_rustynet_cli lan-access on; then
     return 1
   fi
   print_info "LAN access enabled."
-  print_info "For non-default LAN CIDRs, use 'Advertise route' with the target subnet."
   return 0
 }
 
@@ -3863,6 +3909,10 @@ toggle_lan_access() {
   lan_access="$(cut -d'|' -f2 <<<"${status_pair}")"
   if [[ "${lan_access}" == "on" ]]; then
     print_info "Disabling exit-node local LAN access."
+    if is_linux_host; then
+      apply_linux_lan_access_coupling "off"
+      return $?
+    fi
     run_rustynet_cli lan-access off
     return $?
   fi
@@ -4162,7 +4212,13 @@ apply_lan_mode_noninteractive() {
   local mode="$1"
   case "${mode}" in
     on|off)
-      if run_rustynet_cli lan-access "${mode}"; then
+      if is_linux_host; then
+        if apply_linux_lan_access_coupling "${mode}"; then
+          print_info "LAN access set to '${mode}'."
+        else
+          print_warn "Failed to set LAN access to '${mode}'."
+        fi
+      elif run_rustynet_cli lan-access "${mode}"; then
         print_info "LAN access set to '${mode}'."
       else
         print_warn "Failed to set LAN access to '${mode}'."

@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::env_file::format_env_assignment;
+use crate::env_file::{format_env_assignment, parse_env_value};
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, chown};
 use rand::{RngCore, rngs::OsRng};
@@ -41,7 +41,7 @@ use rustynetd::daemon::{
     DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_KEY_PASSPHRASE_PATH,
     DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
 };
-use rustynetd::ipc::{IpcCommand, IpcResponse};
+use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
@@ -194,6 +194,11 @@ enum OpsCommand {
     SetAssignmentRefreshExitNode {
         env_path: PathBuf,
         exit_node_id: Option<String>,
+    },
+    ApplyLanAccessCoupling {
+        enable: bool,
+        lan_routes: Vec<String>,
+        assignment_refresh_env_path: PathBuf,
     },
     ApplyRoleCoupling {
         target_role: String,
@@ -492,6 +497,39 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 }
             }),
         }),
+        "apply-lan-access-coupling" => {
+            let enable = parse_bool_value(
+                "--enable",
+                parser
+                    .value("--enable")
+                    .unwrap_or_else(|| "false".to_string())
+                    .as_str(),
+            )?;
+            let lan_routes = parser
+                .value("--lan-routes")
+                .map(split_csv)
+                .unwrap_or_default();
+            if enable && lan_routes.is_empty() {
+                return Err(
+                    "ops apply-lan-access-coupling requires --lan-routes when --enable true"
+                        .to_string(),
+                );
+            }
+            if !enable && !lan_routes.is_empty() {
+                return Err(
+                    "ops apply-lan-access-coupling does not accept --lan-routes when --enable false"
+                        .to_string(),
+                );
+            }
+            Ok(OpsCommand::ApplyLanAccessCoupling {
+                enable,
+                lan_routes,
+                assignment_refresh_env_path: parser.path_or_default(
+                    "--env-path",
+                    PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
+                ),
+            })
+        }
         "apply-role-coupling" => Ok(OpsCommand::ApplyRoleCoupling {
             target_role: parser.required("--target-role")?,
             preferred_exit_node_id: parser.value("--preferred-exit-node-id").and_then(|value| {
@@ -1351,6 +1389,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             env_path,
             exit_node_id,
         } => execute_ops_set_assignment_refresh_exit_node(env_path, exit_node_id),
+        OpsCommand::ApplyLanAccessCoupling {
+            enable,
+            lan_routes,
+            assignment_refresh_env_path,
+        } => execute_ops_apply_lan_access_coupling(enable, lan_routes, assignment_refresh_env_path),
         OpsCommand::ApplyRoleCoupling {
             target_role,
             preferred_exit_node_id,
@@ -1599,6 +1642,18 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
             ));
         }
     }
+    let lan_routes = env_optional_string("RUSTYNET_ASSIGNMENT_LAN_ROUTES")?
+        .map(split_csv)
+        .unwrap_or_default();
+    if !lan_routes.is_empty() {
+        validate_assignment_refresh_lan_routes(lan_routes.as_slice())?;
+        if exit_node_id.is_none() {
+            return Err(
+                "RUSTYNET_ASSIGNMENT_LAN_ROUTES requires RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"
+                    .to_string(),
+            );
+        }
+    }
 
     let signing_secret_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
@@ -1684,7 +1739,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
             allow_pairs,
             mesh_cidr: "100.64.0.0/10".to_string(),
             exit_node_id,
-            lan_routes: Vec::new(),
+            lan_routes,
             generated_at_unix: unix_now(),
             ttl_secs,
             nonce: generate_assignment_nonce(),
@@ -2803,6 +2858,129 @@ fn execute_ops_set_assignment_refresh_exit_node(
             "assignment refresh exit node cleared: {}",
             env_path.display()
         ),
+    })
+}
+
+fn execute_ops_apply_lan_access_coupling(
+    enable: bool,
+    lan_routes: Vec<String>,
+    assignment_refresh_env_path: PathBuf,
+) -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("apply-lan-access-coupling is supported on Linux only".to_string());
+    }
+    if !assignment_refresh_env_path.is_absolute() {
+        return Err(format!(
+            "assignment refresh env path must be absolute: {}",
+            assignment_refresh_env_path.display()
+        ));
+    }
+    if enable {
+        validate_assignment_refresh_lan_routes(lan_routes.as_slice())?;
+    } else if !lan_routes.is_empty() {
+        return Err(
+            "lan routes must be empty when LAN access coupling is being disabled".to_string(),
+        );
+    }
+
+    let assignment_refresh_available =
+        assignment_refresh_available_ops(assignment_refresh_env_path.as_path())?;
+    if !assignment_refresh_available {
+        return Err(format!(
+            "assignment refresh is unavailable ({}); LAN access coupling is fail-closed",
+            assignment_refresh_env_path.display()
+        ));
+    }
+
+    ensure_regular_file_no_symlink(&assignment_refresh_env_path, "assignment refresh env file")?;
+    let existing = fs::read_to_string(&assignment_refresh_env_path)
+        .map_err(|err| format!("read assignment refresh env failed: {err}"))?;
+
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let status = send_command_with_socket(IpcCommand::Status, socket_path.clone())?;
+    if !status.ok {
+        return Err(format!(
+            "query daemon status failed before LAN access coupling: {}",
+            status.message
+        ));
+    }
+    let node_role = status_field(status.message.as_str(), "node_role")
+        .ok_or_else(|| "daemon status missing node_role".to_string())?;
+    if node_role == "blind_exit" {
+        return Err("LAN access coupling is not permitted for blind_exit role".to_string());
+    }
+    let selected_exit_node = status_field(status.message.as_str(), "exit_node")
+        .ok_or_else(|| "daemon status missing exit_node".to_string())?;
+    if enable && (selected_exit_node.is_empty() || selected_exit_node == "none") {
+        return Err("select an exit node before enabling LAN access".to_string());
+    }
+
+    let persisted_exit_node =
+        assignment_refresh_env_value(existing.as_str(), "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
+    if enable {
+        match persisted_exit_node.as_deref() {
+            Some(exit_node_id) if exit_node_id == selected_exit_node => {}
+            Some(exit_node_id) => {
+                return Err(format!(
+                    "assignment refresh exit node mismatch: daemon selected {selected_exit_node} but env persists {exit_node_id}"
+                ));
+            }
+            None => {
+                return Err(
+                    "assignment refresh env is missing RUSTYNET_ASSIGNMENT_EXIT_NODE_ID; re-select the exit node first"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let rewritten = rewrite_assignment_refresh_lan_routes(
+        existing.as_str(),
+        if enable { lan_routes.as_slice() } else { &[] },
+    );
+    let parent = assignment_refresh_env_path.parent().ok_or_else(|| {
+        format!(
+            "assignment refresh env path has no parent: {}",
+            assignment_refresh_env_path.display()
+        )
+    })?;
+    let tmp = create_secure_temp_file(parent, "assignment-refresh.env.tmp.")?;
+    if let Err(err) = write_private_bytes_to_file(tmp.as_path(), rewritten.as_bytes()) {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = publish_file_with_owner_mode(
+        &tmp,
+        &assignment_refresh_env_path,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+        "assignment refresh env",
+    ) {
+        let _ = remove_file_if_present(&tmp);
+        return Err(err);
+    }
+
+    force_local_assignment_refresh_now_ops()?;
+    wait_for_daemon_status_field(
+        socket_path.as_path(),
+        "lan_access",
+        if enable { "on" } else { "off" },
+        Duration::from_secs(20),
+    )?;
+
+    Ok(if enable {
+        format!(
+            "LAN access coupling enabled with {} via {}",
+            lan_routes.join(","),
+            assignment_refresh_env_path.display()
+        )
+    } else {
+        format!(
+            "LAN access coupling disabled via {}",
+            assignment_refresh_env_path.display()
+        )
     })
 }
 
@@ -4215,6 +4393,51 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
     format!("{}\n", rewritten_lines.join("\n"))
 }
 
+fn assignment_refresh_env_value(body: &str, key: &str) -> Result<Option<String>, String> {
+    let prefix = format!("{key}=");
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(raw_value) = trimmed.strip_prefix(prefix.as_str()) {
+            return parse_env_value(raw_value).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn rewrite_assignment_refresh_lan_routes(body: &str, lan_routes: &[String]) -> String {
+    let mut rewritten_lines = Vec::new();
+    let mut inserted = false;
+    for line in body.lines() {
+        if line.starts_with("RUSTYNET_ASSIGNMENT_LAN_ROUTES=") {
+            if !inserted && !lan_routes.is_empty() {
+                rewritten_lines.push(
+                    format_env_assignment(
+                        "RUSTYNET_ASSIGNMENT_LAN_ROUTES",
+                        lan_routes.join(",").as_str(),
+                    )
+                    .unwrap_or_else(|err| panic!("invalid assignment refresh LAN routes: {err}")),
+                );
+            }
+            inserted = true;
+            continue;
+        }
+        rewritten_lines.push(line.to_string());
+    }
+    if !inserted && !lan_routes.is_empty() {
+        rewritten_lines.push(
+            format_env_assignment(
+                "RUSTYNET_ASSIGNMENT_LAN_ROUTES",
+                lan_routes.join(",").as_str(),
+            )
+            .unwrap_or_else(|err| panic!("invalid assignment refresh LAN routes: {err}")),
+        );
+    }
+    if rewritten_lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", rewritten_lines.join("\n"))
+}
+
 fn require_root_execution() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
@@ -4233,6 +4456,53 @@ fn parse_bool_value(key: &str, value: &str) -> Result<bool, String> {
         "false" | "FALSE" | "no" | "NO" | "0" | "off" | "OFF" | "" => Ok(false),
         _ => Err(format!("invalid boolean value for {key}: {value}")),
     }
+}
+
+fn validate_assignment_refresh_lan_routes(lan_routes: &[String]) -> Result<(), String> {
+    if lan_routes.is_empty() {
+        return Err("at least one LAN route CIDR is required".to_string());
+    }
+    let mut seen = HashSet::new();
+    for cidr in lan_routes {
+        if cidr.trim() != cidr || cidr.is_empty() {
+            return Err(format!("LAN route cidr must not be empty: {cidr:?}"));
+        }
+        if !validate_cidr(cidr.as_str()) {
+            return Err(format!("invalid LAN route cidr: {cidr}"));
+        }
+        if !seen.insert(cidr.as_str()) {
+            return Err(format!("duplicate LAN route cidr: {cidr}"));
+        }
+    }
+    Ok(())
+}
+
+fn status_field(status_line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    status_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
+}
+
+fn wait_for_daemon_status_field(
+    socket_path: &Path,
+    key: &str,
+    expected_value: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() <= timeout {
+        let status = send_command_with_socket(IpcCommand::Status, socket_path.to_path_buf())?;
+        if status.ok
+            && status_field(status.message.as_str(), key).as_deref() == Some(expected_value)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!(
+        "timed out waiting for daemon status field {key}={expected_value}"
+    ))
 }
 
 fn parse_env_u64_with_default(key: &str, default: u64) -> Result<u64, String> {
@@ -5244,6 +5514,7 @@ fn help_text() -> String {
         "  ops ensure-signing-passphrase-material",
         "  ops materialize-signing-passphrase --output <absolute-path>",
         "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
+        "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
         "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
         "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
         "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
@@ -5258,7 +5529,7 @@ mod tests {
         detect_tampered_log, execute, load_signing_key, parse_bool_value, parse_bundle_u64_field,
         parse_command, persist_encrypted_secret_material, phase6_validate_platform_parity_report,
         required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
-        rewrite_env_key_value,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value,
     };
 
     #[test]
@@ -5524,6 +5795,16 @@ mod tests {
         ]);
         assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
 
+        let lan_coupling = parse_command(&[
+            "ops".to_string(),
+            "apply-lan-access-coupling".to_string(),
+            "--enable".to_string(),
+            "true".to_string(),
+            "--lan-routes".to_string(),
+            "192.168.1.0/24".to_string(),
+        ]);
+        assert!(format!("{lan_coupling:?}").contains("ApplyLanAccessCoupling"));
+
         let role_coupling = parse_command(&[
             "ops".to_string(),
             "apply-role-coupling".to_string(),
@@ -5642,6 +5923,20 @@ mod tests {
 
         let cleared = rewrite_assignment_refresh_exit_node(existing, None);
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID="));
+    }
+
+    #[test]
+    fn rewrite_assignment_refresh_lan_routes_updates_and_clears() {
+        let existing = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"node-40\"\nRUSTYNET_ASSIGNMENT_LAN_ROUTES=\"10.0.0.0/24\"\nRUSTYNET_ASSIGNMENT_ALLOW=\"a|b\"\n";
+        let updated = rewrite_assignment_refresh_lan_routes(
+            existing,
+            &[String::from("192.168.1.0/24"), String::from("fd00::/64")],
+        );
+        assert!(updated.contains("RUSTYNET_ASSIGNMENT_LAN_ROUTES=\"192.168.1.0/24,fd00::/64\""));
+        assert!(!updated.contains("RUSTYNET_ASSIGNMENT_LAN_ROUTES=\"10.0.0.0/24\""));
+
+        let cleared = rewrite_assignment_refresh_lan_routes(existing, &[]);
+        assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_ROUTES="));
     }
 
     #[test]

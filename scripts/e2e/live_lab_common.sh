@@ -326,6 +326,19 @@ live_lab_apply_role_coupling() {
   live_lab_run_root "$target" "$command"
 }
 
+live_lab_apply_lan_access_coupling() {
+  local target="$1"
+  local enable="$2"
+  local lan_routes="${3:-}"
+  local env_path="${4:-/etc/rustynet/assignment-refresh.env}"
+  local command
+  command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-lan-access-coupling --enable '${enable}' --env-path '${env_path}'"
+  if [[ -n "$lan_routes" ]]; then
+    command+=" --lan-routes '${lan_routes}'"
+  fi
+  live_lab_run_root "$target" "$command"
+}
+
 live_lab_wait_for_daemon_socket() {
   local target="$1"
   local socket_path="${2:-/run/rustynet/rustynetd.sock}"

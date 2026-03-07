@@ -151,7 +151,7 @@ issue_bundle() {
 }
 
 issue_bundle "$EXIT_NODE_ID" "rn-assignment-$EXIT_NODE_ID.assignment"
-issue_bundle "$CLIENT_NODE_ID" "rn-assignment-$CLIENT_NODE_ID.assignment" --exit-node-id "$EXIT_NODE_ID" --lan-routes "$LAN_TEST_CIDR"
+issue_bundle "$CLIENT_NODE_ID" "rn-assignment-$CLIENT_NODE_ID.assignment" --exit-node-id "$EXIT_NODE_ID"
 issue_bundle "$BLIND_EXIT_NODE_ID" "rn-assignment-$BLIND_EXIT_NODE_ID.assignment"
 ISSUEEOF
 chmod 700 "$ISSUE_SCRIPT"
@@ -208,7 +208,7 @@ CLIENT_STATUS_OFF_INITIAL="$(live_lab_status "$CLIENT_HOST")"
 live_lab_log "Initial client status"
 printf '%s\n' "$CLIENT_STATUS_OFF_INITIAL"
 
-live_lab_run_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet lan-access off"
+live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
 sleep 3
 if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
   lan_off_ping_status="fail"
@@ -217,7 +217,7 @@ else
 fi
 CLIENT_STATUS_OFF="$(live_lab_status "$CLIENT_HOST")"
 
-live_lab_run_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet lan-access on"
+live_lab_apply_lan_access_coupling "$CLIENT_HOST" "true" "$LAN_TEST_CIDR"
 sleep 5
 if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
   lan_on_ping_status="pass"
@@ -227,7 +227,7 @@ fi
 CLIENT_STATUS_ON="$(live_lab_status "$CLIENT_HOST")"
 CLIENT_ROUTE_ON="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get ${LAN_TEST_PROBE_IP} || true")"
 
-live_lab_run_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet lan-access off"
+live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
 sleep 3
 if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
   lan_off_again_status="fail"
@@ -236,7 +236,7 @@ else
 fi
 CLIENT_STATUS_OFF_FINAL="$(live_lab_status "$CLIENT_HOST")"
 
-if live_lab_run_root "$BLIND_EXIT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet lan-access on"; then
+if live_lab_apply_lan_access_coupling "$BLIND_EXIT_HOST" "true" "$LAN_TEST_CIDR"; then
   blind_exit_denied_status="fail"
 else
   blind_exit_denied_status="pass"
@@ -259,6 +259,7 @@ printf '%s\n' "$BLIND_EXIT_STATUS"
 check_lan_off_blocks="fail"
 check_lan_on_allows="fail"
 check_lan_off_again_blocks="fail"
+check_client_status_initial_off="fail"
 check_client_status_on="fail"
 check_client_status_off="fail"
 check_blind_exit_denied="fail"
@@ -272,6 +273,9 @@ if [[ "$lan_on_ping_status" == 'pass' ]] && grep -Fq 'lan_access=on' <<<"$CLIENT
 fi
 if [[ "$lan_off_again_status" == 'pass' ]]; then
   check_lan_off_again_blocks="pass"
+fi
+if grep -Fq 'lan_access=off' <<<"$CLIENT_STATUS_OFF_INITIAL" && grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$CLIENT_STATUS_OFF_INITIAL"; then
+  check_client_status_initial_off="pass"
 fi
 if grep -Fq 'lan_access=on' <<<"$CLIENT_STATUS_ON"; then
   check_client_status_on="pass"
@@ -291,6 +295,7 @@ for value in \
   "$check_lan_off_blocks" \
   "$check_lan_on_allows" \
   "$check_lan_off_again_blocks" \
+  "$check_client_status_initial_off" \
   "$check_client_status_on" \
   "$check_client_status_off" \
   "$check_blind_exit_denied" \
@@ -320,6 +325,7 @@ cat > "$REPORT_PATH" <<EOF_REPORT
     "lan_off_blocks": "${check_lan_off_blocks}",
     "lan_on_allows": "${check_lan_on_allows}",
     "lan_off_again_blocks": "${check_lan_off_again_blocks}",
+    "client_status_initial_off": "${check_client_status_initial_off}",
     "client_status_on": "${check_client_status_on}",
     "client_status_off": "${check_client_status_off}",
     "blind_exit_denied": "${check_blind_exit_denied}",
