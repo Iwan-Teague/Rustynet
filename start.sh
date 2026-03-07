@@ -84,7 +84,9 @@ MACOS_LAUNCHD_HELPER_LABEL="com.rustynet.rustynetd-privileged"
 MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="rustynet.wg_passphrase"
 MACOS_LAUNCHD_DAEMON_PLIST_PATH="${HOME}/Library/LaunchAgents/${MACOS_LAUNCHD_DAEMON_LABEL}.plist"
 MACOS_LAUNCHD_HELPER_PLIST_PATH="/Library/LaunchDaemons/${MACOS_LAUNCHD_HELPER_LABEL}.plist"
-export PATH="/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/sbin:/sbin:${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
+RUST_TOOLCHAIN_FILE="${ROOT_DIR}/rust-toolchain.toml"
+RUST_TOOLCHAIN_CHANNEL="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${RUST_TOOLCHAIN_FILE}" 2>/dev/null | head -n 1)"
+export PATH="${HOME}/.cargo/bin:/opt/homebrew/opt/rustup/bin:/usr/local/opt/rustup/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/sbin:/sbin:${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
 
@@ -1104,6 +1106,20 @@ add_macos_homebrew_to_path() {
   fi
 }
 
+add_rustup_to_path() {
+  if [[ -d "${HOME}/.cargo/bin" ]]; then
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+  fi
+  if is_macos_host; then
+    if [[ -d /opt/homebrew/opt/rustup/bin ]]; then
+      export PATH="/opt/homebrew/opt/rustup/bin:${PATH}"
+    fi
+    if [[ -d /usr/local/opt/rustup/bin ]]; then
+      export PATH="/usr/local/opt/rustup/bin:${PATH}"
+    fi
+  fi
+}
+
 is_macos_admin_user() {
   if ! is_macos_host; then
     return 1
@@ -1247,43 +1263,94 @@ map_package() {
   esac
 }
 
+require_rust_toolchain_channel() {
+  if [[ -n "${RUST_TOOLCHAIN_CHANNEL}" ]]; then
+    return 0
+  fi
+  print_err "Unable to determine required Rust toolchain channel from ${RUST_TOOLCHAIN_FILE}."
+  exit 1
+}
+
 check_rust_min_version() {
-  if ! command -v rustc >/dev/null 2>&1; then
+  require_rust_toolchain_channel
+  add_rustup_to_path
+  if ! command -v rustup >/dev/null 2>&1; then
     return 1
   fi
-  local installed_ver
-  installed_ver="$(rustc --version 2>/dev/null | awk '{print $2}' | cut -d- -f1)"
-  # sort -V puts the lower version first; if min <= installed, min comes first (or they're equal)
-  [[ "$(printf '%s\n%s\n' "${RUST_MIN_VERSION}" "${installed_ver}" | sort -V | head -1)" == "${RUST_MIN_VERSION}" ]]
+  rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1
 }
 
-install_pinned_cargo_deny() {
-  print_info "Installing pinned cargo-deny version ${CARGO_DENY_VERSION}."
-  cargo install --locked cargo-deny --version "${CARGO_DENY_VERSION}"
+install_rustup_package() {
+  local pm
+  pm="$(package_manager)"
+  if [[ "${pm}" == "unknown" ]]; then
+    print_err "No supported package manager found. Install rustup and toolchain ${RUST_TOOLCHAIN_CHANNEL} manually, then rerun ./start.sh."
+    return 1
+  fi
+
+  print_info "Installing rustup via ${pm}."
+  case "${pm}" in
+    apt)
+      run_root apt-get update
+      run_root apt-get install -y rustup
+      ;;
+    dnf)
+      run_root dnf install -y rustup
+      ;;
+    pacman)
+      run_root pacman -Sy --noconfirm rustup
+      ;;
+    zypper)
+      run_root zypper --non-interactive install rustup
+      ;;
+    brew)
+      brew install rustup
+      ;;
+  esac
 }
 
-ensure_rust_components() {
-  if ! command -v rustup >/dev/null 2>&1; then
-    print_warn "rustup is not available; cannot auto-install rustfmt/clippy components."
+ensure_rustup_available() {
+  require_rust_toolchain_channel
+  add_rustup_to_path
+  if command -v rustup >/dev/null 2>&1; then
     return 0
   fi
 
+  install_rustup_package || return 1
+  add_rustup_to_path
+  if ! command -v rustup >/dev/null 2>&1; then
+    print_err "rustup is required but was not found after installation."
+    return 1
+  fi
+}
+
+install_pinned_cargo_deny() {
+  require_rust_toolchain_channel
+  print_info "Installing pinned cargo-deny version ${CARGO_DENY_VERSION}."
+  cargo +"${RUST_TOOLCHAIN_CHANNEL}" install --locked cargo-deny --version "${CARGO_DENY_VERSION}"
+}
+
+ensure_rust_components() {
+  require_rust_toolchain_channel
+  ensure_rustup_available || return 1
+
   local missing=()
-  if ! rustup component list --installed | grep -q '^rustfmt'; then
+  if ! rustup component list --toolchain "${RUST_TOOLCHAIN_CHANNEL}" --installed | grep -q '^rustfmt'; then
     missing+=("rustfmt")
   fi
-  if ! rustup component list --installed | grep -q '^clippy'; then
+  if ! rustup component list --toolchain "${RUST_TOOLCHAIN_CHANNEL}" --installed | grep -q '^clippy'; then
     missing+=("clippy")
   fi
   if [[ "${#missing[@]}" -eq 0 ]]; then
     return 0
   fi
 
-  print_info "Installing Rust components: ${missing[*]}"
-  rustup component add "${missing[@]}"
+  print_info "Installing Rust components for ${RUST_TOOLCHAIN_CHANNEL}: ${missing[*]}"
+  rustup component add --toolchain "${RUST_TOOLCHAIN_CHANNEL}" "${missing[@]}"
 }
 
 ensure_ci_security_tools() {
+  require_rust_toolchain_channel
   local missing_bins=()
   if ! command -v cargo-audit >/dev/null 2>&1; then
     missing_bins+=("cargo-audit")
@@ -1306,78 +1373,37 @@ ensure_ci_security_tools() {
     if [[ "${tool}" == "cargo-deny" ]]; then
       install_pinned_cargo_deny
     else
-      cargo install --locked "${tool}"
+      cargo +"${RUST_TOOLCHAIN_CHANNEL}" install --locked "${tool}"
     fi
   done
 }
 
 ensure_rust_toolchain() {
-  local need_install=0
-  if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
-    need_install=1
-  elif ! check_rust_min_version; then
-    print_warn "Installed Rust $(rustc --version 2>/dev/null | awk '{print $2}') is below the required minimum ${RUST_MIN_VERSION}."
-    need_install=1
-  fi
+  require_rust_toolchain_channel
+  ensure_rustup_available || return 1
 
-  if [[ "${need_install}" -eq 0 ]]; then
-    print_info "Rust toolchain $(rustc --version 2>/dev/null) is present and sufficient."
+  if check_rust_min_version; then
+    print_info "Rust toolchain $(rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version 2>/dev/null) is present and pinned."
     ensure_rust_components
+    rustup default "${RUST_TOOLCHAIN_CHANNEL}" >/dev/null
+    add_rustup_to_path
+    hash -r
     return 0
   fi
 
-  print_warn "Rust >= ${RUST_MIN_VERSION} is required to build Rustynet binaries."
-  echo "  1) Install via system package manager"
-  echo "  2) Skip — I will install Rust manually before building"
-  local choice
-  read -r -p "Choose Rust install method [1]: " choice
-  choice="${choice:-1}"
+  print_info "Installing pinned Rust toolchain ${RUST_TOOLCHAIN_CHANNEL} via rustup."
+  rustup set profile minimal
+  rustup toolchain install "${RUST_TOOLCHAIN_CHANNEL}" --profile minimal --component rustfmt --component clippy
+  rustup default "${RUST_TOOLCHAIN_CHANNEL}"
+  add_rustup_to_path
+  hash -r
 
-  case "${choice}" in
-    1)
-      local pm
-      pm="$(package_manager)"
-      if [[ "${pm}" == "unknown" ]]; then
-        print_err "No supported package manager found. Install Rust manually, then rerun ./start.sh."
-        return 1
-      fi
-      local packages=()
-      case "${pm}" in
-        brew) packages=(rust) ;;
-        pacman) packages=(rust) ;;
-        *) packages=(cargo rustc) ;;
-      esac
-      print_info "Installing Rust via ${pm}: ${packages[*]}"
-      case "${pm}" in
-        apt)
-          run_root apt-get update
-          run_root apt-get install -y "${packages[@]}"
-          ;;
-        dnf)    run_root dnf install -y "${packages[@]}" ;;
-        pacman) run_root pacman -Sy --noconfirm "${packages[@]}" ;;
-        zypper) run_root zypper --non-interactive install "${packages[@]}" ;;
-        brew)   brew install "${packages[@]}" ;;
-      esac
-      ;;
-    2)
-      print_warn "Skipping Rust installation. The build step will fail unless Rust >= ${RUST_MIN_VERSION} is installed."
-      return 0
-      ;;
-    *)
-      print_err "Invalid choice '${choice}'."
-      return 1
-      ;;
-  esac
-
-  if ! command -v cargo >/dev/null 2>&1; then
-    print_err "cargo not found after installation attempt."
+  if ! check_rust_min_version; then
+    print_err "Rust toolchain ${RUST_TOOLCHAIN_CHANNEL} did not install successfully."
     return 1
   fi
-  if ! check_rust_min_version; then
-    print_warn "Installed Rust $(rustc --version 2>/dev/null | awk '{print $2}') may still be below minimum ${RUST_MIN_VERSION}. Build may fail."
-  else
-    print_info "Rust toolchain $(rustc --version 2>/dev/null) installed successfully."
-  fi
+
+  print_info "Rust toolchain $(rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version 2>/dev/null) installed successfully."
   ensure_rust_components
 }
 
@@ -1486,7 +1512,7 @@ ensure_binaries_available() {
   fi
 
   print_warn "rustynet binaries are not installed in PATH."
-  if ! command -v cargo >/dev/null 2>&1 || ! check_rust_min_version; then
+  if ! check_rust_min_version; then
     ensure_rust_toolchain
   fi
 
@@ -1500,7 +1526,7 @@ ensure_binaries_available() {
     exit 1
   fi
 
-  (cd "${ROOT_DIR}" && cargo build --release -p rustynetd -p rustynet-cli)
+  (cd "${ROOT_DIR}" && cargo +"${RUST_TOOLCHAIN_CHANNEL}" build --release -p rustynetd -p rustynet-cli)
   local install_dir="/usr/local/bin"
   if is_macos_host && ! test -w "${install_dir}"; then
     if is_macos_admin_user; then
@@ -1590,6 +1616,7 @@ doctor_preflight() {
   print_info "Running Rustynet preflight doctor..."
   doctor_require_cmd rustynetd "binary"
   doctor_require_cmd rustynet "binary"
+  doctor_require_cmd rustup "toolchain manager"
   doctor_require_cmd cargo "toolchain"
   doctor_require_cmd openssl "crypto runtime"
   doctor_require_cmd curl "network runtime"
@@ -1599,9 +1626,9 @@ doctor_preflight() {
   doctor_require_cmd rg "shell runtime"
 
   if check_rust_min_version; then
-    doctor_ok "rust toolchain >= ${RUST_MIN_VERSION}"
+    doctor_ok "rust toolchain ${RUST_TOOLCHAIN_CHANNEL} is installed"
   else
-    doctor_fail "rust toolchain < ${RUST_MIN_VERSION}; run first-run bootstrap"
+    doctor_fail "rust toolchain ${RUST_TOOLCHAIN_CHANNEL:-unknown} missing; run first-run bootstrap"
   fi
 
   if [[ -f "${CONFIG_FILE}" ]]; then

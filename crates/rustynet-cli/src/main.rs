@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod env_file;
 mod ops_e2e;
 mod ops_install_systemd;
 mod ops_peer_store;
@@ -18,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::env_file::format_env_assignment;
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, chown};
 use rand::{RngCore, rngs::OsRng};
@@ -1590,12 +1592,12 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     let nodes_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_NODES", "assignment node map")?;
     let allow_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_ALLOW", "assignment allow rules")?;
     let exit_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
-    if let Some(exit_node_id_value) = exit_node_id.as_deref()
-        && !is_valid_node_id(exit_node_id_value)
-    {
-        return Err(format!(
-            "exit node id contains unsupported characters: {exit_node_id_value}",
-        ));
+    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
+        if !is_valid_node_id(exit_node_id_value) {
+            return Err(format!(
+                "exit node id contains unsupported characters: {exit_node_id_value}",
+            ));
+        }
     }
 
     let signing_secret_path = env_path_or_default(
@@ -1629,15 +1631,17 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
 
     let now_unix = unix_now();
-    if bundle_path.exists()
-        && let Some(current_expires_at) =
+    if bundle_path.exists() {
+        if let Some(current_expires_at) =
             read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
-    {
-        let remaining_secs = current_expires_at.saturating_sub(now_unix);
-        return Ok(format!(
-            "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
-        ));
+        {
+            if current_expires_at > now_unix.saturating_add(min_remaining_secs) {
+                let remaining_secs = current_expires_at.saturating_sub(now_unix);
+                return Ok(format!(
+                    "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
+                ));
+            }
+        }
     }
 
     let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
@@ -2074,10 +2078,10 @@ fn phase6_leak_report_passed(path: &Path) -> bool {
 }
 
 fn phase6_probe_host() -> String {
-    if let Ok(hostname) = std::env::var("HOSTNAME")
-        && !hostname.trim().is_empty()
-    {
-        return hostname;
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        if !hostname.trim().is_empty() {
+            return hostname;
+        }
     }
     let output = Command::new("hostname")
         .stdout(Stdio::piped())
@@ -2753,12 +2757,12 @@ fn execute_ops_set_assignment_refresh_exit_node(
     } else {
         return Err("set-assignment-refresh-exit-node is supported on Linux only".to_string());
     }
-    if let Some(exit_node_id_value) = exit_node_id.as_deref()
-        && !is_valid_assignment_refresh_exit_node_id(exit_node_id_value)
-    {
-        return Err(format!(
-            "invalid exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id_value}"
-        ));
+    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
+        if !is_valid_assignment_refresh_exit_node_id(exit_node_id_value) {
+            return Err(format!(
+                "invalid exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id_value}"
+            ));
+        }
     }
 
     ensure_regular_file_no_symlink(&env_path, "assignment refresh env file")?;
@@ -2823,12 +2827,12 @@ fn execute_ops_apply_role_coupling(
             "unsupported target role for coupling: {target_role} (expected admin|client)"
         ));
     }
-    if let Some(exit_node_id) = preferred_exit_node_id.as_deref()
-        && !is_valid_assignment_refresh_exit_node_id(exit_node_id)
-    {
-        return Err(format!(
-            "invalid preferred exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id}"
-        ));
+    if let Some(exit_node_id) = preferred_exit_node_id.as_deref() {
+        if !is_valid_assignment_refresh_exit_node_id(exit_node_id) {
+            return Err(format!(
+                "invalid preferred exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id}"
+            ));
+        }
     }
 
     let mut warnings = Vec::new();
@@ -2872,11 +2876,12 @@ fn execute_ops_apply_role_coupling(
         if let Err(err) = send_role_coupling_ipc(IpcCommand::ExitNodeOff) {
             warnings.push(format!("clear exit node selection failed: {err}"));
         }
-        if enable_exit_advertise
-            && let Err(err) =
+        if enable_exit_advertise {
+            if let Err(err) =
                 send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))
-        {
-            warnings.push(format!("advertise default exit route failed: {err}"));
+            {
+                warnings.push(format!("advertise default exit route failed: {err}"));
+            }
         }
     }
 
@@ -3473,13 +3478,13 @@ fn write_atomic_text_file_with_owner_mode(
             target_path.display()
         )
     })?;
-    if let Ok(parent_metadata) = fs::symlink_metadata(parent)
-        && parent_metadata.file_type().is_symlink()
-    {
-        return Err(format!(
-            "target parent must not be a symlink: {}",
-            parent.display()
-        ));
+    if let Ok(parent_metadata) = fs::symlink_metadata(parent) {
+        if parent_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "target parent must not be a symlink: {}",
+                parent.display()
+            ));
+        }
     }
     let tmp = create_secure_temp_file(parent, "rustynet.ops.tmp.")?;
     if let Err(err) = write_private_bytes_to_file(tmp.as_path(), body.as_bytes()) {
@@ -3523,13 +3528,15 @@ fn secure_remove_root_owned_file_if_present(path: &Path, label: &str) -> Result<
 }
 
 fn rewrite_env_key_value(body: &str, key: &str, value: &str) -> String {
+    let assignment = format_env_assignment(key, value)
+        .unwrap_or_else(|err| panic!("invalid env assignment for {key}: {err}"));
     let mut rewritten_lines = Vec::new();
     let mut inserted = false;
     let prefix = format!("{key}=");
     for line in body.lines() {
         if line.starts_with(prefix.as_str()) {
             if !inserted {
-                rewritten_lines.push(format!("{key}={value}"));
+                rewritten_lines.push(assignment.clone());
                 inserted = true;
             }
             continue;
@@ -3537,7 +3544,7 @@ fn rewrite_env_key_value(body: &str, key: &str, value: &str) -> String {
         rewritten_lines.push(line.to_string());
     }
     if !inserted {
-        rewritten_lines.push(format!("{key}={value}"));
+        rewritten_lines.push(assignment);
     }
     if rewritten_lines.is_empty() {
         return String::new();
@@ -3981,23 +3988,68 @@ fn materialize_signing_passphrase_linux(
     output_path: &Path,
 ) -> Result<(), String> {
     require_root_execution()?;
+    let parent = output_path.parent().ok_or_else(|| {
+        format!(
+            "signing passphrase output path has no parent: {}",
+            output_path.display()
+        )
+    })?;
+    let temp_dir = create_secure_temp_directory(parent, "signing-passphrase.decrypt.")?;
+    let temp_output = temp_dir.join("passphrase");
     let decrypt_status = Command::new("systemd-creds")
         .arg("decrypt")
         .arg("--name=signing_key_passphrase")
         .arg(config.signing_credential_blob_path.as_os_str())
-        .arg(output_path.as_os_str())
+        .arg(temp_output.as_os_str())
         .status()
         .map_err(|err| format!("invoke systemd-creds decrypt failed: {err}"))?;
     if !decrypt_status.success() {
-        let _ = secure_remove_file(output_path);
+        let _ = secure_remove_file(temp_output.as_path());
+        let _ = fs::remove_dir(temp_dir.as_path());
         return Err(format!(
             "systemd-creds decrypt failed with status {decrypt_status}"
         ));
     }
-    chown(output_path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
-        .map_err(|err| format!("set output owner failed ({}): {err}", output_path.display()))?;
-    fs::set_permissions(output_path, fs::Permissions::from_mode(0o600))
-        .map_err(|err| format!("set output mode failed ({}): {err}", output_path.display()))?;
+    match fs::symlink_metadata(output_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_dir() {
+                let _ = secure_remove_file(temp_output.as_path());
+                let _ = fs::remove_dir(temp_dir.as_path());
+                return Err(format!(
+                    "signing passphrase output must not be a directory: {}",
+                    output_path.display()
+                ));
+            }
+            secure_remove_file(output_path)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let _ = secure_remove_file(temp_output.as_path());
+            let _ = fs::remove_dir(temp_dir.as_path());
+            return Err(format!(
+                "inspect signing passphrase output failed ({}): {err}",
+                output_path.display()
+            ));
+        }
+    }
+    if let Err(err) = publish_file_with_owner_mode(
+        temp_output.as_path(),
+        output_path,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o600,
+        "signing passphrase output",
+    ) {
+        let _ = secure_remove_file(temp_output.as_path());
+        let _ = fs::remove_dir(temp_dir.as_path());
+        return Err(err);
+    }
+    fs::remove_dir(temp_dir.as_path()).map_err(|err| {
+        format!(
+            "remove temporary signing passphrase directory {} failed: {err}",
+            temp_dir.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -4127,9 +4179,17 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
         if line.starts_with("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=") {
             if !inserted {
                 if let Some(exit_node_id_value) = exit_node_id {
-                    rewritten_lines.push(format!(
-                        "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID={exit_node_id_value}"
-                    ));
+                    rewritten_lines.push(
+                        format_env_assignment(
+                            "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID",
+                            exit_node_id_value,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "invalid assignment refresh exit node value {exit_node_id_value}: {err}"
+                            )
+                        }),
+                    );
                 }
                 inserted = true;
             }
@@ -4137,10 +4197,17 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
         }
         rewritten_lines.push(line.to_string());
     }
-    if !inserted && let Some(exit_node_id_value) = exit_node_id {
-        rewritten_lines.push(format!(
-            "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID={exit_node_id_value}"
-        ));
+    if !inserted {
+        if let Some(exit_node_id_value) = exit_node_id {
+            rewritten_lines.push(
+                format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", exit_node_id_value)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "invalid assignment refresh exit node value {exit_node_id_value}: {err}"
+                        )
+                    }),
+            );
+        }
     }
     if rewritten_lines.is_empty() {
         return String::new();
@@ -4346,6 +4413,37 @@ fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> 
     }
     Err(format!(
         "unable to allocate secure temporary file in {}",
+        dir.display()
+    ))
+}
+
+fn create_secure_temp_directory(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
+    let mut random_bytes = [0u8; 8];
+    for _ in 0..32 {
+        OsRng.fill_bytes(&mut random_bytes);
+        let candidate = dir.join(format!("{prefix}{}", hex_bytes(&random_bytes)));
+        match fs::create_dir(candidate.as_path()) {
+            Ok(()) => {
+                fs::set_permissions(candidate.as_path(), fs::Permissions::from_mode(0o700))
+                    .map_err(|err| {
+                        format!(
+                            "set temporary directory mode {} failed: {err}",
+                            candidate.display()
+                        )
+                    })?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "create temporary directory {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "unable to allocate secure temporary directory in {}",
         dir.display()
     ))
 }
@@ -5537,10 +5635,10 @@ mod tests {
 
     #[test]
     fn rewrite_assignment_refresh_exit_node_updates_and_clears() {
-        let existing = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=node-40\nRUSTYNET_ASSIGNMENT_EXIT_NODE_ID=old\nRUSTYNET_ASSIGNMENT_ALLOW=a|b\n";
+        let existing = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"node-40\"\nRUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"old\"\nRUSTYNET_ASSIGNMENT_ALLOW=\"a|b\"\n";
         let updated = rewrite_assignment_refresh_exit_node(existing, Some("exit-new"));
-        assert!(updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=exit-new"));
-        assert!(!updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=old"));
+        assert!(updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-new\""));
+        assert!(!updated.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"old\""));
 
         let cleared = rewrite_assignment_refresh_exit_node(existing, None);
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID="));
@@ -5548,16 +5646,29 @@ mod tests {
 
     #[test]
     fn rewrite_env_key_value_replaces_or_appends() {
-        let existing = "RUSTYNET_NODE_ID=node-40\nRUSTYNET_ASSIGNMENT_AUTO_REFRESH=true\nRUSTYNET_STATE=/var/lib/rustynet/rustynetd.state\n";
+        let existing = "RUSTYNET_NODE_ID=\"node-40\"\nRUSTYNET_ASSIGNMENT_AUTO_REFRESH=\"true\"\nRUSTYNET_STATE=\"/var/lib/rustynet/rustynetd.state\"\n";
         let rewritten =
             rewrite_env_key_value(existing, "RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false");
-        assert!(rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false"));
-        assert!(!rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true"));
+        assert!(rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=\"false\""));
+        assert!(!rewritten.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=\"true\""));
 
-        let without_key = "RUSTYNET_NODE_ID=node-40\n";
+        let without_key = "RUSTYNET_NODE_ID=\"node-40\"\n";
         let appended =
             rewrite_env_key_value(without_key, "RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false");
-        assert!(appended.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false"));
+        assert!(appended.contains("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=\"false\""));
+    }
+
+    #[test]
+    fn rewrite_env_key_value_quotes_structured_values() {
+        let rewritten = rewrite_env_key_value(
+            "",
+            "RUSTYNET_ASSIGNMENT_NODES",
+            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def",
+        );
+        assert_eq!(
+            rewritten,
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def\"\n"
+        );
     }
 
     #[test]

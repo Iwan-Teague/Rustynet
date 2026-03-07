@@ -41,15 +41,15 @@ pub fn execute_ops_peer_store_list(
 
     let mut output = String::new();
     for record in records {
-        if let Some(role) = role_filter.as_ref()
-            && record.role != *role
-        {
-            continue;
+        if let Some(role) = role_filter.as_ref() {
+            if record.role != *role {
+                continue;
+            }
         }
-        if let Some(node_id) = node_id_filter.as_ref()
-            && record.node_id != *node_id
-        {
-            continue;
+        if let Some(node_id) = node_id_filter.as_ref() {
+            if record.node_id != *node_id {
+                continue;
+            }
         }
         output.push_str(
             format!(

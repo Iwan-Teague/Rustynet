@@ -694,15 +694,15 @@ impl LinuxCommandSystem {
 
     fn ensure_failclosed_table(&mut self) -> Result<String, SystemError> {
         let target_table = self.firewall_table_name();
-        if let Some(table) = self.firewall_table.clone()
-            && table == target_table
-        {
-            if self.killswitch_chain_exists(table.as_str())? {
-                return Ok(table);
+        if let Some(table) = self.firewall_table.clone() {
+            if table == target_table {
+                if self.killswitch_chain_exists(table.as_str())? {
+                    return Ok(table);
+                }
+                // The expected generation table exists in state but is missing its
+                // fail-closed chain on host. Recreate this generation table.
+                self.firewall_table = None;
             }
-            // The expected generation table exists in state but is missing its
-            // fail-closed chain on host. Recreate this generation table.
-            self.firewall_table = None;
         }
 
         let table = target_table;
@@ -1054,13 +1054,13 @@ impl DataplaneSystem for LinuxCommandSystem {
             )
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         }
-        if let Some(previous) = previous_table
-            && previous != table
-        {
-            self.run_allow_failure(
-                PrivilegedCommandProgram::Nft,
-                &["delete", "table", "inet", previous.as_str()],
-            );
+        if let Some(previous) = previous_table {
+            if previous != table {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "inet", previous.as_str()],
+                );
+            }
         }
         Ok(())
     }
@@ -2588,14 +2588,23 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::io::{BufRead, BufReader, Write};
     use std::net::IpAddr;
+    #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener;
-    use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(target_os = "linux")]
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "linux")]
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+    #[cfg(target_os = "linux")]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use rustynet_backend_api::{
         BackendCapabilities, BackendError, BackendErrorKind, RouteKind, SocketEndpoint, TunnelStats,
@@ -2703,6 +2712,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn parse_helper_request_command(line: &str) -> Option<String> {
         let payload: serde_json::Value = serde_json::from_str(line).ok()?;
         let program = payload.get("program")?.as_str()?;
@@ -2714,6 +2724,20 @@ mod tests {
         Some(format!("{program} {}", parts.join(" ")))
     }
 
+    #[cfg(target_os = "linux")]
+    fn phase10_test_socket_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        // Keep socket paths short enough for UNIX domain limits, especially on macOS.
+        PathBuf::from("/tmp").join(format!(
+            "rn10-{prefix}-{}-{unique:x}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     fn spawn_privileged_capture_helper(
         socket_path: &Path,
     ) -> (
@@ -2721,7 +2745,15 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let listener = UnixListener::bind(socket_path).expect("test helper socket should bind");
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -2735,23 +2767,47 @@ mod tests {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let reader_stream =
-                            stream.try_clone().expect("test helper stream should clone");
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let reader_stream = match stream.try_clone() {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
                         let mut reader = BufReader::new(reader_stream);
                         let mut line = String::new();
-                        if reader.read_line(&mut line).is_ok()
-                            && let Some(command) = parse_helper_request_command(line.trim_end())
-                        {
-                            commands_clone
-                                .lock()
-                                .expect("test helper command log should lock")
-                                .push(command);
+                        match reader.read_line(&mut line) {
+                            Ok(read) if read > 0 => {
+                                if let Some(command) = parse_helper_request_command(line.trim_end())
+                                {
+                                    commands_clone
+                                        .lock()
+                                        .expect("test helper command log should lock")
+                                        .push(command);
+                                } else {
+                                    let _ = stream.write_all(
+                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
+                                    );
+                                    let _ = stream.flush();
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                let _ = stream.write_all(
+                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
                         }
-                        stream
+                        if stream
                             .write_all(
                                 b"{\"ok\":true,\"status\":0,\"stdout\":\"\",\"stderr\":\"\"}\n",
                             )
-                            .expect("test helper should write response");
+                            .is_err()
+                        {
+                            continue;
+                        }
                         let _ = stream.flush();
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2765,6 +2821,7 @@ mod tests {
         (commands, stop, handle)
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_privileged_table_list_helper(
         socket_path: &Path,
         list_tables_stdout: String,
@@ -2773,7 +2830,15 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let listener = UnixListener::bind(socket_path).expect("test helper socket should bind");
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
         listener
             .set_nonblocking(true)
             .expect("test helper socket should be non-blocking");
@@ -2788,20 +2853,39 @@ mod tests {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        let reader_stream =
-                            stream.try_clone().expect("test helper stream should clone");
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let reader_stream = match stream.try_clone() {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
                         let mut reader = BufReader::new(reader_stream);
                         let mut line = String::new();
-                        let mut command = String::new();
-                        if reader.read_line(&mut line).is_ok()
-                            && let Some(parsed) = parse_helper_request_command(line.trim_end())
-                        {
-                            command = parsed;
-                            commands_clone
-                                .lock()
-                                .expect("test helper command log should lock")
-                                .push(command.clone());
-                        }
+                        let command = match reader.read_line(&mut line) {
+                            Ok(read) if read > 0 => {
+                                let Some(parsed) = parse_helper_request_command(line.trim_end())
+                                else {
+                                    let _ = stream.write_all(
+                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
+                                    );
+                                    let _ = stream.flush();
+                                    continue;
+                                };
+                                commands_clone
+                                    .lock()
+                                    .expect("test helper command log should lock")
+                                    .push(parsed.clone());
+                                parsed
+                            }
+                            _ => {
+                                let _ = stream.write_all(
+                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        };
 
                         let response = if command.contains("nft list tables") {
                             serde_json::json!({
@@ -2818,9 +2902,12 @@ mod tests {
                                 "stderr": ""
                             })
                         };
-                        stream
+                        if stream
                             .write_all(format!("{response}\n").as_bytes())
-                            .expect("test helper should write response");
+                            .is_err()
+                        {
+                            continue;
+                        }
                         let _ = stream.flush();
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2929,15 +3016,10 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn firewall_generation_handoff_deletes_previous_table_only_after_new_rules_apply() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
-        let test_dir = std::env::temp_dir().join(format!("phase10-fw-handoff-{unique}"));
-        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
-        let socket_path = test_dir.join("helper.sock");
+        let socket_path = phase10_test_socket_path("f");
 
         let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
         let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
@@ -2967,7 +3049,6 @@ mod tests {
             .join()
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&test_dir);
 
         let handoff_commands = &command_log[first_generation_count..];
         let delete_old_index = handoff_commands
@@ -3004,15 +3085,10 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prune_owned_tables_preserves_active_and_target_generation_tables() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
-        let test_dir = std::env::temp_dir().join(format!("phase10-prune-owned-{unique}"));
-        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
-        let socket_path = test_dir.join("helper.sock");
+        let socket_path = phase10_test_socket_path("p");
         let list_tables_stdout = [
             "table inet rustynet_g1",
             "table inet rustynet_g2",
@@ -3049,7 +3125,6 @@ mod tests {
             .join()
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_dir_all(&test_dir);
 
         assert!(
             command_log

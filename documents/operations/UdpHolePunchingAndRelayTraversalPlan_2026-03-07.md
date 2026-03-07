@@ -2,6 +2,8 @@
 
 Detailed implementation blueprint:
 - [`UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./UdpHolePunchingImplementationBlueprint_2026-03-07.md)
+- Concrete HP-2 ingestion order and gating plan:
+- [`UdpHolePunchingHP2IngestionPlan_2026-03-07.md`](./UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 
 ## 1) Objective
 Implement seamless internet-reachable Rustynet connectivity without manual consumer-router port forwarding, using:

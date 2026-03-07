@@ -31,6 +31,9 @@ require_cargo_subcommand clippy
 require_cargo_subcommand audit
 require_cargo_subcommand deny
 
+# Fail closed early when required measured OS-matrix evidence is missing/stale.
+./scripts/ci/fresh_install_os_matrix_release_gate.sh
+
 AUDIT_DB="${RUSTYNET_AUDIT_DB_PATH:-$ROOT_DIR/.cargo-audit-db}"
 SECURITY_TOOLCHAIN="${RUSTYNET_SECURITY_TOOLCHAIN:-1.88.0}"
 "$ROOT_DIR/scripts/ci/prepare_advisory_db.sh" "$AUDIT_DB"
@@ -134,6 +137,5 @@ if [[ "${RUSTYNET_PHASE10_RUN_REAL_E2E:-0}" == "1" ]]; then
 fi
 
 ./scripts/ci/check_phase10_readiness.sh
-./scripts/ci/fresh_install_os_matrix_release_gate.sh
 
 echo "Phase 10 CI gates: PASS"

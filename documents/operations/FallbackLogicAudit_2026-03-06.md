@@ -433,6 +433,13 @@ How to make one secure route:
 2. Fail setup when required toolchain packages are not present from approved source.
 3. Keep remote-script bootstrap as documented manual break-glass only.
 
+Update 2026-03-07:
+- Operator/bootstrap flow in `start.sh` now uses host package-manager `rustup` plus the pinned workspace toolchain from `rust-toolchain.toml`; ambient distro `cargo`/`rustc` fallback is removed from that path.
+- Remote E2E host bootstrap (`rustynet ops e2e-bootstrap-host`) now enforces the pinned repo toolchain when it performs its own build and skips the redundant privileged rebuild path when the caller already installed the binaries.
+- Assignment refresh env writers now emit quoted env-file assignments for structured values (`RUSTYNET_ASSIGNMENT_NODES`, `RUSTYNET_ASSIGNMENT_ALLOW`, and related fields), closing the raw-shell metacharacter parsing path in both systemd `EnvironmentFile` consumption and shell-sourced E2E harnesses.
+- Signing passphrase materialization now decrypts into a fresh secure temp directory path and atomically publishes the requested output; the ad hoc direct decrypt-to-existing-file pattern is removed from the live E2E matrix path.
+- CI helper script `scripts/ci/bootstrap_ci_tools.sh` still needs separate remediation before FL-024 can be considered fully closed repository-wide.
+
 ### FL-025: macOS launchd bootout helper suppresses unload errors
 Where:
 - `start.sh:2631-2643`

@@ -12,7 +12,7 @@ This gate blocks release if any required OS/scenario evidence is missing, stale,
 ./scripts/ci/fresh_install_os_matrix_release_gate.sh
 ```
 
-`phase10_gates.sh` invokes `fresh_install_os_matrix_release_gate.sh` directly, so Phase10 release gating fails closed when this evidence is absent or invalid.
+`phase10_gates.sh` invokes `fresh_install_os_matrix_release_gate.sh` as an early preflight, so Phase10 release gating fails closed immediately when this evidence is absent or invalid.
 
 ## Required Report
 - Path: `artifacts/phase10/fresh_install_os_matrix_report.json`
@@ -61,6 +61,9 @@ All must be `true`:
 - Default max age: `604800` seconds (7 days)
 - Override: `RUSTYNET_FRESH_INSTALL_OS_MATRIX_MAX_AGE_SECONDS`
 - Report path override: `RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH`
+- Profile override:
+  - `RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=cross_platform` (default release mode: requires `debian13`, `ubuntu`, `fedora`, `mint`, `macos`)
+  - `RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=linux` (Linux-only validation mode: requires `debian13`, `ubuntu`, `fedora`, `mint`)
 
 ## Fail-Closed Behavior
 The gate fails when any of the following occurs:

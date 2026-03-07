@@ -6,8 +6,9 @@ cd "$ROOT_DIR"
 
 REPORT_PATH="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH:-artifacts/phase10/fresh_install_os_matrix_report.json}"
 MAX_AGE_SECONDS="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_MAX_AGE_SECONDS:-604800}"
+PROFILE="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE:-cross_platform}"
 
-python3 - "$REPORT_PATH" "$MAX_AGE_SECONDS" <<'PY'
+python3 - "$REPORT_PATH" "$MAX_AGE_SECONDS" "$PROFILE" <<'PY'
 import json
 import re
 import subprocess
@@ -17,15 +18,29 @@ from pathlib import Path
 
 report_path = Path(sys.argv[1])
 max_age_seconds = int(sys.argv[2])
+profile = sys.argv[3]
 now_unix = int(time.time())
 
-required_os_profiles = {
-    "debian13": "linux",
-    "ubuntu": "linux",
-    "fedora": "linux",
-    "mint": "linux",
-    "macos": "macos",
-}
+if profile == "cross_platform":
+    required_os_profiles = {
+        "debian13": "linux",
+        "ubuntu": "linux",
+        "fedora": "linux",
+        "mint": "linux",
+        "macos": "macos",
+    }
+elif profile == "linux":
+    required_os_profiles = {
+        "debian13": "linux",
+        "ubuntu": "linux",
+        "fedora": "linux",
+        "mint": "linux",
+    }
+else:
+    raise SystemExit(
+        "unsupported fresh install OS matrix profile: "
+        f"{profile} (expected cross_platform or linux)"
+    )
 
 required_checks = {
     "clean_install": {

@@ -28,7 +28,7 @@ The wizard handles:
 - sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
 - startup config integrity is strict for security-critical fields: invalid persisted role/chain/backend/interface/port values are fail-closed errors (no silent coercion)
 - macOS canonical storage paths are enforced (`.../trust`, `.../assignment`, `.../keys`, `.../membership`); non-canonical legacy path values are fail-closed
-- dependency bootstrap is single-route hardening: `start.sh` no longer runs remote installer scripts for Homebrew/rustup
+- dependency bootstrap is single-route hardening: `start.sh` installs `rustup` from the approved host package manager and then installs the pinned workspace toolchain from `rust-toolchain.toml`; ambient distro `cargo`/`rustc` fallback and remote installer scripts are disabled
 - Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
   encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
   rejects direct plaintext passphrase-file fallback at daemon runtime
@@ -37,6 +37,9 @@ The wizard handles:
   services via `LoadCredentialEncrypted` (no persistent plaintext passphrase files)
 - signing credential decrypt flows pin embedded credential name for cross-distro
   systemd compatibility: `systemd-creds decrypt --name=signing_key_passphrase ...`
+- signing passphrase materialization is Rust-backed and fail-closed: the CLI decrypts
+  into a fresh secure temp path and atomically publishes the requested output, rather
+  than writing credential material through ad hoc direct-to-existing-file flows
 - local key rotation/revocation through signed control-plane workflows
 - membership bootstrap with encrypted persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
@@ -108,6 +111,7 @@ Linux assignment-refresh behavior:
     - `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` (default `/etc/rustynet/assignment.signing.secret`, `0600 root:root`)
     - `RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE` (default credential path injected by `rustynetd-assignment-refresh.service`)
     - `RUSTYNET_ASSIGNMENT_TTL_SECS` and `RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS`
+  - assignment refresh env files are written in quoted `EnvironmentFile` format; structured values such as `RUSTYNET_ASSIGNMENT_NODES` and `RUSTYNET_ASSIGNMENT_ALLOW` must not be emitted as raw unquoted shell text
 - Installer enables `rustynetd-assignment-refresh.timer` when assignment auto-refresh is enabled.
 - Refresh jobs rewrite assignment artifacts with strict custody:
   - bundle: `/var/lib/rustynet/rustynetd.assignment` (`0640 root:<daemon-group>`)
@@ -294,6 +298,7 @@ Raw measured inputs must exist first:
   - must include one-hop + two-hop enforcement checks per OS
   - must include role-switch validation checks per OS
   - must bind evidence to current `HEAD` commit SHA
+  - for Linux-only validation runs, set `RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=linux` (requires Debian/Ubuntu/Fedora/Mint scenarios; default remains `cross_platform`)
 
 Then run gates:
 
@@ -319,6 +324,7 @@ sudo -E ./scripts/ci/no_leak_dataplane_gate.sh
 
 Security gate toolchain note:
 - phase gate scripts require the pinned Rust security toolchain (`RUSTYNET_SECURITY_TOOLCHAIN`, default `1.88.0-<host-triple>`) to be installed; ambient cargo toolchain fallback is disabled.
+- interactive/operator bootstrap now follows the same provenance rule: install `rustup` from the host package manager, then install/use the pinned workspace toolchain declared in [`rust-toolchain.toml`](/Users/iwanteague/Desktop/Rustynet/rust-toolchain.toml).
 
 ## Phase 1 Measured Baseline Inputs
 

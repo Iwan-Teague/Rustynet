@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,10 @@ use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::unistd::Uid;
+use rand::{RngCore, rngs::OsRng};
+use zeroize::Zeroize;
+
+use crate::env_file::format_env_assignment;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebianTwoNodeE2eConfig {
@@ -166,35 +171,57 @@ pub fn execute_ops_e2e_bootstrap_host(
         detect_service_egress_interface(role.as_str(), ssh_allow_cidrs.as_str())?;
 
     if !skip_apt {
+        install_linux_e2e_prerequisites()?;
+        let required_toolchain = ensure_pinned_rust_toolchain(src_dir.as_path())?;
+        let cargo_proxy = rustup_proxy_path("cargo")?;
+        let cargo_proxy_text = cargo_proxy.display().to_string();
+        let manifest_path = format!("{}/Cargo.toml", src_dir.display());
         run_status(
-            "apt-get",
-            &["update"],
-            &[],
-            "apt update failed during e2e bootstrap",
-        )?;
-        run_status(
-            "apt-get",
+            cargo_proxy_text.as_str(),
             &[
-                "install",
-                "-y",
-                "--no-install-recommends",
-                "ca-certificates",
-                "curl",
-                "git",
-                "build-essential",
-                "pkg-config",
-                "libssl-dev",
-                "libsqlite3-dev",
-                "clang",
-                "llvm",
-                "nftables",
-                "wireguard-tools",
-                "openssl",
-                "cargo",
-                "rustc",
+                "build",
+                "--release",
+                "-p",
+                "rustynetd",
+                "-p",
+                "rustynet-cli",
+                "--manifest-path",
+                manifest_path.as_str(),
             ],
             &[],
-            "apt install failed during e2e bootstrap",
+            format!(
+                "remote release build failed during e2e bootstrap with toolchain {required_toolchain}"
+            )
+            .as_str(),
+        )?;
+
+        let daemon_binary = format!("{}/target/release/rustynetd", src_dir.display());
+        run_status(
+            "install",
+            &[
+                "-m",
+                "0755",
+                daemon_binary.as_str(),
+                "/usr/local/bin/rustynetd",
+            ],
+            &[],
+            "installing rustynetd failed during e2e bootstrap",
+        )?;
+        let cli_binary = format!("{}/target/release/rustynet-cli", src_dir.display());
+        run_status(
+            "install",
+            &["-m", "0755", cli_binary.as_str(), "/usr/local/bin/rustynet"],
+            &[],
+            "installing rustynet CLI failed during e2e bootstrap",
+        )?;
+    } else {
+        ensure_executable_file(
+            Path::new("/usr/local/bin/rustynetd"),
+            "installed rustynetd binary",
+        )?;
+        ensure_executable_file(
+            Path::new("/usr/local/bin/rustynet"),
+            "installed rustynet CLI",
         )?;
     }
 
@@ -209,55 +236,11 @@ pub fn execute_ops_e2e_bootstrap_host(
     run_allow_failure("pkill", &["-f", "rustynetd daemon"], &[]);
     run_allow_failure("pkill", &["-f", "rustynetd privileged-helper"], &[]);
     run_allow_failure("ip", &["link", "delete", "rustynet0"], &[]);
-
-    let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
-    for line in table_listing.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
-            run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
-        }
-    }
+    clear_rustynet_nftables_state()?;
 
     let _ = fs::remove_dir_all("/etc/rustynet");
     let _ = fs::remove_dir_all("/var/lib/rustynet");
     let _ = fs::remove_dir_all("/run/rustynet");
-
-    let manifest_path = format!("{}/Cargo.toml", src_dir.display());
-    run_status(
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "-p",
-            "rustynetd",
-            "-p",
-            "rustynet-cli",
-            "--manifest-path",
-            manifest_path.as_str(),
-        ],
-        &[],
-        "remote release build failed during e2e bootstrap",
-    )?;
-
-    let daemon_binary = format!("{}/target/release/rustynetd", src_dir.display());
-    run_status(
-        "install",
-        &[
-            "-m",
-            "0755",
-            daemon_binary.as_str(),
-            "/usr/local/bin/rustynetd",
-        ],
-        &[],
-        "installing rustynetd failed during e2e bootstrap",
-    )?;
-    let cli_binary = format!("{}/target/release/rustynet-cli", src_dir.display());
-    run_status(
-        "install",
-        &["-m", "0755", cli_binary.as_str(), "/usr/local/bin/rustynet"],
-        &[],
-        "installing rustynet CLI failed during e2e bootstrap",
-    )?;
 
     run_status(
         "install",
@@ -284,13 +267,19 @@ pub fn execute_ops_e2e_bootstrap_host(
         unique_suffix()
     );
     let bootstrap_result = (|| -> Result<(), String> {
-        run_status(
-            "openssl",
-            &["rand", "-hex", "48", "-out", passphrase_path.as_str()],
-            &[],
-            "generating bootstrap passphrase failed",
-        )?;
+        let mut passphrase_bytes = [0u8; 48];
+        OsRng.fill_bytes(&mut passphrase_bytes);
+        let mut passphrase_hex = String::with_capacity(passphrase_bytes.len() * 2 + 1);
+        for byte in passphrase_bytes {
+            write!(&mut passphrase_hex, "{byte:02x}")
+                .map_err(|err| format!("formatting bootstrap passphrase failed: {err}"))?;
+        }
+        passphrase_hex.push('\n');
+        fs::write(passphrase_path.as_str(), passphrase_hex.as_bytes())
+            .map_err(|err| format!("writing bootstrap passphrase failed: {err}"))?;
         set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
+        passphrase_hex.zeroize();
+        passphrase_bytes.zeroize();
 
         run_status(
             "rustynetd",
@@ -1936,13 +1925,13 @@ fn validate_config(config: &DebianTwoNodeE2eConfig) -> Result<(), String> {
             config.remote_root.display()
         ));
     }
-    if let Some(identity) = config.ssh_identity.as_ref()
-        && !identity.is_file()
-    {
-        return Err(format!(
-            "--ssh-identity does not exist: {}",
-            identity.display()
-        ));
+    if let Some(identity) = config.ssh_identity.as_ref() {
+        if !identity.is_file() {
+            return Err(format!(
+                "--ssh-identity does not exist: {}",
+                identity.display()
+            ));
+        }
     }
     for (label, value) in [
         ("exit-node-id", config.exit_node_id.as_str()),
@@ -2121,6 +2110,240 @@ fn secure_remove_file(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+fn install_linux_e2e_prerequisites() -> Result<(), String> {
+    let os_release = fs::read_to_string("/etc/os-release")
+        .map_err(|err| format!("failed to read /etc/os-release: {err}"))?;
+    let os_id = parse_os_release_value(os_release.as_str(), "ID");
+    let os_like = parse_os_release_value(os_release.as_str(), "ID_LIKE");
+    let is_fedora_like = os_id == "fedora"
+        || os_like
+            .split_whitespace()
+            .any(|value| value == "fedora" || value == "rhel");
+    let is_debian_like = os_id == "debian"
+        || os_id == "ubuntu"
+        || os_id == "linuxmint"
+        || os_like
+            .split_whitespace()
+            .any(|value| value == "debian" || value == "ubuntu");
+
+    if is_fedora_like {
+        run_status(
+            "dnf",
+            &[
+                "install",
+                "-y",
+                "ca-certificates",
+                "curl",
+                "git",
+                "gcc",
+                "gcc-c++",
+                "make",
+                "pkgconf-pkg-config",
+                "openssl-devel",
+                "sqlite-devel",
+                "clang",
+                "llvm",
+                "nftables",
+                "wireguard-tools",
+                "openssl",
+                "rustup",
+            ],
+            &[],
+            "dnf install failed during e2e bootstrap",
+        )?;
+        return Ok(());
+    }
+
+    if is_debian_like {
+        run_status(
+            "apt-get",
+            &["update"],
+            &[],
+            "apt update failed during e2e bootstrap",
+        )?;
+        run_status(
+            "apt-get",
+            &[
+                "install",
+                "-y",
+                "--no-install-recommends",
+                "ca-certificates",
+                "curl",
+                "git",
+                "build-essential",
+                "pkg-config",
+                "libssl-dev",
+                "libsqlite3-dev",
+                "clang",
+                "llvm",
+                "nftables",
+                "wireguard-tools",
+                "openssl",
+                "rustup",
+            ],
+            &[],
+            "apt install failed during e2e bootstrap",
+        )?;
+        return Ok(());
+    }
+
+    Err(format!(
+        "unsupported Linux distribution for e2e bootstrap (ID={os_id}, ID_LIKE={os_like})"
+    ))
+}
+
+fn parse_os_release_value(contents: &str, key: &str) -> String {
+    let prefix = format!("{key}=");
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.trim_matches('"').to_string())
+        .unwrap_or_default()
+}
+
+fn rust_toolchain_channel(repo_root: &Path) -> Result<String, String> {
+    let toolchain_path = repo_root.join("rust-toolchain.toml");
+    let contents = fs::read_to_string(toolchain_path.as_path()).map_err(|err| {
+        format!(
+            "failed to read required toolchain file {}: {err}",
+            toolchain_path.display()
+        )
+    })?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("channel") {
+            continue;
+        }
+        let Some((_, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let channel = value.trim().trim_matches('"').to_string();
+        if !channel.is_empty() {
+            return Ok(channel);
+        }
+    }
+    Err(format!(
+        "failed to parse required toolchain channel from {}",
+        toolchain_path.display()
+    ))
+}
+
+fn rustup_proxy_path(tool: &str) -> Result<PathBuf, String> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    let path = home.join(".cargo").join("bin").join(tool);
+    if is_executable(path.as_path()) {
+        return Ok(path);
+    }
+    Err(format!(
+        "missing rustup-managed {tool} proxy at {}; run rustup toolchain bootstrap first",
+        path.display()
+    ))
+}
+
+fn rustup_bootstrap_path() -> Result<PathBuf, String> {
+    if let Ok(path) = rustup_proxy_path("rustup") {
+        return Ok(path);
+    }
+    for candidate in [
+        "/usr/bin/rustup",
+        "/bin/rustup",
+        "/usr/bin/rustup-init",
+        "/bin/rustup-init",
+    ] {
+        let path = PathBuf::from(candidate);
+        if is_executable(path.as_path()) {
+            return Ok(path);
+        }
+    }
+    Err("missing rustup bootstrap binary; expected rustup or rustup-init".to_string())
+}
+
+fn ensure_pinned_rust_toolchain(repo_root: &Path) -> Result<String, String> {
+    let toolchain = rust_toolchain_channel(repo_root)?;
+    let bootstrap_path = rustup_bootstrap_path()?;
+    let bootstrap_text = bootstrap_path.display().to_string();
+    if rustup_proxy_path("rustup").is_err()
+        && bootstrap_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name == "rustup-init")
+    {
+        run_status(
+            bootstrap_text.as_str(),
+            &[
+                "-y",
+                "--profile",
+                "minimal",
+                "--default-toolchain",
+                toolchain.as_str(),
+                "--component",
+                "rustfmt",
+                "--component",
+                "clippy",
+            ],
+            &[],
+            "initializing rustup failed during e2e bootstrap",
+        )?;
+    }
+    let rustup_cli = rustup_proxy_path("rustup").unwrap_or(bootstrap_path);
+    let rustup_cli_text = rustup_cli.display().to_string();
+    let existing_rustc = capture_stdout(
+        rustup_cli_text.as_str(),
+        &["run", toolchain.as_str(), "rustc", "--version"],
+        &[],
+    );
+    let existing_cargo = capture_stdout(
+        rustup_cli_text.as_str(),
+        &["run", toolchain.as_str(), "cargo", "--version"],
+        &[],
+    );
+    run_status(
+        rustup_cli_text.as_str(),
+        &["set", "profile", "minimal"],
+        &[],
+        "setting rustup profile failed during e2e bootstrap",
+    )?;
+    if existing_rustc.is_err() || existing_cargo.is_err() {
+        run_status(
+            rustup_cli_text.as_str(),
+            &[
+                "toolchain",
+                "install",
+                toolchain.as_str(),
+                "--profile",
+                "minimal",
+                "--component",
+                "rustfmt",
+                "--component",
+                "clippy",
+            ],
+            &[],
+            "installing pinned rust toolchain failed during e2e bootstrap",
+        )?;
+    }
+    run_status(
+        rustup_cli_text.as_str(),
+        &["default", toolchain.as_str()],
+        &[],
+        "setting default rust toolchain failed during e2e bootstrap",
+    )?;
+    let rustc_version = capture_stdout(
+        rustup_cli_text.as_str(),
+        &["run", toolchain.as_str(), "rustc", "--version"],
+        &[],
+    )
+    .map_err(|err| format!("verifying pinned rust toolchain failed: {err}"))?;
+    if rustc_version.trim().is_empty() {
+        return Err("pinned rust toolchain verification returned empty rustc version".to_string());
+    }
+    rustup_proxy_path("cargo")?;
+    rustup_proxy_path("rustc")?;
+    Ok(toolchain)
+}
+
 fn resolve_repo_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -2195,6 +2418,36 @@ fn is_executable(path: &Path) -> bool {
     {
         true
     }
+}
+
+fn ensure_executable_file(path: &Path, label: &str) -> Result<(), String> {
+    if is_executable(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} is missing or not executable: {}",
+        path.display()
+    ))
+}
+
+fn clear_rustynet_nftables_state() -> Result<(), String> {
+    let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
+    for line in table_listing.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
+            run_allow_failure("nft", &["flush", "table", tokens[1], tokens[2]], &[]);
+            run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
+        }
+    }
+    let residual = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
+    if residual.lines().any(|line| {
+        line.split_whitespace()
+            .nth(2)
+            .is_some_and(|name| name.starts_with("rustynet"))
+    }) {
+        return Err("residual rustynet nftables state remained after cleanup".to_string());
+    }
+    Ok(())
 }
 
 fn qualify_target(raw: &str, ssh_user: &str) -> Target {
@@ -2841,25 +3094,67 @@ struct AssignmentRefreshEnv {
 
 fn write_assignment_refresh_env(path: &Path, env: AssignmentRefreshEnv) -> Result<(), String> {
     let mut content = String::new();
-    content.push_str("RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true\n");
+    content.push_str(format_env_assignment("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "true")?.as_str());
+    content.push('\n');
     content.push_str(
-        format!(
-            "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID={}\n",
-            env.target_node_id
-        )
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID",
+            env.target_node_id.as_str(),
+        )?
         .as_str(),
     );
-    content.push_str(format!("RUSTYNET_ASSIGNMENT_NODES={}\n", env.nodes_spec).as_str());
-    content.push_str(format!("RUSTYNET_ASSIGNMENT_ALLOW={}\n", env.allow_spec).as_str());
+    content.push('\n');
+    content.push_str(
+        format_env_assignment("RUSTYNET_ASSIGNMENT_NODES", env.nodes_spec.as_str())?.as_str(),
+    );
+    content.push('\n');
+    content.push_str(
+        format_env_assignment("RUSTYNET_ASSIGNMENT_ALLOW", env.allow_spec.as_str())?.as_str(),
+    );
+    content.push('\n');
+    content.push_str(
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
+            "/etc/rustynet/assignment.signing.secret",
+        )?
+        .as_str(),
+    );
+    content.push('\n');
+    content.push_str(
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE",
+            "/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase",
+        )?
+        .as_str(),
+    );
+    content.push('\n');
+    content.push_str(
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_OUTPUT",
+            "/var/lib/rustynet/rustynetd.assignment",
+        )?
+        .as_str(),
+    );
+    content.push('\n');
+    content.push_str(
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+            "/etc/rustynet/assignment.pub",
+        )?
+        .as_str(),
+    );
+    content.push('\n');
+    content.push_str(format_env_assignment("RUSTYNET_ASSIGNMENT_TTL_SECS", "300")?.as_str());
+    content.push('\n');
     content
-        .push_str("RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret\n");
-    content.push_str("RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE=/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase\n");
-    content.push_str("RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment\n");
-    content.push_str("RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/assignment.pub\n");
-    content.push_str("RUSTYNET_ASSIGNMENT_TTL_SECS=300\n");
-    content.push_str("RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS=180\n");
+        .push_str(format_env_assignment("RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS", "180")?.as_str());
+    content.push('\n');
     if let Some(exit_node_id) = env.exit_node_id {
-        content.push_str(format!("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID={exit_node_id}\n").as_str());
+        content.push_str(
+            format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", exit_node_id.as_str())?
+                .as_str(),
+        );
+        content.push('\n');
     }
     fs::write(path, content.as_bytes())
         .map_err(|err| format!("failed writing {}: {err}", path.display()))?;
@@ -2941,7 +3236,12 @@ fn utc_timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_base64, ensure_safe_token, extract_last_assignment_generated};
+    use std::fs;
+
+    use super::{
+        AssignmentRefreshEnv, decode_base64, ensure_safe_token, extract_last_assignment_generated,
+        write_assignment_refresh_env,
+    };
 
     #[test]
     fn safe_token_accepts_expected_charset() {
@@ -2962,5 +3262,29 @@ mod tests {
         let value = extract_last_assignment_generated("state=ExitActive last_assignment=12345:999");
         assert_eq!(value, Some(12345));
         assert_eq!(extract_last_assignment_generated("state=ExitActive"), None);
+    }
+
+    #[test]
+    fn assignment_refresh_env_quotes_structured_values() {
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-assignment-refresh-env-test-{}.env",
+            std::process::id()
+        ));
+        let env = AssignmentRefreshEnv {
+            target_node_id: "client-50".to_string(),
+            nodes_spec: "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def"
+                .to_string(),
+            allow_spec: "client-50|exit-49;exit-49|client-50".to_string(),
+            exit_node_id: Some("exit-49".to_string()),
+        };
+        write_assignment_refresh_env(path.as_path(), env).expect("write assignment refresh env");
+        let body = fs::read_to_string(path.as_path()).expect("read assignment refresh env");
+        let _ = fs::remove_file(path.as_path());
+        assert!(body.contains("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-50\""));
+        assert!(body.contains(
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def\""
+        ));
+        assert!(body.contains("RUSTYNET_ASSIGNMENT_ALLOW=\"client-50|exit-49;exit-49|client-50\""));
+        assert!(body.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\""));
     }
 }
