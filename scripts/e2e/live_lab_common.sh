@@ -312,6 +312,20 @@ live_lab_enforce_host() {
   live_lab_run_root "$target" "root rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'"
 }
 
+live_lab_apply_role_coupling() {
+  local target="$1"
+  local target_role="$2"
+  local preferred_exit_node_id="${3:-}"
+  local enable_exit_advertise="${4:-false}"
+  local env_path="${5:-/etc/rustynet/assignment-refresh.env}"
+  local command
+  command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-role-coupling --target-role '${target_role}' --enable-exit-advertise '${enable_exit_advertise}' --env-path '${env_path}'"
+  if [[ -n "$preferred_exit_node_id" ]]; then
+    command+=" --preferred-exit-node-id '${preferred_exit_node_id}'"
+  fi
+  live_lab_run_root "$target" "$command"
+}
+
 live_lab_wait_for_daemon_socket() {
   local target="$1"
   local socket_path="${2:-/run/rustynet/rustynetd.sock}"

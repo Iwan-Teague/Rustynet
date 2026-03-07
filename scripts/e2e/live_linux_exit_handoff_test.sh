@@ -219,8 +219,7 @@ for ((i=1; i<=MONITOR_ITERATIONS; i++)); do
   if (( i == SWITCH_ITERATION )); then
     switch_ts="$ts"
     live_lab_log "Switching client exit to ${EXIT_B_NODE_ID}"
-    live_lab_run_root "$CLIENT_HOST" "root rustynet ops set-assignment-refresh-exit-node --env-path /etc/rustynet/assignment-refresh.env --exit-node-id '${EXIT_B_NODE_ID}'"
-    live_lab_run_root "$CLIENT_HOST" "root systemctl start rustynetd-assignment-refresh.service"
+    live_lab_apply_role_coupling "$CLIENT_HOST" "client" "$EXIT_B_NODE_ID" "false" "/etc/rustynet/assignment-refresh.env"
   fi
   sleep 1
 done
