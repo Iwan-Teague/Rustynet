@@ -968,6 +968,99 @@ detect_default_egress() {
   fi
 }
 
+effective_selected_exit_node_for_egress() {
+  if [[ "${EXIT_CHAIN_HOPS}" == "2" && "${EXIT_CHAIN_ENTRY_NODE_ID}" == "${DEVICE_NODE_ID}" ]]; then
+    printf '%s' "${EXIT_CHAIN_FINAL_NODE_ID}"
+    return
+  fi
+  printf '%s' "${EXIT_CHAIN_ENTRY_NODE_ID}"
+}
+
+endpoint_host_from_value() {
+  local endpoint="$1"
+  if [[ "${endpoint}" =~ ^\[([0-9A-Fa-f:.]+)\]:[0-9]+$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${endpoint}" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+route_interface_for_host() {
+  local host="$1"
+  if [[ -z "${host}" ]]; then
+    return 1
+  fi
+  if [[ "${host}" == *:* ]]; then
+    ip -o -6 route get "${host}" 2>/dev/null | awk 'NR==1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+    return
+  fi
+  ip -o -4 route get "${host}" 2>/dev/null | awk 'NR==1 { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+derive_selected_exit_route_egress_interface() {
+  local selected_exit record endpoint endpoint_host derived
+  selected_exit="$(effective_selected_exit_node_for_egress)"
+  if [[ -z "${selected_exit}" ]]; then
+    return 1
+  fi
+  record="$(find_peer_record_by_node_id "${selected_exit}" || true)"
+  if [[ -z "${record}" ]]; then
+    return 1
+  fi
+  IFS='|' read -r _name _node_id _public_key endpoint _cidr _role _rest <<<"${record}"
+  if [[ -z "${endpoint}" ]]; then
+    return 1
+  fi
+  if ! endpoint_host="$(endpoint_host_from_value "${endpoint}")"; then
+    return 1
+  fi
+  derived="$(route_interface_for_host "${endpoint_host}" || true)"
+  if [[ -z "${derived}" ]]; then
+    return 1
+  fi
+  printf '%s' "${derived}"
+}
+
+sync_egress_interface_with_selected_exit_route() {
+  local selected_exit derived detected_egress
+  if ! is_linux_host; then
+    return 0
+  fi
+
+  selected_exit="$(effective_selected_exit_node_for_egress)"
+  if [[ -n "${selected_exit}" ]]; then
+    derived="$(derive_selected_exit_route_egress_interface || true)"
+    if [[ -z "${derived}" ]]; then
+      print_err "Unable to derive egress interface for selected exit node '${selected_exit}'."
+      print_info "Verify the selected exit endpoint is present and routable in local peer records."
+      return 1
+    fi
+    if [[ "${EGRESS_INTERFACE}" != "${derived}" ]]; then
+      if [[ -n "${EGRESS_INTERFACE}" ]]; then
+        print_warn "Overriding configured egress interface '${EGRESS_INTERFACE}' with route-derived '${derived}' for selected exit '${selected_exit}'."
+      else
+        print_info "Setting egress interface to route-derived '${derived}' for selected exit '${selected_exit}'."
+      fi
+      EGRESS_INTERFACE="${derived}"
+    fi
+    return 0
+  fi
+
+  if [[ -z "${EGRESS_INTERFACE}" ]]; then
+    detected_egress="$(detect_default_egress)"
+    if [[ -z "${detected_egress}" ]]; then
+      print_err "Unable to detect default egress interface."
+      return 1
+    fi
+    EGRESS_INTERFACE="${detected_egress}"
+  fi
+  return 0
+}
+
 package_manager() {
   if is_macos_host; then
     add_macos_homebrew_to_path
@@ -2132,6 +2225,10 @@ write_daemon_environment() {
   fi
   enforce_auto_tunnel_policy
   require_linux_dataplane "write_daemon_environment" || return 0
+  if ! sync_egress_interface_with_selected_exit_route; then
+    print_err "Failed to derive secure egress interface mapping for current exit selection."
+    return 1
+  fi
 
   run_systemd_installer_with_env() {
     run_root env \

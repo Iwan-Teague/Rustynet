@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,6 +20,10 @@ const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
 const SERVICE_SIGNING_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
 const RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME: &str = concat!("w", "g", "_key_passphrase");
+const ASSIGNMENT_REFRESH_ENV_DST: &str = "/etc/rustynet/assignment-refresh.env";
+const DEFAULT_EXIT_ROUTE_CIDR: &str = "0.0.0.0/0";
+const MAX_ASSIGNMENT_ROUTE_SCAN: usize = 4096;
+const MAX_ASSIGNMENT_PEER_SCAN: usize = 4096;
 
 const SERVICE_DST: &str = "/etc/systemd/system/rustynetd.service";
 const HELPER_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-privileged-helper.service";
@@ -362,13 +367,15 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     let wireguard_listen_port = parse_wireguard_port(wireguard_listen_port_raw.as_str())?;
 
-    let egress_interface = match env_optional_string("RUSTYNET_EGRESS_INTERFACE")? {
-        Some(value) => value,
-        None => match existing_env.get("RUSTYNET_EGRESS_INTERFACE") {
-            Some(value) if !value.is_empty() => value.clone(),
-            _ => detect_default_egress_interface()?,
-        },
-    };
+    let selected_exit_endpoint = detect_selected_exit_endpoint_for_egress(
+        auto_tunnel_bundle_path.as_path(),
+        Path::new(ASSIGNMENT_REFRESH_ENV_DST),
+    )?;
+    let egress_interface = resolve_egress_interface(
+        env_optional_string("RUSTYNET_EGRESS_INTERFACE")?,
+        existing_env.get("RUSTYNET_EGRESS_INTERFACE").cloned(),
+        selected_exit_endpoint.as_deref(),
+    )?;
     if egress_interface.trim().is_empty() {
         return Err(
             "unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string(),
@@ -1203,20 +1210,263 @@ fn parse_wireguard_port(value: &str) -> Result<u16, String> {
 
 fn detect_default_egress_interface() -> Result<String, String> {
     let output = run_command_capture("ip", &["-o", "-4", "route", "show", "to", "default"])?;
-    for line in output.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        for (idx, token) in tokens.iter().enumerate() {
-            if *token == "dev"
-                && let Some(name) = tokens.get(idx + 1)
-            {
-                return Ok((*name).to_string());
-            }
-        }
-        if let Some(name) = tokens.get(4) {
-            return Ok((*name).to_string());
-        }
+    if let Some(interface) = parse_first_route_interface(output.as_str()) {
+        return Ok(interface);
     }
     Err("unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string())
+}
+
+fn resolve_egress_interface(
+    explicit_egress: Option<String>,
+    existing_egress: Option<String>,
+    selected_exit_endpoint: Option<&str>,
+) -> Result<String, String> {
+    if let Some(endpoint) = selected_exit_endpoint {
+        let derived = detect_egress_interface_for_endpoint(endpoint)?;
+        if let Some(explicit_value) = explicit_egress.as_deref()
+            && !explicit_value.trim().is_empty()
+            && explicit_value != derived
+        {
+            return Err(format!(
+                "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
+            ));
+        }
+        return Ok(derived);
+    }
+
+    if let Some(value) = explicit_egress
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    if let Some(value) = existing_egress
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    detect_default_egress_interface()
+}
+
+fn detect_egress_interface_for_endpoint(endpoint: &str) -> Result<String, String> {
+    let socket_addr = endpoint
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("invalid selected-exit endpoint format: {endpoint}"))?;
+    detect_egress_interface_for_ip(socket_addr.ip())
+}
+
+fn detect_egress_interface_for_ip(ip: IpAddr) -> Result<String, String> {
+    let (args_prefix, ip_arg) = match ip {
+        IpAddr::V4(value) => (vec!["-o", "-4", "route", "get"], value.to_string()),
+        IpAddr::V6(value) => (vec!["-o", "-6", "route", "get"], value.to_string()),
+    };
+    let mut args = args_prefix;
+    args.push(ip_arg.as_str());
+    let output = run_command_capture("ip", args.as_slice())?;
+    if let Some(interface) = parse_first_route_interface(output.as_str()) {
+        return Ok(interface);
+    }
+    Err(format!(
+        "unable to detect egress interface for selected exit destination {ip}"
+    ))
+}
+
+fn parse_first_route_interface(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(parse_dev_interface_token)
+        .map(|value| value.to_string())
+}
+
+fn parse_dev_interface_token(line: &str) -> Option<&str> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    for (idx, token) in tokens.iter().enumerate() {
+        if *token == "dev" {
+            return tokens.get(idx + 1).copied();
+        }
+    }
+    tokens.get(4).copied()
+}
+
+fn detect_selected_exit_endpoint_for_egress(
+    assignment_bundle_path: &Path,
+    assignment_refresh_env_path: &Path,
+) -> Result<Option<String>, String> {
+    let preferred_exit_node_id = read_assignment_refresh_exit_node_id(assignment_refresh_env_path)?;
+    if !assignment_bundle_path.exists() {
+        if let Some(exit_node_id) = preferred_exit_node_id {
+            return Err(format!(
+                "selected exit node {exit_node_id} is set but assignment bundle is missing: {}",
+                assignment_bundle_path.display()
+            ));
+        }
+        return Ok(None);
+    }
+    if !assignment_bundle_path.is_file() {
+        return Err(format!(
+            "assignment bundle path must be a regular file: {}",
+            assignment_bundle_path.display()
+        ));
+    }
+    let fields = read_env_file_values(assignment_bundle_path)?;
+    let selected_exit_node_id =
+        resolve_selected_exit_node_id(&fields, preferred_exit_node_id.as_deref());
+    let Some(exit_node_id) = selected_exit_node_id else {
+        return Ok(None);
+    };
+    let endpoint = assignment_peer_endpoint(&fields, exit_node_id.as_str())?;
+    Ok(Some(endpoint))
+}
+
+fn read_assignment_refresh_exit_node_id(path: &Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let values = read_env_file_values(path)?;
+    let raw = match values.get("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID") {
+        Some(value) => value.trim(),
+        None => return Ok(None),
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if !raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+    {
+        return Err(format!(
+            "invalid RUSTYNET_ASSIGNMENT_EXIT_NODE_ID in {}: {}",
+            path.display(),
+            raw
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+fn resolve_selected_exit_node_id(
+    fields: &HashMap<String, String>,
+    preferred_exit_node_id: Option<&str>,
+) -> Option<String> {
+    if let Some(value) = preferred_exit_node_id
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
+    let route_count = fields
+        .get("route_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_ASSIGNMENT_ROUTE_SCAN);
+
+    for index in 0..route_count {
+        let destination_key = format!("route.{index}.destination_cidr");
+        let kind_key = format!("route.{index}.kind");
+        let via_key = format!("route.{index}.via_node");
+        let Some(destination) = fields.get(destination_key.as_str()) else {
+            continue;
+        };
+        let Some(kind) = fields.get(kind_key.as_str()) else {
+            continue;
+        };
+        let Some(via_node) = fields.get(via_key.as_str()) else {
+            continue;
+        };
+        let destination = destination.trim();
+        let kind = kind.trim();
+        let via_node = via_node.trim();
+        if destination == DEFAULT_EXIT_ROUTE_CIDR && kind == "exit_default" && !via_node.is_empty()
+        {
+            return Some(via_node.to_string());
+        }
+    }
+
+    for (key, value) in fields {
+        let Some(index) = parse_indexed_key_component(key.as_str(), "route.", ".destination_cidr")
+        else {
+            continue;
+        };
+        if value.trim() != DEFAULT_EXIT_ROUTE_CIDR {
+            continue;
+        }
+        let kind_key = format!("route.{index}.kind");
+        let via_key = format!("route.{index}.via_node");
+        let Some(kind) = fields.get(kind_key.as_str()) else {
+            continue;
+        };
+        let Some(via_node) = fields.get(via_key.as_str()) else {
+            continue;
+        };
+        let kind = kind.trim();
+        let via_node = via_node.trim();
+        if kind == "exit_default" && !via_node.is_empty() {
+            return Some(via_node.to_string());
+        }
+    }
+
+    None
+}
+
+fn assignment_peer_endpoint(
+    fields: &HashMap<String, String>,
+    target_node_id: &str,
+) -> Result<String, String> {
+    let peer_count = fields
+        .get("peer_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_ASSIGNMENT_PEER_SCAN);
+
+    for index in 0..peer_count {
+        let node_id_key = format!("peer.{index}.node_id");
+        let endpoint_key = format!("peer.{index}.endpoint");
+        let Some(node_id) = fields.get(node_id_key.as_str()) else {
+            continue;
+        };
+        if node_id.trim() != target_node_id {
+            continue;
+        }
+        let endpoint = fields.get(endpoint_key.as_str()).ok_or_else(|| {
+            format!("assignment bundle missing endpoint for selected exit node {target_node_id}")
+        })?;
+        let endpoint = endpoint.trim();
+        endpoint.parse::<SocketAddr>().map_err(|_| {
+            format!("assignment bundle has invalid endpoint for selected exit node {target_node_id}: {endpoint}")
+        })?;
+        return Ok(endpoint.to_string());
+    }
+
+    for (key, value) in fields {
+        let Some(index) = parse_indexed_key_component(key.as_str(), "peer.", ".node_id") else {
+            continue;
+        };
+        if value.trim() != target_node_id {
+            continue;
+        }
+        let endpoint_key = format!("peer.{index}.endpoint");
+        let endpoint = fields.get(endpoint_key.as_str()).ok_or_else(|| {
+            format!("assignment bundle missing endpoint for selected exit node {target_node_id}")
+        })?;
+        let endpoint = endpoint.trim();
+        endpoint.parse::<SocketAddr>().map_err(|_| {
+            format!("assignment bundle has invalid endpoint for selected exit node {target_node_id}: {endpoint}")
+        })?;
+        return Ok(endpoint.to_string());
+    }
+
+    Err(format!(
+        "assignment bundle missing selected exit node peer entry: {target_node_id}"
+    ))
+}
+
+fn parse_indexed_key_component(key: &str, prefix: &str, suffix: &str) -> Option<usize> {
+    if !key.starts_with(prefix) || !key.ends_with(suffix) {
+        return None;
+    }
+    let middle = &key[prefix.len()..key.len().saturating_sub(suffix.len())];
+    if middle.is_empty() || !middle.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    middle.parse::<usize>().ok()
 }
 
 fn ensure_interface_exists(interface: &str) -> Result<(), String> {
@@ -1738,7 +1988,12 @@ fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_to_hex, parse_install_bool, read_env_file_values};
+    use std::collections::HashMap;
+
+    use super::{
+        assignment_peer_endpoint, bytes_to_hex, parse_dev_interface_token, parse_install_bool,
+        read_env_file_values, resolve_selected_exit_node_id,
+    };
 
     #[test]
     fn parse_install_bool_accepts_expected_variants() {
@@ -1780,5 +2035,61 @@ mod tests {
     #[test]
     fn bytes_to_hex_encodes_expected_value() {
         assert_eq!(bytes_to_hex(&[0x00, 0xab, 0xff]), "00abff");
+    }
+
+    #[test]
+    fn parse_dev_interface_token_extracts_interface() {
+        let line = "1.1.1.1 via 192.168.18.1 dev enp0s9 src 192.168.18.51 uid 0";
+        assert_eq!(parse_dev_interface_token(line), Some("enp0s9"));
+    }
+
+    #[test]
+    fn resolve_selected_exit_node_prefers_explicit_exit_id() {
+        let mut fields = HashMap::new();
+        fields.insert("route_count".to_string(), "1".to_string());
+        fields.insert(
+            "route.0.destination_cidr".to_string(),
+            "0.0.0.0/0".to_string(),
+        );
+        fields.insert("route.0.kind".to_string(), "exit_default".to_string());
+        fields.insert("route.0.via_node".to_string(), "exit-a".to_string());
+
+        let resolved = resolve_selected_exit_node_id(&fields, Some("exit-b"));
+        assert_eq!(resolved.as_deref(), Some("exit-b"));
+    }
+
+    #[test]
+    fn resolve_selected_exit_node_from_default_route() {
+        let mut fields = HashMap::new();
+        fields.insert("route_count".to_string(), "1".to_string());
+        fields.insert(
+            "route.0.destination_cidr".to_string(),
+            "0.0.0.0/0".to_string(),
+        );
+        fields.insert("route.0.kind".to_string(), "exit_default".to_string());
+        fields.insert("route.0.via_node".to_string(), "exit-a".to_string());
+
+        let resolved = resolve_selected_exit_node_id(&fields, None);
+        assert_eq!(resolved.as_deref(), Some("exit-a"));
+    }
+
+    #[test]
+    fn assignment_peer_endpoint_resolves_peer_endpoint() {
+        let mut fields = HashMap::new();
+        fields.insert("peer_count".to_string(), "2".to_string());
+        fields.insert("peer.0.node_id".to_string(), "entry".to_string());
+        fields.insert(
+            "peer.0.endpoint".to_string(),
+            "192.168.18.50:51820".to_string(),
+        );
+        fields.insert("peer.1.node_id".to_string(), "final-exit".to_string());
+        fields.insert(
+            "peer.1.endpoint".to_string(),
+            "192.168.18.49:51820".to_string(),
+        );
+
+        let endpoint =
+            assignment_peer_endpoint(&fields, "final-exit").expect("peer endpoint should resolve");
+        assert_eq!(endpoint, "192.168.18.49:51820");
     }
 }
