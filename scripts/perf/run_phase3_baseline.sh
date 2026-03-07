@@ -7,7 +7,8 @@ cd "$ROOT_DIR"
 PHASE3_REPORT="artifacts/perf/phase3/mesh_baseline.json"
 PHASE3_REPORT_ABS="$ROOT_DIR/$PHASE3_REPORT"
 
-RUSTYNET_PHASE3_MESH_REPORT="$PHASE3_REPORT_ABS" cargo test -p rustynetd phase3_three_node_mesh_succeeds
+RUSTYNET_PHASE3_MESH_REPORT="$PHASE3_REPORT_ABS" \
+  ./scripts/ci/run_required_test.sh rustynetd phase3_three_node_mesh_succeeds
 
 if [[ ! -f "$PHASE3_REPORT" ]]; then
   echo "missing phase3 report: $PHASE3_REPORT"

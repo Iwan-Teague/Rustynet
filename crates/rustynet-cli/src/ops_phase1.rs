@@ -13,15 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nix::unistd::Uid;
 use serde_json::{Map, Value, json};
 
-const DEFAULT_PHASE1_SOURCE_NDJSON_PATH: &str =
-    "artifacts/perf/phase1/source/performance_samples.ndjson";
-const DEFAULT_PHASE1_FALLBACK_SOURCE_NDJSON_PATH: &str =
-    "artifacts/operations/source/performance_samples.ndjson";
-const DEFAULT_PHASE1_OPERATIONS_PERF_REPORT_PATH: &str =
-    "artifacts/operations/performance_budget_report.json";
-const DEFAULT_PHASE1_PHASE10_PERF_REPORT_PATH: &str = "artifacts/phase10/perf_budget_report.json";
-const DEFAULT_PHASE1_OPERATIONS_RAW_PERF_REPORT_PATH: &str =
-    "artifacts/operations/raw/performance_budget_report.json";
 const DEFAULT_PHASE1_MEASURED_INPUT_PATH: &str = "artifacts/perf/phase1/measured_input.json";
 const DEFAULT_PHASE1_RUNTIME_REPORT_PATH: &str = "artifacts/perf/phase1/baseline.json";
 const DEFAULT_PHASE1_BACKEND_REPORT_PATH: &str = "artifacts/perf/phase1/backend_contract_perf.json";
@@ -347,28 +338,17 @@ fn phase1_validate_source_path(path: &Path) -> Result<(), String> {
 }
 
 fn resolve_phase1_measured_source_path() -> Result<PathBuf, String> {
-    if let Some(configured_path) = env_optional_string("RUSTYNET_PHASE1_PERF_SAMPLES_PATH")? {
-        let resolved = phase1_resolve_path(configured_path.as_str())?;
-        phase1_validate_source_path(resolved.as_path())?;
-        return Ok(resolved);
-    }
-
-    for candidate in [
-        DEFAULT_PHASE1_SOURCE_NDJSON_PATH,
-        DEFAULT_PHASE1_FALLBACK_SOURCE_NDJSON_PATH,
-        DEFAULT_PHASE1_OPERATIONS_PERF_REPORT_PATH,
-        DEFAULT_PHASE1_PHASE10_PERF_REPORT_PATH,
-        DEFAULT_PHASE1_OPERATIONS_RAW_PERF_REPORT_PATH,
-    ] {
-        let resolved = phase1_resolve_path(candidate)?;
-        if phase1_validate_source_path(resolved.as_path()).is_ok() {
-            return Ok(resolved);
-        }
-    }
-
-    Err(format!(
-        "missing measured source file for phase1 metrics collector\nset RUSTYNET_PHASE1_PERF_SAMPLES_PATH or provide one of:\n  - {DEFAULT_PHASE1_SOURCE_NDJSON_PATH}\n  - {DEFAULT_PHASE1_FALLBACK_SOURCE_NDJSON_PATH}\n  - {DEFAULT_PHASE1_OPERATIONS_PERF_REPORT_PATH}\n  - {DEFAULT_PHASE1_PHASE10_PERF_REPORT_PATH}\n  - {DEFAULT_PHASE1_OPERATIONS_RAW_PERF_REPORT_PATH}"
-    ))
+    let configured_path = env_optional_string("RUSTYNET_PHASE1_PERF_SAMPLES_PATH")?.ok_or_else(
+        || {
+            "missing required measured source path: RUSTYNET_PHASE1_PERF_SAMPLES_PATH\n\
+             fallback source discovery is disabled for phase1 security gating.\n\
+             expected canonical source (default): artifacts/perf/phase1/source/performance_samples.ndjson"
+                .to_string()
+        },
+    )?;
+    let resolved = phase1_resolve_path(configured_path.as_str())?;
+    phase1_validate_source_path(resolved.as_path())?;
+    Ok(resolved)
 }
 
 fn read_json_value(path: &Path, label: &str) -> Result<Value, String> {

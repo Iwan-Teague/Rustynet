@@ -1,6 +1,18 @@
 {
-  "artifact_path": "target/debug/rustynetd",
-  "sha256": "70d14e71b38e21cf6b097b6a03bf4fc5d7e9a8ce0641fed50f759e95cdde6613",
+  "artifact_path": "/Users/iwanteague/Desktop/Rustynet/target/release/rustynetd",
+  "artifact_sha256": "88d23e0fd1ef12683fe14b0f710e55217a86ae1fe14231b76555ec83e4ada483",
+  "artifact_size_bytes": 1664080,
+  "command_digest_sha256": "ae26641e6df4bcc8b82a9c851873ea216b9535709f9734fedd964067a172fe47",
+  "generated_at_unix": 1772890226,
+  "host_identity": "ci-localhost",
+  "phase": "release",
   "release_track": "beta",
-  "generated_at_utc": "2026-03-07T00:46:43Z"
+  "sbom_digest_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/release/sbom.sha256",
+  "sbom_digest_value": "487c796dd086c0ef79b5d924e4950289fe3c4a5db2833a471a65f418097907ee",
+  "sbom_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/release/sbom.cargo-metadata.json",
+  "sbom_sha256": "487c796dd086c0ef79b5d924e4950289fe3c4a5db2833a471a65f418097907ee",
+  "schema_version": 1,
+  "signature_hex": "19cdf702fdc9672ab52aa02d10d9a9bb20d88973c1cb108234f85ab64452c997147ee088239df93625a30b229307972646a7c3ee29600cc088105d055573b30e",
+  "signer_key_id": "ed25519:8016842956f60178",
+  "verifier_key_hex": "910ddf4d31366ec143fef10d16160eabbbabee48e8c0040d795119ac19d5a307"
 }

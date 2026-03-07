@@ -4,14 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+RUSTYNET_GATE_TEST_THREADS="${RUSTYNET_GATE_TEST_THREADS:-1}"
+
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace --all-targets --all-features
-cargo test --workspace --all-targets --all-features
+RUST_TEST_THREADS="${RUSTYNET_GATE_TEST_THREADS}" cargo test --workspace --all-targets --all-features
 
 ./scripts/ci/phase7_gates.sh
 ./scripts/ci/check_dependency_exceptions.sh
-./scripts/ci/verify_release_attestation.sh
+./scripts/ci/supply_chain_integrity_gates.sh
 
 for required_doc in \
   "documents/operations/SecurityAssuranceProgram.md" \

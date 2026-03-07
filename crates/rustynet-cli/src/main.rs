@@ -169,8 +169,12 @@ enum OpsCommand {
     RunPhase1Baseline,
     CollectPhase9RawEvidence,
     GeneratePhase9Artifacts,
+    VerifyPhase9Evidence,
     GeneratePhase10Artifacts,
     VerifyPhase10Provenance,
+    VerifyPhase6ParityEvidence,
+    SignReleaseArtifact,
+    VerifyReleaseArtifact,
     CollectPlatformProbe,
     GeneratePlatformParityReport,
     CollectPlatformParityBundle,
@@ -377,6 +381,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::GeneratePhase9Artifacts)
         }
+        "verify-phase9-evidence" => {
+            if args.len() != 1 {
+                return Err("ops verify-phase9-evidence does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyPhase9Evidence)
+        }
         "generate-phase10-artifacts" => {
             if args.len() != 1 {
                 return Err("ops generate-phase10-artifacts does not accept options".to_string());
@@ -388,6 +398,24 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops verify-phase10-provenance does not accept options".to_string());
             }
             Ok(OpsCommand::VerifyPhase10Provenance)
+        }
+        "verify-phase6-parity-evidence" => {
+            if args.len() != 1 {
+                return Err("ops verify-phase6-parity-evidence does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyPhase6ParityEvidence)
+        }
+        "sign-release-artifact" => {
+            if args.len() != 1 {
+                return Err("ops sign-release-artifact does not accept options".to_string());
+            }
+            Ok(OpsCommand::SignReleaseArtifact)
+        }
+        "verify-release-artifact" => {
+            if args.len() != 1 {
+                return Err("ops verify-release-artifact does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyReleaseArtifact)
         }
         "collect-platform-probe" => {
             if args.len() != 1 {
@@ -1293,10 +1321,16 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_phase9::execute_ops_collect_phase9_raw_evidence()
         }
         OpsCommand::GeneratePhase9Artifacts => ops_phase9::execute_ops_generate_phase9_artifacts(),
+        OpsCommand::VerifyPhase9Evidence => ops_phase9::execute_ops_verify_phase9_evidence(),
         OpsCommand::GeneratePhase10Artifacts => {
             ops_phase9::execute_ops_generate_phase10_artifacts()
         }
         OpsCommand::VerifyPhase10Provenance => ops_phase9::execute_ops_verify_phase10_provenance(),
+        OpsCommand::VerifyPhase6ParityEvidence => {
+            ops_phase9::execute_ops_verify_phase6_parity_evidence()
+        }
+        OpsCommand::SignReleaseArtifact => ops_phase9::execute_ops_sign_release_artifact(),
+        OpsCommand::VerifyReleaseArtifact => ops_phase9::execute_ops_verify_release_artifact(),
         OpsCommand::CollectPlatformProbe => execute_ops_collect_platform_probe(),
         OpsCommand::GeneratePlatformParityReport => execute_ops_generate_platform_parity_report(),
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
@@ -1735,6 +1769,8 @@ fn execute_ops_collect_platform_probe() -> Result<String, String> {
 fn execute_ops_generate_platform_parity_report() -> Result<String, String> {
     let out_path = generate_platform_parity_report_artifact()?;
     phase6_validate_platform_parity_report(out_path.as_path())?;
+    ops_phase9::write_phase6_parity_evidence_attestation(out_path.as_path())?;
+    ops_phase9::execute_ops_verify_phase6_parity_evidence()?;
     Ok(format!(
         "wrote platform parity report: {}",
         out_path.display()
@@ -1790,6 +1826,8 @@ fn execute_ops_collect_platform_parity_bundle() -> Result<String, String> {
 
     let report_path = generate_platform_parity_report_artifact()?;
     phase6_validate_platform_parity_report(report_path.as_path())?;
+    ops_phase9::write_phase6_parity_evidence_attestation(report_path.as_path())?;
+    ops_phase9::execute_ops_verify_phase6_parity_evidence()?;
 
     Ok("phase6 platform parity bundle generated from probes".to_string())
 }
@@ -5091,8 +5129,12 @@ fn help_text() -> String {
         "  ops run-phase1-baseline",
         "  ops collect-phase9-raw-evidence",
         "  ops generate-phase9-artifacts",
+        "  ops verify-phase9-evidence",
         "  ops generate-phase10-artifacts",
         "  ops verify-phase10-provenance",
+        "  ops verify-phase6-parity-evidence",
+        "  ops sign-release-artifact",
+        "  ops verify-release-artifact",
         "  ops collect-platform-probe",
         "  ops generate-platform-parity-report",
         "  ops collect-platform-parity-bundle",
@@ -5313,6 +5355,10 @@ mod tests {
             parse_command(&["ops".to_string(), "generate-phase9-artifacts".to_string()]);
         assert!(format!("{generate_phase9:?}").contains("GeneratePhase9Artifacts"));
 
+        let verify_phase9 =
+            parse_command(&["ops".to_string(), "verify-phase9-evidence".to_string()]);
+        assert!(format!("{verify_phase9:?}").contains("VerifyPhase9Evidence"));
+
         let generate_phase10 =
             parse_command(&["ops".to_string(), "generate-phase10-artifacts".to_string()]);
         assert!(format!("{generate_phase10:?}").contains("GeneratePhase10Artifacts"));
@@ -5320,6 +5366,20 @@ mod tests {
         let verify_phase10_provenance =
             parse_command(&["ops".to_string(), "verify-phase10-provenance".to_string()]);
         assert!(format!("{verify_phase10_provenance:?}").contains("VerifyPhase10Provenance"));
+
+        let verify_phase6_parity = parse_command(&[
+            "ops".to_string(),
+            "verify-phase6-parity-evidence".to_string(),
+        ]);
+        assert!(format!("{verify_phase6_parity:?}").contains("VerifyPhase6ParityEvidence"));
+
+        let sign_release_artifact =
+            parse_command(&["ops".to_string(), "sign-release-artifact".to_string()]);
+        assert!(format!("{sign_release_artifact:?}").contains("SignReleaseArtifact"));
+
+        let verify_release_artifact =
+            parse_command(&["ops".to_string(), "verify-release-artifact".to_string()]);
+        assert!(format!("{verify_release_artifact:?}").contains("VerifyReleaseArtifact"));
 
         let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));
@@ -5640,6 +5700,82 @@ mod tests {
         let result = load_signing_key(&path, &passphrase_path);
         assert!(result.is_ok());
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn secure_remove_file_rejects_directory() {
+        let unique = format!(
+            "rustynet-cli-secure-remove-dir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+
+        let err =
+            super::secure_remove_file(&dir).expect_err("secure remove must reject directories");
+        assert!(err.contains("regular file"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_remove_file_removes_target_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-secure-remove-file-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("secret.tmp");
+        std::fs::write(&path, b"temporary-secret").expect("secret file should exist");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("secret file mode should be owner-only");
+
+        super::secure_remove_file(&path).expect("secure remove should succeed");
+        assert!(!path.exists(), "secure remove should delete the file");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_secure_temp_file_sets_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-secure-temp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+
+        let temp = super::create_secure_temp_file(&dir, "secrets-test.")
+            .expect("secure temp file allocation should succeed");
+        let mode = std::fs::metadata(&temp)
+            .expect("temporary file metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "secure temp files must be owner-only");
+
+        super::secure_remove_file(&temp).expect("cleanup should succeed");
         let _ = std::fs::remove_dir_all(dir);
     }
 

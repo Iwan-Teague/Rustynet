@@ -238,3 +238,5 @@ if not crypto.get("exceptions_auto_expire", False):
 
 print("Phase 9 operational readiness checks: PASS")
 PY
+
+cargo run --quiet -p rustynet-cli -- ops verify-phase9-evidence

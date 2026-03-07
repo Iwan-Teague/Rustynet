@@ -60,6 +60,8 @@ Host-profile behavior:
 
 Current implementation support/security matrix:
 - [`documents/operations/PlatformSupportMatrix.md`](./documents/operations/PlatformSupportMatrix.md)
+- Fresh-install OS matrix release gate (Debian/Ubuntu/Fedora/Mint/macOS):
+  [`documents/operations/FreshInstallOSMatrixReleaseGate.md`](./documents/operations/FreshInstallOSMatrixReleaseGate.md)
 - Traversal architecture and rollout plan:
   [`documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`](./documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
 - Traversal implementation blueprint (file-level security implementation):
@@ -173,6 +175,47 @@ Important:
 - SSH control-master sessions are used; password-based SSH is supported interactively.
 - When SSH user is non-root, provide `--sudo-password-file` (mode `0600`); this keeps sudo secrets out of command arguments.
 
+## Active-Network Adversarial Security Tests
+
+Run hardened, active-network adversarial tests against real hosts:
+
+```bash
+./scripts/e2e/real_wireguard_signed_state_tamper_e2e.sh \
+  --exit-host 192.168.18.49 \
+  --client-host 192.168.18.50 \
+  --ssh-user root \
+  --ssh-allow-cidrs 192.168.18.2/32 \
+  --skip-apt
+
+./scripts/e2e/real_wireguard_rogue_path_hijack_e2e.sh \
+  --exit-host 192.168.18.49 \
+  --client-host 192.168.18.50 \
+  --ssh-user root \
+  --ssh-allow-cidrs 192.168.18.2/32 \
+  --rogue-endpoint-ip 203.0.113.250 \
+  --skip-apt
+```
+
+Security intent:
+- signed-state tamper test mutates the active assignment bundle and requires daemon fail-closed behavior (`state=FailClosed`, `restricted_safe_mode=true`) until valid signed state is restored.
+- rogue-path hijack test forges assignment endpoints to a rogue IP (with invalid signature) and requires explicit rejection, no rogue endpoint adoption in `wg show`, and secure recovery after restoration.
+
+Optional combined gate wrapper:
+
+```bash
+RUSTYNET_ACTIVE_NET_EXIT_HOST=192.168.18.49 \
+RUSTYNET_ACTIVE_NET_CLIENT_HOST=192.168.18.50 \
+RUSTYNET_ACTIVE_NET_SSH_USER=root \
+RUSTYNET_ACTIVE_NET_SSH_ALLOW_CIDRS=192.168.18.2/32 \
+RUSTYNET_ACTIVE_NET_ROGUE_ENDPOINT_IP=203.0.113.250 \
+RUSTYNET_ACTIVE_NET_SKIP_APT=1 \
+./scripts/ci/active_network_security_gates.sh
+```
+
+To include these tests in security regression gates:
+- set `RUSTYNET_SECURITY_RUN_ACTIVE_NETWORK_GATES=1`.
+- set `RUSTYNET_SECURITY_REQUIRE_ACTIVE_NETWORK_GATES=1` to fail closed when active-network gates are not run.
+
 ## Release Readiness Evidence (Fail-Closed)
 
 Rustynet no longer accepts static/pass-through readiness JSON artifacts.
@@ -186,6 +229,7 @@ Before Phase 6/9/10 gates can pass, generate measured evidence artifacts from re
 # Phase 6 platform parity evidence
 RUSTYNET_PHASE6_PARITY_ENVIRONMENT=lab \
 ./scripts/release/generate_platform_parity_report.sh
+cargo run --quiet -p rustynet-cli -- ops verify-phase6-parity-evidence
 
 # Phase 9 raw evidence collection from logs/probes
 ./scripts/operations/collect_phase9_raw_evidence.sh
@@ -193,6 +237,7 @@ RUSTYNET_PHASE6_PARITY_ENVIRONMENT=lab \
 # Phase 9 operational evidence
 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase9_artifacts.sh
+cargo run --quiet -p rustynet-cli -- ops verify-phase9-evidence
 
 # Phase 10 operational evidence
 RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
@@ -209,12 +254,21 @@ Phase 6 release scripts are thin wrappers to Rust-only ops commands:
 - `rustynet ops collect-platform-probe`
 - `rustynet ops generate-platform-parity-report`
 - `rustynet ops collect-platform-parity-bundle`
+- `rustynet ops verify-phase6-parity-evidence`
 
 Phase 9/10 operations scripts are also thin wrappers to Rust-only ops commands:
 - `rustynet ops collect-phase9-raw-evidence`
 - `rustynet ops generate-phase9-artifacts`
+- `rustynet ops verify-phase9-evidence`
 - `rustynet ops generate-phase10-artifacts`
 - `rustynet ops verify-phase10-provenance`
+- `rustynet ops sign-release-artifact`
+- `rustynet ops verify-release-artifact`
+
+Signed evidence attestations:
+- Phase 6 parity report attestation: `artifacts/release/platform_parity_report.attestation.json`
+- Phase 9 operational evidence attestation: `artifacts/operations/phase9_evidence.attestation.json`
+- both attestations are fail-closed verified, signed with release provenance keys, and bound to the current git commit.
 
 Raw measured inputs must exist first:
 - `artifacts/release/raw/platform_parity_linux.json`
@@ -234,6 +288,11 @@ Raw measured inputs must exist first:
   - `perf_budget_report.json`
   - `direct_relay_failover_report.json`
   - `state_transition_audit.log`
+- `artifacts/phase10/fresh_install_os_matrix_report.json` cross-platform fresh-install release evidence:
+  - must include Debian/Ubuntu/Fedora/Mint/macOS clean-install checks
+  - must include one-hop + two-hop enforcement checks per OS
+  - must include role-switch validation checks per OS
+  - must bind evidence to current `HEAD` commit SHA
 
 Then run gates:
 
@@ -241,36 +300,53 @@ Then run gates:
 ./scripts/ci/phase6_gates.sh
 ./scripts/ci/phase9_gates.sh
 ./scripts/ci/phase10_gates.sh
+./scripts/ci/security_regression_gates.sh
+./scripts/ci/supply_chain_integrity_gates.sh
+./scripts/ci/active_network_security_gates.sh
+./scripts/ci/role_auth_matrix_gates.sh
+./scripts/ci/traversal_adversarial_gates.sh
+./scripts/ci/fresh_install_os_matrix_release_gate.sh
+./scripts/ci/secrets_hygiene_gates.sh
 ./scripts/ci/membership_gates.sh
 ```
 
+High-assurance no-leak dataplane gate (root Linux netns + underlay packet capture):
+
+```bash
+sudo -E ./scripts/ci/no_leak_dataplane_gate.sh
+```
+
 Security gate toolchain note:
-- phase gate scripts require the pinned Rust security toolchain (`RUSTYNET_SECURITY_TOOLCHAIN`, default `1.88.0`) to be installed; ambient cargo toolchain fallback is disabled.
+- phase gate scripts require the pinned Rust security toolchain (`RUSTYNET_SECURITY_TOOLCHAIN`, default `1.88.0-<host-triple>`) to be installed; ambient cargo toolchain fallback is disabled.
 
 ## Phase 1 Measured Baseline Inputs
 
-Phase 1 baseline gates require measured runtime inputs (`RUSTYNET_PHASE1_*` vars).  
-Generate them from measured evidence sources (fail-closed, no synthetic fallback):
+Phase 1 baseline gates require measured source evidence from
+`RUSTYNET_PHASE1_PERF_SAMPLES_PATH` (no source-fallback chain).
+
+Canonical flow:
 
 ```bash
 ./scripts/perf/collect_phase1_measured_env.sh
 ./scripts/perf/run_phase1_baseline.sh
 ```
 
-The collector now writes structured measured input JSON
+Both scripts resolve `RUSTYNET_PHASE1_PERF_SAMPLES_PATH` to:
+- default `artifacts/perf/phase1/source/performance_samples.ndjson`, or
+- an explicit operator override.
+
+If the source file is missing, both scripts fail closed.
+
+The collector writes structured measured input JSON
 (`artifacts/perf/phase1/measured_input.json` by default) and no longer emits shell
 `export` scripts.
 
-`run_phase1_baseline.sh` auto-runs the collector when required `RUSTYNET_PHASE1_*`
-vars are missing, then passes validated metrics directly into Rust baseline commands
-(no shell `source` path).
+`run_phase1_baseline.sh` exports the validated source path into the Rust command path
+and runs baseline generation directly (no shell `source`, no legacy fallback chain).
 
 Optional output override:
 - `RUSTYNET_PHASE1_MEASURED_INPUT_OUT` for collector output path.
 - collector source files and output directories fail closed when group/world writable.
 
-If present, the collector can use `artifacts/operations/performance_budget_report.json`
-as measured Phase1 input source.
 The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`
-for first-run CI/bootstrap resolution; refresh this with current measured samples
-for release evidence.
+for first-run CI/bootstrap; refresh this with current measured samples before release evidence sign-off.

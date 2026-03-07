@@ -35,6 +35,6 @@ if ! bash -n start.sh; then
 fi
 
 echo "[macos-smoke] running targeted macOS dataplane security tests"
-cargo test -p rustynetd --all-features phase10::tests::macos_render_pf_rules_enforces_dns_fail_closed_when_enabled -- --exact
-cargo test -p rustynetd --all-features phase10::tests::macos_dns_rule_parser_accepts_port_alias_output -- --exact
-cargo test -p rustynet-backend-wireguard --all-features tests::macos_backend_reports_ipv6_not_supported_until_parity_is_implemented -- --exact
+./scripts/ci/run_required_test.sh rustynetd phase10::tests::macos_render_pf_rules_enforces_dns_fail_closed_when_enabled --all-features
+./scripts/ci/run_required_test.sh rustynetd phase10::tests::macos_dns_rule_parser_accepts_port_alias_output --all-features
+./scripts/ci/run_required_test.sh rustynet-backend-wireguard tests::macos_backend_reports_ipv6_not_supported_until_parity_is_implemented --all-features

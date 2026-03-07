@@ -1,6 +1,6 @@
 {
   "availability_slo_percent": 99.9,
-  "captured_at_unix": 1772844409,
+  "captured_at_unix": 1772891016,
   "environment": "ci",
   "evidence_mode": "measured",
   "max_error_budget_consumed_percent": 75.0,

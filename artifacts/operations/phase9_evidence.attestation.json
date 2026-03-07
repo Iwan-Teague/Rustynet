@@ -1,0 +1,56 @@
+{
+  "artifacts": [
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/compatibility_policy.json",
+      "artifact_sha256": "2ae9cf992c1bfbf988f444e6baa11b835a1856862dd693c388cc7a39baab418d",
+      "captured_at_unix": 1772891016,
+      "name": "compatibility_policy.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/slo_error_budget_report.json",
+      "artifact_sha256": "4347c769ec97f20c93da93e5f2c84675284e4edc478374331c24621101ee9b9d",
+      "captured_at_unix": 1772891016,
+      "name": "slo_error_budget_report.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/performance_budget_report.json",
+      "artifact_sha256": "c954ee8e81c5668a73f622878f962962791991987c8b55f29b6d5aba044fbfb9",
+      "captured_at_unix": 1772891016,
+      "name": "performance_budget_report.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/incident_drill_report.json",
+      "artifact_sha256": "5fd9922ac58025e710ebdcb03a3bd1f8fa88a7252b016b2d0849cf7695279862",
+      "captured_at_unix": 1772891016,
+      "name": "incident_drill_report.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/dr_failover_report.json",
+      "artifact_sha256": "452589fee9c9325144162bb287cf8b1ccc00df11af50b498a6a6f583d6ea786d",
+      "captured_at_unix": 1772891016,
+      "name": "dr_failover_report.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/backend_agility_report.json",
+      "artifact_sha256": "3498efea592e936e3433c6bd4a6418f6316da618ce82e5affca4f273a536a7c2",
+      "captured_at_unix": 1772891016,
+      "name": "backend_agility_report.json"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/crypto_deprecation_schedule.json",
+      "artifact_sha256": "d0f6ecd84ecd9ccb724a42b8edbeba1d3ce7c0c57473879a539f84a22294bb07",
+      "captured_at_unix": 1772891016,
+      "name": "crypto_deprecation_schedule.json"
+    }
+  ],
+  "command_digest_sha256": "c9f77c25bc903afe4d4f2caf3391281e679a48982dfba32187d4c6072b5a4e68",
+  "environment": "ci",
+  "generated_at_unix": 1772891016,
+  "git_commit": "f85da6ead8161976f67fa904e5ab8bdf5c2beb1e",
+  "host_identity": "ci-localhost",
+  "phase": "phase9",
+  "schema_version": 1,
+  "signature_hex": "de9e44b66888c38f6c37ffb527dae5e47405c9ee8bf60af93ef13675f13d9a8274ed9056d49b7e9cddeaf442a0cb646c46703569940c9a68586f6c80273f1f02",
+  "signer_key_id": "ed25519:8016842956f60178",
+  "verifier_key_hex": "910ddf4d31366ec143fef10d16160eabbbabee48e8c0040d795119ac19d5a307"
+}

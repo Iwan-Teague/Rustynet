@@ -141,3 +141,5 @@ if seen != required_platforms:
 
 print("Phase 6 platform parity checks: PASS")
 PY
+
+cargo run --quiet -p rustynet-cli -- ops verify-phase6-parity-evidence

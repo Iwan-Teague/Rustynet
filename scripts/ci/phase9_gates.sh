@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+RUSTYNET_GATE_TEST_THREADS="${RUSTYNET_GATE_TEST_THREADS:-1}"
+
 require_command() {
   local cmd="$1"
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -31,23 +33,19 @@ require_cargo_subcommand deny
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace --all-targets --all-features
-cargo test --workspace --all-targets --all-features
+RUST_TEST_THREADS="${RUSTYNET_GATE_TEST_THREADS}" cargo test --workspace --all-targets --all-features
 
 ./scripts/ci/phase8_gates.sh
 ./scripts/ci/phase1_gates.sh
 
-cargo test -p rustynet-control ga::tests --all-features
+./scripts/ci/run_required_test.sh rustynet-control ga::tests --all-features
 cargo test -p rustynet-backend-wireguard --test conformance --all-features
 cargo test -p rustynet-backend-api --all-targets --all-features
 
-if [[ "${RUSTYNET_PHASE9_COLLECT_RAW:-1}" == "1" ]]; then
-  ./scripts/operations/collect_phase9_raw_evidence.sh
-fi
+./scripts/operations/collect_phase9_raw_evidence.sh
 
-if [[ "${RUSTYNET_PHASE9_GENERATE_ARTIFACTS:-1}" == "1" ]]; then
-  RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT="${RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT:-ci}" \
-    ./scripts/operations/generate_phase9_artifacts.sh
-fi
+RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT="${RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT:-ci}" \
+  ./scripts/operations/generate_phase9_artifacts.sh
 
 ./scripts/ci/check_phase9_readiness.sh
 

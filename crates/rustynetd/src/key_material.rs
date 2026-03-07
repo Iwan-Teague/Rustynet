@@ -966,6 +966,31 @@ mod tests {
     }
 
     #[test]
+    fn remove_file_if_present_rejects_directory() {
+        let test_dir = unique_test_dir("rustynet-remove-dir-reject");
+        let err = remove_file_if_present(&test_dir)
+            .expect_err("secure remove must reject directory inputs");
+        assert!(err.contains("regular file"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_present_removes_symlink_without_following_target() {
+        let test_dir = unique_test_dir("rustynet-remove-symlink");
+        let target = test_dir.join("target.key");
+        let link = test_dir.join("target.link");
+        std::fs::write(&target, b"wireguard-private-key").expect("target file should be writable");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be writable");
+
+        remove_file_if_present(&link).expect("symlink remove should succeed");
+        assert!(!link.exists(), "symlink path should be removed");
+        assert!(target.exists(), "symlink target must remain untouched");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn validate_binary_path_rejects_relative_paths() {
         let err = validate_binary_path("wg", "wg").expect_err("relative paths should be rejected");
         assert!(err.contains("must be absolute"));

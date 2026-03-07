@@ -107,6 +107,30 @@ pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
 const BLIND_EXIT_DEFAULT_ROUTE_CIDR: &str = "0.0.0.0/0";
+const MAX_BUNDLE_VERIFIER_KEY_BYTES: usize = 4 * 1024;
+const MAX_TRUST_EVIDENCE_BYTES: usize = 8 * 1024;
+const MAX_TRUST_EVIDENCE_LINES: usize = 32;
+const MAX_TRUST_EVIDENCE_LINE_BYTES: usize = 512;
+const MAX_TRUST_EVIDENCE_KEY_BYTES: usize = 64;
+const MAX_TRUST_EVIDENCE_VALUE_BYTES: usize = 256;
+const MAX_TRUST_EVIDENCE_KEY_DEPTH: usize = 1;
+const MAX_AUTO_TUNNEL_BUNDLE_BYTES: usize = 256 * 1024;
+const MAX_AUTO_TUNNEL_BUNDLE_LINES: usize = 4_096;
+const MAX_AUTO_TUNNEL_LINE_BYTES: usize = 2_048;
+const MAX_AUTO_TUNNEL_KEY_BYTES: usize = 64;
+const MAX_AUTO_TUNNEL_VALUE_BYTES: usize = 1_536;
+const MAX_AUTO_TUNNEL_KEY_DEPTH: usize = 3;
+const MAX_AUTO_TUNNEL_FIELD_COUNT: usize = 3_072;
+const MAX_AUTO_TUNNEL_PEER_COUNT: usize = 128;
+const MAX_AUTO_TUNNEL_ROUTE_COUNT: usize = 256;
+const MAX_TRAVERSAL_BUNDLE_BYTES: usize = 64 * 1024;
+const MAX_TRAVERSAL_BUNDLE_LINES: usize = 1_024;
+const MAX_TRAVERSAL_LINE_BYTES: usize = 1_024;
+const MAX_TRAVERSAL_KEY_BYTES: usize = 64;
+const MAX_TRAVERSAL_VALUE_BYTES: usize = 512;
+const MAX_TRAVERSAL_KEY_DEPTH: usize = 3;
+const MAX_TRAVERSAL_FIELD_COUNT: usize = 1_024;
+const MAX_TRAVERSAL_CANDIDATE_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -3410,8 +3434,15 @@ fn load_trust_evidence(
     }
 
     let verifying_key = load_verifying_key(verifier_key_path)?;
+    enforce_text_artifact_size_limit(path, "trust evidence", MAX_TRUST_EVIDENCE_BYTES)
+        .map_err(TrustBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_TRUST_EVIDENCE_BYTES {
+        return Err(TrustBootstrapError::InvalidFormat(format!(
+            "trust evidence exceeds maximum size of {MAX_TRUST_EVIDENCE_BYTES} bytes"
+        )));
+    }
     let mut version: Option<u8> = None;
     let mut tls13_valid: Option<bool> = None;
     let mut signed_control_valid: Option<bool> = None;
@@ -3420,13 +3451,45 @@ fn load_trust_evidence(
     let mut updated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
     let mut signature_hex: Option<String> = None;
+    let mut line_count = 0usize;
+    let mut seen_keys = std::collections::HashSet::new();
 
     for line in content.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(TrustBootstrapError::InvalidFormat(
-                "line missing key/value separator".to_string(),
-            ));
-        };
+        line_count = line_count.saturating_add(1);
+        if line_count > MAX_TRUST_EVIDENCE_LINES {
+            return Err(TrustBootstrapError::InvalidFormat(format!(
+                "trust evidence exceeds maximum line count of {MAX_TRUST_EVIDENCE_LINES}"
+            )));
+        }
+        let (key, value) = parse_limited_key_value_line(
+            line,
+            line_count,
+            MAX_TRUST_EVIDENCE_LINE_BYTES,
+            MAX_TRUST_EVIDENCE_KEY_BYTES,
+            MAX_TRUST_EVIDENCE_VALUE_BYTES,
+            MAX_TRUST_EVIDENCE_KEY_DEPTH,
+        )
+        .map_err(TrustBootstrapError::InvalidFormat)?;
+        if !seen_keys.insert(key.to_string()) {
+            return Err(TrustBootstrapError::InvalidFormat(format!(
+                "duplicate key {key}"
+            )));
+        }
+        if !matches!(
+            key,
+            "version"
+                | "tls13_valid"
+                | "signed_control_valid"
+                | "signed_data_age_secs"
+                | "clock_skew_secs"
+                | "updated_at_unix"
+                | "nonce"
+                | "signature"
+        ) {
+            return Err(TrustBootstrapError::InvalidFormat(format!(
+                "unknown key {key}"
+            )));
+        }
 
         match key {
             "version" => {
@@ -3563,6 +3626,129 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     )
 }
 
+fn enforce_text_artifact_size_limit(
+    path: &Path,
+    artifact_name: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let metadata =
+        fs::metadata(path).map_err(|err| format!("{artifact_name} metadata read failed: {err}"))?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!(
+            "{artifact_name} exceeds maximum size of {max_bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_limited_key_value_line(
+    line: &str,
+    line_number: usize,
+    max_line_bytes: usize,
+    max_key_bytes: usize,
+    max_value_bytes: usize,
+    max_key_depth: usize,
+) -> Result<(&str, &str), String> {
+    if line.len() > max_line_bytes {
+        return Err(format!(
+            "line {line_number} exceeds maximum size of {max_line_bytes} bytes"
+        ));
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return Err("line missing key/value separator".to_string());
+    };
+    if key.is_empty() {
+        return Err(format!("line {line_number} has empty key"));
+    }
+    if key.len() > max_key_bytes {
+        return Err(format!(
+            "line {line_number} key exceeds maximum size of {max_key_bytes} bytes"
+        ));
+    }
+    if value.len() > max_value_bytes {
+        return Err(format!(
+            "line {line_number} value exceeds maximum size of {max_value_bytes} bytes"
+        ));
+    }
+    let depth = key.split('.').count();
+    if depth == 0 || depth > max_key_depth {
+        return Err(format!(
+            "line {line_number} key depth exceeds maximum of {max_key_depth}"
+        ));
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(format!("line {line_number} has invalid key characters"));
+    }
+    Ok((key, value))
+}
+
+fn parse_indexed_key<'a>(key: &'a str, prefix: &str) -> Option<(usize, &'a str)> {
+    let tail = key.strip_prefix(prefix)?;
+    let (index_raw, suffix) = tail.split_once('.')?;
+    let index = index_raw.parse::<usize>().ok()?;
+    Some((index, suffix))
+}
+
+fn is_allowed_auto_tunnel_key(key: &str) -> bool {
+    if matches!(
+        key,
+        "version"
+            | "node_id"
+            | "mesh_cidr"
+            | "assigned_cidr"
+            | "generated_at_unix"
+            | "expires_at_unix"
+            | "nonce"
+            | "peer_count"
+            | "route_count"
+            | "signature"
+    ) {
+        return true;
+    }
+
+    if let Some((_index, suffix)) = parse_indexed_key(key, "peer.") {
+        return matches!(
+            suffix,
+            "node_id" | "endpoint" | "public_key_hex" | "allowed_ips"
+        );
+    }
+
+    if let Some((_index, suffix)) = parse_indexed_key(key, "route.") {
+        return matches!(suffix, "destination_cidr" | "via_node" | "kind");
+    }
+
+    false
+}
+
+fn is_allowed_traversal_key(key: &str) -> bool {
+    if matches!(
+        key,
+        "version"
+            | "path_policy"
+            | "source_node_id"
+            | "target_node_id"
+            | "generated_at_unix"
+            | "expires_at_unix"
+            | "nonce"
+            | "candidate_count"
+            | "signature"
+    ) {
+        return true;
+    }
+
+    if let Some((_index, suffix)) = parse_indexed_key(key, "candidate.") {
+        return matches!(
+            suffix,
+            "type" | "addr" | "port" | "family" | "relay_id" | "priority"
+        );
+    }
+
+    false
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value {
         "true" => Some(true),
@@ -3624,8 +3810,15 @@ fn decode_hex_nibble(value: u8) -> Result<u8, TrustBootstrapError> {
 }
 
 fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> {
+    enforce_text_artifact_size_limit(path, "trust verifier key", MAX_BUNDLE_VERIFIER_KEY_BYTES)
+        .map_err(TrustBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
+        return Err(TrustBootstrapError::InvalidFormat(format!(
+            "trust verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
+        )));
+    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -3857,20 +4050,48 @@ fn load_auto_tunnel_bundle(
     }
 
     let verifying_key = load_auto_tunnel_verifying_key(verifier_key_path)?;
+    enforce_text_artifact_size_limit(path, "auto-tunnel bundle", MAX_AUTO_TUNNEL_BUNDLE_BYTES)
+        .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_AUTO_TUNNEL_BUNDLE_BYTES {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "auto-tunnel bundle exceeds maximum size of {MAX_AUTO_TUNNEL_BUNDLE_BYTES} bytes"
+        )));
+    }
 
     let mut payload = String::new();
     let mut signature_hex: Option<String> = None;
     let mut fields = std::collections::HashMap::new();
+    let mut line_count = 0usize;
 
     for line in content.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(AutoTunnelBootstrapError::InvalidFormat(
-                "line missing key/value separator".to_string(),
-            ));
-        };
+        line_count = line_count.saturating_add(1);
+        if line_count > MAX_AUTO_TUNNEL_BUNDLE_LINES {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "auto-tunnel bundle exceeds maximum line count of {MAX_AUTO_TUNNEL_BUNDLE_LINES}"
+            )));
+        }
+        let (key, value) = parse_limited_key_value_line(
+            line,
+            line_count,
+            MAX_AUTO_TUNNEL_LINE_BYTES,
+            MAX_AUTO_TUNNEL_KEY_BYTES,
+            MAX_AUTO_TUNNEL_VALUE_BYTES,
+            MAX_AUTO_TUNNEL_KEY_DEPTH,
+        )
+        .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
+        if !is_allowed_auto_tunnel_key(key) {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "unknown key {key}"
+            )));
+        }
         if key == "signature" {
+            if signature_hex.is_some() {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(
+                    "duplicate key signature".to_string(),
+                ));
+            }
             signature_hex = Some(value.to_string());
             continue;
         }
@@ -3881,6 +4102,11 @@ fn load_auto_tunnel_bundle(
                 "duplicate key {key}"
             )));
         }
+    }
+    if fields.len() > MAX_AUTO_TUNNEL_FIELD_COUNT {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "auto-tunnel bundle exceeds maximum field count of {MAX_AUTO_TUNNEL_FIELD_COUNT}"
+        )));
     }
 
     let version = fields
@@ -4006,6 +4232,12 @@ fn load_auto_tunnel_bundle(
         .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing peer_count".to_string()))?
         .parse::<usize>()
         .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid peer_count".to_string()))?;
+    if peer_count > MAX_AUTO_TUNNEL_PEER_COUNT {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "peer_count exceeds maximum of {MAX_AUTO_TUNNEL_PEER_COUNT}"
+        )));
+    }
+
     let mut peers = Vec::with_capacity(peer_count);
     for index in 0..peer_count {
         let node_id_key = format!("peer.{index}.node_id");
@@ -4066,6 +4298,26 @@ fn load_auto_tunnel_bundle(
         .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing route_count".to_string()))?
         .parse::<usize>()
         .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid route_count".to_string()))?;
+    if route_count > MAX_AUTO_TUNNEL_ROUTE_COUNT {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "route_count exceeds maximum of {MAX_AUTO_TUNNEL_ROUTE_COUNT}"
+        )));
+    }
+    let expected_field_count = 9usize
+        .checked_add(peer_count.checked_mul(4).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("peer field count overflow".to_string())
+        })?)
+        .and_then(|value| value.checked_add(route_count.checked_mul(3)?))
+        .ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("route field count overflow".to_string())
+        })?;
+    if fields.len() != expected_field_count {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "unexpected field count for auto-tunnel bundle: expected {expected_field_count}, got {}",
+            fields.len()
+        )));
+    }
+
     let mut routes = Vec::with_capacity(route_count);
     let mut selected_exit_node: Option<String> = None;
     for index in 0..route_count {
@@ -4129,8 +4381,19 @@ fn load_auto_tunnel_bundle(
 }
 
 fn load_auto_tunnel_verifying_key(path: &Path) -> Result<VerifyingKey, AutoTunnelBootstrapError> {
+    enforce_text_artifact_size_limit(
+        path,
+        "auto-tunnel verifier key",
+        MAX_BUNDLE_VERIFIER_KEY_BYTES,
+    )
+    .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+            "auto-tunnel verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
+        )));
+    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -4326,20 +4589,48 @@ fn load_traversal_bundle(
     }
 
     let verifying_key = load_traversal_verifying_key(verifier_key_path)?;
+    enforce_text_artifact_size_limit(path, "traversal bundle", MAX_TRAVERSAL_BUNDLE_BYTES)
+        .map_err(TraversalBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_TRAVERSAL_BUNDLE_BYTES {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "traversal bundle exceeds maximum size of {MAX_TRAVERSAL_BUNDLE_BYTES} bytes"
+        )));
+    }
 
     let mut payload = String::new();
     let mut signature_hex: Option<String> = None;
     let mut fields = std::collections::HashMap::new();
+    let mut line_count = 0usize;
 
     for line in content.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(TraversalBootstrapError::InvalidFormat(
-                "line missing key/value separator".to_string(),
-            ));
-        };
+        line_count = line_count.saturating_add(1);
+        if line_count > MAX_TRAVERSAL_BUNDLE_LINES {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "traversal bundle exceeds maximum line count of {MAX_TRAVERSAL_BUNDLE_LINES}"
+            )));
+        }
+        let (key, value) = parse_limited_key_value_line(
+            line,
+            line_count,
+            MAX_TRAVERSAL_LINE_BYTES,
+            MAX_TRAVERSAL_KEY_BYTES,
+            MAX_TRAVERSAL_VALUE_BYTES,
+            MAX_TRAVERSAL_KEY_DEPTH,
+        )
+        .map_err(TraversalBootstrapError::InvalidFormat)?;
+        if !is_allowed_traversal_key(key) {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "unknown key {key}"
+            )));
+        }
         if key == "signature" {
+            if signature_hex.is_some() {
+                return Err(TraversalBootstrapError::InvalidFormat(
+                    "duplicate key signature".to_string(),
+                ));
+            }
             signature_hex = Some(value.to_string());
             continue;
         }
@@ -4350,6 +4641,11 @@ fn load_traversal_bundle(
                 "duplicate key {key}"
             )));
         }
+    }
+    if fields.len() > MAX_TRAVERSAL_FIELD_COUNT {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "traversal bundle exceeds maximum field count of {MAX_TRAVERSAL_FIELD_COUNT}"
+        )));
     }
 
     let version = fields
@@ -4438,10 +4734,23 @@ fn load_traversal_bundle(
         .map_err(|_| {
             TraversalBootstrapError::InvalidFormat("invalid candidate_count".to_string())
         })?;
-    if candidate_count == 0 || candidate_count > 8 {
-        return Err(TraversalBootstrapError::InvalidFormat(
-            "candidate_count must be between 1 and 8".to_string(),
-        ));
+    if candidate_count == 0 || candidate_count > MAX_TRAVERSAL_CANDIDATE_COUNT {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "candidate_count must be between 1 and {MAX_TRAVERSAL_CANDIDATE_COUNT}"
+        )));
+    }
+    let expected_field_count = 8usize
+        .checked_add(candidate_count.checked_mul(6).ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_string())
+        })?)
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_string())
+        })?;
+    if fields.len() != expected_field_count {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "unexpected field count for traversal bundle: expected {expected_field_count}, got {}",
+            fields.len()
+        )));
     }
 
     let mut candidates = Vec::with_capacity(candidate_count);
@@ -4668,8 +4977,19 @@ fn is_global_unicast_ipv6(value: std::net::Ipv6Addr) -> bool {
 }
 
 fn load_traversal_verifying_key(path: &Path) -> Result<VerifyingKey, TraversalBootstrapError> {
+    enforce_text_artifact_size_limit(
+        path,
+        "traversal verifier key",
+        MAX_BUNDLE_VERIFIER_KEY_BYTES,
+    )
+    .map_err(TraversalBootstrapError::InvalidFormat)?;
     let content =
         fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "traversal verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
+        )));
+    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -4968,6 +5288,8 @@ fn validate_file_security(
     disallowed_mode_mask: u32,
     allow_root_owner: bool,
 ) -> Result<(), DaemonError> {
+    validate_parent_directory_security(path, label, allow_root_owner)?;
+
     let link_metadata = fs::symlink_metadata(path).map_err(|err| {
         DaemonError::InvalidConfig(format!("{label} metadata read failed: {err}"))
     })?;
@@ -5005,6 +5327,48 @@ fn validate_file_security(
             "{label} is not readable by runtime user (uid {expected_uid}): {err}"
         ))
     })?;
+    Ok(())
+}
+
+fn validate_parent_directory_security(
+    path: &Path,
+    label: &str,
+    allow_root_owner: bool,
+) -> Result<(), DaemonError> {
+    let parent = path.parent().ok_or_else(|| {
+        DaemonError::InvalidConfig(format!(
+            "{label} path must include a parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(parent).map_err(|err| {
+        DaemonError::InvalidConfig(format!(
+            "{label} parent directory metadata read failed for {}: {err}",
+            parent.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} parent directory must be a non-symlink directory: {}",
+            parent.display()
+        )));
+    }
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} parent directory has insecure permissions: mode {:o}",
+            mode & 0o777
+        )));
+    }
+
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} parent directory owner uid mismatch: expected {expected_uid}, got {owner_uid}"
+        )));
+    }
     Ok(())
 }
 
@@ -5097,6 +5461,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::num::NonZeroU32;
+    use std::os::unix::net::UnixStream;
     use std::path::Path;
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -5108,14 +5473,16 @@ mod tests {
 
     use super::{
         AutoTunnelWatermark, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DaemonBackendMode, DaemonConfig,
-        DaemonRuntime, IpcCommand, NodeRole, TrustEvidenceRecord, TrustPolicy, TrustWatermark,
-        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_traversal_bundle,
-        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
+        DaemonRuntime, IpcCommand, IpcResponse, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
+        MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRUST_EVIDENCE_BYTES, NodeRole, TrustEvidenceRecord,
+        TrustPolicy, TrustWatermark, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
+        load_traversal_bundle, load_traversal_watermark, load_trust_evidence, load_trust_watermark,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, run_daemon, run_preflight_checks,
+        prepare_runtime_wireguard_key_material, read_command, run_daemon, run_preflight_checks,
         scrub_runtime_wireguard_key_material, sha256_digest, trust_evidence_payload, unix_now,
-        validate_daemon_config, zeroize_optional_bytes,
+        validate_daemon_config, validate_file_security, zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -5124,6 +5491,54 @@ mod tests {
             out.push_str(&format!("{byte:02x}"));
         }
         out
+    }
+
+    fn write_signed_kv_artifact(path: &Path, verifier_path: &Path, seed: [u8; 32], payload: &str) {
+        let signing_key = SigningKey::from_bytes(&seed);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("verifier key should be written");
+        let signature = signing_key.sign(payload.as_bytes());
+        std::fs::write(
+            path,
+            format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            ),
+        )
+        .expect("signed artifact should be written");
+    }
+
+    fn write_signed_kv_artifact_with_verifier_seed(
+        path: &Path,
+        verifier_path: &Path,
+        signer_seed: [u8; 32],
+        verifier_seed: [u8; 32],
+        payload: &str,
+    ) {
+        let signing_key = SigningKey::from_bytes(&signer_seed);
+        let verifier_signing_key = SigningKey::from_bytes(&verifier_seed);
+        std::fs::write(
+            verifier_path,
+            format!(
+                "{}\n",
+                hex_encode(verifier_signing_key.verifying_key().as_bytes())
+            ),
+        )
+        .expect("verifier key should be written");
+        let signature = signing_key.sign(payload.as_bytes());
+        std::fs::write(
+            path,
+            format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            ),
+        )
+        .expect("signed artifact should be written");
     }
 
     #[test]
@@ -5140,6 +5555,519 @@ mod tests {
             )),
             0o077
         );
+    }
+
+    #[test]
+    fn read_command_rejects_oversized_payload() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        let mut payload = vec![b'a'; 4096];
+        payload.push(b'\n');
+        writer
+            .write_all(payload.as_slice())
+            .expect("oversized payload write should succeed");
+
+        let err = read_command(&reader).expect_err("oversized payload must be rejected");
+        assert!(err.contains("command too long"));
+    }
+
+    #[test]
+    fn read_command_rejects_null_byte_payload() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        writer
+            .write_all(b"status\0\n")
+            .expect("null-byte payload write should succeed");
+
+        let err = read_command(&reader).expect_err("null-byte payload must be rejected");
+        assert!(err.contains("command contains null byte"));
+    }
+
+    #[test]
+    fn node_role_command_matrix_is_fail_closed() {
+        let command_matrix = vec![
+            (IpcCommand::Status, true, true, true),
+            (IpcCommand::Netcheck, true, true, true),
+            (
+                IpcCommand::ExitNodeSelect("node-exit".to_string()),
+                true,
+                true,
+                false,
+            ),
+            (IpcCommand::ExitNodeOff, true, true, false),
+            (IpcCommand::LanAccessOn, true, true, false),
+            (IpcCommand::LanAccessOff, true, true, false),
+            (IpcCommand::DnsInspect, true, true, true),
+            (
+                IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()),
+                true,
+                false,
+                false,
+            ),
+            (
+                IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()),
+                true,
+                false,
+                false,
+            ),
+            (IpcCommand::KeyRotate, true, false, false),
+            (IpcCommand::KeyRevoke, true, false, false),
+            (
+                IpcCommand::Unknown("unknown".to_string()),
+                true,
+                false,
+                false,
+            ),
+        ];
+
+        for (command, admin_expected, client_expected, blind_exit_expected) in &command_matrix {
+            assert_eq!(
+                NodeRole::Admin.allows_command(command),
+                *admin_expected,
+                "admin role command mismatch for {}",
+                command.as_wire()
+            );
+            assert_eq!(
+                NodeRole::Client.allows_command(command),
+                *client_expected,
+                "client role command mismatch for {}",
+                command.as_wire()
+            );
+            assert_eq!(
+                NodeRole::BlindExit.allows_command(command),
+                *blind_exit_expected,
+                "blind_exit role command mismatch for {}",
+                command.as_wire()
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RoleAuthMatrixMode {
+        Manual,
+        AutoTunnel,
+        Restricted,
+        AutoTunnelRestricted,
+    }
+
+    impl RoleAuthMatrixMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                RoleAuthMatrixMode::Manual => "manual",
+                RoleAuthMatrixMode::AutoTunnel => "auto_tunnel",
+                RoleAuthMatrixMode::Restricted => "restricted",
+                RoleAuthMatrixMode::AutoTunnelRestricted => "auto_tunnel_restricted",
+            }
+        }
+
+        fn auto_tunnel_enforced(self) -> bool {
+            matches!(
+                self,
+                RoleAuthMatrixMode::AutoTunnel | RoleAuthMatrixMode::AutoTunnelRestricted
+            )
+        }
+
+        fn restricted_safe(self) -> bool {
+            matches!(
+                self,
+                RoleAuthMatrixMode::Restricted | RoleAuthMatrixMode::AutoTunnelRestricted
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum RoleAuthMatrixHop {
+        OneHop,
+        TwoHop,
+    }
+
+    impl RoleAuthMatrixHop {
+        fn as_str(self) -> &'static str {
+            match self {
+                RoleAuthMatrixHop::OneHop => "one_hop",
+                RoleAuthMatrixHop::TwoHop => "two_hop",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RoleAuthDecision {
+        Allowed,
+        DeniedByRole,
+        DeniedByRestrictedSafeMode,
+        DeniedByAutoTunnelEnforcement,
+    }
+
+    fn role_auth_matrix_commands() -> Vec<IpcCommand> {
+        vec![
+            IpcCommand::Status,
+            IpcCommand::Netcheck,
+            IpcCommand::DnsInspect,
+            IpcCommand::ExitNodeSelect("node-exit".to_string()),
+            IpcCommand::ExitNodeOff,
+            IpcCommand::LanAccessOn,
+            IpcCommand::LanAccessOff,
+            IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()),
+            IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()),
+            IpcCommand::KeyRotate,
+            IpcCommand::KeyRevoke,
+            IpcCommand::Unknown("unknown".to_string()),
+        ]
+    }
+
+    fn classify_role_auth_decision(response: &IpcResponse) -> RoleAuthDecision {
+        if response
+            .message
+            .contains("current node role does not permit this operation")
+        {
+            return RoleAuthDecision::DeniedByRole;
+        }
+        if response.message.contains("restricted-safe mode") {
+            return RoleAuthDecision::DeniedByRestrictedSafeMode;
+        }
+        if response
+            .message
+            .contains("disabled while auto-tunnel is enforced")
+        {
+            return RoleAuthDecision::DeniedByAutoTunnelEnforcement;
+        }
+        RoleAuthDecision::Allowed
+    }
+
+    fn expected_role_auth_decision(
+        role: NodeRole,
+        mode: RoleAuthMatrixMode,
+        command: &IpcCommand,
+    ) -> RoleAuthDecision {
+        if !role.allows_command(command) {
+            return RoleAuthDecision::DeniedByRole;
+        }
+        if mode.restricted_safe() && command.is_mutating() {
+            return RoleAuthDecision::DeniedByRestrictedSafeMode;
+        }
+        if mode.auto_tunnel_enforced()
+            && matches!(
+                command,
+                IpcCommand::ExitNodeSelect(_)
+                    | IpcCommand::ExitNodeOff
+                    | IpcCommand::LanAccessOn
+                    | IpcCommand::LanAccessOff
+                    | IpcCommand::RouteAdvertise(_)
+            )
+        {
+            let auto_tunnel_exception = matches!(
+                command,
+                IpcCommand::RouteAdvertise(cidr)
+                    if role == NodeRole::Admin && cidr == "0.0.0.0/0"
+            );
+            if !auto_tunnel_exception {
+                return RoleAuthDecision::DeniedByAutoTunnelEnforcement;
+            }
+        }
+        RoleAuthDecision::Allowed
+    }
+
+    fn build_role_auth_matrix_runtime(
+        role: NodeRole,
+        mode: RoleAuthMatrixMode,
+        hop: RoleAuthMatrixHop,
+    ) -> (DaemonRuntime, std::path::PathBuf) {
+        let test_dir = secure_test_dir(&format!(
+            "rustynetd-role-auth-{}-{}-{}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str()
+        ));
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: role,
+            ..DaemonConfig::default()
+        };
+
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        runtime.auto_tunnel_enforce = mode.auto_tunnel_enforced();
+        runtime.advertised_routes.clear();
+        runtime.local_route_reconcile_pending = false;
+
+        if !role.is_blind_exit() {
+            runtime.selected_exit_node = Some("node-exit".to_string());
+        } else {
+            // Start from an intentionally over-privileged state and force invariant cleanup.
+            runtime.selected_exit_node = Some("node-exit".to_string());
+            runtime.lan_access_enabled = true;
+            runtime.controller.set_lan_access(true);
+            runtime
+                .enforce_blind_exit_invariants()
+                .expect("blind_exit invariants should enforce least-knowledge state");
+        }
+
+        if matches!(hop, RoleAuthMatrixHop::TwoHop) {
+            runtime.advertised_routes.insert("0.0.0.0/0".to_string());
+        }
+
+        if mode.restricted_safe() {
+            runtime.restrict_recoverable("matrix-forced-restricted".to_string());
+        }
+
+        (runtime, test_dir)
+    }
+
+    fn assert_role_auth_status_invariants(
+        runtime: &mut DaemonRuntime,
+        role: NodeRole,
+        mode: RoleAuthMatrixMode,
+        hop: RoleAuthMatrixHop,
+    ) {
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(
+            status.ok,
+            "status must succeed in matrix scenario role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+        assert!(
+            status
+                .message
+                .contains(format!("node_role={}", role.as_str()).as_str()),
+            "status role marker mismatch for role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+        assert!(
+            status.message.contains(
+                format!(
+                    "auto_tunnel_enforce={}",
+                    if mode.auto_tunnel_enforced() {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                )
+                .as_str()
+            ),
+            "status auto_tunnel marker mismatch for role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+        assert!(
+            status.message.contains(
+                format!(
+                    "restricted_safe_mode={}",
+                    if mode.restricted_safe() {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                )
+                .as_str()
+            ),
+            "status restricted marker mismatch for role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+
+        if role.is_blind_exit() {
+            assert!(
+                status.message.contains("exit_node=none"),
+                "blind_exit must never report selected exit: {}",
+                status.message
+            );
+            assert!(
+                status.message.contains("serving_exit_node=true"),
+                "blind_exit must always serve as exit: {}",
+                status.message
+            );
+            assert!(
+                status.message.contains("lan_access=off"),
+                "blind_exit must never enable LAN access: {}",
+                status.message
+            );
+            return;
+        }
+
+        assert!(
+            status.message.contains("exit_node=node-exit"),
+            "non-blind role must preserve selected exit for matrix scenario role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+
+        let serving_expected = role.is_admin() && matches!(hop, RoleAuthMatrixHop::TwoHop);
+        assert!(
+            status.message.contains(
+                format!(
+                    "serving_exit_node={}",
+                    if serving_expected { "true" } else { "false" }
+                )
+                .as_str()
+            ),
+            "serving_exit_node mismatch for role={} mode={} hop={}: {}",
+            role.as_str(),
+            mode.as_str(),
+            hop.as_str(),
+            status.message
+        );
+    }
+
+    #[test]
+    fn role_auth_matrix_runtime_is_exhaustive_and_fail_closed() {
+        let roles = [NodeRole::Admin, NodeRole::Client, NodeRole::BlindExit];
+        let modes = [
+            RoleAuthMatrixMode::Manual,
+            RoleAuthMatrixMode::AutoTunnel,
+            RoleAuthMatrixMode::Restricted,
+            RoleAuthMatrixMode::AutoTunnelRestricted,
+        ];
+        let hops = [RoleAuthMatrixHop::OneHop, RoleAuthMatrixHop::TwoHop];
+        let commands = role_auth_matrix_commands();
+
+        for role in roles {
+            for mode in modes {
+                for hop in hops {
+                    let (mut status_runtime, status_test_dir) =
+                        build_role_auth_matrix_runtime(role, mode, hop);
+                    assert_role_auth_status_invariants(&mut status_runtime, role, mode, hop);
+                    let _ = std::fs::remove_dir_all(status_test_dir);
+
+                    for command in &commands {
+                        let (mut runtime, test_dir) =
+                            build_role_auth_matrix_runtime(role, mode, hop);
+                        let response = runtime.handle_command(command.clone());
+                        let observed = classify_role_auth_decision(&response);
+                        let expected = expected_role_auth_decision(role, mode, command);
+                        assert_eq!(
+                            observed,
+                            expected,
+                            "role/auth matrix mismatch role={} mode={} hop={} command={} expected={:?} observed={:?} ok={} message={}",
+                            role.as_str(),
+                            mode.as_str(),
+                            hop.as_str(),
+                            command.as_wire(),
+                            expected,
+                            observed,
+                            response.ok,
+                            response.message
+                        );
+
+                        if expected == RoleAuthDecision::Allowed
+                            && !matches!(
+                                command,
+                                IpcCommand::Unknown(_)
+                                    | IpcCommand::KeyRotate
+                                    | IpcCommand::KeyRevoke
+                            )
+                        {
+                            assert!(
+                                response.ok,
+                                "allowed command should complete successfully role={} mode={} hop={} command={} message={}",
+                                role.as_str(),
+                                mode.as_str(),
+                                hop.as_str(),
+                                command.as_wire(),
+                                response.message
+                            );
+                        }
+
+                        let _ = std::fs::remove_dir_all(test_dir);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_file_security_rejects_group_writable_parent_directory() {
+        let test_dir = secure_test_dir("rustynetd-parent-mode-reject");
+        let insecure_parent = test_dir.join("insecure-parent");
+        std::fs::create_dir_all(&insecure_parent).expect("insecure parent should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&insecure_parent, std::fs::Permissions::from_mode(0o770))
+                .expect("insecure parent permissions should be set");
+        }
+
+        let secret_path = insecure_parent.join("secret.key");
+        std::fs::write(&secret_path, b"secret\n").expect("secret file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret file permissions should be set");
+        }
+
+        let err = validate_file_security(&secret_path, "test secret", 0o077, false)
+            .expect_err("group-writable parent directory must be rejected");
+        assert!(
+            err.to_string()
+                .contains("parent directory has insecure permissions"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn validate_file_security_rejects_symlink_parent_directory() {
+        let test_dir = secure_test_dir("rustynetd-parent-symlink-reject");
+        let real_parent = test_dir.join("real-parent");
+        std::fs::create_dir_all(&real_parent).expect("real parent should be created");
+        let symlink_parent = test_dir.join("symlink-parent");
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent)
+            .expect("symlink parent should be creatable");
+
+        let secret_path = symlink_parent.join("secret.key");
+        std::fs::write(&secret_path, b"secret\n")
+            .expect("secret file through symlink should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret file permissions should be set");
+        }
+
+        let err = validate_file_security(&secret_path, "test secret", 0o077, false)
+            .expect_err("symlink parent directory must be rejected");
+        assert!(
+            err.to_string()
+                .contains("parent directory must be a non-symlink directory"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
@@ -5847,6 +6775,570 @@ mod tests {
     }
 
     #[test]
+    fn artifact_limitgate_rejects_oversized_bundle_files() {
+        let test_dir = secure_test_dir("rustynetd-artifact-limit-oversized");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 17);
+        std::fs::write(&trust_path, vec![b'a'; MAX_TRUST_EVIDENCE_BYTES + 1])
+            .expect("oversized trust evidence should be writable");
+        let trust_err = load_trust_evidence(
+            &trust_path,
+            &trust_verifier_path,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("oversized trust evidence must fail closed");
+        assert!(matches!(
+            trust_err,
+            super::TrustBootstrapError::InvalidFormat(_)
+        ));
+        assert!(trust_err.to_string().contains("exceeds maximum size"));
+
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            18,
+            false,
+        );
+        std::fs::write(
+            &assignment_path,
+            vec![b'b'; MAX_AUTO_TUNNEL_BUNDLE_BYTES + 1],
+        )
+        .expect("oversized auto-tunnel bundle should be writable");
+        let assignment_err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("oversized auto-tunnel bundle must fail closed");
+        assert!(matches!(
+            assignment_err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(assignment_err.to_string().contains("exceeds maximum size"));
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            19,
+            false,
+        );
+        std::fs::write(&traversal_path, vec![b'c'; MAX_TRAVERSAL_BUNDLE_BYTES + 1])
+            .expect("oversized traversal bundle should be writable");
+        let traversal_err = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("oversized traversal bundle must fail closed");
+        assert!(matches!(
+            traversal_err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(traversal_err.to_string().contains("exceeds maximum size"));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay() {
+        let test_dir = secure_test_dir("rustynetd-traversal-adversarial-gate");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let verifier_path = test_dir.join("traversal.verifier.pub");
+
+        write_traversal_file(
+            &traversal_path,
+            &verifier_path,
+            "node-a",
+            "node-b",
+            100,
+            true,
+        );
+        let forged_err = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("forged traversal hint must be rejected");
+        assert!(matches!(
+            forged_err,
+            super::TraversalBootstrapError::SignatureInvalid
+        ));
+
+        let wrong_signer_generated = unix_now();
+        let wrong_signer_expires = wrong_signer_generated.saturating_add(60);
+        let wrong_signer_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={wrong_signer_generated}\nexpires_at_unix={wrong_signer_expires}\nnonce=101\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
+        );
+        write_signed_kv_artifact_with_verifier_seed(
+            &traversal_path,
+            &verifier_path,
+            [31u8; 32],
+            [32u8; 32],
+            wrong_signer_payload.as_str(),
+        );
+        let wrong_signer_err = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("wrong-signer traversal hint must be rejected");
+        assert!(matches!(
+            wrong_signer_err,
+            super::TraversalBootstrapError::SignatureInvalid
+        ));
+
+        let stale_generated = unix_now().saturating_sub(DEFAULT_TRAVERSAL_MAX_AGE_SECS + 15);
+        let stale_expires = stale_generated.saturating_add(1);
+        let stale_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={stale_generated}\nexpires_at_unix={stale_expires}\nnonce=102\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &verifier_path,
+            [33u8; 32],
+            stale_payload.as_str(),
+        );
+        let stale_err = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("stale traversal hint must be rejected");
+        assert!(matches!(stale_err, super::TraversalBootstrapError::Stale));
+
+        let replay_generated = unix_now();
+        let replay_expires = replay_generated.saturating_add(60);
+        let replay_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={replay_generated}\nexpires_at_unix={replay_expires}\nnonce=200\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &verifier_path,
+            [34u8; 32],
+            replay_payload.as_str(),
+        );
+        let baseline = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("baseline traversal hint should be accepted");
+
+        let replay_nonce_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={replay_generated}\nexpires_at_unix={replay_expires}\nnonce=199\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &verifier_path,
+            [34u8; 32],
+            replay_nonce_payload.as_str(),
+        );
+        let replay_err = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            Some(baseline.watermark),
+        )
+        .expect_err("nonce replay traversal hint must be rejected");
+        assert!(matches!(
+            replay_err,
+            super::TraversalBootstrapError::ReplayDetected
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn artifact_limitgate_rejects_count_overflow_for_assignment_and_traversal() {
+        let test_dir = secure_test_dir("rustynetd-artifact-limit-count-overflow");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let now = unix_now();
+        let expires = now.saturating_add(300);
+
+        let oversized_peer_payload = format!(
+            "version=1\nnode_id=daemon-local\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=21\npeer_count={}\nroute_count=0\n",
+            MAX_AUTO_TUNNEL_PEER_COUNT + 1
+        );
+        write_signed_kv_artifact(
+            &assignment_path,
+            &assignment_verifier_path,
+            [61u8; 32],
+            &oversized_peer_payload,
+        );
+        let peer_err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("peer_count overflow must fail closed");
+        assert!(matches!(
+            peer_err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(peer_err.to_string().contains("peer_count exceeds maximum"));
+
+        let oversized_route_payload = format!(
+            "version=1\nnode_id=daemon-local\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=22\npeer_count=0\nroute_count={}\n",
+            MAX_AUTO_TUNNEL_ROUTE_COUNT + 1
+        );
+        write_signed_kv_artifact(
+            &assignment_path,
+            &assignment_verifier_path,
+            [62u8; 32],
+            &oversized_route_payload,
+        );
+        let route_err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("route_count overflow must fail closed");
+        assert!(matches!(
+            route_err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(
+            route_err
+                .to_string()
+                .contains("route_count exceeds maximum")
+        );
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        let traversal_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=23\ncandidate_count={}\n",
+            MAX_TRAVERSAL_CANDIDATE_COUNT + 1
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [63u8; 32],
+            &traversal_payload,
+        );
+        let candidate_err = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("candidate_count overflow must fail closed");
+        assert!(matches!(
+            candidate_err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(
+            candidate_err
+                .to_string()
+                .contains("candidate_count must be between")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn artifact_limitgate_rejects_excessive_key_depth() {
+        let test_dir = secure_test_dir("rustynetd-artifact-limit-key-depth");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let now = unix_now();
+        let expires = now.saturating_add(300);
+        let assignment_payload = format!(
+            "version=1\nnode_id=daemon-local\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=24\npeer_count=0\nroute_count=0\npeer.0.extra.deep=value\n"
+        );
+        write_signed_kv_artifact(
+            &assignment_path,
+            &assignment_verifier_path,
+            [64u8; 32],
+            &assignment_payload,
+        );
+        let assignment_err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("auto-tunnel key depth overflow must fail closed");
+        assert!(matches!(
+            assignment_err,
+            super::AutoTunnelBootstrapError::InvalidFormat(_)
+        ));
+        assert!(
+            assignment_err
+                .to_string()
+                .contains("key depth exceeds maximum")
+        );
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        let traversal_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=25\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.3\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=20\ncandidate.0.extra.deep=value\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [65u8; 32],
+            &traversal_payload,
+        );
+        let traversal_err = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("traversal key depth overflow must fail closed");
+        assert!(matches!(
+            traversal_err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(
+            traversal_err
+                .to_string()
+                .contains("key depth exceeds maximum")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn artifact_fuzzgate_rejects_rollback_generations_fail_closed() {
+        let test_dir = secure_test_dir("rustynetd-artifact-fuzzgate-rollback");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 31);
+        let trust_envelope = load_trust_evidence(
+            &trust_path,
+            &trust_verifier_path,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first trust load should succeed");
+        let trust_rollback = load_trust_evidence(
+            &trust_path,
+            &trust_verifier_path,
+            TrustPolicy::default(),
+            Some(TrustWatermark {
+                updated_at_unix: trust_envelope.watermark.updated_at_unix.saturating_add(1),
+                nonce: trust_envelope.watermark.nonce.saturating_add(1),
+                payload_digest: Some([0x11u8; 32]),
+            }),
+        )
+        .expect_err("trust rollback must fail closed");
+        assert!(matches!(
+            trust_rollback,
+            super::TrustBootstrapError::ReplayDetected
+        ));
+
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            32,
+            false,
+        );
+        let assignment_envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first assignment load should succeed");
+        let assignment_rollback = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(AutoTunnelWatermark {
+                generated_at_unix: assignment_envelope
+                    .watermark
+                    .generated_at_unix
+                    .saturating_add(1),
+                nonce: assignment_envelope.watermark.nonce.saturating_add(1),
+                payload_digest: Some([0x22u8; 32]),
+            }),
+        )
+        .expect_err("assignment rollback must fail closed");
+        assert!(matches!(
+            assignment_rollback,
+            super::AutoTunnelBootstrapError::ReplayDetected
+        ));
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            33,
+            false,
+        );
+        let traversal_envelope = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first traversal load should succeed");
+        let traversal_rollback = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            Some(super::TraversalWatermark {
+                generated_at_unix: traversal_envelope
+                    .watermark
+                    .generated_at_unix
+                    .saturating_add(1),
+                nonce: traversal_envelope.watermark.nonce.saturating_add(1),
+                payload_digest: Some([0x33u8; 32]),
+            }),
+        )
+        .expect_err("traversal rollback must fail closed");
+        assert!(matches!(
+            traversal_rollback,
+            super::TraversalBootstrapError::ReplayDetected
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn artifact_fuzzgate_bundle_parsers_never_panic_and_fail_closed() {
+        let test_dir = secure_test_dir("rustynetd-artifact-fuzzgate-no-panic");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 41);
+        let trust_cases = vec![
+            Vec::new(),
+            b"version=2\n".to_vec(),
+            b"version=2\nnonce=abc\n".to_vec(),
+            b"version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix=1\nnonce=1\nsignature=zz\n".to_vec(),
+            vec![0xff, 0xfe, 0xfd],
+        ];
+        for payload in trust_cases {
+            std::fs::write(&trust_path, payload).expect("trust fuzz payload should be writable");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load_trust_evidence(
+                    &trust_path,
+                    &trust_verifier_path,
+                    TrustPolicy::default(),
+                    None,
+                )
+            }));
+            assert!(outcome.is_ok(), "trust parser must never panic");
+            assert!(
+                outcome.expect("panic already asserted absent").is_err(),
+                "trust parser must fail closed on malformed input"
+            );
+        }
+
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            42,
+            false,
+        );
+        let assignment_cases = vec![
+            Vec::new(),
+            b"version=1\nnode_id=daemon-local\n".to_vec(),
+            b"version=1\nnode_id=daemon-local\nmesh_cidr=bad\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix=1\nexpires_at_unix=2\nnonce=1\npeer_count=0\nroute_count=0\nsignature=abcd\n".to_vec(),
+            vec![0x80, 0x81, 0x82],
+        ];
+        for payload in assignment_cases {
+            std::fs::write(&assignment_path, payload)
+                .expect("assignment fuzz payload should be writable");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load_auto_tunnel_bundle(
+                    &assignment_path,
+                    &assignment_verifier_path,
+                    300,
+                    TrustPolicy::default(),
+                    None,
+                )
+            }));
+            assert!(outcome.is_ok(), "auto-tunnel parser must never panic");
+            assert!(
+                outcome.expect("panic already asserted absent").is_err(),
+                "auto-tunnel parser must fail closed on malformed input"
+            );
+        }
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            43,
+            false,
+        );
+        let traversal_cases = vec![
+            Vec::new(),
+            b"version=1\npath_policy=direct_preferred_relay_allowed\n".to_vec(),
+            b"version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix=1\nexpires_at_unix=2\nnonce=1\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=0.0.0.0\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=1\nsignature=abcd\n".to_vec(),
+            vec![0x90, 0x91, 0x92],
+        ];
+        for payload in traversal_cases {
+            std::fs::write(&traversal_path, payload)
+                .expect("traversal fuzz payload should be writable");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load_traversal_bundle(
+                    &traversal_path,
+                    &traversal_verifier_path,
+                    DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+                    TrustPolicy::default(),
+                    None,
+                )
+            }));
+            assert!(outcome.is_ok(), "traversal parser must never panic");
+            assert!(
+                outcome.expect("panic already asserted absent").is_err(),
+                "traversal parser must fail closed on malformed input"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn netcheck_reports_structured_traversal_diagnostics() {
         let test_dir = secure_test_dir("rustynetd-netcheck-traversal-diagnostics");
         let state_path = test_dir.join("daemon.state");
@@ -6150,6 +7642,81 @@ mod tests {
         assert!(netcheck.message.contains("traversal_status=valid"));
         assert!(netcheck.message.contains("candidate_count=3"));
         assert!(netcheck.message.contains("srflx_candidates=1"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-forged");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            53,
+            true,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_status=invalid"));
+        assert!(netcheck.message.contains("candidate_count=0"));
+        assert!(netcheck.message.contains("host_candidates=0"));
+        assert!(netcheck.message.contains("srflx_candidates=0"));
+        assert!(netcheck.message.contains("relay_candidates=0"));
+        assert!(
+            netcheck
+                .message
+                .contains("traversal_error=traversal_bundle_invalid_format")
+                || netcheck
+                    .message
+                    .contains("traversal_error=traversal_signature_verification_failed")
+        );
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);

@@ -434,8 +434,8 @@ fn score_pair(local: TraversalCandidate, remote: TraversalCandidate) -> u64 {
 mod tests {
     use super::{
         CandidateSource, NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
-        TraversalCandidate, TraversalEngine, TraversalEngineConfig, TraversalSession,
-        direct_udp_viable,
+        TraversalCandidate, TraversalEngine, TraversalEngineConfig, TraversalError,
+        TraversalSession, direct_udp_viable,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use std::net::{IpAddr, Ipv4Addr};
@@ -587,5 +587,68 @@ mod tests {
             .plan_direct_probes(local.as_slice(), remote.as_slice())
             .expect_err("duplicate candidate should fail validation");
         assert!(err.to_string().contains("duplicate candidate"));
+    }
+
+    #[test]
+    fn adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback() {
+        let engine =
+            TraversalEngine::new(TraversalEngineConfig::default()).expect("config should be valid");
+        let relay_only_local = vec![candidate(
+            [198, 51, 100, 10],
+            62000,
+            CandidateSource::Relay,
+            900,
+        )];
+        let relay_only_remote = vec![candidate(
+            [203, 0, 113, 20],
+            63000,
+            CandidateSource::Relay,
+            900,
+        )];
+        let no_direct = engine
+            .plan_direct_probes(relay_only_local.as_slice(), relay_only_remote.as_slice())
+            .expect_err("relay-only candidate sets must never authorize direct path planning");
+        assert!(matches!(no_direct, TraversalError::NoDirectCandidates));
+
+        let hard_nat = NatProfile {
+            mapping: NatMappingBehavior::AddressAndPortDependent,
+            filtering: NatFilteringBehavior::AddressAndPortDependent,
+            preserves_port: false,
+        };
+        assert!(
+            !direct_udp_viable(hard_nat, hard_nat),
+            "hard NAT mismatch must deny direct viability and require relay fallback"
+        );
+
+        let peer = NodeId::new("peer-nat-hard").expect("node id should be valid");
+        let mut session = TraversalSession::new(peer, 100);
+        let fallback_config = TraversalEngineConfig {
+            relay_switch_after_failures: 2,
+            ..TraversalEngineConfig::default()
+        };
+        assert_eq!(session.path, PathMode::Relay);
+        assert!(
+            session
+                .on_direct_probe_timeout(101, fallback_config)
+                .is_none()
+        );
+        assert_eq!(session.path, PathMode::Relay);
+        assert!(
+            session
+                .on_direct_probe_timeout(102, fallback_config)
+                .is_some()
+        );
+        assert_eq!(session.path, PathMode::Relay);
+        assert_eq!(session.active_endpoint, None);
+
+        let direct_endpoint = endpoint([203, 0, 113, 21], 51820);
+        session.on_direct_probe_success(direct_endpoint, 103);
+        assert_eq!(session.path, PathMode::Direct);
+        session.on_direct_probe_timeout(104, fallback_config);
+        let failback = session
+            .on_direct_probe_timeout(105, fallback_config)
+            .expect("relay failback should trigger after configured direct probe failures");
+        assert_eq!(failback.to, PathMode::Relay);
+        assert_eq!(session.path, PathMode::Relay);
     }
 }

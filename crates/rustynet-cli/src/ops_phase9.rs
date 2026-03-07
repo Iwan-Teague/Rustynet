@@ -26,17 +26,55 @@ const DEFAULT_PHASE10_PROVENANCE_DIR: &str = "artifacts/phase10/provenance";
 const DEFAULT_PHASE10_PROVENANCE_SIGNING_KEY_FILENAME: &str = "signing_seed.hex";
 const DEFAULT_PHASE10_PROVENANCE_VERIFIER_KEY_FILENAME: &str = "verifier_key.hex";
 const DEFAULT_PHASE10_PROVENANCE_HOST_ID: &str = "ci-localhost";
+const DEFAULT_RELEASE_OUT_DIR: &str = "artifacts/release";
+const DEFAULT_RELEASE_PROVENANCE_DIR: &str = "artifacts/release/provenance";
+const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
+const DEFAULT_PHASE6_PARITY_ATTESTATION_FILENAME: &str = "platform_parity_report.attestation.json";
+const DEFAULT_PHASE9_EVIDENCE_ATTESTATION_FILENAME: &str = "phase9_evidence.attestation.json";
+const DEFAULT_RELEASE_PROVENANCE_SIGNING_KEY_FILENAME: &str = "signing_seed.hex";
+const DEFAULT_RELEASE_PROVENANCE_VERIFIER_KEY_FILENAME: &str = "verifier_key.hex";
+const DEFAULT_RELEASE_HOST_ID: &str = "ci-localhost";
+const DEFAULT_RELEASE_ARTIFACT_PATH: &str = "target/release/rustynetd";
+const DEFAULT_RELEASE_PROVENANCE_FILENAME: &str = "rustynetd.provenance.json";
+const DEFAULT_RELEASE_TRACK: &str = "beta";
+const DEFAULT_RELEASE_MAX_PROVENANCE_AGE_SECONDS: u64 = 2_678_400;
+const RELEASE_PROVENANCE_SCHEMA_VERSION: u64 = 1;
+const RELEASE_PROVENANCE_COMMAND_LITERAL: &str = "rustynet ops sign-release-artifact";
 const DEFAULT_PHASE10_MAX_SOURCE_AGE_SECONDS: u64 = 2_678_400;
 const DEFAULT_PHASE9_MAX_SOURCE_AGE_SECONDS: i64 = 2_678_400;
 const DEFAULT_PHASE10_MAX_PROVENANCE_AGE_SECONDS: u64 = 2_678_400;
+const MAX_PHASE10_JSON_SOURCE_BYTES: u64 = 1_048_576;
+const MAX_PHASE10_STATE_LOG_SOURCE_BYTES: u64 = 1_048_576;
 const PHASE10_PROVENANCE_FILENAME: &str = "phase10_provenance.attestation.json";
 const PHASE10_PROVENANCE_SIGNING_KEY_PATH_ENV: &str =
     "RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH";
 const PHASE10_PROVENANCE_VERIFIER_KEY_PATH_ENV: &str =
     "RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH";
 const PHASE10_PROVENANCE_HOST_ID_ENV: &str = "RUSTYNET_PHASE10_PROVENANCE_HOST_ID";
+const RELEASE_PROVENANCE_SIGNING_KEY_PATH_ENV: &str =
+    "RUSTYNET_RELEASE_PROVENANCE_SIGNING_KEY_PATH";
+const RELEASE_PROVENANCE_VERIFIER_KEY_PATH_ENV: &str =
+    "RUSTYNET_RELEASE_PROVENANCE_VERIFIER_KEY_PATH";
+const RELEASE_PROVENANCE_PATH_ENV: &str = "RUSTYNET_RELEASE_PROVENANCE_PATH";
+const RELEASE_ARTIFACT_PATH_ENV: &str = "RUSTYNET_RELEASE_ARTIFACT_PATH";
+const RELEASE_SBOM_PATH_ENV: &str = "RUSTYNET_RELEASE_SBOM_PATH";
+const RELEASE_SBOM_SHA256_PATH_ENV: &str = "RUSTYNET_RELEASE_SBOM_SHA256_PATH";
+const RELEASE_TRACK_ENV: &str = "RUSTYNET_RELEASE_TRACK";
+const RELEASE_HOST_ID_ENV: &str = "RUSTYNET_RELEASE_HOST_ID";
+const RELEASE_MAX_PROVENANCE_AGE_SECONDS_ENV: &str = "RUSTYNET_RELEASE_MAX_PROVENANCE_AGE_SECONDS";
+const PHASE6_PARITY_ATTESTATION_PATH_ENV: &str = "RUSTYNET_PHASE6_PARITY_ATTESTATION_PATH";
+const PHASE6_PARITY_ATTESTATION_MAX_AGE_SECONDS_ENV: &str =
+    "RUSTYNET_PHASE6_PARITY_ATTESTATION_MAX_AGE_SECONDS";
+const PHASE9_EVIDENCE_ATTESTATION_PATH_ENV: &str = "RUSTYNET_PHASE9_EVIDENCE_ATTESTATION_PATH";
+const PHASE9_EVIDENCE_ATTESTATION_MAX_AGE_SECONDS_ENV: &str =
+    "RUSTYNET_PHASE9_EVIDENCE_ATTESTATION_MAX_AGE_SECONDS";
 const PHASE10_PROVENANCE_SCHEMA_VERSION: u64 = 1;
 const PHASE10_PROVENANCE_COMMAND_LITERAL: &str = "rustynet ops generate-phase10-artifacts";
+const PHASE6_PARITY_ATTESTATION_SCHEMA_VERSION: u64 = 1;
+const PHASE6_PARITY_ATTESTATION_COMMAND_LITERAL: &str =
+    "rustynet ops generate-platform-parity-report";
+const PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION: u64 = 1;
+const PHASE9_EVIDENCE_ATTESTATION_COMMAND_LITERAL: &str = "rustynet ops generate-phase9-artifacts";
 
 const PHASE9_REQUIRED_SOURCES: &[&str] = &[
     "compatibility_policy.json",
@@ -486,9 +524,311 @@ fn phase10_host_identity_from_env_or_default() -> Result<String, String> {
     }
 }
 
+fn validate_release_track(value: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    match normalized {
+        "unstable" | "canary" | "stable" | "internal" | "beta" => Ok(normalized.to_string()),
+        _ => Err(format!("unsupported release track: {normalized}")),
+    }
+}
+
+fn release_out_dir_from_env_or_default() -> Result<PathBuf, String> {
+    path_from_env_or_default("RUSTYNET_RELEASE_OUT_DIR", DEFAULT_RELEASE_OUT_DIR)
+}
+
+fn release_provenance_dir_from_env_or_default() -> Result<PathBuf, String> {
+    path_from_env_or_default(
+        "RUSTYNET_RELEASE_PROVENANCE_DIR",
+        DEFAULT_RELEASE_PROVENANCE_DIR,
+    )
+}
+
+fn release_signing_key_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(RELEASE_PROVENANCE_SIGNING_KEY_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_provenance_dir_from_env_or_default()?
+        .join(DEFAULT_RELEASE_PROVENANCE_SIGNING_KEY_FILENAME))
+}
+
+fn release_verifier_key_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(RELEASE_PROVENANCE_VERIFIER_KEY_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_provenance_dir_from_env_or_default()?
+        .join(DEFAULT_RELEASE_PROVENANCE_VERIFIER_KEY_FILENAME))
+}
+
+fn release_provenance_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(RELEASE_PROVENANCE_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_out_dir_from_env_or_default()?.join(DEFAULT_RELEASE_PROVENANCE_FILENAME))
+}
+
+fn phase6_parity_report_path_from_env_or_default() -> Result<PathBuf, String> {
+    path_from_env_or_default(
+        "RUSTYNET_PHASE6_PLATFORM_PARITY_REPORT",
+        DEFAULT_PHASE6_PARITY_REPORT_PATH,
+    )
+}
+
+fn phase6_parity_attestation_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(PHASE6_PARITY_ATTESTATION_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_out_dir_from_env_or_default()?.join(DEFAULT_PHASE6_PARITY_ATTESTATION_FILENAME))
+}
+
+fn phase9_evidence_attestation_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(PHASE9_EVIDENCE_ATTESTATION_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(
+        path_from_env_or_default("RUSTYNET_PHASE9_OUT_DIR", DEFAULT_PHASE9_OUT_DIR)?
+            .join(DEFAULT_PHASE9_EVIDENCE_ATTESTATION_FILENAME),
+    )
+}
+
+fn release_artifact_path_from_env_or_default() -> Result<PathBuf, String> {
+    path_from_env_or_default(RELEASE_ARTIFACT_PATH_ENV, DEFAULT_RELEASE_ARTIFACT_PATH)
+}
+
+fn release_sbom_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(RELEASE_SBOM_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_out_dir_from_env_or_default()?.join("sbom.cargo-metadata.json"))
+}
+
+fn release_sbom_sha256_path_from_env_or_default() -> Result<PathBuf, String> {
+    if let Some(value) = env_optional_string(RELEASE_SBOM_SHA256_PATH_ENV)? {
+        return resolve_path(value.as_str());
+    }
+    Ok(release_out_dir_from_env_or_default()?.join("sbom.sha256"))
+}
+
+fn release_track_from_env_or_default() -> Result<String, String> {
+    match env_optional_string(RELEASE_TRACK_ENV)? {
+        Some(value) => validate_release_track(value.as_str()),
+        None => Ok(DEFAULT_RELEASE_TRACK.to_string()),
+    }
+}
+
+fn release_host_identity_from_env_or_default() -> Result<String, String> {
+    match env_optional_string(RELEASE_HOST_ID_ENV)? {
+        Some(value) => validate_phase10_host_identity(value.as_str()),
+        None => Ok(DEFAULT_RELEASE_HOST_ID.to_string()),
+    }
+}
+
+fn release_max_provenance_age_seconds_from_env() -> Result<i64, String> {
+    let value = env_u64_with_default(
+        RELEASE_MAX_PROVENANCE_AGE_SECONDS_ENV,
+        DEFAULT_RELEASE_MAX_PROVENANCE_AGE_SECONDS,
+    )?;
+    i64::try_from(value).map_err(|_| {
+        format!("{RELEASE_MAX_PROVENANCE_AGE_SECONDS_ENV} is too large for signed attestation age")
+    })
+}
+
+fn phase6_parity_attestation_max_age_seconds_from_env() -> Result<i64, String> {
+    let value = env_u64_with_default(
+        PHASE6_PARITY_ATTESTATION_MAX_AGE_SECONDS_ENV,
+        DEFAULT_RELEASE_MAX_PROVENANCE_AGE_SECONDS,
+    )?;
+    i64::try_from(value).map_err(|_| {
+        format!(
+            "{PHASE6_PARITY_ATTESTATION_MAX_AGE_SECONDS_ENV} is too large for signed attestation age"
+        )
+    })
+}
+
+fn phase9_evidence_attestation_max_age_seconds_from_env() -> Result<i64, String> {
+    let value = env_u64_with_default(
+        PHASE9_EVIDENCE_ATTESTATION_MAX_AGE_SECONDS_ENV,
+        DEFAULT_RELEASE_MAX_PROVENANCE_AGE_SECONDS,
+    )?;
+    i64::try_from(value).map_err(|_| {
+        format!(
+            "{PHASE9_EVIDENCE_ATTESTATION_MAX_AGE_SECONDS_ENV} is too large for signed attestation age"
+        )
+    })
+}
+
+fn current_git_commit() -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("invoke git rev-parse HEAD failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed with status {}",
+            output.status
+        ));
+    }
+    let commit = String::from_utf8(output.stdout)
+        .map_err(|err| format!("decode git commit output failed: {err}"))?
+        .trim()
+        .to_ascii_lowercase();
+    if commit.len() != 40 || !commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "git rev-parse HEAD returned invalid commit: {commit}"
+        ));
+    }
+    Ok(commit)
+}
+
+fn read_sha256_digest_file(path: &Path, label: &str) -> Result<String, String> {
+    let body = read_utf8_regular_file_with_max_bytes(path, label, 256)?;
+    let digest = body.trim();
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{label} must contain a 64-character hex sha256 digest: {}",
+            path.display()
+        ));
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn write_release_provenance_keypair(
+    signing_key_path: &Path,
+    verifier_key_path: &Path,
+) -> Result<(), String> {
+    let signing_parent = signing_key_path.parent().ok_or_else(|| {
+        format!(
+            "release provenance signing key path has no parent: {}",
+            signing_key_path.display()
+        )
+    })?;
+    ensure_secure_directory(signing_parent, "release provenance key directory")?;
+
+    let verifier_parent = verifier_key_path.parent().ok_or_else(|| {
+        format!(
+            "release provenance verifier key path has no parent: {}",
+            verifier_key_path.display()
+        )
+    })?;
+    if verifier_parent != signing_parent {
+        ensure_secure_directory(verifier_parent, "release provenance key directory")?;
+    }
+
+    let mut signing_seed = [0u8; 32];
+    OsRng.fill_bytes(&mut signing_seed);
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let verifier_key = signing_key.verifying_key();
+    let mut signing_key_hex = hex_encode(&signing_seed);
+    let mut signing_key_body = signing_key_hex.clone();
+    signing_key_body.push('\n');
+    let verifier_key_body = format!("{}\n", hex_encode(verifier_key.as_bytes()));
+    let write_result = (|| {
+        write_secure_bytes(signing_key_path, signing_key_body.as_bytes())?;
+        write_secure_bytes(verifier_key_path, verifier_key_body.as_bytes())?;
+        Ok(())
+    })();
+    signing_seed.zeroize();
+    signing_key_hex.zeroize();
+    signing_key_body.zeroize();
+    write_result
+}
+
+fn ensure_release_provenance_keypair_exists() -> Result<(), String> {
+    let signing_key_path = release_signing_key_path_from_env_or_default()?;
+    let verifier_key_path = release_verifier_key_path_from_env_or_default()?;
+    if !signing_key_path.is_absolute() {
+        return Err(format!(
+            "{RELEASE_PROVENANCE_SIGNING_KEY_PATH_ENV} must resolve to an absolute path"
+        ));
+    }
+    if !verifier_key_path.is_absolute() {
+        return Err(format!(
+            "{RELEASE_PROVENANCE_VERIFIER_KEY_PATH_ENV} must resolve to an absolute path"
+        ));
+    }
+
+    let signing_exists =
+        secure_regular_file_exists(signing_key_path.as_path(), "release provenance signing key")?;
+    let verifier_exists = secure_regular_file_exists(
+        verifier_key_path.as_path(),
+        "release provenance verifier key",
+    )?;
+
+    match (signing_exists, verifier_exists) {
+        (true, true) => Ok(()),
+        (false, false) => write_release_provenance_keypair(
+            signing_key_path.as_path(),
+            verifier_key_path.as_path(),
+        ),
+        _ => Err(
+            "release provenance key material is incomplete: signing and verifier keys must either both exist or both be absent".to_string(),
+        ),
+    }
+}
+
+fn load_release_signing_key() -> Result<SigningKey, String> {
+    let key_path = release_signing_key_path_from_env_or_default()?;
+    if !key_path.is_absolute() {
+        return Err(format!(
+            "{RELEASE_PROVENANCE_SIGNING_KEY_PATH_ENV} must resolve to an absolute path"
+        ));
+    }
+    let key_hex =
+        load_key_hex_from_secure_path(key_path.as_path(), "release provenance signing key")?;
+    let seed = decode_hex_to_fixed::<32>(key_hex.as_str())
+        .map_err(|err| format!("invalid release provenance signing key hex: {err}"))?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+fn load_release_verifier_key() -> Result<VerifyingKey, String> {
+    let key_path = release_verifier_key_path_from_env_or_default()?;
+    if !key_path.is_absolute() {
+        return Err(format!(
+            "{RELEASE_PROVENANCE_VERIFIER_KEY_PATH_ENV} must resolve to an absolute path"
+        ));
+    }
+    let key_hex =
+        load_key_hex_from_secure_path(key_path.as_path(), "release provenance verifier key")?;
+    let key_bytes = decode_hex_to_fixed::<32>(key_hex.as_str())
+        .map_err(|err| format!("invalid release provenance verifier key hex: {err}"))?;
+    VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|err| format!("parse release provenance verifier key failed: {err}"))
+}
+
+fn read_utf8_regular_file_with_max_bytes(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+) -> Result<String, String> {
+    ensure_regular_file(path, label)?;
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} exceeds maximum size ({} bytes > {} bytes): {}",
+            metadata.len(),
+            max_bytes,
+            path.display()
+        ));
+    }
+    let body =
+        fs::read(path).map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
+    if (body.len() as u64) > max_bytes {
+        return Err(format!(
+            "{label} exceeds maximum size after read ({} bytes > {} bytes): {}",
+            body.len(),
+            max_bytes,
+            path.display()
+        ));
+    }
+    String::from_utf8(body)
+        .map_err(|err| format!("decode {label} as utf-8 failed ({}): {err}", path.display()))
+}
+
 fn read_json_object(path: &Path, label: &str) -> Result<Map<String, Value>, String> {
-    let body = fs::read_to_string(path)
-        .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
+    let body = read_utf8_regular_file_with_max_bytes(path, label, MAX_PHASE10_JSON_SOURCE_BYTES)?;
     let value: Value = serde_json::from_str(body.as_str())
         .map_err(|err| format!("parse {label} failed ({}): {err}", path.display()))?;
     value
@@ -1587,6 +1927,184 @@ fn phase10_provenance_payload(fields: &Phase10ProvenancePayload<'_>) -> String {
     )
 }
 
+struct ReleaseProvenancePayload<'a> {
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    command_digest_sha256: &'a str,
+    signer_key_id: &'a str,
+    verifier_key_hex: &'a str,
+    release_track: &'a str,
+    artifact_path: &'a str,
+    artifact_sha256: &'a str,
+    artifact_size_bytes: u64,
+    sbom_path: &'a str,
+    sbom_sha256: &'a str,
+    sbom_digest_path: &'a str,
+    sbom_digest_value: &'a str,
+}
+
+fn release_provenance_payload(fields: &ReleaseProvenancePayload<'_>) -> String {
+    format!(
+        "version={RELEASE_PROVENANCE_SCHEMA_VERSION}\nphase=release\ngenerated_at_unix={generated_at_unix}\nhost_identity={host_identity}\ncommand_digest_sha256={command_digest_sha256}\nsigner_key_id={signer_key_id}\nverifier_key_hex={verifier_key_hex}\nrelease_track={release_track}\nartifact_path={artifact_path}\nartifact_sha256={artifact_sha256}\nartifact_size_bytes={artifact_size_bytes}\nsbom_path={sbom_path}\nsbom_sha256={sbom_sha256}\nsbom_digest_path={sbom_digest_path}\nsbom_digest_value={sbom_digest_value}\n",
+        generated_at_unix = fields.generated_at_unix,
+        host_identity = fields.host_identity,
+        command_digest_sha256 = fields.command_digest_sha256,
+        signer_key_id = fields.signer_key_id,
+        verifier_key_hex = fields.verifier_key_hex,
+        release_track = fields.release_track,
+        artifact_path = fields.artifact_path,
+        artifact_sha256 = fields.artifact_sha256,
+        artifact_size_bytes = fields.artifact_size_bytes,
+        sbom_path = fields.sbom_path,
+        sbom_sha256 = fields.sbom_sha256,
+        sbom_digest_path = fields.sbom_digest_path,
+        sbom_digest_value = fields.sbom_digest_value,
+    )
+}
+
+struct Phase6ParityAttestationPayload<'a> {
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    command_digest_sha256: &'a str,
+    signer_key_id: &'a str,
+    verifier_key_hex: &'a str,
+    git_commit: &'a str,
+    report_path: &'a str,
+    report_sha256: &'a str,
+    report_captured_at_unix: u64,
+}
+
+fn phase6_parity_attestation_payload(fields: &Phase6ParityAttestationPayload<'_>) -> String {
+    format!(
+        "version={PHASE6_PARITY_ATTESTATION_SCHEMA_VERSION}\nphase=phase6\ngenerated_at_unix={generated_at_unix}\nhost_identity={host_identity}\ncommand_digest_sha256={command_digest_sha256}\nsigner_key_id={signer_key_id}\nverifier_key_hex={verifier_key_hex}\ngit_commit={git_commit}\nreport_path={report_path}\nreport_sha256={report_sha256}\nreport_captured_at_unix={report_captured_at_unix}\n",
+        generated_at_unix = fields.generated_at_unix,
+        host_identity = fields.host_identity,
+        command_digest_sha256 = fields.command_digest_sha256,
+        signer_key_id = fields.signer_key_id,
+        verifier_key_hex = fields.verifier_key_hex,
+        git_commit = fields.git_commit,
+        report_path = fields.report_path,
+        report_sha256 = fields.report_sha256,
+        report_captured_at_unix = fields.report_captured_at_unix,
+    )
+}
+
+#[derive(Clone)]
+struct Phase9EvidenceArtifactEntry {
+    name: String,
+    artifact_path: String,
+    artifact_sha256: String,
+    captured_at_unix: u64,
+}
+
+struct Phase9EvidenceAttestationPayload<'a> {
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    command_digest_sha256: &'a str,
+    signer_key_id: &'a str,
+    verifier_key_hex: &'a str,
+    git_commit: &'a str,
+    environment: &'a str,
+    artifacts: &'a [Phase9EvidenceArtifactEntry],
+}
+
+fn phase9_evidence_attestation_payload(fields: &Phase9EvidenceAttestationPayload<'_>) -> String {
+    let mut payload = format!(
+        "version={PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION}\nphase=phase9\ngenerated_at_unix={generated_at_unix}\nhost_identity={host_identity}\ncommand_digest_sha256={command_digest_sha256}\nsigner_key_id={signer_key_id}\nverifier_key_hex={verifier_key_hex}\ngit_commit={git_commit}\nenvironment={environment}\n",
+        generated_at_unix = fields.generated_at_unix,
+        host_identity = fields.host_identity,
+        command_digest_sha256 = fields.command_digest_sha256,
+        signer_key_id = fields.signer_key_id,
+        verifier_key_hex = fields.verifier_key_hex,
+        git_commit = fields.git_commit,
+        environment = fields.environment,
+    );
+    for artifact in fields.artifacts {
+        payload.push_str(
+            format!(
+                "artifact={name}|{artifact_path}|{artifact_sha256}|{captured_at_unix}\n",
+                name = artifact.name,
+                artifact_path = artifact.artifact_path,
+                artifact_sha256 = artifact.artifact_sha256,
+                captured_at_unix = artifact.captured_at_unix,
+            )
+            .as_str(),
+        );
+    }
+    payload
+}
+
+struct ReleaseProvenanceBuildInputs<'a> {
+    artifact_path: &'a Path,
+    sbom_path: &'a Path,
+    sbom_digest_path: &'a Path,
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    release_track: &'a str,
+    signing_key: &'a SigningKey,
+    verifier_key: &'a VerifyingKey,
+}
+
+fn build_release_provenance_document(
+    inputs: &ReleaseProvenanceBuildInputs<'_>,
+) -> Result<Value, String> {
+    let release_track = validate_release_track(inputs.release_track)?;
+    let artifact_path = canonical_file_display(inputs.artifact_path, "release artifact")?;
+    let sbom_path = canonical_file_display(inputs.sbom_path, "release sbom")?;
+    let sbom_digest_path = canonical_file_display(inputs.sbom_digest_path, "release sbom digest")?;
+
+    let artifact_sha256 = sha256_file_hex(Path::new(artifact_path.as_str()))?;
+    let sbom_sha256 = sha256_file_hex(Path::new(sbom_path.as_str()))?;
+    let sbom_digest_value =
+        read_sha256_digest_file(Path::new(sbom_digest_path.as_str()), "release sbom digest")?;
+    if sbom_digest_value != sbom_sha256 {
+        return Err("release sbom digest file does not match sbom content digest".to_string());
+    }
+    let artifact_size_bytes = fs::metadata(Path::new(artifact_path.as_str()))
+        .map_err(|err| format!("inspect release artifact metadata failed: {err}"))?
+        .len();
+
+    let command_digest_sha256 = sha256_hex(RELEASE_PROVENANCE_COMMAND_LITERAL.as_bytes());
+    let verifier_key_hex = hex_encode(inputs.verifier_key.as_bytes());
+    let signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
+    let signer_key_id = format!("ed25519:{}", &signer_fingerprint[..16]);
+    let payload = release_provenance_payload(&ReleaseProvenancePayload {
+        generated_at_unix: inputs.generated_at_unix,
+        host_identity: inputs.host_identity,
+        command_digest_sha256: command_digest_sha256.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        release_track: release_track.as_str(),
+        artifact_path: artifact_path.as_str(),
+        artifact_sha256: artifact_sha256.as_str(),
+        artifact_size_bytes,
+        sbom_path: sbom_path.as_str(),
+        sbom_sha256: sbom_sha256.as_str(),
+        sbom_digest_path: sbom_digest_path.as_str(),
+        sbom_digest_value: sbom_digest_value.as_str(),
+    });
+    let signature = inputs.signing_key.sign(payload.as_bytes());
+
+    Ok(json!({
+        "schema_version": RELEASE_PROVENANCE_SCHEMA_VERSION,
+        "phase": "release",
+        "generated_at_unix": inputs.generated_at_unix,
+        "host_identity": inputs.host_identity,
+        "command_digest_sha256": command_digest_sha256,
+        "signer_key_id": signer_key_id,
+        "verifier_key_hex": verifier_key_hex,
+        "release_track": release_track,
+        "artifact_path": artifact_path,
+        "artifact_sha256": artifact_sha256,
+        "artifact_size_bytes": artifact_size_bytes,
+        "sbom_path": sbom_path,
+        "sbom_sha256": sbom_sha256,
+        "sbom_digest_path": sbom_digest_path,
+        "sbom_digest_value": sbom_digest_value,
+        "signature_hex": hex_encode(&signature.to_bytes()),
+    }))
+}
+
 fn build_phase10_provenance_document(
     source_dir: &Path,
     out_dir: &Path,
@@ -1832,6 +2350,822 @@ fn verify_phase10_provenance_document(
     Ok(())
 }
 
+struct ReleaseProvenanceVerifyInputs<'a> {
+    provenance_path: &'a Path,
+    expected_artifact_path: &'a Path,
+    expected_sbom_path: &'a Path,
+    expected_sbom_digest_path: &'a Path,
+    expected_host_identity: &'a str,
+    expected_release_track: &'a str,
+    verifier_key: &'a VerifyingKey,
+    max_provenance_age_seconds: i64,
+}
+
+fn verify_release_provenance_document(
+    inputs: &ReleaseProvenanceVerifyInputs<'_>,
+) -> Result<(), String> {
+    let expected_release_track = validate_release_track(inputs.expected_release_track)?;
+    let provenance = read_json_object(inputs.provenance_path, "release provenance attestation")?;
+    if object_u64_field(
+        &provenance,
+        "schema_version",
+        "release provenance attestation",
+    )? != RELEASE_PROVENANCE_SCHEMA_VERSION
+    {
+        return Err("release provenance schema_version mismatch".to_string());
+    }
+    if object_string_field(&provenance, "phase", "release provenance attestation")? != "release" {
+        return Err("release provenance must set phase=release".to_string());
+    }
+
+    let generated_at_unix = object_u64_field(
+        &provenance,
+        "generated_at_unix",
+        "release provenance attestation",
+    )?;
+    let now_unix =
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+    let generated_at = i64::try_from(generated_at_unix)
+        .map_err(|_| "release provenance generated_at_unix out of range".to_string())?;
+    if generated_at > now_unix + 300 {
+        return Err("release provenance generated_at_unix is in the future".to_string());
+    }
+    if now_unix - generated_at > inputs.max_provenance_age_seconds {
+        return Err("release provenance attestation is stale".to_string());
+    }
+
+    let host_identity = object_string_field(
+        &provenance,
+        "host_identity",
+        "release provenance attestation",
+    )?;
+    if host_identity != inputs.expected_host_identity {
+        return Err("release provenance host identity mismatch".to_string());
+    }
+
+    let release_track = object_string_field(
+        &provenance,
+        "release_track",
+        "release provenance attestation",
+    )?;
+    let release_track = validate_release_track(release_track.as_str())?;
+    if release_track != expected_release_track {
+        return Err("release provenance release_track mismatch".to_string());
+    }
+
+    let command_digest = object_string_field(
+        &provenance,
+        "command_digest_sha256",
+        "release provenance attestation",
+    )?;
+    let expected_command_digest = sha256_hex(RELEASE_PROVENANCE_COMMAND_LITERAL.as_bytes());
+    if command_digest != expected_command_digest {
+        return Err("release provenance command digest mismatch".to_string());
+    }
+
+    let signer_key_id = object_string_field(
+        &provenance,
+        "signer_key_id",
+        "release provenance attestation",
+    )?;
+    let verifier_key_hex = object_string_field(
+        &provenance,
+        "verifier_key_hex",
+        "release provenance attestation",
+    )?;
+    if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
+        return Err("release provenance verifier key mismatch".to_string());
+    }
+
+    let artifact_path = object_string_field(
+        &provenance,
+        "artifact_path",
+        "release provenance attestation",
+    )?;
+    let expected_artifact =
+        canonical_file_display(inputs.expected_artifact_path, "release artifact")?;
+    if artifact_path != expected_artifact {
+        return Err("release provenance artifact path mismatch".to_string());
+    }
+    let artifact_sha256 = object_string_field(
+        &provenance,
+        "artifact_sha256",
+        "release provenance attestation",
+    )?;
+    let actual_artifact_sha256 = sha256_file_hex(Path::new(artifact_path.as_str()))?;
+    if artifact_sha256 != actual_artifact_sha256 {
+        return Err("release provenance artifact digest mismatch".to_string());
+    }
+    let artifact_size_bytes = object_u64_field(
+        &provenance,
+        "artifact_size_bytes",
+        "release provenance attestation",
+    )?;
+    let actual_artifact_size = fs::metadata(Path::new(artifact_path.as_str()))
+        .map_err(|err| format!("inspect release artifact metadata failed: {err}"))?
+        .len();
+    if artifact_size_bytes != actual_artifact_size {
+        return Err("release provenance artifact size mismatch".to_string());
+    }
+
+    let sbom_path =
+        object_string_field(&provenance, "sbom_path", "release provenance attestation")?;
+    let expected_sbom = canonical_file_display(inputs.expected_sbom_path, "release sbom")?;
+    if sbom_path != expected_sbom {
+        return Err("release provenance sbom path mismatch".to_string());
+    }
+    let sbom_sha256 =
+        object_string_field(&provenance, "sbom_sha256", "release provenance attestation")?;
+    let actual_sbom_sha256 = sha256_file_hex(Path::new(sbom_path.as_str()))?;
+    if sbom_sha256 != actual_sbom_sha256 {
+        return Err("release provenance sbom digest mismatch".to_string());
+    }
+
+    let sbom_digest_path = object_string_field(
+        &provenance,
+        "sbom_digest_path",
+        "release provenance attestation",
+    )?;
+    let expected_sbom_digest =
+        canonical_file_display(inputs.expected_sbom_digest_path, "release sbom digest")?;
+    if sbom_digest_path != expected_sbom_digest {
+        return Err("release provenance sbom digest path mismatch".to_string());
+    }
+    let sbom_digest_value = object_string_field(
+        &provenance,
+        "sbom_digest_value",
+        "release provenance attestation",
+    )?;
+    let actual_sbom_digest_value =
+        read_sha256_digest_file(Path::new(sbom_digest_path.as_str()), "release sbom digest")?;
+    if sbom_digest_value != actual_sbom_digest_value || sbom_digest_value != sbom_sha256 {
+        return Err("release provenance sbom digest value mismatch".to_string());
+    }
+
+    let signature_hex = object_string_field(
+        &provenance,
+        "signature_hex",
+        "release provenance attestation",
+    )?;
+    let signature_bytes = decode_hex_to_fixed::<64>(signature_hex.as_str())
+        .map_err(|err| format!("release provenance signature parse failed: {err}"))?;
+    let payload = release_provenance_payload(&ReleaseProvenancePayload {
+        generated_at_unix,
+        host_identity: host_identity.as_str(),
+        command_digest_sha256: command_digest.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        release_track: release_track.as_str(),
+        artifact_path: artifact_path.as_str(),
+        artifact_sha256: artifact_sha256.as_str(),
+        artifact_size_bytes,
+        sbom_path: sbom_path.as_str(),
+        sbom_sha256: sbom_sha256.as_str(),
+        sbom_digest_path: sbom_digest_path.as_str(),
+        sbom_digest_value: sbom_digest_value.as_str(),
+    });
+    let signature = Signature::from_bytes(&signature_bytes);
+    inputs
+        .verifier_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| "release provenance signature verification failed".to_string())?;
+    Ok(())
+}
+
+fn phase9_validate_source_artifacts_field(
+    document: &Map<String, Value>,
+    label: &str,
+) -> Result<(), String> {
+    let sources = document
+        .get("source_artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{label} missing non-empty source_artifacts array"))?;
+    if sources.is_empty() {
+        return Err(format!("{label} source_artifacts array must not be empty"));
+    }
+    for source in sources {
+        let source_str = source
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{label} has invalid source_artifacts entry"))?;
+        let source_path = Path::new(source_str);
+        if !source_path.exists() {
+            return Err(format!(
+                "{label} source artifact does not exist: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn phase9_parse_measured_artifact_document(
+    artifact_path: &Path,
+    label: &str,
+) -> Result<(u64, String), String> {
+    let document = read_json_object(artifact_path, label)?;
+    if document.get("gate_passed").is_some() {
+        return Err(format!("{label} must not include gate_passed field"));
+    }
+    let evidence_mode = object_string_field(&document, "evidence_mode", label)?;
+    if evidence_mode != "measured" {
+        return Err(format!("{label} must set evidence_mode=measured"));
+    }
+    let captured_at_unix = object_u64_field(&document, "captured_at_unix", label)?;
+    let environment = object_string_field(&document, "environment", label)?;
+    phase9_validate_source_artifacts_field(&document, label)?;
+    Ok((captured_at_unix, environment))
+}
+
+fn phase6_report_captured_at_unix(report_path: &Path) -> Result<u64, String> {
+    let report = read_json_object(report_path, "phase6 parity report")?;
+    if report.get("gate_passed").is_some() {
+        return Err("phase6 parity report must not include gate_passed field".to_string());
+    }
+    let evidence_mode = object_string_field(&report, "evidence_mode", "phase6 parity report")?;
+    if evidence_mode != "measured" {
+        return Err("phase6 parity report must set evidence_mode=measured".to_string());
+    }
+    let _ = object_string_field(&report, "environment", "phase6 parity report")?;
+    phase9_validate_source_artifacts_field(&report, "phase6 parity report")?;
+    object_u64_field(&report, "captured_at_unix", "phase6 parity report")
+}
+
+struct Phase6ParityAttestationBuildInputs<'a> {
+    report_path: &'a Path,
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    git_commit: &'a str,
+    signing_key: &'a SigningKey,
+    verifier_key: &'a VerifyingKey,
+}
+
+fn build_phase6_parity_attestation_document(
+    inputs: &Phase6ParityAttestationBuildInputs<'_>,
+) -> Result<Value, String> {
+    let report_path = canonical_file_display(inputs.report_path, "phase6 parity report")?;
+    let report_sha256 = sha256_file_hex(Path::new(report_path.as_str()))?;
+    let report_captured_at_unix = phase6_report_captured_at_unix(Path::new(report_path.as_str()))?;
+    let command_digest_sha256 = sha256_hex(PHASE6_PARITY_ATTESTATION_COMMAND_LITERAL.as_bytes());
+    let verifier_key_hex = hex_encode(inputs.verifier_key.as_bytes());
+    let signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
+    let signer_key_id = format!("ed25519:{}", &signer_fingerprint[..16]);
+    let payload = phase6_parity_attestation_payload(&Phase6ParityAttestationPayload {
+        generated_at_unix: inputs.generated_at_unix,
+        host_identity: inputs.host_identity,
+        command_digest_sha256: command_digest_sha256.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        git_commit: inputs.git_commit,
+        report_path: report_path.as_str(),
+        report_sha256: report_sha256.as_str(),
+        report_captured_at_unix,
+    });
+    let signature = inputs.signing_key.sign(payload.as_bytes());
+    Ok(json!({
+        "schema_version": PHASE6_PARITY_ATTESTATION_SCHEMA_VERSION,
+        "phase": "phase6",
+        "generated_at_unix": inputs.generated_at_unix,
+        "host_identity": inputs.host_identity,
+        "command_digest_sha256": command_digest_sha256,
+        "signer_key_id": signer_key_id,
+        "verifier_key_hex": verifier_key_hex,
+        "git_commit": inputs.git_commit,
+        "report_path": report_path,
+        "report_sha256": report_sha256,
+        "report_captured_at_unix": report_captured_at_unix,
+        "signature_hex": hex_encode(&signature.to_bytes()),
+    }))
+}
+
+struct Phase6ParityAttestationVerifyInputs<'a> {
+    attestation_path: &'a Path,
+    expected_report_path: &'a Path,
+    expected_host_identity: &'a str,
+    expected_git_commit: &'a str,
+    verifier_key: &'a VerifyingKey,
+    max_attestation_age_seconds: i64,
+}
+
+fn verify_phase6_parity_attestation_document(
+    inputs: &Phase6ParityAttestationVerifyInputs<'_>,
+) -> Result<(), String> {
+    let attestation = read_json_object(inputs.attestation_path, "phase6 parity attestation")?;
+    if object_u64_field(&attestation, "schema_version", "phase6 parity attestation")?
+        != PHASE6_PARITY_ATTESTATION_SCHEMA_VERSION
+    {
+        return Err("phase6 parity attestation schema_version mismatch".to_string());
+    }
+    if object_string_field(&attestation, "phase", "phase6 parity attestation")? != "phase6" {
+        return Err("phase6 parity attestation must set phase=phase6".to_string());
+    }
+
+    let generated_at_unix = object_u64_field(
+        &attestation,
+        "generated_at_unix",
+        "phase6 parity attestation",
+    )?;
+    let now_unix =
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+    let generated_at = i64::try_from(generated_at_unix)
+        .map_err(|_| "phase6 parity generated_at_unix out of range".to_string())?;
+    if generated_at > now_unix + 300 {
+        return Err("phase6 parity generated_at_unix is in the future".to_string());
+    }
+    if now_unix - generated_at > inputs.max_attestation_age_seconds {
+        return Err("phase6 parity attestation is stale".to_string());
+    }
+
+    let host_identity =
+        object_string_field(&attestation, "host_identity", "phase6 parity attestation")?;
+    if host_identity != inputs.expected_host_identity {
+        return Err("phase6 parity host identity mismatch".to_string());
+    }
+
+    let command_digest = object_string_field(
+        &attestation,
+        "command_digest_sha256",
+        "phase6 parity attestation",
+    )?;
+    let expected_command_digest = sha256_hex(PHASE6_PARITY_ATTESTATION_COMMAND_LITERAL.as_bytes());
+    if command_digest != expected_command_digest {
+        return Err("phase6 parity command digest mismatch".to_string());
+    }
+
+    let signer_key_id =
+        object_string_field(&attestation, "signer_key_id", "phase6 parity attestation")?;
+    let expected_signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
+    let expected_signer_key_id = format!("ed25519:{}", &expected_signer_fingerprint[..16]);
+    if signer_key_id != expected_signer_key_id {
+        return Err("phase6 parity signer key id mismatch".to_string());
+    }
+    let verifier_key_hex = object_string_field(
+        &attestation,
+        "verifier_key_hex",
+        "phase6 parity attestation",
+    )?;
+    if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
+        return Err("phase6 parity verifier key mismatch".to_string());
+    }
+
+    let git_commit = object_string_field(&attestation, "git_commit", "phase6 parity attestation")?;
+    if git_commit != inputs.expected_git_commit {
+        return Err("phase6 parity git commit mismatch".to_string());
+    }
+
+    let report_path =
+        object_string_field(&attestation, "report_path", "phase6 parity attestation")?;
+    let expected_report =
+        canonical_file_display(inputs.expected_report_path, "phase6 parity report")?;
+    if report_path != expected_report {
+        return Err("phase6 parity report path mismatch".to_string());
+    }
+    let report_sha256 =
+        object_string_field(&attestation, "report_sha256", "phase6 parity attestation")?;
+    let actual_report_sha256 = sha256_file_hex(Path::new(report_path.as_str()))?;
+    if report_sha256 != actual_report_sha256 {
+        return Err("phase6 parity report digest mismatch".to_string());
+    }
+
+    let report_captured_at_unix = object_u64_field(
+        &attestation,
+        "report_captured_at_unix",
+        "phase6 parity attestation",
+    )?;
+    let report_captured_at = i64::try_from(report_captured_at_unix)
+        .map_err(|_| "phase6 parity report_captured_at_unix out of range".to_string())?;
+    if report_captured_at > now_unix + 300 {
+        return Err("phase6 parity report_captured_at_unix is in the future".to_string());
+    }
+    if now_unix - report_captured_at > inputs.max_attestation_age_seconds {
+        return Err("phase6 parity report_captured_at_unix is stale".to_string());
+    }
+    let observed_report_captured_at =
+        phase6_report_captured_at_unix(Path::new(report_path.as_str()))?;
+    if report_captured_at_unix != observed_report_captured_at {
+        return Err("phase6 parity report captured_at_unix mismatch".to_string());
+    }
+
+    let signature_hex =
+        object_string_field(&attestation, "signature_hex", "phase6 parity attestation")?;
+    let signature_bytes = decode_hex_to_fixed::<64>(signature_hex.as_str())
+        .map_err(|err| format!("phase6 parity signature parse failed: {err}"))?;
+    let payload = phase6_parity_attestation_payload(&Phase6ParityAttestationPayload {
+        generated_at_unix,
+        host_identity: host_identity.as_str(),
+        command_digest_sha256: command_digest.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        git_commit: git_commit.as_str(),
+        report_path: report_path.as_str(),
+        report_sha256: report_sha256.as_str(),
+        report_captured_at_unix,
+    });
+    let signature = Signature::from_bytes(&signature_bytes);
+    inputs
+        .verifier_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| "phase6 parity signature verification failed".to_string())?;
+    Ok(())
+}
+
+struct Phase9EvidenceAttestationBuildInputs<'a> {
+    out_dir: &'a Path,
+    environment: &'a str,
+    generated_at_unix: u64,
+    host_identity: &'a str,
+    git_commit: &'a str,
+    signing_key: &'a SigningKey,
+    verifier_key: &'a VerifyingKey,
+}
+
+fn build_phase9_evidence_attestation_document(
+    inputs: &Phase9EvidenceAttestationBuildInputs<'_>,
+) -> Result<Value, String> {
+    let command_digest_sha256 = sha256_hex(PHASE9_EVIDENCE_ATTESTATION_COMMAND_LITERAL.as_bytes());
+    let verifier_key_hex = hex_encode(inputs.verifier_key.as_bytes());
+    let signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
+    let signer_key_id = format!("ed25519:{}", &signer_fingerprint[..16]);
+
+    let mut artifacts = Vec::with_capacity(PHASE9_REQUIRED_ARTIFACTS.len());
+    for name in PHASE9_REQUIRED_ARTIFACTS {
+        let candidate = inputs.out_dir.join(name);
+        let canonical_path =
+            canonical_file_display(candidate.as_path(), "phase9 evidence artifact")?;
+        let artifact_path = Path::new(canonical_path.as_str());
+        let artifact_sha256 = sha256_file_hex(artifact_path)?;
+        let artifact_label = format!("phase9 evidence artifact {name}");
+        let (captured_at_unix, artifact_environment) =
+            phase9_parse_measured_artifact_document(artifact_path, artifact_label.as_str())?;
+        if artifact_environment != inputs.environment {
+            return Err(format!(
+                "phase9 evidence environment mismatch for {name}: expected={} observed={}",
+                inputs.environment, artifact_environment
+            ));
+        }
+        artifacts.push(Phase9EvidenceArtifactEntry {
+            name: (*name).to_string(),
+            artifact_path: canonical_path,
+            artifact_sha256,
+            captured_at_unix,
+        });
+    }
+
+    let payload = phase9_evidence_attestation_payload(&Phase9EvidenceAttestationPayload {
+        generated_at_unix: inputs.generated_at_unix,
+        host_identity: inputs.host_identity,
+        command_digest_sha256: command_digest_sha256.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        git_commit: inputs.git_commit,
+        environment: inputs.environment,
+        artifacts: artifacts.as_slice(),
+    });
+    let signature = inputs.signing_key.sign(payload.as_bytes());
+
+    let artifact_documents = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "name": artifact.name,
+                "artifact_path": artifact.artifact_path,
+                "artifact_sha256": artifact.artifact_sha256,
+                "captured_at_unix": artifact.captured_at_unix,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "schema_version": PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION,
+        "phase": "phase9",
+        "generated_at_unix": inputs.generated_at_unix,
+        "host_identity": inputs.host_identity,
+        "command_digest_sha256": command_digest_sha256,
+        "signer_key_id": signer_key_id,
+        "verifier_key_hex": verifier_key_hex,
+        "git_commit": inputs.git_commit,
+        "environment": inputs.environment,
+        "artifacts": artifact_documents,
+        "signature_hex": hex_encode(&signature.to_bytes()),
+    }))
+}
+
+struct Phase9EvidenceAttestationVerifyInputs<'a> {
+    attestation_path: &'a Path,
+    expected_out_dir: &'a Path,
+    expected_host_identity: &'a str,
+    expected_git_commit: &'a str,
+    verifier_key: &'a VerifyingKey,
+    max_attestation_age_seconds: i64,
+}
+
+fn verify_phase9_evidence_attestation_document(
+    inputs: &Phase9EvidenceAttestationVerifyInputs<'_>,
+) -> Result<(), String> {
+    let attestation = read_json_object(inputs.attestation_path, "phase9 evidence attestation")?;
+    if object_u64_field(
+        &attestation,
+        "schema_version",
+        "phase9 evidence attestation",
+    )? != PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION
+    {
+        return Err("phase9 evidence attestation schema_version mismatch".to_string());
+    }
+    if object_string_field(&attestation, "phase", "phase9 evidence attestation")? != "phase9" {
+        return Err("phase9 evidence attestation must set phase=phase9".to_string());
+    }
+
+    let generated_at_unix = object_u64_field(
+        &attestation,
+        "generated_at_unix",
+        "phase9 evidence attestation",
+    )?;
+    let now_unix =
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+    let generated_at = i64::try_from(generated_at_unix)
+        .map_err(|_| "phase9 evidence generated_at_unix out of range".to_string())?;
+    if generated_at > now_unix + 300 {
+        return Err("phase9 evidence generated_at_unix is in the future".to_string());
+    }
+    if now_unix - generated_at > inputs.max_attestation_age_seconds {
+        return Err("phase9 evidence attestation is stale".to_string());
+    }
+
+    let host_identity =
+        object_string_field(&attestation, "host_identity", "phase9 evidence attestation")?;
+    if host_identity != inputs.expected_host_identity {
+        return Err("phase9 evidence host identity mismatch".to_string());
+    }
+
+    let command_digest = object_string_field(
+        &attestation,
+        "command_digest_sha256",
+        "phase9 evidence attestation",
+    )?;
+    let expected_command_digest =
+        sha256_hex(PHASE9_EVIDENCE_ATTESTATION_COMMAND_LITERAL.as_bytes());
+    if command_digest != expected_command_digest {
+        return Err("phase9 evidence command digest mismatch".to_string());
+    }
+
+    let signer_key_id =
+        object_string_field(&attestation, "signer_key_id", "phase9 evidence attestation")?;
+    let expected_signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
+    let expected_signer_key_id = format!("ed25519:{}", &expected_signer_fingerprint[..16]);
+    if signer_key_id != expected_signer_key_id {
+        return Err("phase9 evidence signer key id mismatch".to_string());
+    }
+    let verifier_key_hex = object_string_field(
+        &attestation,
+        "verifier_key_hex",
+        "phase9 evidence attestation",
+    )?;
+    if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
+        return Err("phase9 evidence verifier key mismatch".to_string());
+    }
+
+    let git_commit =
+        object_string_field(&attestation, "git_commit", "phase9 evidence attestation")?;
+    if git_commit != inputs.expected_git_commit {
+        return Err("phase9 evidence git commit mismatch".to_string());
+    }
+    let environment =
+        object_string_field(&attestation, "environment", "phase9 evidence attestation")?;
+
+    let entries = attestation
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "phase9 evidence attestation missing artifacts array".to_string())?;
+    if entries.len() != PHASE9_REQUIRED_ARTIFACTS.len() {
+        return Err("phase9 evidence attestation artifact count mismatch".to_string());
+    }
+
+    let mut expected_paths = std::collections::BTreeMap::new();
+    for name in PHASE9_REQUIRED_ARTIFACTS {
+        let expected_path = canonical_file_display(
+            inputs.expected_out_dir.join(name).as_path(),
+            "phase9 evidence artifact",
+        )?;
+        expected_paths.insert((*name).to_string(), expected_path);
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut observed_entries = std::collections::BTreeMap::new();
+    for entry in entries {
+        let entry_object = entry.as_object().ok_or_else(|| {
+            "phase9 evidence attestation artifact entry must be object".to_string()
+        })?;
+        let name = object_string_field(entry_object, "name", "phase9 evidence artifact entry")?;
+        if !seen.insert(name.clone()) {
+            return Err(format!(
+                "phase9 evidence attestation has duplicate artifact: {name}"
+            ));
+        }
+        let expected_path = expected_paths.get(name.as_str()).ok_or_else(|| {
+            format!("phase9 evidence attestation has unexpected artifact: {name}")
+        })?;
+        let artifact_path = object_string_field(
+            entry_object,
+            "artifact_path",
+            "phase9 evidence artifact entry",
+        )?;
+        if artifact_path != *expected_path {
+            return Err(format!("phase9 evidence artifact path mismatch for {name}"));
+        }
+
+        let artifact_sha256 = object_string_field(
+            entry_object,
+            "artifact_sha256",
+            "phase9 evidence artifact entry",
+        )?;
+        let actual_artifact_sha256 = sha256_file_hex(Path::new(artifact_path.as_str()))?;
+        if artifact_sha256 != actual_artifact_sha256 {
+            return Err(format!(
+                "phase9 evidence artifact digest mismatch for {name}"
+            ));
+        }
+
+        let captured_at_unix = object_u64_field(
+            entry_object,
+            "captured_at_unix",
+            "phase9 evidence artifact entry",
+        )?;
+        let captured_at = i64::try_from(captured_at_unix)
+            .map_err(|_| format!("phase9 evidence captured_at_unix out of range for {name}"))?;
+        if captured_at > now_unix + 300 {
+            return Err(format!(
+                "phase9 evidence captured_at_unix is in the future for {name}"
+            ));
+        }
+        if now_unix - captured_at > inputs.max_attestation_age_seconds {
+            return Err(format!(
+                "phase9 evidence captured_at_unix is stale for {name}"
+            ));
+        }
+
+        let label = format!("phase9 evidence artifact {name}");
+        let (artifact_captured_at, artifact_environment) = phase9_parse_measured_artifact_document(
+            Path::new(artifact_path.as_str()),
+            label.as_str(),
+        )?;
+        if artifact_captured_at != captured_at_unix {
+            return Err(format!(
+                "phase9 evidence captured_at_unix mismatch for {name}"
+            ));
+        }
+        if artifact_environment != environment {
+            return Err(format!("phase9 evidence environment mismatch for {name}"));
+        }
+
+        observed_entries.insert(
+            name.clone(),
+            Phase9EvidenceArtifactEntry {
+                name,
+                artifact_path,
+                artifact_sha256,
+                captured_at_unix,
+            },
+        );
+    }
+
+    if seen.len() != PHASE9_REQUIRED_ARTIFACTS.len() {
+        return Err("phase9 evidence attestation missing required artifacts".to_string());
+    }
+
+    let mut ordered_entries = Vec::with_capacity(PHASE9_REQUIRED_ARTIFACTS.len());
+    for required_name in PHASE9_REQUIRED_ARTIFACTS {
+        let Some(entry) = observed_entries.remove(*required_name) else {
+            return Err(format!(
+                "phase9 evidence attestation missing required artifact: {required_name}"
+            ));
+        };
+        ordered_entries.push(entry);
+    }
+    if !observed_entries.is_empty() {
+        return Err("phase9 evidence attestation contains unexpected artifacts".to_string());
+    }
+
+    let signature_hex =
+        object_string_field(&attestation, "signature_hex", "phase9 evidence attestation")?;
+    let signature_bytes = decode_hex_to_fixed::<64>(signature_hex.as_str())
+        .map_err(|err| format!("phase9 evidence signature parse failed: {err}"))?;
+    let payload = phase9_evidence_attestation_payload(&Phase9EvidenceAttestationPayload {
+        generated_at_unix,
+        host_identity: host_identity.as_str(),
+        command_digest_sha256: command_digest.as_str(),
+        signer_key_id: signer_key_id.as_str(),
+        verifier_key_hex: verifier_key_hex.as_str(),
+        git_commit: git_commit.as_str(),
+        environment: environment.as_str(),
+        artifacts: ordered_entries.as_slice(),
+    });
+    let signature = Signature::from_bytes(&signature_bytes);
+    inputs
+        .verifier_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| "phase9 evidence signature verification failed".to_string())?;
+    Ok(())
+}
+
+fn write_phase9_evidence_attestation(out_dir: &Path, environment: &str) -> Result<PathBuf, String> {
+    ensure_release_provenance_keypair_exists()?;
+    let signing_key = load_release_signing_key()?;
+    let verifier_key = load_release_verifier_key()?;
+    let derived_verifier_key = signing_key.verifying_key();
+    if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
+        return Err(
+            "phase9 evidence key mismatch: signing key does not match verifier key".to_string(),
+        );
+    }
+
+    let generated_at_unix = unix_now();
+    let host_identity = release_host_identity_from_env_or_default()?;
+    let git_commit = current_git_commit()?;
+    let attestation_document =
+        build_phase9_evidence_attestation_document(&Phase9EvidenceAttestationBuildInputs {
+            out_dir,
+            environment,
+            generated_at_unix,
+            host_identity: host_identity.as_str(),
+            git_commit: git_commit.as_str(),
+            signing_key: &signing_key,
+            verifier_key: &verifier_key,
+        })?;
+    let attestation_path = phase9_evidence_attestation_path_from_env_or_default()?;
+    write_json_secure(attestation_path.as_path(), &attestation_document)?;
+    Ok(attestation_path)
+}
+
+pub fn write_phase6_parity_evidence_attestation(report_path: &Path) -> Result<(), String> {
+    ensure_release_provenance_keypair_exists()?;
+    let signing_key = load_release_signing_key()?;
+    let verifier_key = load_release_verifier_key()?;
+    let derived_verifier_key = signing_key.verifying_key();
+    if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
+        return Err(
+            "phase6 parity key mismatch: signing key does not match verifier key".to_string(),
+        );
+    }
+
+    let generated_at_unix = unix_now();
+    let host_identity = release_host_identity_from_env_or_default()?;
+    let git_commit = current_git_commit()?;
+    let attestation_document =
+        build_phase6_parity_attestation_document(&Phase6ParityAttestationBuildInputs {
+            report_path,
+            generated_at_unix,
+            host_identity: host_identity.as_str(),
+            git_commit: git_commit.as_str(),
+            signing_key: &signing_key,
+            verifier_key: &verifier_key,
+        })?;
+    let attestation_path = phase6_parity_attestation_path_from_env_or_default()?;
+    write_json_secure(attestation_path.as_path(), &attestation_document)
+}
+
+pub fn execute_ops_verify_phase6_parity_evidence() -> Result<String, String> {
+    let report_path = phase6_parity_report_path_from_env_or_default()?;
+    let attestation_path = phase6_parity_attestation_path_from_env_or_default()?;
+    let host_identity = release_host_identity_from_env_or_default()?;
+    let verifier_key = load_release_verifier_key()?;
+    let git_commit = current_git_commit()?;
+    verify_phase6_parity_attestation_document(&Phase6ParityAttestationVerifyInputs {
+        attestation_path: attestation_path.as_path(),
+        expected_report_path: report_path.as_path(),
+        expected_host_identity: host_identity.as_str(),
+        expected_git_commit: git_commit.as_str(),
+        verifier_key: &verifier_key,
+        max_attestation_age_seconds: phase6_parity_attestation_max_age_seconds_from_env()?,
+    })?;
+    Ok(format!(
+        "phase6 parity evidence verification passed: report={} attestation={}",
+        report_path.display(),
+        attestation_path.display()
+    ))
+}
+
+pub fn execute_ops_verify_phase9_evidence() -> Result<String, String> {
+    let out_dir = path_from_env_or_default("RUSTYNET_PHASE9_OUT_DIR", DEFAULT_PHASE9_OUT_DIR)?;
+    let attestation_path = phase9_evidence_attestation_path_from_env_or_default()?;
+    let host_identity = release_host_identity_from_env_or_default()?;
+    let verifier_key = load_release_verifier_key()?;
+    let git_commit = current_git_commit()?;
+    verify_phase9_evidence_attestation_document(&Phase9EvidenceAttestationVerifyInputs {
+        attestation_path: attestation_path.as_path(),
+        expected_out_dir: out_dir.as_path(),
+        expected_host_identity: host_identity.as_str(),
+        expected_git_commit: git_commit.as_str(),
+        verifier_key: &verifier_key,
+        max_attestation_age_seconds: phase9_evidence_attestation_max_age_seconds_from_env()?,
+    })?;
+    Ok(format!(
+        "phase9 evidence verification passed: out_dir={} attestation={}",
+        out_dir.display(),
+        attestation_path.display()
+    ))
+}
+
 pub fn execute_ops_generate_phase9_artifacts() -> Result<String, String> {
     let raw_dir = path_from_env_or_default("RUSTYNET_PHASE9_RAW_DIR", DEFAULT_PHASE9_RAW_DIR)?;
     let out_dir = path_from_env_or_default("RUSTYNET_PHASE9_OUT_DIR", DEFAULT_PHASE9_OUT_DIR)?;
@@ -1861,6 +3195,7 @@ pub fn execute_ops_generate_phase9_artifacts() -> Result<String, String> {
         write_json_secure(target.as_path(), &Value::Object(document))?;
     }
 
+    write_phase9_evidence_attestation(out_dir.as_path(), environment.as_str())?;
     run_check_script(
         "./scripts/ci/check_phase9_readiness.sh",
         "phase9 readiness check",
@@ -2017,12 +3352,11 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
 
     let state_source = source_dir.join("state_transition_audit.log");
     ensure_regular_file(state_source.as_path(), "raw phase10 evidence source")?;
-    let state_body = fs::read_to_string(state_source.as_path()).map_err(|err| {
-        format!(
-            "read phase10 state transition source failed ({}): {err}",
-            state_source.display()
-        )
-    })?;
+    let state_body = read_utf8_regular_file_with_max_bytes(
+        state_source.as_path(),
+        "phase10 state transition source",
+        MAX_PHASE10_STATE_LOG_SOURCE_BYTES,
+    )?;
     if !contains_generation_marker(state_body.as_str()) {
         return Err(format!(
             "state_transition_audit.log source missing generation entries: {}",
@@ -2086,18 +3420,106 @@ pub fn execute_ops_verify_phase10_provenance() -> Result<String, String> {
     ))
 }
 
+pub fn execute_ops_sign_release_artifact() -> Result<String, String> {
+    let artifact_path = release_artifact_path_from_env_or_default()?;
+    let sbom_path = release_sbom_path_from_env_or_default()?;
+    let sbom_digest_path = release_sbom_sha256_path_from_env_or_default()?;
+    let provenance_path = release_provenance_path_from_env_or_default()?;
+    let release_track = release_track_from_env_or_default()?;
+    let host_identity = release_host_identity_from_env_or_default()?;
+
+    ensure_release_provenance_keypair_exists()?;
+    let signing_key = load_release_signing_key()?;
+    let verifier_key = load_release_verifier_key()?;
+    let derived_verifier_key = signing_key.verifying_key();
+    if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
+        return Err(
+            "release provenance key mismatch: signing key does not match verifier key".to_string(),
+        );
+    }
+
+    let generated_at_unix = unix_now();
+    let provenance = build_release_provenance_document(&ReleaseProvenanceBuildInputs {
+        artifact_path: artifact_path.as_path(),
+        sbom_path: sbom_path.as_path(),
+        sbom_digest_path: sbom_digest_path.as_path(),
+        generated_at_unix,
+        host_identity: host_identity.as_str(),
+        release_track: release_track.as_str(),
+        signing_key: &signing_key,
+        verifier_key: &verifier_key,
+    })?;
+    write_json_secure(provenance_path.as_path(), &provenance)?;
+
+    verify_release_provenance_document(&ReleaseProvenanceVerifyInputs {
+        provenance_path: provenance_path.as_path(),
+        expected_artifact_path: artifact_path.as_path(),
+        expected_sbom_path: sbom_path.as_path(),
+        expected_sbom_digest_path: sbom_digest_path.as_path(),
+        expected_host_identity: host_identity.as_str(),
+        expected_release_track: release_track.as_str(),
+        verifier_key: &verifier_key,
+        max_provenance_age_seconds: release_max_provenance_age_seconds_from_env()?,
+    })?;
+
+    Ok(format!(
+        "release provenance signed and verified: artifact={} sbom={} provenance={} release_track={}",
+        artifact_path.display(),
+        sbom_path.display(),
+        provenance_path.display(),
+        release_track
+    ))
+}
+
+pub fn execute_ops_verify_release_artifact() -> Result<String, String> {
+    let artifact_path = release_artifact_path_from_env_or_default()?;
+    let sbom_path = release_sbom_path_from_env_or_default()?;
+    let sbom_digest_path = release_sbom_sha256_path_from_env_or_default()?;
+    let provenance_path = release_provenance_path_from_env_or_default()?;
+    let release_track = release_track_from_env_or_default()?;
+    let host_identity = release_host_identity_from_env_or_default()?;
+    let verifier_key = load_release_verifier_key()?;
+
+    verify_release_provenance_document(&ReleaseProvenanceVerifyInputs {
+        provenance_path: provenance_path.as_path(),
+        expected_artifact_path: artifact_path.as_path(),
+        expected_sbom_path: sbom_path.as_path(),
+        expected_sbom_digest_path: sbom_digest_path.as_path(),
+        expected_host_identity: host_identity.as_str(),
+        expected_release_track: release_track.as_str(),
+        verifier_key: &verifier_key,
+        max_provenance_age_seconds: release_max_provenance_age_seconds_from_env()?,
+    })?;
+
+    Ok(format!(
+        "release provenance verification passed: artifact={} provenance={}",
+        artifact_path.display(),
+        provenance_path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use ed25519_dalek::SigningKey;
+    use serde_json::json;
 
     use super::{
-        contains_generation_marker, decode_hex_to_fixed, hex_encode, load_key_hex_from_secure_path,
-        validate_phase10_host_identity, write_phase10_provenance_keypair,
+        MAX_PHASE10_JSON_SOURCE_BYTES, PHASE9_REQUIRED_ARTIFACTS,
+        Phase6ParityAttestationBuildInputs, Phase6ParityAttestationVerifyInputs,
+        Phase9EvidenceAttestationBuildInputs, Phase9EvidenceAttestationVerifyInputs,
+        ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
+        build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
+        build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
+        hex_encode, load_key_hex_from_secure_path, read_json_object,
+        read_utf8_regular_file_with_max_bytes, sha256_hex, validate_phase10_host_identity,
+        verify_phase6_parity_attestation_document, verify_phase9_evidence_attestation_document,
+        verify_release_provenance_document, write_phase10_provenance_keypair,
     };
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn generation_marker_parser_accepts_valid_tokens() {
@@ -2121,6 +3543,58 @@ mod tests {
         assert!(validate_phase10_host_identity("prod#host").is_err());
         let oversized = "a".repeat(129);
         assert!(validate_phase10_host_identity(oversized.as_str()).is_err());
+    }
+
+    #[test]
+    fn read_json_object_rejects_oversized_source() {
+        let unique = format!(
+            "ops-phase10-source-size-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(temp_dir.as_path()).expect("temp directory should be creatable");
+        let oversized_json_path = temp_dir.join("oversized.json");
+        let oversized = vec![b' '; (MAX_PHASE10_JSON_SOURCE_BYTES as usize) + 1];
+        fs::write(oversized_json_path.as_path(), oversized).expect("oversized file should write");
+
+        let err = read_json_object(oversized_json_path.as_path(), "phase10 test source")
+            .expect_err("oversized source must be rejected");
+        assert!(err.contains("exceeds maximum size"));
+
+        fs::remove_file(oversized_json_path.as_path()).expect("remove oversized source file");
+        fs::remove_dir(temp_dir.as_path()).expect("remove temp directory");
+    }
+
+    #[test]
+    fn read_utf8_regular_file_with_max_bytes_rejects_oversized_source() {
+        let unique = format!(
+            "ops-phase10-source-size-limit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(temp_dir.as_path()).expect("temp directory should be creatable");
+        let oversized_text_path = temp_dir.join("oversized.log");
+        fs::write(oversized_text_path.as_path(), vec![b'x'; 257])
+            .expect("oversized state source should write");
+
+        let err = read_utf8_regular_file_with_max_bytes(
+            oversized_text_path.as_path(),
+            "phase10 state transition source",
+            256,
+        )
+        .expect_err("oversized text source must be rejected");
+        assert!(err.contains("exceeds maximum size"));
+
+        fs::remove_file(oversized_text_path.as_path()).expect("remove oversized source file");
+        fs::remove_dir(temp_dir.as_path()).expect("remove temp directory");
     }
 
     #[test]
@@ -2211,5 +3685,335 @@ mod tests {
         fs::set_permissions(key_dir.as_path(), fs::Permissions::from_mode(0o700))
             .expect("set key directory mode for cleanup");
         fs::remove_dir(key_dir.as_path()).expect("remove key directory");
+    }
+
+    #[test]
+    fn release_provenance_verification_rejects_tampered_artifact() {
+        let unique = format!(
+            "ops-release-provenance-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(root_dir.as_path()).expect("create temp root");
+
+        let artifact_path = root_dir.join("rustynetd");
+        let sbom_path = root_dir.join("sbom.cargo-metadata.json");
+        let sbom_digest_path = root_dir.join("sbom.sha256");
+        let provenance_path = root_dir.join("rustynetd.provenance.json");
+
+        fs::write(artifact_path.as_path(), b"binary-content-v1").expect("write artifact");
+        fs::write(
+            sbom_path.as_path(),
+            br#"{"name":"rustynet","version":"0.1.0"}"#,
+        )
+        .expect("write sbom");
+        let sbom_digest = sha256_hex(fs::read(sbom_path.as_path()).expect("read sbom").as_slice());
+        fs::write(sbom_digest_path.as_path(), format!("{sbom_digest}\n"))
+            .expect("write sbom digest");
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifier_key = signing_key.verifying_key();
+        let generated_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let provenance = build_release_provenance_document(&ReleaseProvenanceBuildInputs {
+            artifact_path: artifact_path.as_path(),
+            sbom_path: sbom_path.as_path(),
+            sbom_digest_path: sbom_digest_path.as_path(),
+            generated_at_unix,
+            host_identity: "ci-localhost",
+            release_track: "beta",
+            signing_key: &signing_key,
+            verifier_key: &verifier_key,
+        })
+        .expect("build release provenance");
+        let mut payload = serde_json::to_string_pretty(&provenance).expect("serialize provenance");
+        payload.push('\n');
+        fs::write(provenance_path.as_path(), payload.as_bytes()).expect("write provenance");
+
+        verify_release_provenance_document(&ReleaseProvenanceVerifyInputs {
+            provenance_path: provenance_path.as_path(),
+            expected_artifact_path: artifact_path.as_path(),
+            expected_sbom_path: sbom_path.as_path(),
+            expected_sbom_digest_path: sbom_digest_path.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_release_track: "beta",
+            verifier_key: &verifier_key,
+            max_provenance_age_seconds: 3600,
+        })
+        .expect("baseline provenance verify");
+
+        let mut artifact_handle = fs::OpenOptions::new()
+            .append(true)
+            .open(artifact_path.as_path())
+            .expect("reopen artifact for tamper");
+        artifact_handle
+            .write_all(b"tamper")
+            .expect("tamper write should succeed");
+        artifact_handle.sync_all().expect("sync tampered artifact");
+
+        let err = verify_release_provenance_document(&ReleaseProvenanceVerifyInputs {
+            provenance_path: provenance_path.as_path(),
+            expected_artifact_path: artifact_path.as_path(),
+            expected_sbom_path: sbom_path.as_path(),
+            expected_sbom_digest_path: sbom_digest_path.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_release_track: "beta",
+            verifier_key: &verifier_key,
+            max_provenance_age_seconds: 3600,
+        })
+        .expect_err("tampered artifact must fail verification");
+        assert!(err.contains("artifact digest mismatch"));
+
+        fs::remove_file(provenance_path.as_path()).expect("remove provenance");
+        fs::remove_file(sbom_digest_path.as_path()).expect("remove sbom digest");
+        fs::remove_file(sbom_path.as_path()).expect("remove sbom");
+        fs::remove_file(artifact_path.as_path()).expect("remove artifact");
+        fs::remove_dir(root_dir.as_path()).expect("remove temp root");
+    }
+
+    #[test]
+    fn release_provenance_verification_rejects_unsigned_document() {
+        let unique = format!(
+            "ops-release-provenance-unsigned-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(root_dir.as_path()).expect("create temp root");
+
+        let artifact_path = root_dir.join("rustynetd");
+        let sbom_path = root_dir.join("sbom.cargo-metadata.json");
+        let sbom_digest_path = root_dir.join("sbom.sha256");
+        let provenance_path = root_dir.join("rustynetd.provenance.json");
+
+        fs::write(artifact_path.as_path(), b"binary-content-v1").expect("write artifact");
+        fs::write(
+            sbom_path.as_path(),
+            br#"{"name":"rustynet","version":"0.1.0"}"#,
+        )
+        .expect("write sbom");
+        let sbom_digest = sha256_hex(fs::read(sbom_path.as_path()).expect("read sbom").as_slice());
+        fs::write(sbom_digest_path.as_path(), format!("{sbom_digest}\n"))
+            .expect("write sbom digest");
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_key = signing_key.verifying_key();
+        let generated_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let mut provenance = build_release_provenance_document(&ReleaseProvenanceBuildInputs {
+            artifact_path: artifact_path.as_path(),
+            sbom_path: sbom_path.as_path(),
+            sbom_digest_path: sbom_digest_path.as_path(),
+            generated_at_unix,
+            host_identity: "ci-localhost",
+            release_track: "beta",
+            signing_key: &signing_key,
+            verifier_key: &verifier_key,
+        })
+        .expect("build release provenance");
+        let object = provenance
+            .as_object_mut()
+            .expect("release provenance should be object");
+        object.remove("signature_hex");
+        let mut serialized =
+            serde_json::to_string_pretty(&provenance).expect("serialize unsigned provenance");
+        serialized.push('\n');
+        fs::write(provenance_path.as_path(), serialized.as_bytes()).expect("write provenance");
+
+        let err = verify_release_provenance_document(&ReleaseProvenanceVerifyInputs {
+            provenance_path: provenance_path.as_path(),
+            expected_artifact_path: artifact_path.as_path(),
+            expected_sbom_path: sbom_path.as_path(),
+            expected_sbom_digest_path: sbom_digest_path.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_release_track: "beta",
+            verifier_key: &verifier_key,
+            max_provenance_age_seconds: 3600,
+        })
+        .expect_err("unsigned provenance must fail verification");
+        assert!(err.contains("missing non-empty string field: signature_hex"));
+
+        fs::remove_file(provenance_path.as_path()).expect("remove provenance");
+        fs::remove_file(sbom_digest_path.as_path()).expect("remove sbom digest");
+        fs::remove_file(sbom_path.as_path()).expect("remove sbom");
+        fs::remove_file(artifact_path.as_path()).expect("remove artifact");
+        fs::remove_dir(root_dir.as_path()).expect("remove temp root");
+    }
+
+    #[test]
+    fn phase6_parity_attestation_verification_rejects_tampered_report() {
+        let unique = format!(
+            "ops-phase6-attestation-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(root_dir.as_path()).expect("create temp root");
+
+        let source_path = root_dir.join("probe-source.json");
+        fs::write(source_path.as_path(), br#"{"probe":"ok"}"#).expect("write source");
+        let report_path = root_dir.join("platform_parity_report.json");
+        let captured_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let report = json!({
+            "evidence_mode": "measured",
+            "captured_at_unix": captured_at_unix,
+            "environment": "ci",
+            "source_artifacts": [source_path.display().to_string()],
+        });
+        let mut report_body = serde_json::to_string_pretty(&report).expect("serialize report");
+        report_body.push('\n');
+        fs::write(report_path.as_path(), report_body.as_bytes()).expect("write report");
+
+        let attestation_path = root_dir.join("platform_parity_report.attestation.json");
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let verifier_key = signing_key.verifying_key();
+        let attestation =
+            build_phase6_parity_attestation_document(&Phase6ParityAttestationBuildInputs {
+                report_path: report_path.as_path(),
+                generated_at_unix: captured_at_unix,
+                host_identity: "ci-localhost",
+                git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                signing_key: &signing_key,
+                verifier_key: &verifier_key,
+            })
+            .expect("build phase6 attestation");
+        let mut attestation_body =
+            serde_json::to_string_pretty(&attestation).expect("serialize attestation");
+        attestation_body.push('\n');
+        fs::write(attestation_path.as_path(), attestation_body.as_bytes())
+            .expect("write phase6 attestation");
+
+        verify_phase6_parity_attestation_document(&Phase6ParityAttestationVerifyInputs {
+            attestation_path: attestation_path.as_path(),
+            expected_report_path: report_path.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            verifier_key: &verifier_key,
+            max_attestation_age_seconds: 3600,
+        })
+        .expect("baseline phase6 attestation verify");
+
+        fs::write(
+            report_path.as_path(),
+            br#"{"evidence_mode":"measured","captured_at_unix":1,"environment":"ci","source_artifacts":["tampered"]}"#,
+        )
+        .expect("tamper report");
+
+        let err = verify_phase6_parity_attestation_document(&Phase6ParityAttestationVerifyInputs {
+            attestation_path: attestation_path.as_path(),
+            expected_report_path: report_path.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_git_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            verifier_key: &verifier_key,
+            max_attestation_age_seconds: 3600,
+        })
+        .expect_err("tampered phase6 report must fail verification");
+        assert!(err.contains("report digest mismatch"));
+
+        fs::remove_file(attestation_path.as_path()).expect("remove attestation");
+        fs::remove_file(report_path.as_path()).expect("remove report");
+        fs::remove_file(source_path.as_path()).expect("remove source");
+        fs::remove_dir(root_dir.as_path()).expect("remove temp root");
+    }
+
+    #[test]
+    fn phase9_evidence_attestation_verification_rejects_git_commit_mismatch() {
+        let unique = format!(
+            "ops-phase9-attestation-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join(unique);
+        let out_dir = root_dir.join("operations");
+        fs::create_dir_all(out_dir.as_path()).expect("create phase9 output directory");
+        let source_path = root_dir.join("source.log");
+        fs::write(source_path.as_path(), b"source").expect("write source");
+        let captured_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+
+        for artifact in PHASE9_REQUIRED_ARTIFACTS {
+            let payload = json!({
+                "evidence_mode": "measured",
+                "captured_at_unix": captured_at_unix,
+                "environment": "ci",
+                "source_artifacts": [source_path.display().to_string()],
+            });
+            let mut body =
+                serde_json::to_string_pretty(&payload).expect("serialize phase9 artifact payload");
+            body.push('\n');
+            fs::write(out_dir.join(artifact), body.as_bytes()).expect("write phase9 artifact");
+        }
+
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let verifier_key = signing_key.verifying_key();
+        let attestation =
+            build_phase9_evidence_attestation_document(&Phase9EvidenceAttestationBuildInputs {
+                out_dir: out_dir.as_path(),
+                environment: "ci",
+                generated_at_unix: captured_at_unix,
+                host_identity: "ci-localhost",
+                git_commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                signing_key: &signing_key,
+                verifier_key: &verifier_key,
+            })
+            .expect("build phase9 evidence attestation");
+        let attestation_path = out_dir.join("phase9_evidence.attestation.json");
+        let mut attestation_body =
+            serde_json::to_string_pretty(&attestation).expect("serialize phase9 attestation");
+        attestation_body.push('\n');
+        fs::write(attestation_path.as_path(), attestation_body.as_bytes())
+            .expect("write phase9 attestation");
+
+        verify_phase9_evidence_attestation_document(&Phase9EvidenceAttestationVerifyInputs {
+            attestation_path: attestation_path.as_path(),
+            expected_out_dir: out_dir.as_path(),
+            expected_host_identity: "ci-localhost",
+            expected_git_commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            verifier_key: &verifier_key,
+            max_attestation_age_seconds: 3600,
+        })
+        .expect("baseline phase9 verify");
+
+        let err =
+            verify_phase9_evidence_attestation_document(&Phase9EvidenceAttestationVerifyInputs {
+                attestation_path: attestation_path.as_path(),
+                expected_out_dir: out_dir.as_path(),
+                expected_host_identity: "ci-localhost",
+                expected_git_commit: "cccccccccccccccccccccccccccccccccccccccc",
+                verifier_key: &verifier_key,
+                max_attestation_age_seconds: 3600,
+            })
+            .expect_err("phase9 verify must fail on commit mismatch");
+        assert!(err.contains("git commit mismatch"));
+
+        fs::remove_file(attestation_path.as_path()).expect("remove phase9 attestation");
+        for artifact in PHASE9_REQUIRED_ARTIFACTS {
+            fs::remove_file(out_dir.join(artifact)).expect("remove phase9 artifact");
+        }
+        fs::remove_file(source_path.as_path()).expect("remove source");
+        fs::remove_dir(out_dir.as_path()).expect("remove operations directory");
+        fs::remove_dir(root_dir.as_path()).expect("remove temp root");
     }
 }

@@ -1101,7 +1101,14 @@ impl fmt::Display for PrivilegedCommandProgram {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivilegedCommandProgram, is_nft_token, is_safe_token, validate_request};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use super::{
+        HelperRequest, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
+        handle_request, is_nft_token, is_safe_token, read_request, validate_request,
+    };
 
     #[test]
     fn privileged_program_parser_rejects_unknown() {
@@ -1194,5 +1201,185 @@ mod tests {
         )
         .expect_err("unknown nft rule schema should be rejected");
         assert!(err.contains("unsupported nft add rule argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_too_many_arguments() {
+        let args = vec!["x"; MAX_ARGS + 1];
+        let err = validate_request(PrivilegedCommandProgram::Ip, args.as_slice())
+            .expect_err("argument-count overflow must be rejected");
+        assert!(err.contains("too many arguments"));
+    }
+
+    #[test]
+    fn validate_request_rejects_argument_over_max_bytes() {
+        let oversized = "a".repeat(MAX_ARG_BYTES + 1);
+        let args = vec![oversized.as_str()];
+        let err = validate_request(PrivilegedCommandProgram::Ip, args.as_slice())
+            .expect_err("oversized argument must be rejected");
+        assert!(err.contains("argument too long"));
+    }
+
+    #[test]
+    fn fuzzgate_read_request_rejects_oversized_payload() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let mut payload = vec![b'a'; MAX_MESSAGE_BYTES];
+        payload.push(b'\n');
+        let writer = std::thread::spawn(move || {
+            client_stream
+                .write_all(&payload)
+                .expect("oversized payload should be written");
+        });
+
+        let err = read_request(&mut server_stream)
+            .expect_err("oversized privileged helper request must be rejected");
+        writer.join().expect("writer thread should complete");
+        assert!(err.contains("request exceeds maximum size"));
+    }
+
+    #[test]
+    fn fuzzgate_rejects_unknown_tokens_and_shell_metacharacters() {
+        let unknown_program = handle_request(HelperRequest {
+            program: "not-a-real-program".to_string(),
+            args: vec!["--version".to_string()],
+        });
+        assert!(!unknown_program.ok);
+        assert_eq!(unknown_program.status, None);
+        assert!(unknown_program.error.is_some());
+        assert!(
+            unknown_program
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported privileged command program")
+        );
+
+        let shell_like_tokens = [
+            "$(id)",
+            "`id`",
+            "a|b",
+            "a;b",
+            "a&&b",
+            "a||b",
+            "contains space",
+            "$HOME",
+            ">out",
+            "<in",
+        ];
+
+        for token in shell_like_tokens {
+            let ip_err = validate_request(
+                PrivilegedCommandProgram::Ip,
+                &["link", "set", "up", "dev", token],
+            )
+            .expect_err("ip schema should reject shell-like token");
+            assert!(ip_err.contains("unsupported ip argument schema"));
+
+            let wg_err = validate_request(
+                PrivilegedCommandProgram::Wg,
+                &["set", "rustynet0", "peer", token, "remove"],
+            )
+            .expect_err("wg schema should reject shell-like token");
+            assert!(wg_err.contains("unsupported wg argument schema"));
+
+            let pf_err = validate_request(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", token, "-s", "rules"],
+            )
+            .expect_err("pfctl schema should reject shell-like token");
+            assert!(
+                pf_err.contains("unsupported pfctl token")
+                    || pf_err.contains("unsupported pfctl argument schema")
+            );
+        }
+    }
+
+    #[test]
+    fn fuzzgate_malformed_inputs_never_panic() {
+        let malformed_payloads: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"{\n",
+            b"{\"program\":1}\n",
+            b"{\"program\":\"ip\",\"args\":\"not-an-array\"}\n",
+            b"{\"program\":\"ip\",\"args\":[\"link\",null]}\n",
+            b"{\"program\":\"ip\",\"args\":[\"link\",\"set\",\"up\",\"dev\",\"$(id)\"]}\n",
+            b"{\"program\":\"not-real\",\"args\":[\"--version\"]}\n",
+            b"{\"program\":\"ip\",\"args\":[]}\n",
+        ];
+
+        for payload in malformed_payloads {
+            let (mut server_stream, mut client_stream) =
+                UnixStream::pair().expect("unix stream pair should be created");
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("read timeout should be set");
+            client_stream
+                .write_all(payload)
+                .expect("malformed payload should be written");
+            drop(client_stream);
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_request(&mut server_stream)
+            }));
+            assert!(
+                outcome.is_ok(),
+                "read_request panicked on malformed payload"
+            );
+        }
+
+        let malformed_requests = vec![
+            HelperRequest {
+                program: String::new(),
+                args: vec![],
+            },
+            HelperRequest {
+                program: "not-real".to_string(),
+                args: vec!["--version".to_string()],
+            },
+            HelperRequest {
+                program: "ip".to_string(),
+                args: vec![],
+            },
+            HelperRequest {
+                program: "ip".to_string(),
+                args: vec![
+                    "route".to_string(),
+                    "replace".to_string(),
+                    "0.0.0.0/0".to_string(),
+                    "via".to_string(),
+                    "203.0.113.1".to_string(),
+                ],
+            },
+            HelperRequest {
+                program: "nft".to_string(),
+                args: vec![
+                    "list".to_string(),
+                    "table".to_string(),
+                    "inet".to_string(),
+                    "$(id)".to_string(),
+                ],
+            },
+            HelperRequest {
+                program: "kill".to_string(),
+                args: vec!["-TERM".to_string(), "1".to_string()],
+            },
+        ];
+
+        for request in malformed_requests {
+            let outcome = std::panic::catch_unwind(|| handle_request(request.clone()));
+            assert!(
+                outcome.is_ok(),
+                "handle_request panicked for malformed input"
+            );
+            let response = outcome.expect("panic already asserted absent");
+            assert!(!response.ok);
+            assert!(response.error.is_some());
+        }
     }
 }

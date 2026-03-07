@@ -105,9 +105,9 @@ fi
 
 ./scripts/ci/check_backend_boundary_leakage.sh
 
-cargo test -p rustynet-control membership::tests --all-features
-cargo test -p rustynet-policy membership_aware --all-features
-cargo test -p rustynetd daemon_runtime_denies_exit_selection_for_revoked_membership_node --all-features
+./scripts/ci/run_required_test.sh rustynet-control membership::tests --all-features
+./scripts/ci/run_required_test.sh rustynet-policy membership_aware --all-features
+./scripts/ci/run_required_test.sh rustynetd daemon_runtime_denies_exit_selection_for_revoked_membership_node --all-features
 
 MEMBERSHIP_SNAPSHOT_PATH="${RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH:-/var/lib/rustynet/membership.snapshot}"
 MEMBERSHIP_LOG_PATH="${RUSTYNET_MEMBERSHIP_LOG_PATH:-/var/lib/rustynet/membership.log}"

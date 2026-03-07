@@ -12,16 +12,11 @@ Generate required Phase 1 baseline measured inputs from measured evidence:
 ./scripts/perf/collect_phase1_measured_env.sh
 ```
 
-Supported measured sources (checked in order unless overridden):
-- `artifacts/perf/phase1/source/performance_samples.ndjson`
-- `artifacts/operations/source/performance_samples.ndjson`
-- `artifacts/operations/performance_budget_report.json`
-- `artifacts/phase10/perf_budget_report.json`
-- `artifacts/operations/raw/performance_budget_report.json`
-
-Repository bootstrap source:
-- `artifacts/perf/phase1/source/performance_samples.ndjson` is populated so fresh workspaces do not fail immediately on missing measured source resolution.
-- Treat this as seed evidence and replace/refresh it with your current environment measurements before release sign-off.
+Measured source requirement:
+- `RUSTYNET_PHASE1_PERF_SAMPLES_PATH` must resolve to a concrete measured source file.
+- default path is `artifacts/perf/phase1/source/performance_samples.ndjson`.
+- source discovery fallback chain is removed from the active Phase 1 gate path.
+- missing source files fail closed.
 
 Override source explicitly:
 ```bash
@@ -38,8 +33,8 @@ Then run baseline:
 ./scripts/perf/run_phase1_baseline.sh
 ```
 
-`run_phase1_baseline.sh` auto-invokes the collector (fail-closed) when required
-`RUSTYNET_PHASE1_*` vars are missing.
+`run_phase1_baseline.sh` now requires a measured source path and exports
+`RUSTYNET_PHASE1_PERF_SAMPLES_PATH` into the Rust command path directly.
 
 Security hardening note:
 - legacy shell `source` ingestion of generated phase1 env scripts has been removed from the active baseline path.
@@ -84,10 +79,12 @@ Each raw file must be a JSON object with boolean fields:
 ```bash
 RUSTYNET_PHASE6_PARITY_ENVIRONMENT=lab \
 ./scripts/release/generate_platform_parity_report.sh
+cargo run --quiet -p rustynet-cli -- ops verify-phase6-parity-evidence
 ```
 
 Generated artifact:
 - `artifacts/release/platform_parity_report.json`
+- `artifacts/release/platform_parity_report.attestation.json`
 
 ## Phase 9: Operational Readiness Reports
 
@@ -149,6 +146,7 @@ Then generate measured phase9 artifacts:
 ```bash
 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase9_artifacts.sh
+cargo run --quiet -p rustynet-cli -- ops verify-phase9-evidence
 ```
 
 The script is a thin wrapper over:
@@ -173,6 +171,7 @@ Generated artifacts:
 - `artifacts/operations/dr_failover_report.json`
 - `artifacts/operations/backend_agility_report.json`
 - `artifacts/operations/crypto_deprecation_schedule.json`
+- `artifacts/operations/phase9_evidence.attestation.json`
 
 ## Phase 10: Dataplane Readiness Reports
 

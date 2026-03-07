@@ -693,16 +693,19 @@ impl LinuxCommandSystem {
     }
 
     fn ensure_failclosed_table(&mut self) -> Result<String, SystemError> {
-        if let Some(table) = self.firewall_table.clone() {
+        let target_table = self.firewall_table_name();
+        if let Some(table) = self.firewall_table.clone()
+            && table == target_table
+        {
             if self.killswitch_chain_exists(table.as_str())? {
                 return Ok(table);
             }
-            // A prior generation table can be pruned before fail-closed recovery runs.
-            // Drop stale state so we can recreate a valid fail-closed table/chain.
+            // The expected generation table exists in state but is missing its
+            // fail-closed chain on host. Recreate this generation table.
             self.firewall_table = None;
         }
 
-        let table = self.firewall_table_name();
+        let table = target_table;
         self.run_allow_failure(
             PrivilegedCommandProgram::Nft,
             &["delete", "table", "inet", table.as_str()],
@@ -830,15 +833,31 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
-        let keep_firewall = self.firewall_table_name();
-        let keep_nat = self.nat_table_name();
+        let keep_firewall_target = self.firewall_table_name();
+        let keep_nat_target = self.nat_table_name();
+        let keep_firewall_active = self.firewall_table.clone();
+        let keep_nat_active = self.nat_table.clone();
         for (family, table) in self.list_tables()? {
             let is_owned = (family == "inet" && table.starts_with("rustynet_g"))
                 || (family == "ip" && table.starts_with("rustynet_nat_g"));
             if !is_owned {
                 continue;
             }
-            if (family == "inet" && table == keep_firewall) || (family == "ip" && table == keep_nat)
+            if family == "inet"
+                && (table == keep_firewall_target
+                    || keep_firewall_active
+                        .as_deref()
+                        .map(|active| active == table.as_str())
+                        .unwrap_or(false))
+            {
+                continue;
+            }
+            if family == "ip"
+                && (table == keep_nat_target
+                    || keep_nat_active
+                        .as_deref()
+                        .map(|active| active == table.as_str())
+                        .unwrap_or(false))
             {
                 continue;
             }
@@ -918,12 +937,7 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
-        if let Some(previous) = self.firewall_table.take() {
-            self.run_allow_failure(
-                PrivilegedCommandProgram::Nft,
-                &["delete", "table", "inet", previous.as_str()],
-            );
-        }
+        let previous_table = self.firewall_table.clone();
         let table = self.ensure_failclosed_table()?;
         self.run(
             PrivilegedCommandProgram::Nft,
@@ -1039,6 +1053,14 @@ impl DataplaneSystem for LinuxCommandSystem {
                 ],
             )
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        }
+        if let Some(previous) = previous_table
+            && previous != table
+        {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "inet", previous.as_str()],
+            );
         }
         Ok(())
     }
@@ -2566,7 +2588,14 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
     use std::net::IpAddr;
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rustynet_backend_api::{
         BackendCapabilities, BackendError, BackendErrorKind, RouteKind, SocketEndpoint, TunnelStats,
@@ -2674,6 +2703,137 @@ mod tests {
         }
     }
 
+    fn parse_helper_request_command(line: &str) -> Option<String> {
+        let payload: serde_json::Value = serde_json::from_str(line).ok()?;
+        let program = payload.get("program")?.as_str()?;
+        let args = payload.get("args")?.as_array()?;
+        let parts = args
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{program} {}", parts.join(" ")))
+    }
+
+    fn spawn_privileged_capture_helper(
+        socket_path: &Path,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = UnixListener::bind(socket_path).expect("test helper socket should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let commands_clone = Arc::clone(&commands);
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let reader_stream =
+                            stream.try_clone().expect("test helper stream should clone");
+                        let mut reader = BufReader::new(reader_stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok()
+                            && let Some(command) = parse_helper_request_command(line.trim_end())
+                        {
+                            commands_clone
+                                .lock()
+                                .expect("test helper command log should lock")
+                                .push(command);
+                        }
+                        stream
+                            .write_all(
+                                b"{\"ok\":true,\"status\":0,\"stdout\":\"\",\"stderr\":\"\"}\n",
+                            )
+                            .expect("test helper should write response");
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (commands, stop, handle)
+    }
+
+    fn spawn_privileged_table_list_helper(
+        socket_path: &Path,
+        list_tables_stdout: String,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = UnixListener::bind(socket_path).expect("test helper socket should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let commands_clone = Arc::clone(&commands);
+        let stop_clone = Arc::clone(&stop);
+        let tables_output = list_tables_stdout;
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let reader_stream =
+                            stream.try_clone().expect("test helper stream should clone");
+                        let mut reader = BufReader::new(reader_stream);
+                        let mut line = String::new();
+                        let mut command = String::new();
+                        if reader.read_line(&mut line).is_ok()
+                            && let Some(parsed) = parse_helper_request_command(line.trim_end())
+                        {
+                            command = parsed;
+                            commands_clone
+                                .lock()
+                                .expect("test helper command log should lock")
+                                .push(command.clone());
+                        }
+
+                        let response = if command.contains("nft list tables") {
+                            serde_json::json!({
+                                "ok": true,
+                                "status": 0,
+                                "stdout": tables_output,
+                                "stderr": ""
+                            })
+                        } else {
+                            serde_json::json!({
+                                "ok": true,
+                                "status": 0,
+                                "stdout": "",
+                                "stderr": ""
+                            })
+                        };
+                        stream
+                            .write_all(format!("{response}\n").as_bytes())
+                            .expect("test helper should write response");
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (commands, stop, handle)
+    }
+
     #[test]
     fn transition_to_fail_closed_when_trust_is_invalid() {
         let policy = allow_shared_exit_policy();
@@ -2766,6 +2926,166 @@ mod tests {
                 .operations
                 .iter()
                 .any(|op| op == "set_relay_forwarding:true")
+        );
+    }
+
+    #[test]
+    fn firewall_generation_handoff_deletes_previous_table_only_after_new_rules_apply() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("phase10-fw-handoff-{unique}"));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        let socket_path = test_dir.join("helper.sock");
+
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::set_generation(&mut system, 1);
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("first generation firewall apply should succeed");
+        let first_generation_count = commands.lock().expect("command log should lock").len();
+
+        DataplaneSystem::set_generation(&mut system, 2);
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("second generation firewall apply should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        let handoff_commands = &command_log[first_generation_count..];
+        let delete_old_index = handoff_commands
+            .iter()
+            .position(|cmd| cmd.contains("nft delete table inet rustynet_g1"))
+            .expect("old generation table must be pruned in second apply");
+        let add_new_table_index = handoff_commands
+            .iter()
+            .position(|cmd| cmd.contains("nft add table inet rustynet_g2"))
+            .expect("new generation table must be created");
+        let add_new_forward_chain_index = handoff_commands
+            .iter()
+            .position(|cmd| cmd.contains("nft add chain inet rustynet_g2 forward"))
+            .expect("new generation forward chain must be installed");
+        let add_new_forward_rule_index = handoff_commands
+            .iter()
+            .position(|cmd| {
+                cmd.contains(
+                    "nft add rule inet rustynet_g2 forward iifname rustynet0 oifname enp0s9 accept",
+                )
+            })
+            .expect("new generation egress allow rule must be installed");
+
+        assert!(
+            delete_old_index > add_new_table_index
+                && delete_old_index > add_new_forward_chain_index
+                && delete_old_index > add_new_forward_rule_index,
+            "old generation table was pruned before new fail-closed rules were fully applied"
+        );
+        assert_eq!(
+            delete_old_index,
+            handoff_commands.len().saturating_sub(1),
+            "old generation table prune must happen as the final handoff command"
+        );
+    }
+
+    #[test]
+    fn prune_owned_tables_preserves_active_and_target_generation_tables() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("phase10-prune-owned-{unique}"));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        let socket_path = test_dir.join("helper.sock");
+        let list_tables_stdout = [
+            "table inet rustynet_g1",
+            "table inet rustynet_g2",
+            "table inet rustynet_g9",
+            "table ip rustynet_nat_g1",
+            "table ip rustynet_nat_g2",
+            "table ip rustynet_nat_g9",
+            "table inet non_rustynet",
+        ]
+        .join("\n");
+
+        let (commands, stop, helper_thread) =
+            spawn_privileged_table_list_helper(&socket_path, list_tables_stdout);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_generation(&mut system, 2);
+        system.firewall_table = Some("rustynet_g1".to_string());
+        system.nat_table = Some("rustynet_nat_g1".to_string());
+
+        DataplaneSystem::prune_owned_tables(&mut system).expect("prune should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table inet rustynet_g9")),
+            "stale firewall generation table should be pruned"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table ip rustynet_nat_g9")),
+            "stale nat generation table should be pruned"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table inet rustynet_g1")),
+            "active firewall table must not be pruned before handoff"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table inet rustynet_g2")),
+            "target firewall table must not be pruned"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table ip rustynet_nat_g1")),
+            "active nat table must not be pruned before handoff"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("nft delete table ip rustynet_nat_g2")),
+            "target nat table must not be pruned"
         );
     }
 
