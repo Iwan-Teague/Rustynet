@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -20,8 +21,8 @@ use crate::key_material::{
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
-    ApplyOptions, DataplaneState, DataplaneSystem, Phase10Controller, RouteGrantRequest,
-    RuntimeSystem, TrustEvidence, TrustPolicy,
+    ApplyOptions, DataplaneState, DataplaneSystem, ManagementCidr, Phase10Controller,
+    RouteGrantRequest, RuntimeSystem, TrustEvidence, TrustPolicy,
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
@@ -201,7 +202,7 @@ pub struct DaemonConfig {
     pub auto_tunnel_bundle_path: Option<PathBuf>,
     pub auto_tunnel_verifier_key_path: Option<PathBuf>,
     pub auto_tunnel_watermark_path: Option<PathBuf>,
-    pub auto_tunnel_max_age_secs: u64,
+    pub auto_tunnel_max_age_secs: NonZeroU64,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_listen_port: u16,
@@ -212,12 +213,12 @@ pub struct DaemonConfig {
     pub egress_interface: String,
     pub dataplane_mode: DaemonDataplaneMode,
     pub privileged_helper_socket_path: Option<PathBuf>,
-    pub privileged_helper_timeout_ms: u64,
-    pub reconcile_interval_ms: u64,
-    pub max_reconcile_failures: u32,
+    pub privileged_helper_timeout_ms: NonZeroU64,
+    pub reconcile_interval_ms: NonZeroU64,
+    pub max_reconcile_failures: NonZeroU32,
     pub fail_closed_ssh_allow: bool,
-    pub fail_closed_ssh_allow_cidrs: Vec<String>,
-    pub max_requests: Option<usize>,
+    pub fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
+    pub max_requests: Option<NonZeroUsize>,
 }
 
 impl Default for DaemonConfig {
@@ -239,7 +240,8 @@ impl Default for DaemonConfig {
                 DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH,
             )),
             auto_tunnel_watermark_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_WATERMARK_PATH)),
-            auto_tunnel_max_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            auto_tunnel_max_age_secs: NonZeroU64::new(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
+                .expect("default auto tunnel max age must be non-zero"),
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
             wg_listen_port: DEFAULT_WG_LISTEN_PORT,
@@ -252,9 +254,12 @@ impl Default for DaemonConfig {
             egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
             dataplane_mode: DaemonDataplaneMode::default(),
             privileged_helper_socket_path: Some(PathBuf::from(DEFAULT_TRUSTED_HELPER_SOCKET_PATH)),
-            privileged_helper_timeout_ms: DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
-            reconcile_interval_ms: DEFAULT_RECONCILE_INTERVAL_MS,
-            max_reconcile_failures: DEFAULT_MAX_RECONCILE_FAILURES,
+            privileged_helper_timeout_ms: NonZeroU64::new(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS)
+                .expect("default privileged helper timeout must be non-zero"),
+            reconcile_interval_ms: NonZeroU64::new(DEFAULT_RECONCILE_INTERVAL_MS)
+                .expect("default reconcile interval must be non-zero"),
+            max_reconcile_failures: NonZeroU32::new(DEFAULT_MAX_RECONCILE_FAILURES)
+                .expect("default max reconcile failures must be non-zero"),
             fail_closed_ssh_allow: DEFAULT_FAIL_CLOSED_SSH_ALLOW,
             fail_closed_ssh_allow_cidrs: Vec::new(),
             max_requests: None,
@@ -567,7 +572,7 @@ impl DaemonBackend {
                     validate_private_key_permissions(private_key)?;
                     let helper_client = PrivilegedCommandClient::new(
                         helper_socket.clone(),
-                        Duration::from_millis(config.privileged_helper_timeout_ms),
+                        Duration::from_millis(config.privileged_helper_timeout_ms.get()),
                     )
                     .map_err(DaemonError::InvalidConfig)?;
                     let backend = LinuxWireguardBackend::new(
@@ -607,7 +612,7 @@ impl DaemonBackend {
                     validate_private_key_permissions(private_key)?;
                     let helper_client = PrivilegedCommandClient::new(
                         helper_socket.clone(),
-                        Duration::from_millis(config.privileged_helper_timeout_ms),
+                        Duration::from_millis(config.privileged_helper_timeout_ms.get()),
                     )
                     .map_err(DaemonError::InvalidConfig)?;
                     let backend = MacosWireguardBackend::new(
@@ -798,7 +803,7 @@ impl DaemonRuntime {
             .map(|path| {
                 PrivilegedCommandClient::new(
                     path.clone(),
-                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                    Duration::from_millis(config.privileged_helper_timeout_ms.get()),
                 )
             })
             .transpose()
@@ -826,7 +831,7 @@ impl DaemonRuntime {
             auto_tunnel_bundle_path: config.auto_tunnel_bundle_path.clone(),
             auto_tunnel_verifier_key_path: config.auto_tunnel_verifier_key_path.clone(),
             auto_tunnel_watermark_path: config.auto_tunnel_watermark_path.clone(),
-            auto_tunnel_max_age_secs: config.auto_tunnel_max_age_secs,
+            auto_tunnel_max_age_secs: config.auto_tunnel_max_age_secs.get(),
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -839,7 +844,7 @@ impl DaemonRuntime {
             last_reconcile_error: None,
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
-            max_reconcile_failures: config.max_reconcile_failures,
+            max_reconcile_failures: config.max_reconcile_failures.get(),
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
         })
@@ -2055,7 +2060,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             .map(|path| {
                 PrivilegedCommandClient::new(
                     path.clone(),
-                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                    Duration::from_millis(config.privileged_helper_timeout_ms.get()),
                 )
             })
             .transpose()
@@ -2086,7 +2091,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             .map(|path| {
                 PrivilegedCommandClient::new(
                     path.clone(),
-                    Duration::from_millis(config.privileged_helper_timeout_ms),
+                    Duration::from_millis(config.privileged_helper_timeout_ms.get()),
                 )
             })
             .transpose()
@@ -2185,7 +2190,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
     let mut processed = 0usize;
-    let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.max(100));
+    let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
     let mut next_reconcile = Instant::now() + reconcile_interval;
 
     loop {
@@ -2229,7 +2234,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
         if config
             .max_requests
-            .map(|max| processed >= max)
+            .map(|max| processed >= max.get())
             .unwrap_or(false)
         {
             break;
@@ -2449,11 +2454,6 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "membership watermark path must not be empty".to_string(),
         ));
     }
-    if config.auto_tunnel_max_age_secs == 0 {
-        return Err(DaemonError::InvalidConfig(
-            "auto tunnel max age must be greater than 0".to_string(),
-        ));
-    }
     if config.auto_tunnel_enforce
         && (config.auto_tunnel_bundle_path.is_none()
             || config.auto_tunnel_verifier_key_path.is_none()
@@ -2519,34 +2519,10 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
                 .to_string(),
         ));
     }
-    if config.reconcile_interval_ms == 0 {
-        return Err(DaemonError::InvalidConfig(
-            "reconcile interval must be greater than 0".to_string(),
-        ));
-    }
-    if config.max_reconcile_failures == 0 {
-        return Err(DaemonError::InvalidConfig(
-            "max reconcile failures must be greater than 0".to_string(),
-        ));
-    }
-    if config.privileged_helper_timeout_ms == 0 {
-        return Err(DaemonError::InvalidConfig(
-            "privileged helper timeout must be greater than 0".to_string(),
-        ));
-    }
     if config.fail_closed_ssh_allow {
         if config.fail_closed_ssh_allow_cidrs.is_empty() {
             return Err(DaemonError::InvalidConfig(
                 "fail-closed ssh allow requires at least one management cidr".to_string(),
-            ));
-        }
-        if config
-            .fail_closed_ssh_allow_cidrs
-            .iter()
-            .any(|cidr| !is_valid_ipv4_or_ipv6_cidr(cidr))
-        {
-            return Err(DaemonError::InvalidConfig(
-                "fail-closed ssh allow cidrs must be valid ipv4/ipv6 cidr values".to_string(),
             ));
         }
     }
@@ -2703,7 +2679,7 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         let _ = load_auto_tunnel_bundle(
             bundle_path,
             verifier_key_path,
-            config.auto_tunnel_max_age_secs,
+            config.auto_tunnel_max_age_secs.get(),
             TrustPolicy::default(),
             watermark,
         )
@@ -4179,18 +4155,6 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("fail-closed ssh allow must require management cidrs");
         assert!(err.to_string().contains("at least one management cidr"));
-    }
-
-    #[test]
-    fn validate_daemon_config_rejects_invalid_fail_closed_ssh_cidrs() {
-        let config = DaemonConfig {
-            fail_closed_ssh_allow: true,
-            fail_closed_ssh_allow_cidrs: vec!["not-a-cidr".to_string()],
-            ..DaemonConfig::default()
-        };
-        let err =
-            validate_daemon_config(&config).expect_err("invalid management cidr must be rejected");
-        assert!(err.to_string().contains("valid ipv4/ipv6 cidr"));
     }
 
     #[test]

@@ -40,6 +40,83 @@ const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
 const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManagementCidr {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl ManagementCidr {
+    fn nft_family(self) -> &'static str {
+        match self.address {
+            IpAddr::V4(_) => "ip",
+            IpAddr::V6(_) => "ip6",
+        }
+    }
+
+    fn pf_family(self) -> &'static str {
+        match self.address {
+            IpAddr::V4(_) => "inet",
+            IpAddr::V6(_) => "inet6",
+        }
+    }
+
+    fn is_ipv6(self) -> bool {
+        matches!(self.address, IpAddr::V6(_))
+    }
+
+    fn probe_ip(self) -> IpAddr {
+        match self.address {
+            IpAddr::V4(value) => {
+                if self.prefix == 32 {
+                    IpAddr::V4(value)
+                } else if self.prefix < 31 {
+                    IpAddr::V4(Ipv4Addr::from(u32::from(value).saturating_add(1)))
+                } else {
+                    IpAddr::V4(value)
+                }
+            }
+            IpAddr::V6(value) => {
+                if self.prefix == 128 {
+                    IpAddr::V6(value)
+                } else {
+                    IpAddr::V6(Ipv6Addr::from(u128::from(value).saturating_add(1)))
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ManagementCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix)
+    }
+}
+
+impl std::str::FromStr for ManagementCidr {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (base, prefix_raw) = value
+            .split_once('/')
+            .ok_or_else(|| format!("invalid management cidr: {value}"))?;
+        let prefix = prefix_raw
+            .parse::<u8>()
+            .map_err(|_| format!("invalid management cidr prefix: {value}"))?;
+        let address = base
+            .parse::<IpAddr>()
+            .map_err(|_| format!("invalid management cidr address: {value}"))?;
+        let max_prefix = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix > max_prefix {
+            return Err(format!("invalid management cidr prefix: {value}"));
+        }
+        Ok(Self { address, prefix })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataplaneState {
     Init,
@@ -341,7 +418,7 @@ pub struct LinuxCommandSystem {
     privileged_client: Option<PrivilegedCommandClient>,
     generation: u64,
     fail_closed_ssh_allow: bool,
-    fail_closed_ssh_allow_cidrs: Vec<String>,
+    fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
     firewall_table: Option<String>,
     nat_table: Option<String>,
     prior_ipv4_forwarding: Option<bool>,
@@ -362,7 +439,7 @@ impl LinuxCommandSystem {
         mode: LinuxDataplaneMode,
         privileged_client: Option<PrivilegedCommandClient>,
         fail_closed_ssh_allow: bool,
-        fail_closed_ssh_allow_cidrs: Vec<String>,
+        fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
     ) -> Result<Self, SystemError> {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
@@ -439,25 +516,12 @@ impl LinuxCommandSystem {
         })
     }
 
-    fn nft_family_for_cidr(cidr: &str) -> Option<&'static str> {
-        let (base, prefix) = cidr.split_once('/')?;
-        if prefix.parse::<u8>().is_err() {
-            return None;
-        }
-        match base.parse::<IpAddr>().ok()? {
-            IpAddr::V4(_) => Some("ip"),
-            IpAddr::V6(_) => Some("ip6"),
-        }
-    }
-
     fn apply_fail_closed_management_allow_rules(&self, table: &str) -> Result<(), SystemError> {
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
-            let family = Self::nft_family_for_cidr(cidr).ok_or_else(|| {
-                SystemError::FirewallApplyFailed(format!("invalid management cidr: {cidr}"))
-            })?;
+            let cidr_text = cidr.to_string();
             self.run(
                 PrivilegedCommandProgram::Nft,
                 &[
@@ -466,9 +530,9 @@ impl LinuxCommandSystem {
                     "inet",
                     table,
                     "killswitch",
-                    family,
+                    cidr.nft_family(),
                     "daddr",
-                    cidr.as_str(),
+                    cidr_text.as_str(),
                     "tcp",
                     "sport",
                     "22",
@@ -477,7 +541,7 @@ impl LinuxCommandSystem {
             )
             .map_err(|err| {
                 SystemError::FirewallApplyFailed(format!(
-                    "management ssh fail-closed allow rule failed for {cidr}: {err}"
+                    "management ssh fail-closed allow rule failed for {cidr_text}: {err}"
                 ))
             })?;
         }
@@ -489,11 +553,7 @@ impl LinuxCommandSystem {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
-            let probe_ip = Self::management_probe_ip(cidr).map_err(|message| {
-                SystemError::RouteApplyFailed(format!(
-                    "management ssh bypass route probe failed for {cidr}: {message}"
-                ))
-            })?;
+            let probe_ip = cidr.probe_ip();
             let route_interface = self.resolve_route_interface_for_ip(probe_ip)?;
             let args = Self::management_bypass_route_args(cidr, route_interface.as_str());
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -505,44 +565,6 @@ impl LinuxCommandSystem {
             })?;
         }
         Ok(())
-    }
-
-    fn management_probe_ip(cidr: &str) -> Result<IpAddr, String> {
-        let (base, prefix_str) = cidr
-            .split_once('/')
-            .ok_or_else(|| format!("invalid management cidr: {cidr}"))?;
-        let prefix = prefix_str
-            .parse::<u8>()
-            .map_err(|_| format!("invalid management cidr prefix: {cidr}"))?;
-        let ip = base
-            .parse::<IpAddr>()
-            .map_err(|_| format!("invalid management cidr address: {cidr}"))?;
-        match ip {
-            IpAddr::V4(value) => {
-                if prefix > 32 {
-                    return Err(format!("invalid management cidr prefix: {cidr}"));
-                }
-                if prefix == 32 {
-                    return Ok(IpAddr::V4(value));
-                }
-                let candidate = if prefix < 31 {
-                    u32::from(value).saturating_add(1)
-                } else {
-                    u32::from(value)
-                };
-                Ok(IpAddr::V4(Ipv4Addr::from(candidate)))
-            }
-            IpAddr::V6(value) => {
-                if prefix > 128 {
-                    return Err(format!("invalid management cidr prefix: {cidr}"));
-                }
-                if prefix == 128 {
-                    return Ok(IpAddr::V6(value));
-                }
-                let candidate = u128::from(value).saturating_add(1);
-                Ok(IpAddr::V6(Ipv6Addr::from(candidate)))
-            }
-        }
     }
 
     fn resolve_route_interface_for_ip(&self, target_ip: IpAddr) -> Result<String, SystemError> {
@@ -582,9 +604,9 @@ impl LinuxCommandSystem {
         )))
     }
 
-    fn management_bypass_route_args(cidr: &str, route_interface: &str) -> Vec<String> {
+    fn management_bypass_route_args(cidr: &ManagementCidr, route_interface: &str) -> Vec<String> {
         let mut args = Vec::with_capacity(9);
-        if cidr.contains(':') {
+        if cidr.is_ipv6() {
             args.push("-6".to_string());
         }
         args.push("route".to_string());
@@ -1316,7 +1338,7 @@ pub struct MacosCommandSystem {
     privileged_client: Option<PrivilegedCommandClient>,
     generation: u64,
     fail_closed_ssh_allow: bool,
-    fail_closed_ssh_allow_cidrs: Vec<String>,
+    fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
     anchor_name: Option<String>,
     allow_egress_interface: bool,
     ipv6_blocked: bool,
@@ -1329,7 +1351,7 @@ impl MacosCommandSystem {
         egress_interface: impl Into<String>,
         privileged_client: Option<PrivilegedCommandClient>,
         fail_closed_ssh_allow: bool,
-        fail_closed_ssh_allow_cidrs: Vec<String>,
+        fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
     ) -> Result<Self, SystemError> {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
@@ -1416,25 +1438,6 @@ impl MacosCommandSystem {
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
 
-    fn management_cidr_family(cidr: &str) -> Result<&'static str, SystemError> {
-        let (base, prefix) = cidr.split_once('/').ok_or_else(|| {
-            SystemError::FirewallApplyFailed(format!("invalid management cidr: {cidr}"))
-        })?;
-        let prefix_valid = prefix.parse::<u8>().is_ok();
-        if !prefix_valid {
-            return Err(SystemError::FirewallApplyFailed(format!(
-                "invalid management cidr prefix: {cidr}"
-            )));
-        }
-        match base.parse::<IpAddr>() {
-            Ok(IpAddr::V4(_)) => Ok("inet"),
-            Ok(IpAddr::V6(_)) => Ok("inet6"),
-            Err(_) => Err(SystemError::FirewallApplyFailed(format!(
-                "invalid management cidr: {cidr}"
-            ))),
-        }
-    }
-
     fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
         let mut rules = String::new();
         rules.push_str("set block-policy drop\n");
@@ -1465,10 +1468,10 @@ impl MacosCommandSystem {
         }
         if self.fail_closed_ssh_allow {
             for cidr in &self.fail_closed_ssh_allow_cidrs {
-                let family = Self::management_cidr_family(cidr)?;
                 rules.push_str(&format!(
                     "pass out quick {} proto tcp from any port 22 to {} keep state\n",
-                    family, cidr
+                    cidr.pf_family(),
+                    cidr
                 ));
             }
         }
@@ -3076,7 +3079,10 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv4_routing_for_ipv4_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("192.168.18.0/24", "enp0s8");
+        let cidr = "192.168.18.0/24"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
         assert_eq!(
             args,
             vec![
@@ -3093,7 +3099,8 @@ mod tests {
 
     #[test]
     fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
-        let args = LinuxCommandSystem::management_bypass_route_args("fd00::/64", "enp0s8");
+        let cidr = "fd00::/64".parse::<ManagementCidr>().expect("valid cidr");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
         assert_eq!(
             args,
             vec![

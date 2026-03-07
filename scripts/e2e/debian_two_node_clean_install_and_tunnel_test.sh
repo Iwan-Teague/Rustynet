@@ -310,10 +310,6 @@ log() {
   printf '[debian-pair-e2e] %s\n' "$*"
 }
 
-escape_for_single_quotes() {
-  printf '%s' "$1" | sed "s/'/'\"'\"'/g"
-}
-
 open_master() {
   local host="$1"
   log "Opening SSH control master: ${host}"
@@ -324,41 +320,51 @@ open_master() {
 ssh_run() {
   local host="$1"
   shift
+  if (( $# != 1 )); then
+    echo "ssh_run requires exactly one remote script argument" >&2
+    exit 1
+  fi
+  local remote_script="$1"
   if target_needs_sudo "${host}"; then
-    local remote_cmd="$*"
-    local escaped_remote_cmd
-    escaped_remote_cmd="$(escape_for_single_quotes "${remote_cmd}")"
-    ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc '${escaped_remote_cmd}'" <<<"${SUDO_PASSWORD}"
+    {
+      printf '%s\n' "${SUDO_PASSWORD}"
+      printf '%s\n' "${remote_script}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" sudo -S -p '' bash -se
     return
   fi
-  ssh "${SSH_BASE_OPTS[@]}" "${host}" "$@"
+  printf '%s\n' "${remote_script}" | ssh "${SSH_BASE_OPTS[@]}" "${host}" bash -se
 }
 
 ssh_capture() {
   local host="$1"
   shift
+  if (( $# != 1 )); then
+    echo "ssh_capture requires exactly one remote script argument" >&2
+    exit 1
+  fi
+  local remote_script="$1"
   if target_needs_sudo "${host}"; then
-    local remote_cmd="$*"
-    local escaped_remote_cmd
-    escaped_remote_cmd="$(escape_for_single_quotes "${remote_cmd}")"
-    ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc '${escaped_remote_cmd}'" <<<"${SUDO_PASSWORD}"
+    {
+      printf '%s\n' "${SUDO_PASSWORD}"
+      printf '%s\n' "${remote_script}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" sudo -S -p '' bash -se
     return
   fi
-  ssh "${SSH_BASE_OPTS[@]}" "${host}" "$@"
+  printf '%s\n' "${remote_script}" | ssh "${SSH_BASE_OPTS[@]}" "${host}" bash -se
 }
 
 copy_local_archive_to_host() {
   local host="$1"
   log "Syncing source archive to ${host} (${REPO_REF} -> ${REMOTE_SRC_DIR})"
+  ssh_run "${host}" "set -euo pipefail; rm -rf '${REMOTE_SRC_DIR}'; install -d -m 0755 '${REMOTE_SRC_DIR}'"
   if target_needs_sudo "${host}"; then
     {
       printf '%s\n' "${SUDO_PASSWORD}"
       cat "${LOCAL_SOURCE_ARCHIVE}"
-    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -lc 'set -euo pipefail; rm -rf '\''${REMOTE_SRC_DIR}'\''; install -d -m 0755 '\''${REMOTE_SRC_DIR}'\''; tar -xf - -C '\''${REMOTE_SRC_DIR}'\'''"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" sudo -S -p '' tar -xf - -C "${REMOTE_SRC_DIR}"
     return
   fi
-  cat "${LOCAL_SOURCE_ARCHIVE}" \
-    | ssh "${SSH_BASE_OPTS[@]}" "${host}" "set -euo pipefail; rm -rf '${REMOTE_SRC_DIR}'; install -d -m 0755 '${REMOTE_SRC_DIR}'; tar -xf - -C '${REMOTE_SRC_DIR}'"
+  cat "${LOCAL_SOURCE_ARCHIVE}" | ssh "${SSH_BASE_OPTS[@]}" "${host}" tar -xf - -C "${REMOTE_SRC_DIR}"
 }
 
 BOOTSTRAP_SCRIPT="${TMP_DIR}/remote_bootstrap.sh"
@@ -698,18 +704,16 @@ run_remote_script_with_args() {
   local args=()
   for arg in "$@"; do
     require_safe_token "remote-arg" "${arg}"
-    args+=("'${arg}'")
+    args+=("${arg}")
   done
   if target_needs_sudo "${host}"; then
-    # shellcheck disable=SC2086
     {
       printf '%s\n' "${SUDO_PASSWORD}"
       cat "${script_path}"
-    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' bash -se -- ${args[*]}"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" sudo -S -p '' bash -se -- "${args[@]}"
     return
   fi
-  # shellcheck disable=SC2086
-  ssh "${SSH_BASE_OPTS[@]}" "${host}" "bash -se -- ${args[*]}" < "${script_path}"
+  ssh "${SSH_BASE_OPTS[@]}" "${host}" bash -se -- "${args[@]}" < "${script_path}"
 }
 
 copy_remote_file_to_local() {
@@ -734,10 +738,10 @@ copy_local_file_to_remote() {
     {
       printf '%s\n' "${SUDO_PASSWORD}"
       cat "${local_path}"
-    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" "sudo -S -p '' install -D -m ${mode} -o ${owner_user} -g ${owner_group} /dev/stdin '${remote_path}'"
+    } | ssh "${SSH_BASE_OPTS[@]}" "${host}" sudo -S -p '' install -D -m "${mode}" -o "${owner_user}" -g "${owner_group}" /dev/stdin "${remote_path}"
     return
   fi
-  cat "${local_path}" | ssh_run "${host}" "install -D -m ${mode} -o ${owner_user} -g ${owner_group} /dev/stdin '${remote_path}'"
+  cat "${local_path}" | ssh "${SSH_BASE_OPTS[@]}" "${host}" install -D -m "${mode}" -o "${owner_user}" -g "${owner_group}" /dev/stdin "${remote_path}"
 }
 
 retry_ssh_command() {

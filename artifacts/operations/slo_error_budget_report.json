@@ -1,14 +1,14 @@
 {
-  "window_start_utc": "2026-03-04T00:00:00Z",
-  "window_end_utc": "2026-03-05T00:00:00Z",
   "availability_slo_percent": 99.9,
-  "measured_availability_percent": 99.97,
-  "max_error_budget_consumed_percent": 75.0,
-  "measured_error_budget_consumed_percent": 36.4,
-  "evidence_mode": "measured",
-  "captured_at_unix": 1772814044,
+  "captured_at_unix": 1772844409,
   "environment": "ci",
+  "evidence_mode": "measured",
+  "max_error_budget_consumed_percent": 75.0,
+  "measured_availability_percent": 99.97,
+  "measured_error_budget_consumed_percent": 36.4,
   "source_artifacts": [
-    "artifacts/operations/raw/slo_error_budget_report.json"
-  ]
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/raw/slo_error_budget_report.json"
+  ],
+  "window_end_utc": "2026-03-05T00:00:00Z",
+  "window_start_utc": "2026-03-04T00:00:00Z"
 }

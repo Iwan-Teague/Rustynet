@@ -3,6 +3,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -458,6 +459,12 @@ fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Result<
             program
         ));
     }
+    if args.is_empty() {
+        return Err(format!(
+            "missing arguments for privileged command {}",
+            program
+        ));
+    }
     for arg in args {
         if arg.is_empty() {
             return Err(format!("empty argument in privileged command {}", program));
@@ -468,24 +475,606 @@ fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Result<
                 program
             ));
         }
-        if !is_safe_token(arg) {
-            return Err(format!(
-                "unsupported argument token '{}' in privileged command {}",
-                arg, program
-            ));
-        }
     }
-    Ok(())
+    match program {
+        PrivilegedCommandProgram::Ip => validate_ip_args(args),
+        PrivilegedCommandProgram::Nft => validate_nft_args(args),
+        PrivilegedCommandProgram::Wg => validate_wg_args(args),
+        PrivilegedCommandProgram::Sysctl => validate_sysctl_args(args),
+        PrivilegedCommandProgram::Ifconfig => validate_ifconfig_args(args),
+        PrivilegedCommandProgram::Route => validate_route_args(args),
+        PrivilegedCommandProgram::Pfctl => validate_pfctl_args(args),
+        PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
+        PrivilegedCommandProgram::Kill => validate_kill_args(args),
+    }
 }
 
 fn is_safe_token(value: &str) -> bool {
     value.chars().all(|ch| {
-        ch.is_ascii_alphanumeric()
-            || matches!(
-                ch,
-                '-' | '_' | '.' | '/' | ':' | ',' | '=' | '{' | '}' | ';' | '!' | '+'
-            )
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | ',' | '=' | '+')
     })
+}
+
+#[cfg(test)]
+fn is_nft_token(value: &str) -> bool {
+    matches!(value, "{" | "}" | ";" | "!=") || is_safe_token(value)
+}
+
+fn is_interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 15
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn is_path_token(value: &str) -> bool {
+    value.starts_with('/') && is_safe_token(value)
+}
+
+fn is_u16_token(value: &str) -> bool {
+    value
+        .parse::<u16>()
+        .map(|parsed| parsed != 0)
+        .unwrap_or(false)
+}
+
+fn is_u32_token(value: &str) -> bool {
+    value.parse::<u32>().is_ok()
+}
+
+fn is_ipv4_or_ipv6(value: &str) -> bool {
+    value.parse::<IpAddr>().is_ok()
+}
+
+fn is_cidr_token(value: &str) -> bool {
+    let Some((base, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = base.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix_value) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr {
+        IpAddr::V4(_) => prefix_value <= 32,
+        IpAddr::V6(_) => prefix_value <= 128,
+    }
+}
+
+fn is_wg_public_key_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+}
+
+fn is_wg_endpoint_token(value: &str) -> bool {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty() || !is_u16_token(port) {
+        return false;
+    }
+    host.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '-' | '[' | ']'))
+}
+
+fn is_allowed_ips_token(value: &str) -> bool {
+    !value.is_empty() && value.split(',').all(is_cidr_token)
+}
+
+fn is_anchor_name_token(value: &str) -> bool {
+    value.starts_with("com.apple/rustynet_g")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.'))
+}
+
+fn is_owned_nft_table_token(value: &str) -> bool {
+    (value.starts_with("rustynet_g") || value.starts_with("rustynet_nat_g"))
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn is_owned_failclosed_table_token(value: &str) -> bool {
+    value.starts_with("rustynet_g")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn is_owned_nat_table_token(value: &str) -> bool {
+    value.starts_with("rustynet_nat_g")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn is_nft_family_token(value: &str) -> bool {
+    matches!(value, "inet" | "ip" | "ip6")
+}
+
+fn is_nft_chain_token(value: &str) -> bool {
+    matches!(
+        value,
+        "killswitch" | "forward" | "input" | "output" | "prerouting" | "postrouting"
+    )
+}
+
+fn is_nft_daddr_family_token(value: &str) -> bool {
+    matches!(value, "ip" | "ip6")
+}
+
+fn is_cidr_for_nft_family(cidr: &str, family: &str) -> bool {
+    let Some((base, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = base.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix_value) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match (family, addr) {
+        ("ip", IpAddr::V4(_)) => prefix_value <= 32,
+        ("ip6", IpAddr::V6(_)) => prefix_value <= 128,
+        _ => false,
+    }
+}
+
+fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        [
+            "add",
+            "chain",
+            "inet",
+            table,
+            "killswitch",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "output",
+            "priority",
+            "0",
+            ";",
+            "policy",
+            "drop",
+            ";",
+            "}",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "chain",
+            "inet",
+            table,
+            "forward",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "forward",
+            "priority",
+            "0",
+            ";",
+            "policy",
+            "drop",
+            ";",
+            "}",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "chain",
+            "ip",
+            table,
+            "postrouting",
+            "{",
+            "type",
+            "nat",
+            "hook",
+            "postrouting",
+            "priority",
+            "100",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ] if is_owned_nat_table_token(table) => Ok(()),
+        _ => Err("unsupported nft add chain argument schema".to_string()),
+    }
+}
+
+fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            "lo",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "ct",
+            "state",
+            "established,related",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "accept",
+        ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "ct",
+            "state",
+            "established,related",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "iifname",
+            incoming_interface,
+            "oifname",
+            outgoing_interface,
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(incoming_interface)
+            && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            family,
+            "daddr",
+            cidr,
+            "tcp",
+            "sport",
+            "22",
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_nft_daddr_family_token(family)
+            && is_cidr_for_nft_family(cidr, family) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            protocol,
+            "dport",
+            "53",
+            "oifname",
+            "!=",
+            interface,
+            "drop",
+        ] if is_owned_failclosed_table_token(table)
+            && matches!(*protocol, "udp" | "tcp")
+            && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            protocol,
+            "dport",
+            "53",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) && matches!(*protocol, "udp" | "tcp") => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "counter",
+            "drop",
+            "comment",
+            "rustynet_fail_closed_drop",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "ip",
+            table,
+            "postrouting",
+            "oifname",
+            interface,
+            "masquerade",
+        ] if is_owned_nat_table_token(table) && is_interface_name(interface) => Ok(()),
+        [
+            "add",
+            "rule",
+            "ip",
+            table,
+            "postrouting",
+            "iifname",
+            incoming_interface,
+            "oifname",
+            outgoing_interface,
+            "masquerade",
+        ] if is_owned_nat_table_token(table)
+            && is_interface_name(incoming_interface)
+            && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        _ => Err("unsupported nft add rule argument schema".to_string()),
+    }
+}
+
+fn validate_ip_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["-V"] => Ok(()),
+        ["link", "add", "dev", interface, "type", "wireguard"] if is_interface_name(interface) => {
+            Ok(())
+        }
+        ["link", "set", "up", "dev", interface] if is_interface_name(interface) => Ok(()),
+        ["link", "set", "down", "dev", interface] if is_interface_name(interface) => Ok(()),
+        ["link", "del", "dev", interface] if is_interface_name(interface) => Ok(()),
+        ["address", "add", cidr, "dev", interface]
+            if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        ["route", "del", cidr, "dev", interface]
+            if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        ["route", "replace", cidr, "dev", interface]
+            if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        ["route", "replace", cidr, "dev", interface, "table", "51820"]
+            if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        [
+            "-6",
+            "route",
+            "replace",
+            cidr,
+            "dev",
+            interface,
+            "table",
+            "51820",
+        ] if is_cidr_token(cidr) && is_interface_name(interface) => Ok(()),
+        ["route", "flush", "table", "51820"] => Ok(()),
+        ["route", "get", target] if is_ipv4_or_ipv6(target) => Ok(()),
+        ["-6", "route", "get", target] if target.parse::<std::net::Ipv6Addr>().is_ok() => Ok(()),
+        ["rule", "del", "table", "51820"] => Ok(()),
+        ["rule", "del", "priority", priority, "table", "51820"] if is_u32_token(priority) => Ok(()),
+        ["rule", "add", "priority", priority, "table", "51820"] if is_u32_token(priority) => Ok(()),
+        _ => Err("unsupported ip argument schema".to_string()),
+    }
+}
+
+fn validate_nft_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["--version"] => Ok(()),
+        ["list", "tables"] => Ok(()),
+        ["list", "table", family, table]
+            if is_nft_family_token(family) && is_owned_nft_table_token(table) =>
+        {
+            Ok(())
+        }
+        ["list", "chain", family, table, chain]
+            if is_nft_family_token(family)
+                && is_owned_nft_table_token(table)
+                && is_nft_chain_token(chain) =>
+        {
+            Ok(())
+        }
+        ["add", "table", family, table]
+            if is_nft_family_token(family) && is_owned_nft_table_token(table) =>
+        {
+            Ok(())
+        }
+        ["delete", "table", family, table]
+            if is_nft_family_token(family) && is_owned_nft_table_token(table) =>
+        {
+            Ok(())
+        }
+        _ if args.starts_with(&["add", "chain"]) => validate_nft_add_chain_args(args),
+        _ if args.starts_with(&["add", "rule"]) => validate_nft_add_rule_args(args),
+        _ => Err("unsupported nft argument schema".to_string()),
+    }
+}
+
+fn validate_wg_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["--version"] => Ok(()),
+        [
+            "set",
+            interface,
+            "private-key",
+            private_key_path,
+            "listen-port",
+            port,
+        ] if is_interface_name(interface)
+            && is_path_token(private_key_path)
+            && is_u16_token(port) =>
+        {
+            Ok(())
+        }
+        ["set", interface, "private-key", private_key_path]
+            if is_interface_name(interface) && is_path_token(private_key_path) =>
+        {
+            Ok(())
+        }
+        [
+            "set",
+            interface,
+            "peer",
+            public_key,
+            "endpoint",
+            endpoint,
+            "allowed-ips",
+            allowed_ips,
+        ] if is_interface_name(interface)
+            && is_wg_public_key_token(public_key)
+            && is_wg_endpoint_token(endpoint)
+            && is_allowed_ips_token(allowed_ips) =>
+        {
+            Ok(())
+        }
+        ["set", interface, "peer", public_key, "remove"]
+            if is_interface_name(interface) && is_wg_public_key_token(public_key) =>
+        {
+            Ok(())
+        }
+        _ => Err("unsupported wg argument schema".to_string()),
+    }
+}
+
+fn validate_sysctl_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["--version"] => Ok(()),
+        ["-w", "net.ipv4.ip_forward=1" | "net.ipv4.ip_forward=0"] => Ok(()),
+        [
+            "-w",
+            "net.ipv6.conf.all.disable_ipv6=1" | "net.ipv6.conf.all.disable_ipv6=0",
+        ] => Ok(()),
+        _ => Err("unsupported sysctl argument schema".to_string()),
+    }
+}
+
+fn validate_ifconfig_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["-l"] => Ok(()),
+        [interface, "up"] if is_interface_name(interface) => Ok(()),
+        [interface, "down"] if is_interface_name(interface) => Ok(()),
+        [
+            interface,
+            "inet",
+            local_ip,
+            peer_ip,
+            "netmask",
+            "255.255.255.255",
+        ] if is_interface_name(interface)
+            && is_ipv4_or_ipv6(local_ip)
+            && is_ipv4_or_ipv6(peer_ip) =>
+        {
+            Ok(())
+        }
+        _ => Err("unsupported ifconfig argument schema".to_string()),
+    }
+}
+
+fn validate_route_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["-n", "get", "default"] => Ok(()),
+        [
+            "-n",
+            "add" | "change",
+            "-inet",
+            "default",
+            "-interface",
+            interface,
+        ] if is_interface_name(interface) => Ok(()),
+        ["-n", "change", "-inet", "default", gateway] if is_ipv4_or_ipv6(gateway) => Ok(()),
+        [
+            "-n",
+            "add",
+            "-inet" | "-inet6",
+            "-host",
+            endpoint,
+            gateway,
+            "-ifscope",
+            interface,
+        ] if is_ipv4_or_ipv6(endpoint)
+            && is_ipv4_or_ipv6(gateway)
+            && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        ["-n", "delete", "-inet" | "-inet6", "-host", endpoint] if is_ipv4_or_ipv6(endpoint) => {
+            Ok(())
+        }
+        [
+            "-n",
+            "add",
+            "-inet" | "-inet6",
+            "-net",
+            cidr,
+            "-interface",
+            interface,
+        ] if is_cidr_token(cidr) && is_interface_name(interface) => Ok(()),
+        ["-n", "delete", "-inet" | "-inet6", "-net", cidr] if is_cidr_token(cidr) => Ok(()),
+        _ => Err("unsupported route argument schema".to_string()),
+    }
+}
+
+fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
+    for arg in args {
+        if !is_safe_token(arg) {
+            return Err(format!("unsupported pfctl token: {arg}"));
+        }
+    }
+    match args {
+        ["-E"] => Ok(()),
+        ["-s", "info"] => Ok(()),
+        ["-s", "Anchors"] => Ok(()),
+        ["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
+        ["-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => Ok(()),
+        ["-a", anchor, "-s", "rules"] if is_anchor_name_token(anchor) => Ok(()),
+        _ => Err("unsupported pfctl argument schema".to_string()),
+    }
+}
+
+fn validate_wireguard_go_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        [interface] if is_interface_name(interface) => Ok(()),
+        _ => Err("unsupported wireguard-go argument schema".to_string()),
+    }
+}
+
+fn validate_kill_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["-TERM", pid] if pid.parse::<u32>().map(|value| value > 1).unwrap_or(false) => Ok(()),
+        _ => Err("unsupported kill argument schema".to_string()),
+    }
 }
 
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
@@ -521,7 +1110,7 @@ impl fmt::Display for PrivilegedCommandProgram {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivilegedCommandProgram, is_safe_token, validate_request};
+    use super::{PrivilegedCommandProgram, is_nft_token, is_safe_token, validate_request};
 
     #[test]
     fn privileged_program_parser_rejects_unknown() {
@@ -532,19 +1121,87 @@ mod tests {
     #[test]
     fn safe_token_rejects_unsafe_characters() {
         assert!(is_safe_token("established,related"));
-        assert!(is_safe_token("!="));
+        assert!(!is_safe_token("!="));
         assert!(!is_safe_token("$(id)"));
         assert!(!is_safe_token("a|b"));
         assert!(!is_safe_token("contains space"));
+        assert!(is_nft_token("!="));
+        assert!(is_nft_token("{"));
     }
 
     #[test]
-    fn validate_request_rejects_invalid_tokens() {
+    fn validate_request_rejects_invalid_nft_tokens() {
         let err = validate_request(
             PrivilegedCommandProgram::Nft,
             &["list", "table", "inet", "$(id)"],
         )
         .expect_err("unsafe token should be rejected");
-        assert!(err.contains("unsupported argument token"));
+        assert!(err.contains("unsupported nft argument schema"));
+    }
+
+    #[test]
+    fn validate_request_accepts_known_ip_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "route",
+                "replace",
+                "192.0.2.1/32",
+                "dev",
+                "rustynet0",
+                "table",
+                "51820",
+            ],
+        )
+        .expect("known ip schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_unknown_ip_schema() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["route", "replace", "192.0.2.1/32", "via", "198.51.100.1"],
+        )
+        .expect_err("unknown ip schema should be rejected");
+        assert!(err.contains("unsupported ip argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_unknown_wg_schema() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Wg,
+            &["set", "rustynet0", "fwmark", "51820"],
+        )
+        .expect_err("unknown wg schema should be rejected");
+        assert!(err.contains("unsupported wg argument schema"));
+    }
+
+    #[test]
+    fn validate_request_accepts_known_nft_list_table_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &["list", "table", "inet", "rustynet_g1"],
+        )
+        .expect("known nft list table schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_unknown_nft_rule_schema() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "meta",
+                "mark",
+                "0x1",
+                "accept",
+            ],
+        )
+        .expect_err("unknown nft rule schema should be rejected");
+        assert!(err.contains("unsupported nft add rule argument schema"));
     }
 }

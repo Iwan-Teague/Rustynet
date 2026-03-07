@@ -2,7 +2,7 @@
   "phase": "membership",
   "evidence_mode": "measured",
   "environment": "ci",
-  "captured_at_unix": 1772814045,
+  "captured_at_unix": 1772844040,
   "status": "pass",
   "network_id": "bootstrap-net",
   "epoch": 0,

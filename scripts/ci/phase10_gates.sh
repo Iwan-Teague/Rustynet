@@ -102,16 +102,7 @@ fi
 
 ./scripts/ci/phase9_gates.sh
 
-if rg -n "(Wireguard|WireGuard|wg[-_]|wgctrl)" \
-  crates/rustynet-control \
-  crates/rustynet-policy \
-  crates/rustynet-crypto \
-  crates/rustynet-backend-api \
-  crates/rustynet-cli \
-  crates/rustynet-relay; then
-  echo "WireGuard boundary leakage gate failed"
-  exit 1
-fi
+./scripts/ci/check_backend_boundary_leakage.sh
 
 if rg -n 'BEGIN PRIVATE KEY|SECRET_KEY=|API_KEY=|TOKEN=.{8,}|password\s*=\s*"[^"]+"' crates; then
   echo "Secret redaction gate failed"

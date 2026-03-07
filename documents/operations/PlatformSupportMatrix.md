@@ -21,7 +21,7 @@ Purpose: provide a single current-state view of platform capability, security po
 | Direct/relay failover path in Phase10 runtime | State tracking present | State tracking present | Needs more work for full relay dataplane transport switching | `crates/rustynetd/src/phase10.rs:1954-1970`, `crates/rustynetd/src/phase10.rs:2692-2730` |
 | IPv6 protected-mode parity | Supported | Explicitly not supported (`supports_ipv6=false`) until parity is complete | Secure short-term default | `crates/rustynet-backend-wireguard/src/lib.rs:775-781` |
 | CI dataplane evidence | Real Linux WireGuard E2E | macOS dataplane smoke + targeted security tests | Needs more work on macOS depth | `.github/workflows/cross-platform-ci.yml:55-65`, `.github/workflows/cross-platform-ci.yml:26-28`, `scripts/ci/macos_dataplane_smoke.sh:44-46` |
-| Break-glass/manual peer admin parity | Available | Linux-only guards block equivalent flows | Needs more work | `start.sh:2558`, `start.sh:2590`, `start.sh:2626` |
+| Manual peer break-glass mutation path | Removed (fail-closed) | Removed (fail-closed) | More secure than older docs/assumptions | `start.sh:3303-3356`, `start.sh:4213-4270` |
 | Exit-node selection readiness probe UX | Membership+tunnel probe in `SELECT EXIT NODE`; current selection marker + connect/disconnect quick action | Same menu behavior on macOS host profile (compat runtime) | Implemented | `start.sh:3711-3774`, `start.sh:4257-4327` |
 | Additional non-simulated backend implementation | Not present in-tree beyond WireGuard | Not present in-tree beyond WireGuard | Needs more work (policy/code discrepancy) | `crates/rustynet-backend-wireguard/src/lib.rs:54`, `crates/rustynet-backend-stub/src/lib.rs:38` |
 
@@ -32,7 +32,6 @@ Purpose: provide a single current-state view of platform capability, security po
   - macOS key custody defaults to Keychain and plaintext passphrase files are rejected by default checks.
 - Still needs more work:
   - macOS CI is currently smoke-level for dataplane security compared with Linux real E2E depth,
-  - Linux-only constraints still gate some manual admin peer flows,
   - policy expects a second non-simulated backend path, but current in-tree implementation set is WireGuard + stub,
   - direct/relay failover in Phase10 runtime is currently state-mode signaling, not full relay transport path integration.
 

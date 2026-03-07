@@ -1,20 +1,20 @@
 {
-  "evidence_mode": "measured",
+  "captured_at_unix": 1772844409,
   "entries": [
     {
       "algorithm": "sha1-signature-only",
       "deprecates_at_utc": "2026-03-01T00:00:00Z",
-      "removal_at_utc": "2026-09-01T00:00:00Z",
-      "notes": "legacy compatibility exception sunset window"
+      "notes": "legacy compatibility exception sunset window",
+      "removal_at_utc": "2026-09-01T00:00:00Z"
     }
   ],
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "exceptions_auto_expire": true,
   "exceptions_default_enabled": false,
   "exceptions_require_risk_acceptance": true,
-  "exceptions_auto_expire": true,
   "measured_at_utc": "2026-03-05T11:06:00Z",
-  "captured_at_unix": 1772814044,
-  "environment": "ci",
   "source_artifacts": [
-    "artifacts/operations/raw/crypto_deprecation_schedule.json"
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/raw/crypto_deprecation_schedule.json"
   ]
 }

@@ -243,21 +243,21 @@ impl DisasterRecoveryValidation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendAgilityValidation {
-    pub default_backend: String,
+    pub default_backend_configured: bool,
     pub additional_backend_paths: u8,
     pub conformance_passed: bool,
     pub security_review_complete: bool,
-    pub wireguard_is_adapter_boundary: bool,
+    pub backend_adapter_boundary_preserved: bool,
     pub protocol_leakage_detected: bool,
 }
 
 impl BackendAgilityValidation {
     pub fn passes(&self) -> bool {
-        self.default_backend.eq_ignore_ascii_case("wireguard")
+        self.default_backend_configured
             && self.additional_backend_paths >= 1
             && self.conformance_passed
             && self.security_review_complete
-            && self.wireguard_is_adapter_boundary
+            && self.backend_adapter_boundary_preserved
             && !self.protocol_leakage_detected
     }
 }
@@ -447,11 +447,11 @@ mod tests {
                 restore_integrity_verified: true,
             },
             backend_agility: BackendAgilityValidation {
-                default_backend: "wireguard".to_string(),
+                default_backend_configured: true,
                 additional_backend_paths: 1,
                 conformance_passed: true,
                 security_review_complete: true,
-                wireguard_is_adapter_boundary: true,
+                backend_adapter_boundary_preserved: true,
                 protocol_leakage_detected: false,
             },
             incident_drill_completed: true,

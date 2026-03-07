@@ -1,6 +1,6 @@
 {
   "artifact_path": "target/debug/rustynetd",
-  "sha256": "fbe1cb71cd2bb5e6c023c15bb9468efba9f07e9939a42c04ff94858fb7dc695b",
+  "sha256": "70d14e71b38e21cf6b097b6a03bf4fc5d7e9a8ce0641fed50f759e95cdde6613",
   "release_track": "beta",
-  "generated_at_utc": "2026-03-06T16:20:39Z"
+  "generated_at_utc": "2026-03-07T00:46:43Z"
 }

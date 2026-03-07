@@ -1,43 +1,43 @@
 {
-  "phase": "phase10",
-  "evidence_mode": "measured",
+  "captured_at_unix": 1772844410,
   "environment": "ci",
-  "captured_at_unix": 1772814044,
-  "soak_test_hours": 24,
-  "soak_status": "pass",
+  "evidence_mode": "measured",
   "metrics": [
     {
       "name": "idle_cpu_percent",
-      "value": 1.2,
+      "status": "pass",
       "threshold": "<=2",
-      "status": "pass"
+      "value": 1.2
     },
     {
       "name": "idle_rss_mb",
-      "value": 82.0,
+      "status": "pass",
       "threshold": "<=120",
-      "status": "pass"
+      "value": 82.0
     },
     {
       "name": "reconnect_seconds",
-      "value": 2.0,
+      "status": "pass",
       "threshold": "<=5",
-      "status": "pass"
+      "value": 2.0
     },
     {
       "name": "route_apply_p95_seconds",
-      "value": 0.8,
+      "status": "pass",
       "threshold": "<=2",
-      "status": "pass"
+      "value": 0.8
     },
     {
       "name": "throughput_overhead_percent",
-      "value": 10.5,
+      "status": "pass",
       "threshold": "<=15",
-      "status": "pass"
+      "value": 10.5
     }
   ],
+  "phase": "phase10",
+  "soak_status": "pass",
+  "soak_test_hours": 24,
   "source_artifacts": [
-    "artifacts/phase10/source/perf_budget_report.json"
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/perf_budget_report.json"
   ]
 }

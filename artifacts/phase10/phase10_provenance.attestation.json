@@ -1,0 +1,91 @@
+{
+  "command_digest_sha256": "bea18af0056d3ac372ca8256684b4a8080a4de5285e3fa0b8d15ec19ca164d63",
+  "entries": [
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/netns_e2e_report.json",
+      "artifact_sha256": "b723cded085008b70aca7d7a7225e59f3dd6186b0457fb54ba34cc4bb71d3196",
+      "captured_at_unix": 1772717564,
+      "label": "source_netns_e2e_report",
+      "role": "source",
+      "signature_hex": "1a696712f5099f2844bc7a060cc646eb969f7dc44845b77b61189979af60acbec5ca30e66dea5c316bba5e363c8484006f3eb94d93fbc798ad48602bcb726e0d"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/leak_test_report.json",
+      "artifact_sha256": "2ce69499d43c4d9a2fbc26bb5a9a9979b8f626f7331c6cf3a691a109f7117027",
+      "captured_at_unix": 1772717564,
+      "label": "source_leak_test_report",
+      "role": "source",
+      "signature_hex": "c580ac44d4a8dd0228f727d8177b04270021b3ff59a50800608714306c4ca16f9e5fdd8f38cf6031b2d55b224f92a3af7f97f0fcf714955043e037fa6b1d990a"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/perf_budget_report.json",
+      "artifact_sha256": "e00e16369d5b97d2bc979393f908f8fcbfdb16d4a36be90e917944ddba2168f3",
+      "captured_at_unix": 1772717564,
+      "label": "source_perf_budget_report",
+      "role": "source",
+      "signature_hex": "a24e5814cea8fe3d5205920b96938a1fdc7422f9709f580e55a3c0d9b67adcf9377c0eb74d6db44365ba984ff026942d2b05388ae05d4cddc50a0c7c78980f04"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/direct_relay_failover_report.json",
+      "artifact_sha256": "06d3784dc9769be443fc5e5533513997823024219bdd8c35993e3537439aa15e",
+      "captured_at_unix": 1772717564,
+      "label": "source_direct_relay_failover_report",
+      "role": "source",
+      "signature_hex": "6741d4e588461b79c50eb273dedc78d0b0517c1412e8bf4a3b0f745759abd47876077a17a01e3b5a1851cc3ba252e8ed50c82cf4d7054bf03f72b882d1df4a0c"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/state_transition_audit.log",
+      "artifact_sha256": "28f7e74b8115a52ac86ded3fe6bf9f25b19baf46a474cb673d3cc36f7528f7be",
+      "captured_at_unix": 1772844410,
+      "label": "source_state_transition_audit_log",
+      "role": "source",
+      "signature_hex": "3b311c64292f9f975ceb458f60b0cc0458e3b9398760366aa5ac88fcca4df9f7521d5d24fa1ca85c21c8a361133fc6942862869c68531ce44ba28871533d040f"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/netns_e2e_report.json",
+      "artifact_sha256": "033b9848ba58b41b439c491073deb6e46cae099fe5110d580af95ee37dd300f9",
+      "captured_at_unix": 1772844410,
+      "label": "derived_netns_e2e_report",
+      "role": "derived",
+      "signature_hex": "1c9f22b8936980e048fe3239de0fd50a0c7554df7fdf7f0e779c96c6762480fa788862f71b5591717209f00f7b2a9e691e953bd055f33d5829f00eceea0eeb01"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/leak_test_report.json",
+      "artifact_sha256": "2e2ca0a5ac37af9655415b9b7379783325e32ab4e9826bef0d82445a6cc0a32e",
+      "captured_at_unix": 1772844410,
+      "label": "derived_leak_test_report",
+      "role": "derived",
+      "signature_hex": "7718f3d992c2b2b4000ef58f41b5764ba0ba05529fe88105083f0b12be27876824f065668d789178c2d18269bd40f200becc81c95d9b85cf8804f44740bb3204"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/perf_budget_report.json",
+      "artifact_sha256": "03d68feeaf7bc744d18e402c8b2763544ede7f3411d7025fb8bbac686c2253de",
+      "captured_at_unix": 1772844410,
+      "label": "derived_perf_budget_report",
+      "role": "derived",
+      "signature_hex": "aa0fe4d75360e0aa831765f12affbe357d7aca695baca89fde59b64d35225e7b46cc9fb4593de3e9ace6bd88b78bf4f3242f84ee10b219df272a7fb5c297790e"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/direct_relay_failover_report.json",
+      "artifact_sha256": "ef231f37619a4ddb2319cdf4fe8ac7ea67d915b92521b6ecf3adb4402716dfd1",
+      "captured_at_unix": 1772844410,
+      "label": "derived_direct_relay_failover_report",
+      "role": "derived",
+      "signature_hex": "fe626d1cbdcce5c2aa634ea3935cd02ef95f63594427a94d413366756c032035cd97364a79577bcea546f40b434fd79f9267243bf217a8f99b9804192c1a6305"
+    },
+    {
+      "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/state_transition_audit.log",
+      "artifact_sha256": "28f7e74b8115a52ac86ded3fe6bf9f25b19baf46a474cb673d3cc36f7528f7be",
+      "captured_at_unix": 1772844410,
+      "label": "derived_state_transition_audit_log",
+      "role": "derived",
+      "signature_hex": "31311b88a0a5b42c6e53d6db857fe822c75c18ded4c36d20cdbd2248f292b6f5b253ee618f08819c6c423e6d8fceefbce85c4ffcb1ed41cb57a1db45e752e506"
+    }
+  ],
+  "generated_at_unix": 1772844410,
+  "host_identity": "ci-localhost",
+  "phase": "phase10",
+  "schema_version": 1,
+  "signer_key_id": "ed25519:7ef944ac55508baf",
+  "verifier_key_hex": "3c73ce164c9a4baf242ffb5717b75adda0e573afac15b9b2b4a1ac05755cf544"
+}

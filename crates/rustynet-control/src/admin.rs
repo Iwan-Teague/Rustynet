@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -92,7 +93,8 @@ pub struct WebSecurityHeaders {
     pub referrer_policy: String,
 }
 
-pub fn default_web_security_headers() -> WebSecurityHeaders {
+#[cfg(test)]
+fn default_web_security_headers() -> WebSecurityHeaders {
     WebSecurityHeaders {
         x_frame_options: "DENY".to_string(),
         content_security_policy: "frame-ancestors 'none'".to_string(),
@@ -196,7 +198,8 @@ pub struct PrivilegedCommand {
     pub run_as_user: String,
 }
 
-pub fn validate_privileged_command(command: &PrivilegedCommand) -> Result<(), AdminError> {
+#[cfg(test)]
+fn validate_privileged_command(command: &PrivilegedCommand) -> Result<(), AdminError> {
     if !command.program.starts_with('/') {
         return Err(AdminError::CommandRejected);
     }
@@ -209,7 +212,8 @@ pub fn validate_privileged_command(command: &PrivilegedCommand) -> Result<(), Ad
     Ok(())
 }
 
-pub fn command_preview(command: &PrivilegedCommand) -> Result<String, AdminError> {
+#[cfg(test)]
+fn command_preview(command: &PrivilegedCommand) -> Result<String, AdminError> {
     validate_privileged_command(command)?;
     let mut output = String::new();
     output.push_str("program=");
@@ -242,6 +246,7 @@ fn is_privileged(action: AdminAction) -> bool {
     )
 }
 
+#[cfg(test)]
 fn contains_shell_meta(value: &str) -> bool {
     value.chars().any(|ch| {
         matches!(
@@ -251,7 +256,8 @@ fn contains_shell_meta(value: &str) -> bool {
     })
 }
 
-pub fn policy_bootstrap_defaults() -> BTreeMap<String, String> {
+#[cfg(test)]
+fn policy_bootstrap_defaults() -> BTreeMap<String, String> {
     let mut defaults = BTreeMap::new();
     defaults.insert("mode".to_string(), "default-deny".to_string());
     defaults.insert("allow_all".to_string(), "false".to_string());

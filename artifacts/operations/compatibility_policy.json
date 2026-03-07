@@ -1,24 +1,24 @@
 {
+  "captured_at_unix": 1772844409,
+  "deprecation_window_days": 90,
+  "environment": "ci",
   "evidence_mode": "measured",
-  "policy_version": "2026.03",
-  "minimum_supported_client": {
-    "major": 1,
-    "minor": 0
+  "insecure_compatibility_mode": {
+    "auto_expiry_required": true,
+    "default_enabled": false,
+    "risk_acceptance_required": true
   },
   "latest_server": {
     "major": 1,
     "minor": 3
   },
-  "deprecation_window_days": 90,
-  "insecure_compatibility_mode": {
-    "default_enabled": false,
-    "risk_acceptance_required": true,
-    "auto_expiry_required": true
-  },
   "measured_at_utc": "2026-03-05T11:05:00Z",
-  "captured_at_unix": 1772814044,
-  "environment": "ci",
+  "minimum_supported_client": {
+    "major": 1,
+    "minor": 0
+  },
+  "policy_version": "2026.03",
   "source_artifacts": [
-    "artifacts/operations/raw/compatibility_policy.json"
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/raw/compatibility_policy.json"
   ]
 }

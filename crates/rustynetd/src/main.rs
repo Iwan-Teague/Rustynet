@@ -17,7 +17,9 @@ use rustynetd::key_material::{
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
 use rustynetd::perf;
+use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
     "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
@@ -441,9 +443,11 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--auto-tunnel-max-age-secs requires a value".to_string())?;
-                config.auto_tunnel_max_age_secs = value
+                let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid auto tunnel max age: {err}"))?;
+                config.auto_tunnel_max_age_secs = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "auto tunnel max age must be greater than 0".to_string())?;
                 index += 2;
             }
             Some("--backend") => {
@@ -543,9 +547,12 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--privileged-helper-timeout-ms requires a value".to_string())?;
-                config.privileged_helper_timeout_ms = value
+                let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid privileged helper timeout: {err}"))?;
+                config.privileged_helper_timeout_ms = NonZeroU64::new(parsed).ok_or_else(|| {
+                    "privileged helper timeout must be greater than 0".to_string()
+                })?;
                 index += 2;
             }
             Some("--max-requests") => {
@@ -555,25 +562,32 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|err| format!("invalid max requests: {err}"))?;
-                config.max_requests = Some(parsed);
+                config.max_requests = Some(
+                    NonZeroUsize::new(parsed)
+                        .ok_or_else(|| "max requests must be greater than 0".to_string())?,
+                );
                 index += 2;
             }
             Some("--reconcile-interval-ms") => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--reconcile-interval-ms requires a value".to_string())?;
-                config.reconcile_interval_ms = value
+                let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid reconcile interval: {err}"))?;
+                config.reconcile_interval_ms = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "reconcile interval must be greater than 0".to_string())?;
                 index += 2;
             }
             Some("--max-reconcile-failures") => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--max-reconcile-failures requires a value".to_string())?;
-                config.max_reconcile_failures = value
+                let parsed = value
                     .parse::<u32>()
                     .map_err(|err| format!("invalid max reconcile failures: {err}"))?;
+                config.max_reconcile_failures = NonZeroU32::new(parsed)
+                    .ok_or_else(|| "max reconcile failures must be greater than 0".to_string())?;
                 index += 2;
             }
             Some("--fail-closed-ssh-allow") => {
@@ -601,8 +615,11 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                             .split(',')
                             .map(str::trim)
                             .filter(|entry| !entry.is_empty())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>();
+                            .map(str::parse::<ManagementCidr>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|err| {
+                                format!("invalid --fail-closed-ssh-allow-cidrs value: {err}")
+                            })?;
                         index += 2;
                     }
                 } else {
@@ -985,6 +1002,7 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_daemon_config;
+    use rustynetd::phase10::ManagementCidr;
 
     #[test]
     fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_value_is_omitted() {
@@ -1014,7 +1032,24 @@ mod tests {
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
             config.fail_closed_ssh_allow_cidrs,
-            vec!["192.168.0.0/24".to_string(), "fd00::/64".to_string()]
+            vec![
+                "192.168.0.0/24"
+                    .parse::<ManagementCidr>()
+                    .expect("cidr should parse"),
+                "fd00::/64"
+                    .parse::<ManagementCidr>()
+                    .expect("cidr should parse"),
+            ]
         );
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_fail_closed_cidrs() {
+        let args = vec![
+            "--fail-closed-ssh-allow-cidrs".to_string(),
+            "not-a-cidr".to_string(),
+        ];
+        let err = parse_daemon_config(&args).expect_err("invalid cidr should fail parsing");
+        assert!(err.contains("invalid --fail-closed-ssh-allow-cidrs value"));
     }
 }

@@ -22,7 +22,7 @@ The wizard handles:
 - optional signer-backed trust-evidence auto-refresh timer on Linux to keep trust freshness valid during unattended runtime
 - daemon/service lifecycle
 - centrally signed auto-tunnel defaults with fail-closed enforcement
-- break-glass manual peer connection helpers (explicit acknowledgement + audit logging)
+- manual peer break-glass mutation paths removed; signed assignment workflows are the only supported peer/routing mutation path
 - encrypted key custody at rest + runtime key management
 - Rust-backed WireGuard custody bootstrap (`rustynet ops bootstrap-wireguard-custody`) is mandatory in setup paths; unsupported/failed ops invocation is fail-closed (no shell fallback)
 - sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
@@ -37,7 +37,7 @@ The wizard handles:
   services via `LoadCredentialEncrypted` (no persistent plaintext passphrase files)
 - signing credential decrypt flows pin embedded credential name for cross-distro
   systemd compatibility: `systemd-creds decrypt --name=signing_key_passphrase ...`
-- local key rotation/revocation and peer rotation-bundle apply flow
+- local key rotation/revocation through signed control-plane workflows
 - membership bootstrap with encrypted persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
@@ -61,7 +61,7 @@ Current implementation support/security matrix:
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 
 Role model:
-- `admin`: full operational console (policy/trust/key/exit-node administration, with break-glass controls).
+- `admin`: full operational console (policy/trust/key/exit-node administration) with signed control-plane enforcement.
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
 - `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, auto-enforces exit-serving posture, and sanitizes client-only assignment fields (selected exit/LAN flags) instead of fail-closing on role conversion.
 
@@ -190,10 +190,22 @@ RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase10_artifacts.sh
 ```
 
+Phase10 provenance defaults:
+- if `RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH` / `RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH` are unset, Rustynet uses `artifacts/phase10/provenance/signing_seed.hex` and `artifacts/phase10/provenance/verifier_key.hex`.
+- when both default key files are absent, Rustynet generates a matching Ed25519 keypair through the Rust command path and writes owner-only files (`0600`) under an owner-only directory (`0700`).
+- if `RUSTYNET_PHASE10_PROVENANCE_HOST_ID` is unset, Rustynet uses `ci-localhost`.
+- for production, set all three provenance env vars explicitly to stable host-specific values under controlled key paths.
+
 Phase 6 release scripts are thin wrappers to Rust-only ops commands:
 - `rustynet ops collect-platform-probe`
 - `rustynet ops generate-platform-parity-report`
 - `rustynet ops collect-platform-parity-bundle`
+
+Phase 9/10 operations scripts are also thin wrappers to Rust-only ops commands:
+- `rustynet ops collect-phase9-raw-evidence`
+- `rustynet ops generate-phase9-artifacts`
+- `rustynet ops generate-phase10-artifacts`
+- `rustynet ops verify-phase10-provenance`
 
 Raw measured inputs must exist first:
 - `artifacts/release/raw/platform_parity_linux.json`
@@ -236,7 +248,18 @@ Generate them from measured evidence sources (fail-closed, no synthetic fallback
 ./scripts/perf/run_phase1_baseline.sh
 ```
 
-`run_phase1_baseline.sh` will auto-run the collector when env vars are missing.
+The collector now writes structured measured input JSON
+(`artifacts/perf/phase1/measured_input.json` by default) and no longer emits shell
+`export` scripts.
+
+`run_phase1_baseline.sh` auto-runs the collector when required `RUSTYNET_PHASE1_*`
+vars are missing, then passes validated metrics directly into Rust baseline commands
+(no shell `source` path).
+
+Optional output override:
+- `RUSTYNET_PHASE1_MEASURED_INPUT_OUT` for collector output path.
+- collector source files and output directories fail closed when group/world writable.
+
 If present, the collector can use `artifacts/operations/performance_budget_report.json`
 as measured Phase1 input source.
 The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`

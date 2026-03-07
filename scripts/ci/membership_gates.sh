@@ -103,16 +103,7 @@ fi
 ./scripts/ci/phase9_gates.sh
 ./scripts/ci/phase10_gates.sh
 
-if rg -n "(Wireguard|WireGuard|wg[-_]|wgctrl)" \
-  crates/rustynet-control \
-  crates/rustynet-policy \
-  crates/rustynet-crypto \
-  crates/rustynet-backend-api \
-  crates/rustynet-cli \
-  crates/rustynet-relay; then
-  echo "WireGuard boundary leakage gate failed"
-  exit 1
-fi
+./scripts/ci/check_backend_boundary_leakage.sh
 
 cargo test -p rustynet-control membership::tests --all-features
 cargo test -p rustynet-policy membership_aware --all-features

@@ -5,8 +5,8 @@ Generate Phase 6 and Phase 9 release-gate artifacts only from measured evidence.
 
 ## Phase 1: Runtime Baseline Inputs
 
-### Automated measured env collector
-Generate required Phase 1 baseline environment variables from measured evidence:
+### Automated measured input collector
+Generate required Phase 1 baseline measured inputs from measured evidence:
 
 ```bash
 ./scripts/perf/collect_phase1_measured_env.sh
@@ -30,14 +30,21 @@ RUSTYNET_PHASE1_PERF_SAMPLES_PATH=/absolute/path/to/performance_samples.ndjson \
 ```
 
 Generated file:
-- `artifacts/perf/phase1/measured_env.sh` (owner-readable only)
+- `artifacts/perf/phase1/measured_input.json` (owner-readable only by default)
+  - override path with `RUSTYNET_PHASE1_MEASURED_INPUT_OUT`
 
 Then run baseline:
 ```bash
 ./scripts/perf/run_phase1_baseline.sh
 ```
 
-`run_phase1_baseline.sh` auto-invokes the collector (fail-closed) when required `RUSTYNET_PHASE1_*` vars are missing.
+`run_phase1_baseline.sh` auto-invokes the collector (fail-closed) when required
+`RUSTYNET_PHASE1_*` vars are missing.
+
+Security hardening note:
+- legacy shell `source` ingestion of generated phase1 env scripts has been removed from the active baseline path.
+- phase1 collection/baseline validation is Rust-backed; shell wrappers only dispatch to Rust commands.
+- phase1 measured source files and output directories must not be group/world writable (fail closed).
 
 ## Phase 6: Platform Parity Report
 
@@ -90,6 +97,9 @@ Collect raw phase9 evidence from concrete source logs/config plus backend comman
 ./scripts/operations/collect_phase9_raw_evidence.sh
 ```
 
+The script is a thin wrapper over:
+- `rustynet ops collect-phase9-raw-evidence`
+
 This collector writes:
 - `artifacts/operations/raw/compatibility_policy.json`
 - `artifacts/operations/raw/slo_error_budget_report.json`
@@ -141,6 +151,9 @@ RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase9_artifacts.sh
 ```
 
+The script is a thin wrapper over:
+- `rustynet ops generate-phase9-artifacts`
+
 Create these raw files before generation if not using the collector:
 - `artifacts/operations/raw/compatibility_policy.json`
 - `artifacts/operations/raw/slo_error_budget_report.json`
@@ -169,6 +182,9 @@ RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=prod-lab \
 ./scripts/operations/generate_phase10_artifacts.sh
 ```
 
+The script is a thin wrapper over:
+- `rustynet ops generate-phase10-artifacts`
+
 Required source files:
 - `artifacts/phase10/source/netns_e2e_report.json`
 - `artifacts/phase10/source/leak_test_report.json`
@@ -184,12 +200,27 @@ Source evidence requirements:
 - perf report must have `soak_status=pass` and no failing metric entries
 - state transition log must include `generation=` entries
 
+Provenance requirements (fail-closed):
+- `RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH` and `RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH` are optional. If unset, Rustynet uses:
+  - `artifacts/phase10/provenance/signing_seed.hex`
+  - `artifacts/phase10/provenance/verifier_key.hex`
+- when both default key files are absent, Rustynet generates a matching Ed25519 keypair and writes owner-only files (`0600`) under an owner-only directory (`0700`); partial key-material state fails closed.
+- if `RUSTYNET_PHASE10_PROVENANCE_HOST_ID` is unset, Rustynet defaults to `ci-localhost`.
+- when set explicitly, key paths must resolve to absolute owner-only files (`<=0600`) and host id is bound into signed provenance payloads.
+- `check_phase10_readiness.sh` now requires successful `rustynet ops verify-phase10-provenance` before structural checks.
+
 Generated artifacts:
 - `artifacts/phase10/netns_e2e_report.json`
 - `artifacts/phase10/leak_test_report.json`
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/phase10/direct_relay_failover_report.json`
 - `artifacts/phase10/state_transition_audit.log`
+- `artifacts/phase10/phase10_provenance.attestation.json`
+
+Optional standalone provenance verification:
+```bash
+cargo run --quiet -p rustynet-cli -- ops verify-phase10-provenance
+```
 
 ## Membership: Governance Evidence Reports
 

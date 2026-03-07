@@ -81,7 +81,6 @@ MACOS_LAUNCHD_HELPER_PLIST_PATH="/Library/LaunchDaemons/${MACOS_LAUNCHD_HELPER_L
 export PATH="/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/sbin:/sbin:${MACOS_LOCAL_TOOLS_BIN}:${MACOS_LOCAL_TOOLS_BASE}/go/bin:${PATH}"
 
 mkdir -p "${CONFIG_DIR}"
-touch "${PEERS_FILE}"
 
 print_info() {
   printf '[info] %s\n' "$*"
@@ -244,7 +243,8 @@ enforce_host_storage_policy() {
   fi
 
   if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
-    print_err "Manual peer break-glass override must remain disabled on macOS hosts."
+    print_err "Manual peer break-glass override is no longer supported."
+    print_info "Set MANUAL_PEER_OVERRIDE=0 in ${CONFIG_FILE}."
     exit 1
   fi
 }
@@ -494,6 +494,11 @@ validate_loaded_config_or_die() {
     print_info "Allowed values: skip, on, off."
     exit 1
   fi
+  if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
+    print_err "Invalid persisted MANUAL_PEER_OVERRIDE='${MANUAL_PEER_OVERRIDE}' in ${CONFIG_FILE}."
+    print_info "Manual peer break-glass is removed. Set MANUAL_PEER_OVERRIDE=0."
+    exit 1
+  fi
 }
 
 enforce_backend_mode() {
@@ -535,41 +540,14 @@ enforce_wg_listen_port_policy() {
 }
 
 manual_peer_override_enabled() {
-  is_admin_role && [[ "${MANUAL_PEER_OVERRIDE}" == "1" || "${RUSTYNET_MANUAL_PEER_OVERRIDE:-0}" == "1" ]]
-}
-
-append_manual_peer_override_audit() {
-  local action="$1"
-  local timestamp
-  local user_name
-  local host_name
-  local line
-  timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  user_name="${SUDO_USER:-${USER:-unknown}}"
-  host_name="$(hostname -s 2>/dev/null || echo unknown)"
-  line="timestamp=${timestamp} action=${action} user=${user_name} host=${host_name}"
-
-  run_root install -d -m 0700 "$(dirname "${MANUAL_PEER_AUDIT_LOG}")"
-  printf '%s\n' "${line}" | run_root tee -a "${MANUAL_PEER_AUDIT_LOG}" >/dev/null
-  run_root chmod 600 "${MANUAL_PEER_AUDIT_LOG}"
+  return 1
 }
 
 require_manual_peer_override_authorization() {
   local action="$1"
-  local confirmation
-  if ! manual_peer_override_enabled; then
-    print_err "Manual peer programming is disabled."
-    print_info "Use centrally signed auto-tunnel assignments by default."
-    print_info "To invoke break-glass mode, set MANUAL_PEER_OVERRIDE=1 in wizard config."
-    return 1
-  fi
-  print_warn "Break-glass override requested for ${action}."
-  read -r -p "Type '${MANUAL_OVERRIDE_CONFIRMATION}' to proceed: " confirmation
-  if [[ "${confirmation}" != "${MANUAL_OVERRIDE_CONFIRMATION}" ]]; then
-    print_err "Break-glass confirmation mismatch. Operation cancelled."
-    return 1
-  fi
-  append_manual_peer_override_audit "${action}"
+  print_err "Manual peer break-glass operation is disabled: ${action}"
+  print_info "Use signed assignment workflows only (rustynet assignment issue + refresh-assignment)."
+  return 1
 }
 
 run_root() {
@@ -2810,11 +2788,133 @@ show_service_status() {
 }
 
 ensure_peer_store() {
-  if [[ ! -s "${PEERS_FILE}" ]]; then
-    cat >"${PEERS_FILE}" <<'EOF'
+  if [[ -L "${CONFIG_DIR}" ]]; then
+    print_err "Refusing to use symlink config directory: ${CONFIG_DIR}"
+    exit 1
+  fi
+  if [[ -e "${CONFIG_DIR}" && ! -d "${CONFIG_DIR}" ]]; then
+    print_err "Refusing to use non-directory config path: ${CONFIG_DIR}"
+    exit 1
+  fi
+  if ! mkdir -p "${CONFIG_DIR}"; then
+    print_err "Failed to create config directory: ${CONFIG_DIR}"
+    exit 1
+  fi
+
+  local config_owner_uid=""
+  if stat -c '%u' "${CONFIG_DIR}" >/dev/null 2>&1; then
+    config_owner_uid="$(stat -c '%u' "${CONFIG_DIR}")"
+  elif stat -f '%u' "${CONFIG_DIR}" >/dev/null 2>&1; then
+    config_owner_uid="$(stat -f '%u' "${CONFIG_DIR}")"
+  fi
+  if [[ -z "${config_owner_uid}" ]]; then
+    print_err "Unable to determine config directory owner: ${CONFIG_DIR}"
+    exit 1
+  fi
+  if [[ "${config_owner_uid}" != "$(id -u)" ]]; then
+    print_err "Config directory owner is not trusted (${CONFIG_DIR}, uid=${config_owner_uid}). Expected uid $(id -u)."
+    exit 1
+  fi
+  if ! chmod 700 "${CONFIG_DIR}" >/dev/null 2>&1; then
+    print_err "Failed to enforce 0700 mode on config directory: ${CONFIG_DIR}"
+    exit 1
+  fi
+
+  if [[ -L "${PEERS_FILE}" ]]; then
+    print_err "Refusing to use symlink peer store: ${PEERS_FILE}"
+    exit 1
+  fi
+  if [[ -e "${PEERS_FILE}" && ! -f "${PEERS_FILE}" ]]; then
+    print_err "Refusing to use non-regular peer store path: ${PEERS_FILE}"
+    exit 1
+  fi
+
+  if [[ ! -e "${PEERS_FILE}" ]]; then
+    if ! (
+      umask 077
+      cat >"${PEERS_FILE}" <<'EOF'
 # name|node_id|public_key|endpoint|cidr|role
 EOF
+    ); then
+      print_err "Failed to initialize secure peer store: ${PEERS_FILE}"
+      exit 1
+    fi
   fi
+
+  local owner_uid=""
+  if stat -c '%u' "${PEERS_FILE}" >/dev/null 2>&1; then
+    owner_uid="$(stat -c '%u' "${PEERS_FILE}")"
+  elif stat -f '%u' "${PEERS_FILE}" >/dev/null 2>&1; then
+    owner_uid="$(stat -f '%u' "${PEERS_FILE}")"
+  fi
+  if [[ -z "${owner_uid}" ]]; then
+    print_err "Unable to determine peer store owner: ${PEERS_FILE}"
+    exit 1
+  fi
+  if [[ "${owner_uid}" != "$(id -u)" ]]; then
+    print_err "Peer store owner is not trusted (${PEERS_FILE}, uid=${owner_uid}). Expected uid $(id -u)."
+    exit 1
+  fi
+
+  if ! chmod 600 "${PEERS_FILE}" >/dev/null 2>&1; then
+    print_err "Failed to enforce 0600 mode on peer store: ${PEERS_FILE}"
+    exit 1
+  fi
+}
+
+ensure_peer_store_field_safe() {
+  local label="$1"
+  local value="$2"
+  if [[ "${value}" == *"|"* ]]; then
+    print_err "Peer ${label} contains forbidden delimiter '|'."
+    return 1
+  fi
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    print_err "Peer ${label} contains forbidden newline characters."
+    return 1
+  fi
+  if printf '%s' "${value}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    print_err "Peer ${label} contains forbidden control characters."
+    return 1
+  fi
+  return 0
+}
+
+validate_peer_store_record_or_die() {
+  local name="$1"
+  local node_id="$2"
+  local public_key="$3"
+  local endpoint="$4"
+  local cidr="$5"
+  local role="$6"
+  ensure_peer_store_field_safe "name" "${name}" || return 1
+  ensure_peer_store_field_safe "node_id" "${node_id}" || return 1
+  ensure_peer_store_field_safe "public_key" "${public_key}" || return 1
+  ensure_peer_store_field_safe "endpoint" "${endpoint}" || return 1
+  ensure_peer_store_field_safe "cidr" "${cidr}" || return 1
+  ensure_peer_store_field_safe "role" "${role}" || return 1
+  return 0
+}
+
+validate_peer_store_existing_lines_or_die() {
+  local line_no=0 line name node_id public_key endpoint cidr role extra
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line_no=$((line_no + 1))
+    if [[ -z "${line}" || "${line}" == \#* ]]; then
+      continue
+    fi
+
+    IFS='|' read -r name node_id public_key endpoint cidr role extra <<<"${line}"
+    if [[ -n "${extra}" ]]; then
+      print_err "Peer store line ${line_no} is malformed (too many fields)."
+      return 1
+    fi
+    validate_peer_store_record_or_die "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${role}" || {
+      print_err "Peer store line ${line_no} failed delimiter/control-char validation."
+      return 1
+    }
+  done <"${PEERS_FILE}"
+  return 0
 }
 
 peer_endpoint_host() {
@@ -2873,6 +2973,7 @@ probe_peer_online_status() {
 
 print_saved_peers() {
   ensure_peer_store
+  validate_peer_store_existing_lines_or_die || return 1
   local name node_id public_key endpoint cidr role status
   while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
     if [[ "${name}" == \#* || -z "${name}" ]]; then
@@ -2892,6 +2993,7 @@ print_saved_peers() {
 
 print_saved_admin_peers() {
   ensure_peer_store
+  validate_peer_store_existing_lines_or_die || return 1
   awk -F'|' '
     $0 !~ /^#/ && NF >= 5 {
       role = (NF >= 6 && $6 != "") ? $6 : "unknown";
@@ -2902,39 +3004,11 @@ print_saved_admin_peers() {
   ' "${PEERS_FILE}"
 }
 
-upsert_peer() {
-  local name="$1"
-  local node_id="$2"
-  local public_key="$3"
-  local endpoint="$4"
-  local cidr="$5"
-  local role="${6:-unknown}"
-  ensure_peer_store
-  local tmp
-  tmp="$(mktemp)"
-  awk -F'|' -v n="${name}" '$0 ~ /^#/ || $1 != n { print }' "${PEERS_FILE}" >"${tmp}"
-  printf '%s|%s|%s|%s|%s|%s\n' "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${role}" >>"${tmp}"
-  mv "${tmp}" "${PEERS_FILE}"
-}
-
-remove_peer_record() {
-  local name="$1"
-  ensure_peer_store
-  local tmp
-  tmp="$(mktemp)"
-  awk -F'|' -v n="${name}" '$0 ~ /^#/ || $1 != n { print }' "${PEERS_FILE}" >"${tmp}"
-  mv "${tmp}" "${PEERS_FILE}"
-}
-
-find_peer_record() {
-  local name="$1"
-  ensure_peer_store
-  awk -F'|' -v n="${name}" '$0 !~ /^#/ && NF>=5 && $1 == n { print; exit }' "${PEERS_FILE}"
-}
-
 find_peer_record_by_node_id() {
   local node_id="$1"
   ensure_peer_store
+  validate_peer_store_existing_lines_or_die || return 1
+  ensure_peer_store_field_safe "node_id" "${node_id}" || return 1
   awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF>=5 && $2 == nid { print; exit }' "${PEERS_FILE}"
 }
 
@@ -3324,61 +3398,17 @@ print_menu_runtime_header() {
 connect_to_device() {
   require_admin_role "connect_to_device" || return 0
   require_linux_dataplane "connect_to_device" || return 0
-  local name node_id public_key endpoint_ip endpoint_port endpoint cidr peer_role
-  prompt_default name "Peer name (local label)" "peer-$(date +%H%M%S)"
-  prompt_default node_id "Peer node id" "${name}"
-  prompt_default public_key "Peer WireGuard public key (base64)" ""
-  prompt_default endpoint_ip "Peer endpoint IP or DNS" ""
-  prompt_default endpoint_port "Peer endpoint port" "51820"
-  prompt_default cidr "Peer tunnel CIDR" "100.64.0.2/32"
-  prompt_default peer_role "Peer role (admin|client|blind_exit)" "client"
-  case "${peer_role}" in
-    admin|client|blind_exit) ;;
-    *)
-      print_warn "Unsupported peer role '${peer_role}', storing as client."
-      peer_role="client"
-      ;;
-  esac
-
-  if [[ -z "${public_key}" || -z "${endpoint_ip}" ]]; then
-    print_err "Public key and endpoint are required."
-    return 1
-  fi
-
-  require_manual_peer_override_authorization "manual_peer_connect:${name}:${node_id}" || return 1
-  endpoint="${endpoint_ip}:${endpoint_port}"
-  run_root wg set "${WG_INTERFACE}" peer "${public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
-  run_root ip route replace "${cidr}" dev "${WG_INTERFACE}"
-  upsert_peer "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${peer_role}"
-  print_info "Peer ${name} configured on ${WG_INTERFACE}."
+  print_err "Manual peer add/update is disabled."
+  print_info "Use signed assignment issuance and assignment refresh (single hardened path)."
+  return 1
 }
 
 disconnect_device() {
   require_admin_role "disconnect_device" || return 0
   require_linux_dataplane "disconnect_device" || return 0
-  local name record public_key cidr
-  print_saved_peers
-  prompt_default name "Peer name to remove" ""
-  if [[ -z "${name}" ]]; then
-    print_err "Peer name is required."
-    return 1
-  fi
-  record="$(find_peer_record "${name}")"
-  if [[ -z "${record}" ]]; then
-    print_err "Peer ${name} not found."
-    return 1
-  fi
-  require_manual_peer_override_authorization "manual_peer_disconnect:${name}" || return 1
-  public_key="$(echo "${record}" | awk -F'|' '{print $3}')"
-  cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
-  if ! run_root wg set "${WG_INTERFACE}" peer "${public_key}" remove; then
-    print_warn "Peer ${name} was not present in WireGuard runtime state."
-  fi
-  if ! run_root ip route del "${cidr}" dev "${WG_INTERFACE}"; then
-    print_warn "Route ${cidr} was not present on ${WG_INTERFACE}."
-  fi
-  remove_peer_record "${name}"
-  print_info "Peer ${name} removed."
+  print_err "Manual peer remove is disabled."
+  print_info "Use signed assignment updates and assignment refresh (single hardened path)."
+  return 1
 }
 
 show_connected_devices() {
@@ -3392,27 +3422,9 @@ show_connected_devices() {
 connect_to_saved_admin_peers() {
   require_admin_role "connect_to_saved_admin_peers" || return 0
   require_linux_dataplane "connect_to_saved_admin_peers" || return 0
-  ensure_peer_store
-  require_manual_peer_override_authorization "manual_peer_admin_mesh_sync" || return 1
-
-  local configured=0
-  local failed=0
-  while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
-    [[ -z "${name}" || "${name}" == \#* ]] && continue
-    if [[ "${role:-unknown}" != "admin" ]]; then
-      continue
-    fi
-
-    if run_root wg set "${WG_INTERFACE}" peer "${public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25 \
-      && run_root ip route replace "${cidr}" dev "${WG_INTERFACE}"; then
-      configured=$((configured + 1))
-    else
-      failed=$((failed + 1))
-      print_warn "Failed to apply admin peer '${name}' (${node_id})."
-    fi
-  done <"${PEERS_FILE}"
-
-  print_info "Admin-peer sync complete: configured=${configured} failed=${failed}."
+  print_err "Manual admin-peer sync is disabled."
+  print_info "Use signed assignment workflows only (single hardened path)."
+  return 1
 }
 
 rotate_local_key() {
@@ -3432,45 +3444,9 @@ revoke_local_key() {
 apply_rotation_bundle() {
   require_admin_role "apply_rotation_bundle" || return 0
   require_linux_dataplane "apply_rotation_bundle" || return 0
-  local bundle prefix node_id new_public_key record name old_public endpoint cidr peer_role
-  prompt_default bundle "Rotation bundle (format rotation:<node_id>:<public_key>)" ""
-  if [[ -z "${bundle}" ]]; then
-    print_err "Rotation bundle is required."
-    return 1
-  fi
-  IFS=':' read -r prefix node_id new_public_key <<<"${bundle}"
-  if [[ "${prefix}" != "rotation" || -z "${node_id}" || -z "${new_public_key}" ]]; then
-    print_err "Invalid rotation bundle format."
-    return 1
-  fi
-
-  record="$(find_peer_record_by_node_id "${node_id}")"
-  if [[ -z "${record}" ]]; then
-    print_err "No saved peer found for node id ${node_id}."
-    return 1
-  fi
-
-  name="$(echo "${record}" | awk -F'|' '{print $1}')"
-  old_public="$(echo "${record}" | awk -F'|' '{print $3}')"
-  endpoint="$(echo "${record}" | awk -F'|' '{print $4}')"
-  cidr="$(echo "${record}" | awk -F'|' '{print $5}')"
-  peer_role="$(echo "${record}" | awk -F'|' '{print $6}')"
-  if [[ -z "${peer_role}" ]]; then
-    peer_role="unknown"
-  fi
-
-  if [[ "${old_public}" == "${new_public_key}" ]]; then
-    print_info "Peer ${name} already has this key."
-    return 0
-  fi
-
-  require_manual_peer_override_authorization "manual_peer_rotation_bundle:${name}:${node_id}" || return 1
-  if ! run_root wg set "${WG_INTERFACE}" peer "${old_public}" remove; then
-    print_warn "Previous peer key was not present in WireGuard runtime state."
-  fi
-  run_root wg set "${WG_INTERFACE}" peer "${new_public_key}" endpoint "${endpoint}" allowed-ips "${cidr}" persistent-keepalive 25
-  upsert_peer "${name}" "${node_id}" "${new_public_key}" "${endpoint}" "${cidr}" "${peer_role}"
-  print_info "Updated peer key for ${name} (${node_id}) without changing node identity."
+  print_err "Manual peer key-rotation apply is disabled."
+  print_info "Use signed membership/assignment key-rotation workflows only."
+  return 1
 }
 
 configure_launch_defaults() {
@@ -3625,16 +3601,10 @@ configure_values() {
   enforce_wg_listen_port_policy
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
 
-  if is_linux_host && is_admin_role; then
-    prompt_default MANUAL_PEER_OVERRIDE "Enable manual peer break-glass override (0/1)" "${MANUAL_PEER_OVERRIDE}"
-    if [[ "${MANUAL_PEER_OVERRIDE}" != "1" ]]; then
-      MANUAL_PEER_OVERRIDE="0"
-    else
-      print_warn "Manual peer break-glass override is ENABLED. All use is audit logged."
-    fi
-  else
-    MANUAL_PEER_OVERRIDE="0"
+  if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
+    print_warn "Manual peer break-glass override is removed; forcing MANUAL_PEER_OVERRIDE=0."
   fi
+  MANUAL_PEER_OVERRIDE="0"
 
   enforce_role_policy_defaults
   configure_launch_defaults
@@ -3708,7 +3678,7 @@ Current Rustynet Wizard Configuration
   fail_closed_ssh_cidrs   : ${FAIL_CLOSED_SSH_ALLOW_CIDRS}
   trust_signer_key        : ${TRUST_SIGNER_KEY_PATH}
   auto_refresh_trust      : ${AUTO_REFRESH_TRUST}
-  manual_peer_override    : ${MANUAL_PEER_OVERRIDE}
+  manual_peer_override    : ${MANUAL_PEER_OVERRIDE} (deprecated; must remain 0)
   manual_peer_audit_log   : ${MANUAL_PEER_AUDIT_LOG}
   default_launch_profile  : ${DEFAULT_LAUNCH_PROFILE}
   auto_launch_on_start    : ${AUTO_LAUNCH_ON_START}
@@ -3727,18 +3697,76 @@ offer_device_as_exit_node() {
   print_info "This device can now be selected as an exit node by peers (node id: ${DEVICE_NODE_ID})."
 }
 
-toggle_lan_access() {
-  local choice
+query_lan_access_status() {
+  local status_line selected_exit lan_access
+  status_line="$(run_rustynet_cli status 2>/dev/null || true)"
+  if [[ -z "${status_line}" ]]; then
+    print_err "Unable to query daemon status for LAN access toggle."
+    return 1
+  fi
+  selected_exit="$(extract_status_field "${status_line}" "exit_node")"
+  lan_access="$(extract_status_field "${status_line}" "lan_access")"
+  case "${lan_access}" in
+    on|true) lan_access="on" ;;
+    off|false|"") lan_access="off" ;;
+    *) lan_access="off" ;;
+  esac
+  printf '%s|%s\n' "${selected_exit}" "${lan_access}"
+}
+
+enable_lan_access_for_selected_exit() {
+  local status_pair selected_exit lan_access
   if is_blind_exit_role; then
     print_err "LAN access toggles are disabled for blind_exit role."
     return 1
   fi
-  read -r -p "LAN access [on/off]: " choice
-  case "${choice}" in
-    on) run_rustynet_cli lan-access on ;;
-    off) run_rustynet_cli lan-access off ;;
-    *) print_err "Expected 'on' or 'off'." ;;
-  esac
+
+  if ! status_pair="$(query_lan_access_status)"; then
+    return 1
+  fi
+  selected_exit="$(cut -d'|' -f1 <<<"${status_pair}")"
+  lan_access="$(cut -d'|' -f2 <<<"${status_pair}")"
+  if [[ "${lan_access}" == "on" ]]; then
+    print_info "LAN access is already enabled."
+    return 0
+  fi
+
+  if [[ -z "${selected_exit}" || "${selected_exit}" == "none" ]]; then
+    print_err "Select an exit node first, then toggle LAN access on."
+    return 1
+  fi
+
+  print_info "Enabling local LAN access through exit node '${selected_exit}'."
+  if ! run_rustynet_cli lan-access on; then
+    return 1
+  fi
+  print_info "LAN access enabled."
+  print_info "For non-default LAN CIDRs, use 'Advertise route' with the target subnet."
+  return 0
+}
+
+toggle_lan_access() {
+  local status_pair lan_access
+  if ! status_pair="$(query_lan_access_status)"; then
+    return 1
+  fi
+  lan_access="$(cut -d'|' -f2 <<<"${status_pair}")"
+  if [[ "${lan_access}" == "on" ]]; then
+    print_info "Disabling exit-node local LAN access."
+    run_rustynet_cli lan-access off
+    return $?
+  fi
+  enable_lan_access_for_selected_exit
+}
+
+enable_lan_access_after_exit_selection() {
+  if prompt_yes_no "Enable local LAN access through the selected exit node now?" "n"; then
+    if ! enable_lan_access_for_selected_exit; then
+      print_warn "Exit selection succeeded, but enabling LAN access failed."
+      return 1
+    fi
+  fi
+  return 0
 }
 
 probe_selected_exit_tunnel_status() {
@@ -3833,6 +3861,7 @@ probe_exit_node_readiness() {
 
 print_saved_exit_candidates_with_probe() {
   ensure_peer_store
+  validate_peer_store_existing_lines_or_die || return 1
   local name node_id public_key endpoint cidr role probe_result membership_state tunnel_state readiness
   local status_line current_exit_node marker
   status_line="$(run_rustynet_cli status 2>/dev/null || true)"
@@ -3934,6 +3963,7 @@ select_exit_node() {
     EXIT_CHAIN_FINAL_NODE_ID=""
     save_config
     print_info "One-hop exit selected: ${first_hop}"
+    enable_lan_access_after_exit_selection || true
     return 0
   fi
 
@@ -4005,6 +4035,7 @@ select_exit_node() {
   EXIT_CHAIN_FINAL_NODE_ID="${final_hop}"
   save_config
   print_info "Two-hop chain selection saved: ${first_hop} -> ${final_hop}"
+  enable_lan_access_after_exit_selection || true
 }
 
 advertise_route() {
@@ -4171,16 +4202,12 @@ menu_peer_exit_routing() {
       cat <<'EOF'
 
 Peer, Exit Node & Routing
-  1) Connect to device (break-glass manual peer add/update)
-  2) Remove device peer (break-glass manual peer remove)
-  3) Select exit node
-  4) Disable exit node
-  5) Offer this device as an exit node
-  6) Toggle LAN access
-  7) Advertise route
-  8) Apply peer key rotation bundle (break-glass manual path)
-  9) Sync all saved admin peers (admin mesh break-glass)
-  10) Show saved admin peers
+  1) Select exit node
+  2) Disable exit node
+  3) Offer this device as an exit node
+  4) Toggle exit local LAN access
+  5) Advertise route
+  6) Show saved admin peers
   0) Back
 EOF
     else
@@ -4189,7 +4216,7 @@ EOF
 Client Connectivity
   1) Select exit node
   2) Disable exit node
-  3) Toggle LAN access
+  3) Toggle exit local LAN access
   4) Show saved admin peers
   0) Back
 EOF
@@ -4201,16 +4228,12 @@ EOF
     fi
     if is_admin_role; then
       case "${choice}" in
-        1) connect_to_device ;;
-        2) disconnect_device ;;
-        3) select_exit_node ;;
-        4) run_rustynet_cli exit-node off ;;
-        5) offer_device_as_exit_node ;;
-        6) toggle_lan_access ;;
-        7) advertise_route ;;
-        8) apply_rotation_bundle ;;
-        9) connect_to_saved_admin_peers ;;
-        10)
+        1) select_exit_node ;;
+        2) run_rustynet_cli exit-node off ;;
+        3) offer_device_as_exit_node ;;
+        4) toggle_lan_access ;;
+        5) advertise_route ;;
+        6)
           echo "Saved admin peers:"
           print_saved_admin_peers
           ;;
@@ -4504,6 +4527,7 @@ enforce_host_storage_policy
 sanitize_launch_defaults
 enforce_backend_mode
 enforce_wg_listen_port_policy
+ensure_peer_store
 
 if [[ "${SETUP_COMPLETE}" != "1" ]]; then
   print_warn "Rustynet is not configured yet."

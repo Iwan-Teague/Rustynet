@@ -1,15 +1,15 @@
 {
-  "phase": "phase10",
-  "suite": "direct_relay_failover",
-  "evidence_mode": "measured",
-  "environment": "ci",
-  "captured_at_unix": 1772814044,
-  "status": "pass",
+  "captured_at_unix": 1772844410,
   "checks": {
     "direct_to_relay_failover": "pass",
     "relay_to_direct_failback": "pass"
   },
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "phase": "phase10",
   "source_artifacts": [
-    "artifacts/phase10/source/direct_relay_failover_report.json"
-  ]
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/direct_relay_failover_report.json"
+  ],
+  "status": "pass",
+  "suite": "direct_relay_failover"
 }

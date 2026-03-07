@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 #[cfg(unix)]
 use nix::unistd::Uid;
@@ -25,6 +26,10 @@ use rand::RngCore;
 use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
+
+const SIGNING_SEED_HKDF_SALT_V1: &[u8] = b"rustynet-control-signing-seed-hkdf-salt-v1";
+const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-signing-v1";
+const ACCESS_TOKEN_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-access-token-signing-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRateLimitConfig {
@@ -1504,9 +1509,9 @@ pub struct ControlPlaneCore {
 impl ControlPlaneCore {
     pub fn new(mut signing_secret: Vec<u8>, policy: PolicySet) -> Self {
         let mut assignment_seed =
-            derive_signing_seed(b"rustynet-control-assignment-signing-v1", &signing_secret);
+            derive_signing_seed(ASSIGNMENT_SIGNING_SEED_INFO_V1, &signing_secret);
         let mut access_token_seed =
-            derive_signing_seed(b"rustynet-control-access-token-signing-v1", &signing_secret);
+            derive_signing_seed(ACCESS_TOKEN_SIGNING_SEED_INFO_V1, &signing_secret);
         signing_secret.zeroize();
 
         let assignment_signing_key = SigningKey::from_bytes(&assignment_seed);
@@ -2005,12 +2010,10 @@ impl fmt::Display for ControlPlaneError {
 impl std::error::Error for ControlPlaneError {}
 
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(secret);
-    let digest = hasher.finalize();
     let mut seed = [0u8; 32];
-    seed.copy_from_slice(&digest[..32]);
+    let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
+    hkdf.expand(domain, &mut seed)
+        .expect("hkdf expand length is fixed and valid");
     seed
 }
 
@@ -2147,12 +2150,13 @@ fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbuseAlertPolicy, ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard,
-        AutoTunnelBundleRequest, ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion,
-        CredentialError, EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision,
-        PolicyGuard, ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
+        ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
+        ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
+        ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
+        EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
+        ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
         ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TrustState, load_trust_state, persist_trust_state,
+        TrustState, derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -3003,6 +3007,22 @@ mod tests {
             tampered_result.err(),
             Some(AuthError::TokenSignatureInvalid)
         );
+    }
+
+    #[test]
+    fn signing_seed_derivation_uses_stable_hkdf_vectors() {
+        let assignment_seed =
+            derive_signing_seed(ASSIGNMENT_SIGNING_SEED_INFO_V1, b"control-secret");
+        let access_seed = derive_signing_seed(ACCESS_TOKEN_SIGNING_SEED_INFO_V1, b"control-secret");
+        assert_eq!(
+            hex_bytes(&assignment_seed),
+            "823450eb42a8e622264f36041cc7c2bbe1f39b90eabb622f1b73c35aa496764a"
+        );
+        assert_eq!(
+            hex_bytes(&access_seed),
+            "8ae34416e7e185594a0cd9e154b8ae2885e2f70e0e9470bfeb4ab128fb42aac4"
+        );
+        assert_ne!(assignment_seed, access_seed);
     }
 
     #[test]

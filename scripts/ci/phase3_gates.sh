@@ -6,20 +6,17 @@ cd "$ROOT_DIR"
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo check --workspace --all-targets --all-features
+# Enforce compiler-level unsafe prohibition for workspace code paths.
+PHASE3_UNSAFE_RUSTFLAGS="${RUSTFLAGS:-} -Dunsafe_code -Dunsafe_op_in_unsafe_fn"
+RUSTFLAGS="${PHASE3_UNSAFE_RUSTFLAGS}" cargo check --workspace --all-targets --all-features
 cargo test --workspace --all-targets --all-features
 
 scripts/perf/run_phase1_baseline.sh
 scripts/perf/run_phase3_baseline.sh
 
-if rg -n "(Wireguard|WireGuard|wg[-_]|wgctrl)" \
-  crates/rustynet-control crates/rustynet-policy crates/rustynet-crypto \
-  crates/rustynet-backend-api crates/rustynet-cli crates/rustynet-relay; then
-  echo "WireGuard leakage gate failed"
-  exit 1
-fi
+./scripts/ci/check_backend_boundary_leakage.sh
 
-if rg -n "\\bunsafe\\b" crates; then
+if ! ./scripts/ci/check_no_unsafe_code.sh; then
   echo "Unsafe code gate failed"
   exit 1
 fi

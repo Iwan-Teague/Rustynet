@@ -20,6 +20,8 @@ Success criteria:
 - Phase E started: added Rust ops `prepare-system-dirs`, `apply-blind-exit-lockdown`, `init-membership`, and `refresh-signed-trust`; migrated `start.sh` privilege paths are Rust-only and fail closed.
 - Phase E progress: `ensure_wireguard_keys` is enforced through `rustynet ops bootstrap-wireguard-custody` with fail-closed behavior.
 - Phase F complete: Phase 6 parity probe/report/bundle generators are Rust-backed (`rustynet ops collect-platform-probe`, `rustynet ops generate-platform-parity-report`, `rustynet ops collect-platform-parity-bundle`); release scripts are thin wrappers that only dispatch to Rust commands.
+- Phase G complete: Phase9/Phase10 evidence pipeline is Rust-backed (`rustynet ops collect-phase9-raw-evidence`, `rustynet ops generate-phase9-artifacts`, `rustynet ops generate-phase10-artifacts`); shell/Python collection/generation logic removed from active scripts.
+- Phase H complete: phase1 measured input collection + baseline orchestration are Rust-backed (`rustynet ops collect-phase1-measured-input`, `rustynet ops run-phase1-baseline`); legacy shell/Python collector logic and shell `source` ingestion are removed from the active path.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
@@ -225,16 +227,7 @@ Priority is based on: `privilege level` + `secret handling` + `state mutation ri
 - `start_or_restart_service`
 - `disconnect_vpn`
 
-2. Operations evidence pipeline
-- `scripts/operations/collect_phase9_raw_evidence.sh`
-- `scripts/operations/generate_phase9_artifacts.sh`
-- `scripts/operations/generate_phase10_artifacts.sh`
-
-3. Performance measured-input pipeline
-- `scripts/perf/collect_phase1_measured_env.sh`
-- `scripts/perf/run_phase1_baseline.sh`
-
-4. Optional later (test harness hardening)
+2. Optional later (test harness hardening)
 - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh`
 
 Keep as shell wrappers for now:
@@ -325,16 +318,17 @@ Scope:
 - replace shell+python measured env collector and baseline launcher logic with Rust.
 
 Recommended Rust command additions:
-- `rustynet perf collect-phase1-measured-env`
-- `rustynet perf run-phase1-baseline`
+- `rustynet ops collect-phase1-measured-input`
+- `rustynet ops run-phase1-baseline`
 
 Security controls:
 - remove `source` of generated shell files from baseline flow,
 - validate numeric ranges and required metrics with strict typed parsing,
+- enforce secure source/output filesystem permissions (reject group/world writable paths),
 - produce deterministic output files with explicit permissions.
 
 Validation:
-- `./scripts/perf/run_phase1_baseline.sh` parity (during transition),
+- `./scripts/perf/run_phase1_baseline.sh`,
 - `./scripts/ci/phase1_gates.sh`,
 - `./scripts/ci/perf_regression_gate.sh`.
 

@@ -23,6 +23,9 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Trust evidence file present at `/var/lib/rustynet/rustynetd.trust`.
 - Trust verifier key present at `/etc/rustynet/trust-evidence.pub`.
 - If unattended trust auto-refresh is enabled: encrypted signer key present at `/etc/rustynet/trust-evidence.key` (`0600`) and passphrase injected via systemd credential (`%d/signing_key_passphrase`).
+- Phase10 provenance signing seed file present at absolute path configured by `RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH` (owner-only mode `<=0600`, 32-byte hex seed).
+- Matching phase10 provenance verifier key file present at absolute path configured by `RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH` (owner-only mode `<=0600`, 32-byte hex key).
+- `RUSTYNET_PHASE10_PROVENANCE_HOST_ID` configured and stable for the host/environment.
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
@@ -72,6 +75,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `sudo systemctl list-timers --all | grep rustynetd-trust-refresh`
 - `sudo journalctl -u rustynetd-trust-refresh.service -n 50 --no-pager`
 - `sudo systemd-creds decrypt --name=signing_key_passphrase /etc/rustynet/credentials/signing_key_passphrase.cred /tmp/signing_key_passphrase.test && sudo rm -f /tmp/signing_key_passphrase.test`
+- `RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH=<absolute-path> RUSTYNET_PHASE10_PROVENANCE_HOST_ID=<host-id> cargo run --quiet -p rustynet-cli -- ops verify-phase10-provenance`
 - `./scripts/ci/phase10_gates.sh` (validates pre-generated measured artifacts in `artifacts/phase10`)
 
 ## 7) Required Evidence for Sign-Off
@@ -80,6 +84,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/phase10/direct_relay_failover_report.json`
 - `artifacts/phase10/state_transition_audit.log`
+- `artifacts/phase10/phase10_provenance.attestation.json`
 - Limitation note: current failover artifact demonstrates path-mode transition/audit evidence; full relay transport failover integration remains open code work.
 
 ## 8) Security Invariants

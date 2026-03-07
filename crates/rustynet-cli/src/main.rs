@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod ops_install_systemd;
+mod ops_phase1;
+mod ops_phase9;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -161,6 +163,12 @@ enum OpsCommand {
     RefreshSignedTrust,
     BootstrapTunnelCustody,
     RefreshAssignment,
+    CollectPhase1MeasuredInput,
+    RunPhase1Baseline,
+    CollectPhase9RawEvidence,
+    GeneratePhase9Artifacts,
+    GeneratePhase10Artifacts,
+    VerifyPhase10Provenance,
     CollectPlatformProbe,
     GeneratePlatformParityReport,
     CollectPlatformParityBundle,
@@ -302,6 +310,42 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops refresh-assignment does not accept options".to_string());
             }
             Ok(OpsCommand::RefreshAssignment)
+        }
+        "collect-phase1-measured-input" => {
+            if args.len() != 1 {
+                return Err("ops collect-phase1-measured-input does not accept options".to_string());
+            }
+            Ok(OpsCommand::CollectPhase1MeasuredInput)
+        }
+        "run-phase1-baseline" => {
+            if args.len() != 1 {
+                return Err("ops run-phase1-baseline does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase1Baseline)
+        }
+        "collect-phase9-raw-evidence" => {
+            if args.len() != 1 {
+                return Err("ops collect-phase9-raw-evidence does not accept options".to_string());
+            }
+            Ok(OpsCommand::CollectPhase9RawEvidence)
+        }
+        "generate-phase9-artifacts" => {
+            if args.len() != 1 {
+                return Err("ops generate-phase9-artifacts does not accept options".to_string());
+            }
+            Ok(OpsCommand::GeneratePhase9Artifacts)
+        }
+        "generate-phase10-artifacts" => {
+            if args.len() != 1 {
+                return Err("ops generate-phase10-artifacts does not accept options".to_string());
+            }
+            Ok(OpsCommand::GeneratePhase10Artifacts)
+        }
+        "verify-phase10-provenance" => {
+            if args.len() != 1 {
+                return Err("ops verify-phase10-provenance does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyPhase10Provenance)
         }
         "collect-platform-probe" => {
             if args.len() != 1 {
@@ -1120,6 +1164,18 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
         OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),
         OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
+        OpsCommand::CollectPhase1MeasuredInput => {
+            ops_phase1::execute_ops_collect_phase1_measured_input()
+        }
+        OpsCommand::RunPhase1Baseline => ops_phase1::execute_ops_run_phase1_baseline(),
+        OpsCommand::CollectPhase9RawEvidence => {
+            ops_phase9::execute_ops_collect_phase9_raw_evidence()
+        }
+        OpsCommand::GeneratePhase9Artifacts => ops_phase9::execute_ops_generate_phase9_artifacts(),
+        OpsCommand::GeneratePhase10Artifacts => {
+            ops_phase9::execute_ops_generate_phase10_artifacts()
+        }
+        OpsCommand::VerifyPhase10Provenance => ops_phase9::execute_ops_verify_phase10_provenance(),
         OpsCommand::CollectPlatformProbe => execute_ops_collect_platform_probe(),
         OpsCommand::GeneratePlatformParityReport => execute_ops_generate_platform_parity_report(),
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
@@ -2281,7 +2337,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
         && legacy_plaintext_private_key_path.exists()
     {
         return Err(format!(
-            "legacy plaintext WireGuard key detected at {}; implicit migration is disabled. Move it to canonical runtime path {} and rerun, or rotate/reinitialize keys explicitly",
+            "legacy plaintext tunnel private key detected at {}; implicit migration is disabled. Move it to canonical runtime path {} and rerun, or rotate/reinitialize keys explicitly",
             legacy_plaintext_private_key_path.display(),
             config.runtime_private_key_path.display()
         ));
@@ -3931,11 +3987,24 @@ fn env_required_nonempty(key: &str, label: &str) -> Result<String, String> {
 }
 
 fn env_path_or_default(key: &str, default: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(env_string_or_default(key, default)?);
-    if !path.is_absolute() {
-        return Err(format!("path must be absolute: {}", path.display()));
+    if let Some(raw) = env_optional_string(key)? {
+        let configured_path = PathBuf::from(raw);
+        if !configured_path.is_absolute() {
+            return Err(format!(
+                "path must be absolute: {}",
+                configured_path.display()
+            ));
+        }
+        return Ok(configured_path);
     }
-    Ok(path)
+
+    let default_path = PathBuf::from(default);
+    if default_path.is_absolute() {
+        return Ok(default_path);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("resolve current directory failed: {err}"))?;
+    Ok(cwd.join(default_path))
 }
 
 fn env_required_path(key: &str) -> Result<PathBuf, String> {
@@ -4844,6 +4913,12 @@ fn help_text() -> String {
         "  ops refresh-signed-trust",
         "  ops bootstrap-wireguard-custody",
         "  ops refresh-assignment",
+        "  ops collect-phase1-measured-input",
+        "  ops run-phase1-baseline",
+        "  ops collect-phase9-raw-evidence",
+        "  ops generate-phase9-artifacts",
+        "  ops generate-phase10-artifacts",
+        "  ops verify-phase10-provenance",
         "  ops collect-platform-probe",
         "  ops generate-platform-parity-report",
         "  ops collect-platform-parity-bundle",
@@ -5043,6 +5118,31 @@ mod tests {
 
         let assignment = parse_command(&["ops".to_string(), "refresh-assignment".to_string()]);
         assert!(format!("{assignment:?}").contains("RefreshAssignment"));
+
+        let collect_phase1 = parse_command(&[
+            "ops".to_string(),
+            "collect-phase1-measured-input".to_string(),
+        ]);
+        assert!(format!("{collect_phase1:?}").contains("CollectPhase1MeasuredInput"));
+
+        let run_phase1 = parse_command(&["ops".to_string(), "run-phase1-baseline".to_string()]);
+        assert!(format!("{run_phase1:?}").contains("RunPhase1Baseline"));
+
+        let collect_phase9_raw =
+            parse_command(&["ops".to_string(), "collect-phase9-raw-evidence".to_string()]);
+        assert!(format!("{collect_phase9_raw:?}").contains("CollectPhase9RawEvidence"));
+
+        let generate_phase9 =
+            parse_command(&["ops".to_string(), "generate-phase9-artifacts".to_string()]);
+        assert!(format!("{generate_phase9:?}").contains("GeneratePhase9Artifacts"));
+
+        let generate_phase10 =
+            parse_command(&["ops".to_string(), "generate-phase10-artifacts".to_string()]);
+        assert!(format!("{generate_phase10:?}").contains("GeneratePhase10Artifacts"));
+
+        let verify_phase10_provenance =
+            parse_command(&["ops".to_string(), "verify-phase10-provenance".to_string()]);
+        assert!(format!("{verify_phase10_provenance:?}").contains("VerifyPhase10Provenance"));
 
         let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));

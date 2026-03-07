@@ -1,33 +1,33 @@
 {
-  "evidence_mode": "measured",
-  "captured_at_unix": 1772814039,
+  "captured_at_unix": 1772844403,
   "environment": "ci",
-  "source_artifacts": [
-    "artifacts/release/raw/platform_parity_linux.json",
-    "artifacts/release/raw/platform_parity_macos.json",
-    "artifacts/release/raw/platform_parity_windows.json"
-  ],
+  "evidence_mode": "measured",
   "platform_results": [
     {
+      "dns_hook_ready": true,
+      "firewall_hook_ready": true,
+      "leak_matrix_passed": true,
       "platform": "linux",
-      "route_hook_ready": true,
-      "dns_hook_ready": true,
-      "firewall_hook_ready": true,
-      "leak_matrix_passed": true
+      "route_hook_ready": true
     },
     {
+      "dns_hook_ready": true,
+      "firewall_hook_ready": true,
+      "leak_matrix_passed": true,
       "platform": "macos",
-      "route_hook_ready": true,
-      "dns_hook_ready": true,
-      "firewall_hook_ready": true,
-      "leak_matrix_passed": true
+      "route_hook_ready": true
     },
     {
-      "platform": "windows",
-      "route_hook_ready": true,
       "dns_hook_ready": true,
       "firewall_hook_ready": true,
-      "leak_matrix_passed": true
+      "leak_matrix_passed": true,
+      "platform": "windows",
+      "route_hook_ready": true
     }
+  ],
+  "source_artifacts": [
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/release/raw/platform_parity_linux.json",
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/release/raw/platform_parity_macos.json",
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/release/raw/platform_parity_windows.json"
   ]
 }

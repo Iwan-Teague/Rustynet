@@ -31,16 +31,20 @@ Guarantee that WireGuard remains the default backend adapter while the control/p
 ## Enforcement Points
 - `crates/rustynet-backend-api/src/lib.rs` (`TunnelBackend` contract)
 - `crates/rustynet-control/src/ga.rs` (`BackendAgilityValidation::passes`)
-- `scripts/ci/phase1_gates.sh` (WireGuard leakage gate)
+- `scripts/ci/check_backend_boundary_leakage.sh` (shared protocol-boundary leakage gate)
+- `scripts/ci/phase1_gates.sh` (invokes shared leakage gate)
 - `scripts/ci/phase9_gates.sh` (backend conformance + agility checks)
 
-## Current Caveat and Security Risk
-- Current leakage regex checks are case-sensitive (`Wireguard|WireGuard|wg[-_]|wgctrl`) in CI scripts.
-- Security risk truth: lowercase `wireguard` references can bypass the automated leakage gate and allow protocol-coupling drift in crates intended to stay protocol-agnostic.
-- Risk level: medium architectural-security risk (higher long-term risk via boundary erosion, lower immediate exploitability).
-- Required handling until gate hardening lands:
-  - treat backend-boundary review as a mandatory human security-review item,
-  - block release if any lowercase `wireguard` coupling is found in protocol-agnostic crates.
+## Boundary Leakage Gate (Hardened)
+- Gate logic is centralized in `scripts/ci/check_backend_boundary_leakage.sh`.
+- Scan behavior is case-insensitive and fail-closed for protocol-specific tokens (`wireguard`, `wg-`, `wg_`, `wgctrl`).
+- Scan scope is protocol-agnostic runtime code only:
+  - `crates/rustynet-control/src`
+  - `crates/rustynet-policy/src`
+  - `crates/rustynet-crypto/src`
+  - `crates/rustynet-backend-api/src`
+  - `crates/rustynet-relay/src`
+- Shared use across phase gates removes regex drift and closes lowercase bypass class.
 
 ## Evidence
 Artifact:

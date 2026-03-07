@@ -1,15 +1,15 @@
 {
-  "phase": "phase10",
-  "suite": "leak_prevention",
-  "evidence_mode": "measured",
-  "environment": "ci",
-  "captured_at_unix": 1772814044,
-  "status": "pass",
+  "captured_at_unix": 1772844410,
   "checks": {
-    "tunnel_fail_closed": "pass",
-    "dns_fail_closed": "pass"
+    "dns_fail_closed": "pass",
+    "tunnel_fail_closed": "pass"
   },
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "phase": "phase10",
   "source_artifacts": [
-    "artifacts/phase10/source/leak_test_report.json"
-  ]
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/leak_test_report.json"
+  ],
+  "status": "pass",
+  "suite": "leak_prevention"
 }

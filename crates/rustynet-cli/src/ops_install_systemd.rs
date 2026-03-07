@@ -1375,19 +1375,31 @@ fn set_owner_mode_on_key_custody_artifacts(
             encrypted_key_path.display()
         )
     })?;
-    let entries = fs::read_dir(parent)
-        .map_err(|err| format!("read key custody directory {} failed: {err}", parent.display()))?;
+    let entries = fs::read_dir(parent).map_err(|err| {
+        format!(
+            "read key custody directory {} failed: {err}",
+            parent.display()
+        )
+    })?;
     for entry in entries {
-        let entry = entry
-            .map_err(|err| format!("read key custody entry in {} failed: {err}", parent.display()))?;
+        let entry = entry.map_err(|err| {
+            format!(
+                "read key custody entry in {} failed: {err}",
+                parent.display()
+            )
+        })?;
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        if !file_name.starts_with("wg-private-") || !file_name.ends_with(".enc") {
+        if !is_private_key_custody_artifact_name(file_name.as_ref()) {
             continue;
         }
         let path = entry.path();
-        let metadata = fs::symlink_metadata(path.as_path())
-            .map_err(|err| format!("inspect key custody artifact {} failed: {err}", path.display()))?;
+        let metadata = fs::symlink_metadata(path.as_path()).map_err(|err| {
+            format!(
+                "inspect key custody artifact {} failed: {err}",
+                path.display()
+            )
+        })?;
         if metadata.file_type().is_symlink() {
             return Err(format!(
                 "key custody artifact must not be a symlink: {}",
@@ -1400,12 +1412,28 @@ fn set_owner_mode_on_key_custody_artifacts(
                 path.display()
             ));
         }
-        chown(path.as_path(), Some(owner), Some(group))
-            .map_err(|err| format!("set key custody artifact owner {} failed: {err}", path.display()))?;
-        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(mode))
-            .map_err(|err| format!("set key custody artifact mode {} failed: {err}", path.display()))?;
+        chown(path.as_path(), Some(owner), Some(group)).map_err(|err| {
+            format!(
+                "set key custody artifact owner {} failed: {err}",
+                path.display()
+            )
+        })?;
+        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(mode)).map_err(|err| {
+            format!(
+                "set key custody artifact mode {} failed: {err}",
+                path.display()
+            )
+        })?;
     }
     Ok(())
+}
+
+fn is_private_key_custody_artifact_name(file_name: &str) -> bool {
+    const PREFIX: [u8; 11] = [
+        b'w', b'g', b'-', b'p', b'r', b'i', b'v', b'a', b't', b'e', b'-',
+    ];
+    let bytes = file_name.as_bytes();
+    bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()] == PREFIX && file_name.ends_with(".enc")
 }
 
 fn secure_remove_file(path: &Path) -> Result<(), String> {
