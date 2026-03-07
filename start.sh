@@ -22,6 +22,8 @@ AUTO_TUNNEL_WATERMARK_PATH="/var/lib/rustynet/rustynetd.assignment.watermark"
 AUTO_TUNNEL_MAX_AGE_SECS="300"
 WG_INTERFACE="rustynet0"
 WG_LISTEN_PORT="51820"
+AUTO_PORT_FORWARD_EXIT="0"
+AUTO_PORT_FORWARD_LEASE_SECS="1200"
 WG_PRIVATE_KEY_PATH="/run/rustynet/wireguard.key"
 WG_ENCRYPTED_PRIVATE_KEY_PATH="/var/lib/rustynet/keys/wireguard.key.enc"
 WG_KEY_PASSPHRASE_PATH="/var/lib/rustynet/keys/wireguard.passphrase"
@@ -335,6 +337,7 @@ enforce_role_policy_defaults() {
         DEFAULT_LAUNCH_PROFILE="quick-connect"
         ;;
     esac
+    AUTO_PORT_FORWARD_EXIT="0"
     return 0
   fi
 
@@ -357,7 +360,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|AUTO_PORT_FORWARD_EXIT|AUTO_PORT_FORWARD_LEASE_SECS|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -536,6 +539,24 @@ enforce_wg_listen_port_policy() {
   if ! [[ "${WG_LISTEN_PORT}" =~ ^[0-9]+$ ]] || (( WG_LISTEN_PORT < 1 || WG_LISTEN_PORT > 65535 )); then
     print_err "Invalid WG_LISTEN_PORT '${WG_LISTEN_PORT}'. Expected numeric range 1..65535."
     exit 1
+  fi
+}
+
+enforce_auto_port_forward_policy() {
+  if [[ "${AUTO_PORT_FORWARD_EXIT}" != "1" ]]; then
+    AUTO_PORT_FORWARD_EXIT="0"
+  fi
+  if ! [[ "${AUTO_PORT_FORWARD_LEASE_SECS}" =~ ^[0-9]+$ ]] || (( AUTO_PORT_FORWARD_LEASE_SECS < 60 )); then
+    print_err "Invalid AUTO_PORT_FORWARD_LEASE_SECS '${AUTO_PORT_FORWARD_LEASE_SECS}'. Expected numeric value >= 60."
+    exit 1
+  fi
+  if ! is_linux_host && [[ "${AUTO_PORT_FORWARD_EXIT}" == "1" ]]; then
+    print_warn "Auto port-forward is currently supported only on Linux. Forcing AUTO_PORT_FORWARD_EXIT=0."
+    AUTO_PORT_FORWARD_EXIT="0"
+  fi
+  if ! is_admin_role && ! is_blind_exit_role && [[ "${AUTO_PORT_FORWARD_EXIT}" == "1" ]]; then
+    print_warn "Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '${NODE_ROLE}'."
+    AUTO_PORT_FORWARD_EXIT="0"
   fi
 }
 
@@ -881,6 +902,8 @@ save_config() {
     printf 'AUTO_TUNNEL_MAX_AGE_SECS=%s\n' "${AUTO_TUNNEL_MAX_AGE_SECS}"
     printf 'WG_INTERFACE=%s\n' "${WG_INTERFACE}"
     printf 'WG_LISTEN_PORT=%s\n' "${WG_LISTEN_PORT}"
+    printf 'AUTO_PORT_FORWARD_EXIT=%s\n' "${AUTO_PORT_FORWARD_EXIT}"
+    printf 'AUTO_PORT_FORWARD_LEASE_SECS=%s\n' "${AUTO_PORT_FORWARD_LEASE_SECS}"
     printf 'WG_PRIVATE_KEY_PATH=%s\n' "${WG_PRIVATE_KEY_PATH}"
     printf 'WG_ENCRYPTED_PRIVATE_KEY_PATH=%s\n' "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     printf 'WG_KEY_PASSPHRASE_PATH=%s\n' "${WG_KEY_PASSPHRASE_PATH}"
@@ -2075,6 +2098,7 @@ write_daemon_environment() {
   enforce_backend_mode
   enforce_fail_closed_ssh_policy
   enforce_wg_listen_port_policy
+  enforce_auto_port_forward_policy
   if is_macos_host; then
     return 0
   fi
@@ -2118,6 +2142,8 @@ write_daemon_environment() {
       RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
       RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
       RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
+      RUSTYNET_AUTO_PORT_FORWARD_EXIT="$( [[ "${AUTO_PORT_FORWARD_EXIT}" == "1" ]] && echo true || echo false )" \
+      RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS="${AUTO_PORT_FORWARD_LEASE_SECS}" \
       RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
       RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
       RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
@@ -2788,133 +2814,27 @@ show_service_status() {
 }
 
 ensure_peer_store() {
-  if [[ -L "${CONFIG_DIR}" ]]; then
-    print_err "Refusing to use symlink config directory: ${CONFIG_DIR}"
-    exit 1
-  fi
-  if [[ -e "${CONFIG_DIR}" && ! -d "${CONFIG_DIR}" ]]; then
-    print_err "Refusing to use non-directory config path: ${CONFIG_DIR}"
-    exit 1
-  fi
-  if ! mkdir -p "${CONFIG_DIR}"; then
-    print_err "Failed to create config directory: ${CONFIG_DIR}"
-    exit 1
-  fi
-
-  local config_owner_uid=""
-  if stat -c '%u' "${CONFIG_DIR}" >/dev/null 2>&1; then
-    config_owner_uid="$(stat -c '%u' "${CONFIG_DIR}")"
-  elif stat -f '%u' "${CONFIG_DIR}" >/dev/null 2>&1; then
-    config_owner_uid="$(stat -f '%u' "${CONFIG_DIR}")"
-  fi
-  if [[ -z "${config_owner_uid}" ]]; then
-    print_err "Unable to determine config directory owner: ${CONFIG_DIR}"
-    exit 1
-  fi
-  if [[ "${config_owner_uid}" != "$(id -u)" ]]; then
-    print_err "Config directory owner is not trusted (${CONFIG_DIR}, uid=${config_owner_uid}). Expected uid $(id -u)."
-    exit 1
-  fi
-  if ! chmod 700 "${CONFIG_DIR}" >/dev/null 2>&1; then
-    print_err "Failed to enforce 0700 mode on config directory: ${CONFIG_DIR}"
-    exit 1
-  fi
-
-  if [[ -L "${PEERS_FILE}" ]]; then
-    print_err "Refusing to use symlink peer store: ${PEERS_FILE}"
-    exit 1
-  fi
-  if [[ -e "${PEERS_FILE}" && ! -f "${PEERS_FILE}" ]]; then
-    print_err "Refusing to use non-regular peer store path: ${PEERS_FILE}"
-    exit 1
-  fi
-
-  if [[ ! -e "${PEERS_FILE}" ]]; then
-    if ! (
-      umask 077
-      cat >"${PEERS_FILE}" <<'EOF'
-# name|node_id|public_key|endpoint|cidr|role
-EOF
-    ); then
-      print_err "Failed to initialize secure peer store: ${PEERS_FILE}"
-      exit 1
+  local output=""
+  if ! output="$(run_rustynet_cli ops peer-store-validate --config-dir "${CONFIG_DIR}" --peers-file "${PEERS_FILE}" 2>&1)"; then
+    print_err "Peer-store validation failed."
+    if [[ -n "${output}" ]]; then
+      print_err "${output}"
     fi
-  fi
-
-  local owner_uid=""
-  if stat -c '%u' "${PEERS_FILE}" >/dev/null 2>&1; then
-    owner_uid="$(stat -c '%u' "${PEERS_FILE}")"
-  elif stat -f '%u' "${PEERS_FILE}" >/dev/null 2>&1; then
-    owner_uid="$(stat -f '%u' "${PEERS_FILE}")"
-  fi
-  if [[ -z "${owner_uid}" ]]; then
-    print_err "Unable to determine peer store owner: ${PEERS_FILE}"
-    exit 1
-  fi
-  if [[ "${owner_uid}" != "$(id -u)" ]]; then
-    print_err "Peer store owner is not trusted (${PEERS_FILE}, uid=${owner_uid}). Expected uid $(id -u)."
-    exit 1
-  fi
-
-  if ! chmod 600 "${PEERS_FILE}" >/dev/null 2>&1; then
-    print_err "Failed to enforce 0600 mode on peer store: ${PEERS_FILE}"
-    exit 1
+    return 1
   fi
 }
 
-ensure_peer_store_field_safe() {
-  local label="$1"
-  local value="$2"
-  if [[ "${value}" == *"|"* ]]; then
-    print_err "Peer ${label} contains forbidden delimiter '|'."
-    return 1
+peer_store_list_records() {
+  local role_filter="${1:-}"
+  local node_id_filter="${2:-}"
+  local args=(ops peer-store-list --config-dir "${CONFIG_DIR}" --peers-file "${PEERS_FILE}")
+  if [[ -n "${role_filter}" ]]; then
+    args+=(--role "${role_filter}")
   fi
-  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
-    print_err "Peer ${label} contains forbidden newline characters."
-    return 1
+  if [[ -n "${node_id_filter}" ]]; then
+    args+=(--node-id "${node_id_filter}")
   fi
-  if printf '%s' "${value}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
-    print_err "Peer ${label} contains forbidden control characters."
-    return 1
-  fi
-  return 0
-}
-
-validate_peer_store_record_or_die() {
-  local name="$1"
-  local node_id="$2"
-  local public_key="$3"
-  local endpoint="$4"
-  local cidr="$5"
-  local role="$6"
-  ensure_peer_store_field_safe "name" "${name}" || return 1
-  ensure_peer_store_field_safe "node_id" "${node_id}" || return 1
-  ensure_peer_store_field_safe "public_key" "${public_key}" || return 1
-  ensure_peer_store_field_safe "endpoint" "${endpoint}" || return 1
-  ensure_peer_store_field_safe "cidr" "${cidr}" || return 1
-  ensure_peer_store_field_safe "role" "${role}" || return 1
-  return 0
-}
-
-validate_peer_store_existing_lines_or_die() {
-  local line_no=0 line name node_id public_key endpoint cidr role extra
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line_no=$((line_no + 1))
-    if [[ -z "${line}" || "${line}" == \#* ]]; then
-      continue
-    fi
-
-    IFS='|' read -r name node_id public_key endpoint cidr role extra <<<"${line}"
-    if [[ -n "${extra}" ]]; then
-      print_err "Peer store line ${line_no} is malformed (too many fields)."
-      return 1
-    fi
-    validate_peer_store_record_or_die "${name}" "${node_id}" "${public_key}" "${endpoint}" "${cidr}" "${role}" || {
-      print_err "Peer store line ${line_no} failed delimiter/control-char validation."
-      return 1
-    }
-  done <"${PEERS_FILE}"
-  return 0
+  run_rustynet_cli "${args[@]}"
 }
 
 peer_endpoint_host() {
@@ -2972,9 +2892,12 @@ probe_peer_online_status() {
 }
 
 print_saved_peers() {
-  ensure_peer_store
-  validate_peer_store_existing_lines_or_die || return 1
-  local name node_id public_key endpoint cidr role status
+  local records_output name node_id public_key endpoint cidr role status
+  if ! records_output="$(peer_store_list_records 2>&1)"; then
+    print_err "Unable to read peer store."
+    print_err "${records_output}"
+    return 1
+  fi
   while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
     if [[ "${name}" == \#* || -z "${name}" ]]; then
       continue
@@ -2988,28 +2911,40 @@ print_saved_peers() {
     status="$(probe_peer_online_status "${endpoint}")"
     printf '  - %s (node=%s endpoint=%s cidr=%s role=%s status=%s)\n' \
       "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" "${status}"
-  done <"${PEERS_FILE}"
+  done <<< "${records_output}"
 }
 
 print_saved_admin_peers() {
-  ensure_peer_store
-  validate_peer_store_existing_lines_or_die || return 1
-  awk -F'|' '
-    $0 !~ /^#/ && NF >= 5 {
-      role = (NF >= 6 && $6 != "") ? $6 : "unknown";
-      if (role == "admin") {
-        printf "  - %s (node=%s endpoint=%s cidr=%s)\n", $1, $2, $4, $5
-      }
-    }
-  ' "${PEERS_FILE}"
+  local records_output name node_id public_key endpoint cidr role
+  if ! records_output="$(peer_store_list_records "admin" 2>&1)"; then
+    print_err "Unable to read admin peer records."
+    print_err "${records_output}"
+    return 1
+  fi
+  while IFS='|' read -r name node_id public_key endpoint cidr role _rest; do
+    if [[ -z "${name}" || -z "${node_id}" || -z "${endpoint}" || -z "${cidr}" ]]; then
+      continue
+    fi
+    printf '  - %s (node=%s endpoint=%s cidr=%s)\n' \
+      "${name}" "${node_id}" "${endpoint}" "${cidr}"
+  done <<< "${records_output}"
 }
 
 find_peer_record_by_node_id() {
   local node_id="$1"
-  ensure_peer_store
-  validate_peer_store_existing_lines_or_die || return 1
-  ensure_peer_store_field_safe "node_id" "${node_id}" || return 1
-  awk -F'|' -v nid="${node_id}" '$0 !~ /^#/ && NF>=5 && $2 == nid { print; exit }' "${PEERS_FILE}"
+  local records_output line
+  if [[ -z "${node_id}" ]]; then
+    return 0
+  fi
+  if ! records_output="$(peer_store_list_records "" "${node_id}" 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ -n "${line}" ]]; then
+      printf '%s\n' "${line}"
+      break
+    fi
+  done <<< "${records_output}"
 }
 
 run_rustynet_cli() {
@@ -3558,6 +3493,14 @@ configure_values() {
   prompt_default AUTO_TUNNEL_MAX_AGE_SECS "Auto-tunnel bundle max age (secs)" "${AUTO_TUNNEL_MAX_AGE_SECS}"
   prompt_default WG_INTERFACE "WireGuard interface name" "${WG_INTERFACE}"
   prompt_default WG_LISTEN_PORT "WireGuard listen port (1-65535)" "${WG_LISTEN_PORT}"
+  if is_linux_host && ( is_admin_role || is_blind_exit_role ); then
+    prompt_default AUTO_PORT_FORWARD_EXIT "Auto port-forward exit endpoint via NAT-PMP (0/1)" "${AUTO_PORT_FORWARD_EXIT}"
+    if [[ "${AUTO_PORT_FORWARD_EXIT}" == "1" ]]; then
+      prompt_default AUTO_PORT_FORWARD_LEASE_SECS "Auto port-forward lease seconds (>=60)" "${AUTO_PORT_FORWARD_LEASE_SECS}"
+    fi
+  else
+    AUTO_PORT_FORWARD_EXIT="0"
+  fi
   prompt_default WG_PRIVATE_KEY_PATH "WireGuard runtime private key path" "${WG_PRIVATE_KEY_PATH}"
   prompt_default WG_ENCRYPTED_PRIVATE_KEY_PATH "WireGuard encrypted private key path" "${WG_ENCRYPTED_PRIVATE_KEY_PATH}"
   if is_linux_host; then
@@ -3599,6 +3542,7 @@ configure_values() {
   fi
   enforce_fail_closed_ssh_policy
   enforce_wg_listen_port_policy
+  enforce_auto_port_forward_policy
   prompt_default TRUST_SIGNER_KEY_PATH "Trust signer key path (for auto-refresh)" "${TRUST_SIGNER_KEY_PATH}"
 
   if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
@@ -3656,6 +3600,8 @@ Current Rustynet Wizard Configuration
   auto_tunnel_max_age_secs: ${AUTO_TUNNEL_MAX_AGE_SECS}
   wg_interface            : ${WG_INTERFACE}
   wg_listen_port          : ${WG_LISTEN_PORT}
+  auto_port_forward_exit  : ${AUTO_PORT_FORWARD_EXIT}
+  auto_port_forward_lease_secs: ${AUTO_PORT_FORWARD_LEASE_SECS}
   wg_runtime_private_key  : ${WG_PRIVATE_KEY_PATH}
   wg_encrypted_private_key: ${WG_ENCRYPTED_PRIVATE_KEY_PATH}
   wg_key_passphrase       : ${WG_KEY_PASSPHRASE_PATH}
@@ -3860,10 +3806,13 @@ probe_exit_node_readiness() {
 }
 
 print_saved_exit_candidates_with_probe() {
-  ensure_peer_store
-  validate_peer_store_existing_lines_or_die || return 1
-  local name node_id public_key endpoint cidr role probe_result membership_state tunnel_state readiness
+  local records_output name node_id public_key endpoint cidr role probe_result membership_state tunnel_state readiness
   local status_line current_exit_node marker
+  if ! records_output="$(peer_store_list_records 2>&1)"; then
+    print_err "Unable to read peer store for exit-candidate probe."
+    print_err "${records_output}"
+    return 1
+  fi
   status_line="$(run_rustynet_cli status 2>/dev/null || true)"
   current_exit_node="$(extract_status_field "${status_line}" "exit_node")"
   if [[ "${current_exit_node}" == "none" ]]; then
@@ -3898,7 +3847,7 @@ print_saved_exit_candidates_with_probe() {
     printf '  %s %s (node=%s endpoint=%s cidr=%s role=%s membership=%s tunnel=%s readiness=%s)\n' \
       "${marker}" "${name}" "${node_id}" "${endpoint}" "${cidr}" "${role}" \
       "${membership_state}" "${tunnel_state}" "${readiness}"
-  done <"${PEERS_FILE}"
+  done <<< "${records_output}"
 }
 
 select_exit_node() {

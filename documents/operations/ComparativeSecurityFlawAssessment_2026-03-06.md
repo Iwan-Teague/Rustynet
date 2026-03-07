@@ -37,19 +37,25 @@ Severity scale used:
 ### F-02: Peer store input and file-custody controls are weaker than other sensitive state
 - Severity: `Medium`
 - Evidence:
-  - `start.sh:2790`
-  - `start.sh:2883`
-  - `start.sh:2899`
-  - `start.sh:2974`
-  - `start.sh:3007`
-  - `start.sh:4530`
+  - `start.sh:2816`
+  - `start.sh:2827`
+  - `start.sh:2894`
+  - `start.sh:2933`
+  - `start.sh:3808`
+  - `crates/rustynet-cli/src/main.rs:486`
+  - `crates/rustynet-cli/src/main.rs:490`
+  - `crates/rustynet-cli/src/ops_peer_store.rs:17`
+  - `crates/rustynet-cli/src/ops_peer_store.rs:30`
+  - `crates/rustynet-cli/src/ops_peer_store.rs:82`
+  - `crates/rustynet-cli/src/ops_peer_store.rs:246`
 - Why this matters:
-  - `peers.db` now has explicit custody and parsing controls, but this path is still shell-managed and should eventually move to Rust for typed persistence invariants.
+  - Prior implementation relied on shell-managed peer-store validation/read paths, which are harder to reason about and test for strict parsing invariants.
+  - Current implementation routes peer-store validation and listing through typed Rust ops commands with custody checks and fail-closed parsing.
 - Recommended hardening:
   - Keep strict custody on create/write (`0600`, owner-only, non-symlink regular file only).
   - Keep delimiter/control-character rejection for all persisted peer fields.
-  - Move peer-store write path to Rust for typed parsing and atomic write helpers.
-- Status: `Partially mitigated on 2026-03-07 (strict file custody + delimiter/control-char validation + secure temp writes, and dead shell peer-store mutator helpers removed from start.sh); follow-up still needed to migrate active peer-store persistence/read paths to Rust`
+  - Preserve one-path policy: `start.sh` must use Rust peer-store ops rather than direct shell file parsing.
+- Status: `Mitigated on 2026-03-07 (active peer-store validation/read paths migrated to Rust ops commands; shell parsing path removed from active start.sh peer-store flow)`
 
 ### F-03: Privileged helper token policy is broad and not command-schema specific
 - Severity: `High`
@@ -66,19 +72,26 @@ Severity scale used:
   - Add negative tests for parser-level argument smuggling.
 - Status: `Mitigated on 2026-03-07 (strict per-command nft/ip/wg/etc schemas + negative tests)`
 
-### F-04: E2E remote orchestration still relies on shell-based remote execution
+### F-04: E2E remote orchestration shell-execution risk (historical)
 - Severity: `Medium`
 - Evidence:
-  - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh:320`
-  - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh:338`
-  - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh:700`
+  - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh:9`
+  - `crates/rustynet-cli/src/main.rs:517`
+  - `crates/rustynet-cli/src/ops_e2e.rs:789`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2359`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2401`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2412`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2489`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2527`
+  - `crates/rustynet-cli/src/ops_e2e.rs:2639`
 - Why this matters:
-  - `bash -lc` command assembly was removed, but remote execution is still shell-script based (`bash -se`) and therefore more brittle than typed Rust orchestration.
-  - Regression in argument handling can still become remote-command abuse in privileged CI/lab workflows.
+  - Prior implementation used remote shell snippet execution (`bash -se`) for privileged orchestration helpers.
+  - Current implementation dispatches all active remote orchestration/probe steps via argv-based SSH command execution helpers and typed Rust ops subcommands.
 - Recommended hardening:
-  - Migrate remote execution to Rust SSH orchestration with argv-only command transport.
-  - Remove `bash -lc` usage from privileged remote paths.
-- Status: `Partially mitigated on 2026-03-07 (removed bash -lc command assembly from scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh by switching to stdin-fed bash -se and argv-based sudo/tar/install calls); follow-up remains to migrate remote orchestration from shell to Rust`
+  - Keep a single Rust entrypoint (`rustynet ops run-debian-two-node-e2e`) for orchestration.
+  - Keep strict token/path validation for all dynamic remote arguments.
+  - Preserve test coverage that guards against reintroducing shell payload execution paths.
+- Status: `Mitigated on 2026-03-07 (legacy shell orchestrator, remote bash payload scripts, and SSH shell-snippet helpers removed from active path; active orchestration uses argv-only remote command dispatch with typed Rust ops subcommands)`
 
 ### F-05: Phase readiness artifacts are validated structurally but not cryptographically
 - Severity: `High`
@@ -237,8 +250,7 @@ Severity scale used:
 - Tighten privileged helper argument validation to per-command schema. (`Completed on 2026-03-07: strict program/subcommand schemas + negative tests`)
 
 ### Near-term
-- Complete Rust migration of e2e privileged remote orchestration (after `bash -lc` removal) to eliminate shell execution drift.
-- Migrate `peers.db` persistence from hardened shell path to Rust typed persistence.
+- Collect Linux VM validation evidence for recent security migrations (`F-02`, `F-04`) and keep CI/runtime regression checks green.
 
 ### Quick wins
 - Minimize public API surface in `rustynet-control/src/admin.rs`. (`Completed on 2026-03-07`)
@@ -246,7 +258,7 @@ Severity scale used:
 
 ## 4) Notes on Existing Strengths
 - Rustynet already enforces several strong controls (fail-closed defaults, signed trust handling, key custody hardening).
-- Remaining high-value hardening is now concentrated in legacy shell orchestration and peer-store migration follow-up (`F-04`, Rust migration follow-up for `F-02`), not in core cryptographic primitives.
+- Recent high-value shell-to-Rust security migrations (`F-02`, `F-04`) are now implemented; remaining work is operational validation evidence on Linux VM matrix.
 
 ## References
 - [TunnelCrack](https://tunnelcrack.mathyvanhoef.com/)

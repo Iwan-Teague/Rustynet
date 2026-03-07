@@ -9,7 +9,7 @@
 - Status discrepancy (2026-03-05): direct/relay failover in current `Phase10Controller` is path-state signaling and audit coverage; full relay dataplane transport switching is not yet integrated in this runtime path and needs code work.
 
 ## 1) Phase 10 Objective
-Deliver real Linux dataplane execution so one enrolled device can act as an authorized exit node and securely route another enrolled device's traffic through encrypted transport, with mandatory fail-closed behavior for traffic and DNS.
+Deliver real Linux dataplane execution so one enrolled device can act as an authorized exit node and securely route another enrolled device's traffic through encrypted transport, including signed endpoint-hint-driven direct UDP hole punching with encrypted relay fallback/failback, and mandatory fail-closed behavior for traffic and DNS.
 
 ## 2) Exact Phase 10 Boundaries
 ### 2.1 In Scope
@@ -18,6 +18,7 @@ Deliver real Linux dataplane execution so one enrolled device can act as an auth
 - Real route/rule/firewall/NAT programming for exit-node full-tunnel and LAN-toggle flows.
 - Tunnel and DNS fail-closed enforcement and validation.
 - Direct/relay fallback/failback behavior under real networking.
+- Signed traversal endpoint-hint validation and deterministic path-control behavior for direct/relay transitions.
 - End-to-end Linux netns/VM validation and production-grade gate scripts.
 
 ### 2.2 Out of Scope
@@ -68,8 +69,9 @@ This revised document closes those gaps.
 4. `dns_manager`: applies protected-DNS routing and resolver restrictions.
 5. `exit_manager`: owns exit-node selection, LAN-toggle, and ACL-validated route grants.
 6. `ipc_server`: authenticated local control RPC over Unix socket.
-7. `health_monitor`: path/tunnel/dns health and fail-closed transitions.
-8. `state_store`: durable runtime state with integrity checks.
+7. `nat_traversal`: signed endpoint-hint ingestion, candidate checks, direct hole-punch orchestration, and relay failover/failback decisions.
+8. `health_monitor`: path/tunnel/dns health and fail-closed transitions.
+9. `state_store`: durable runtime state with integrity checks.
 
 ### 6.2 Linux Integration Choices
 - nftables-first firewall and NAT.
@@ -83,18 +85,26 @@ This revised document closes those gaps.
 - Role check before mutation.
 - IPC auth failure results in deny with zero side effects.
 
+### 6.4 Traversal Path-Control Contract
+- Endpoint-hint updates are accepted only when signature, nonce, and freshness checks succeed.
+- Direct and relay are runtime path states under one controller, not separate legacy paths.
+- Path transitions are deterministic, auditable, and policy-gated.
+- If no trusted path is available in protected mode, transition to `fail_closed`.
+
 ## 7) Dataplane State Machine (Normative)
 States:
 1. `init`
 2. `control_trusted`
 3. `dataplane_applied`
-4. `exit_active`
+4. `exit_active` (with path substate `direct_active` or `relay_active`)
 5. `fail_closed`
 
 Required transitions:
 - `init -> control_trusted`: control TLS1.3 valid + signed control data valid + freshness checks pass.
 - `control_trusted -> dataplane_applied`: backend/routing/firewall/dns transactional apply succeeds.
 - `dataplane_applied -> exit_active`: exit policy + ACL + route advertisement + LAN-toggle constraints valid.
+- `exit_active(direct_active) -> exit_active(relay_active)`: direct path health loss or probe failure with trusted relay path available.
+- `exit_active(relay_active) -> exit_active(direct_active)`: signed, fresh, policy-valid direct path re-established and stable.
 - `* -> fail_closed`: any trust loss, apply failure, integrity failure, or health loss in protected mode.
 - `fail_closed -> control_trusted`: only after trust and safety preconditions re-validated.
 
@@ -154,6 +164,12 @@ Default for Phase 10: if equivalent protections are not implemented for IPv6, en
 - If trust-state load/verify fails: deny trust-required connectivity.
 - If daemon state restore fails integrity checks: start in restricted-safe mode.
 
+### 9.7 Traversal Integrity Controls
+- Endpoint-hint payloads must be signed and freshness-bounded; replayed or tampered hints are rejected.
+- Runtime must not mutate peer endpoints from unsigned traversal data.
+- Path transition logic must preserve ACL/default-deny and leak-prevention invariants across direct/relay handoffs.
+- Relay path use must remain ciphertext-only forwarding from a relay trust perspective.
+
 ## 10) Detailed Workstreams
 ### Workstream A: Real Linux WireGuard Backend (`rustynet-backend-wireguard`)
 - Implement interface create/configure/start/stop.
@@ -181,6 +197,11 @@ Default for Phase 10: if equivalent protections are not implemented for IPv6, en
 - Packet-capture verification for encrypted tunnel transport.
 - Ops runbook updates for deployment, rollback, and incident handling.
 
+### Workstream F: Traversal/Hole-Punch Integration
+- Implement signed endpoint-hint schema verification and replay rejection in `rustynetd`.
+- Implement direct candidate checks and deterministic direct/relay path controller behavior.
+- Integrate traversal telemetry into `status`/`netcheck` and transition audit logs.
+
 ## 11) Observability and Alerting Contract
 Required metrics:
 - tunnel state, peer count, direct/relay path mode, handshake recency.
@@ -205,18 +226,23 @@ Required alerts:
 - IPC authn/authz and command validation.
 - Route/firewall planner idempotency and rollback behavior.
 - Kill-switch state-machine transitions.
+- Traversal endpoint-hint validator coverage (signature, nonce, freshness, replay rejection).
 
 ### 12.2 Integration Tests
 - Device A selects device B as exit node and reaches internet through B.
 - Device A LAN access denied with toggle off.
 - Device A LAN access allowed only with toggle on + ACL allow + advertised route.
 - Direct-path failure triggers relay fallback, then direct failback when healthy.
+- Direct UDP hole punching establishes path when NAT conditions permit.
+- Hard-NAT scenario converges to encrypted relay path while preserving connectivity.
 - Roaming endpoint change preserves connectivity.
 
 ### 12.3 Security/Negative Tests
 - Tunnel drop in protected mode blocks egress.
 - DNS path loss in protected DNS mode blocks DNS egress.
 - Invalid or stale signed control data rejected before dataplane mutation.
+- Tampered/replayed traversal endpoint hints are rejected before endpoint mutation.
+- Path flaps (direct<->relay) do not bypass ACL, kill-switch, or DNS fail-close controls.
 - Privileged helper rejects unsafe input and shell-like payloads.
 - WireGuard leakage check outside backend adapter crates.
 
@@ -247,6 +273,7 @@ cargo deny check bans licenses sources advisories
 - Real Linux backend integration tests pass.
 - Exit-node full-tunnel and LAN-toggle E2E tests pass.
 - Tunnel and DNS fail-close leak tests pass.
+- Traversal tests pass for direct-hole-punch success, relay fallback, and deterministic failback.
 - WireGuard boundary leakage check passes.
 - Performance budgets and soak evidence satisfy thresholds.
 
@@ -255,6 +282,7 @@ cargo deny check bans licenses sources advisories
 - `leak_test_report.json`
 - `perf_budget_report.json`
 - `direct_relay_failover_report.json`
+- `traversal_path_selection_report.json`
 - `state_transition_audit.log`
 
 ## 14) Rollout and Rollback Plan
@@ -273,7 +301,7 @@ Rollback:
 ## 15) Requirement-to-Implementation Traceability Matrix (Phase 10)
 | Source Clause | Requirement | Implementation Direction | Owner |
 | --- | --- | --- | --- |
-| Requirements 3.2 | Encrypted mesh networking | real WireGuard backend via `TunnelBackend` | `rustynet-backend-wireguard` |
+| Requirements 3.2 | Encrypted mesh networking with NAT traversal + relay fallback | WireGuard backend + signed traversal endpoint-hint flow + deterministic path controller | `rustynet-backend-wireguard` + `rustynetd` |
 | Requirements 3.3 | Exit node selection/full-tunnel | `exit_manager` + route/firewall/NAT apply | `rustynetd` |
 | Requirements 3.4 | LAN toggle with ACL gates | toggle + advertised route + ACL precondition enforcement | `rustynetd` + `rustynet-policy` |
 | Requirements 3.5 | Magic DNS behavior safety | protected DNS routing + resolver constraints | `dns_manager` |
@@ -281,13 +309,15 @@ Rollback:
 | Requirements 4/5 | Reliability and security-first defaults | state machine + fail-closed + trust gating | `health_monitor` + `state_store` |
 | Security Minimum Bar Critical 1 | Proven crypto only | WireGuard-only production dataplane | backend adapter layer |
 | Security Minimum Bar Critical 2 | TLS1.3 + signed control validation | trust preconditions before dataplane apply | control client path |
+| Security Minimum Bar Critical 8 | Traversal transition integrity + leak prevention | signed traversal hints + direct/relay path guards + fail-closed transitions | `nat_traversal` + `health_monitor` |
 | Security Minimum Bar Critical 7 | Leak prevention | kill-switch + DNS fail-close tests | firewall/dns managers |
-| Security Minimum Bar Critical 9 | Supply-chain integrity | phase10 gate includes artifact verification and evidence | CI scripts |
+| Security Minimum Bar Critical 10 | Supply-chain integrity | phase10 gate includes artifact verification and evidence | CI scripts |
 
 ## 16) Deliverables
 - Real Linux WireGuard adapter implementation behind `TunnelBackend`.
 - Persistent `rustynetd` daemon with secure local IPC.
 - CLI wired to daemon IPC (no ephemeral command-local state).
+- Signed traversal endpoint-hint verification and deterministic direct/relay path controller.
 - Exit-node forwarding/NAT + kill-switch + protected DNS enforcement.
 - E2E Linux network harness and acceptance/security test suite.
 - Updated operations runbook and incident drill procedures for exit-node dataplane incidents.
@@ -298,6 +328,7 @@ Rollback:
 - One node can be selected as exit node by authorized client and route client internet traffic.
 - LAN-route access behavior is exactly ACL/toggle/advertisement constrained.
 - Tunnel and DNS fail-close behavior is proven in negative tests.
+- Direct path establishes through hole punching when network allows, and relay path is used when direct is unavailable.
 - Direct/relay fallback and failback works under controlled fault tests.
 - All mandatory CI/security/performance/soak gates pass.
 - Required evidence artifacts exist and are valid.

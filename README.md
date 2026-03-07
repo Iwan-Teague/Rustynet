@@ -42,6 +42,7 @@ The wizard handles:
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
 - `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
+- connectivity architecture is direct-UDP-first with signed traversal endpoint hints, encrypted relay fallback for hard NAT paths, and automatic failback to direct when healthy
 - route advertisement and status checks
 
 Host-profile behavior:
@@ -57,6 +58,8 @@ Host-profile behavior:
 
 Current implementation support/security matrix:
 - [`documents/operations/PlatformSupportMatrix.md`](./documents/operations/PlatformSupportMatrix.md)
+- Traversal architecture and rollout plan:
+  [`documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`](./documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 
@@ -128,6 +131,8 @@ rustynet assignment init-signing-secret \
 - `--nodes` format: `node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]` entries separated by `;`.
 - `--allow` format: `source_node_id|destination_node_id` entries separated by `;` (default-deny unless explicitly allowed).
 - Endpoint stability: set a fixed WireGuard listen port on each node (`RUSTYNET_WG_LISTEN_PORT`, default `51820`) so signed assignment endpoints remain valid across daemon restarts.
+- Optional internet reachability assist for Linux exit-serving nodes: setup now exposes opt-in NAT-PMP auto port-forward (`AUTO_PORT_FORWARD_EXIT=1`, default `0`; lease via `AUTO_PORT_FORWARD_LEASE_SECS`, default `1200`). This path is intentionally best-effort and fail-safe: unsupported routers/backends keep normal tunnel operation but leave external mapping unavailable.
+- NAT-PMP/PCP/UPnP-style mapping is an optimization only and is not the primary connectivity architecture.
 - Exit-serving mode under enforced auto-tunnel: advertise `0.0.0.0/0` on the serving node (`rustynet route advertise 0.0.0.0/0`). This is the only route mutation allowed while auto-tunnel enforcement is enabled.
 - When `0.0.0.0/0` is advertised and the node is not itself using an exit node, `rustynetd` applies forwarding+NAT for secure exit serving during reconcile.
 - Linux fail-closed management and peer-endpoint bypass routes resolve interface per destination (`ip route get`) before installing table `51820` host/CIDR routes. This prevents dual-NIC lockouts when management and internet egress interfaces differ.

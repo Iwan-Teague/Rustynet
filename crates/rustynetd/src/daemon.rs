@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -91,6 +93,8 @@ pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.p
 pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
+pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
+pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
@@ -211,6 +215,8 @@ pub struct DaemonConfig {
     pub wg_key_passphrase_path: Option<PathBuf>,
     pub wg_public_key_path: Option<PathBuf>,
     pub egress_interface: String,
+    pub auto_port_forward_exit: bool,
+    pub auto_port_forward_lease_secs: NonZeroU32,
     pub dataplane_mode: DaemonDataplaneMode,
     pub privileged_helper_socket_path: Option<PathBuf>,
     pub privileged_helper_timeout_ms: NonZeroU64,
@@ -252,6 +258,9 @@ impl Default for DaemonConfig {
             wg_key_passphrase_path: Some(PathBuf::from(DEFAULT_WG_KEY_PASSPHRASE_PATH)),
             wg_public_key_path: Some(PathBuf::from(DEFAULT_WG_PUBLIC_KEY_PATH)),
             egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
+            auto_port_forward_exit: DEFAULT_AUTO_PORT_FORWARD_EXIT,
+            auto_port_forward_lease_secs: NonZeroU32::new(DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS)
+                .expect("default auto port-forward lease must be non-zero"),
             dataplane_mode: DaemonDataplaneMode::default(),
             privileged_helper_socket_path: Some(PathBuf::from(DEFAULT_TRUSTED_HELPER_SOCKET_PATH)),
             privileged_helper_timeout_ms: NonZeroU64::new(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS)
@@ -735,11 +744,15 @@ struct DaemonRuntime {
     node_role: NodeRole,
     local_node_id: String,
     wg_interface: String,
+    #[cfg(target_os = "linux")]
+    wg_listen_port: u16,
     wg_private_key_path: Option<PathBuf>,
     wg_encrypted_private_key_path: Option<PathBuf>,
     wg_key_passphrase_path: Option<PathBuf>,
     wg_public_key_path: Option<PathBuf>,
     privileged_helper_client: Option<PrivilegedCommandClient>,
+    #[cfg(target_os = "linux")]
+    egress_interface: String,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
@@ -767,6 +780,22 @@ struct DaemonRuntime {
     max_reconcile_failures: u32,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
+    auto_port_forward_exit: bool,
+    #[cfg(target_os = "linux")]
+    auto_port_forward_lease_secs: u32,
+    exit_port_forward_last_error: Option<String>,
+    #[cfg(target_os = "linux")]
+    exit_port_forward_lease: Option<ExitPortForwardLease>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExitPortForwardLease {
+    gateway: Ipv4Addr,
+    internal_port: u16,
+    external_port: u16,
+    lease_secs: u32,
+    renewed_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,11 +844,15 @@ impl DaemonRuntime {
             node_role: config.node_role,
             local_node_id: config.node_id.clone(),
             wg_interface: config.wg_interface.clone(),
+            #[cfg(target_os = "linux")]
+            wg_listen_port: config.wg_listen_port,
             wg_private_key_path: config.wg_private_key_path.clone(),
             wg_encrypted_private_key_path: config.wg_encrypted_private_key_path.clone(),
             wg_key_passphrase_path: config.wg_key_passphrase_path.clone(),
             wg_public_key_path: config.wg_public_key_path.clone(),
             privileged_helper_client,
+            #[cfg(target_os = "linux")]
+            egress_interface: config.egress_interface.clone(),
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
@@ -847,6 +880,12 @@ impl DaemonRuntime {
             max_reconcile_failures: config.max_reconcile_failures.get(),
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
+            auto_port_forward_exit: config.auto_port_forward_exit,
+            #[cfg(target_os = "linux")]
+            auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
+            exit_port_forward_last_error: None,
+            #[cfg(target_os = "linux")]
+            exit_port_forward_lease: None,
         })
     }
 
@@ -1211,6 +1250,9 @@ impl DaemonRuntime {
 
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
+        self.maintain_exit_port_forward(
+            self.is_serving_exit_node(self.selected_exit_node.as_deref()),
+        );
     }
 
     fn handle_command(&mut self, command: IpcCommand) -> IpcResponse {
@@ -1259,6 +1301,14 @@ impl DaemonRuntime {
                     .as_ref()
                     .map(|state| state.active_nodes().len().to_string())
                     .unwrap_or_else(|| "none".to_string());
+                let port_forward_external_port = self
+                    .exit_port_forward_external_port()
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let port_forward_error = self
+                    .exit_port_forward_last_error
+                    .as_deref()
+                    .unwrap_or("none");
                 let serving_exit_node =
                     if self.is_serving_exit_node(self.selected_exit_node.as_deref()) {
                         "true"
@@ -1266,7 +1316,7 @@ impl DaemonRuntime {
                         "false"
                     };
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -1297,6 +1347,13 @@ impl DaemonRuntime {
                     } else {
                         "false"
                     },
+                    if self.auto_port_forward_exit {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    port_forward_external_port,
+                    port_forward_error,
                     last_assignment,
                     membership_epoch,
                     membership_active_nodes
@@ -1628,6 +1685,8 @@ impl DaemonRuntime {
 
         self.selected_exit_node = None;
         self.lan_access_enabled = false;
+        self.release_exit_port_forward();
+        self.clear_exit_port_forward_state();
 
         if let Err(err) = self.persist_state() {
             failures.push(format!("persist failed after revoke: {err}"));
@@ -1937,6 +1996,10 @@ impl DaemonRuntime {
                 }
             }
         }
+
+        self.maintain_exit_port_forward(
+            self.is_serving_exit_node(self.selected_exit_node.as_deref()),
+        );
     }
 
     fn enforce_blind_exit_invariants(&mut self) -> Result<(), String> {
@@ -2029,6 +2092,258 @@ impl DaemonRuntime {
             ));
         }
     }
+
+    fn maintain_exit_port_forward(&mut self, should_serve_exit: bool) {
+        if !self.auto_port_forward_exit {
+            self.release_exit_port_forward();
+            self.clear_exit_port_forward_state();
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if !should_serve_exit {
+                self.release_exit_port_forward();
+                self.clear_exit_port_forward_state();
+                return;
+            }
+
+            let now_unix = unix_now();
+            if let Some(current) = self.exit_port_forward_lease {
+                let refresh_at = current
+                    .renewed_at_unix
+                    .saturating_add(u64::from(current.lease_secs.max(60) / 2));
+                if now_unix < refresh_at {
+                    return;
+                }
+            }
+
+            let gateway =
+                match detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.exit_port_forward_last_error = Some(err);
+                        self.exit_port_forward_lease = None;
+                        return;
+                    }
+                };
+
+            match nat_pmp_map_udp_port(
+                gateway,
+                self.wg_listen_port,
+                self.wg_listen_port,
+                self.auto_port_forward_lease_secs,
+            ) {
+                Ok((external_port, granted_lease_secs)) => {
+                    if external_port != self.wg_listen_port {
+                        let _ =
+                            nat_pmp_delete_udp_port(gateway, self.wg_listen_port, external_port);
+                        self.exit_port_forward_last_error = Some(format!(
+                            "router mapped unexpected external port {external_port}; expected {}",
+                            self.wg_listen_port
+                        ));
+                        self.exit_port_forward_lease = None;
+                        return;
+                    }
+                    self.exit_port_forward_lease = Some(ExitPortForwardLease {
+                        gateway,
+                        internal_port: self.wg_listen_port,
+                        external_port,
+                        lease_secs: granted_lease_secs,
+                        renewed_at_unix: now_unix,
+                    });
+                    self.exit_port_forward_last_error = None;
+                }
+                Err(err) => {
+                    self.exit_port_forward_last_error = Some(err);
+                    self.exit_port_forward_lease = None;
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = should_serve_exit;
+            self.exit_port_forward_last_error =
+                Some("auto port forward is supported only on Linux".to_string());
+        }
+    }
+
+    fn release_exit_port_forward(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(lease) = self.exit_port_forward_lease {
+                if let Err(err) =
+                    nat_pmp_delete_udp_port(lease.gateway, lease.internal_port, lease.external_port)
+                {
+                    self.exit_port_forward_last_error =
+                        Some(format!("auto port-forward release failed: {err}"));
+                }
+            }
+        }
+    }
+
+    fn clear_exit_port_forward_state(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.exit_port_forward_lease = None;
+        }
+        self.exit_port_forward_last_error = None;
+    }
+
+    fn exit_port_forward_external_port(&self) -> Option<u16> {
+        #[cfg(target_os = "linux")]
+        {
+            return self
+                .exit_port_forward_lease
+                .map(|lease| lease.external_port);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr, String> {
+    let routes = fs::read_to_string("/proc/net/route")
+        .map_err(|err| format!("read /proc/net/route failed: {err}"))?;
+    for (index, line) in routes.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        if fields[0] != interface {
+            continue;
+        }
+        if fields[1] != "00000000" {
+            continue;
+        }
+        let flags = u16::from_str_radix(fields[3], 16)
+            .map_err(|err| format!("parse route flags failed: {err}"))?;
+        let route_is_up = (flags & 0x1) != 0;
+        let has_gateway = (flags & 0x2) != 0;
+        if !route_is_up || !has_gateway {
+            continue;
+        }
+        let gateway_u32 = u32::from_str_radix(fields[2], 16)
+            .map_err(|err| format!("parse default gateway failed: {err}"))?;
+        let octets = gateway_u32.to_le_bytes();
+        return Ok(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+    }
+    Err(format!(
+        "no IPv4 default gateway found for interface {interface}"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn nat_pmp_map_udp_port(
+    gateway: Ipv4Addr,
+    internal_port: u16,
+    requested_external_port: u16,
+    requested_lease_secs: u32,
+) -> Result<(u16, u32), String> {
+    let mut request = [0u8; 12];
+    request[0] = 0;
+    request[1] = 1;
+    request[4..6].copy_from_slice(&internal_port.to_be_bytes());
+    request[6..8].copy_from_slice(&requested_external_port.to_be_bytes());
+    request[8..12].copy_from_slice(&requested_lease_secs.to_be_bytes());
+    let response = nat_pmp_round_trip(gateway, &request)?;
+    if response.len() < 16 {
+        return Err("nat-pmp mapping response too short".to_string());
+    }
+    if response[0] != 0 || response[1] != 129 {
+        return Err("nat-pmp mapping response opcode mismatch".to_string());
+    }
+    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    if result_code != 0 {
+        return Err(format!(
+            "nat-pmp mapping rejected by gateway (code {result_code})"
+        ));
+    }
+    let returned_internal = u16::from_be_bytes([response[8], response[9]]);
+    if returned_internal != internal_port {
+        return Err(format!(
+            "nat-pmp internal port mismatch: expected {internal_port}, got {returned_internal}"
+        ));
+    }
+    let mapped_external = u16::from_be_bytes([response[10], response[11]]);
+    let granted_lease =
+        u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
+    if mapped_external == 0 {
+        return Err("nat-pmp gateway returned invalid external port".to_string());
+    }
+    if granted_lease == 0 {
+        return Err("nat-pmp gateway returned zero lease".to_string());
+    }
+    Ok((mapped_external, granted_lease))
+}
+
+#[cfg(target_os = "linux")]
+fn nat_pmp_delete_udp_port(
+    gateway: Ipv4Addr,
+    internal_port: u16,
+    current_external_port: u16,
+) -> Result<(), String> {
+    let mut request = [0u8; 12];
+    request[0] = 0;
+    request[1] = 1;
+    request[4..6].copy_from_slice(&internal_port.to_be_bytes());
+    request[6..8].copy_from_slice(&current_external_port.to_be_bytes());
+    request[8..12].copy_from_slice(&0u32.to_be_bytes());
+    let response = nat_pmp_round_trip(gateway, &request)?;
+    if response.len() < 16 {
+        return Err("nat-pmp delete response too short".to_string());
+    }
+    if response[0] != 0 || response[1] != 129 {
+        return Err("nat-pmp delete response opcode mismatch".to_string());
+    }
+    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    if result_code != 0 {
+        return Err(format!(
+            "nat-pmp delete rejected by gateway (code {result_code})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn nat_pmp_round_trip(gateway: Ipv4Addr, request: &[u8]) -> Result<Vec<u8>, String> {
+    let gateway_addr = SocketAddrV4::new(gateway, 5351);
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|err| format!("nat-pmp socket bind failed: {err}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("nat-pmp read-timeout setup failed: {err}"))?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("nat-pmp write-timeout setup failed: {err}"))?;
+    socket
+        .send_to(request, gateway_addr)
+        .map_err(|err| format!("nat-pmp request send failed: {err}"))?;
+    let mut response = [0u8; 64];
+    let (len, from) = socket
+        .recv_from(&mut response)
+        .map_err(|err| format!("nat-pmp response receive failed: {err}"))?;
+    if from.ip() != gateway {
+        return Err(format!(
+            "nat-pmp response source mismatch: expected {gateway}, got {}",
+            from.ip()
+        ));
+    }
+    if from.port() != 5351 {
+        return Err(format!(
+            "nat-pmp response source port mismatch: expected 5351, got {}",
+            from.port()
+        ));
+    }
+    Ok(response[..len].to_vec())
 }
 
 fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
@@ -2422,6 +2737,18 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.egress_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "egress interface must not be empty".to_string(),
+        ));
+    }
+    if config.auto_port_forward_lease_secs.get() < 60 {
+        return Err(DaemonError::InvalidConfig(
+            "auto port-forward lease must be at least 60 seconds".to_string(),
+        ));
+    }
+    if config.auto_port_forward_exit
+        && !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
+    {
+        return Err(DaemonError::InvalidConfig(
+            "auto port-forward exit is supported only with linux-wireguard backend".to_string(),
         ));
     }
     if config.trust_evidence_path.as_os_str().is_empty() {
@@ -3912,6 +4239,7 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::num::NonZeroU32;
     use std::path::Path;
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -4155,6 +4483,35 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("fail-closed ssh allow must require management cidrs");
         assert!(err.to_string().contains("at least one management cidr"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_auto_port_forward_short_lease() {
+        let config = DaemonConfig {
+            auto_port_forward_lease_secs: NonZeroU32::new(59)
+                .expect("non-zero auto port-forward lease for test"),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("short auto port-forward lease should be rejected");
+        assert!(err.to_string().contains("at least 60 seconds"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_auto_port_forward_on_non_linux_backend() {
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::MacosWireguard,
+            auto_port_forward_exit: true,
+            auto_port_forward_lease_secs: NonZeroU32::new(1200)
+                .expect("non-zero auto port-forward lease for test"),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("auto port-forward should be linux-wireguard only");
+        assert!(
+            err.to_string()
+                .contains("supported only with linux-wireguard backend")
+        );
     }
 
     #[test]

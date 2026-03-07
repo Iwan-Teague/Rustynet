@@ -53,6 +53,8 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 - Tunnel fail-close behavior in protected-routing modes.
 - DNS fail-close behavior in protected DNS modes.
 - Protocol-filter ACL behavior is validated in shared subnet-router and shared-exit scenarios.
+- Direct/relay traversal transitions require authenticated, replay-protected, freshness-bounded endpoint-hint state.
+- Path failover/failback cannot bypass ACL, trust-state, or leak-prevention controls.
 
 9. Audit and forensics:
 - Tamper-evident, append-only audit logging.
@@ -73,6 +75,7 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 - Critical: mitigation or patched build within 48 hours.
 - High: patched build within 7 calendar days.
 - Medium: patched build within 30 calendar days.
+7. Relay abuse/capacity controls validated under traversal load and reconnect churn.
 
 ## 5) Performance Minimum Bar
 1. Idle daemon CPU: <= 2% of one core on Raspberry Pi-class target.
@@ -90,6 +93,7 @@ These budgets are release gates once benchmarking harnesses are active.
 - Integration tests for mesh, exit-node routing, LAN toggle, and relay fallback.
 - Negative tests for auth abuse (rate limits, replay, lockout/backoff).
 - Leak tests for tunnel and DNS fail-close behavior.
+- Traversal security tests for signed endpoint-hint validation, replay rejection, and failover/failback policy integrity.
 - Shared-router/shared-exit protocol-filter ACL tests.
 - Audit-log integrity verification tests.
 - Performance benchmark report with regression thresholds.
@@ -104,10 +108,10 @@ These budgets are release gates once benchmarking harnesses are active.
 - Phase 4: exit/LAN/DNS with fail-close leak prevention.
 - Phase 5: tamper-evident audit + early signing/SBOM + perf regression + SLA operations.
 - Phase 6: admin UI with RBAC/MFA + CSRF/session/clickjacking + privileged helper hardening.
-- Phase 7: HA, tenant boundary hardening, and trust-state fail-closed enforcement.
+- Phase 7: HA, tenant boundary hardening, trust-state fail-closed enforcement, and relay/traversal hardening controls.
 - Phase 8: external audit cadence + advanced compliance/key custody.
 - Phase 9: GA readiness with SLO/DR/performance gates fully enforced.
-- Phase 10: real Linux dataplane enforcement for encrypted exit-node traffic, NAT/forwarding hardening, and tunnel/DNS leak-prevention verification in live networking paths.
+- Phase 10: real Linux dataplane enforcement for encrypted exit-node traffic, traversal failover/failback integrity, NAT/forwarding hardening, and tunnel/DNS leak-prevention verification in live networking paths.
 
 ## 8) Sign-off Checklist
 - [ ] Security owner approval

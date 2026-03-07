@@ -279,6 +279,13 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         env_string_or_existing_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "false", &existing_env)?;
     let fail_closed_ssh_allow_cidrs =
         env_string_or_existing_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS", "", &existing_env)?;
+    let auto_port_forward_exit_raw =
+        env_string_or_existing_default("RUSTYNET_AUTO_PORT_FORWARD_EXIT", "false", &existing_env)?;
+    let auto_port_forward_lease_secs_raw = env_string_or_existing_default(
+        "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS",
+        "1200",
+        &existing_env,
+    )?;
 
     if wireguard_key_passphrase_credential_blob_path.as_path()
         != Path::new(SERVICE_CREDENTIAL_BLOB_PATH)
@@ -311,6 +318,14 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     parse_install_bool(
         "RUSTYNET_AUTO_TUNNEL_ENFORCE",
         auto_tunnel_enforce_raw.as_str(),
+    )?;
+    parse_install_bool(
+        "RUSTYNET_AUTO_PORT_FORWARD_EXIT",
+        auto_port_forward_exit_raw.as_str(),
+    )?;
+    parse_nonzero_u64(
+        "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS",
+        auto_port_forward_lease_secs_raw.as_str(),
     )?;
 
     if fail_closed_ssh_allow_enabled && fail_closed_ssh_allow_cidrs.trim().is_empty() {
@@ -688,6 +703,14 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_EGRESS_INTERFACE".to_string(),
             egress_interface.clone(),
+        ),
+        (
+            "RUSTYNET_AUTO_PORT_FORWARD_EXIT".to_string(),
+            auto_port_forward_exit_raw,
+        ),
+        (
+            "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS".to_string(),
+            auto_port_forward_lease_secs_raw,
         ),
         ("RUSTYNET_DATAPLANE_MODE".to_string(), dataplane_mode),
         (

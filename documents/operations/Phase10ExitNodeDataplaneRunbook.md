@@ -6,7 +6,7 @@ Status correction (verified 2026-03-05):
 - Security risk truth: relying on legacy plaintext passphrase-file assumptions weakens key-custody posture and can cause unsafe operator workflows.
 
 ## 1) Purpose
-This runbook defines deployment, validation, rollback, and incident procedures for Rustynet Phase 10 Linux dataplane enablement (exit-node full tunnel + LAN-toggle controls + DNS/tunnel fail-close behavior).
+This runbook defines deployment, validation, rollback, and incident procedures for Rustynet Phase 10 Linux dataplane enablement (exit-node full tunnel + LAN-toggle controls + direct/relay traversal path control + DNS/tunnel fail-close behavior).
 
 ## 2) Preconditions
 - Linux host with required privileges for route/firewall/NAT operations.
@@ -26,6 +26,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Phase10 provenance signing seed file present at absolute path configured by `RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH` (owner-only mode `<=0600`, 32-byte hex seed).
 - Matching phase10 provenance verifier key file present at absolute path configured by `RUSTYNET_PHASE10_PROVENANCE_VERIFIER_KEY_PATH` (owner-only mode `<=0600`, 32-byte hex key).
 - `RUSTYNET_PHASE10_PROVENANCE_HOST_ID` configured and stable for the host/environment.
+- Host clock synchronization healthy (for freshness-bound signed traversal endpoint-hint checks).
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
@@ -39,11 +40,13 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `sudo systemctl start rustynetd-trust-refresh.service`
 6. Validate baseline daemon status:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
-7. Select exit node:
+7. Validate traversal/path diagnostics baseline:
+- `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- netcheck`
+8. Select exit node:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- exit-node select <node-id>`
-8. Toggle LAN access only when required:
+9. Toggle LAN access only when required:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- lan-access on`
-9. Validate DNS policy state:
+10. Validate DNS policy state:
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- dns inspect`
 
 ## 4) Rollback Procedure
@@ -83,6 +86,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - `artifacts/phase10/leak_test_report.json`
 - `artifacts/phase10/perf_budget_report.json`
 - `artifacts/phase10/direct_relay_failover_report.json`
+- `artifacts/phase10/traversal_path_selection_report.json` (when traversal gate coverage is enabled)
 - `artifacts/phase10/state_transition_audit.log`
 - `artifacts/phase10/phase10_provenance.attestation.json`
 - Limitation note: current failover artifact demonstrates path-mode transition/audit evidence; full relay transport failover integration remains open code work.
@@ -93,4 +97,5 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - Mutating daemon IPC commands require peer credential authorization.
 - WireGuard implementation remains behind `TunnelBackend` and replaceable.
 - No custom crypto/protocol behavior is introduced.
+- Direct/relay path transitions require signed, fresh traversal endpoint data; invalid traversal state must fail closed.
 - Dataplane firewall/NAT ownership is generation-tagged and must only clean up Rustynet-owned tables.

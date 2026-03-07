@@ -2,15 +2,16 @@
 
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
 use rustynetd::daemon::{
-    DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES,
-    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
-    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID,
-    DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS, DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH,
-    DEFAULT_STATE_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_TRUSTED_HELPER_SOCKET_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_LISTEN_PORT, DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
-    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DEFAULT_AUTO_PORT_FORWARD_EXIT, DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS, DEFAULT_EGRESS_INTERFACE,
+    DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
+    DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
+    DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
+    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
+    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
+    DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_LISTEN_PORT,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
+    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -521,6 +522,33 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 config.egress_interface = value.clone();
                 index += 2;
             }
+            Some("--auto-port-forward-exit") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-port-forward-exit requires a value".to_string())?;
+                config.auto_port_forward_exit = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(
+                            "invalid auto-port-forward-exit value: expected true/false".to_string()
+                        );
+                    }
+                };
+                index += 2;
+            }
+            Some("--auto-port-forward-lease-secs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--auto-port-forward-lease-secs requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|err| format!("invalid auto port-forward lease: {err}"))?;
+                config.auto_port_forward_lease_secs = NonZeroU32::new(parsed).ok_or_else(|| {
+                    "auto-port-forward-lease-secs must be greater than 0".to_string()
+                })?;
+                index += 2;
+            }
             Some("--dataplane-mode") => {
                 let value = args
                     .get(index + 1)
@@ -953,7 +981,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -983,6 +1011,10 @@ fn help_text() -> String {
         &format!("  wg_key_passphrase={DEFAULT_WG_KEY_PASSPHRASE_PATH}"),
         &format!("  wg_public_key={DEFAULT_WG_PUBLIC_KEY_PATH}"),
         &format!("  egress_interface={DEFAULT_EGRESS_INTERFACE}"),
+        &format!("  auto_port_forward_exit={DEFAULT_AUTO_PORT_FORWARD_EXIT}"),
+        &format!(
+            "  auto_port_forward_lease_secs={DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS}"
+        ),
         &format!(
             "  dataplane_mode={:?}",
             DaemonDataplaneMode::default()
@@ -1051,5 +1083,36 @@ mod tests {
         ];
         let err = parse_daemon_config(&args).expect_err("invalid cidr should fail parsing");
         assert!(err.contains("invalid --fail-closed-ssh-allow-cidrs value"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_auto_port_forward_settings() {
+        let args = vec![
+            "--auto-port-forward-exit".to_string(),
+            "true".to_string(),
+            "--auto-port-forward-lease-secs".to_string(),
+            "1200".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.auto_port_forward_exit);
+        assert_eq!(config.auto_port_forward_lease_secs.get(), 1200);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_auto_port_forward_exit_value() {
+        let args = vec!["--auto-port-forward-exit".to_string(), "maybe".to_string()];
+        let err =
+            parse_daemon_config(&args).expect_err("invalid auto-port-forward value should fail");
+        assert!(err.contains("invalid auto-port-forward-exit value"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_auto_port_forward_lease() {
+        let args = vec![
+            "--auto-port-forward-lease-secs".to_string(),
+            "0".to_string(),
+        ];
+        let err = parse_daemon_config(&args).expect_err("zero lease should fail parsing");
+        assert!(err.contains("must be greater than 0"));
     }
 }

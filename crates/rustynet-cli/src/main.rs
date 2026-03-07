@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod ops_e2e;
 mod ops_install_systemd;
+mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
 
@@ -192,6 +194,46 @@ enum OpsCommand {
         preferred_exit_node_id: Option<String>,
         enable_exit_advertise: bool,
         assignment_refresh_env_path: PathBuf,
+    },
+    PeerStoreValidate {
+        config_dir: PathBuf,
+        peers_file: PathBuf,
+    },
+    PeerStoreList {
+        config_dir: PathBuf,
+        peers_file: PathBuf,
+        role: Option<String>,
+        node_id: Option<String>,
+    },
+    RunDebianTwoNodeE2e {
+        config: ops_e2e::DebianTwoNodeE2eConfig,
+    },
+    E2eBootstrapHost {
+        role: String,
+        node_id: String,
+        network_id: String,
+        src_dir: PathBuf,
+        ssh_allow_cidrs: String,
+        skip_apt: bool,
+    },
+    E2eEnforceHost {
+        role: String,
+        node_id: String,
+        src_dir: PathBuf,
+        ssh_allow_cidrs: String,
+    },
+    E2eMembershipAdd {
+        client_node_id: String,
+        client_pubkey_hex: String,
+        owner_approver_id: String,
+    },
+    E2eIssueAssignments {
+        exit_node_id: String,
+        client_node_id: String,
+        exit_endpoint: String,
+        client_endpoint: String,
+        exit_pubkey_hex: String,
+        client_pubkey_hex: String,
     },
 }
 
@@ -440,6 +482,85 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 "--env-path",
                 PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
             ),
+        }),
+        "peer-store-validate" => Ok(OpsCommand::PeerStoreValidate {
+            config_dir: parser.required_path("--config-dir")?,
+            peers_file: parser.required_path("--peers-file")?,
+        }),
+        "peer-store-list" => Ok(OpsCommand::PeerStoreList {
+            config_dir: parser.required_path("--config-dir")?,
+            peers_file: parser.required_path("--peers-file")?,
+            role: parser.value("--role"),
+            node_id: parser.value("--node-id"),
+        }),
+        "run-debian-two-node-e2e" => Ok(OpsCommand::RunDebianTwoNodeE2e {
+            config: ops_e2e::DebianTwoNodeE2eConfig {
+                exit_host: parser.required("--exit-host")?,
+                client_host: parser.required("--client-host")?,
+                ssh_user: parser
+                    .value("--ssh-user")
+                    .unwrap_or_else(|| "root".to_string()),
+                ssh_port: parser
+                    .value("--ssh-port")
+                    .unwrap_or_else(|| "22".to_string())
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid --ssh-port value: {err}"))?,
+                ssh_identity: parser.optional_path("--ssh-identity"),
+                ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
+                ssh_sudo_mode: ops_e2e::SshSudoMode::parse(
+                    parser
+                        .value("--ssh-sudo")
+                        .unwrap_or_else(|| "auto".to_string())
+                        .as_str(),
+                )?,
+                sudo_password_file: parser.optional_path("--sudo-password-file"),
+                exit_node_id: parser
+                    .value("--exit-node-id")
+                    .unwrap_or_else(|| "exit-node".to_string()),
+                client_node_id: parser
+                    .value("--client-node-id")
+                    .unwrap_or_else(|| "client-node".to_string()),
+                network_id: parser
+                    .value("--network-id")
+                    .unwrap_or_else(|| "local-net".to_string()),
+                remote_root: parser
+                    .optional_path("--remote-root")
+                    .unwrap_or_else(|| PathBuf::from("/opt/rustynet-clean")),
+                repo_ref: parser
+                    .value("--repo-ref")
+                    .unwrap_or_else(|| "HEAD".to_string()),
+                skip_apt: parser.has_flag("--skip-apt"),
+                report_path: parser.optional_path("--report-path").unwrap_or_else(|| {
+                    PathBuf::from("artifacts/phase10/debian_two_node_remote_validation.md")
+                }),
+            },
+        }),
+        "e2e-bootstrap-host" => Ok(OpsCommand::E2eBootstrapHost {
+            role: parser.required("--role")?,
+            node_id: parser.required("--node-id")?,
+            network_id: parser.required("--network-id")?,
+            src_dir: parser.required_path("--src-dir")?,
+            ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
+            skip_apt: parser.has_flag("--skip-apt"),
+        }),
+        "e2e-enforce-host" => Ok(OpsCommand::E2eEnforceHost {
+            role: parser.required("--role")?,
+            node_id: parser.required("--node-id")?,
+            src_dir: parser.required_path("--src-dir")?,
+            ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
+        }),
+        "e2e-membership-add" => Ok(OpsCommand::E2eMembershipAdd {
+            client_node_id: parser.required("--client-node-id")?,
+            client_pubkey_hex: parser.required("--client-pubkey-hex")?,
+            owner_approver_id: parser.required("--owner-approver-id")?,
+        }),
+        "e2e-issue-assignments" => Ok(OpsCommand::E2eIssueAssignments {
+            exit_node_id: parser.required("--exit-node-id")?,
+            client_node_id: parser.required("--client-node-id")?,
+            exit_endpoint: parser.required("--exit-endpoint")?,
+            client_endpoint: parser.required("--client-endpoint")?,
+            exit_pubkey_hex: parser.required("--exit-pubkey-hex")?,
+            client_pubkey_hex: parser.required("--client-pubkey-hex")?,
         }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
@@ -1204,6 +1325,64 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             preferred_exit_node_id,
             enable_exit_advertise,
             assignment_refresh_env_path,
+        ),
+        OpsCommand::PeerStoreValidate {
+            config_dir,
+            peers_file,
+        } => ops_peer_store::execute_ops_peer_store_validate(config_dir, peers_file),
+        OpsCommand::PeerStoreList {
+            config_dir,
+            peers_file,
+            role,
+            node_id,
+        } => ops_peer_store::execute_ops_peer_store_list(config_dir, peers_file, role, node_id),
+        OpsCommand::RunDebianTwoNodeE2e { config } => {
+            ops_e2e::execute_ops_run_debian_two_node_e2e(config)
+        }
+        OpsCommand::E2eBootstrapHost {
+            role,
+            node_id,
+            network_id,
+            src_dir,
+            ssh_allow_cidrs,
+            skip_apt,
+        } => ops_e2e::execute_ops_e2e_bootstrap_host(
+            role,
+            node_id,
+            network_id,
+            src_dir,
+            ssh_allow_cidrs,
+            skip_apt,
+        ),
+        OpsCommand::E2eEnforceHost {
+            role,
+            node_id,
+            src_dir,
+            ssh_allow_cidrs,
+        } => ops_e2e::execute_ops_e2e_enforce_host(role, node_id, src_dir, ssh_allow_cidrs),
+        OpsCommand::E2eMembershipAdd {
+            client_node_id,
+            client_pubkey_hex,
+            owner_approver_id,
+        } => ops_e2e::execute_ops_e2e_membership_add(
+            client_node_id,
+            client_pubkey_hex,
+            owner_approver_id,
+        ),
+        OpsCommand::E2eIssueAssignments {
+            exit_node_id,
+            client_node_id,
+            exit_endpoint,
+            client_endpoint,
+            exit_pubkey_hex,
+            client_pubkey_hex,
+        } => ops_e2e::execute_ops_e2e_issue_assignments(
+            exit_node_id,
+            client_node_id,
+            exit_endpoint,
+            client_endpoint,
+            exit_pubkey_hex,
+            client_pubkey_hex,
         ),
     }
 }
@@ -4931,6 +5110,9 @@ fn help_text() -> String {
         "  ops materialize-signing-passphrase --output <absolute-path>",
         "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
         "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
+        "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
+        "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
+        "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
     ]
     .join("\n")
 }
@@ -5200,6 +5382,102 @@ mod tests {
             "false".to_string(),
         ]);
         assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
+
+        let peer_store_validate = parse_command(&[
+            "ops".to_string(),
+            "peer-store-validate".to_string(),
+            "--config-dir".to_string(),
+            "/tmp/rustynet-config".to_string(),
+            "--peers-file".to_string(),
+            "/tmp/rustynet-config/peers.db".to_string(),
+        ]);
+        assert!(format!("{peer_store_validate:?}").contains("PeerStoreValidate"));
+
+        let peer_store_list = parse_command(&[
+            "ops".to_string(),
+            "peer-store-list".to_string(),
+            "--config-dir".to_string(),
+            "/tmp/rustynet-config".to_string(),
+            "--peers-file".to_string(),
+            "/tmp/rustynet-config/peers.db".to_string(),
+            "--role".to_string(),
+            "admin".to_string(),
+            "--node-id".to_string(),
+            "exit-1".to_string(),
+        ]);
+        assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
+
+        let remote_e2e = parse_command(&[
+            "ops".to_string(),
+            "run-debian-two-node-e2e".to_string(),
+            "--exit-host".to_string(),
+            "192.168.18.37".to_string(),
+            "--client-host".to_string(),
+            "192.168.18.40".to_string(),
+            "--ssh-allow-cidrs".to_string(),
+            "192.168.18.2/32".to_string(),
+        ]);
+        assert!(format!("{remote_e2e:?}").contains("RunDebianTwoNodeE2e"));
+
+        let bootstrap = parse_command(&[
+            "ops".to_string(),
+            "e2e-bootstrap-host".to_string(),
+            "--role".to_string(),
+            "admin".to_string(),
+            "--node-id".to_string(),
+            "exit-node".to_string(),
+            "--network-id".to_string(),
+            "local-net".to_string(),
+            "--src-dir".to_string(),
+            "/opt/rustynet-clean/src".to_string(),
+            "--ssh-allow-cidrs".to_string(),
+            "192.168.18.2/32".to_string(),
+        ]);
+        assert!(format!("{bootstrap:?}").contains("E2eBootstrapHost"));
+
+        let enforce = parse_command(&[
+            "ops".to_string(),
+            "e2e-enforce-host".to_string(),
+            "--role".to_string(),
+            "client".to_string(),
+            "--node-id".to_string(),
+            "client-node".to_string(),
+            "--src-dir".to_string(),
+            "/opt/rustynet-clean/src".to_string(),
+            "--ssh-allow-cidrs".to_string(),
+            "192.168.18.2/32".to_string(),
+        ]);
+        assert!(format!("{enforce:?}").contains("E2eEnforceHost"));
+
+        let membership = parse_command(&[
+            "ops".to_string(),
+            "e2e-membership-add".to_string(),
+            "--client-node-id".to_string(),
+            "client-node".to_string(),
+            "--client-pubkey-hex".to_string(),
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
+            "--owner-approver-id".to_string(),
+            "exit-node-owner".to_string(),
+        ]);
+        assert!(format!("{membership:?}").contains("E2eMembershipAdd"));
+
+        let assignments = parse_command(&[
+            "ops".to_string(),
+            "e2e-issue-assignments".to_string(),
+            "--exit-node-id".to_string(),
+            "exit-node".to_string(),
+            "--client-node-id".to_string(),
+            "client-node".to_string(),
+            "--exit-endpoint".to_string(),
+            "192.168.18.37:51820".to_string(),
+            "--client-endpoint".to_string(),
+            "192.168.18.40:51820".to_string(),
+            "--exit-pubkey-hex".to_string(),
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
+            "--client-pubkey-hex".to_string(),
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
+        ]);
+        assert!(format!("{assignments:?}").contains("E2eIssueAssignments"));
     }
 
     #[test]

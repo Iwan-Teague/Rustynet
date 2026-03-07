@@ -22,6 +22,7 @@ Success criteria:
 - Phase F complete: Phase 6 parity probe/report/bundle generators are Rust-backed (`rustynet ops collect-platform-probe`, `rustynet ops generate-platform-parity-report`, `rustynet ops collect-platform-parity-bundle`); release scripts are thin wrappers that only dispatch to Rust commands.
 - Phase G complete: Phase9/Phase10 evidence pipeline is Rust-backed (`rustynet ops collect-phase9-raw-evidence`, `rustynet ops generate-phase9-artifacts`, `rustynet ops generate-phase10-artifacts`); shell/Python collection/generation logic removed from active scripts.
 - Phase H complete: phase1 measured input collection + baseline orchestration are Rust-backed (`rustynet ops collect-phase1-measured-input`, `rustynet ops run-phase1-baseline`); legacy shell/Python collector logic and shell `source` ingestion are removed from the active path.
+- Phase I progress: Debian two-node remote E2E orchestration is Rust-invoked (`rustynet ops run-debian-two-node-e2e`), `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` is wrapper-only, and active remote orchestration/probe operations now use argv-only SSH command dispatch (no `bash -se` payload/snippet path in active code); remaining work is execution evidence refresh from lab dry-runs.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
@@ -227,8 +228,9 @@ Priority is based on: `privilege level` + `secret handling` + `state mutation ri
 - `start_or_restart_service`
 - `disconnect_vpn`
 
-2. Optional later (test harness hardening)
-- `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh`
+2. E2E hardening follow-up (in progress)
+- `rustynet ops run-debian-two-node-e2e`: collect fresh lab dry-run evidence for the argv-only remote execution path and retain regression checks to prevent shell-path reintroduction.
+- `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` remains wrapper-only (`exec rustynet ...`).
 
 Keep as shell wrappers for now:
 - `scripts/ci/*` gate wrappers, `scripts/fuzz/smoke.sh` (orchestration glue; lower security ROI).
@@ -335,13 +337,15 @@ Validation:
 Exit criteria:
 - measured-input derivation and phase1 baseline orchestration are Rust-backed.
 
-## Phase I (Optional): E2E Remote Orchestrator Migration
+## Phase I (In Progress): E2E Remote Orchestrator Migration
 Scope:
-- port `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` into Rust test harness tooling.
+- keep `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` as an `exec rustynet ...` wrapper only.
+- migrate orchestration flow to `rustynet ops run-debian-two-node-e2e`.
+- follow-up: refresh lab validation evidence for the argv-only remote execution path and keep guardrails that prevent shell-path regression.
 
-Why optional:
+Why in progress:
 - high complexity but lower production-runtime risk than phases E-H,
-- still useful for secure remote orchestration and reproducibility.
+- still high security value for privileged remote orchestration and reproducibility.
 
 ## 12) Implementation Pattern (Apply To Every Phase)
 1. Add Rust command with strict typed argument/env parsing.

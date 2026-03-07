@@ -19,6 +19,9 @@ Scale the platform architecture and add commercial control primitives for broade
 - Multi-relay deployment support.
 - Health-based relay selection.
 - Regional relay options.
+- Authenticated relay transport behavior that forwards ciphertext only.
+- Traversal coordination support for signed endpoint-hint distribution and freshness windows.
+- Relay abuse controls (rate limits/quotas) validated under churn and failover.
 
 3. Commercial controls:
 - Multi-tenant organization model.
@@ -39,6 +42,7 @@ Scale the platform architecture and add commercial control primitives for broade
 ## 3) Deliverables
 - HA control-plane deployment reference.
 - Multi-relay control and health behavior in staging.
+- Traversal-aware relay coordination baseline in staging (signed endpoint-hint path).
 - Tenant controls and delegated admin boundaries implemented.
 - SSO/MFA integration available for production use.
 - Control-plane trust-hardening mode available and documented.
@@ -49,12 +53,14 @@ Scale the platform architecture and add commercial control primitives for broade
 - HA failover does not bypass policy or revocation controls.
 - Trust-hardening mode cannot be bypassed by compromised coordination service alone.
 - Trust-hardening mode refuses to operate when trusted state cannot be safely loaded or persisted.
+- Relay transport path is ciphertext-only and cannot inspect/decrypt payload content.
+- Traversal endpoint-hint replay/tamper checks are enforced and test-backed.
 
 ## 5) Phase 7 Exit Criteria
 - Platform remains available through tested failover scenarios.
 - Multi-tenant boundaries are validated.
 - Commercial account controls function with auditable changes.
-- Relay fleet behavior is stable under regional or node-level faults.
+- Relay fleet behavior is stable under regional/node-level faults and hard-NAT traversal scenarios.
 
 ## 6) Handoff to Phase 8
 - Phase 8 adds advanced assurance, compliance maturity, and stronger key custody controls.

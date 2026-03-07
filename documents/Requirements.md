@@ -62,6 +62,10 @@ Primary goal:
 - NAT traversal using UDP hole punching when possible.
 - Relay fallback when direct P2P cannot be established.
 - Keepalive and roaming support (IP changes, Wi-Fi to LTE transitions).
+- Traversal coordination must use signed, short-lived endpoint hints with anti-replay checks (nonce + freshness bounds) before endpoint mutation.
+- Direct and relay path selection must use one deterministic runtime controller (`direct`/`relay` states) with fail-closed outcomes; no parallel legacy/fallback path logic.
+- Relay transport is a first-class production capability for hard NAT cases and must forward ciphertext only.
+- Runtime must continuously probe relay-backed sessions and automatically fail back to direct when trusted direct connectivity becomes healthy.
 
 ### 3.3 Exit Nodes
 - Admin can enable/disable exit-node capability per node.
@@ -174,6 +178,8 @@ Primary goal:
 - Tunnel/data-path compression for sensitive traffic must be disabled by default to avoid compression side-channel classes.
 - Redaction and secret handling requirements apply to all config ingestion paths (MDM, CLI flags, env vars, API payloads, UI forms, and logs).
 - Time correctness controls must exist for monotonic-counter dependent handshake logic (clock skew/drift detection and fail-safe handling).
+- Traversal endpoint/candidate updates must be authenticated, replay-protected, and freshness-bounded; unsigned or stale traversal hints are rejected fail-closed.
+- Direct/relay path transitions must preserve ACL, trust-state, and leak-prevention invariants (no policy bypass during failover/failback).
 - Threat considerations:
 - Compromised node
 - Stolen pre-auth key
@@ -183,18 +189,21 @@ Primary goal:
 
 ### 6.1 Components
 - `rustynet-control`:
-- Auth, node registry, policy engine, peer map distribution, DNS records.
+- Auth, node registry, policy engine, peer map distribution, DNS records, and signed traversal endpoint-hint distribution.
 - `rustynetd`:
-- Client daemon handling tunnels, route programming, DNS config, exit-node logic.
+- Client daemon handling tunnels, route programming, DNS config, exit-node logic, and deterministic direct/relay traversal path control.
 - `rustynet`:
 - CLI frontend to daemon + control API.
-- `rustynet-relay` (optional in MVP if embedded in control):
-- Relay/DERP-like transport for hard NAT cases.
+- `rustynet-relay`:
+- Relay/DERP-like ciphertext-forwarding transport for hard NAT cases (deployment may be embedded with control in early environments, but behavior is mandatory).
 
 ### 6.2 Data Plane
 - WireGuard-compatible transport behavior.
 - Prefer direct P2P UDP path.
+- Perform authenticated traversal candidate checks for direct path establishment (hole punching).
 - Relay path fallback with health probing and automatic failback to direct.
+- Reject unsigned/stale traversal endpoint hints before any peer endpoint update.
+- Fail closed in protected modes when neither trusted direct nor trusted relay path is available.
 
 ### 6.3 Transport Backend Abstraction (Hard Requirement)
 - Define a transport backend interface in Rust (e.g., start tunnel, add/remove peer, apply routes, collect stats, shutdown).
@@ -218,10 +227,10 @@ Primary goal:
 - `Phase 4`: Exit nodes, LAN access toggle enforcement, Magic DNS, and CLI feature completion.
 - `Phase 5`: Observability, diagnostics, reliability hardening, tamper-evident auditing, and early release-integrity guardrails.
 - `Phase 6`: Web admin UX, multi-user workflows, baseline RBAC+MFA controls, and macOS/Windows client expansion.
-- `Phase 7`: High-availability scale-out, relay fleet maturity, commercial controls, and control-plane trust-hardening mode.
+- `Phase 7`: High-availability scale-out, relay fleet maturity (including traversal coordination and authenticated ciphertext relay transport), commercial controls, and control-plane trust-hardening mode.
 - `Phase 8`: Security assurance program, key custody hardening, compliance, and privacy maturity.
 - `Phase 9`: Completion readiness, API compatibility guarantees, operational excellence, and long-term protocol agility validation.
-- `Phase 10`: Real Linux dataplane enablement for encrypted exit-node traffic, persistent daemon IPC control, NAT/forwarding enforcement, and fail-closed leak prevention validation.
+- `Phase 10`: Real Linux dataplane enablement for encrypted exit-node traffic, signed traversal endpoint-hint enforcement, deterministic direct-hole-punch/relay fallback behavior, persistent daemon IPC control, NAT/forwarding enforcement, and fail-closed leak prevention validation.
 
 ## 8) Phase Planning Rules
 - Earlier phases must land the abstractions required by later phases before feature expansion.
