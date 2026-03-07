@@ -3016,44 +3016,30 @@ fn execute_ops_apply_role_coupling(
     let mut warnings = Vec::new();
     let assignment_refresh_available =
         assignment_refresh_available_ops(assignment_refresh_env_path.as_path())?;
-    if assignment_refresh_available {
-        if target_role == "client" {
-            if let Err(err) = execute_ops_set_assignment_refresh_exit_node(
-                assignment_refresh_env_path.clone(),
-                preferred_exit_node_id.clone(),
-            ) {
-                warnings.push(format!("set assignment refresh exit node failed: {err}"));
-            }
-        } else if let Err(err) =
-            execute_ops_set_assignment_refresh_exit_node(assignment_refresh_env_path.clone(), None)
-        {
-            warnings.push(format!("clear assignment refresh exit node failed: {err}"));
-        }
-
-        if let Err(err) = force_local_assignment_refresh_now_ops() {
-            warnings.push(format!("forced local assignment refresh failed: {err}"));
-        }
-    } else {
-        warnings.push(format!(
-            "assignment refresh is unavailable ({}); skipped persisted exit-node mutation and forced refresh",
+    if !assignment_refresh_available {
+        return Err(format!(
+            "assignment refresh is unavailable ({}); role coupling is fail-closed",
             assignment_refresh_env_path.display()
         ));
     }
-
     if target_role == "client" {
-        if let Some(exit_node_id) = preferred_exit_node_id.as_deref() {
-            if let Err(err) =
-                send_role_coupling_ipc(IpcCommand::ExitNodeSelect(exit_node_id.to_string()))
-            {
-                warnings.push(format!("select exit node {exit_node_id} failed: {err}"));
-            }
-        } else if let Err(err) = send_role_coupling_ipc(IpcCommand::ExitNodeOff) {
-            warnings.push(format!("clear exit node selection failed: {err}"));
+        if let Err(err) = execute_ops_set_assignment_refresh_exit_node(
+            assignment_refresh_env_path.clone(),
+            preferred_exit_node_id.clone(),
+        ) {
+            return Err(format!("set assignment refresh exit node failed: {err}"));
         }
-    } else {
-        if let Err(err) = send_role_coupling_ipc(IpcCommand::ExitNodeOff) {
-            warnings.push(format!("clear exit node selection failed: {err}"));
-        }
+    } else if let Err(err) =
+        execute_ops_set_assignment_refresh_exit_node(assignment_refresh_env_path.clone(), None)
+    {
+        return Err(format!("clear assignment refresh exit node failed: {err}"));
+    }
+
+    if let Err(err) = force_local_assignment_refresh_now_ops() {
+        return Err(format!("forced local assignment refresh failed: {err}"));
+    }
+
+    if target_role == "admin" {
         if enable_exit_advertise {
             if let Err(err) =
                 send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))

@@ -43,6 +43,26 @@ options:
 USAGE
 }
 
+wait_for_lan_probe_state() {
+  local target="$1"
+  local desired_state="$2"
+  local attempts="${3:-15}"
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if live_lab_ssh "$target" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
+      if [[ "$desired_state" == "reachable" ]]; then
+        return 0
+      fi
+    else
+      if [[ "$desired_state" == "blocked" ]]; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
@@ -210,16 +230,16 @@ printf '%s\n' "$CLIENT_STATUS_OFF_INITIAL"
 
 live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
 sleep 3
-if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
-  lan_off_ping_status="fail"
-else
+if wait_for_lan_probe_state "$CLIENT_HOST" "blocked" 15; then
   lan_off_ping_status="pass"
+else
+  lan_off_ping_status="fail"
 fi
 CLIENT_STATUS_OFF="$(live_lab_status "$CLIENT_HOST")"
 
 live_lab_apply_lan_access_coupling "$CLIENT_HOST" "true" "$LAN_TEST_CIDR"
 sleep 5
-if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
+if wait_for_lan_probe_state "$CLIENT_HOST" "reachable" 15; then
   lan_on_ping_status="pass"
 else
   lan_on_ping_status="fail"
@@ -229,10 +249,10 @@ CLIENT_ROUTE_ON="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get ${LAN_TEST_P
 
 live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
 sleep 3
-if live_lab_ssh "$CLIENT_HOST" "ping -c 1 -W 1 ${LAN_TEST_PROBE_IP} >/dev/null 2>&1" 20; then
-  lan_off_again_status="fail"
-else
+if wait_for_lan_probe_state "$CLIENT_HOST" "blocked" 15; then
   lan_off_again_status="pass"
+else
+  lan_off_again_status="fail"
 fi
 CLIENT_STATUS_OFF_FINAL="$(live_lab_status "$CLIENT_HOST")"
 
