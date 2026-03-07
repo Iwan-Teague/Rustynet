@@ -7,6 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::env_file::parse_env_value;
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{RngCore, rngs::OsRng};
 
@@ -1083,7 +1084,13 @@ fn read_env_file_values(path: &Path) -> Result<HashMap<String, String>, String> 
             if key.is_empty() || values.contains_key(key) {
                 continue;
             }
-            values.insert(key.to_string(), value.to_string());
+            let parsed = parse_env_value(value).map_err(|err| {
+                format!(
+                    "parse environment file {} failed for key {key}: {err}",
+                    path.display()
+                )
+            })?;
+            values.insert(key.to_string(), parsed);
         }
     }
     Ok(values)
@@ -2026,6 +2033,42 @@ mod tests {
         assert_eq!(
             values.get("RUSTYNET_NODE_ROLE").expect("node role"),
             "client"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_env_file_values_decodes_quoted_values() {
+        let unique = format!(
+            "rustynet-cli-env-quoted-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(format!("{unique}.env"));
+        std::fs::write(
+            &path,
+            concat!(
+                "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\"\n",
+                "RUSTYNET_ASSIGNMENT_ALLOW=\"client-50|exit-49;exit-49|client-50\"\n"
+            ),
+        )
+        .expect("env file should be written");
+
+        let values = read_env_file_values(path.as_path()).expect("env should parse");
+        assert_eq!(
+            values
+                .get("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")
+                .expect("exit node id"),
+            "exit-49"
+        );
+        assert_eq!(
+            values
+                .get("RUSTYNET_ASSIGNMENT_ALLOW")
+                .expect("allow rules"),
+            "client-50|exit-49;exit-49|client-50"
         );
 
         let _ = std::fs::remove_file(path);
