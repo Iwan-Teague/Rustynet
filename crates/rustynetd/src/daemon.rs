@@ -5165,6 +5165,12 @@ mod tests {
             format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
         )
         .expect("verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("verifier key permissions should be secure");
+        }
         let body = trust_evidence_payload(&record);
         let signature = signing_key.sign(body.as_bytes());
         std::fs::write(
@@ -5172,6 +5178,12 @@ mod tests {
             format!("{body}signature={}\n", hex_encode(&signature.to_bytes())),
         )
         .expect("trust file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("trust evidence permissions should be secure");
+        }
     }
 
     fn write_auto_tunnel_file(
