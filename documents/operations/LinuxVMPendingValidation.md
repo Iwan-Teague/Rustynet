@@ -227,6 +227,78 @@ cargo test -p rustynet-cli -- --nocapture
   - `membership_gates.sh` passes without manual provenance env setup.
   - Generated provenance key files are owner-only and provenance verification remains pass/fail closed.
 
+### LNX-2026-03-07-04: F04 remote E2E orchestration hardening (argv-only active path)
+- Status: `PENDING`
+- Priority: High
+- Runtime impact: High (privileged remote provisioning/orchestration path)
+- Files:
+  - `crates/rustynet-cli/src/ops_e2e.rs`
+  - `crates/rustynet-cli/src/main.rs`
+  - `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh`
+  - `documents/operations/ComparativeSecurityFlawAssessment_2026-03-06.md`
+  - `documents/operations/ShellToRustMigrationPlan_2026-03-06.md`
+- Change summary:
+  - Active remote orchestration path is Rust-only (`ops run-debian-two-node-e2e`).
+  - Legacy remote `bash -se` payload/snippet helpers were removed from active code path.
+  - Remote orchestration/probe steps now run through argv-only SSH command dispatch helpers.
+- Required VM coverage:
+  - `debian-a`, `debian-b`
+- Required checks:
+```bash
+cargo check -p rustynet-cli
+cargo test -p rustynet-cli -- --nocapture
+bash -n scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh
+umask 077 && printf 'tempo\n' > /tmp/rustynet_sudo.pass
+./scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh \
+  --exit-host 192.168.18.49 \
+  --client-host 192.168.18.50 \
+  --ssh-user debian \
+  --sudo-password-file /tmp/rustynet_sudo.pass \
+  --ssh-allow-cidrs 192.168.18.2/32 \
+  --skip-apt
+rm -f /tmp/rustynet_sudo.pass
+```
+- Pass criteria:
+  - E2E command succeeds and report is generated at `artifacts/phase10/debian_two_node_remote_validation.md`.
+  - Report contains no failing checks.
+  - No shell payload fallback path is required for successful orchestration.
+
+### LNX-2026-03-07-05: F02 peer-store validation/read migration to Rust ops path
+- Status: `PENDING`
+- Priority: High
+- Runtime impact: Medium-High (startup/menu peer-state parsing and candidate discovery path)
+- Files:
+  - `crates/rustynet-cli/src/ops_peer_store.rs`
+  - `crates/rustynet-cli/src/main.rs`
+  - `start.sh`
+  - `documents/operations/ComparativeSecurityFlawAssessment_2026-03-06.md`
+- Change summary:
+  - Added Rust peer-store ops commands (`peer-store-validate`, `peer-store-list`) with strict custody + parsing controls.
+  - `start.sh` peer-store flows now call Rust ops commands (no active shell peer-file parser path).
+  - Startup + peer listing + admin peer listing + exit-candidate probe now consume Rust-validated records.
+- Required VM coverage:
+  - `debian-a`, `ubuntu-a`, `fedora-a`, `mint-a`
+- Required checks:
+```bash
+cargo check -p rustynet-cli
+cargo test -p rustynet-cli -- --nocapture
+bash -n start.sh
+PEER_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rustynet"
+rustynet ops peer-store-validate --config-dir "${PEER_CFG_DIR}" --peers-file "${PEER_CFG_DIR}/peers.db"
+rustynet ops peer-store-list --config-dir "${PEER_CFG_DIR}" --peers-file "${PEER_CFG_DIR}/peers.db"
+rustynet ops peer-store-list --config-dir "${PEER_CFG_DIR}" --peers-file "${PEER_CFG_DIR}/peers.db" --role admin
+stat -c '%a %u %n' "${PEER_CFG_DIR}" "${PEER_CFG_DIR}/peers.db"
+./start.sh
+```
+Manual runtime checks in menu:
+1. Run `LIST SAVED PEERS`; command completes without parser errors.
+2. Run `SELECT EXIT NODE`; candidate probe executes without peer-store parse failures.
+3. For a known node id, two-hop selection pre-check (`find_peer_record_by_node_id` path) resolves records without shell parser regressions.
+- Pass criteria:
+  - Rust peer-store ops commands succeed on all listed VMs.
+  - `peers.db` custody is enforced (`config dir 0700`, `peers.db 0600`, owner is current user).
+  - `start.sh` peer-listing/probe flows succeed without shell parser failures.
+
 ## Non-Runtime / Docs-Only Changes (No VM Runtime Validation Required)
 - `README.md`
 - `documents/operations/MeasuredEvidenceGeneration.md`
@@ -258,6 +330,12 @@ Record each VM run here.
 | _pending_ | LNX-2026-03-07-02 | _pending_ | ubuntu-a | _pending_ | _pending_ | _pending_ |
 | _pending_ | LNX-2026-03-07-03 | _pending_ | debian-a | _pending_ | _pending_ | _pending_ |
 | _pending_ | LNX-2026-03-07-03 | _pending_ | ubuntu-a | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-04 | _pending_ | debian-a | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-04 | _pending_ | debian-b | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-05 | _pending_ | debian-a | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-05 | _pending_ | ubuntu-a | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-05 | _pending_ | fedora-a | _pending_ | _pending_ | _pending_ |
+| _pending_ | LNX-2026-03-07-05 | _pending_ | mint-a | _pending_ | _pending_ | _pending_ |
 
 ## PR / Commit Gate for This Queue
 Before marking a change set `PASSED`:

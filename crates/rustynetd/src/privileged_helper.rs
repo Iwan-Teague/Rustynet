@@ -422,10 +422,7 @@ fn handle_request(request: HelperRequest) -> HelperResponse {
     let binary = match program.resolve_binary() {
         Some(path) => path,
         None => {
-            return HelperResponse::error(format!(
-                "no supported binary path found for {}",
-                program
-            ));
+            return HelperResponse::error(format!("no supported binary path found for {program}",));
         }
     };
 
@@ -436,10 +433,9 @@ fn handle_request(request: HelperRequest) -> HelperResponse {
             let stderr = truncate_lossy(&output.stderr, MAX_OUTPUT_BYTES);
             HelperResponse::success(status, stdout, stderr)
         }
-        Err(err) => HelperResponse::error(format!(
-            "{} command spawn failed ({}): {err}",
-            program, binary
-        )),
+        Err(err) => {
+            HelperResponse::error(format!("{program} command spawn failed ({binary}): {err}",))
+        }
     }
 }
 
@@ -455,25 +451,20 @@ fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
 fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), String> {
     if args.len() > MAX_ARGS {
         return Err(format!(
-            "too many arguments for privileged command {}",
-            program
+            "too many arguments for privileged command {program}",
         ));
     }
     if args.is_empty() {
         return Err(format!(
-            "missing arguments for privileged command {}",
-            program
+            "missing arguments for privileged command {program}",
         ));
     }
     for arg in args {
         if arg.is_empty() {
-            return Err(format!("empty argument in privileged command {}", program));
+            return Err(format!("empty argument in privileged command {program}"));
         }
         if arg.len() > MAX_ARG_BYTES {
-            return Err(format!(
-                "argument too long in privileged command {}",
-                program
-            ));
+            return Err(format!("argument too long in privileged command {program}",));
         }
     }
     match program {

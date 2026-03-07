@@ -226,6 +226,23 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     let auto_tunnel_max_age_secs =
         env_string_or_existing_default("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", "300", &existing_env)?;
+    let traversal_bundle_path = env_path_or_existing_default(
+        "RUSTYNET_TRAVERSAL_BUNDLE",
+        "/var/lib/rustynet/rustynetd.traversal",
+        &existing_env,
+    )?;
+    let traversal_verifier_key_path = env_path_or_existing_default(
+        "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
+        "/etc/rustynet/traversal.pub",
+        &existing_env,
+    )?;
+    let traversal_watermark_path = env_path_or_existing_default(
+        "RUSTYNET_TRAVERSAL_WATERMARK",
+        "/var/lib/rustynet/rustynetd.traversal.watermark",
+        &existing_env,
+    )?;
+    let traversal_max_age_secs =
+        env_string_or_existing_default("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", "120", &existing_env)?;
     let node_id = env_string_or_existing_required("RUSTYNET_NODE_ID", &existing_env)?;
     let node_role = env_string_or_existing_default("RUSTYNET_NODE_ROLE", "client", &existing_env)?;
     let backend_mode =
@@ -327,6 +344,10 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS",
         auto_port_forward_lease_secs_raw.as_str(),
     )?;
+    parse_nonzero_u64(
+        "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
+        traversal_max_age_secs.as_str(),
+    )?;
 
     if fail_closed_ssh_allow_enabled && fail_closed_ssh_allow_cidrs.trim().is_empty() {
         return Err(
@@ -362,6 +383,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         trust_watermark_path.as_path(),
         membership_watermark_path.as_path(),
         auto_tunnel_watermark_path.as_path(),
+        traversal_watermark_path.as_path(),
         wireguard_private_key_path.as_path(),
     ] {
         ensure_parent_dir_if_missing(mutable_target, daemon_uid, daemon_gid, 0o750)?;
@@ -492,6 +514,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         trust_signer_key_path.as_path(),
         auto_tunnel_bundle_path.as_path(),
         auto_tunnel_verifier_key_path.as_path(),
+        traversal_bundle_path.as_path(),
+        traversal_verifier_key_path.as_path(),
         membership_owner_signing_key_path.as_path(),
     ] {
         ensure_parent_dir_if_missing(readonly_target, Uid::from_raw(0), daemon_gid, 0o750)?;
@@ -519,6 +543,12 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     set_owner_mode_if_exists(
         auto_tunnel_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        traversal_watermark_path.as_path(),
         daemon_uid,
         daemon_gid,
         0o600,
@@ -561,6 +591,12 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         0o640,
     )?;
     set_owner_mode_if_exists(
+        traversal_bundle_path.as_path(),
+        Uid::from_raw(0),
+        daemon_gid,
+        0o640,
+    )?;
+    set_owner_mode_if_exists(
         trust_verifier_key_path.as_path(),
         Uid::from_raw(0),
         Gid::from_raw(0),
@@ -574,6 +610,12 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     set_owner_mode_if_exists(
         auto_tunnel_verifier_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+    )?;
+    set_owner_mode_if_exists(
+        traversal_verifier_key_path.as_path(),
         Uid::from_raw(0),
         Gid::from_raw(0),
         0o644,
@@ -667,6 +709,22 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS".to_string(),
             auto_tunnel_max_age_secs,
         ),
+        (
+            "RUSTYNET_TRAVERSAL_BUNDLE".to_string(),
+            display_path(traversal_bundle_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRAVERSAL_VERIFIER_KEY".to_string(),
+            display_path(traversal_verifier_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRAVERSAL_WATERMARK".to_string(),
+            display_path(traversal_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_string(),
+            traversal_max_age_secs,
+        ),
         ("RUSTYNET_BACKEND".to_string(), backend_mode),
         ("RUSTYNET_WG_INTERFACE".to_string(), wireguard_interface),
         (
@@ -684,8 +742,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_WG_KEY_PASSPHRASE".to_string(),
             format!(
-                "/run/credentials/rustynetd.service/{}",
-                RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME
+                "/run/credentials/rustynetd.service/{RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME}",
             ),
         ),
         (
@@ -874,8 +931,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
 
     Ok(format!(
-        "systemd installer completed: role={} wireguard_listen_port={} egress_interface={} timeout_ms={}",
-        node_role, wireguard_listen_port, egress_interface, privileged_helper_timeout_ms
+        "systemd installer completed: role={node_role} wireguard_listen_port={wireguard_listen_port} egress_interface={egress_interface} timeout_ms={privileged_helper_timeout_ms}",
     ))
 }
 

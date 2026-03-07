@@ -23,6 +23,7 @@ Success criteria:
 - Phase G complete: Phase9/Phase10 evidence pipeline is Rust-backed (`rustynet ops collect-phase9-raw-evidence`, `rustynet ops generate-phase9-artifacts`, `rustynet ops generate-phase10-artifacts`); shell/Python collection/generation logic removed from active scripts.
 - Phase H complete: phase1 measured input collection + baseline orchestration are Rust-backed (`rustynet ops collect-phase1-measured-input`, `rustynet ops run-phase1-baseline`); legacy shell/Python collector logic and shell `source` ingestion are removed from the active path.
 - Phase I progress: Debian two-node remote E2E orchestration is Rust-invoked (`rustynet ops run-debian-two-node-e2e`), `scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh` is wrapper-only, and active remote orchestration/probe operations now use argv-only SSH command dispatch (no `bash -se` payload/snippet path in active code); remaining work is execution evidence refresh from lab dry-runs.
+- Phase E/F02 progress: peer-store validation/read flows are Rust-backed via `rustynet ops peer-store-validate` and `rustynet ops peer-store-list`; `start.sh` now consumes Rust-validated peer records instead of shell parsing `peers.db` directly.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:

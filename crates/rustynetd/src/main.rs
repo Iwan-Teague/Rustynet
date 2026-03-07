@@ -7,6 +7,8 @@ use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
     DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
+    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
     DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
     DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
     DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_LISTEN_PORT,
@@ -189,8 +191,7 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
     )?;
 
     println!(
-        "key init complete: runtime_private_key={} encrypted_private_key={} public_key={}",
-        runtime_path, encrypted_path, public_path
+        "key init complete: runtime_private_key={runtime_path} encrypted_private_key={encrypted_path} public_key={public_path}",
     );
     Ok(())
 }
@@ -277,8 +278,7 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
     )?;
 
     println!(
-        "key migrate complete: existing_private_key={} runtime_private_key={} encrypted_private_key={} public_key={}",
-        existing_private_key_path, runtime_path, encrypted_path, public_path
+        "key migrate complete: existing_private_key={existing_private_key_path} runtime_private_key={runtime_path} encrypted_private_key={encrypted_path} public_key={public_path}",
     );
     Ok(())
 }
@@ -449,6 +449,38 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .map_err(|err| format!("invalid auto tunnel max age: {err}"))?;
                 config.auto_tunnel_max_age_secs = NonZeroU64::new(parsed)
                     .ok_or_else(|| "auto tunnel max age must be greater than 0".to_string())?;
+                index += 2;
+            }
+            Some("--traversal-bundle") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-bundle requires a value".to_string())?;
+                config.traversal_bundle_path = value.into();
+                index += 2;
+            }
+            Some("--traversal-verifier-key") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-verifier-key requires a value".to_string())?;
+                config.traversal_verifier_key_path = value.into();
+                index += 2;
+            }
+            Some("--traversal-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-watermark requires a value".to_string())?;
+                config.traversal_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--traversal-max-age-secs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-max-age-secs requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid traversal max age: {err}"))?;
+                config.traversal_max_age_secs = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "traversal max age must be greater than 0".to_string())?;
                 index += 2;
             }
             Some("--backend") => {
@@ -770,8 +802,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     let owner_signing_key_passphrase_path =
         owner_signing_key_passphrase_path.ok_or_else(|| {
             format!(
-                "owner signing key passphrase path is required; pass --owner-signing-key-passphrase-file or set {}",
-                MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV
+                "owner signing key passphrase path is required; pass --owner-signing-key-passphrase-file or set {MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV}",
             )
         })?;
     if !owner_signing_key_passphrase_path.starts_with('/') {
@@ -981,7 +1012,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -1000,6 +1031,10 @@ fn help_text() -> String {
         &format!("  membership_snapshot={DEFAULT_MEMBERSHIP_SNAPSHOT_PATH}"),
         &format!("  membership_log={DEFAULT_MEMBERSHIP_LOG_PATH}"),
         &format!("  membership_watermark={DEFAULT_MEMBERSHIP_WATERMARK_PATH}"),
+        &format!("  traversal_bundle={DEFAULT_TRAVERSAL_BUNDLE_PATH}"),
+        &format!("  traversal_verifier_key={DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH}"),
+        &format!("  traversal_watermark={DEFAULT_TRAVERSAL_WATERMARK_PATH}"),
+        &format!("  traversal_max_age_secs={DEFAULT_TRAVERSAL_MAX_AGE_SECS}"),
         &format!(
             "  membership_owner_signing_key={DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
         ),
@@ -1114,5 +1149,40 @@ mod tests {
         ];
         let err = parse_daemon_config(&args).expect_err("zero lease should fail parsing");
         assert!(err.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_traversal_settings() {
+        let args = vec![
+            "--traversal-bundle".to_string(),
+            "/tmp/rustynet.traversal".to_string(),
+            "--traversal-verifier-key".to_string(),
+            "/tmp/rustynet.traversal.pub".to_string(),
+            "--traversal-watermark".to_string(),
+            "/tmp/rustynet.traversal.watermark".to_string(),
+            "--traversal-max-age-secs".to_string(),
+            "90".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config.traversal_bundle_path,
+            std::path::PathBuf::from("/tmp/rustynet.traversal")
+        );
+        assert_eq!(
+            config.traversal_verifier_key_path,
+            std::path::PathBuf::from("/tmp/rustynet.traversal.pub")
+        );
+        assert_eq!(
+            config.traversal_watermark_path,
+            std::path::PathBuf::from("/tmp/rustynet.traversal.watermark")
+        );
+        assert_eq!(config.traversal_max_age_secs.get(), 90);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_traversal_max_age() {
+        let args = vec!["--traversal-max-age-secs".to_string(), "0".to_string()];
+        let err = parse_daemon_config(&args).expect_err("zero traversal max age should fail");
+        assert!(err.contains("traversal max age must be greater than 0"));
     }
 }

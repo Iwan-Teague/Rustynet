@@ -541,8 +541,7 @@ pub fn execute_ops_e2e_enforce_host(
     )?;
 
     Ok(format!(
-        "e2e enforce host complete: role={} node_id={}",
-        role, node_id
+        "e2e enforce host complete: role={role} node_id={node_id}",
     ))
 }
 
@@ -648,8 +647,7 @@ pub fn execute_ops_e2e_membership_add(
     result?;
 
     Ok(format!(
-        "e2e membership add complete: client_node_id={}",
-        client_node_id
+        "e2e membership add complete: client_node_id={client_node_id}",
     ))
 }
 
@@ -710,18 +708,10 @@ pub fn execute_ops_e2e_issue_assignments(
         }
 
         let nodes_spec = format!(
-            "{}|{}|{};{}|{}|{}",
-            exit_node_id,
-            exit_endpoint,
-            exit_pubkey_hex,
-            client_node_id,
-            client_endpoint,
-            client_pubkey_hex
+            "{exit_node_id}|{exit_endpoint}|{exit_pubkey_hex};{client_node_id}|{client_endpoint}|{client_pubkey_hex}",
         );
-        let allow_spec = format!(
-            "{}|{};{}|{}",
-            client_node_id, exit_node_id, exit_node_id, client_node_id
-        );
+        let allow_spec =
+            format!("{client_node_id}|{exit_node_id};{exit_node_id}|{client_node_id}",);
 
         run_status(
             "rustynet",
@@ -781,8 +771,7 @@ pub fn execute_ops_e2e_issue_assignments(
     result?;
 
     Ok(format!(
-        "e2e assignment issuance complete: exit_node_id={} client_node_id={}",
-        exit_node_id, client_node_id
+        "e2e assignment issuance complete: exit_node_id={exit_node_id} client_node_id={client_node_id}",
     ))
 }
 
@@ -1276,11 +1265,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        20,
-        2,
-        "test",
-        &["-S", "/run/rustynet/rustynetd.sock"],
-        &[],
+        RemoteRetryProgram {
+            attempts: 20,
+            sleep_secs: 2,
+            program: "test",
+            args: &["-S", "/run/rustynet/rustynetd.sock"],
+            envs: &[],
+        },
     )?;
     retry_remote_program(
         ssh_opts.as_slice(),
@@ -1290,11 +1281,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        20,
-        2,
-        "test",
-        &["-S", "/run/rustynet/rustynetd.sock"],
-        &[],
+        RemoteRetryProgram {
+            attempts: 20,
+            sleep_secs: 2,
+            program: "test",
+            args: &["-S", "/run/rustynet/rustynetd.sock"],
+            envs: &[],
+        },
     )?;
     retry_remote_program(
         ssh_opts.as_slice(),
@@ -1304,11 +1297,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        10,
-        2,
-        "rustynet",
-        &["route", "advertise", "0.0.0.0/0"],
-        &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
+        RemoteRetryProgram {
+            attempts: 10,
+            sleep_secs: 2,
+            program: "rustynet",
+            args: &["route", "advertise", "0.0.0.0/0"],
+            envs: &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
+        },
     )?;
 
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -2636,22 +2631,33 @@ fn copy_local_file_to_remote(
     run_command_with_input(command, payload.as_slice()).map(|_| ())
 }
 
+struct RemoteRetryProgram<'a> {
+    attempts: u32,
+    sleep_secs: u64,
+    program: &'a str,
+    args: &'a [&'a str],
+    envs: &'a [(&'a str, &'a str)],
+}
+
 fn retry_remote_program(
     options: &[OsString],
     host: &str,
     sudo_password: Option<&str>,
-    attempts: u32,
-    sleep_secs: u64,
-    program: &str,
-    args: &[&str],
-    envs: &[(&str, &str)],
+    retry: RemoteRetryProgram<'_>,
 ) -> Result<(), String> {
-    for attempt in 1..=attempts {
-        match run_remote_program_checked(options, host, sudo_password, program, args, envs) {
+    for attempt in 1..=retry.attempts {
+        match run_remote_program_checked(
+            options,
+            host,
+            sudo_password,
+            retry.program,
+            retry.args,
+            retry.envs,
+        ) {
             Ok(()) => return Ok(()),
-            Err(err) if attempt < attempts => {
+            Err(err) if attempt < retry.attempts => {
                 let _ = err;
-                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+                std::thread::sleep(std::time::Duration::from_secs(retry.sleep_secs));
             }
             Err(err) => return Err(err),
         }

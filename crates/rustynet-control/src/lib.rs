@@ -30,6 +30,7 @@ use zeroize::Zeroize;
 const SIGNING_SEED_HKDF_SALT_V1: &[u8] = b"rustynet-control-signing-seed-hkdf-salt-v1";
 const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-signing-v1";
 const ACCESS_TOKEN_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-access-token-signing-v1";
+const ENDPOINT_HINT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-endpoint-hint-signing-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRateLimitConfig {
@@ -1334,6 +1335,51 @@ pub struct SignedPeerMap {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointHintCandidateType {
+    Host,
+    ServerReflexive,
+    Relay,
+}
+
+impl EndpointHintCandidateType {
+    fn as_str(self) -> &'static str {
+        match self {
+            EndpointHintCandidateType::Host => "host",
+            EndpointHintCandidateType::ServerReflexive => "srflx",
+            EndpointHintCandidateType::Relay => "relay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointHintCandidate {
+    pub candidate_type: EndpointHintCandidateType,
+    pub endpoint: String,
+    pub relay_id: Option<String>,
+    pub priority: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointHintBundleRequest {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub generated_at_unix: u64,
+    pub ttl_secs: u64,
+    pub nonce: u64,
+    pub candidates: Vec<EndpointHintCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedEndpointHintBundle {
+    pub payload: String,
+    pub signature_hex: String,
+    pub generated_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub source_node_id: String,
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoTunnelRouteKind {
     Mesh,
     ExitNodeLan,
@@ -1502,6 +1548,8 @@ pub struct ControlPlaneCore {
     transport_policy: ControlPlaneTransportPolicy,
     assignment_signing_key: SigningKey,
     assignment_verifying_key: [u8; 32],
+    endpoint_hint_signing_key: SigningKey,
+    endpoint_hint_verifying_key: [u8; 32],
     access_token_signing_key: SigningKey,
     access_token_verifying_key: [u8; 32],
 }
@@ -1510,6 +1558,8 @@ impl ControlPlaneCore {
     pub fn new(mut signing_secret: Vec<u8>, policy: PolicySet) -> Self {
         let mut assignment_seed =
             derive_signing_seed(ASSIGNMENT_SIGNING_SEED_INFO_V1, &signing_secret);
+        let mut endpoint_hint_seed =
+            derive_signing_seed(ENDPOINT_HINT_SIGNING_SEED_INFO_V1, &signing_secret);
         let mut access_token_seed =
             derive_signing_seed(ACCESS_TOKEN_SIGNING_SEED_INFO_V1, &signing_secret);
         signing_secret.zeroize();
@@ -1517,6 +1567,9 @@ impl ControlPlaneCore {
         let assignment_signing_key = SigningKey::from_bytes(&assignment_seed);
         assignment_seed.zeroize();
         let assignment_verifying_key = *assignment_signing_key.verifying_key().as_bytes();
+        let endpoint_hint_signing_key = SigningKey::from_bytes(&endpoint_hint_seed);
+        endpoint_hint_seed.zeroize();
+        let endpoint_hint_verifying_key = *endpoint_hint_signing_key.verifying_key().as_bytes();
         let access_token_signing_key = SigningKey::from_bytes(&access_token_seed);
         access_token_seed.zeroize();
         let access_token_verifying_key = *access_token_signing_key.verifying_key().as_bytes();
@@ -1528,6 +1581,8 @@ impl ControlPlaneCore {
             transport_policy: ControlPlaneTransportPolicy::default(),
             assignment_signing_key,
             assignment_verifying_key,
+            endpoint_hint_signing_key,
+            endpoint_hint_verifying_key,
             access_token_signing_key,
             access_token_verifying_key,
         }
@@ -1575,7 +1630,7 @@ impl ControlPlaneCore {
             expires_at_unix: request
                 .now_unix
                 .saturating_add(ReplayPolicy::default().token_lifetime_secs),
-            nonce: format!("nonce-{}-{}", request.node_id, request.now_unix),
+            nonce: random_nonce_hex(16),
         };
         let token = self.sign_access_token(&token_claims);
 
@@ -1590,7 +1645,48 @@ impl ControlPlaneCore {
         request: EnrollmentRequest,
         persistence: &ControlPlanePersistence,
     ) -> Result<EnrollmentResponse, ControlPlaneError> {
-        let response = self.enroll_with_throwaway(request.clone())?;
+        let consumed = persistence
+            .consume_single_use_credential(&request.credential_id, request.now_unix)
+            .map_err(ControlPlaneError::Persistence)?;
+        if !consumed {
+            let credential_state = persistence
+                .credential_state(&request.credential_id)
+                .map_err(ControlPlaneError::Persistence)?;
+            return Err(ControlPlaneError::Credential(
+                map_persisted_credential_state_to_error(credential_state.as_deref()),
+            ));
+        }
+
+        match self
+            .credentials
+            .consume(&request.credential_id, request.now_unix)
+        {
+            Ok(_) | Err(CredentialError::NotFound) => {}
+            Err(err) => return Err(ControlPlaneError::Credential(err)),
+        }
+
+        let node = NodeMetadata {
+            node_id: request.node_id.clone(),
+            hostname: request.hostname.clone(),
+            os: request.os.clone(),
+            tags: request.tags.clone(),
+            owner: request.owner.clone(),
+            endpoint: request.endpoint.clone(),
+            last_seen_unix: request.now_unix,
+            public_key: request.public_key,
+        };
+        self.nodes.upsert(node)?;
+
+        let token_claims = TokenClaims {
+            subject: request.owner.clone(),
+            issued_at_unix: request.now_unix,
+            expires_at_unix: request
+                .now_unix
+                .saturating_add(ReplayPolicy::default().token_lifetime_secs),
+            nonce: random_nonce_hex(16),
+        };
+        let token = self.sign_access_token(&token_claims);
+
         let owner = request.owner.clone();
         let credential_id = request.credential_id.clone();
 
@@ -1620,22 +1716,6 @@ impl ControlPlaneCore {
             .upsert_node(&node_row)
             .map_err(ControlPlaneError::Persistence)?;
 
-        let credential_row = persistence::CredentialRow {
-            credential_id: credential_id.clone(),
-            creator_user_id: owner.clone(),
-            scope: "tag:enrollment".to_string(),
-            credential_kind: "throwaway".to_string(),
-            state: "used".to_string(),
-            max_uses: 1,
-            uses: 1,
-            expires_at_unix: request.now_unix,
-            created_at_unix: request.now_unix,
-            updated_at_unix: request.now_unix,
-            storage_policy: "throwaway_default".to_string(),
-        };
-        persistence
-            .insert_credential(&credential_row)
-            .map_err(ControlPlaneError::Persistence)?;
         persistence
             .insert_credential_audit_event(
                 &credential_id,
@@ -1646,7 +1726,10 @@ impl ControlPlaneCore {
             )
             .map_err(ControlPlaneError::Persistence)?;
 
-        Ok(response)
+        Ok(EnrollmentResponse {
+            node_id: request.node_id,
+            access_token: token,
+        })
     }
 
     pub fn signed_peer_map(&self, now_unix: u64) -> Result<SignedPeerMap, ControlPlaneError> {
@@ -1684,6 +1767,10 @@ impl ControlPlaneCore {
 
     pub fn access_token_verifier_key_hex(&self) -> String {
         hex_bytes(&self.access_token_verifying_key)
+    }
+
+    pub fn endpoint_hint_verifier_key_hex(&self) -> String {
+        hex_bytes(&self.endpoint_hint_verifying_key)
     }
 
     pub fn verify_access_token(&self, token: &SignedTokenClaims) -> bool {
@@ -1864,6 +1951,139 @@ impl ControlPlaneCore {
         })
     }
 
+    pub fn signed_endpoint_hint_bundle(
+        &self,
+        request: EndpointHintBundleRequest,
+    ) -> Result<SignedEndpointHintBundle, ControlPlaneError> {
+        if request.ttl_secs == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hint ttl must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs > 120 {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hint ttl exceeds max supported value".to_string(),
+            ));
+        }
+        if request.generated_at_unix == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "generated_at_unix must be greater than zero".to_string(),
+            ));
+        }
+        if request.candidates.is_empty() {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hints require at least one candidate".to_string(),
+            ));
+        }
+        if request.candidates.len() > 8 {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hints exceed max candidate count".to_string(),
+            ));
+        }
+
+        let source = self.nodes.get(&request.source_node_id)?.ok_or_else(|| {
+            ControlPlaneError::Traversal("source node does not exist".to_string())
+        })?;
+        let target = self.nodes.get(&request.target_node_id)?.ok_or_else(|| {
+            ControlPlaneError::Traversal("target node does not exist".to_string())
+        })?;
+        if !self.policy_allows_node_pair(&source, &target) {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hints denied by policy".to_string(),
+            ));
+        }
+
+        let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
+        if request.generated_at_unix >= expires_at_unix {
+            return Err(ControlPlaneError::Traversal(
+                "invalid generated/expires ordering".to_string(),
+            ));
+        }
+
+        let mut seen_candidates = HashSet::new();
+        for candidate in &request.candidates {
+            let endpoint = candidate.endpoint.parse::<SocketAddr>().map_err(|_| {
+                ControlPlaneError::Traversal("candidate endpoint is invalid".to_string())
+            })?;
+            if endpoint.port() == 0 {
+                return Err(ControlPlaneError::Traversal(
+                    "candidate endpoint port must be non-zero".to_string(),
+                ));
+            }
+            if matches!(candidate.candidate_type, EndpointHintCandidateType::Relay) {
+                let relay_id = candidate.relay_id.as_deref().unwrap_or("").trim();
+                if relay_id.is_empty() {
+                    return Err(ControlPlaneError::Traversal(
+                        "relay candidates require relay_id".to_string(),
+                    ));
+                }
+            } else if candidate.relay_id.is_some() {
+                return Err(ControlPlaneError::Traversal(
+                    "relay_id is only valid for relay candidates".to_string(),
+                ));
+            }
+
+            let relay_key = candidate
+                .relay_id
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let uniqueness = format!(
+                "{}|{}|{}",
+                candidate.candidate_type.as_str(),
+                endpoint,
+                relay_key
+            );
+            if !seen_candidates.insert(uniqueness) {
+                return Err(ControlPlaneError::Traversal(
+                    "duplicate endpoint hint candidate".to_string(),
+                ));
+            }
+        }
+
+        let payload = serialize_endpoint_hint_payload(
+            request.source_node_id.as_str(),
+            request.target_node_id.as_str(),
+            request.generated_at_unix,
+            expires_at_unix,
+            request.nonce,
+            &request.candidates,
+        )?;
+        let signature = self.endpoint_hint_signing_key.sign(payload.as_bytes());
+
+        Ok(SignedEndpointHintBundle {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            generated_at_unix: request.generated_at_unix,
+            expires_at_unix,
+            source_node_id: request.source_node_id,
+            target_node_id: request.target_node_id,
+        })
+    }
+
+    pub fn verify_signed_endpoint_hint_bundle(&self, bundle: &SignedEndpointHintBundle) -> bool {
+        if bundle.generated_at_unix >= bundle.expires_at_unix {
+            return false;
+        }
+        let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
+            Ok(bytes) => bytes,
+            Err(()) => return false,
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let verifying_key = match VerifyingKey::from_bytes(&self.endpoint_hint_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verifying_key
+            .verify(bundle.payload.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    pub fn signed_endpoint_hint_bundle_to_wire(bundle: &SignedEndpointHintBundle) -> String {
+        format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
+    }
+
     pub fn verify_signed_auto_tunnel_bundle(&self, bundle: &SignedAutoTunnelBundle) -> bool {
         if bundle.generated_at_unix > bundle.expires_at_unix {
             return false;
@@ -1991,6 +2211,7 @@ pub enum ControlPlaneError {
     Trust(TrustStateError),
     Persistence(persistence::PersistenceError),
     Assignment(String),
+    Traversal(String),
     Internal,
 }
 
@@ -2002,6 +2223,7 @@ impl fmt::Display for ControlPlaneError {
             ControlPlaneError::Trust(err) => write!(f, "trust error: {err}"),
             ControlPlaneError::Persistence(err) => write!(f, "persistence error: {err}"),
             ControlPlaneError::Assignment(err) => write!(f, "assignment error: {err}"),
+            ControlPlaneError::Traversal(err) => write!(f, "traversal error: {err}"),
             ControlPlaneError::Internal => f.write_str("control-plane internal error"),
         }
     }
@@ -2015,6 +2237,23 @@ fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     hkdf.expand(domain, &mut seed)
         .expect("hkdf expand length is fixed and valid");
     seed
+}
+
+fn map_persisted_credential_state_to_error(state: Option<&str>) -> CredentialError {
+    match state {
+        Some("revoked") => CredentialError::Revoked,
+        Some("expired") => CredentialError::Expired,
+        Some("used") | Some("created") | Some(_) => CredentialError::AlreadyConsumed,
+        None => CredentialError::NotFound,
+    }
+}
+
+fn random_nonce_hex(length_bytes: usize) -> String {
+    let mut nonce = vec![0u8; length_bytes];
+    rand::rngs::OsRng.fill_bytes(nonce.as_mut_slice());
+    let encoded = hex_bytes(nonce.as_slice());
+    nonce.zeroize();
+    encoded
 }
 
 fn sha256_digest(payload: &[u8]) -> [u8; 32] {
@@ -2130,6 +2369,88 @@ fn serialize_auto_tunnel_payload(
     payload
 }
 
+fn serialize_endpoint_hint_payload(
+    source_node_id: &str,
+    target_node_id: &str,
+    generated_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: u64,
+    candidates: &[EndpointHintCandidate],
+) -> Result<String, ControlPlaneError> {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then(
+                left.candidate_type
+                    .as_str()
+                    .cmp(right.candidate_type.as_str()),
+            )
+            .then(left.endpoint.cmp(&right.endpoint))
+            .then(
+                left.relay_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(right.relay_id.as_deref().unwrap_or("")),
+            )
+    });
+
+    let mut payload = String::new();
+    payload.push_str("version=1\n");
+    payload.push_str("path_policy=direct_preferred_relay_allowed\n");
+    payload.push_str(&format!("source_node_id={source_node_id}\n"));
+    payload.push_str(&format!("target_node_id={target_node_id}\n"));
+    payload.push_str(&format!("generated_at_unix={generated_at_unix}\n"));
+    payload.push_str(&format!("expires_at_unix={expires_at_unix}\n"));
+    payload.push_str(&format!("nonce={nonce}\n"));
+    payload.push_str(&format!("candidate_count={}\n", ordered.len()));
+    for (index, candidate) in ordered.iter().enumerate() {
+        let endpoint = candidate.endpoint.parse::<SocketAddr>().map_err(|_| {
+            ControlPlaneError::Traversal(
+                "candidate endpoint failed canonical serialization".to_string(),
+            )
+        })?;
+        if endpoint.port() == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "candidate endpoint port must be non-zero".to_string(),
+            ));
+        }
+
+        let family = if endpoint.ip().is_ipv4() {
+            "ipv4"
+        } else {
+            "ipv6"
+        };
+        let relay_id = candidate.relay_id.as_deref().unwrap_or("").trim();
+        if matches!(candidate.candidate_type, EndpointHintCandidateType::Relay) {
+            if relay_id.is_empty() {
+                return Err(ControlPlaneError::Traversal(
+                    "relay candidates require relay_id".to_string(),
+                ));
+            }
+        } else if !relay_id.is_empty() {
+            return Err(ControlPlaneError::Traversal(
+                "relay_id is only valid for relay candidates".to_string(),
+            ));
+        }
+
+        payload.push_str(&format!(
+            "candidate.{index}.type={}\n",
+            candidate.candidate_type.as_str()
+        ));
+        payload.push_str(&format!("candidate.{index}.addr={}\n", endpoint.ip()));
+        payload.push_str(&format!("candidate.{index}.port={}\n", endpoint.port()));
+        payload.push_str(&format!("candidate.{index}.family={family}\n"));
+        payload.push_str(&format!("candidate.{index}.relay_id={relay_id}\n"));
+        payload.push_str(&format!(
+            "candidate.{index}.priority={}\n",
+            candidate.priority
+        ));
+    }
+    Ok(payload)
+}
+
 fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
     let Some((ip_part, prefix_part)) = value.split_once('/') else {
         return false;
@@ -2153,10 +2474,12 @@ mod tests {
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
         ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
-        EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
-        ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
-        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TrustState, derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
+        ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
+        EndpointHintCandidateType, EnrollmentRequest, LockoutConfig, PolicyCheckRequest,
+        PolicyDecision, PolicyGuard, ReplayPolicy, ReusableCredentialPolicy,
+        ReusableCredentialRequest, ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims,
+        TransportPolicyError, TrustState, derive_signing_seed, hex_bytes, load_trust_state,
+        persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -2708,6 +3031,230 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_hint_bundle_is_signed_and_tamper_detected() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.70:51820", [70; 32]),
+            ("cred-b", "node-b", "198.51.100.71:51820", [71; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let bundle = core
+            .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+                source_node_id: "node-a".to_string(),
+                target_node_id: "node-b".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 60,
+                nonce: 7,
+                candidates: vec![
+                    EndpointHintCandidate {
+                        candidate_type: EndpointHintCandidateType::Host,
+                        endpoint: "10.0.0.3:51820".to_string(),
+                        relay_id: None,
+                        priority: 10,
+                    },
+                    EndpointHintCandidate {
+                        candidate_type: EndpointHintCandidateType::Relay,
+                        endpoint: "203.0.113.44:443".to_string(),
+                        relay_id: Some("relay-eu-1".to_string()),
+                        priority: 20,
+                    },
+                ],
+            })
+            .expect("endpoint hint bundle should be issued");
+
+        assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
+        assert_eq!(
+            payload_field(&bundle.payload, "candidate_count").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "candidate.0.type").as_deref(),
+            Some("relay")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "candidate.0.relay_id").as_deref(),
+            Some("relay-eu-1")
+        );
+
+        let wire = ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle);
+        assert!(wire.contains("signature="));
+
+        let mut tampered = bundle.clone();
+        tampered.payload.push_str("candidate.99.type=relay\n");
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_bundle_enforces_policy_and_candidate_validation() {
+        let deny_all = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.80:51820", [80; 32]),
+            ("cred-b", "node-b", "198.51.100.81:51820", [81; 32]),
+        ] {
+            deny_all
+                .credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            deny_all
+                .enroll_with_throwaway(EnrollmentRequest {
+                    credential_id: credential_id.to_string(),
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec!["servers".to_string()],
+                    owner: "alice@example.local".to_string(),
+                    endpoint: endpoint.to_string(),
+                    public_key,
+                    now_unix: 120,
+                })
+                .expect("enrollment should succeed");
+        }
+        let denied = deny_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: "node-a".to_string(),
+            target_node_id: "node-b".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 60,
+            nonce: 1,
+            candidates: vec![EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: "10.0.0.2:51820".to_string(),
+                relay_id: None,
+                priority: 1,
+            }],
+        });
+        assert!(
+            denied
+                .expect_err("policy must deny source->target endpoint hints")
+                .to_string()
+                .contains("denied by policy")
+        );
+
+        let allow_all = ControlPlaneCore::new(
+            b"control-secret".to_vec(),
+            PolicySet {
+                rules: vec![PolicyRule {
+                    src: "*".to_string(),
+                    dst: "*".to_string(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                }],
+            },
+        );
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-c", "node-c", "198.51.100.82:51820", [82; 32]),
+            ("cred-d", "node-d", "198.51.100.83:51820", [83; 32]),
+        ] {
+            allow_all
+                .credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            allow_all
+                .enroll_with_throwaway(EnrollmentRequest {
+                    credential_id: credential_id.to_string(),
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec!["servers".to_string()],
+                    owner: "alice@example.local".to_string(),
+                    endpoint: endpoint.to_string(),
+                    public_key,
+                    now_unix: 120,
+                })
+                .expect("enrollment should succeed");
+        }
+
+        let duplicate = allow_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: "node-c".to_string(),
+            target_node_id: "node-d".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 60,
+            nonce: 2,
+            candidates: vec![
+                EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::Host,
+                    endpoint: "10.2.0.2:51820".to_string(),
+                    relay_id: None,
+                    priority: 100,
+                },
+                EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::Host,
+                    endpoint: "10.2.0.2:51820".to_string(),
+                    relay_id: None,
+                    priority: 1,
+                },
+            ],
+        });
+        assert!(
+            duplicate
+                .expect_err("duplicate endpoint candidates must fail")
+                .to_string()
+                .contains("duplicate endpoint hint candidate")
+        );
+
+        let relay_missing_id = allow_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: "node-c".to_string(),
+            target_node_id: "node-d".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 60,
+            nonce: 3,
+            candidates: vec![EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Relay,
+                endpoint: "203.0.113.55:443".to_string(),
+                relay_id: None,
+                priority: 1,
+            }],
+        });
+        assert!(
+            relay_missing_id
+                .expect_err("relay candidates without relay_id must fail")
+                .to_string()
+                .contains("relay candidates require relay_id")
+        );
+    }
+
+    #[test]
     fn reusable_credential_requires_strict_scope_ttl_and_vault_storage() {
         let store = ThrowawayCredentialStore::default();
         let policy = ReusableCredentialPolicy::default();
@@ -2886,6 +3433,24 @@ mod tests {
                 60,
             )
             .expect("credential should be created");
+        persistence
+            .insert_credential(&super::persistence::CredentialRow {
+                credential_id: "cred-persist".to_string(),
+                creator_user_id: "admin".to_string(),
+                scope: "tag:servers".to_string(),
+                credential_kind: "throwaway".to_string(),
+                state: "created".to_string(),
+                max_uses: 1,
+                uses: 0,
+                expires_at_unix: 160,
+                created_at_unix: 100,
+                updated_at_unix: 100,
+                storage_policy: "throwaway_default".to_string(),
+            })
+            .expect("credential should be persisted before enrollment");
+        persistence
+            .insert_credential_audit_event("cred-persist", None, "created", 100, "admin")
+            .expect("credential creation audit event should be persisted");
 
         let response = core
             .enroll_with_throwaway_and_persist(
@@ -2918,7 +3483,125 @@ mod tests {
         let audit_count = persistence
             .credential_audit_event_count("cred-persist")
             .expect("audit count should be readable");
-        assert_eq!(audit_count, 1);
+        assert_eq!(audit_count, 2);
+    }
+
+    #[test]
+    fn persisted_enrollment_rejects_missing_persisted_credential() {
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
+        let persistence = ControlPlanePersistence::open_in_memory()
+            .expect("in-memory persistence should be available");
+
+        core.credentials
+            .create(
+                "cred-missing-db".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("in-memory credential should be created");
+
+        let result = core.enroll_with_throwaway_and_persist(
+            EnrollmentRequest {
+                credential_id: "cred-missing-db".to_string(),
+                node_id: "node-missing-db".to_string(),
+                hostname: "node-missing-db".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.31:51820".to_string(),
+                public_key: [9; 32],
+                now_unix: 150,
+            },
+            &persistence,
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::ControlPlaneError::Credential(
+                CredentialError::NotFound
+            ))
+        ));
+    }
+
+    #[test]
+    fn persisted_enrollment_enforces_single_use_in_persistence() {
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
+        let persistence = ControlPlanePersistence::open_in_memory()
+            .expect("in-memory persistence should be available");
+
+        persistence
+            .upsert_user(&super::persistence::UserRow {
+                user_id: "admin".to_string(),
+                email: "admin@example.local".to_string(),
+                mfa_enabled: false,
+                created_at_unix: 100,
+                updated_at_unix: 100,
+            })
+            .expect("admin user should be persisted");
+
+        core.credentials
+            .create(
+                "cred-persist-once".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+        persistence
+            .insert_credential(&super::persistence::CredentialRow {
+                credential_id: "cred-persist-once".to_string(),
+                creator_user_id: "admin".to_string(),
+                scope: "tag:servers".to_string(),
+                credential_kind: "throwaway".to_string(),
+                state: "created".to_string(),
+                max_uses: 1,
+                uses: 0,
+                expires_at_unix: 160,
+                created_at_unix: 100,
+                updated_at_unix: 100,
+                storage_policy: "throwaway_default".to_string(),
+            })
+            .expect("credential should be persisted");
+
+        core.enroll_with_throwaway_and_persist(
+            EnrollmentRequest {
+                credential_id: "cred-persist-once".to_string(),
+                node_id: "node-persist-once-a".to_string(),
+                hostname: "node-persist-once-a".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.33:51820".to_string(),
+                public_key: [11; 32],
+                now_unix: 150,
+            },
+            &persistence,
+        )
+        .expect("first enrollment should succeed");
+
+        let second = core.enroll_with_throwaway_and_persist(
+            EnrollmentRequest {
+                credential_id: "cred-persist-once".to_string(),
+                node_id: "node-persist-once-b".to_string(),
+                hostname: "node-persist-once-b".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.34:51820".to_string(),
+                public_key: [12; 32],
+                now_unix: 151,
+            },
+            &persistence,
+        );
+        assert!(matches!(
+            second,
+            Err(super::ControlPlaneError::Credential(
+                CredentialError::AlreadyConsumed
+            ))
+        ));
     }
 
     #[test]
@@ -3010,19 +3693,97 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_tokens_use_randomized_nonce_values() {
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
+        core.credentials
+            .create(
+                "cred-token-a".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+        core.credentials
+            .create(
+                "cred-token-b".to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+
+        let token_a = core
+            .enroll_with_throwaway(EnrollmentRequest {
+                credential_id: "cred-token-a".to_string(),
+                node_id: "node-token-a".to_string(),
+                hostname: "mini-pc-token-a".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.60:51820".to_string(),
+                public_key: [61; 32],
+                now_unix: 120,
+            })
+            .expect("first enrollment should succeed")
+            .access_token;
+        let token_b = core
+            .enroll_with_throwaway(EnrollmentRequest {
+                credential_id: "cred-token-b".to_string(),
+                node_id: "node-token-b".to_string(),
+                hostname: "mini-pc-token-b".to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: "198.51.100.61:51820".to_string(),
+                public_key: [62; 32],
+                now_unix: 120,
+            })
+            .expect("second enrollment should succeed")
+            .access_token;
+
+        assert_eq!(token_a.claims.nonce.len(), 32);
+        assert_eq!(token_b.claims.nonce.len(), 32);
+        assert!(
+            token_a
+                .claims
+                .nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert!(
+            token_b
+                .claims
+                .nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_ne!(token_a.claims.nonce, token_b.claims.nonce);
+    }
+
+    #[test]
     fn signing_seed_derivation_uses_stable_hkdf_vectors() {
         let assignment_seed =
             derive_signing_seed(ASSIGNMENT_SIGNING_SEED_INFO_V1, b"control-secret");
+        let endpoint_seed =
+            derive_signing_seed(ENDPOINT_HINT_SIGNING_SEED_INFO_V1, b"control-secret");
         let access_seed = derive_signing_seed(ACCESS_TOKEN_SIGNING_SEED_INFO_V1, b"control-secret");
         assert_eq!(
             hex_bytes(&assignment_seed),
             "823450eb42a8e622264f36041cc7c2bbe1f39b90eabb622f1b73c35aa496764a"
         );
         assert_eq!(
+            hex_bytes(&endpoint_seed),
+            "45c6b4a8cf265219f296bb670a1cb8dfbe077a6dee3689540d346a4d6cdeb513"
+        );
+        assert_eq!(
             hex_bytes(&access_seed),
             "8ae34416e7e185594a0cd9e154b8ae2885e2f70e0e9470bfeb4ab128fb42aac4"
         );
         assert_ne!(assignment_seed, access_seed);
+        assert_ne!(assignment_seed, endpoint_seed);
+        assert_ne!(endpoint_seed, access_seed);
     }
 
     #[test]

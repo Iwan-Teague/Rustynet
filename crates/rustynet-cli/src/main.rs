@@ -1549,8 +1549,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         })?;
     if !is_valid_node_id(target_node_id.as_str()) {
         return Err(format!(
-            "target node id contains unsupported characters: {}",
-            target_node_id
+            "target node id contains unsupported characters: {target_node_id}",
         ));
     }
 
@@ -1561,8 +1560,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         && !is_valid_node_id(exit_node_id_value)
     {
         return Err(format!(
-            "exit node id contains unsupported characters: {}",
-            exit_node_id_value
+            "exit node id contains unsupported characters: {exit_node_id_value}",
         ));
     }
 
@@ -1583,8 +1581,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     let ttl_secs = parse_env_u64_with_default("RUSTYNET_ASSIGNMENT_TTL_SECS", 300)?;
     if !(60..=86_400).contains(&ttl_secs) {
         return Err(format!(
-            "assignment ttl must be an integer in range 60-86400 seconds: {}",
-            ttl_secs
+            "assignment ttl must be an integer in range 60-86400 seconds: {ttl_secs}",
         ));
     }
     let min_remaining_secs =
@@ -1605,8 +1602,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     {
         let remaining_secs = current_expires_at.saturating_sub(now_unix);
         return Ok(format!(
-            "[assignment-refresh] current assignment expires in {}s; skip refresh.",
-            remaining_secs
+            "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
         ));
     }
 
@@ -1998,8 +1994,7 @@ fn phase6_detect_probe_platform() -> Result<Phase6Platform, String> {
             "macos" => Ok(Phase6Platform::Macos),
             "windows" => Ok(Phase6Platform::Windows),
             _ => Err(format!(
-                "unsupported platform override: {}",
-                override_platform
+                "unsupported platform override: {override_platform}",
             )),
         };
     }
@@ -2905,6 +2900,9 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
         "RUSTYNET_AUTO_TUNNEL_BUNDLE",
         "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY",
         "RUSTYNET_AUTO_TUNNEL_WATERMARK",
+        "RUSTYNET_TRAVERSAL_BUNDLE",
+        "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
+        "RUSTYNET_TRAVERSAL_WATERMARK",
         "RUSTYNET_WG_PRIVATE_KEY",
         "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
         "RUSTYNET_WG_KEY_PASSPHRASE",
@@ -4592,8 +4590,7 @@ fn validate_encrypted_secret_file_security(path: &Path, label: &str) -> Result<(
     let mode = metadata.mode() & 0o777;
     if (mode & 0o077) != 0 {
         return Err(format!(
-            "{label} file permissions must be owner-only (0600); found {:03o}",
-            mode,
+            "{label} file permissions must be owner-only (0600); found {mode:03o}",
         ));
     }
 
@@ -4829,15 +4826,13 @@ fn validate_assignment_issue_config(
     }
     if !node_ids.contains(target_node_id) {
         return Err(format!(
-            "target node {} is not present in --nodes",
-            target_node_id
+            "target node {target_node_id} is not present in --nodes",
         ));
     }
     match exit_node_id {
         Some(exit_node_id) if !node_ids.contains(exit_node_id) => {
             return Err(format!(
-                "exit node {} is not present in --nodes",
-                exit_node_id
+                "exit node {exit_node_id} is not present in --nodes",
             ));
         }
         _ => {}

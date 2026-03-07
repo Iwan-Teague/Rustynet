@@ -1,5 +1,8 @@
 # Rustynet UDP Hole Punching + Relay Traversal Plan (2026-03-07)
 
+Detailed implementation blueprint:
+- [`UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./UdpHolePunchingImplementationBlueprint_2026-03-07.md)
+
 ## 1) Objective
 Implement seamless internet-reachable Rustynet connectivity without manual consumer-router port forwarding, using:
 - direct UDP when possible (hole punching), and
@@ -87,6 +90,15 @@ Deliverables:
 Acceptance:
 - Signed endpoint hints reject tamper/replay.
 - Netcheck reports deterministic, auditable path reasoning.
+
+### HP-1 Implementation Status (2026-03-07)
+- `rustynet-control` now issues and verifies signed endpoint-hint bundles with a dedicated signer domain (`rustynet-control-endpoint-hint-signing-v1`) and deterministic canonical payload serialization.
+- Endpoint-hint issuance enforces strict TTL bounds (max 120s), source/target policy gating, candidate schema checks, and duplicate-candidate rejection.
+- `rustynetd` now includes signed traversal bundle parsing with signature validation, strict schema checks, freshness bounds, and digest-bound watermark replay/rollback protection.
+- `rustynet netcheck` now emits structured traversal diagnostics (path mode/reason, traversal artifact freshness, candidate counts by type, and validation error state) instead of the prior static message.
+- Traversal artifact paths are now wired through daemon config + CLI flags + Linux systemd installer/env (`RUSTYNET_TRAVERSAL_BUNDLE`, `RUSTYNET_TRAVERSAL_VERIFIER_KEY`, `RUSTYNET_TRAVERSAL_WATERMARK`, `RUSTYNET_TRAVERSAL_MAX_AGE_SECS`) and propagated into runtime launch arguments.
+- Daemon preflight now treats traversal verifier custody as conditional on traversal bundle presence: no bundle means verifier is not required, while a present bundle still fails closed if verifier key custody/validation is missing or invalid.
+- Unit tests were added for tamper detection, replay rejection, watermark persistence, and deterministic netcheck diagnostics.
 
 ## Phase HP-2: Direct UDP Hole Punching Engine
 Deliverables:

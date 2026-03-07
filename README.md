@@ -43,6 +43,8 @@ The wizard handles:
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
 - `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
 - connectivity architecture is direct-UDP-first with signed traversal endpoint hints, encrypted relay fallback for hard NAT paths, and automatic failback to direct when healthy
+- `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) instead of a static transport string
+- traversal artifact custody is configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
 - route advertisement and status checks
 
 Host-profile behavior:
@@ -60,6 +62,8 @@ Current implementation support/security matrix:
 - [`documents/operations/PlatformSupportMatrix.md`](./documents/operations/PlatformSupportMatrix.md)
 - Traversal architecture and rollout plan:
   [`documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`](./documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
+- Traversal implementation blueprint (file-level security implementation):
+  [`documents/operations/UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./documents/operations/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 

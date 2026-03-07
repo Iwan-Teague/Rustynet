@@ -66,8 +66,7 @@ pub fn store_passphrase_in_os_secure_store(
             Some(value) => normalize_macos_keychain_account(value)?,
             None => resolve_macos_keychain_account_from_env()?.ok_or_else(|| {
                 format!(
-                    "missing {}; configure a macOS keychain account for passphrase custody",
-                    PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+                    "missing {PASSPHRASE_KEYCHAIN_ACCOUNT_ENV}; configure a macOS keychain account for passphrase custody"
                 )
             })?,
         };
@@ -125,8 +124,7 @@ fn read_passphrase_from_macos_keychain(account: &str) -> Result<Zeroizing<String
     let value =
         load_macos_generic_password(MACOS_PASSPHRASE_KEYCHAIN_SERVICE, account).map_err(|err| {
             format!(
-                "load macOS keychain passphrase failed for service '{}' account '{}': {err}",
-                MACOS_PASSPHRASE_KEYCHAIN_SERVICE, account
+                "load macOS keychain passphrase failed for service '{MACOS_PASSPHRASE_KEYCHAIN_SERVICE}' account '{account}': {err}",
             )
         })?;
     parse_passphrase_bytes(value, "macOS keychain passphrase")
@@ -139,8 +137,7 @@ fn resolve_macos_keychain_account_from_env() -> Result<Option<String>, String> {
         Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(format!(
-                "{} must be valid utf-8",
-                PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+                "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} must be valid utf-8",
             ));
         }
     };
@@ -152,14 +149,12 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
     let account = raw.trim();
     if account.is_empty() {
         return Err(format!(
-            "{} must not be empty",
-            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} must not be empty",
         ));
     }
     if account.len() > 128 {
         return Err(format!(
-            "{} exceeds max length (128)",
-            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} exceeds max length (128)",
         ));
     }
     if !account
@@ -167,8 +162,7 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
     {
         return Err(format!(
-            "{} contains invalid characters; allowed: [A-Za-z0-9._-]",
-            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} contains invalid characters; allowed: [A-Za-z0-9._-]",
         ));
     }
     Ok(account.to_string())
@@ -274,8 +268,7 @@ fn validate_secret_file_security(
                 "owner-only"
             };
             return Err(format!(
-                "{label} permissions are too broad: expected {expected}, found {:03o}",
-                mode,
+                "{label} permissions are too broad: expected {expected}, found {mode:03o}",
             ));
         }
         let owner_uid = metadata.uid();
@@ -316,8 +309,7 @@ fn resolve_passphrase_source_from_env(
             credentials_directory,
         );
         Err(format!(
-            "macOS passphrase file custody is disabled; set {} and provision the passphrase in keychain",
-            PASSPHRASE_KEYCHAIN_ACCOUNT_ENV
+            "macOS passphrase file custody is disabled; set {PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} and provision the passphrase in keychain",
         ))
     }
     #[cfg(not(target_os = "macos"))]
@@ -441,8 +433,7 @@ pub fn apply_interface_private_key(
         return Ok(());
     }
     Err(format!(
-        "wg set private-key failed for {}: {}",
-        interface_name, status
+        "wg set private-key failed for {interface_name}: {status}",
     ))
 }
 
@@ -484,8 +475,7 @@ pub fn set_interface_down(interface_name: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     return Err(format!(
-        "ifconfig down failed for {}: {}",
-        interface_name, status
+        "ifconfig down failed for {interface_name}: {status}",
     ));
     #[cfg(not(target_os = "macos"))]
     Err(format!(

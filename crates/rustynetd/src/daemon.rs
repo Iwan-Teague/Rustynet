@@ -84,6 +84,11 @@ pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/assignmen
 pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.assignment.watermark";
 pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
+pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
+pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/traversal.pub";
+pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
+    "/var/lib/rustynet/rustynetd.traversal.watermark";
+pub const DEFAULT_TRAVERSAL_MAX_AGE_SECS: u64 = 120;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
@@ -207,6 +212,10 @@ pub struct DaemonConfig {
     pub auto_tunnel_verifier_key_path: Option<PathBuf>,
     pub auto_tunnel_watermark_path: Option<PathBuf>,
     pub auto_tunnel_max_age_secs: NonZeroU64,
+    pub traversal_bundle_path: PathBuf,
+    pub traversal_verifier_key_path: PathBuf,
+    pub traversal_watermark_path: PathBuf,
+    pub traversal_max_age_secs: NonZeroU64,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_listen_port: u16,
@@ -248,6 +257,11 @@ impl Default for DaemonConfig {
             auto_tunnel_watermark_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_WATERMARK_PATH)),
             auto_tunnel_max_age_secs: NonZeroU64::new(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                 .expect("default auto tunnel max age must be non-zero"),
+            traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
+            traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
+            traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            traversal_max_age_secs: NonZeroU64::new(DEFAULT_TRAVERSAL_MAX_AGE_SECS)
+                .expect("default traversal max age must be non-zero"),
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
             wg_listen_port: DEFAULT_WG_LISTEN_PORT,
@@ -420,6 +434,91 @@ struct AutoTunnelBundle {
     routes: Vec<Route>,
     selected_exit_node: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalCandidateType {
+    Host,
+    ServerReflexive,
+    Relay,
+}
+
+impl TraversalCandidateType {
+    fn as_str(self) -> &'static str {
+        match self {
+            TraversalCandidateType::Host => "host",
+            TraversalCandidateType::ServerReflexive => "srflx",
+            TraversalCandidateType::Relay => "relay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalCandidate {
+    candidate_type: TraversalCandidateType,
+    endpoint: std::net::SocketAddr,
+    relay_id: Option<String>,
+    priority: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalBundle {
+    source_node_id: String,
+    target_node_id: String,
+    generated_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: u64,
+    candidates: Vec<TraversalCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraversalWatermark {
+    generated_at_unix: u64,
+    nonce: u64,
+    payload_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalBundleEnvelope {
+    bundle: TraversalBundle,
+    watermark: TraversalWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraversalBootstrapError {
+    Missing,
+    Io(String),
+    InvalidFormat(String),
+    KeyInvalid,
+    SignatureInvalid,
+    ReplayDetected,
+    FutureDated,
+    Stale,
+}
+
+impl fmt::Display for TraversalBootstrapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TraversalBootstrapError::Missing => f.write_str("traversal bundle is missing"),
+            TraversalBootstrapError::Io(message) => {
+                write!(f, "traversal bundle io failure: {message}")
+            }
+            TraversalBootstrapError::InvalidFormat(message) => {
+                write!(f, "traversal bundle invalid format: {message}")
+            }
+            TraversalBootstrapError::KeyInvalid => f.write_str("traversal verifier key is invalid"),
+            TraversalBootstrapError::SignatureInvalid => {
+                f.write_str("traversal signature verification failed")
+            }
+            TraversalBootstrapError::ReplayDetected => {
+                f.write_str("traversal bundle replay detected")
+            }
+            TraversalBootstrapError::FutureDated => f.write_str("traversal bundle is future dated"),
+            TraversalBootstrapError::Stale => f.write_str("traversal bundle is stale"),
+        }
+    }
+}
+
+impl std::error::Error for TraversalBootstrapError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MembershipBootstrapError {
@@ -765,6 +864,10 @@ struct DaemonRuntime {
     auto_tunnel_verifier_key_path: Option<PathBuf>,
     auto_tunnel_watermark_path: Option<PathBuf>,
     auto_tunnel_max_age_secs: u64,
+    traversal_bundle_path: PathBuf,
+    traversal_verifier_key_path: PathBuf,
+    traversal_watermark_path: PathBuf,
+    traversal_max_age_secs: u64,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -780,6 +883,8 @@ struct DaemonRuntime {
     max_reconcile_failures: u32,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
+    traversal_hint: Option<TraversalBundleEnvelope>,
+    traversal_hint_error: Option<String>,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
     auto_port_forward_lease_secs: u32,
@@ -865,6 +970,10 @@ impl DaemonRuntime {
             auto_tunnel_verifier_key_path: config.auto_tunnel_verifier_key_path.clone(),
             auto_tunnel_watermark_path: config.auto_tunnel_watermark_path.clone(),
             auto_tunnel_max_age_secs: config.auto_tunnel_max_age_secs.get(),
+            traversal_bundle_path: config.traversal_bundle_path.clone(),
+            traversal_verifier_key_path: config.traversal_verifier_key_path.clone(),
+            traversal_watermark_path: config.traversal_watermark_path.clone(),
+            traversal_max_age_secs: config.traversal_max_age_secs.get(),
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -880,6 +989,8 @@ impl DaemonRuntime {
             max_reconcile_failures: config.max_reconcile_failures.get(),
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
+            traversal_hint: None,
+            traversal_hint_error: None,
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
             auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
@@ -1057,6 +1168,130 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    fn refresh_traversal_hint_state(&mut self) {
+        let previous_watermark = match load_traversal_watermark(&self.traversal_watermark_path) {
+            Ok(value) => value,
+            Err(err) => {
+                self.traversal_hint = None;
+                self.traversal_hint_error = Some(err.to_string());
+                return;
+            }
+        };
+        match load_traversal_bundle(
+            &self.traversal_bundle_path,
+            &self.traversal_verifier_key_path,
+            self.traversal_max_age_secs,
+            self.trust_policy,
+            previous_watermark,
+        ) {
+            Ok(envelope) => {
+                if let Err(err) =
+                    persist_traversal_watermark(&self.traversal_watermark_path, envelope.watermark)
+                {
+                    self.traversal_hint = None;
+                    self.traversal_hint_error = Some(err.to_string());
+                    return;
+                }
+                self.traversal_hint = Some(envelope);
+                self.traversal_hint_error = None;
+            }
+            Err(TraversalBootstrapError::Missing) => {
+                self.traversal_hint = None;
+                self.traversal_hint_error = None;
+            }
+            Err(err) => {
+                self.traversal_hint = None;
+                self.traversal_hint_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn netcheck_response_line(&self) -> String {
+        let (path_mode, path_reason) = match self.controller.state() {
+            DataplaneState::FailClosed => ("fail_closed", "fail_closed"),
+            DataplaneState::ExitActive => ("direct_preferred_relay_fallback", "exit_active"),
+            DataplaneState::DataplaneApplied => {
+                ("direct_preferred_relay_fallback", "dataplane_applied")
+            }
+            DataplaneState::ControlTrusted => {
+                ("direct_preferred_relay_fallback", "control_trusted")
+            }
+            DataplaneState::Init => ("initializing", "init"),
+        };
+
+        let now = unix_now();
+        let (traversal_status, source, target, generated_at, expires_at, age_secs, remaining_secs) =
+            if let Some(envelope) = self.traversal_hint.as_ref() {
+                let age = now.saturating_sub(envelope.bundle.generated_at_unix);
+                let remaining = envelope.bundle.expires_at_unix.saturating_sub(now);
+                (
+                    "valid",
+                    envelope.bundle.source_node_id.as_str(),
+                    envelope.bundle.target_node_id.as_str(),
+                    envelope.bundle.generated_at_unix.to_string(),
+                    envelope.bundle.expires_at_unix.to_string(),
+                    age.to_string(),
+                    remaining.to_string(),
+                )
+            } else if self.traversal_hint_error.is_some() {
+                (
+                    "invalid",
+                    "none",
+                    "none",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                )
+            } else {
+                (
+                    "missing",
+                    "none",
+                    "none",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                )
+            };
+
+        let mut host_candidates = 0usize;
+        let mut srflx_candidates = 0usize;
+        let mut relay_candidates = 0usize;
+        let mut candidate_count = 0usize;
+        let mut max_candidate_priority: Option<u32> = None;
+        if let Some(envelope) = self.traversal_hint.as_ref() {
+            candidate_count = envelope.bundle.candidates.len();
+            for candidate in &envelope.bundle.candidates {
+                max_candidate_priority =
+                    Some(max_candidate_priority.unwrap_or(0).max(candidate.priority));
+                match candidate.candidate_type {
+                    TraversalCandidateType::Host => {
+                        host_candidates = host_candidates.saturating_add(1)
+                    }
+                    TraversalCandidateType::ServerReflexive => {
+                        srflx_candidates = srflx_candidates.saturating_add(1)
+                    }
+                    TraversalCandidateType::Relay => {
+                        relay_candidates = relay_candidates.saturating_add(1)
+                    }
+                }
+            }
+        }
+
+        let traversal_error = self
+            .traversal_hint_error
+            .as_deref()
+            .map(sanitize_netcheck_value)
+            .unwrap_or_else(|| "none".to_string());
+        let max_candidate_priority = max_candidate_priority
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_error={traversal_error}",
+        )
+    }
+
     fn bootstrap(&mut self) {
         match self.restore_state() {
             Ok(()) => {}
@@ -1149,6 +1384,8 @@ impl DaemonRuntime {
                 .force_fail_closed("blind_exit_assignment_rejected");
             return;
         }
+
+        self.refresh_traversal_hint_state();
 
         let local_node = match NodeId::new(self.local_node_id.clone()) {
             Ok(node_id) => node_id,
@@ -1250,6 +1487,7 @@ impl DaemonRuntime {
 
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
+        self.refresh_traversal_hint_state();
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
         );
@@ -1360,12 +1598,8 @@ impl DaemonRuntime {
                 ))
             }
             IpcCommand::Netcheck => {
-                let transport = if self.controller.state() == DataplaneState::FailClosed {
-                    "fail-closed"
-                } else {
-                    "direct-preferred relay-fallback"
-                };
-                IpcResponse::ok(format!("netcheck: path={transport}"))
+                self.refresh_traversal_hint_state();
+                IpcResponse::ok(self.netcheck_response_line())
             }
             IpcCommand::ExitNodeSelect(node) => {
                 let node_id = match NodeId::new(node.clone()) {
@@ -2724,6 +2958,21 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             ));
         }
     }
+    if !config.traversal_bundle_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal bundle path must be absolute".to_string(),
+        ));
+    }
+    if !config.traversal_verifier_key_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal verifier key path must be absolute".to_string(),
+        ));
+    }
+    if !config.traversal_watermark_path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal watermark path must be absolute".to_string(),
+        ));
+    }
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "wireguard interface must not be empty".to_string(),
@@ -2779,6 +3028,21 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.membership_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
             "membership watermark path must not be empty".to_string(),
+        ));
+    }
+    if config.traversal_bundle_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal bundle path must not be empty".to_string(),
+        ));
+    }
+    if config.traversal_verifier_key_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal verifier key path must not be empty".to_string(),
+        ));
+    }
+    if config.traversal_watermark_path.as_os_str().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "traversal watermark path must not be empty".to_string(),
         ));
     }
     if config.auto_tunnel_enforce
@@ -2924,11 +3188,27 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             }
         }
     }
+    if let Some(parent) = config.traversal_bundle_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!("traversal bundle directory create failed: {err}"))
+        })?;
+    }
+    if let Some(parent) = config.traversal_watermark_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DaemonError::InvalidConfig(format!(
+                "traversal watermark directory create failed: {err}"
+            ))
+        })?;
+    }
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
     validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
     validate_membership_log_permissions(&config.membership_log_path)?;
+    if config.traversal_bundle_path.exists() {
+        validate_traversal_verifier_key_permissions(&config.traversal_verifier_key_path)?;
+        validate_traversal_bundle_permissions(&config.traversal_bundle_path)?;
+    }
     if config.auto_tunnel_enforce {
         let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
             DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_string())
@@ -3013,6 +3293,21 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         .map_err(|err| {
             DaemonError::InvalidConfig(format!("auto tunnel preflight failed: {err}"))
         })?;
+    }
+
+    let traversal_watermark =
+        load_traversal_watermark(&config.traversal_watermark_path).map_err(|err| {
+            DaemonError::InvalidConfig(format!("traversal watermark preflight failed: {err}"))
+        })?;
+    if config.traversal_bundle_path.exists() {
+        let _ = load_traversal_bundle(
+            &config.traversal_bundle_path,
+            &config.traversal_verifier_key_path,
+            config.traversal_max_age_secs.get(),
+            TrustPolicy::default(),
+            traversal_watermark,
+        )
+        .map_err(|err| DaemonError::InvalidConfig(format!("traversal preflight failed: {err}")))?;
     }
 
     let mut system = daemon_system(config)?;
@@ -4019,6 +4314,538 @@ fn persist_auto_tunnel_watermark(
     Ok(())
 }
 
+fn load_traversal_bundle(
+    path: &Path,
+    verifier_key_path: &Path,
+    max_age_secs: u64,
+    trust_policy: TrustPolicy,
+    previous_watermark: Option<TraversalWatermark>,
+) -> Result<TraversalBundleEnvelope, TraversalBootstrapError> {
+    if !path.exists() {
+        return Err(TraversalBootstrapError::Missing);
+    }
+
+    let verifying_key = load_traversal_verifying_key(verifier_key_path)?;
+    let content =
+        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+
+    let mut payload = String::new();
+    let mut signature_hex: Option<String> = None;
+    let mut fields = std::collections::HashMap::new();
+
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(TraversalBootstrapError::InvalidFormat(
+                "line missing key/value separator".to_string(),
+            ));
+        };
+        if key == "signature" {
+            signature_hex = Some(value.to_string());
+            continue;
+        }
+        payload.push_str(line);
+        payload.push('\n');
+        if fields.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "duplicate key {key}"
+            )));
+        }
+    }
+
+    let version = fields
+        .get("version")
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing version".to_string()))?;
+    if version != "1" {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "unsupported traversal version".to_string(),
+        ));
+    }
+    if fields.get("path_policy").map(String::as_str) != Some("direct_preferred_relay_allowed") {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "unsupported traversal path_policy".to_string(),
+        ));
+    }
+
+    let source_node_id = fields
+        .get("source_node_id")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing source_node_id".to_string())
+        })?
+        .to_string();
+    NodeId::new(source_node_id.clone())
+        .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
+    let target_node_id = fields
+        .get("target_node_id")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing target_node_id".to_string())
+        })?
+        .to_string();
+    NodeId::new(target_node_id.clone())
+        .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
+
+    let generated_at_unix = fields
+        .get("generated_at_unix")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing generated_at_unix".to_string())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat("invalid generated_at_unix".to_string())
+        })?;
+    let expires_at_unix = fields
+        .get("expires_at_unix")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing expires_at_unix".to_string())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat("invalid expires_at_unix".to_string())
+        })?;
+    if generated_at_unix >= expires_at_unix {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "invalid generated/expires ordering".to_string(),
+        ));
+    }
+    let nonce = fields
+        .get("nonce")
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing nonce".to_string()))?
+        .parse::<u64>()
+        .map_err(|_| TraversalBootstrapError::InvalidFormat("invalid nonce".to_string()))?;
+
+    let signature_hex = signature_hex.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_string())
+    })?;
+    let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| TraversalBootstrapError::SignatureInvalid)?;
+
+    let now = unix_now();
+    if generated_at_unix > now.saturating_add(trust_policy.max_clock_skew_secs) {
+        return Err(TraversalBootstrapError::FutureDated);
+    }
+    if now > expires_at_unix || now.saturating_sub(generated_at_unix) > max_age_secs {
+        return Err(TraversalBootstrapError::Stale);
+    }
+
+    let candidate_count = fields
+        .get("candidate_count")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing candidate_count".to_string())
+        })?
+        .parse::<usize>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat("invalid candidate_count".to_string())
+        })?;
+    if candidate_count == 0 || candidate_count > 8 {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "candidate_count must be between 1 and 8".to_string(),
+        ));
+    }
+
+    let mut candidates = Vec::with_capacity(candidate_count);
+    let mut seen = std::collections::HashSet::new();
+    for index in 0..candidate_count {
+        let candidate_type_key = format!("candidate.{index}.type");
+        let addr_key = format!("candidate.{index}.addr");
+        let port_key = format!("candidate.{index}.port");
+        let family_key = format!("candidate.{index}.family");
+        let relay_id_key = format!("candidate.{index}.relay_id");
+        let priority_key = format!("candidate.{index}.priority");
+
+        let candidate_type = match fields.get(&candidate_type_key).map(String::as_str) {
+            Some("host") => TraversalCandidateType::Host,
+            Some("srflx") => TraversalCandidateType::ServerReflexive,
+            Some("relay") => TraversalCandidateType::Relay,
+            _ => {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "invalid candidate type for index {index}"
+                )));
+            }
+        };
+
+        let ip = fields
+            .get(&addr_key)
+            .ok_or_else(|| TraversalBootstrapError::InvalidFormat(format!("missing {addr_key}")))?
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| {
+                TraversalBootstrapError::InvalidFormat(format!(
+                    "invalid candidate addr for index {index}"
+                ))
+            })?;
+        validate_traversal_candidate_ip(candidate_type, ip, index)?;
+        let family = fields.get(&family_key).ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(format!("missing {family_key}"))
+        })?;
+        if (ip.is_ipv4() && family != "ipv4") || (ip.is_ipv6() && family != "ipv6") {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "candidate family mismatch for index {index}"
+            )));
+        }
+        let port = fields
+            .get(&port_key)
+            .ok_or_else(|| TraversalBootstrapError::InvalidFormat(format!("missing {port_key}")))?
+            .parse::<u16>()
+            .map_err(|_| {
+                TraversalBootstrapError::InvalidFormat(format!(
+                    "invalid candidate port for index {index}"
+                ))
+            })?;
+        if port == 0 {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "candidate port must be non-zero for index {index}"
+            )));
+        }
+
+        let relay_id_raw = fields.get(&relay_id_key).ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(format!("missing {relay_id_key}"))
+        })?;
+        let relay_id = if relay_id_raw.trim().is_empty() {
+            None
+        } else {
+            Some(relay_id_raw.trim().to_string())
+        };
+        if matches!(candidate_type, TraversalCandidateType::Relay) && relay_id.is_none() {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "relay candidate missing relay_id for index {index}"
+            )));
+        }
+        if !matches!(candidate_type, TraversalCandidateType::Relay) && relay_id.is_some() {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "relay_id is only allowed for relay candidates (index {index})"
+            )));
+        }
+
+        let priority = fields
+            .get(&priority_key)
+            .ok_or_else(|| {
+                TraversalBootstrapError::InvalidFormat(format!("missing {priority_key}"))
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                TraversalBootstrapError::InvalidFormat(format!(
+                    "invalid candidate priority for index {index}"
+                ))
+            })?;
+        let dedupe = format!(
+            "{}|{}|{}|{}",
+            candidate_type.as_str(),
+            ip,
+            port,
+            relay_id.as_deref().unwrap_or("")
+        );
+        if !seen.insert(dedupe) {
+            return Err(TraversalBootstrapError::InvalidFormat(
+                "duplicate traversal candidate tuple".to_string(),
+            ));
+        }
+
+        candidates.push(TraversalCandidate {
+            candidate_type,
+            endpoint: std::net::SocketAddr::new(ip, port),
+            relay_id,
+            priority,
+        });
+    }
+
+    let payload_digest = sha256_digest(payload.as_bytes());
+    let watermark = TraversalWatermark {
+        generated_at_unix,
+        nonce,
+        payload_digest: Some(payload_digest),
+    };
+    if let Some(existing) = previous_watermark {
+        match traversal_watermark_ordering(&watermark, &existing) {
+            std::cmp::Ordering::Less => {
+                return Err(TraversalBootstrapError::ReplayDetected);
+            }
+            std::cmp::Ordering::Equal => {
+                let existing_digest = existing
+                    .payload_digest
+                    .ok_or(TraversalBootstrapError::ReplayDetected)?;
+                if existing_digest != payload_digest {
+                    return Err(TraversalBootstrapError::ReplayDetected);
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    Ok(TraversalBundleEnvelope {
+        bundle: TraversalBundle {
+            source_node_id,
+            target_node_id,
+            generated_at_unix,
+            expires_at_unix,
+            nonce,
+            candidates,
+        },
+        watermark,
+    })
+}
+
+fn validate_traversal_candidate_ip(
+    candidate_type: TraversalCandidateType,
+    ip: std::net::IpAddr,
+    index: usize,
+) -> Result<(), TraversalBootstrapError> {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "candidate index {index} uses disallowed special address"
+        )));
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_link_local() || v4.is_broadcast() {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "candidate index {index} uses disallowed special address"
+                )));
+            }
+            if matches!(candidate_type, TraversalCandidateType::ServerReflexive)
+                && !is_global_unicast_ipv4(v4)
+            {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "srflx candidate index {index} must use global unicast address"
+                )));
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unicast_link_local() || v6.is_unique_local() {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "candidate index {index} uses disallowed special address"
+                )));
+            }
+            if matches!(candidate_type, TraversalCandidateType::ServerReflexive)
+                && !is_global_unicast_ipv6(v6)
+            {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "srflx candidate index {index} must use global unicast address"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_global_unicast_ipv4(value: std::net::Ipv4Addr) -> bool {
+    if value.is_private()
+        || value.is_loopback()
+        || value.is_link_local()
+        || value.is_multicast()
+        || value.is_broadcast()
+        || value.is_unspecified()
+        || value.is_documentation()
+    {
+        return false;
+    }
+    let octets = value.octets();
+    // Shared Address Space (100.64.0.0/10) and benchmarking space (198.18.0.0/15).
+    if octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000 {
+        return false;
+    }
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return false;
+    }
+    true
+}
+
+fn is_global_unicast_ipv6(value: std::net::Ipv6Addr) -> bool {
+    if value.is_unspecified()
+        || value.is_loopback()
+        || value.is_multicast()
+        || value.is_unicast_link_local()
+        || value.is_unique_local()
+    {
+        return false;
+    }
+    // Documentation range 2001:db8::/32.
+    let segments = value.segments();
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+    true
+}
+
+fn load_traversal_verifying_key(path: &Path) -> Result<VerifyingKey, TraversalBootstrapError> {
+    let content =
+        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    let key_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing verifier key".to_string())
+        })?;
+    let key_bytes = decode_traversal_hex_to_fixed::<32>(key_line)?;
+    VerifyingKey::from_bytes(&key_bytes).map_err(|_| TraversalBootstrapError::KeyInvalid)
+}
+
+fn decode_traversal_hex_to_fixed<const N: usize>(
+    encoded: &str,
+) -> Result<[u8; N], TraversalBootstrapError> {
+    let mut bytes = [0u8; N];
+    let trimmed = encoded.trim();
+    if trimmed.len() != N * 2 {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "unexpected hex length".to_string(),
+        ));
+    }
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < N {
+        let hi = decode_traversal_hex_nibble(raw[index * 2])?;
+        let lo = decode_traversal_hex_nibble(raw[index * 2 + 1])?;
+        bytes[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
+fn decode_traversal_hex_nibble(value: u8) -> Result<u8, TraversalBootstrapError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(TraversalBootstrapError::InvalidFormat(
+            "invalid hex character".to_string(),
+        )),
+    }
+}
+
+fn traversal_watermark_ordering(
+    current: &TraversalWatermark,
+    previous: &TraversalWatermark,
+) -> std::cmp::Ordering {
+    current
+        .generated_at_unix
+        .cmp(&previous.generated_at_unix)
+        .then(current.nonce.cmp(&previous.nonce))
+}
+
+fn load_traversal_watermark(
+    path: &Path,
+) -> Result<Option<TraversalWatermark>, TraversalBootstrapError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    let mut version: Option<u8> = None;
+    let mut generated_at_unix: Option<u64> = None;
+    let mut nonce: Option<u64> = None;
+    let mut payload_digest: Option<[u8; 32]> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(TraversalBootstrapError::InvalidFormat(
+                "watermark line missing key/value separator".to_string(),
+            ));
+        };
+        match key {
+            "version" => version = value.parse::<u8>().ok(),
+            "generated_at_unix" => generated_at_unix = value.parse::<u64>().ok(),
+            "nonce" => nonce = value.parse::<u64>().ok(),
+            "payload_digest_sha256" => {
+                payload_digest = Some(decode_traversal_hex_to_fixed::<32>(value)?);
+            }
+            _ => {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "unknown watermark key {key}"
+                )));
+            }
+        }
+    }
+    let generated_at_unix = generated_at_unix.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_string())
+    })?;
+    let nonce = nonce.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+    })?;
+    let version = version.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat("missing watermark version".to_string())
+    })?;
+    if version != 2 {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "unsupported watermark version; expected version=2".to_string(),
+        ));
+    }
+    let payload_digest = Some(payload_digest.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat(
+            "missing watermark payload_digest_sha256".to_string(),
+        )
+    })?);
+    Ok(Some(TraversalWatermark {
+        generated_at_unix,
+        nonce,
+        payload_digest,
+    }))
+}
+
+fn persist_traversal_watermark(
+    path: &Path,
+    watermark: TraversalWatermark,
+) -> Result<(), TraversalBootstrapError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+        }
+    }
+    let payload_digest = watermark
+        .payload_digest
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(
+                "watermark payload digest is required".to_string(),
+            )
+        })
+        .map(|digest| encode_hex(&digest))?;
+    let payload = format!(
+        "version=2\ngenerated_at_unix={}\nnonce={}\npayload_digest_sha256={}\n",
+        watermark.generated_at_unix, watermark.nonce, payload_digest
+    );
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TraversalBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TraversalBootstrapError::Io(err.to_string()));
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(TraversalBootstrapError::Io(err.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    }
+    Ok(())
+}
+
 fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
     parse_cidr(value).is_some()
 }
@@ -4103,6 +4930,26 @@ fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), Daem
 #[cfg(not(target_os = "linux"))]
 fn validate_auto_tunnel_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "auto tunnel verifier key", 0o022, true)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_traversal_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "traversal bundle", 0o037, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_traversal_bundle_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "traversal bundle", 0o037, true)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_traversal_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "traversal verifier key", 0o022, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_traversal_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "traversal verifier key", 0o022, true)
 }
 
 #[cfg(target_os = "linux")]
@@ -4221,6 +5068,16 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn sanitize_netcheck_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':' | '.' | '/' | '+' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
 fn membership_directory_from_state(state: &MembershipState) -> MembershipDirectory {
     let mut directory = MembershipDirectory::default();
     for node in &state.nodes {
@@ -4250,13 +5107,15 @@ mod tests {
     };
 
     use super::{
-        AutoTunnelWatermark, DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, NodeRole,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, load_auto_tunnel_bundle,
-        load_auto_tunnel_watermark, load_trust_evidence, load_trust_watermark,
-        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, run_daemon, scrub_runtime_wireguard_key_material,
-        sha256_digest, trust_evidence_payload, unix_now, validate_daemon_config,
-        zeroize_optional_bytes,
+        AutoTunnelWatermark, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DaemonBackendMode, DaemonConfig,
+        DaemonRuntime, IpcCommand, NodeRole, TrustEvidenceRecord, TrustPolicy, TrustWatermark,
+        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_traversal_bundle,
+        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
+        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
+        persist_traversal_watermark, persist_trust_watermark,
+        prepare_runtime_wireguard_key_material, run_daemon, run_preflight_checks,
+        scrub_runtime_wireguard_key_material, sha256_digest, trust_evidence_payload, unix_now,
+        validate_daemon_config, zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -4376,6 +5235,69 @@ mod tests {
             ),
         )
         .expect("auto tunnel file should be written");
+    }
+
+    fn write_traversal_file_with_srflx(
+        path: &Path,
+        verifier_path: &Path,
+        nonce: u64,
+        srflx_addr: &str,
+        tamper_after_sign: bool,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[29u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("traversal verifier key should be written");
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(DEFAULT_TRAVERSAL_MAX_AGE_SECS);
+        let payload = format!(
+            "version=1\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npath_policy=direct_preferred_relay_allowed\ncandidate_count=3\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.10\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=900\ncandidate.1.type=srflx\ncandidate.1.addr={srflx_addr}\ncandidate.1.port=62000\ncandidate.1.family=ipv4\ncandidate.1.relay_id=\ncandidate.1.priority=850\ncandidate.2.type=relay\ncandidate.2.addr=198.51.100.40\ncandidate.2.port=51820\ncandidate.2.family=ipv4\ncandidate.2.relay_id=relay-eu-1\ncandidate.2.priority=700\n"
+        );
+        let signature = signing_key.sign(payload.as_bytes());
+        let mut body = format!(
+            "{}signature={}\n",
+            payload,
+            hex_encode(&signature.to_bytes())
+        );
+        if tamper_after_sign {
+            body = body.replace("candidate.2.priority=700", "candidate.2.priority=701");
+        }
+        std::fs::write(path, body).expect("traversal file should be written");
+    }
+
+    fn write_traversal_file(
+        path: &Path,
+        verifier_path: &Path,
+        source_node: &str,
+        target_node: &str,
+        nonce: u64,
+        tamper_after_sign: bool,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[23u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("traversal verifier key should be written");
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(60);
+        let payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id={source_node}\ntarget_node_id={target_node}\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
+        );
+        let signature = signing_key.sign(payload.as_bytes());
+        let mut body = format!(
+            "{}signature={}\n",
+            payload,
+            hex_encode(&signature.to_bytes())
+        );
+        if tamper_after_sign {
+            body = body.replace("candidate_count=2", "candidate_count=3");
+        }
+        std::fs::write(path, body).expect("traversal file should be written");
     }
 
     fn write_membership_files(snapshot_path: &Path, log_path: &Path, local_node_id: &str) {
@@ -4511,6 +5433,20 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("supported only with linux-wireguard backend")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relative_traversal_paths() {
+        let config = DaemonConfig {
+            traversal_bundle_path: std::path::PathBuf::from("relative.traversal"),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relative traversal bundle path must be rejected");
+        assert!(
+            err.to_string()
+                .contains("traversal bundle path must be absolute")
         );
     }
 
@@ -4822,6 +5758,137 @@ mod tests {
     }
 
     #[test]
+    fn traversal_watermark_round_trip_persists_payload_digest() {
+        let test_dir = secure_test_dir("rustynetd-traversal-watermark-round-trip");
+        let watermark_path = test_dir.join("traversal.watermark");
+        let expected = super::TraversalWatermark {
+            generated_at_unix: 200,
+            nonce: 13,
+            payload_digest: Some([0x55u8; 32]),
+        };
+        persist_traversal_watermark(&watermark_path, expected)
+            .expect("traversal watermark should persist");
+        let loaded = load_traversal_watermark(&watermark_path)
+            .expect("traversal watermark should load")
+            .expect("traversal watermark should exist");
+        assert_eq!(loaded, expected);
+        let raw = std::fs::read_to_string(&watermark_path)
+            .expect("traversal watermark file should exist");
+        assert!(raw.contains("version=2"));
+        assert!(raw.contains("payload_digest_sha256="));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_traversal_bundle_rejects_tampered_signature_and_replay() {
+        let test_dir = secure_test_dir("rustynetd-traversal-tamper-replay");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let verifier_path = test_dir.join("traversal.verifier.pub");
+
+        write_traversal_file(&traversal_path, &verifier_path, "node-a", "node-b", 1, true);
+        let tampered = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("tampered traversal bundle must fail signature verification");
+        assert!(matches!(
+            tampered,
+            super::TraversalBootstrapError::SignatureInvalid
+        ));
+
+        write_traversal_file(
+            &traversal_path,
+            &verifier_path,
+            "node-a",
+            "node-b",
+            2,
+            false,
+        );
+        let first = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first traversal bundle load should succeed");
+        let replay = load_traversal_bundle(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            Some(super::TraversalWatermark {
+                generated_at_unix: first.watermark.generated_at_unix,
+                nonce: first.watermark.nonce,
+                payload_digest: Some([0x42u8; 32]),
+            }),
+        )
+        .expect_err("equal traversal watermark with mismatched digest must fail");
+        assert!(matches!(
+            replay,
+            super::TraversalBootstrapError::ReplayDetected
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn netcheck_reports_structured_traversal_diagnostics() {
+        let test_dir = secure_test_dir("rustynetd-netcheck-traversal-diagnostics");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            5,
+            false,
+        );
+
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::InMemory,
+            node_id: "daemon-local".to_string(),
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            membership_snapshot_path,
+            membership_log_path,
+            auto_tunnel_enforce: false,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should initialize");
+        runtime.traversal_bundle_path = traversal_path;
+        runtime.traversal_verifier_key_path = traversal_verifier_path;
+        runtime.traversal_watermark_path = traversal_watermark_path;
+        runtime.refresh_traversal_hint_state();
+        let output = runtime.netcheck_response_line();
+        assert!(output.contains("path_mode=initializing"));
+        assert!(output.contains("traversal_status=valid"));
+        assert!(output.contains("candidate_count=2"));
+        assert!(output.contains("host_candidates=1"));
+        assert!(output.contains("relay_candidates=1"));
+        assert!(output.contains("srflx_candidates=0"));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn load_auto_tunnel_bundle_rejects_assigned_cidr_outside_mesh() {
         let test_dir = secure_test_dir("rustynetd-auto-assigned-outside-mesh");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -4882,6 +5949,206 @@ mod tests {
             super::AutoTunnelBootstrapError::InvalidFormat(_)
         ));
         assert!(err.to_string().contains("host cidr"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_traversal_bundle_rejects_private_srflx_candidate() {
+        let test_dir = secure_test_dir("rustynetd-traversal-private-srflx");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        write_traversal_file_with_srflx(
+            &traversal_path,
+            &traversal_verifier_path,
+            1,
+            "10.10.10.10",
+            false,
+        );
+
+        let err = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("private srflx candidate must be rejected");
+        assert!(matches!(
+            err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(err.to_string().contains("srflx candidate"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn preflight_allows_missing_traversal_bundle_without_verifier_key() {
+        let test_dir = secure_test_dir("rustynetd-preflight-traversal-optional");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let traversal_bundle_path = test_dir.join("missing.traversal.bundle");
+        let traversal_verifier_path = test_dir.join("missing.traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            traversal_bundle_path: traversal_bundle_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        run_preflight_checks(&config)
+            .expect("preflight should pass when traversal bundle is absent");
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn preflight_rejects_present_traversal_bundle_when_verifier_key_missing() {
+        let test_dir = secure_test_dir("rustynetd-preflight-traversal-requires-verifier");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let traversal_bundle_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("missing.traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        std::fs::write(&traversal_bundle_path, "version=1\n")
+            .expect("traversal bundle marker should be writable");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            traversal_bundle_path: traversal_bundle_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_preflight_checks(&config)
+            .expect_err("preflight must fail when traversal bundle exists without verifier key");
+        assert!(
+            err.to_string()
+                .contains("traversal verifier key metadata read failed"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(traversal_bundle_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_netcheck_uses_configured_traversal_paths() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-netcheck");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_traversal_file_with_srflx(
+            &traversal_path,
+            &traversal_verifier_path,
+            9,
+            "1.1.1.1",
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_status=valid"));
+        assert!(netcheck.message.contains("candidate_count=3"));
+        assert!(netcheck.message.contains("srflx_candidates=1"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
