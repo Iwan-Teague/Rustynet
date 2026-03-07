@@ -347,10 +347,9 @@ fn resolve_passphrase_source_from_env(
             ));
         }
 
-        return Err(format!(
-            "passphrase credential source is not configured; set {} or {}",
-            PASSPHRASE_CREDENTIAL_PATH_ENV, SYSTEMD_CREDENTIALS_DIRECTORY_ENV
-        ));
+        Err(format!(
+            "passphrase credential source is not configured; set {PASSPHRASE_CREDENTIAL_PATH_ENV} or {SYSTEMD_CREDENTIALS_DIRECTORY_ENV}",
+        ))
     }
 }
 
@@ -479,8 +478,7 @@ pub fn set_interface_down(interface_name: &str) -> Result<(), String> {
     ));
     #[cfg(not(target_os = "macos"))]
     Err(format!(
-        "ip link set down failed for {}: {}",
-        interface_name, status
+        "ip link set down failed for {interface_name}: {status}"
     ))
 }
 

@@ -15,10 +15,12 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
+#[cfg(target_os = "macos")]
+use crate::key_material::read_passphrase_file;
 use crate::key_material::{
     apply_interface_private_key, decrypt_private_key, encrypt_private_key,
-    generate_wireguard_keypair, read_passphrase_file, remove_file_if_present, set_interface_down,
-    write_public_key, write_runtime_private_key,
+    generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
+    write_runtime_private_key,
 };
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
@@ -2393,7 +2395,6 @@ impl DaemonRuntime {
                     self.exit_port_forward_lease = None;
                 }
             }
-            return;
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -2429,9 +2430,8 @@ impl DaemonRuntime {
     fn exit_port_forward_external_port(&self) -> Option<u16> {
         #[cfg(target_os = "linux")]
         {
-            return self
-                .exit_port_forward_lease
-                .map(|lease| lease.external_port);
+            self.exit_port_forward_lease
+                .map(|lease| lease.external_port)
         }
         #[cfg(not(target_os = "linux"))]
         {
