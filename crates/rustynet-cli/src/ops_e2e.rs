@@ -167,9 +167,6 @@ pub fn execute_ops_e2e_bootstrap_host(
         return Err(format!("source dir is missing: {}", src_dir.display()));
     }
 
-    let service_egress_iface =
-        detect_service_egress_interface(role.as_str(), ssh_allow_cidrs.as_str())?;
-
     if !skip_apt {
         install_linux_e2e_prerequisites()?;
         let required_toolchain = ensure_pinned_rust_toolchain(src_dir.as_path())?;
@@ -453,7 +450,6 @@ pub fn execute_ops_e2e_bootstrap_host(
                 ("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false"),
                 ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false"),
                 ("RUSTYNET_WG_LISTEN_PORT", "51820"),
-                ("RUSTYNET_EGRESS_INTERFACE", service_egress_iface.as_str()),
                 ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
                 (
                     "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
@@ -491,9 +487,6 @@ pub fn execute_ops_e2e_enforce_host(
     }
     let src_dir_text = src_dir.display().to_string();
     ensure_safe_token("src-dir", src_dir_text.as_str())?;
-    let service_egress_iface =
-        detect_service_egress_interface(role.as_str(), ssh_allow_cidrs.as_str())?;
-
     let auto_refresh = Path::new("/etc/rustynet/trust-evidence.key").is_file();
     let assignment_auto_refresh = Path::new("/etc/rustynet/assignment.signing.secret").is_file()
         && Path::new("/etc/rustynet/assignment-refresh.env").is_file();
@@ -518,7 +511,6 @@ pub fn execute_ops_e2e_enforce_host(
             ),
             ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "true"),
             ("RUSTYNET_WG_LISTEN_PORT", "51820"),
-            ("RUSTYNET_EGRESS_INTERFACE", service_egress_iface.as_str()),
             ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
             (
                 "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
@@ -2027,56 +2019,6 @@ fn capture_stdout(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn detect_service_egress_interface(role: &str, ssh_allow_cidrs: &str) -> Result<String, String> {
-    let default_route = capture_stdout("ip", &["-o", "-4", "route", "show", "to", "default"], &[])?;
-    let mut default_iface = String::new();
-    for line in default_route.lines() {
-        if let Some(iface) = parse_dev_interface_token(line) {
-            default_iface = iface.to_string();
-            break;
-        }
-    }
-
-    let primary_allow_cidr = ssh_allow_cidrs.split(',').next().unwrap_or_default().trim();
-    let primary_allow_ip = primary_allow_cidr
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .trim();
-    let management_iface = if primary_allow_ip.is_empty() {
-        String::new()
-    } else {
-        let route_get = capture_stdout("ip", &["-o", "route", "get", primary_allow_ip], &[])
-            .unwrap_or_default();
-        route_get
-            .lines()
-            .find_map(parse_dev_interface_token)
-            .unwrap_or_default()
-            .to_string()
-    };
-
-    let service_iface = if role == "client" && !management_iface.is_empty() {
-        management_iface
-    } else {
-        default_iface
-    };
-    if service_iface.is_empty() {
-        return Err("unable to determine service egress interface".to_string());
-    }
-    ensure_safe_token("service-egress-interface", service_iface.as_str())?;
-    Ok(service_iface)
-}
-
-fn parse_dev_interface_token(line: &str) -> Option<&str> {
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        if *token == "dev" {
-            return tokens.get(index + 1).copied();
-        }
-    }
-    None
 }
 
 fn extract_first_ipv4(output: &str) -> Option<&str> {
