@@ -228,7 +228,7 @@ CLIENT_STATUS_OFF_INITIAL="$(live_lab_status "$CLIENT_HOST")"
 live_lab_log "Initial client status"
 printf '%s\n' "$CLIENT_STATUS_OFF_INITIAL"
 
-live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
+live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false" "$LAN_TEST_CIDR"
 sleep 3
 if wait_for_lan_probe_state "$CLIENT_HOST" "blocked" 15; then
   lan_off_ping_status="pass"
@@ -247,7 +247,7 @@ fi
 CLIENT_STATUS_ON="$(live_lab_status "$CLIENT_HOST")"
 CLIENT_ROUTE_ON="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get ${LAN_TEST_PROBE_IP} || true")"
 
-live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false"
+live_lab_apply_lan_access_coupling "$CLIENT_HOST" "false" "$LAN_TEST_CIDR"
 sleep 3
 if wait_for_lan_probe_state "$CLIENT_HOST" "blocked" 15; then
   lan_off_again_status="pass"

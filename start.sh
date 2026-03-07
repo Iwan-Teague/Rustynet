@@ -3850,7 +3850,7 @@ apply_linux_lan_access_coupling() {
   local lan_coupling_cmd=(rustynet ops apply-lan-access-coupling \
     --enable "${enable_bool}" \
     --env-path "${ASSIGNMENT_REFRESH_ENV_PATH}")
-  if [[ "${mode}" == "on" ]]; then
+  if [[ "${mode}" == "on" || "${mode}" == "off" ]]; then
     lan_coupling_cmd+=(--lan-routes "${DEFAULT_EXIT_LAN_CIDRS}")
   fi
   if ! run_root env \

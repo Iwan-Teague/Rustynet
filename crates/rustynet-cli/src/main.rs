@@ -515,12 +515,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .to_string(),
                 );
             }
-            if !enable && !lan_routes.is_empty() {
-                return Err(
-                    "ops apply-lan-access-coupling does not accept --lan-routes when --enable false"
-                        .to_string(),
-                );
-            }
             Ok(OpsCommand::ApplyLanAccessCoupling {
                 enable,
                 lan_routes,
@@ -2876,12 +2870,8 @@ fn execute_ops_apply_lan_access_coupling(
             assignment_refresh_env_path.display()
         ));
     }
-    if enable {
+    if enable || !lan_routes.is_empty() {
         validate_assignment_refresh_lan_routes(lan_routes.as_slice())?;
-    } else if !lan_routes.is_empty() {
-        return Err(
-            "lan routes must be empty when LAN access coupling is being disabled".to_string(),
-        );
     }
 
     let assignment_refresh_available =
@@ -2967,7 +2957,12 @@ fn execute_ops_apply_lan_access_coupling(
     }
 
     if !enable {
-        apply_lan_blackhole_routes(previous_lan_routes.as_slice(), true)?;
+        let blackhole_routes = if lan_routes.is_empty() {
+            previous_lan_routes.as_slice()
+        } else {
+            lan_routes.as_slice()
+        };
+        apply_lan_blackhole_routes(blackhole_routes, true)?;
     }
     force_local_assignment_refresh_now_ops()?;
     wait_for_daemon_status_field(
