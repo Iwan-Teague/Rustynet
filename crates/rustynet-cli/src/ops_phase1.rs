@@ -933,6 +933,20 @@ mod tests {
         phase1_validate_secure_directory,
     };
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        let counter = TEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{prefix}-{now_nanos}-{counter}{suffix}"))
+    }
 
     #[test]
     fn parse_bool_value_matches_systemd_script_contract() {
@@ -944,15 +958,17 @@ mod tests {
 
     #[test]
     fn phase1_collector_derives_max_metrics_from_ndjson() {
-        let source_path = std::env::temp_dir().join(format!(
-            "rustynet-phase1-collector-{}.ndjson",
-            std::process::id()
-        ));
+        let source_path = unique_temp_path("rustynet-phase1-collector", ".ndjson");
         let body = concat!(
             "{\"evidence_mode\":\"measured\",\"idle_cpu_percent\":1.2,\"idle_memory_mb\":80,\"reconnect_seconds\":1.5,\"route_apply_p95_seconds\":0.8,\"throughput_overhead_percent\":10.0}\n",
             "{\"evidence_mode\":\"measured\",\"idle_cpu_percent\":1.6,\"idle_memory_mb\":96,\"reconnect_seconds\":2.1,\"route_apply_p95_seconds\":1.4,\"throughput_overhead_percent\":12.3}\n"
         );
         std::fs::write(&source_path, body).expect("write ndjson source");
+        let mut perms = std::fs::metadata(&source_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&source_path, perms).expect("set secure mode");
 
         let measured = phase1_collect_measured_input_from_source(&source_path)
             .expect("collector should parse ndjson");
@@ -969,8 +985,7 @@ mod tests {
 
     #[test]
     fn phase1_collector_rejects_non_measured_json_source() {
-        let source_path =
-            std::env::temp_dir().join(format!("rustynet-phase1-unmeasured-{}", std::process::id()));
+        let source_path = unique_temp_path("rustynet-phase1-unmeasured", ".json");
         let body = concat!(
             "{",
             "\"evidence_mode\":\"synthetic\",",
@@ -982,6 +997,11 @@ mod tests {
             "}\n"
         );
         std::fs::write(&source_path, body).expect("write json source");
+        let mut perms = std::fs::metadata(&source_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&source_path, perms).expect("set secure mode");
 
         let err = phase1_collect_measured_input_from_source(&source_path)
             .expect_err("collector should reject non-measured evidence");
@@ -992,12 +1012,14 @@ mod tests {
 
     #[test]
     fn phase1_collector_rejects_non_measured_ndjson_entry() {
-        let source_path = std::env::temp_dir().join(format!(
-            "rustynet-phase1-ndjson-unmeasured-{}.ndjson",
-            std::process::id()
-        ));
+        let source_path = unique_temp_path("rustynet-phase1-ndjson-unmeasured", ".ndjson");
         let body = "{\"evidence_mode\":\"synthetic\",\"idle_cpu_percent\":1.2,\"idle_memory_mb\":80,\"reconnect_seconds\":1.5,\"route_apply_p95_seconds\":0.8,\"throughput_overhead_percent\":10.0}\n";
         std::fs::write(&source_path, body).expect("write ndjson source");
+        let mut perms = std::fs::metadata(&source_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&source_path, perms).expect("set secure mode");
 
         let err = phase1_collect_measured_input_from_source(&source_path)
             .expect_err("collector should reject non-measured ndjson evidence");
@@ -1008,10 +1030,7 @@ mod tests {
 
     #[test]
     fn phase1_collector_rejects_group_writable_source_file() {
-        let source_path = std::env::temp_dir().join(format!(
-            "rustynet-phase1-insecure-perms-{}.ndjson",
-            std::process::id()
-        ));
+        let source_path = unique_temp_path("rustynet-phase1-insecure-perms", ".ndjson");
         let body = "{\"evidence_mode\":\"measured\",\"idle_cpu_percent\":1.2,\"idle_memory_mb\":80,\"reconnect_seconds\":1.5,\"route_apply_p95_seconds\":0.8,\"throughput_overhead_percent\":10.0}\n";
         std::fs::write(&source_path, body).expect("write ndjson source");
         let mut perms = std::fs::metadata(&source_path)
@@ -1029,8 +1048,7 @@ mod tests {
 
     #[test]
     fn phase1_secure_directory_rejects_group_writable_directory() {
-        let dir_path =
-            std::env::temp_dir().join(format!("rustynet-phase1-dir-perms-{}", std::process::id()));
+        let dir_path = unique_temp_path("rustynet-phase1-dir-perms", "");
         std::fs::create_dir_all(&dir_path).expect("create temp directory");
         let mut perms = std::fs::metadata(&dir_path)
             .expect("metadata")

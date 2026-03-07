@@ -331,14 +331,18 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static TEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn temp_paths() -> (PathBuf, PathBuf, PathBuf) {
+        let counter = TEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let root = PathBuf::from(format!("/tmp/rustynet-peer-store-tests.{unique}"));
+        let root = PathBuf::from(format!("/tmp/rustynet-peer-store-tests.{unique}.{counter}"));
         let config_dir = root.join("config");
         let peers_file = config_dir.join("peers.db");
         (root, config_dir, peers_file)
