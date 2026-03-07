@@ -4,12 +4,13 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use nix::unistd::Uid;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde_json::{Map, Value, json};
@@ -181,9 +182,37 @@ fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_trusted_owner(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<(), String> {
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid {
+        return Err(format!(
+            "{label} owner is not trusted ({} uid={owner_uid} expected_uid={expected_uid})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn enforce_owner_only_mode(path: &Path, label: &str) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
+    let mut metadata = fs::symlink_metadata(path)
         .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+    ensure_trusted_owner(path, &metadata, label)?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        let hardened_mode = mode & !0o077;
+        fs::set_permissions(path, fs::Permissions::from_mode(hardened_mode)).map_err(|err| {
+            format!(
+                "failed to harden {label} mode ({} mode {:o} -> {:o}): {err}",
+                path.display(),
+                mode,
+                hardened_mode
+            )
+        })?;
+        metadata = fs::symlink_metadata(path)
+            .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
+        ensure_trusted_owner(path, &metadata, label)?;
+    }
     let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(format!(
@@ -198,7 +227,8 @@ fn ensure_secure_parent_directory(path: &Path, label: &str) -> Result<(), String
     let parent = path
         .parent()
         .ok_or_else(|| format!("{label} has no parent directory: {}", path.display()))?;
-    let metadata = fs::symlink_metadata(parent).map_err(|err| {
+    let parent_label = format!("{label} parent");
+    let mut metadata = fs::symlink_metadata(parent).map_err(|err| {
         format!(
             "inspect {label} parent failed ({}): {err}",
             parent.display()
@@ -215,6 +245,26 @@ fn ensure_secure_parent_directory(path: &Path, label: &str) -> Result<(), String
             "{label} parent must be a directory: {}",
             parent.display()
         ));
+    }
+    ensure_trusted_owner(parent, &metadata, parent_label.as_str())?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        let hardened_mode = mode & !0o077;
+        fs::set_permissions(parent, fs::Permissions::from_mode(hardened_mode)).map_err(|err| {
+            format!(
+                "failed to harden {label} parent mode ({} mode {:o} -> {:o}): {err}",
+                parent.display(),
+                mode,
+                hardened_mode
+            )
+        })?;
+        metadata = fs::symlink_metadata(parent).map_err(|err| {
+            format!(
+                "inspect {label} parent failed ({}): {err}",
+                parent.display()
+            )
+        })?;
+        ensure_trusted_owner(parent, &metadata, parent_label.as_str())?;
     }
     let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -2126,6 +2176,40 @@ mod tests {
 
         fs::remove_file(signing_path.as_path()).expect("remove signing key file");
         fs::remove_file(verifier_path.as_path()).expect("remove verifier key file");
+        fs::remove_dir(key_dir.as_path()).expect("remove key directory");
+    }
+
+    #[test]
+    fn phase10_provenance_keypair_writer_hardens_open_parent_directory() {
+        let unique = format!(
+            "ops-phase10-provenance-open-parent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let key_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(key_dir.as_path()).expect("create key directory");
+        fs::set_permissions(key_dir.as_path(), fs::Permissions::from_mode(0o755))
+            .expect("set insecure key directory mode");
+
+        let signing_path = key_dir.join("signing_seed.hex");
+        let verifier_path = key_dir.join("verifier_key.hex");
+        write_phase10_provenance_keypair(signing_path.as_path(), verifier_path.as_path())
+            .expect("phase10 provenance keypair writer should harden open parent directory");
+
+        let dir_mode = fs::metadata(key_dir.as_path())
+            .expect("key directory metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode & 0o077, 0);
+
+        fs::remove_file(signing_path.as_path()).expect("remove signing key file");
+        fs::remove_file(verifier_path.as_path()).expect("remove verifier key file");
+        fs::set_permissions(key_dir.as_path(), fs::Permissions::from_mode(0o700))
+            .expect("set key directory mode for cleanup");
         fs::remove_dir(key_dir.as_path()).expect("remove key directory");
     }
 }
