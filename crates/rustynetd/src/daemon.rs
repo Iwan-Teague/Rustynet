@@ -50,7 +50,7 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Uid};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
     RuntimeContext, TunnelBackend, TunnelStats,
@@ -5354,22 +5354,55 @@ fn validate_parent_directory_security(
         )));
     }
 
-    let mode = metadata.permissions().mode();
-    if mode & 0o022 != 0 {
+    let mode = metadata.permissions().mode() & 0o777;
+    let owner_uid = metadata.uid();
+    let owner_gid = metadata.gid();
+    let expected_gid = Gid::effective().as_raw();
+    let root_managed_shared_runtime =
+        is_root_managed_shared_runtime_parent(parent, mode, owner_uid, owner_gid, expected_gid);
+
+    if mode & 0o022 != 0 && !root_managed_shared_runtime {
         return Err(DaemonError::InvalidConfig(format!(
             "{label} parent directory has insecure permissions: mode {:o}",
-            mode & 0o777
+            mode
         )));
     }
 
-    let owner_uid = metadata.uid();
     let expected_uid = Uid::effective().as_raw();
-    if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
+    if owner_uid != expected_uid
+        && !(allow_root_owner && owner_uid == 0)
+        && !root_managed_shared_runtime
+    {
         return Err(DaemonError::InvalidConfig(format!(
             "{label} parent directory owner uid mismatch: expected {expected_uid}, got {owner_uid}"
         )));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_root_managed_shared_runtime_parent(
+    parent: &Path,
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    expected_gid: u32,
+) -> bool {
+    parent == Path::new("/run/rustynet")
+        && owner_uid == 0
+        && mode == 0o770
+        && (owner_gid == expected_gid || owner_gid == 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_root_managed_shared_runtime_parent(
+    _parent: &Path,
+    _mode: u32,
+    _owner_uid: u32,
+    _owner_gid: u32,
+    _expected_gid: u32,
+) -> bool {
+    false
 }
 
 fn read_command(stream: &UnixStream) -> Result<String, String> {
@@ -5476,8 +5509,9 @@ mod tests {
         DaemonRuntime, IpcCommand, IpcResponse, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
         MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRUST_EVIDENCE_BYTES, NodeRole, TrustEvidenceRecord,
-        TrustPolicy, TrustWatermark, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
-        load_traversal_bundle, load_traversal_watermark, load_trust_evidence, load_trust_watermark,
+        TrustPolicy, TrustWatermark, is_root_managed_shared_runtime_parent,
+        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_traversal_bundle,
+        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, read_command, run_daemon, run_preflight_checks,
@@ -6068,6 +6102,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn root_managed_shared_runtime_parent_policy_allows_expected_shape() {
+        let expected_gid = nix::unistd::Gid::effective().as_raw();
+        #[cfg(target_os = "linux")]
+        assert!(is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet"),
+            0o770,
+            0,
+            expected_gid,
+            expected_gid
+        ));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet"),
+            0o770,
+            0,
+            expected_gid,
+            expected_gid
+        ));
+        #[cfg(target_os = "linux")]
+        assert!(is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet"),
+            0o770,
+            0,
+            0,
+            expected_gid
+        ));
+        assert!(!is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet"),
+            0o775,
+            0,
+            expected_gid,
+            expected_gid
+        ));
+        assert!(!is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet"),
+            0o770,
+            1000,
+            expected_gid,
+            expected_gid
+        ));
+        assert!(!is_root_managed_shared_runtime_parent(
+            Path::new("/run/other"),
+            0o770,
+            0,
+            expected_gid,
+            expected_gid
+        ));
+        assert!(!is_root_managed_shared_runtime_parent(
+            Path::new("/run/rustynet/wireguard.key"),
+            0o770,
+            0,
+            expected_gid,
+            expected_gid
+        ));
     }
 
     fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
