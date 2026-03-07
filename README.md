@@ -221,6 +221,35 @@ To include these tests in security regression gates:
 - set `RUSTYNET_SECURITY_RUN_ACTIVE_NETWORK_GATES=1`.
 - set `RUSTYNET_SECURITY_REQUIRE_ACTIVE_NETWORK_GATES=1` to fail closed when active-network gates are not run.
 
+Additional live Linux regression scenarios on the active VM lab:
+
+```bash
+umask 077 && printf 'tempo\n' > /tmp/rustynet_lab.pass
+
+./scripts/e2e/live_linux_two_hop_test.sh \
+  --ssh-password-file /tmp/rustynet_lab.pass \
+  --sudo-password-file /tmp/rustynet_lab.pass
+
+./scripts/e2e/live_linux_exit_handoff_test.sh \
+  --ssh-password-file /tmp/rustynet_lab.pass \
+  --sudo-password-file /tmp/rustynet_lab.pass
+
+./scripts/e2e/live_linux_lan_toggle_test.sh \
+  --ssh-password-file /tmp/rustynet_lab.pass \
+  --sudo-password-file /tmp/rustynet_lab.pass
+```
+
+These scripts are measured live-network regressions for:
+- two-hop client -> entry relay -> final exit routing
+- exit handoff under load without route leak or restricted-safe regressions
+- LAN-access toggle enforcement, including blind-exit deny behavior
+
+Security properties asserted by the live harness:
+- assignment issuance uses the Rust signing/passphrase path (`rustynet ops materialize-signing-passphrase`)
+- remote sudo password material is securely scrubbed on cleanup (`rustynet ops secure-remove`)
+- plaintext passphrase-file residue checks are enforced on the tested hosts
+- reports are bound to the current git commit and written under `artifacts/phase10/`
+
 ## Release Readiness Evidence (Fail-Closed)
 
 Rustynet no longer accepts static/pass-through readiness JSON artifacts.
