@@ -190,10 +190,13 @@ live_lab_log "Enforcing runtime roles"
 live_lab_enforce_host "$EXIT_A_HOST" "admin" "$EXIT_A_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_A_HOST")"
 live_lab_enforce_host "$EXIT_B_HOST" "admin" "$EXIT_B_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_B_HOST")"
 live_lab_enforce_host "$CLIENT_HOST" "client" "$CLIENT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$CLIENT_HOST")"
+live_lab_wait_for_daemon_socket "$EXIT_A_HOST"
+live_lab_wait_for_daemon_socket "$EXIT_B_HOST"
+live_lab_wait_for_daemon_socket "$CLIENT_HOST"
 
 live_lab_log "Advertising default route on both exits"
-live_lab_run_root "$EXIT_A_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
-live_lab_run_root "$EXIT_B_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
+live_lab_retry_root "$EXIT_A_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2
+live_lab_retry_root "$EXIT_B_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2
 
 sleep 5
 : > "$MONITOR_LOG"

@@ -198,10 +198,14 @@ live_lab_enforce_host "$FINAL_EXIT_HOST" "admin" "$FINAL_EXIT_NODE_ID" "$SSH_ALL
 live_lab_enforce_host "$CLIENT_HOST" "client" "$CLIENT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$CLIENT_HOST")"
 live_lab_enforce_host "$ENTRY_HOST" "admin" "$ENTRY_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$ENTRY_HOST")"
 live_lab_enforce_host "$SECOND_CLIENT_HOST" "client" "$SECOND_CLIENT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$SECOND_CLIENT_HOST")"
+live_lab_wait_for_daemon_socket "$FINAL_EXIT_HOST"
+live_lab_wait_for_daemon_socket "$CLIENT_HOST"
+live_lab_wait_for_daemon_socket "$ENTRY_HOST"
+live_lab_wait_for_daemon_socket "$SECOND_CLIENT_HOST"
 
 live_lab_log "Advertising default route on final exit and entry relay"
-live_lab_run_root "$FINAL_EXIT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
-live_lab_run_root "$ENTRY_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
+live_lab_retry_root "$FINAL_EXIT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2
+live_lab_retry_root "$ENTRY_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2
 
 sleep 6
 

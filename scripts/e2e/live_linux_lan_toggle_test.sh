@@ -192,9 +192,12 @@ live_lab_log "Enforcing runtime roles"
 live_lab_enforce_host "$EXIT_HOST" "admin" "$EXIT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_HOST")"
 live_lab_enforce_host "$CLIENT_HOST" "client" "$CLIENT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$CLIENT_HOST")"
 live_lab_enforce_host "$BLIND_EXIT_HOST" "blind_exit" "$BLIND_EXIT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$BLIND_EXIT_HOST")"
+live_lab_wait_for_daemon_socket "$EXIT_HOST"
+live_lab_wait_for_daemon_socket "$CLIENT_HOST"
+live_lab_wait_for_daemon_socket "$BLIND_EXIT_HOST"
 
 live_lab_log "Advertising default route on exit"
-live_lab_run_root "$EXIT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0"
+live_lab_retry_root "$EXIT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2
 
 live_lab_log "Provisioning synthetic LAN subnet on exit"
 live_lab_run_root "$EXIT_HOST" "root ip link add ${LAN_TEST_INTERFACE} type dummy >/dev/null 2>&1 || true && root ip addr replace ${LAN_TEST_GATEWAY_IP} dev ${LAN_TEST_INTERFACE} && root ip link set ${LAN_TEST_INTERFACE} up"

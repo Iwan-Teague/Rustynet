@@ -192,6 +192,23 @@ live_lab_run_root() {
   live_lab_ssh "$target" "$(live_lab_rootify "$body")"
 }
 
+live_lab_retry_root() {
+  local target="$1"
+  local body="$2"
+  local attempts="${3:-20}"
+  local sleep_secs="${4:-2}"
+  local attempt
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if live_lab_run_root "$target" "$body" >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      sleep "$sleep_secs"
+    fi
+  done
+  live_lab_run_root "$target" "$body"
+}
+
 live_lab_capture_root() {
   local target="$1"
   local body="$2"
@@ -278,6 +295,14 @@ live_lab_enforce_host() {
   local ssh_allow_cidrs="$4"
   local src_dir="$5"
   live_lab_run_root "$target" "root rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'"
+}
+
+live_lab_wait_for_daemon_socket() {
+  local target="$1"
+  local socket_path="${2:-/run/rustynet/rustynetd.sock}"
+  local attempts="${3:-20}"
+  local sleep_secs="${4:-2}"
+  live_lab_retry_root "$target" "root test -S '${socket_path}'" "$attempts" "$sleep_secs"
 }
 
 live_lab_status() {
