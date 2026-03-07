@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nix::unistd::Uid;
 use serde_json::{Map, Value, json};
 
 const DEFAULT_PHASE1_SOURCE_NDJSON_PATH: &str =
@@ -224,6 +226,50 @@ fn phase1_validate_non_writable_by_group_or_world(
     Ok(())
 }
 
+fn phase1_validate_trusted_file_owner(
+    path: &Path,
+    metadata: &fs::Metadata,
+    label: &str,
+) -> Result<(), String> {
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid {
+        return Err(format!(
+            "{label} owner is not trusted ({} uid={owner_uid} expected_uid={expected_uid})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn phase1_harden_file_write_bits_if_needed(
+    path: &Path,
+    metadata: fs::Metadata,
+    label: &str,
+) -> Result<fs::Metadata, String> {
+    phase1_validate_trusted_file_owner(path, &metadata, label)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        let hardened_mode = mode & !0o022;
+        fs::set_permissions(path, fs::Permissions::from_mode(hardened_mode)).map_err(|err| {
+            format!(
+                "failed to harden {label} write bits ({} mode {:o} -> {:o}): {err}",
+                path.display(),
+                mode & 0o777,
+                hardened_mode & 0o777
+            )
+        })?;
+    }
+    let refreshed_metadata = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "inspect {label} failed after hardening ({}): {err}",
+            path.display()
+        )
+    })?;
+    phase1_validate_non_writable_by_group_or_world(path, &refreshed_metadata, label)?;
+    Ok(refreshed_metadata)
+}
+
 fn phase1_validate_secure_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
@@ -262,7 +308,7 @@ fn phase1_validate_source_path(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    phase1_validate_non_writable_by_group_or_world(path, &metadata, "phase1 metrics source file")?;
+    let _ = phase1_harden_file_write_bits_if_needed(path, metadata, "phase1 metrics source file")?;
     Ok(())
 }
 
@@ -475,9 +521,9 @@ fn phase1_write_measured_input_artifact(
                 output_path.display()
             ));
         }
-        phase1_validate_non_writable_by_group_or_world(
+        let _ = phase1_harden_file_write_bits_if_needed(
             output_path,
-            &metadata,
+            metadata,
             "phase1 measured output file",
         )?;
     }
@@ -1029,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_collector_rejects_group_writable_source_file() {
+    fn phase1_collector_hardens_group_writable_source_file() {
         let source_path = unique_temp_path("rustynet-phase1-insecure-perms", ".ndjson");
         let body = "{\"evidence_mode\":\"measured\",\"idle_cpu_percent\":1.2,\"idle_memory_mb\":80,\"reconnect_seconds\":1.5,\"route_apply_p95_seconds\":0.8,\"throughput_overhead_percent\":10.0}\n";
         std::fs::write(&source_path, body).expect("write ndjson source");
@@ -1039,9 +1085,15 @@ mod tests {
         perms.set_mode(0o664);
         std::fs::set_permissions(&source_path, perms).expect("set insecure mode");
 
-        let err = phase1_collect_measured_input_from_source(&source_path)
-            .expect_err("collector should reject group writable source");
-        assert!(err.contains("must not be group/world writable"));
+        let measured = phase1_collect_measured_input_from_source(&source_path)
+            .expect("collector should harden trusted group-writable source");
+        assert_eq!(measured.sample_count, 1);
+        let hardened_mode = std::fs::metadata(&source_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(hardened_mode & 0o022, 0);
 
         let _ = std::fs::remove_file(source_path);
     }
