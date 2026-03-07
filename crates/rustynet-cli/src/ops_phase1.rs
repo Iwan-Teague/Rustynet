@@ -226,7 +226,7 @@ fn phase1_validate_non_writable_by_group_or_world(
     Ok(())
 }
 
-fn phase1_validate_trusted_file_owner(
+fn phase1_validate_trusted_owner(
     path: &Path,
     metadata: &fs::Metadata,
     label: &str,
@@ -247,7 +247,7 @@ fn phase1_harden_file_write_bits_if_needed(
     metadata: fs::Metadata,
     label: &str,
 ) -> Result<fs::Metadata, String> {
-    phase1_validate_trusted_file_owner(path, &metadata, label)?;
+    phase1_validate_trusted_owner(path, &metadata, label)?;
     let mode = metadata.permissions().mode();
     if mode & 0o022 != 0 {
         let hardened_mode = mode & !0o022;
@@ -270,6 +270,40 @@ fn phase1_harden_file_write_bits_if_needed(
     Ok(refreshed_metadata)
 }
 
+fn phase1_harden_directory_write_bits_if_needed(
+    path: &Path,
+    metadata: fs::Metadata,
+    label: &str,
+) -> Result<fs::Metadata, String> {
+    phase1_validate_trusted_owner(path, &metadata, label)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        let hardened_mode = mode & !0o022;
+        fs::set_permissions(path, fs::Permissions::from_mode(hardened_mode)).map_err(|err| {
+            format!(
+                "failed to harden {label} write bits ({} mode {:o} -> {:o}): {err}",
+                path.display(),
+                mode & 0o777,
+                hardened_mode & 0o777
+            )
+        })?;
+    }
+    let refreshed_metadata = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "inspect {label} failed after hardening ({}): {err}",
+            path.display()
+        )
+    })?;
+    if refreshed_metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !refreshed_metadata.file_type().is_dir() {
+        return Err(format!("{label} must be a directory: {}", path.display()));
+    }
+    phase1_validate_non_writable_by_group_or_world(path, &refreshed_metadata, label)?;
+    Ok(refreshed_metadata)
+}
+
 fn phase1_validate_secure_directory(path: &Path, label: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|err| format!("inspect {label} failed ({}): {err}", path.display()))?;
@@ -279,7 +313,7 @@ fn phase1_validate_secure_directory(path: &Path, label: &str) -> Result<(), Stri
     if !metadata.file_type().is_dir() {
         return Err(format!("{label} must be a directory: {}", path.display()));
     }
-    phase1_validate_non_writable_by_group_or_world(path, &metadata, label)?;
+    let _ = phase1_harden_directory_write_bits_if_needed(path, metadata, label)?;
     Ok(())
 }
 
@@ -1099,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_secure_directory_rejects_group_writable_directory() {
+    fn phase1_secure_directory_hardens_group_writable_directory() {
         let dir_path = unique_temp_path("rustynet-phase1-dir-perms", "");
         std::fs::create_dir_all(&dir_path).expect("create temp directory");
         let mut perms = std::fs::metadata(&dir_path)
@@ -1108,9 +1142,14 @@ mod tests {
         perms.set_mode(0o777);
         std::fs::set_permissions(&dir_path, perms).expect("set insecure mode");
 
-        let err = phase1_validate_secure_directory(&dir_path, "test phase1 output directory")
-            .expect_err("directory with open write bits must be rejected");
-        assert!(err.contains("must not be group/world writable"));
+        phase1_validate_secure_directory(&dir_path, "test phase1 output directory")
+            .expect("directory should be hardened when owner is trusted");
+        let hardened_mode = std::fs::metadata(&dir_path)
+            .expect("metadata after harden")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(hardened_mode & 0o022, 0);
 
         let _ = std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(dir_path);
