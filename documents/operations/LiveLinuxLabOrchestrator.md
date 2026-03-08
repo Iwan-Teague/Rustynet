@@ -173,7 +173,8 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
 Source selection:
 
 - default: package the current local working tree
-- interactive toggle: choose latest committed `origin/main` instead
+- interactive toggle: ask whether to update from latest git instead of the local working tree
+- if you answer `yes`, the script fetches `origin`, prints the available branch names, and lets you choose by number or branch name
 - explicit flags:
   - `--source-mode working-tree`
   - `--source-mode local-head`
@@ -187,6 +188,7 @@ Important:
 - `working-tree` can include local uncommitted changes
 - `local-head` uses the latest local commit only
 - `origin-main` fetches and archives the latest committed remote `main`
+- interactive branch selection can also deploy other fetched remote branches such as `origin/testing`
 - if you want every VM on the latest committed repo state, use `origin-main`
 
 Non-interactive, full five-node topology:

@@ -53,6 +53,9 @@ usage() {
 usage: ${SCRIPT_NAME} [options]
 
 Interactive by default. If any required target/password input is missing, the script prompts.
+Interactive source selection now also supports:
+  - use local working tree, or
+  - update from latest git and pick a branch from a numbered list
 
 options:
   --profile <path>               Load saved lab profile (.env-style)
@@ -124,6 +127,23 @@ prompt_yes_no() {
       *) printf 'please answer yes or no\n' >&2 ;;
     esac
   done
+}
+
+prompt_with_default() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local reply=""
+  if [[ -n "$default_value" ]]; then
+    printf '%s [%s]: ' "$prompt" "$default_value" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+  read -r reply
+  reply="$(trim_ascii "$reply")"
+  if [[ -z "$reply" ]]; then
+    reply="$default_value"
+  fi
+  printf '%s' "$reply"
 }
 
 require_cmd() {
@@ -304,6 +324,147 @@ describe_source_mode() {
       printf 'git ref %s' "$REPO_REF"
       ;;
   esac
+}
+
+fetch_git_ref_if_needed() {
+  local ref="$1"
+  if is_origin_branch_ref "$ref"; then
+    git -C "$ROOT_DIR" fetch origin --prune --quiet
+  fi
+}
+
+git_ref_exists() {
+  local ref="$1"
+  git -C "$ROOT_DIR" rev-parse --verify --quiet "$ref" >/dev/null 2>&1
+}
+
+is_origin_branch_ref() {
+  local ref="$1"
+  [[ "$ref" == origin/* ]]
+}
+
+collect_interactive_git_branches() {
+  local branch
+  local seen=""
+  local branches=()
+  local remote_count=0
+
+  while IFS= read -r branch; do
+    branch="$(trim_ascii "$branch")"
+    [[ -n "$branch" ]] || continue
+    [[ "$branch" == "origin" ]] && continue
+    [[ "$branch" == "HEAD" ]] && continue
+    [[ "$branch" == "origin/HEAD" ]] && continue
+    branch="${branch#origin/}"
+    if [[ ",$seen," != *",$branch,"* ]]; then
+      branches+=("$branch")
+      seen="${seen},${branch}"
+      remote_count=$((remote_count + 1))
+    fi
+  done < <(git -C "$ROOT_DIR" for-each-ref refs/remotes/origin --format='%(refname:short)' 2>/dev/null || true)
+
+  if (( remote_count > 0 )); then
+    printf '%s\n' "${branches[@]}"
+    return 0
+  fi
+
+  while IFS= read -r branch; do
+    branch="$(trim_ascii "$branch")"
+    [[ -n "$branch" ]] || continue
+    if [[ ",$seen," != *",$branch,"* ]]; then
+      branches+=("$branch")
+      seen="${seen},${branch}"
+    fi
+  done < <(git -C "$ROOT_DIR" for-each-ref refs/heads --format='%(refname:short)' 2>/dev/null || true)
+
+  printf '%s\n' "${branches[@]}"
+}
+
+default_interactive_git_branch() {
+  if git_ref_exists "refs/remotes/origin/main"; then
+    printf 'main'
+    return 0
+  fi
+  if git_ref_exists "refs/heads/main"; then
+    printf 'main'
+    return 0
+  fi
+  git -C "$ROOT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true
+}
+
+resolve_interactive_git_branch_ref() {
+  local branch_name="$1"
+  if git_ref_exists "refs/remotes/origin/${branch_name}"; then
+    printf 'origin/%s' "$branch_name"
+    return 0
+  fi
+  if git_ref_exists "refs/heads/${branch_name}"; then
+    printf '%s' "$branch_name"
+    return 0
+  fi
+  if git_ref_exists "$branch_name"; then
+    printf '%s' "$branch_name"
+    return 0
+  fi
+  return 1
+}
+
+prompt_for_git_branch_source() {
+  local fetch_failed=0
+  local branch_lines branch_count=0
+  local branch_choices=()
+  local branch default_branch selection selected_ref index
+
+  if ! git -C "$ROOT_DIR" fetch origin --prune --quiet; then
+    fetch_failed=1
+    printf 'warning: git fetch origin failed; listing currently available local refs\n' >&2
+  fi
+
+  branch_lines="$(collect_interactive_git_branches)"
+  while IFS= read -r branch; do
+    branch="$(trim_ascii "$branch")"
+    [[ -n "$branch" ]] || continue
+    branch_choices+=("$branch")
+    branch_count=$((branch_count + 1))
+  done <<< "$branch_lines"
+
+  if [[ "$branch_count" -eq 0 ]]; then
+    printf 'no git branches available for interactive selection\n' >&2
+    return 1
+  fi
+
+  printf 'Available branches:\n' >&2
+  for index in "${!branch_choices[@]}"; do
+    printf '  %d) %s\n' "$((index + 1))" "${branch_choices[$index]}" >&2
+  done
+
+  default_branch="$(default_interactive_git_branch)"
+  if [[ -z "$default_branch" ]]; then
+    default_branch="${branch_choices[0]}"
+  fi
+
+  while true; do
+    selection="$(prompt_with_default 'Branch to deploy (number or name)' "$default_branch")"
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+      index=$((selection - 1))
+      if (( index >= 0 && index < ${#branch_choices[@]} )); then
+        selection="${branch_choices[$index]}"
+      else
+        printf 'invalid branch selection: %s\n' "$selection" >&2
+        continue
+      fi
+    fi
+    selected_ref="$(resolve_interactive_git_branch_ref "$selection")" || {
+      printf 'unknown branch: %s\n' "$selection" >&2
+      continue
+    }
+    SOURCE_MODE="ref"
+    REPO_REF="$selected_ref"
+    if [[ "$fetch_failed" -eq 0 && "$selected_ref" == "origin/main" ]]; then
+      SOURCE_MODE="origin-main"
+    fi
+    return 0
+  done
 }
 
 node_target_for_label() {
@@ -823,9 +984,7 @@ stage_prepare_source_archive() {
       -czf "$SOURCE_ARCHIVE" .
   else
     archive_ref="$(resolve_source_ref)"
-    if [[ "$SOURCE_MODE" == "origin-main" ]]; then
-      git -C "$ROOT_DIR" fetch origin main --quiet
-    fi
+    fetch_git_ref_if_needed "$archive_ref"
     git -C "$ROOT_DIR" archive --format=tar.gz --output "$SOURCE_ARCHIVE" "$archive_ref"
   fi
   if [[ "$SOURCE_MODE" == "working-tree" ]]; then
@@ -1676,10 +1835,11 @@ maybe_prompt_for_source_mode() {
   if [[ ! -t 0 || ! -t 1 ]]; then
     return 0
   fi
-  if prompt_yes_no "Use latest committed origin/main instead of local working tree?" "n"; then
-    SOURCE_MODE="origin-main"
+  if prompt_yes_no "Update from latest git instead of local working tree?" "n"; then
+    prompt_for_git_branch_source
   else
     SOURCE_MODE="working-tree"
+    REPO_REF="working-tree"
   fi
 }
 
