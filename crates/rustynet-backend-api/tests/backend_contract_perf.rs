@@ -52,6 +52,23 @@ impl TunnelBackend for PerfBackend {
         Ok(())
     }
 
+    fn update_peer_endpoint(
+        &mut self,
+        _node_id: &NodeId,
+        _endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        _node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(None)
+    }
+
     fn remove_peer(&mut self, _node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
         if self.peers > 0 {

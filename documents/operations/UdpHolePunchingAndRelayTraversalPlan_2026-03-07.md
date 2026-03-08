@@ -13,12 +13,12 @@ while preserving Rustynet security constraints (default-deny, fail-closed, signe
 
 ## 2) Current State (Codebase Reality)
 - `Requirements.md` already requires NAT traversal + relay fallback (`3.2`).
-- `rustynetd` currently reports `direct-preferred relay-fallback` in netcheck, but relay dataplane switching is still not fully implemented in runtime path (`documents/phase10.md` status discrepancy).
+- `rustynetd` now validates signed traversal bundles and programs authoritative per-peer direct/relay endpoint targets into the Phase 10 runtime controller; auto-tunnel runtime applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, and netcheck reflects runtime path state instead of a static traversal slogan.
 - `rustynet-relay` currently provides relay fleet selection primitives, not full encrypted packet relay transport.
 - Auto-tunnel assignment currently carries a single signed endpoint per peer (`peer.N.endpoint`).
 
 Implication:
-- To match Tailscale-like UX, Rustynet needs a real traversal subsystem and production relay transport path, not just endpoint static assignment.
+- To match Tailscale-like UX, Rustynet still needs the HP-2 direct probing engine and HP-3 production relay transport path, not just signed endpoint provisioning.
 
 ## 3) External Reference Constraints (Primary Sources)
 - Tailscale design notes indicate NAT traversal and protocol behavior must share socket/port behavior to make hole punching effective, and they combine direct attempts with relay fallback.
@@ -100,6 +100,7 @@ Acceptance:
 - `rustynet netcheck` now emits structured traversal diagnostics (path mode/reason, traversal artifact freshness, candidate counts by type, and validation error state) instead of the prior static message.
 - Traversal artifact paths are now wired through daemon config + CLI flags + Linux systemd installer/env (`RUSTYNET_TRAVERSAL_BUNDLE`, `RUSTYNET_TRAVERSAL_VERIFIER_KEY`, `RUSTYNET_TRAVERSAL_WATERMARK`, `RUSTYNET_TRAVERSAL_MAX_AGE_SECS`) and propagated into runtime launch arguments.
 - Daemon preflight now treats traversal verifier custody as conditional on traversal bundle presence: no bundle means verifier is not required, while a present bundle still fails closed if verifier key custody/validation is missing or invalid.
+- Auto-tunnel runtime now applies traversal-authoritative peer endpoints before backend peer provisioning for covered peers and fail-closes on traversal runtime programming errors instead of silently ignoring them.
 - Unit tests were added for tamper detection, replay rejection, watermark persistence, and deterministic netcheck diagnostics.
 
 ## Phase HP-2: Direct UDP Hole Punching Engine

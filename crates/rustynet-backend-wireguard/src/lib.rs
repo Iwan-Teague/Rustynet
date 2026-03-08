@@ -6,7 +6,7 @@ use std::process::Command;
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
-    RuntimeContext, TunnelBackend, TunnelStats,
+    RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
 };
 
 const MACOS_ROUTE_BINARY: &str = "/sbin/route";
@@ -83,6 +83,27 @@ impl TunnelBackend for WireguardBackend {
         self.peers.insert(peer.node_id.clone(), peer);
         self.refresh_stats();
         Ok(())
+    }
+
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        let Some(peer) = self.peers.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        peer.endpoint = endpoint;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -449,6 +470,39 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
 
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
+    }
+
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        let Some(peer) = self.peers.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        let endpoint_value = format!("{}:{}", endpoint.addr, endpoint.port);
+        self.runner.run(
+            "wg",
+            &[
+                "set".to_string(),
+                self.interface_name.clone(),
+                "peer".to_string(),
+                encode_wg_public_key_base64(&peer.public_key),
+                "endpoint".to_string(),
+                endpoint_value,
+            ],
+        )?;
+        peer.endpoint = endpoint;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -876,6 +930,39 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
 
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
+    }
+
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        let Some(peer) = self.peers.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        let endpoint_value = format!("{}:{}", endpoint.addr, endpoint.port);
+        self.runner.run(
+            "wg",
+            &[
+                "set".to_string(),
+                self.interface_name.clone(),
+                "peer".to_string(),
+                encode_wg_public_key_base64(&peer.public_key),
+                "endpoint".to_string(),
+                endpoint_value,
+            ],
+        )?;
+        peer.endpoint = endpoint;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {

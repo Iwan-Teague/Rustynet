@@ -1,0 +1,12 @@
+[stage:prime_remote_access] START push sudo credentials to all targets
+scp: Connection closed
+ssh: connect to host 192.168.18.49 port 22: Operation not permitted
+scp: Connection closed
+ssh: connect to host 192.168.18.50 port 22: Operation not permitted
+scp: Connection closed
+ssh: connect to host 192.168.18.52 port 22: Operation not permitted
+scp: Connection closed
+ssh: connect to host 192.168.18.51 port 22: Operation not permitted
+scp: Connection closed
+ssh: connect to host 192.168.18.53 port 22: Operation not permitted
+[stage:prime_remote_access] PASS

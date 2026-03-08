@@ -1,0 +1,17 @@
+[stage:cleanup_hosts] START remove prior RustyNet state from targets
+[cleanup] exit debian@192.168.18.49
+scp: Connection closed
+ssh: connect to host 192.168.18.49 port 22: Operation not permitted
+[cleanup] client debian@192.168.18.50
+scp: Connection closed
+ssh: connect to host 192.168.18.50 port 22: Operation not permitted
+[cleanup] entry ubuntu@192.168.18.52
+scp: Connection closed
+ssh: connect to host 192.168.18.52 port 22: Operation not permitted
+[cleanup] aux fedora@192.168.18.51
+scp: Connection closed
+ssh: connect to host 192.168.18.51 port 22: Operation not permitted
+[cleanup] extra mint@192.168.18.53
+scp: Connection closed
+ssh: connect to host 192.168.18.53 port 22: Operation not permitted
+[stage:cleanup_hosts] FAIL rc=255

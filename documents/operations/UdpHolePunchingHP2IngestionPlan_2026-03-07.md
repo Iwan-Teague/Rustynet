@@ -25,11 +25,13 @@ Key mandatory constraints carried into this plan:
 - `rustynet-control` can issue and verify signed endpoint-hint bundles.
 - `rustynetd` parses/validates traversal bundles with strict schema, signature, freshness, and watermark replay checks.
 - `rustynet netcheck` reports traversal diagnostics.
-- `Phase10Controller` path toggles are mostly bookkeeping (`mark_direct_failed/recovered`) and are not yet driven by a live probe executor.
-- Runtime peer endpoint authority still comes from assignment `peer.N.endpoint` during apply/reconcile.
+- `Phase10Controller` path toggles are no longer bookkeeping-only for runtime state: traversal endpoint programming updates the managed peer endpoint and bypass routing, but it is still not driven by a live probe executor.
+- Auto-tunnel runtime now exposes an explicit internal authority mode (`TraversalAuthorityMode::EnforcedV1`) and applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers; assignment `peer.N.endpoint` still remains the fallback input for peers that do not yet have verified traversal state.
+- Traversal runtime programming errors now fail closed instead of being silently swallowed.
+- Backend contract already supports controlled endpoint rotation (`update_peer_endpoint` / `current_peer_endpoint`).
 - `rustynet-relay` is still selector-only (HP-3 scope for real relay transport).
 
-Implication: HP-2 must wire signed traversal hints into actual endpoint decision/apply flow and remove assignment-endpoint authority for runtime mutation.
+Implication: HP-2 must finish the probe-evidence path, expand authority from “covered peers” to all traversal-managed peers, and remove remaining assignment-endpoint fallback authority for runtime mutation.
 
 ## 4) HP-2 Security Contract (Non-Negotiable)
 1. Traversal artifact validity is a hard precondition for endpoint mutation.
@@ -55,6 +57,13 @@ Changes:
 
 Exit criteria:
 - Unit test proves missing traversal state blocks peer mutation in enforced mode.
+
+Status (2026-03-08):
+- partially implemented
+- runtime now has `TraversalAuthorityMode::EnforcedV1` in auto-tunnel mode,
+- covered peers are mutated from verified traversal state during bootstrap/reconcile,
+- inconsistent traversal runtime programming now fail-closes instead of being ignored,
+- fully blocking peers with missing traversal state remains open until the verified traversal index / multi-peer authority model is completed.
 
 ---
 
@@ -95,6 +104,11 @@ Changes:
 Exit criteria:
 - Parser fuzz/negative tests: unknown tokens, oversized output, malformed lines, no panic.
 - Unit tests: endpoint update only for known peers; unknown peer rejected.
+
+Status (2026-03-08):
+- partially implemented
+- `update_peer_endpoint(node_id, endpoint)` and `current_peer_endpoint(node_id)` are now present in the backend contract and wired through the WireGuard backends,
+- handshake-recency evidence is still missing and remains the next backend primitive required for probe-driven HP-2 decisions.
 
 ---
 
@@ -237,4 +251,3 @@ Minimum required checks in artifact payload:
 - All HP-2 gates green in CI.
 - Artifacts generated and readiness check enforces them.
 - Documentation synchronized and explicitly notes HP-3 still required for authenticated ciphertext relay transport service.
-

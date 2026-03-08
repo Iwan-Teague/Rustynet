@@ -11,6 +11,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,7 +54,7 @@ use nix::sys::socket::sockopt::PeerCredentials;
 use nix::unistd::{Gid, Uid};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
-    RuntimeContext, TunnelBackend, TunnelStats,
+    RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
 };
 #[cfg(target_os = "linux")]
 use rustynet_backend_wireguard::LinuxWireguardBackend;
@@ -97,7 +98,7 @@ pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.k
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
 pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
 pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub";
-pub const DEFAULT_EGRESS_INTERFACE: &str = "eth0";
+pub const DEFAULT_EGRESS_INTERFACE: &str = "auto";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
@@ -811,6 +812,33 @@ impl TunnelBackend for DaemonBackend {
         }
     }
 
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.update_peer_endpoint(node_id, endpoint),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.update_peer_endpoint(node_id, endpoint),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.update_peer_endpoint(node_id, endpoint),
+        }
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.current_peer_endpoint(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.current_peer_endpoint(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.current_peer_endpoint(node_id),
+        }
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),
@@ -934,6 +962,25 @@ enum RestrictionMode {
     None,
     Recoverable,
     Permanent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalAuthorityMode {
+    StaticAssignment,
+    EnforcedV1,
+}
+
+impl TraversalAuthorityMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            TraversalAuthorityMode::StaticAssignment => "static_assignment",
+            TraversalAuthorityMode::EnforcedV1 => "enforced_v1",
+        }
+    }
+
+    fn is_enforced(self) -> bool {
+        matches!(self, TraversalAuthorityMode::EnforcedV1)
+    }
 }
 
 impl DaemonRuntime {
@@ -1230,20 +1277,20 @@ impl DaemonRuntime {
                 self.traversal_hint_error = Some(err.to_string());
             }
         }
+        if let Err(err) = self.sync_traversal_runtime_state() {
+            self.traversal_hint_error = Some(err.clone());
+            if self.traversal_authority_mode().is_enforced() {
+                self.restrict_recoverable(format!("traversal runtime sync failed: {err}"));
+                let _ = self
+                    .controller
+                    .force_fail_closed("traversal_runtime_sync_failed");
+            }
+        }
     }
 
     fn netcheck_response_line(&self) -> String {
-        let (path_mode, path_reason) = match self.controller.state() {
-            DataplaneState::FailClosed => ("fail_closed", "fail_closed"),
-            DataplaneState::ExitActive => ("direct_preferred_relay_fallback", "exit_active"),
-            DataplaneState::DataplaneApplied => {
-                ("direct_preferred_relay_fallback", "dataplane_applied")
-            }
-            DataplaneState::ControlTrusted => {
-                ("direct_preferred_relay_fallback", "control_trusted")
-            }
-            DataplaneState::Init => ("initializing", "init"),
-        };
+        let (path_mode, path_reason) = self.netcheck_path_state();
+        let traversal_authority = self.traversal_authority_mode().as_str();
 
         let now = unix_now();
         let (traversal_status, source, target, generated_at, expires_at, age_secs, remaining_secs) =
@@ -1314,8 +1361,145 @@ impl DaemonRuntime {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_error={traversal_error}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_error={traversal_error}",
         )
+    }
+
+    fn netcheck_path_state(&self) -> (&'static str, &'static str) {
+        match self.controller.state() {
+            DataplaneState::FailClosed => ("fail_closed", "fail_closed"),
+            DataplaneState::ExitActive | DataplaneState::DataplaneApplied => {
+                if self.controller.has_active_relay_path() {
+                    ("relay_active", "relay_endpoint_programmed")
+                } else if self.controller.has_armed_relay_path() {
+                    ("direct_active", "relay_armed")
+                } else {
+                    ("direct_active", "static_assignment")
+                }
+            }
+            DataplaneState::ControlTrusted => ("control_trusted", "control_trusted"),
+            DataplaneState::Init => ("initializing", "init"),
+        }
+    }
+
+    fn sync_traversal_runtime_state(&mut self) -> Result<(), String> {
+        if !matches!(
+            self.controller.state(),
+            DataplaneState::DataplaneApplied | DataplaneState::ExitActive
+        ) {
+            return Ok(());
+        }
+
+        if let Some(err) = self.traversal_hint_error.as_deref()
+            && self.traversal_authority_mode().is_enforced()
+        {
+            return Err(format!(
+                "traversal authority rejected invalid traversal state: {err}"
+            ));
+        }
+
+        let Some(envelope) = self.traversal_hint.clone() else {
+            return Ok(());
+        };
+        let Some(remote_node_id) = self.traversal_remote_node_id(
+            envelope.bundle.source_node_id.as_str(),
+            envelope.bundle.target_node_id.as_str(),
+        ) else {
+            return Ok(());
+        };
+        let (direct_endpoint, relay_endpoint) =
+            select_runtime_traversal_endpoints(&envelope.bundle.candidates);
+        if direct_endpoint.is_none() && relay_endpoint.is_none() {
+            return Err(format!(
+                "traversal bundle for peer {} contains no usable runtime endpoints",
+                remote_node_id.as_str()
+            ));
+        }
+
+        self.controller
+            .configure_traversal_paths(&remote_node_id, direct_endpoint, relay_endpoint)
+            .map_err(|err| {
+                format!(
+                    "traversal authority failed to program peer {}: {err}",
+                    remote_node_id.as_str()
+                )
+            })
+    }
+
+    fn traversal_authority_mode(&self) -> TraversalAuthorityMode {
+        if self.auto_tunnel_enforce {
+            TraversalAuthorityMode::EnforcedV1
+        } else {
+            TraversalAuthorityMode::StaticAssignment
+        }
+    }
+
+    fn apply_traversal_authority_to_peers(
+        &self,
+        mut peers: Vec<PeerConfig>,
+        membership_directory: &MembershipDirectory,
+    ) -> Result<Vec<PeerConfig>, String> {
+        if !self.traversal_authority_mode().is_enforced() {
+            return Ok(peers);
+        }
+        if let Some(err) = self.traversal_hint_error.as_deref() {
+            return Err(format!(
+                "traversal authority requires valid signed traversal state: {err}"
+            ));
+        }
+
+        let Some(envelope) = self.traversal_hint.as_ref() else {
+            return Ok(peers);
+        };
+        let Some(remote_node_id) = self.traversal_remote_node_id(
+            envelope.bundle.source_node_id.as_str(),
+            envelope.bundle.target_node_id.as_str(),
+        ) else {
+            return Ok(peers);
+        };
+
+        if membership_directory.node_status(remote_node_id.as_str()) != MembershipStatus::Active {
+            return Err(format!(
+                "traversal authority target {} is not active in membership state",
+                remote_node_id.as_str()
+            ));
+        }
+
+        let authoritative_endpoint = select_runtime_traversal_endpoints(
+            &envelope.bundle.candidates,
+        )
+        .0
+        .or(select_runtime_traversal_endpoints(&envelope.bundle.candidates).1)
+        .ok_or_else(|| {
+            format!(
+                "traversal authority bundle for peer {} contains no usable runtime endpoints",
+                remote_node_id.as_str()
+            )
+        })?;
+
+        let Some(peer) = peers.iter_mut().find(|peer| peer.node_id == remote_node_id) else {
+            return Err(format!(
+                "traversal authority bundle targets peer {} but assignment does not manage that peer",
+                remote_node_id.as_str()
+            ));
+        };
+        peer.endpoint = authoritative_endpoint;
+        Ok(peers)
+    }
+
+    fn traversal_remote_node_id(
+        &self,
+        source_node_id: &str,
+        target_node_id: &str,
+    ) -> Option<NodeId> {
+        let remote_node = if source_node_id == self.local_node_id {
+            target_node_id
+        } else if target_node_id == self.local_node_id {
+            source_node_id
+        } else {
+            return None;
+        };
+        NodeId::new(remote_node.to_string()).ok()
     }
 
     fn bootstrap(&mut self) {
@@ -1436,6 +1620,19 @@ impl DaemonRuntime {
             self.is_serving_exit_node(auto_exit.as_deref())
         } else {
             self.is_serving_exit_node(self.selected_exit_node.as_deref())
+        };
+
+        let peers = match self.apply_traversal_authority_to_peers(peers, &membership_directory) {
+            Ok(peers) => peers,
+            Err(err) => {
+                self.restrict_recoverable(format!(
+                    "traversal authority rejected bootstrap apply: {err}"
+                ));
+                let _ = self
+                    .controller
+                    .force_fail_closed("bootstrap_traversal_authority_rejected");
+                return;
+            }
         };
 
         let apply_result = self.controller.apply_dataplane_generation(
@@ -1580,7 +1777,7 @@ impl DaemonRuntime {
                         "false"
                     };
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} traversal_authority={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -1611,6 +1808,7 @@ impl DaemonRuntime {
                     } else {
                         "false"
                     },
+                    self.traversal_authority_mode().as_str(),
                     if self.auto_port_forward_exit {
                         "true"
                     } else {
@@ -2176,6 +2374,22 @@ impl DaemonRuntime {
                 self.is_serving_exit_node(self.selected_exit_node.as_deref())
             };
 
+            let peers = match self.apply_traversal_authority_to_peers(peers, &membership_directory)
+            {
+                Ok(peers) => peers,
+                Err(err) => {
+                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                    let message = format!("traversal authority rejected reconcile apply: {err}");
+                    self.last_reconcile_error = Some(message.clone());
+                    self.restrict_recoverable(message);
+                    let _ = self
+                        .controller
+                        .force_fail_closed("reconcile_traversal_authority_rejected");
+                    self.promote_to_permanent_if_over_limit();
+                    return;
+                }
+            };
+
             let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
@@ -2697,6 +2911,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
 }
 
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
+    let mut config = config;
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
         return Err(DaemonError::InvalidConfig(
             "in-memory backend is disabled in production daemon paths".to_string(),
@@ -2707,6 +2922,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             "socket path must not be empty".to_string(),
         ));
     }
+    resolve_configured_egress_interface(&mut config)?;
     validate_daemon_config(&config)?;
     prepare_runtime_wireguard_key(&config)?;
     if let Err(err) = run_preflight_checks(&config) {
@@ -3153,6 +3369,80 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
 
     Ok(())
+}
+
+fn resolve_configured_egress_interface(config: &mut DaemonConfig) -> Result<(), DaemonError> {
+    config.egress_interface = resolve_egress_interface_value(
+        config.egress_interface.as_str(),
+        detect_default_egress_interface,
+    )
+    .map_err(DaemonError::InvalidConfig)?;
+    Ok(())
+}
+
+fn resolve_egress_interface_value<F>(configured: &str, detect: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    let value = configured.trim();
+    if value.is_empty() {
+        return Err("egress interface must not be empty".to_string());
+    }
+    if !value.eq_ignore_ascii_case(DEFAULT_EGRESS_INTERFACE) {
+        return Ok(value.to_string());
+    }
+    detect()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_default_egress_interface() -> Result<String, String> {
+    detect_route_interface("ip", &["-o", "route", "show", "to", "default"])
+}
+
+#[cfg(target_os = "macos")]
+fn detect_default_egress_interface() -> Result<String, String> {
+    detect_route_interface("route", &["-n", "get", "default"])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_default_egress_interface() -> Result<String, String> {
+    Err("egress interface auto-detect is unsupported on this platform".to_string())
+}
+
+fn detect_route_interface(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("spawn {program} for egress detection failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "{program} egress detection exited unsuccessfully: status={} stderr={stderr}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| format!("{program} egress detection returned non-utf8 output"))?;
+    parse_first_route_interface(stdout.as_str())
+        .ok_or_else(|| "unable to detect default egress interface from route output".to_string())
+}
+
+fn parse_first_route_interface(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(parse_route_interface_token)
+        .map(str::to_string)
+}
+
+fn parse_route_interface_token(line: &str) -> Option<&str> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    for (idx, token) in tokens.iter().enumerate() {
+        let normalized = token.trim_end_matches(':');
+        if normalized == "dev" || normalized == "interface" {
+            return tokens.get(idx + 1).copied();
+        }
+    }
+    tokens.get(4).copied()
 }
 
 fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
@@ -4937,6 +5227,28 @@ fn validate_traversal_candidate_ip(
     Ok(())
 }
 
+fn select_runtime_traversal_endpoints(
+    candidates: &[TraversalCandidate],
+) -> (Option<SocketEndpoint>, Option<SocketEndpoint>) {
+    let direct = candidates
+        .iter()
+        .filter(|candidate| !matches!(candidate.candidate_type, TraversalCandidateType::Relay))
+        .max_by_key(|candidate| candidate.priority)
+        .map(|candidate| SocketEndpoint {
+            addr: candidate.endpoint.ip(),
+            port: candidate.endpoint.port(),
+        });
+    let relay = candidates
+        .iter()
+        .filter(|candidate| matches!(candidate.candidate_type, TraversalCandidateType::Relay))
+        .max_by_key(|candidate| candidate.priority)
+        .map(|candidate| SocketEndpoint {
+            addr: candidate.endpoint.ip(),
+            port: candidate.endpoint.port(),
+        });
+    (direct, relay)
+}
+
 fn is_global_unicast_ipv4(value: std::net::Ipv4Addr) -> bool {
     if value.is_private()
         || value.is_loopback()
@@ -5498,6 +5810,7 @@ mod tests {
     use std::path::Path;
 
     use ed25519_dalek::{Signer, SigningKey};
+    use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
@@ -5505,18 +5818,19 @@ mod tests {
     };
 
     use super::{
-        AutoTunnelWatermark, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DaemonBackendMode, DaemonConfig,
-        DaemonRuntime, IpcCommand, IpcResponse, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
-        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
-        MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRUST_EVIDENCE_BYTES, NodeRole, TrustEvidenceRecord,
-        TrustPolicy, TrustWatermark, is_root_managed_shared_runtime_parent,
-        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_traversal_bundle,
-        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
-        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
-        persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, read_command, run_daemon, run_preflight_checks,
-        scrub_runtime_wireguard_key_material, sha256_digest, trust_evidence_payload, unix_now,
-        validate_daemon_config, validate_file_security, zeroize_optional_bytes,
+        AutoTunnelWatermark, DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+        DaemonBackendMode, DaemonConfig, DaemonRuntime, IpcCommand, IpcResponse,
+        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRUST_EVIDENCE_BYTES,
+        NodeRole, TrustEvidenceRecord, TrustPolicy, TrustWatermark,
+        is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
+        load_traversal_bundle, load_traversal_watermark, load_trust_evidence, load_trust_watermark,
+        parse_route_interface_token, passphrase_disallowed_mode_mask,
+        persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
+        prepare_runtime_wireguard_key_material, read_command, resolve_egress_interface_value,
+        run_daemon, run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
+        trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
+        zeroize_optional_bytes,
     };
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -7484,6 +7798,311 @@ mod tests {
     }
 
     #[test]
+    fn parse_route_interface_token_handles_linux_and_macos_output() {
+        assert_eq!(
+            parse_route_interface_token(
+                "default via 192.168.1.1 dev enp0s3 proto dhcp src 192.168.1.10"
+            ),
+            Some("enp0s3")
+        );
+        assert_eq!(parse_route_interface_token("interface: en0"), Some("en0"));
+    }
+
+    #[test]
+    fn resolve_egress_interface_value_uses_detector_only_for_auto() {
+        let explicit =
+            resolve_egress_interface_value("wlp2s0", || Err("detector should not run".to_string()))
+                .expect("explicit interface should be preserved");
+        assert_eq!(explicit, "wlp2s0");
+
+        let detected =
+            resolve_egress_interface_value(DEFAULT_EGRESS_INTERFACE, || Ok("enp0s8".to_string()))
+                .expect("auto interface should use detector");
+        assert_eq!(detected, "enp0s8");
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_traversal_authority_overrides_assignment_endpoint_before_apply() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-override");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
+                addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+                port: 51820,
+            })
+        );
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(crate::phase10::PathMode::Direct)
+        );
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("traversal_authority=enforced_v1"));
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-unmanaged");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-ghost",
+            2,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("restricted_safe_mode=true"));
+        assert!(
+            status
+                .message
+                .contains("bootstrap_error=traversal authority rejected bootstrap apply")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_unmanaged_peer() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-sync");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-ghost",
+            3,
+            false,
+        );
+        runtime.refresh_traversal_hint_state();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("restricted_safe_mode=true"));
+        assert!(
+            status
+                .message
+                .contains("bootstrap_error=traversal runtime sync failed")
+        );
+        assert_eq!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::FailClosed
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn load_auto_tunnel_bundle_rejects_assigned_cidr_outside_mesh() {
         let test_dir = secure_test_dir("rustynetd-auto-assigned-outside-mesh");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -7683,7 +8302,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_runtime_netcheck_uses_configured_traversal_paths() {
+    fn daemon_runtime_netcheck_reports_runtime_programmed_traversal_paths() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-netcheck");
         let state_path = test_dir.join("daemon.state");
         let trust_path = test_dir.join("trust.evidence");
@@ -7692,6 +8311,9 @@ mod tests {
         let membership_snapshot_path = test_dir.join("membership.snapshot");
         let membership_log_path = test_dir.join("membership.log");
         let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
         let traversal_path = test_dir.join("traversal.bundle");
         let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
         let traversal_watermark_path = test_dir.join("traversal.watermark");
@@ -7702,11 +8324,19 @@ mod tests {
             &membership_log_path,
             "daemon-local",
         );
-        write_traversal_file_with_srflx(
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            8,
+            false,
+        );
+        write_traversal_file(
             &traversal_path,
             &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
             9,
-            "1.1.1.1",
             false,
         );
 
@@ -7718,10 +8348,13 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
-            auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -7730,9 +8363,13 @@ mod tests {
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=direct_active"));
+        assert!(netcheck.message.contains("path_reason=relay_armed"));
         assert!(netcheck.message.contains("traversal_status=valid"));
-        assert!(netcheck.message.contains("candidate_count=3"));
-        assert!(netcheck.message.contains("srflx_candidates=1"));
+        assert!(netcheck.message.contains("candidate_count=2"));
+        assert!(netcheck.message.contains("host_candidates=1"));
+        assert!(netcheck.message.contains("relay_candidates=1"));
+        assert!(runtime.controller.has_armed_relay_path());
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -7741,6 +8378,9 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
         let _ = std::fs::remove_file(traversal_path);
         let _ = std::fs::remove_file(traversal_verifier_path);
         let _ = std::fs::remove_file(traversal_watermark_path);

@@ -37,10 +37,10 @@ Primary references in this repository:
 
 | Area | Current state | Gap to close |
 | --- | --- | --- |
-| Runtime path state | `PathMode::Direct/Relay` exists in Phase10 (`crates/rustynetd/src/phase10.rs`) | Path changes are recorded, but no signed traversal artifact ingestion and no full direct-probe engine |
-| CLI netcheck | Returns `direct-preferred relay-fallback` string (`crates/rustynetd/src/daemon.rs`) | No real candidate diagnostics or cryptographic traversal evidence in output |
-| Backend API | `PeerConfig` has single endpoint (`crates/rustynet-backend-api/src/lib.rs`) | Needs endpoint-set model and controlled endpoint updates |
-| WireGuard backend | Can configure peer endpoint with `wg set ... endpoint` (`crates/rustynet-backend-wireguard/src/lib.rs`) | Needs strict runtime contract for endpoint rotation from signed traversal artifacts only |
+| Runtime path state | `Phase10Controller` stores authoritative per-peer direct/relay endpoints, refreshes peer endpoint bypass routing on path changes, and auto-tunnel runtime applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers (`crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/daemon.rs`) | Still missing full direct-probe engine, handshake-recency evidence, and health-driven automatic failover/failback |
+| CLI netcheck | Returns structured runtime diagnostics (`path_mode`, `path_reason`, `traversal_authority`, freshness/candidate/error fields) (`crates/rustynetd/src/daemon.rs`) | Still lacks per-peer probe rounds, handshake evidence, and HP-2-specific path-selection telemetry |
+| Backend API | `TunnelBackend` now supports controlled endpoint rotation via `update_peer_endpoint` and `current_peer_endpoint` (`crates/rustynet-backend-api/src/lib.rs`) | Still needs handshake-recency evidence and richer endpoint-set/probe surfaces for HP-2 |
+| WireGuard backend | Can configure peers and rotate endpoints via strict `wg set ... endpoint` contract (`crates/rustynet-backend-wireguard/src/lib.rs`) | Still needs strict probe/handshake evidence plumbing for HP-2 decisions |
 | Control signing model | Signed peer-map and signed assignment bundle are implemented (`crates/rustynet-control/src/lib.rs`) | Missing signed traversal-hint bundle and relay-session token artifacts |
 | Relay crate | Fleet selection primitives only (`crates/rustynet-relay/src/lib.rs`) | Missing production relay transport service with authenticated sessions and abuse controls |
 | Phase10 gates | Current artifacts: netns/leak/perf/failover/state-audit (`scripts/ci/check_phase10_readiness.sh`) | Must add traversal security artifact checks (tamper/replay/failback integrity) |

@@ -2,8 +2,10 @@
 
 Status correction (verified 2026-03-05):
 - This progress log contains historical completion claims.
-- Current code discrepancy: direct/relay failover in `Phase10Controller` is currently path-state recording (`Direct`/`Relay`) and audit behavior, not full relay dataplane transport switching. This needs further code implementation for full parity with Phase 10 wording.
-- Security risk truth: this can overstate resilience claims if interpreted as complete relay transport failover under real network conditions.
+- Current code truth: `Phase10Controller` now programs per-peer direct/relay endpoints and refreshes peer endpoint bypass routing when traversal state changes.
+- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers and fail-closes on traversal runtime programming errors instead of silently swallowing them.
+- Remaining scope gap: production relay transport service and automatic health-driven failover/failback under real WAN traversal conditions are still open code work.
+- Security risk truth: resilience claims are still overstated if this is interpreted as fully completed internet-scale relay transport failover.
 
 ## 1) Objective and Scope Lock
 Historical objective at implementation time: implement Phase 10 end-to-end exactly as defined in [phase10.md](./phase10.md), with no deferred scope and no unresolved phase-scope TODO/FIXME/placeholders.
@@ -53,7 +55,7 @@ Scope lock:
 ### High
 - [x] API/IPC abuse detection signals for repeated failed mutation attempts.
 - [x] Backup/restore/state-integrity behavior validated for daemon state.
-- [ ] Direct/relay fallback/failback behavior validated end-to-end in real dataplane transport path (currently partial: path-state recording and audit are implemented).
+- [ ] Direct/relay fallback/failback behavior validated end-to-end in real dataplane transport path (current state: runtime endpoint programming is implemented; production relay transport + health-driven automation remain open).
 - [x] Incident/runbook updates completed for Phase 10 operations.
 
 ### Performance
@@ -86,7 +88,7 @@ Scope lock:
 
 ### E) E2E Harness and Operationalization
 - [x] Added Linux-focused evidence harness (`--emit-phase10-evidence`).
-- [ ] Added fail-close leak tests and direct/relay failover/failback validation (currently partial for relay transport integration).
+- [ ] Added fail-close leak tests and direct/relay failover/failback validation (current state: controller/runtime endpoint programming is present; production relay transport integration remains open).
 - [x] Added Phase 10 runbook (`documents/operations/Phase10ExitNodeDataplaneRunbook.md`).
 - [x] Emitted mandatory artifacts under `artifacts/phase10/`.
 
@@ -116,7 +118,7 @@ Scope lock:
 | 2026-02-27T18:20:00Z | `cargo audit` advisory-db lock failed in sandboxed `~/.cargo` | Security gate blocked | Re-ran Phase 10 gates with escalated permissions | Resolved |
 
 ## 10) Final Completion Ledger
-- [ ] All Phase 10 workstream tasks completed (status correction: full relay transport failover/failback integration remains open code work).
+- [ ] All Phase 10 workstream tasks completed (status correction: production relay transport service and automatic failover/failback remain open code work).
 - [x] All mandatory gates passed (`fmt/clippy/check/test/audit/deny/phase9/phase10`).
 - [x] Required Phase 10 artifacts exist and validate:
   - [x] `artifacts/phase10/netns_e2e_report.json`
@@ -124,6 +126,6 @@ Scope lock:
   - [x] `artifacts/phase10/perf_budget_report.json`
   - [x] `artifacts/phase10/direct_relay_failover_report.json`
   - [x] `artifacts/phase10/state_transition_audit.log`
-- [ ] No unresolved blockers remain (status correction: relay transport failover depth gap remains open).
+- [ ] No unresolved blockers remain (status correction: production relay transport/failover depth gap remains open).
 - [x] No unresolved Phase 10 TODO/FIXME/placeholders remain.
 - [x] `documents/Phase10CompletionReport.md` updated with explicit current deferment status.

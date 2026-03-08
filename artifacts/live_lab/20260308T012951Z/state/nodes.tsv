@@ -1,0 +1,5 @@
+exit	debian@192.168.18.49	exit-1	admin
+client	debian@192.168.18.50	client-1	client
+entry	ubuntu@192.168.18.52	client-2	client
+aux	fedora@192.168.18.51	client-3	client
+extra	mint@192.168.18.53	client-4	client

@@ -146,6 +146,17 @@ pub trait TunnelBackend: Send + Sync {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError>;
 
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError>;
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError>;
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError>;
 
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError>;

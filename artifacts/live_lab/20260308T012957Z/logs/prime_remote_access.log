@@ -1,0 +1,5 @@
+[stage:prime_remote_access] START push sudo credentials to all targets
+ 
+ 
+scp: Connection closed
+[stage:prime_remote_access] FAIL rc=1

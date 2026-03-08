@@ -39,7 +39,7 @@ Environment=RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY=/var/lib/rustynet/keys/wireguard.k
 Environment=RUSTYNET_WG_KEY_PASSPHRASE=%d/wg_key_passphrase
 Environment=RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH=%d/wg_key_passphrase
 Environment=RUSTYNET_WG_PUBLIC_KEY=/var/lib/rustynet/keys/wireguard.pub
-Environment=RUSTYNET_EGRESS_INTERFACE=eth0
+Environment=RUSTYNET_EGRESS_INTERFACE=auto
 Environment=RUSTYNET_AUTO_PORT_FORWARD_EXIT=false
 Environment=RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS=1200
 Environment=RUSTYNET_DATAPLANE_MODE=hybrid-native

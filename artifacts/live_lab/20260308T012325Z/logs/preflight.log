@@ -1,0 +1,2 @@
+[stage:preflight] START verify local prerequisites
+[stage:preflight] FAIL rc=1

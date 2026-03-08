@@ -1,0 +1,7 @@
+[stage:cleanup_hosts] START remove prior RustyNet state from targets
+[cleanup] exit debian@192.168.18.49
+ 
+ 
+[cleanup] client debian@192.168.18.50
+scp: Connection closed
+[stage:cleanup_hosts] FAIL rc=1

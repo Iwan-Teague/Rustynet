@@ -628,6 +628,15 @@ secure_remove_file_with_scope() {
   return 0
 }
 
+secure_remove_temp_passphrase_or_fail() {
+  local target="$1"
+  if secure_remove_file_with_scope "${target}"; then
+    return 0
+  fi
+  print_err "Failed to securely remove temporary signing passphrase file ${target}."
+  return 1
+}
+
 ensure_signing_passphrase_material() {
   if ! command -v rustynet >/dev/null 2>&1; then
     print_err "rustynet CLI is required for signing passphrase custody operations."
@@ -677,7 +686,7 @@ materialize_signing_passphrase_file() {
   tmp_passphrase="$(mktemp)"
   chmod 600 "${tmp_passphrase}" || {
     print_err "Failed to set secure mode on temporary signing passphrase file."
-    secure_remove_file_with_scope "${tmp_passphrase}" || true
+    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
     return 1
   }
 
@@ -703,31 +712,31 @@ materialize_signing_passphrase_file() {
       RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
       rustynet ops materialize-signing-passphrase --output "${tmp_passphrase}" >/dev/null 2>&1 || rust_ops_status=$?
   else
-    secure_remove_file_with_scope "${tmp_passphrase}" || true
+    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
     print_err "Unsupported host profile for signing passphrase materialization: ${HOST_PROFILE}"
     return 1
   fi
 
   if [[ "${rust_ops_status}" != "0" ]]; then
-    secure_remove_file_with_scope "${tmp_passphrase}" || true
+    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
     print_err "Rust-backed signing passphrase materialization failed; setup is fail-closed."
     return 1
   fi
 
   if is_linux_host; then
     run_root chown root:root "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_file_with_scope "${tmp_passphrase}" || true
+      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
       print_err "Failed to set signing passphrase file owner to root:root."
       return 1
     }
     run_root chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_file_with_scope "${tmp_passphrase}" || true
+      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
       print_err "Failed to set signing passphrase file mode to 0600."
       return 1
     }
   else
     chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_file_with_scope "${tmp_passphrase}" || true
+      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
       print_err "Failed to set signing passphrase file mode to 0600."
       return 1
     }

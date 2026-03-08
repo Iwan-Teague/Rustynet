@@ -64,6 +64,27 @@ impl TunnelBackend for ContractBackend {
         Ok(())
     }
 
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        let Some(peer) = self.peers.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        peer.endpoint = endpoint;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
         self.peers.remove(node_id);
@@ -195,4 +216,38 @@ fn backend_contract_replaces_route_set_deterministically() {
 
     assert_eq!(backend.routes.len(), 1);
     assert_eq!(backend.routes[0].destination_cidr, "10.0.0.0/8");
+}
+
+#[test]
+fn backend_contract_updates_peer_endpoint_without_replacing_peer() {
+    let mut backend = ContractBackend::default();
+    backend
+        .start(sample_runtime_context())
+        .expect("backend should start successfully");
+    let peer = sample_peer("peer-a");
+    let node_id = peer.node_id.clone();
+    backend
+        .configure_peer(peer)
+        .expect("configure_peer should succeed");
+
+    let rotated_endpoint = SocketEndpoint {
+        addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88)),
+        port: 443,
+    };
+    backend
+        .update_peer_endpoint(&node_id, rotated_endpoint)
+        .expect("endpoint update should succeed");
+
+    let current = backend
+        .current_peer_endpoint(&node_id)
+        .expect("current peer endpoint should resolve");
+    assert_eq!(current, Some(rotated_endpoint));
+    assert_eq!(
+        backend
+            .peers
+            .get(&node_id)
+            .expect("peer should remain present")
+            .allowed_ips,
+        vec!["100.64.1.0/24".to_string()]
+    );
 }

@@ -16,6 +16,8 @@ Code-path audit for fallback, downgrade, compatibility, and legacy behavior in r
   - `FL-022`, `FL-023`, `FL-024`, `FL-026`, `FL-027`
 - Implemented in pass 3:
   - `FL-006`, `FL-008`, `FL-010`, `FL-011`
+- Implemented in pass 4:
+  - `FL-013`
 - Remaining for next passes:
   - none
 
@@ -233,7 +235,8 @@ How to make one secure route:
 
 ### FL-013: Default egress interface fallback (`eth0`/`en0`)
 Where:
-- `start.sh:3779-3787`
+- historical `start.sh` default-interface guessing path
+- historical daemon/sample-unit default `RUSTYNET_EGRESS_INTERFACE=eth0`
 
 Why it exists:
 - Setup convenience when autodetection fails.
@@ -241,9 +244,11 @@ Why it exists:
 What can go wrong:
 - Wrong interface guess can cause routing misconfiguration.
 
-How to make one secure route:
-1. Require explicit detected interface or explicit operator input.
-2. Fail setup when detection fails instead of default guessing.
+Current status:
+- implemented
+- `start.sh` now fails when it cannot derive a real egress interface instead of guessing,
+- `rustynetd` default `egress_interface` is now `auto` rather than `eth0`,
+- sample systemd wiring now uses `RUSTYNET_EGRESS_INTERFACE=auto` and daemon startup resolves the actual default-route interface before dataplane preflight.
 
 ### FL-014: Hostname fallback in systemd installer
 Where:

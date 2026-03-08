@@ -45,8 +45,8 @@ The wizard handles:
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
 - `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
-- connectivity architecture is direct-UDP-first with signed traversal endpoint hints, encrypted relay fallback for hard NAT paths, and automatic failback to direct when healthy
-- `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) instead of a static transport string
+- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime now validates signed traversal bundles, applies traversal-authoritative peer endpoints during auto-tunnel bootstrap/reconcile for covered peers, and programs direct/relay endpoint targets into `rustynetd` with fail-closed runtime sync on traversal programming errors; production WAN hole punching and relay transport remain HP-2/HP-3 work
+- `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) and uses runtime-authored path states (`direct_active`, `relay_active`, `fail_closed`) instead of a static transport string
 - traversal artifact custody is configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
 - route advertisement and status checks
 
@@ -147,6 +147,7 @@ rustynet assignment init-signing-secret \
 - When `0.0.0.0/0` is advertised and the node is not itself using an exit node, `rustynetd` applies forwarding+NAT for secure exit serving during reconcile.
 - Linux fail-closed management and peer-endpoint bypass routes resolve interface per destination (`ip route get`) before installing table `51820` host/CIDR routes. This prevents dual-NIC lockouts when management and internet egress interfaces differ.
 - Linux service egress hardening now derives `RUSTYNET_EGRESS_INTERFACE` from the selected exit endpoint route when a client exit is selected (assignment-backed); explicit env overrides that do not match the route-derived interface are rejected fail-closed.
+- `rustynetd` no longer ships with a stale `eth0` assumption: daemon default `egress_interface` is `auto`, and service startup resolves the actual default-route interface before dataplane preflight.
 - Keep assignment TTL aligned to `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS` (default max-age is 300s). If TTL exceeds max-age, max-age still enforces fail-closed expiration.
 
 ## Automated Debian Pair Clean Install + Tunnel Validation

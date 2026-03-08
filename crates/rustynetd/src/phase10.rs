@@ -15,7 +15,7 @@ use crate::privileged_helper::{
 };
 use rustynet_backend_api::{
     BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
-    TunnelBackend,
+    SocketEndpoint, TunnelBackend,
 };
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, Protocol, TrafficContext,
@@ -183,6 +183,14 @@ impl Default for ApplyOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPeer {
+    configured: PeerConfig,
+    direct_endpoint: SocketEndpoint,
+    relay_endpoint: Option<SocketEndpoint>,
+    path: PathMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteGrantRequest {
     pub user: String,
     pub cidr: String,
@@ -238,6 +246,8 @@ pub enum Phase10Error {
     PolicyDenied,
     ExitNotSelected,
     LanAccessDenied,
+    PeerNotManaged,
+    RelayPathUnavailable,
     NotStarted,
 }
 
@@ -251,6 +261,10 @@ impl fmt::Display for Phase10Error {
             Phase10Error::PolicyDenied => f.write_str("policy denied"),
             Phase10Error::ExitNotSelected => f.write_str("exit node not selected"),
             Phase10Error::LanAccessDenied => f.write_str("lan access denied"),
+            Phase10Error::PeerNotManaged => f.write_str("peer is not managed by phase10"),
+            Phase10Error::RelayPathUnavailable => {
+                f.write_str("relay path unavailable for managed peer")
+            }
             Phase10Error::NotStarted => f.write_str("phase10 controller not started"),
         }
     }
@@ -1916,7 +1930,8 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     lan_access_enabled: bool,
     advertised_lan_routes: HashMap<NodeId, BTreeSet<String>>,
     lan_route_acl: HashMap<(String, String), bool>,
-    peer_paths: BTreeMap<NodeId, PathMode>,
+    managed_peers: BTreeMap<NodeId, ManagedPeer>,
+    current_routes: Vec<Route>,
 }
 
 impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
@@ -1939,7 +1954,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             lan_access_enabled: false,
             advertised_lan_routes: HashMap::new(),
             lan_route_acl: HashMap::new(),
-            peer_paths: BTreeMap::new(),
+            managed_peers: BTreeMap::new(),
+            current_routes: Vec::new(),
         }
     }
 
@@ -2045,8 +2061,15 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     ) -> Result<(), Phase10Error> {
         for peer in &peers {
             self.backend.configure_peer(peer.clone())?;
-            self.peer_paths
-                .insert(peer.node_id.clone(), PathMode::Direct);
+            self.managed_peers.insert(
+                peer.node_id.clone(),
+                ManagedPeer {
+                    configured: peer.clone(),
+                    direct_endpoint: peer.endpoint,
+                    relay_endpoint: None,
+                    path: PathMode::Direct,
+                },
+            );
             applied_stages.push(StageMarker::PeerApplied);
         }
 
@@ -2054,6 +2077,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         applied_stages.push(StageMarker::EndpointBypassApplied);
 
         self.backend.apply_routes(routes.clone())?;
+        self.current_routes = routes.clone();
         applied_stages.push(StageMarker::BackendRoutesApplied);
 
         self.system.apply_routes(&routes)?;
@@ -2117,11 +2141,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 }
                 StageMarker::BackendRoutesApplied => {
                     self.backend.apply_routes(Vec::new())?;
+                    self.current_routes.clear();
                 }
                 StageMarker::PeerApplied => {
-                    if let Some(node_id) = self.peer_paths.keys().next().cloned() {
+                    if let Some(node_id) = self.managed_peers.keys().next().cloned() {
                         self.backend.remove_peer(&node_id)?;
-                        self.peer_paths.remove(&node_id);
+                        self.managed_peers.remove(&node_id);
                     }
                 }
                 StageMarker::BackendStarted => {
@@ -2229,24 +2254,85 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn mark_direct_failed(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
         self.ensure_started()?;
-        if let Some(path) = self.peer_paths.get_mut(node_id) {
-            *path = PathMode::Relay;
-            return Ok(());
-        }
-        Err(Phase10Error::NotStarted)
+        let relay_endpoint = self
+            .managed_peers
+            .get(node_id)
+            .ok_or(Phase10Error::PeerNotManaged)?
+            .relay_endpoint
+            .ok_or(Phase10Error::RelayPathUnavailable)?;
+        self.reconfigure_managed_peer(node_id, relay_endpoint, PathMode::Relay)
     }
 
     pub fn mark_direct_recovered(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
         self.ensure_started()?;
-        if let Some(path) = self.peer_paths.get_mut(node_id) {
-            *path = PathMode::Direct;
-            return Ok(());
+        let direct_endpoint = self
+            .managed_peers
+            .get(node_id)
+            .ok_or(Phase10Error::PeerNotManaged)?
+            .direct_endpoint;
+        self.reconfigure_managed_peer(node_id, direct_endpoint, PathMode::Direct)
+    }
+
+    pub fn configure_traversal_paths(
+        &mut self,
+        node_id: &NodeId,
+        direct_endpoint: Option<SocketEndpoint>,
+        relay_endpoint: Option<SocketEndpoint>,
+    ) -> Result<(), Phase10Error> {
+        self.ensure_started()?;
+
+        let managed = self
+            .managed_peers
+            .get_mut(node_id)
+            .ok_or(Phase10Error::PeerNotManaged)?;
+        let current_path = managed.path;
+        let current_endpoint = managed.configured.endpoint;
+        if let Some(endpoint) = direct_endpoint {
+            managed.direct_endpoint = endpoint;
         }
-        Err(Phase10Error::NotStarted)
+        managed.relay_endpoint = relay_endpoint;
+
+        let reconfigure_endpoint = match current_path {
+            PathMode::Direct => Some(managed.direct_endpoint),
+            PathMode::Relay => managed.relay_endpoint,
+        };
+        if let Some(endpoint) = reconfigure_endpoint {
+            let needs_update = current_endpoint != endpoint;
+            if needs_update {
+                let _ = managed;
+                self.reconfigure_managed_peer(node_id, endpoint, current_path)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn peer_path(&self, node_id: &NodeId) -> Option<PathMode> {
-        self.peer_paths.get(node_id).copied()
+        self.managed_peers.get(node_id).map(|peer| peer.path)
+    }
+
+    pub fn managed_peer_endpoint(&self, node_id: &NodeId) -> Option<SocketEndpoint> {
+        self.managed_peers
+            .get(node_id)
+            .map(|peer| peer.configured.endpoint)
+    }
+
+    pub fn relay_path_armed(&self, node_id: &NodeId) -> bool {
+        self.managed_peers
+            .get(node_id)
+            .and_then(|peer| peer.relay_endpoint)
+            .is_some()
+    }
+
+    pub fn has_armed_relay_path(&self) -> bool {
+        self.managed_peers
+            .values()
+            .any(|peer| peer.relay_endpoint.is_some())
+    }
+
+    pub fn has_active_relay_path(&self) -> bool {
+        self.managed_peers
+            .values()
+            .any(|peer| peer.path == PathMode::Relay)
     }
 
     pub fn shutdown(&mut self) -> Result<(), Phase10Error> {
@@ -2254,7 +2340,46 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.backend.shutdown()?;
         self.selected_exit_node = None;
         self.lan_access_enabled = false;
+        self.managed_peers.clear();
+        self.current_routes.clear();
         self.transition_to(DataplaneState::Init, "shutdown");
+        Ok(())
+    }
+
+    fn reconfigure_managed_peer(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+        path: PathMode,
+    ) -> Result<(), Phase10Error> {
+        let mut peer = self
+            .managed_peers
+            .get(node_id)
+            .cloned()
+            .ok_or(Phase10Error::PeerNotManaged)?;
+        peer.configured.endpoint = endpoint;
+        peer.path = path;
+        let current_endpoint = self.backend.current_peer_endpoint(node_id)?;
+        if current_endpoint == Some(endpoint) {
+            self.managed_peers.insert(node_id.clone(), peer);
+            return Ok(());
+        }
+        self.backend.update_peer_endpoint(node_id, endpoint)?;
+        self.refresh_peer_endpoint_routes()?;
+        self.system.assert_killswitch()?;
+        self.managed_peers.insert(node_id.clone(), peer);
+        Ok(())
+    }
+
+    fn refresh_peer_endpoint_routes(&mut self) -> Result<(), Phase10Error> {
+        self.system.rollback_routes()?;
+        let peers = self
+            .managed_peers
+            .values()
+            .map(|peer| peer.configured.clone())
+            .collect::<Vec<_>>();
+        self.system.apply_peer_endpoint_bypass_routes(&peers)?;
+        self.system.apply_routes(&self.current_routes)?;
         Ok(())
     }
 
@@ -2631,6 +2756,119 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RecordingBackend {
+        started: bool,
+        peers: BTreeMap<NodeId, PeerConfig>,
+        routes: Vec<Route>,
+        exit_mode: ExitMode,
+    }
+
+    impl Default for RecordingBackend {
+        fn default() -> Self {
+            Self {
+                started: false,
+                peers: BTreeMap::new(),
+                routes: Vec::new(),
+                exit_mode: ExitMode::Off,
+            }
+        }
+    }
+
+    impl TunnelBackend for RecordingBackend {
+        fn name(&self) -> &'static str {
+            "recording-backend"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                supports_roaming: true,
+                supports_exit_nodes: true,
+                supports_lan_routes: true,
+                supports_ipv6: true,
+            }
+        }
+
+        fn start(&mut self, _context: RuntimeContext) -> Result<(), BackendError> {
+            self.started = true;
+            Ok(())
+        }
+
+        fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            self.peers.insert(peer.node_id.clone(), peer);
+            Ok(())
+        }
+
+        fn update_peer_endpoint(
+            &mut self,
+            node_id: &NodeId,
+            endpoint: SocketEndpoint,
+        ) -> Result<(), BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            let Some(peer) = self.peers.get_mut(node_id) else {
+                return Err(BackendError::invalid_input("peer is not configured"));
+            };
+            peer.endpoint = endpoint;
+            Ok(())
+        }
+
+        fn current_peer_endpoint(
+            &self,
+            node_id: &NodeId,
+        ) -> Result<Option<SocketEndpoint>, BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+        }
+
+        fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            self.peers.remove(node_id);
+            Ok(())
+        }
+
+        fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            self.routes = routes;
+            Ok(())
+        }
+
+        fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            self.exit_mode = mode;
+            Ok(())
+        }
+
+        fn stats(&self) -> Result<TunnelStats, BackendError> {
+            Ok(TunnelStats {
+                peer_count: self.peers.len(),
+                bytes_tx: 0,
+                bytes_rx: 0,
+                using_relay_path: false,
+            })
+        }
+
+        fn shutdown(&mut self) -> Result<(), BackendError> {
+            self.started = false;
+            self.peers.clear();
+            self.routes.clear();
+            self.exit_mode = ExitMode::Off;
+            Ok(())
+        }
+    }
+
     impl TunnelBackend for ControlledStartBackend {
         fn name(&self) -> &'static str {
             "controlled-start-backend"
@@ -2656,6 +2894,21 @@ mod tests {
 
         fn configure_peer(&mut self, _peer: PeerConfig) -> Result<(), BackendError> {
             Ok(())
+        }
+
+        fn update_peer_endpoint(
+            &mut self,
+            _node_id: &NodeId,
+            _endpoint: SocketEndpoint,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn current_peer_endpoint(
+            &self,
+            _node_id: &NodeId,
+        ) -> Result<Option<SocketEndpoint>, BackendError> {
+            Ok(None)
         }
 
         fn remove_peer(&mut self, _node_id: &NodeId) -> Result<(), BackendError> {
@@ -3382,7 +3635,88 @@ mod tests {
     fn direct_relay_failover_and_failback_are_recorded() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(
-            WireguardBackend::default(),
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+        let direct_endpoint = SocketEndpoint {
+            addr: "198.51.100.55".parse::<IpAddr>().expect("ip should parse"),
+            port: 51820,
+        };
+        let relay_endpoint = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+            port: 443,
+        };
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .configure_traversal_paths(&peer_id, Some(direct_endpoint), Some(relay_endpoint))
+            .expect("traversal endpoints should configure");
+
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+        assert_eq!(
+            controller
+                .backend
+                .peers
+                .get(&peer_id)
+                .expect("peer should be present")
+                .endpoint,
+            direct_endpoint
+        );
+        assert!(controller.relay_path_armed(&peer_id));
+
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("failover should work");
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
+        assert_eq!(
+            controller
+                .backend
+                .peers
+                .get(&peer_id)
+                .expect("peer should be present")
+                .endpoint,
+            relay_endpoint
+        );
+
+        controller
+            .mark_direct_recovered(&peer_id)
+            .expect("failback should work");
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+        assert_eq!(
+            controller
+                .backend
+                .peers
+                .get(&peer_id)
+                .expect("peer should be present")
+                .endpoint,
+            direct_endpoint
+        );
+    }
+
+    #[test]
+    fn direct_failover_requires_a_provisioned_relay_endpoint() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
             DryRunSystem::default(),
             policy,
             TrustPolicy::default(),
@@ -3407,17 +3741,10 @@ mod tests {
             )
             .expect("apply should succeed");
 
-        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
-
-        controller
+        let err = controller
             .mark_direct_failed(&peer_id)
-            .expect("failover should work");
-        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
-
-        controller
-            .mark_direct_recovered(&peer_id)
-            .expect("failback should work");
-        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+            .expect_err("relay failover must require an explicit relay endpoint");
+        assert_eq!(err, Phase10Error::RelayPathUnavailable);
     }
 
     #[test]

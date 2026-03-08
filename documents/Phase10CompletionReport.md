@@ -2,8 +2,10 @@
 
 Status correction (verified 2026-03-05):
 - This report includes historical completion assertions.
-- Current code discrepancy: direct/relay failover in `Phase10Controller` is path-state signaling (`Direct`/`Relay`) plus audit evidence, not full relay dataplane transport switching.
-- Security risk truth: resilience claims are overstated if this is interpreted as complete transport-level failover.
+- Current code truth: `Phase10Controller` now stores authoritative direct/relay endpoints per peer and reprograms peer endpoint bypass routing on traversal path changes.
+- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers and fail-closes on traversal runtime programming errors instead of treating them as advisory-only state.
+- Remaining scope gap: production relay transport service and automatic health-driven failover/failback under real WAN traversal conditions remain open.
+- Security risk truth: resilience claims are still overstated if this is interpreted as complete transport-level failover across arbitrary NAT environments.
 
 ## 1) Deliverable-by-Deliverable Completion Summary
 1. Real Linux WireGuard adapter path behind `TunnelBackend` completed.
@@ -36,7 +38,7 @@ Status correction (verified 2026-03-05):
   - `perf_budget_report.json`
   - `direct_relay_failover_report.json`
   - `state_transition_audit.log`
-- Current limitation note: `direct_relay_failover_report.json` presently demonstrates path-mode transition/audit coverage; full relay transport failover integration in runtime remains pending.
+- Current limitation note: `direct_relay_failover_report.json` now demonstrates endpoint reprogramming plus path-mode transition coverage inside runtime; production relay transport service and automatic health-driven failover remain pending.
 
 8. Operations runbook update completed.
 - Added `documents/operations/Phase10ExitNodeDataplaneRunbook.md` with deployment, rollback, and incident procedures.
@@ -67,4 +69,4 @@ Outcome:
 
 ## 4) Current Deferment Status (Supersedes Historical Statement)
 - Historical statement "No Phase 10 scope items were deferred" is no longer accurate against current code.
-- Open deferred item requiring code work: full relay dataplane transport failover/failback integration in Phase10 runtime path.
+- Open deferred item requiring code work: production relay transport service and automatic health-driven failover/failback integration in the runtime path.

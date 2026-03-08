@@ -1,0 +1,4 @@
+preflight	hard	pass	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012512Z/logs/preflight.log	verify local prerequisites	2026-03-08T01:25:12Z	2026-03-08T01:25:13Z
+prepare_source_archive	hard	pass	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012512Z/logs/prepare_source_archive.log	package local source tree for remote install	2026-03-08T01:25:13Z	2026-03-08T01:25:14Z
+prime_remote_access	hard	pass	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012512Z/logs/prime_remote_access.log	push sudo credentials to all targets	2026-03-08T01:25:14Z	2026-03-08T01:25:30Z
+cleanup_hosts	hard	pass	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012512Z/logs/cleanup_hosts.log	remove prior RustyNet state from targets	2026-03-08T01:25:30Z	2026-03-08T01:25:42Z

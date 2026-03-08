@@ -1,0 +1,14 @@
+preflight	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/preflight.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+prepare_source_archive	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/prepare_source_archive.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+prime_remote_access	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/prime_remote_access.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+cleanup_hosts	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/cleanup_hosts.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+bootstrap_hosts	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/bootstrap_hosts.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+collect_pubkeys	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/collect_pubkeys.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+membership_setup	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/membership_setup.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+distribute_membership_state	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/distribute_membership_state.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+issue_and_distribute_assignments	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/issue_and_distribute_assignments.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+enforce_baseline_runtime	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/enforce_baseline_runtime.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+validate_baseline_runtime	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/validate_baseline_runtime.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+live_exit_handoff	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/live_exit_handoff.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+live_two_hop	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/live_two_hop.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z
+live_lan_toggle	hard	skipped	0	/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T012951Z/logs/live_lan_toggle.log	dry-run: not executed	2026-03-08T01:29:51Z	2026-03-08T01:29:51Z

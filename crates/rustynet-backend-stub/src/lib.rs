@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
-    TunnelBackend, TunnelStats,
+    SocketEndpoint, TunnelBackend, TunnelStats,
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +63,27 @@ impl TunnelBackend for StubBackend {
         self.ensure_running()?;
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
+    }
+
+    fn update_peer_endpoint(
+        &mut self,
+        node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> Result<(), BackendError> {
+        self.ensure_running()?;
+        let Some(peer) = self.peers.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        peer.endpoint = endpoint;
+        Ok(())
+    }
+
+    fn current_peer_endpoint(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -139,6 +160,24 @@ mod tests {
         backend
             .configure_peer(peer("peer-a"))
             .expect("configure should succeed");
+        backend
+            .update_peer_endpoint(
+                &NodeId::new("peer-a").expect("node id should be valid"),
+                SocketEndpoint {
+                    addr: "203.0.113.9".parse().expect("ip should parse"),
+                    port: 51821,
+                },
+            )
+            .expect("endpoint update should succeed");
+        assert_eq!(
+            backend
+                .current_peer_endpoint(&NodeId::new("peer-a").expect("node id should be valid"))
+                .expect("current endpoint query should succeed"),
+            Some(SocketEndpoint {
+                addr: "203.0.113.9".parse().expect("ip should parse"),
+                port: 51821,
+            })
+        );
         backend
             .apply_routes(vec![Route {
                 destination_cidr: "0.0.0.0/0".to_string(),
