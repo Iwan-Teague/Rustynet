@@ -1,0 +1,236 @@
+ 
+ 
+ 
+ 
+ 
+ 
+[exit-handoff] Collecting WireGuard public keys
+[exit-handoff] Issuing signed handoff assignments on debian@192.168.18.49
+ 
+ 
+ 
+signing passphrase materialized at /tmp/rn-handoff-passphrase.f34YCW
+assignment bundle issued: target=exit-49 output=/run/rustynet/assignment-issue/rn-assignment-exit-49.assignment generated_at_unix=1772929902 expires_at_unix=1772930202 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-53 output=/run/rustynet/assignment-issue/rn-assignment-client-53.assignment generated_at_unix=1772929902 expires_at_unix=1772930202 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-50 output=/run/rustynet/assignment-issue/rn-assignment-client-50.assignment generated_at_unix=1772929902 expires_at_unix=1772930202 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+ 
+[exit-handoff] Distributing signed assignments
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+[exit-handoff] Enforcing runtime roles
+ 
+e2e enforce host complete: role=admin node_id=exit-49
+ 
+e2e enforce host complete: role=admin node_id=client-53
+ 
+e2e enforce host complete: role=client node_id=client-50
+[exit-handoff] Advertising default route on both exits
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+[exit-handoff] Switching client exit to client-53
+ 
+role coupling applied for target role client
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+[exit-handoff] Final client status
+node_id=client-50 node_role=client state=ExitActive generation=3 exit_node=client-53 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=298 reconcile_failures=0 last_reconcile_unix=1772930385 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772930338:1772930338949801869 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final exit A status
+node_id=exit-49 node_role=admin state=ExitActive generation=5 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=473 reconcile_failures=0 last_reconcile_unix=1772930386 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772930322:1772930322273331793 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final exit B status
+node_id=client-53 node_role=admin state=ExitActive generation=5 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=473 reconcile_failures=0 last_reconcile_unix=1772930386 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772930317:1772930317876486136 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final client route
+1.1.1.1 dev rustynet0 table 51820 src 100.68.175.216 uid 1000 
+    cache 
+[exit-handoff] Final client endpoints
+6EIXgAfNuOdwJM8qWGrubq1AlCYeqMk44sJ4cGatODs=	192.168.18.53:51820
+lbiNL6CG15UHNxRBtMTwwvjNCCzZ6FnueKAtDy7xCCg=	192.168.18.49:51820
+[exit-handoff] Exit handoff report written: artifacts/phase10/live_linux_exit_handoff_soak_report.json

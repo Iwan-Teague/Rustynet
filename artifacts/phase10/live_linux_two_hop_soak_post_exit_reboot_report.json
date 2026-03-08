@@ -1,0 +1,26 @@
+{
+  "phase": "phase10",
+  "mode": "live_linux_two_hop",
+  "evidence_mode": "measured",
+  "captured_at": "2026-03-08T00:55:43Z",
+  "captured_at_unix": 1772931343,
+  "git_commit": "2e38107c97532d0cc9d8872247f3127da76a718e",
+  "status": "pass",
+  "final_exit_host": "debian@192.168.18.49",
+  "client_host": "fedora@192.168.18.51",
+  "entry_host": "ubuntu@192.168.18.52",
+  "second_client_host": "mint@192.168.18.53",
+  "checks": {
+    "client_exit_is_entry": "pass",
+    "entry_exit_is_final": "pass",
+    "entry_serves_exit": "pass",
+    "final_exit_serves": "pass",
+    "client_route_via_rustynet0": "pass",
+    "second_client_route_via_rustynet0": "pass",
+    "entry_peer_visibility": "pass",
+    "no_plaintext_passphrase_files": "pass"
+  },
+  "source_artifacts": [
+    "artifacts/phase10/source/live_linux_two_hop_soak_post_exit_reboot.log"
+  ]
+}

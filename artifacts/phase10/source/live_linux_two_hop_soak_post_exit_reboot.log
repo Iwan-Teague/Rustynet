@@ -1,0 +1,68 @@
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+[two-hop-live] Collecting WireGuard public keys
+[two-hop-live] Issuing signed two-hop assignments on debian@192.168.18.49
+ 
+ 
+ 
+signing passphrase materialized at /tmp/rn-twohop-passphrase.yD7Qr4
+assignment bundle issued: target=exit-49 output=/run/rustynet/assignment-issue/rn-assignment-exit-49.assignment generated_at_unix=1772931308 expires_at_unix=1772931608 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-51 output=/run/rustynet/assignment-issue/rn-assignment-client-51.assignment generated_at_unix=1772931308 expires_at_unix=1772931608 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-52 output=/run/rustynet/assignment-issue/rn-assignment-client-52.assignment generated_at_unix=1772931308 expires_at_unix=1772931608 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-53 output=/run/rustynet/assignment-issue/rn-assignment-client-53.assignment generated_at_unix=1772931308 expires_at_unix=1772931608 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+ 
+[two-hop-live] Distributing signed assignments
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+[two-hop-live] Enforcing runtime roles
+ 
+e2e enforce host complete: role=admin node_id=exit-49
+ 
+e2e enforce host complete: role=client node_id=client-51
+ 
+e2e enforce host complete: role=admin node_id=client-52
+ 
+e2e enforce host complete: role=client node_id=client-53
+[two-hop-live] Advertising default route on final exit and entry relay
+[two-hop-live] Final status snapshot: client
+node_id=client-51 node_role=client state=ExitActive generation=1 exit_node=client-52 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=14 reconcile_failures=0 last_reconcile_unix=1772931339 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772931308:1772931308170395011 membership_epoch=5 membership_active_nodes=5
+[two-hop-live] Final status snapshot: entry
+node_id=client-52 node_role=admin state=ExitActive generation=2 exit_node=exit-49 serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=11 reconcile_failures=0 last_reconcile_unix=1772931339 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772931308:1772931308210392202 membership_epoch=5 membership_active_nodes=5
+[two-hop-live] Final status snapshot: final exit
+node_id=exit-49 node_role=admin state=ExitActive generation=2 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=19 reconcile_failures=0 last_reconcile_unix=1772931340 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772931308:1772931308130397822 membership_epoch=5 membership_active_nodes=5
+[two-hop-live] Final status snapshot: second client
+node_id=client-53 node_role=client state=ExitActive generation=1 exit_node=exit-49 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=10 reconcile_failures=0 last_reconcile_unix=1772931340 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772931308:1772931308254389110 membership_epoch=5 membership_active_nodes=5
+[two-hop-live] Client route
+1.1.1.1 dev rustynet0 table 51820 src 100.82.160.108 uid 1000 
+    cache 
+[two-hop-live] Second client route
+1.1.1.1 dev rustynet0 table 51820 src 100.76.206.118 uid 1000 
+    cache 
+[two-hop-live] Entry endpoints
+O++R173LT+Ut4AWFputR7rKnv9bmOThMWHYuEgMUsXM=	192.168.18.51:51820
+lbiNL6CG15UHNxRBtMTwwvjNCCzZ6FnueKAtDy7xCCg=	192.168.18.49:51820
+[two-hop-live] Two-hop report written: artifacts/phase10/live_linux_two_hop_soak_post_exit_reboot_report.json
