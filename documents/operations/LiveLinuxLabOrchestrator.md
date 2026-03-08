@@ -49,6 +49,11 @@ What runs with each topology:
   - plus commit-bound Linux fresh-install OS matrix report generation
   - plus local full gate suite with fresh-install release-gate evidence rebound to the current run
 
+Security note:
+
+- when the topology has only 4 nodes, the orchestrator now skips the 5-node-only release-gate attestation path instead of pretending to run a complete full-gate evidence flow
+- the `local_full_gate_suite` stage only runs when `entry`, `aux`, and `extra` are all present
+
 ## Security model
 
 The orchestrator reuses the hardened live-lab helpers and existing signed-assignment flows.
@@ -153,6 +158,8 @@ The failure digest files are intentionally smaller and optimized for triage:
 - most likely failure reason extracted from the relevant worker or stage log
 - direct path to the full log when deeper inspection is needed
 
+For reboot/soak failures, the digest now prefers the structured reboot recovery report over the raw stage log so the first failure reason reflects the actual failed checks instead of a generic stage trailer.
+
 On any hard-fail stage, the orchestrator also prints the `failure_digest.md` path immediately in the terminal output so you can jump straight to the compact triage view.
 
 For parallel stages, the stage log also contains worker-delimited blocks so you can see:
@@ -171,7 +178,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh
 
 When launched interactively with no targets or explicit `--profile`, the script now asks whether to use the default saved VM lab profile:
 
-- default profile: `profiles/live_lab/iwan_vm_lab.env`
+- default profile: `profiles/live_lab/default_four_node.env`
 - answer `yes`: load that profile immediately
 - answer `no`: continue with the manual target prompts
 
@@ -179,8 +186,15 @@ Saved profile:
 
 ```bash
 bash scripts/e2e/live_linux_lab_orchestrator.sh \
-  --profile profiles/live_lab/iwan_vm_lab.env
+  --profile profiles/live_lab/default_four_node.env
 ```
+
+Tracked lab profiles:
+
+- `profiles/live_lab/default_four_node.env`
+  - default four-node topology that avoids the unstable `192.168.18.50` VM
+- `profiles/live_lab/default_five_node.env`
+  - full five-node topology for release-gate evidence runs
 
 Source selection:
 

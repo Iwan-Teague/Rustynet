@@ -42,8 +42,11 @@ CLIENT_TARGET=""
 ENTRY_TARGET=""
 AUX_TARGET=""
 EXTRA_TARGET=""
+ENTRY_TARGET_DECLARED=0
+AUX_TARGET_DECLARED=0
+EXTRA_TARGET_DECLARED=0
 PROFILE_PATH=""
-DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/iwan_vm_lab.env"
+DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
 
 sanitize_text() {
@@ -232,9 +235,18 @@ load_profile_file() {
     case "$key" in
       EXIT_TARGET) [[ -z "$EXIT_TARGET" ]] && EXIT_TARGET="$value" ;;
       CLIENT_TARGET) [[ -z "$CLIENT_TARGET" ]] && CLIENT_TARGET="$value" ;;
-      ENTRY_TARGET) [[ -z "$ENTRY_TARGET" ]] && ENTRY_TARGET="$value" ;;
-      AUX_TARGET) [[ -z "$AUX_TARGET" ]] && AUX_TARGET="$value" ;;
-      EXTRA_TARGET) [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value" ;;
+      ENTRY_TARGET)
+        ENTRY_TARGET_DECLARED=1
+        [[ -z "$ENTRY_TARGET" ]] && ENTRY_TARGET="$value"
+        ;;
+      AUX_TARGET)
+        AUX_TARGET_DECLARED=1
+        [[ -z "$AUX_TARGET" ]] && AUX_TARGET="$value"
+        ;;
+      EXTRA_TARGET)
+        EXTRA_TARGET_DECLARED=1
+        [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value"
+        ;;
       SSH_PASSWORD_FILE) [[ -z "$SSH_PASSWORD_FILE" ]] && SSH_PASSWORD_FILE="$value" ;;
       SUDO_PASSWORD_FILE) [[ -z "$SUDO_PASSWORD_FILE" ]] && SUDO_PASSWORD_FILE="$value" ;;
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
@@ -493,6 +505,14 @@ has_label() {
 
 node_count() {
   awk 'END { print NR + 0 }' "$NODES_TSV"
+}
+
+has_four_node_live_topology() {
+  has_label entry && has_label aux
+}
+
+has_five_node_release_gate_topology() {
+  has_four_node_live_topology && has_label extra
 }
 
 normalize_target() {
@@ -985,7 +1005,7 @@ stage_prepare_source_archive() {
   write_remote_scripts
   printf 'source mode: %s\n' "$(describe_source_mode)"
   if [[ "$SOURCE_MODE" == "working-tree" ]]; then
-    tar -C "$ROOT_DIR" \
+    COPYFILE_DISABLE=1 tar -C "$ROOT_DIR" \
       --exclude='.git' \
       --exclude='target' \
       --exclude='.cargo-home' \
@@ -1262,8 +1282,8 @@ assert_local_gate_suite_provenance() {
 
 stage_run_live_role_switch_matrix() {
   local commit_short role_report role_source role_log
-  if ! has_label entry || ! has_label aux || ! has_label extra; then
-    printf 'role switch matrix requires client, entry, aux, and extra targets\n' >&2
+  if ! has_five_node_release_gate_topology; then
+    printf 'role switch matrix requires the full five-node topology (client, entry, aux, and extra targets)\n' >&2
     return 1
   fi
   commit_short="$(current_run_git_commit_short)"
@@ -1291,6 +1311,10 @@ stage_run_live_role_switch_matrix() {
 
 stage_run_local_full_gate_suite() {
   local gate_log="$VERIFICATION_DIR/full_gate_suite_${RUN_ID}.log"
+  if ! has_five_node_release_gate_topology; then
+    printf 'local full gate suite requires the full five-node topology so release-gate evidence remains commit-bound and complete\n' >&2
+    return 1
+  fi
   assert_local_gate_suite_provenance || return 1
   mkdir -p "$VERIFICATION_DIR"
   : > "$gate_log"
@@ -1411,8 +1435,8 @@ stage_run_live_lan_toggle() {
 
 stage_generate_fresh_install_os_matrix_report() {
   local commit_short role_report canonical_report
-  if ! has_label entry || ! has_label aux || ! has_label extra; then
-    printf 'fresh install OS matrix report generation requires entry, aux, and extra targets\n' >&2
+  if ! has_five_node_release_gate_topology; then
+    printf 'fresh install OS matrix report generation requires the full five-node topology (entry, aux, and extra targets)\n' >&2
     return 1
   fi
   commit_short="$(current_run_git_commit_short)"
@@ -1685,12 +1709,12 @@ PY
     salvage_twohop="skipped"
   fi
 
-  python3 - "$reboot_report" "$observations_file" "$exit_pre" "$client_pre" "$exit_return" "$exit_boot_change" "$post_exit_twohop" "$client_return" "$client_boot_change" "$post_client_twohop" "$salvage_twohop" <<'PY'
+  python3 - "$reboot_report" "$observations_file" "$exit_pre" "$exit_post" "$client_pre" "$client_post" "$exit_return" "$exit_boot_change" "$post_exit_twohop" "$client_return" "$client_boot_change" "$post_client_twohop" "$salvage_twohop" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-(report_path, observations_path, exit_pre, client_pre, exit_return, exit_boot_change, post_exit_twohop,
+(report_path, observations_path, exit_pre, exit_post, client_pre, client_post, exit_return, exit_boot_change, post_exit_twohop,
  client_return, client_boot_change, post_client_twohop, salvage_twohop) = sys.argv[1:]
 observations = Path(observations_path).read_text(encoding='utf-8', errors='ignore')
 checks = {
@@ -1704,6 +1728,32 @@ checks = {
 }
 relevant = [value for value in checks.values() if value != 'skipped']
 status = 'pass' if relevant and all(value == 'pass' for value in relevant) else 'fail'
+failure_reason_map = {
+    'exit_reboot_returns': 'exit did not return on SSH after reboot',
+    'exit_boot_id_changes': 'exit reboot was not proven by a new boot_id',
+    'post_exit_reboot_twohop': 'two-hop validation failed after exit reboot',
+    'client_reboot_returns': 'client did not return on SSH after reboot',
+    'client_boot_id_changes': 'client reboot was not proven by a new boot_id',
+    'post_client_reboot_twohop': 'two-hop validation failed after client reboot',
+    'client_failure_salvage_twohop': 'salvage two-hop validation failed after the client reboot outage',
+}
+failure_reasons = [
+    failure_reason_map[name]
+    for name, value in checks.items()
+    if value == 'fail'
+]
+for observation_line in observations.splitlines():
+    observation_line = observation_line.strip()
+    if not observation_line:
+        continue
+    if observation_line == 'client_reboot_wait=fail':
+        failure_reasons.append('client reboot wait timed out')
+    elif observation_line == 'exit_reboot_wait=fail':
+        failure_reasons.append('exit reboot wait timed out')
+    elif observation_line == 'exit_post=':
+        failure_reasons.append('exit post-reboot boot_id capture was empty')
+    elif observation_line == 'client_post=':
+        failure_reasons.append('client post-reboot boot_id capture was empty')
 report = {
     'schema_version': 1,
     'mode': 'live_linux_reboot_recovery',
@@ -1711,8 +1761,11 @@ report = {
     'checks': checks,
     'boot_ids': {
         'exit_pre': exit_pre,
+        'exit_post': exit_post,
         'client_pre': client_pre,
+        'client_post': client_post,
     },
+    'failure_reasons': failure_reasons,
     'observations': observations.strip(),
 }
 Path(report_path).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
@@ -1867,13 +1920,19 @@ prompt_missing_inputs() {
     CLIENT_TARGET="$(prompt_value 'Primary client node (user@ip or ip)')"
   fi
   if [[ -z "$ENTRY_TARGET" ]]; then
-    ENTRY_TARGET="$(prompt_value 'Entry relay / alternate exit node (user@ip or ip, blank to skip advanced tests)')"
+    if [[ "$ENTRY_TARGET_DECLARED" -eq 0 ]]; then
+      ENTRY_TARGET="$(prompt_value 'Entry relay / alternate exit node (user@ip or ip, blank to skip advanced tests)')"
+    fi
   fi
   if [[ -z "$AUX_TARGET" ]]; then
-    AUX_TARGET="$(prompt_value 'Auxiliary client / blind-exit node (user@ip or ip, blank to skip advanced tests)')"
+    if [[ "$AUX_TARGET_DECLARED" -eq 0 ]]; then
+      AUX_TARGET="$(prompt_value 'Auxiliary client / blind-exit node (user@ip or ip, blank to skip advanced tests)')"
+    fi
   fi
   if [[ -z "$EXTRA_TARGET" ]]; then
-    EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@ip or ip, blank if none)')"
+    if [[ "$EXTRA_TARGET_DECLARED" -eq 0 ]]; then
+      EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@ip or ip, blank if none)')"
+    fi
   fi
 }
 
@@ -1989,23 +2048,31 @@ main() {
     record_stage_skip "issue_and_distribute_assignments" "hard" "dry-run: not executed"
     record_stage_skip "enforce_baseline_runtime" "hard" "dry-run: not executed"
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
-    if has_label entry && has_label aux && has_label extra; then
+    if has_five_node_release_gate_topology; then
       record_stage_skip "live_role_switch_matrix" "hard" "dry-run: not executed"
+    else
+      record_stage_skip "live_role_switch_matrix" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
     fi
     if has_label entry; then
       record_stage_skip "live_exit_handoff" "hard" "dry-run: not executed"
     fi
-    if has_label entry && has_label aux; then
+    if has_four_node_live_topology; then
       record_stage_skip "live_two_hop" "hard" "dry-run: not executed"
       record_stage_skip "live_lan_toggle" "hard" "dry-run: not executed"
     fi
-    if has_label entry && has_label aux && has_label extra; then
+    if has_five_node_release_gate_topology; then
       record_stage_skip "fresh_install_os_matrix_report" "hard" "dry-run: not executed"
+    else
+      record_stage_skip "fresh_install_os_matrix_report" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
     fi
     if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
-      record_stage_skip "local_full_gate_suite" "hard" "dry-run: not executed"
+      if has_five_node_release_gate_topology; then
+        record_stage_skip "local_full_gate_suite" "hard" "dry-run: not executed"
+      else
+        record_stage_skip "local_full_gate_suite" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
+      fi
     fi
-    if has_label entry && has_label aux && [[ "$RUN_SOAK" -eq 1 ]]; then
+    if has_four_node_live_topology && [[ "$RUN_SOAK" -eq 1 ]]; then
       record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
     write_run_summary
@@ -2026,12 +2093,10 @@ main() {
   run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime
   run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime
 
-  if has_label entry && has_label aux && has_label extra; then
-    run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
-  elif [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+  if has_five_node_release_gate_topology; then
     run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
   else
-    record_stage_skip live_role_switch_matrix hard 'requires entry, aux, and extra targets'
+    record_stage_skip live_role_switch_matrix hard 'requires the full five-node topology (entry, aux, and extra targets)'
   fi
 
   if has_label entry; then
@@ -2040,7 +2105,7 @@ main() {
     record_stage_skip live_exit_handoff hard 'requires entry or aux target'
   fi
 
-  if has_label entry && has_label aux; then
+  if has_four_node_live_topology; then
     run_stage hard live_two_hop 'run live two-hop validation' stage_run_live_two_hop
     run_stage hard live_lan_toggle 'run LAN access toggle / blind-exit validation' stage_run_live_lan_toggle
   else
@@ -2048,21 +2113,23 @@ main() {
     record_stage_skip live_lan_toggle hard 'requires aux target'
   fi
 
-  if has_label entry && has_label aux && has_label extra; then
-    run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
-  elif [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+  if has_five_node_release_gate_topology; then
     run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
   else
-    record_stage_skip fresh_install_os_matrix_report hard 'requires entry, aux, and extra targets'
+    record_stage_skip fresh_install_os_matrix_report hard 'requires the full five-node topology (entry, aux, and extra targets)'
   fi
 
   if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
-    run_stage hard local_full_gate_suite 'run local full security gate suite' stage_run_local_full_gate_suite
+    if has_five_node_release_gate_topology; then
+      run_stage hard local_full_gate_suite 'run local full security gate suite' stage_run_local_full_gate_suite
+    else
+      record_stage_skip local_full_gate_suite hard 'requires the full five-node topology for complete commit-bound release-gate evidence'
+    fi
   else
     record_stage_skip local_full_gate_suite hard 'skipped by --skip-gates'
   fi
 
-  if has_label entry && has_label aux; then
+  if has_four_node_live_topology; then
     if [[ "$RUN_SOAK" -eq 1 ]]; then
       if [[ "$SOAK_HARD_FAIL" -eq 1 ]]; then
         run_stage hard extended_soak 'run extended soak and reboot recovery validation' stage_run_extended_soak

@@ -105,6 +105,16 @@ IGNORE_LINE_PATTERNS = [
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
 
+REBOOT_CHECK_REASON_TEXT = {
+    "exit_reboot_returns": "exit did not return on SSH after reboot",
+    "exit_boot_id_changes": "exit reboot was not proven by a new boot_id",
+    "post_exit_reboot_twohop": "two-hop validation failed after exit reboot",
+    "client_reboot_returns": "client did not return on SSH after reboot",
+    "client_boot_id_changes": "client reboot was not proven by a new boot_id",
+    "post_client_reboot_twohop": "two-hop validation failed after client reboot",
+    "client_failure_salvage_twohop": "salvage two-hop validation failed after the client reboot outage",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -160,6 +170,64 @@ def extract_likely_reason(log_path: Path) -> str:
         if any(pattern.search(line) for pattern in PREFERRED_REASON_PATTERNS):
             return shorten(line)
     return shorten(candidates[-1])
+
+
+def extract_extended_soak_reason(report_dir: Path) -> str | None:
+    report_path = report_dir / "live_linux_reboot_recovery_report.json"
+    if not report_path.exists():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    failure_reasons = report.get("failure_reasons")
+    if isinstance(failure_reasons, list):
+        cleaned = [str(item).strip() for item in failure_reasons if str(item).strip()]
+        if cleaned:
+            return shorten("; ".join(cleaned))
+
+    checks = report.get("checks")
+    reasons: list[str] = []
+    if isinstance(checks, dict):
+        for name, value in checks.items():
+            if value == "fail" and name in REBOOT_CHECK_REASON_TEXT:
+                reasons.append(REBOOT_CHECK_REASON_TEXT[name])
+
+    observations = report.get("observations")
+    if isinstance(observations, str):
+        for raw_line in observations.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "client_reboot_wait=fail":
+                reasons.append("client reboot wait timed out")
+            elif line == "exit_reboot_wait=fail":
+                reasons.append("exit reboot wait timed out")
+            elif line == "exit_post=":
+                reasons.append("exit post-reboot boot_id capture was empty")
+            elif line == "client_post=":
+                reasons.append("client post-reboot boot_id capture was empty")
+            elif line.startswith("ssh_port22_hosts="):
+                reasons.append(line)
+
+    if reasons:
+        deduped = []
+        seen = set()
+        for reason in reasons:
+            if reason not in seen:
+                deduped.append(reason)
+                seen.add(reason)
+        return shorten("; ".join(deduped))
+    return None
+
+
+def extract_stage_reason(stage_name: str, report_dir: Path, log_path: Path) -> str:
+    if stage_name == "extended_soak":
+        report_reason = extract_extended_soak_reason(report_dir)
+        if report_reason:
+            return report_reason
+    return extract_likely_reason(log_path)
 
 
 def read_parallel_results(report_dir: Path, stage_name: str) -> list[dict[str, object]]:
@@ -218,7 +286,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, object], str]:
         stage_name, severity, status, rc, log_path, message, started_at, finished_at = row
         worker_results = read_parallel_results(report_dir, stage_name)
         failed_workers = [item for item in worker_results if item["rc"] != 0]
-        likely_reason = extract_likely_reason(Path(log_path))
+        likely_reason = extract_stage_reason(stage_name, report_dir, Path(log_path))
         if failed_workers:
             likely_reason = failed_workers[0]["likely_reason"]
         condensed = stage_sentence(stage_name, status, worker_results)
