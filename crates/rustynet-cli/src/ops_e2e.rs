@@ -1917,13 +1917,13 @@ fn validate_config(config: &DebianTwoNodeE2eConfig) -> Result<(), String> {
             config.remote_root.display()
         ));
     }
-    if let Some(identity) = config.ssh_identity.as_ref() {
-        if !identity.is_file() {
-            return Err(format!(
-                "--ssh-identity does not exist: {}",
-                identity.display()
-            ));
-        }
+    if let Some(identity) = config.ssh_identity.as_ref()
+        && !identity.is_file()
+    {
+        return Err(format!(
+            "--ssh-identity does not exist: {}",
+            identity.display()
+        ));
     }
     for (label, value) in [
         ("exit-node-id", config.exit_node_id.as_str()),

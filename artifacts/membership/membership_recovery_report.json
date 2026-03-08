@@ -2,7 +2,7 @@
   "phase": "membership",
   "evidence_mode": "measured",
   "environment": "ci",
-  "captured_at_unix": 1772844040,
+  "captured_at_unix": 1772929653,
   "status": "pass",
   "audit_path": "artifacts/membership/membership_audit_integrity.log",
   "entries": 0,

@@ -1,0 +1,26 @@
+{
+  "phase": "phase10",
+  "mode": "live_linux_exit_handoff",
+  "evidence_mode": "measured",
+  "captured_at": "2026-03-08T00:01:39Z",
+  "captured_at_unix": 1772928099,
+  "git_commit": "3d43695bbfed6c9f8cd994d9fec49ea9d356d9bc",
+  "status": "pass",
+  "exit_a_host": "debian@192.168.18.49",
+  "exit_b_host": "mint@192.168.18.53",
+  "client_host": "debian@192.168.18.50",
+  "switch_iteration": 20,
+  "monitor_iterations": 55,
+  "reconvergence_seconds": 5,
+  "checks": {
+    "handoff_reconvergence": "pass",
+    "no_route_leak_during_handoff": "pass",
+    "no_restricted_safe_mode": "pass",
+    "exit_b_endpoint_visible": "pass",
+    "both_exits_nat": "pass"
+  },
+  "source_artifacts": [
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/live_linux_exit_handoff.log",
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/live_linux_exit_handoff_monitor.log"
+  ]
+}

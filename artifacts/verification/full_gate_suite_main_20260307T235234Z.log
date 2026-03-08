@@ -1,0 +1,830 @@
+
+[2026-03-07T23:52:34Z] RUN ./scripts/ci/phase1_gates.sh
+    Checking rustynet-cli v0.1.0 (/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.75s
+    Checking rustynetd v0.1.0 (/Users/iwanteague/Desktop/Rustynet/crates/rustynetd)
+    Checking rustynet-cli v0.1.0 (/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.18s
+   Compiling rustynetd v0.1.0 (/Users/iwanteague/Desktop/Rustynet/crates/rustynetd)
+   Compiling rustynet-cli v0.1.0 (/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.38s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_api-641ed518a7802bbb)
+
+running 2 tests
+test tests::node_id_rejects_empty_or_whitespace_only_values ... ok
+test tests::node_id_trims_outer_whitespace ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/backend_contract.rs (target/debug/deps/backend_contract-c8b9f88df26ec18e)
+
+running 3 tests
+test backend_contract_rejects_double_start_and_resets_on_shutdown ... ok
+test backend_contract_replaces_route_set_deterministically ... ok
+test backend_contract_requires_running_state_for_mutations ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/backend_contract_perf.rs (target/debug/deps/backend_contract_perf-81deac4cb99761c6)
+
+running 1 test
+test phase1_backend_contract_perf_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_stub-6d8cd8f111b7fafa)
+
+running 2 tests
+test tests::stub_backend_passes_lifecycle_and_peer_route_flow ... ok
+test tests::stub_backend_rejects_mutation_while_stopped ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_wireguard-e25aec1583a061cf)
+
+running 11 tests
+test tests::base64_encoder_matches_wireguard_key_format ... ok
+test tests::in_memory_backend_preserves_lifecycle_contract ... ok
+test tests::linux_backend_executes_ip_and_wg_calls_through_runner ... ok
+test tests::linux_backend_full_tunnel_rule_uses_fixed_priority ... ok
+test tests::linux_backend_ignores_missing_route_delete_during_reconciliation ... ok
+test tests::linux_backend_propagates_runner_failures ... ok
+test tests::linux_backend_uses_base64_peer_key_for_wg_commands ... ok
+test tests::linux_backend_validates_interface_and_cidr_inputs ... ok
+test tests::macos_backend_accepts_basic_lifecycle_with_recording_runner ... ok
+test tests::macos_backend_reports_ipv6_not_supported_until_parity_is_implemented ... ok
+test tests::macos_backend_requires_utun_interface_name ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/conformance.rs (target/debug/deps/conformance-07a51ee35b7b1171)
+
+running 3 tests
+test wireguard_backend_follows_lifecycle_contract ... ok
+test wireguard_backend_rejects_double_start ... ok
+test wireguard_backend_remove_peer_updates_runtime_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 62 tests
+test env_file::tests::format_env_assignment_escapes_shell_expansion_bytes ... ok
+test env_file::tests::format_env_assignment_quotes_shell_metacharacters ... ok
+test env_file::tests::format_env_assignment_rejects_newlines ... ok
+test env_file::tests::parse_env_value_decodes_double_quoted_values ... ok
+test env_file::tests::parse_env_value_decodes_single_quoted_values ... ok
+test ops_e2e::tests::assignment_refresh_env_quotes_structured_values ... ok
+test ops_e2e::tests::decode_base64_roundtrip_wireguard_pubkey_shape ... ok
+test ops_e2e::tests::extract_assignment_generated_from_status_line ... ok
+test ops_e2e::tests::safe_token_accepts_expected_charset ... ok
+test ops_install_systemd::tests::assignment_peer_endpoint_resolves_peer_endpoint ... ok
+test ops_install_systemd::tests::bytes_to_hex_encodes_expected_value ... ok
+test ops_install_systemd::tests::parse_dev_interface_token_extracts_interface ... ok
+test ops_install_systemd::tests::parse_install_bool_accepts_expected_variants ... ok
+test ops_install_systemd::tests::read_env_file_values_decodes_quoted_values ... ok
+test ops_install_systemd::tests::read_env_file_values_takes_first_assignment_only ... ok
+test ops_install_systemd::tests::resolve_selected_exit_node_from_default_route ... ok
+test ops_install_systemd::tests::resolve_selected_exit_node_prefers_explicit_exit_id ... ok
+test ops_peer_store::tests::list_rejects_malformed_record_with_extra_field ... ok
+test ops_peer_store::tests::list_supports_role_and_node_filters ... ok
+test ops_peer_store::tests::validate_creates_store_with_secure_modes ... ok
+test ops_phase1::tests::parse_bool_value_matches_systemd_script_contract ... ok
+test ops_phase1::tests::phase1_collector_derives_max_metrics_from_ndjson ... ok
+test ops_phase1::tests::phase1_collector_hardens_group_writable_source_file ... ok
+test ops_phase1::tests::phase1_collector_rejects_non_measured_json_source ... ok
+test ops_phase1::tests::phase1_collector_rejects_non_measured_ndjson_entry ... ok
+test ops_phase1::tests::phase1_report_validator_rejects_not_measurable_metric ... ok
+test ops_phase1::tests::phase1_secure_directory_hardens_group_writable_directory ... ok
+test ops_phase9::tests::generation_marker_parser_accepts_valid_tokens ... ok
+test ops_phase9::tests::generation_marker_parser_rejects_missing_or_non_numeric_tokens ... ok
+test ops_phase9::tests::phase10_host_identity_validation_rejects_invalid_values ... ok
+test ops_phase9::tests::phase10_provenance_keypair_writer_hardens_open_parent_directory ... ok
+test ops_phase9::tests::phase10_provenance_keypair_writer_sets_secure_permissions_and_matching_keys ... ok
+test ops_phase9::tests::phase6_parity_attestation_verification_rejects_tampered_report ... ok
+test ops_phase9::tests::phase9_evidence_attestation_verification_rejects_git_commit_mismatch ... ok
+test ops_phase9::tests::read_json_object_rejects_oversized_source ... ok
+test ops_phase9::tests::read_utf8_regular_file_with_max_bytes_rejects_oversized_source ... ok
+test ops_phase9::tests::release_provenance_verification_rejects_tampered_artifact ... ok
+test ops_phase9::tests::release_provenance_verification_rejects_unsigned_document ... ok
+test tests::create_secure_temp_file_sets_owner_only_mode ... ok
+test tests::detect_tampered_log_handles_empty_membership_log ... ok
+test tests::execute_reports_error_when_daemon_is_unreachable ... ok
+test tests::macos_keychain_account_validation_rejects_invalid_values ... ok
+test tests::parse_bool_value_matches_systemd_script_contract ... ok
+test tests::parse_bundle_field_ignores_whitespace ... ok
+test tests::parse_supports_assignment_issue_command ... ok
+test tests::parse_supports_key_commands ... ok
+test tests::parse_supports_membership_commands ... ok
+test tests::parse_supports_membership_evidence_generation ... ok
+test tests::parse_supports_operator_menu_command ... ok
+test tests::parse_supports_ops_commands ... ok
+test tests::parse_supports_phase10_route_advertise_command ... ok
+test tests::parse_supports_phase6_parity_ops_commands ... ok
+test tests::phase6_parity_validation_rejects_false_readiness_control ... ok
+test tests::rewrite_assignment_refresh_exit_node_updates_and_clears ... ok
+test tests::rewrite_assignment_refresh_lan_routes_updates_and_clears ... ok
+test tests::rewrite_env_key_value_quotes_structured_values ... ok
+test tests::rewrite_env_key_value_replaces_or_appends ... ok
+test tests::secure_remove_file_rejects_directory ... ok
+test tests::secure_remove_file_removes_target_file ... ok
+test tests::signing_key_loader_accepts_owner_only_file ... ok
+test tests::signing_key_loader_rejects_group_readable_file ... ok
+test tests::signing_key_loader_rejects_symlink_path ... ok
+
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_control-9d1ae66abe9a4066)
+
+running 60 tests
+test admin::tests::clickjacking_headers_are_hardened ... ok
+test admin::tests::csrf_and_session_policies_are_enforced ... ok
+test admin::tests::mfa_is_required_for_privileged_mutations ... ok
+test admin::tests::policy_bootstrap_defaults_to_safe_values ... ok
+test admin::tests::privileged_helper_validation_accepts_argv_only_commands ... ok
+test admin::tests::privileged_helper_validation_rejects_shell_construction ... ok
+test admin::tests::rbac_is_deny_by_default_for_privileged_actions ... ok
+test ga::tests::compatibility_policy_blocks_outdated_or_cross_major_clients ... ok
+test ga::tests::compatibility_policy_rejects_invalid_window ... ok
+test ga::tests::crypto_calendar_enforces_deny_after_removal ... ok
+test ga::tests::ga_release_gate_fails_closed_when_any_condition_is_unmet ... ok
+test ga::tests::insecure_compatibility_exception_requires_explicit_active_risk_acceptance ... ok
+test ga::tests::performance_budget_enforces_phase9_targets ... ok
+test membership::tests::add_node_update_requires_valid_signatures_and_root_chain ... ok
+test membership::tests::canonical_state_and_root_are_deterministic ... ok
+test membership::tests::replay_and_rollback_are_rejected ... ok
+test membership::tests::signed_update_requires_threshold_and_owner_for_quorum_change ... ok
+test membership::tests::snapshot_and_log_roundtrip_integrity ... ok
+test membership::tests::unknown_schema_version_is_rejected_fail_closed ... ok
+test operations::tests::diagnostics_summary_reports_overall_health ... ok
+test operations::tests::redaction_covers_all_ingestion_paths ... ok
+test operations::tests::structured_logger_never_writes_cleartext_secrets ... ok
+test operations::tests::tamper_evident_audit_log_detects_corruption ... ok
+test persistence::tests::sqlite_store_applies_schema_and_persists_core_records ... ok
+test persistence::tests::sqlite_store_enforces_single_use_consume_semantics ... ok
+test scale::tests::enterprise_auth_validates_issuer_audience_and_mfa ... ok
+test scale::tests::ha_cluster_fails_over_to_next_healthy_replica ... ok
+test scale::tests::ha_cluster_rejects_when_no_healthy_replica_exists ... ok
+test scale::tests::tenant_guard_enforces_isolation_and_delegated_admin_limits ... ok
+test scale::tests::trust_hardening_disable_requires_break_glass_secret ... ok
+test scale::tests::trust_hardening_fails_closed_when_state_missing_or_mismatched ... ok
+test tests::algorithm_policy_rejects_compatibility_exceptions ... ok
+test tests::api_abuse_monitor_emits_alert_after_threshold ... ok
+test tests::auth_lockout_applies_exponential_backoff ... ok
+test tests::auth_rate_limit_enforces_per_ip_limits ... ok
+test tests::auto_tunnel_bundle_assignments_are_consistent_across_targets ... ok
+test tests::auto_tunnel_bundle_is_centrally_assigned_and_signed ... ok
+test tests::auto_tunnel_bundle_is_policy_gated_and_assignment_is_stable ... ok
+test tests::endpoint_hint_bundle_enforces_policy_and_candidate_validation ... ok
+test tests::endpoint_hint_bundle_is_signed_and_tamper_detected ... ok
+test tests::enrollment_is_single_use_and_registers_node ... ok
+test tests::enrollment_persists_user_node_and_audit_event ... ok
+test tests::enrollment_tokens_use_randomized_nonce_values ... ok
+test tests::persisted_enrollment_enforces_single_use_in_persistence ... ok
+test tests::persisted_enrollment_rejects_missing_persisted_credential ... ok
+test tests::policy_guard_defaults_to_deny ... ok
+test tests::replay_protection_rejects_nonce_reuse ... ok
+test tests::reusable_credential_can_be_consumed_multiple_times_within_limit ... ok
+test tests::reusable_credential_requires_strict_scope_ttl_and_vault_storage ... ok
+test tests::reusable_credential_scope_requires_tag_prefix ... ok
+test tests::revocation_events_are_generation_tracked ... ok
+test tests::signed_peer_map_detects_tampering ... ok
+test tests::signed_token_claims_are_verified_and_replay_guarded ... ok
+test tests::signing_seed_derivation_uses_stable_hkdf_vectors ... ok
+test tests::throwaway_credential_atomic_single_use_under_concurrency ... ok
+test tests::throwaway_credential_debug_redacts_sensitive_fields ... ok
+test tests::throwaway_credential_lifecycle_and_audit_events ... ok
+test tests::token_claims_debug_redacts_sensitive_fields ... ok
+test tests::transport_policy_rejects_tls12_and_unsigned_control_data ... ok
+test tests::trust_state_persist_and_integrity_check ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_control-135ec4a33f4c5712)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_crypto-c58af6e950cffdc5)
+
+running 19 tests
+test tests::accepts_nonzero_key_material ... ok
+test tests::allowlisted_algorithm_is_accepted ... ok
+test tests::denylisted_algorithm_exceptions_are_rejected ... ok
+test tests::denylisted_algorithm_is_rejected_without_exception ... ok
+test tests::denylisted_algorithm_remains_denied_without_exceptions ... ok
+test tests::encrypted_envelope_rejects_wrong_passphrase ... ok
+test tests::encrypted_envelope_roundtrip_succeeds ... ok
+test tests::encrypted_key_file_roundtrip_with_permission_checks ... ok
+test tests::invalid_exception_for_allowlisted_algorithm_is_rejected ... ok
+test tests::key_custody_manager_falls_back_when_os_store_unavailable ... ok
+test tests::key_custody_manager_rejects_invalid_key_identifier ... ok
+test tests::key_custody_manager_strict_mode_rejects_encrypted_file_fallback ... ok
+test tests::provider_attestation_rejects_wrong_signing_key ... ok
+test tests::provider_attestation_roundtrip_verifies ... ok
+test tests::rejects_symlink_key_file_permissions ... ok
+test tests::rejects_weak_key_custody_permissions ... ok
+test tests::rejects_zero_key_material ... ok
+test tests::signing_provider_policy_requires_hardware_primary ... ok
+test tests::validates_strict_key_custody_permissions ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_policy-a85c06580042342a)
+
+running 8 tests
+test tests::contextual_policy_defaults_to_deny_in_shared_contexts ... ok
+test tests::contextual_policy_does_not_widen_between_shared_router_and_exit ... ok
+test tests::membership_aware_contextual_policy_denies_revoked_and_unknown_nodes ... ok
+test tests::membership_aware_policy_preserves_protocol_filters ... ok
+test tests::policy_defaults_to_deny ... ok
+test tests::policy_respects_first_match ... ok
+test tests::protocol_filter_is_preserved_for_shared_exit_context ... ok
+test tests::rollout_controller_rejects_allow_all_and_supports_rollback ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynet_relay-482c666ddf010a77)
+
+running 3 tests
+test tests::relay_fleet_fails_over_when_primary_is_unhealthy ... ok
+test tests::relay_fleet_prefers_healthy_low_latency_nodes ... ok
+test tests::relay_selection_policy_respects_allowed_regions ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_relay-dcd1f17a90d86759)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 120 tests
+test daemon::tests::artifact_fuzzgate_bundle_parsers_never_panic_and_fail_closed ... ok
+test daemon::tests::artifact_fuzzgate_rejects_rollback_generations_fail_closed ... ok
+test daemon::tests::artifact_limitgate_rejects_count_overflow_for_assignment_and_traversal ... ok
+test daemon::tests::artifact_limitgate_rejects_excessive_key_depth ... ok
+test daemon::tests::artifact_limitgate_rejects_oversized_bundle_files ... ok
+test daemon::tests::auto_tunnel_watermark_round_trip_persists_payload_digest ... ok
+test daemon::tests::daemon_runtime_auto_tunnel_allows_exit_service_advertise_only ... ok
+test daemon::tests::daemon_runtime_auto_tunnel_allows_relay_exit_with_upstream_exit ... ok
+test daemon::tests::daemon_runtime_auto_tunnel_enforcement_applies_and_blocks_manual_mutations ... ok
+test daemon::tests::daemon_runtime_auto_tunnel_tamper_and_replay_fail_closed ... ok
+test daemon::tests::daemon_runtime_blind_exit_ignores_client_assignment_fields ... ok
+test daemon::tests::daemon_runtime_blind_exit_role_is_least_privilege ... ok
+test daemon::tests::daemon_runtime_client_role_blocks_admin_mutations ... ok
+test daemon::tests::daemon_runtime_client_role_never_reports_exit_serving ... ok
+test daemon::tests::daemon_runtime_denies_exit_selection_for_revoked_membership_node ... ok
+test daemon::tests::daemon_runtime_enters_restricted_safe_mode_without_trust_evidence ... ok
+test daemon::tests::daemon_runtime_handles_status_and_mutating_commands ... ok
+test daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed ... ok
+test daemon::tests::daemon_runtime_netcheck_uses_configured_traversal_paths ... ok
+test daemon::tests::daemon_runtime_rejects_replayed_trust_evidence ... ok
+test daemon::tests::load_auto_tunnel_bundle_allows_equal_watermark_when_payload_digest_matches ... ok
+test daemon::tests::load_auto_tunnel_bundle_rejects_assigned_cidr_outside_mesh ... ok
+test daemon::tests::load_auto_tunnel_bundle_rejects_equal_watermark_when_payload_digest_differs ... ok
+test daemon::tests::load_auto_tunnel_bundle_rejects_non_host_assigned_cidr ... ok
+test daemon::tests::load_auto_tunnel_watermark_rejects_legacy_version_without_digest ... ok
+test daemon::tests::load_traversal_bundle_rejects_private_srflx_candidate ... ok
+test daemon::tests::load_traversal_bundle_rejects_tampered_signature_and_replay ... ok
+test daemon::tests::load_trust_evidence_allows_equal_watermark_when_payload_digest_matches ... ok
+test daemon::tests::load_trust_evidence_rejects_equal_watermark_when_legacy_digest_missing ... ok
+test daemon::tests::load_trust_evidence_rejects_equal_watermark_when_payload_digest_differs ... ok
+test daemon::tests::load_trust_watermark_rejects_legacy_version_without_digest ... ok
+test daemon::tests::netcheck_reports_structured_traversal_diagnostics ... ok
+test daemon::tests::node_role_command_matrix_is_fail_closed ... ok
+test daemon::tests::passphrase_permission_mask_accepts_systemd_runtime_credential_mode ... ok
+test daemon::tests::preflight_allows_missing_traversal_bundle_without_verifier_key ... ok
+test daemon::tests::preflight_rejects_present_traversal_bundle_when_verifier_key_missing ... ok
+test daemon::tests::read_command_rejects_null_byte_payload ... ok
+test daemon::tests::read_command_rejects_oversized_payload ... ok
+test daemon::tests::role_auth_matrix_runtime_is_exhaustive_and_fail_closed ... ok
+test daemon::tests::root_managed_shared_runtime_parent_policy_allows_expected_shape ... ok
+test daemon::tests::run_daemon_rejects_in_memory_backend_mode ... ok
+test daemon::tests::runtime_key_prepare_requires_plaintext_key_when_encrypted_store_disabled ... ok
+test daemon::tests::runtime_key_scrub_only_removes_ephemeral_file_when_encrypted_store_is_used ... ok
+test daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay ... ok
+test daemon::tests::traversal_watermark_round_trip_persists_payload_digest ... ok
+test daemon::tests::trust_watermark_round_trip_persists_payload_digest ... ok
+test daemon::tests::validate_daemon_config_rejects_auto_port_forward_on_non_linux_backend ... ok
+test daemon::tests::validate_daemon_config_rejects_auto_port_forward_short_lease ... ok
+test daemon::tests::validate_daemon_config_rejects_fail_closed_ssh_allow_without_cidrs ... ok
+test daemon::tests::validate_daemon_config_rejects_relative_traversal_paths ... ok
+test daemon::tests::validate_file_security_rejects_group_writable_parent_directory ... ok
+test daemon::tests::validate_file_security_rejects_symlink_parent_directory ... ok
+test daemon::tests::zeroize_optional_bytes_scrubs_sensitive_buffer ... ok
+test dataplane::tests::phase3_default_deny_blocks_peer_connection ... ok
+test dataplane::tests::phase3_direct_path_prefers_direct_then_falls_back_to_relay ... ok
+test dataplane::tests::phase3_handshake_guard_limits_burst ... ok
+test dataplane::tests::phase3_linux_dataplane_lifecycle_and_route_flow ... ok
+test dataplane::tests::phase3_rekey_rotation_advances_generation ... ok
+test dataplane::tests::phase3_three_node_mesh_succeeds ... ok
+test dataplane::tests::phase4_exit_node_clear_removes_selection ... ok
+test dataplane::tests::phase4_exit_node_selection_and_lan_toggle_are_enforced ... ok
+test dataplane::tests::phase4_fail_close_blocks_tunnel_and_dns_when_required ... ok
+test dataplane::tests::phase4_magic_dns_handles_duplicate_hostnames_deterministically ... ok
+test ipc::tests::cidr_validation_rejects_non_numeric_payloads ... ok
+test ipc::tests::parse_and_wire_roundtrip_for_mutating_command ... ok
+test ipc::tests::parse_key_rotation_mutations ... ok
+test ipc::tests::response_wire_roundtrip_preserves_ok_and_message ... ok
+test key_material::tests::remove_file_if_present_rejects_directory ... ok
+test key_material::tests::remove_file_if_present_removes_symlink_without_following_target ... ok
+test key_material::tests::remove_file_if_present_removes_target_file ... ok
+test key_material::tests::resolve_passphrase_source_rejects_file_custody_on_macos ... ok
+test key_material::tests::validate_binary_path_rejects_relative_paths ... ok
+test key_material::tests::validate_binary_path_rejects_symlink_to_untrusted_target ... ok
+test perf::tests::baseline_report_is_writable ... ok
+test perf::tests::metrics_include_required_phase1_names ... ok
+test phase10::tests::apply_accepts_already_running_backend_start ... ok
+test phase10::tests::apply_does_not_require_nat_when_not_full_tunnel_or_exit_serving ... ok
+test phase10::tests::apply_exit_serving_requires_nat_forwarding ... ok
+test phase10::tests::apply_rejects_backend_start_failure_and_fail_closes ... ok
+test phase10::tests::apply_rollback_forces_fail_closed_when_system_step_fails ... ok
+test phase10::tests::audit_and_perf_reports_are_writable ... ok
+test phase10::tests::direct_relay_failover_and_failback_are_recorded ... ok
+test phase10::tests::lan_toggle_requires_toggle_route_advertisement_acl_and_policy ... ok
+test phase10::tests::macos_dns_rule_parser_accepts_port_alias_output ... ok
+test phase10::tests::macos_render_pf_rules_enforces_dns_fail_closed_when_enabled ... ok
+test phase10::tests::macos_render_pf_rules_omits_dns_fail_closed_rules_when_disabled ... ok
+test phase10::tests::management_bypass_route_args_use_ipv4_routing_for_ipv4_cidr ... ok
+test phase10::tests::management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr ... ok
+test phase10::tests::owned_anchor_names_filters_only_rustynet_anchors ... ok
+test phase10::tests::peer_endpoint_bypass_route_args_use_ipv4_host_route ... ok
+test phase10::tests::peer_endpoint_bypass_route_args_use_ipv6_host_route ... ok
+test phase10::tests::relay_with_upstream_enables_tunnel_forwarding_path ... ok
+test phase10::tests::transactional_apply_commits_generation_and_exit_state ... ok
+test phase10::tests::transition_to_fail_closed_when_trust_is_invalid ... ok
+test phase10::tests::validate_binary_path_rejects_relative_paths ... ok
+test phase10::tests::validate_binary_path_rejects_symlink_to_untrusted_target ... ok
+test platform::tests::macos_and_windows_parity_checks_pass_when_hooks_are_ready ... ok
+test platform::tests::parity_check_fails_when_leak_matrix_is_not_green ... ok
+test privileged_helper::tests::fuzzgate_malformed_inputs_never_panic ... ok
+test privileged_helper::tests::fuzzgate_read_request_rejects_oversized_payload ... ok
+test privileged_helper::tests::fuzzgate_rejects_unknown_tokens_and_shell_metacharacters ... ok
+test privileged_helper::tests::privileged_program_parser_rejects_unknown ... ok
+test privileged_helper::tests::safe_token_rejects_unsafe_characters ... ok
+test privileged_helper::tests::validate_request_accepts_known_ip_schema ... ok
+test privileged_helper::tests::validate_request_accepts_known_nft_list_table_schema ... ok
+test privileged_helper::tests::validate_request_rejects_argument_over_max_bytes ... ok
+test privileged_helper::tests::validate_request_rejects_invalid_nft_tokens ... ok
+test privileged_helper::tests::validate_request_rejects_too_many_arguments ... ok
+test privileged_helper::tests::validate_request_rejects_unknown_ip_schema ... ok
+test privileged_helper::tests::validate_request_rejects_unknown_nft_rule_schema ... ok
+test privileged_helper::tests::validate_request_rejects_unknown_wg_schema ... ok
+test resilience::tests::concurrent_persist_keeps_snapshot_integrity ... ok
+test resilience::tests::reconnect_policy_exponential_backoff_is_capped ... ok
+test resilience::tests::session_snapshot_persist_restore_detects_tampering ... ok
+test traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback ... ok
+test traversal::tests::candidate_validation_rejects_duplicates ... ok
+test traversal::tests::direct_plan_builds_simultaneous_rounds ... ok
+test traversal::tests::direct_session_survives_endpoint_roam ... ok
+test traversal::tests::direct_viability_rejects_double_symmetric_nat ... ok
+test traversal::tests::keepalive_interval_is_tighter_for_hard_nat ... ok
+
+test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.54s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 9 tests
+test tests::parse_daemon_config_allows_empty_fail_closed_cidrs_when_next_flag_follows ... ok
+test tests::parse_daemon_config_allows_empty_fail_closed_cidrs_when_value_is_omitted ... ok
+test tests::parse_daemon_config_parses_auto_port_forward_settings ... ok
+test tests::parse_daemon_config_parses_explicit_fail_closed_cidrs ... ok
+test tests::parse_daemon_config_parses_traversal_settings ... ok
+test tests::parse_daemon_config_rejects_invalid_auto_port_forward_exit_value ... ok
+test tests::parse_daemon_config_rejects_invalid_fail_closed_cidrs ... ok
+test tests::parse_daemon_config_rejects_zero_auto_port_forward_lease ... ok
+test tests::parse_daemon_config_rejects_zero_traversal_max_age ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/phase1_runtime_baseline.rs (target/debug/deps/phase1_runtime_baseline-486a629de9e38919)
+
+running 1 test
+test phase1_runtime_baseline_workload_is_deterministic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+      Loaded 939 security advisories (from /Users/iwanteague/Desktop/Rustynet/.cargo-audit-db)
+    Scanning Cargo.lock for vulnerabilities (89 crate dependencies)
+advisories ok, bans ok, licenses ok, sources ok
+Backend boundary leakage checks: PASS
+Unsafe code checks: PASS
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::read_command_rejects_oversized_payload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::read_command_rejects_null_byte_payload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::node_role_command_matrix_is_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::artifact_limitgate_rejects_oversized_bundle_files ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::artifact_limitgate_rejects_count_overflow_for_assignment_and_traversal ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::artifact_limitgate_rejects_excessive_key_depth ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::artifact_fuzzgate_rejects_rollback_generations_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::artifact_fuzzgate_bundle_parsers_never_panic_and_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::load_auto_tunnel_bundle_rejects_equal_watermark_when_payload_digest_differs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::load_trust_evidence_rejects_equal_watermark_when_payload_digest_differs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test privileged_helper::tests::validate_request_rejects_too_many_arguments ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test privileged_helper::tests::validate_request_rejects_argument_over_max_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test privileged_helper::tests::fuzzgate_read_request_rejects_oversized_payload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test privileged_helper::tests::fuzzgate_rejects_unknown_tokens_and_shell_metacharacters ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test privileged_helper::tests::fuzzgate_malformed_inputs_never_panic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test ops_phase9::tests::read_json_object_rejects_oversized_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test ops_phase9::tests::read_utf8_regular_file_with_max_bytes_rejects_oversized_source ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_control-b26412b5a4773d7e)
+
+running 1 test
+test operations::tests::redaction_covers_all_ingestion_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_control-814dee276b287606)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_control-b26412b5a4773d7e)
+
+running 1 test
+test operations::tests::structured_logger_never_writes_cleartext_secrets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_control-814dee276b287606)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_control-b26412b5a4773d7e)
+
+running 1 test
+test tests::token_claims_debug_redacts_sensitive_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_control-814dee276b287606)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_control-b26412b5a4773d7e)
+
+running 1 test
+test tests::throwaway_credential_debug_redacts_sensitive_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 59 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynet_control-814dee276b287606)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::validate_file_security_rejects_group_writable_parent_directory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::validate_file_security_rejects_symlink_parent_directory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::passphrase_permission_mask_accepts_systemd_runtime_credential_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test key_material::tests::remove_file_if_present_removes_target_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test key_material::tests::remove_file_if_present_rejects_directory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test key_material::tests::remove_file_if_present_removes_symlink_without_following_target ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::signing_key_loader_rejects_group_readable_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.35s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::signing_key_loader_rejects_symlink_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.31s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::signing_key_loader_accepts_owner_only_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.60s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::secure_remove_file_rejects_directory ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.00s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::secure_remove_file_removes_target_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.01s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/main.rs (target/debug/deps/rustynet_cli-b6ed200859e20580)
+
+running 1 test
+test tests::create_secure_temp_file_sets_owner_only_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 61 filtered out; finished in 0.01s
+
+[secrets-hygiene] artifact/log leak scan detected possible secrets

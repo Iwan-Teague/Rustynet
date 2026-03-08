@@ -1,14 +1,14 @@
 {
   "command_digest_sha256": "0a6410d4b0cd0d00bcca2beb74ea2697daf58f33d105251624c10281809c158c",
-  "generated_at_unix": 1772891021,
-  "git_commit": "f85da6ead8161976f67fa904e5ab8bdf5c2beb1e",
+  "generated_at_unix": 1772929542,
+  "git_commit": "3d43695bbfed6c9f8cd994d9fec49ea9d356d9bc",
   "host_identity": "ci-localhost",
   "phase": "phase6",
-  "report_captured_at_unix": 1772891021,
+  "report_captured_at_unix": 1772929542,
   "report_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/release/platform_parity_report.json",
-  "report_sha256": "5f2f8685588be95d925fe0dcf2e68658ac864b6fb494c317919b7795006d5f6e",
+  "report_sha256": "d406234fa3acb31533da448786f7da058f0c2fef9520e05f05b0851c44725893",
   "schema_version": 1,
-  "signature_hex": "7caaa237b8e35cbf9ecd321508625e7d10c5f1d69658dec13617e4969e92335e6e3026bab9e9b90fbefdf81d59c301a2d04ac9dc007cac0a6f571c5316bc890b",
+  "signature_hex": "e879ee7edfe33960d302458bbab60a0a5c26a2aff5eaa1c032f1c9d64d6ef11bf871fa5738d71c1bfd1c7efd9d82236db9f7f67f3470e15750aef89c1ea5f60f",
   "signer_key_id": "ed25519:8016842956f60178",
   "verifier_key_hex": "910ddf4d31366ec143fef10d16160eabbbabee48e8c0040d795119ac19d5a307"
 }

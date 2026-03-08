@@ -404,14 +404,14 @@ fn phase1_collect_measured_input_from_source(
                     line_number
                 )
             })?;
-            if let Some(mode) = object.get("evidence_mode").and_then(Value::as_str) {
-                if mode != "measured" {
-                    return Err(format!(
-                        "ndjson source is not measured evidence at {}:{}: evidence_mode={mode}",
-                        source_path.display(),
-                        line_number
-                    ));
-                }
+            if let Some(mode) = object.get("evidence_mode").and_then(Value::as_str)
+                && mode != "measured"
+            {
+                return Err(format!(
+                    "ndjson source is not measured evidence at {}:{}: evidence_mode={mode}",
+                    source_path.display(),
+                    line_number
+                ));
             }
             accumulator.consume_object(
                 object,
@@ -425,13 +425,13 @@ fn phase1_collect_measured_input_from_source(
     let payload_object = payload
         .as_object()
         .ok_or_else(|| format!("json source must be object: {}", source_path.display()))?;
-    if let Some(mode) = payload_object.get("evidence_mode").and_then(Value::as_str) {
-        if mode != "measured" {
-            return Err(format!(
-                "json source is not measured evidence ({}): evidence_mode={mode}",
-                source_path.display()
-            ));
-        }
+    if let Some(mode) = payload_object.get("evidence_mode").and_then(Value::as_str)
+        && mode != "measured"
+    {
+        return Err(format!(
+            "json source is not measured evidence ({}): evidence_mode={mode}",
+            source_path.display()
+        ));
     }
 
     if let Some(metrics) = payload_object.get("metrics").and_then(Value::as_array) {
@@ -464,10 +464,10 @@ fn phase1_collect_measured_input_from_source(
             "backend_throughput_overhead_percent",
             "backend_overhead_percent",
         ] {
-            if !flattened.contains_key(key) {
-                if let Some(value) = payload_object.get(key).and_then(phase1_value_as_number) {
-                    flattened.insert(key.to_string(), json!(value));
-                }
+            if !flattened.contains_key(key)
+                && let Some(value) = payload_object.get(key).and_then(phase1_value_as_number)
+            {
+                flattened.insert(key.to_string(), json!(value));
             }
         }
         accumulator.consume_object(&flattened, source_path.display().to_string().as_str())?;

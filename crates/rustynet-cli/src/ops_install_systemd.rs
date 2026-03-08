@@ -1230,25 +1230,26 @@ fn resolve_egress_interface(
 ) -> Result<String, String> {
     if let Some(endpoint) = selected_exit_endpoint {
         let derived = detect_egress_interface_for_endpoint(endpoint)?;
-        if let Some(explicit_value) = explicit_egress.as_deref() {
-            if !explicit_value.trim().is_empty() && explicit_value != derived {
-                return Err(format!(
-                    "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
-                ));
-            }
+        if let Some(explicit_value) = explicit_egress.as_deref()
+            && !explicit_value.trim().is_empty()
+            && explicit_value != derived
+        {
+            return Err(format!(
+                "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
+            ));
         }
         return Ok(derived);
     }
 
-    if let Some(value) = explicit_egress {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
+    if let Some(value) = explicit_egress
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
     }
-    if let Some(value) = existing_egress {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
+    if let Some(value) = existing_egress
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
     }
     detect_default_egress_interface()
 }
@@ -1352,10 +1353,10 @@ fn resolve_selected_exit_node_id(
     fields: &HashMap<String, String>,
     preferred_exit_node_id: Option<&str>,
 ) -> Option<String> {
-    if let Some(value) = preferred_exit_node_id {
-        if !value.trim().is_empty() {
-            return Some(value.to_string());
-        }
+    if let Some(value) = preferred_exit_node_id
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
     }
 
     let route_count = fields

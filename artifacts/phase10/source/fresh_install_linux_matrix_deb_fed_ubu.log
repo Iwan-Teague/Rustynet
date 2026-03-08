@@ -1,0 +1,1141 @@
+[four-node-fresh] Running full cleanup + fresh bootstrap on all four hosts
+[four-node-fresh] Host debian@192.168.18.49: cleanup
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_cleanup.sh debian@192.168.18.49:/tmp/rn_cleanup.sh
+
+
+rn_cleanup.sh                                   0%    0     0.0KB/s   --:-- ETA
+rn_cleanup.sh                                 100% 1408   284.7KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh
+
+[sudo] password for debian: 
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Host debian@192.168.18.49: bootstrap latest main as exit-49 (admin)
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_bootstrap.sh debian@192.168.18.49:/tmp/rn_bootstrap.sh
+
+
+rn_bootstrap.sh                                 0%    0     0.0KB/s   --:-- ETA
+rn_bootstrap.sh                               100% 6354     1.8MB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_source.tar.gz debian@192.168.18.49:/tmp/rn_source.tar.gz
+
+
+rn_source.tar.gz                                0%    0     0.0KB/s   --:-- ETA
+rn_source.tar.gz                              100% 1189KB  20.2MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh 'admin' 'exit-49' 'rn-lab-20260306-new' '192.168.18.0/24' '/tmp/rn_source.tar.gz'
+
+[0m[1minfo: [0musing existing install for '1.88.0-x86_64-unknown-linux-gnu'
+[0m[1minfo: [0mdefault toolchain set to '1.88.0-x86_64-unknown-linux-gnu'
+
+  1.88.0-x86_64-unknown-linux-gnu unchanged - rustc 1.88.0 (6b00bc388 2025-06-23)
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.macl'
+   Compiling version_check v0.9.5
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.182
+   Compiling typenum v1.19.0
+   Compiling subtle v2.6.1
+   Compiling generic-array v0.14.7
+   Compiling proc-macro2 v1.0.106
+   Compiling zerocopy v0.8.40
+   Compiling quote v1.0.44
+   Compiling unicode-ident v1.0.24
+   Compiling block-buffer v0.10.4
+   Compiling cpufeatures v0.2.17
+   Compiling semver v1.0.27
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling syn v2.0.117
+   Compiling zeroize v1.8.2
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling rustc_version v0.4.1
+   Compiling ahash v0.8.12
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling cc v1.2.56
+   Compiling curve25519-dalek v4.1.3
+   Compiling inout v0.1.4
+   Compiling pkg-config v0.3.32
+   Compiling autocfg v1.5.0
+   Compiling once_cell v1.21.3
+   Compiling vcpkg v0.2.15
+   Compiling memoffset v0.9.1
+   Compiling cipher v0.4.4
+   Compiling universal-hash v0.5.1
+   Compiling serde_core v1.0.228
+   Compiling libsqlite3-sys v0.30.1
+   Compiling opaque-debug v0.3.1
+   Compiling cfg_aliases v0.2.1
+   Compiling signature v2.2.0
+   Compiling base64ct v1.8.3
+   Compiling password-hash v0.5.0
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling hashbrown v0.14.5
+   Compiling rand_chacha v0.3.1
+   Compiling ed25519 v2.2.3
+   Compiling nix v0.29.0
+   Compiling poly1305 v0.8.0
+   Compiling chacha20 v0.9.1
+   Compiling blake2 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling aead v0.5.2
+   Compiling zmij v1.0.21
+   Compiling bitflags v2.11.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling ed25519-dalek v2.2.0
+   Compiling argon2 v0.5.3
+   Compiling hashlink v0.9.1
+   Compiling rand v0.8.5
+   Compiling hmac v0.12.1
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling smallvec v1.15.1
+   Compiling hkdf v0.12.4
+   Compiling rustynet-crypto v0.1.0 (/home/debian/Rustynet/crates/rustynet-crypto)
+   Compiling serde_derive v1.0.228
+   Compiling rustynet-backend-api v0.1.0 (/home/debian/Rustynet/crates/rustynet-backend-api)
+   Compiling rustynet-policy v0.1.0 (/home/debian/Rustynet/crates/rustynet-policy)
+   Compiling itoa v1.0.17
+   Compiling memchr v2.8.0
+   Compiling rustynet-backend-wireguard v0.1.0 (/home/debian/Rustynet/crates/rustynet-backend-wireguard)
+   Compiling rusqlite v0.32.1
+   Compiling rustynet-control v0.1.0 (/home/debian/Rustynet/crates/rustynet-control)
+   Compiling rustynetd v0.1.0 (/home/debian/Rustynet/crates/rustynetd)
+   Compiling rustynet-cli v0.1.0 (/home/debian/Rustynet/crates/rustynet-cli)
+    Finished `release` profile [optimized] target(s) in 42.31s
+[sudo] password for debian: 
+key init complete: runtime_private_key=/run/rustynet/wireguard.key encrypted_private_key=/var/lib/rustynet/keys/wireguard.key.enc public_key=/var/lib/rustynet/keys/wireguard.pub
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+membership init complete: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log watermark_reset=/var/lib/rustynet/membership.watermark owner_signing_key=/etc/rustynet/membership.owner.key
+  node_id=exit-49 network_id=rn-lab-20260306-new owner_approver_id=exit-49-owner
+trust signing key initialized: signing_key=/etc/rustynet/trust-evidence.key verifier_key_output=/etc/rustynet/trust-evidence.pub
+assignment signing secret initialized: [REDACTED]
+[trust-refresh] refreshed signed trust evidence at /var/lib/rustynet/rustynetd.trust
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:54:28 GMT; 139ms ago
+ Invocation: d742bc5a37e847ffa1ad1c34df3b5338
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 11041 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 416K (peak: 2.2M)
+        CPU: 43ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─11041 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 986 --timeout-ms 2000
+
+Mar 07 15:54:28 vbox systemd[1]: Stopped rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+Mar 07 15:54:28 vbox systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:54:28 GMT; 167ms ago
+ Invocation: 236364c1600f4bbaa7a15211a64a57a8
+    Trigger: Sat 2026-03-07 15:55:32 GMT; 1min 3s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:54:28 vbox systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:54:28 GMT; 32ms ago
+ Invocation: 9ae00827e1d743d2a05a4218f2170f73
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 11042 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11047 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 11051 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11055 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 11059 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11063 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 11067 ((ustynetd))
+      Tasks: 1 (limit: 4634)
+     Memory: 1.9M (peak: 2.5M)
+        CPU: 62ms
+     CGroup: /system.slice/rustynetd.service
+             └─11067 "(ustynetd)"
+
+Mar 07 15:54:28 vbox systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:54:28 vbox systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=admin wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Host debian@192.168.18.50: cleanup
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_cleanup.sh debian@192.168.18.50:/tmp/rn_cleanup.sh
+
+
+rn_cleanup.sh                                   0%    0     0.0KB/s   --:-- ETA
+rn_cleanup.sh                                 100% 1408   249.6KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh
+
+[sudo] password for debian: 
+Connection to 192.168.18.50 closed.
+
+[four-node-fresh] Host debian@192.168.18.50: bootstrap latest main as client-50 (client)
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_bootstrap.sh debian@192.168.18.50:/tmp/rn_bootstrap.sh
+
+
+rn_bootstrap.sh                                 0%    0     0.0KB/s   --:-- ETA
+rn_bootstrap.sh                               100% 6354     1.4MB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_source.tar.gz debian@192.168.18.50:/tmp/rn_source.tar.gz
+
+
+rn_source.tar.gz                                0%    0     0.0KB/s   --:-- ETA
+rn_source.tar.gz                              100% 1189KB  20.9MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh 'client' 'client-50' 'rn-lab-20260306-new' '192.168.18.0/24' '/tmp/rn_source.tar.gz'
+
+[0m[1minfo: [0musing existing install for '1.88.0-x86_64-unknown-linux-gnu'
+[0m[1minfo: [0mdefault toolchain set to '1.88.0-x86_64-unknown-linux-gnu'
+
+  1.88.0-x86_64-unknown-linux-gnu unchanged - rustc 1.88.0 (6b00bc388 2025-06-23)
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.macl'
+   Compiling version_check v0.9.5
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.182
+   Compiling typenum v1.19.0
+   Compiling subtle v2.6.1
+   Compiling generic-array v0.14.7
+   Compiling zerocopy v0.8.40
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.44
+   Compiling unicode-ident v1.0.24
+   Compiling block-buffer v0.10.4
+   Compiling cpufeatures v0.2.17
+   Compiling semver v1.0.27
+   Compiling syn v2.0.117
+   Compiling getrandom v0.2.17
+   Compiling zeroize v1.8.2
+   Compiling rustc_version v0.4.1
+   Compiling rand_core v0.6.4
+   Compiling ahash v0.8.12
+   Compiling crypto-common v0.1.7
+   Compiling shlex v1.3.0
+   Compiling digest v0.10.7
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.56
+   Compiling curve25519-dalek v4.1.3
+   Compiling inout v0.1.4
+   Compiling autocfg v1.5.0
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.32
+   Compiling once_cell v1.21.3
+   Compiling memoffset v0.9.1
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling libsqlite3-sys v0.30.1
+   Compiling cipher v0.4.4
+   Compiling universal-hash v0.5.1
+   Compiling signature v2.2.0
+   Compiling cfg_aliases v0.2.1
+   Compiling base64ct v1.8.3
+   Compiling serde_core v1.0.228
+   Compiling opaque-debug v0.3.1
+   Compiling password-hash v0.5.0
+   Compiling poly1305 v0.8.0
+   Compiling nix v0.29.0
+   Compiling ed25519 v2.2.3
+   Compiling chacha20 v0.9.1
+   Compiling rand_chacha v0.3.1
+   Compiling hashbrown v0.14.5
+   Compiling blake2 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling aead v0.5.2
+   Compiling bitflags v2.11.0
+   Compiling zmij v1.0.21
+   Compiling chacha20poly1305 v0.10.1
+   Compiling ed25519-dalek v2.2.0
+   Compiling hashlink v0.9.1
+   Compiling argon2 v0.5.3
+   Compiling rand v0.8.5
+   Compiling hmac v0.12.1
+   Compiling smallvec v1.15.1
+   Compiling fallible-iterator v0.3.0
+   Compiling serde_json v1.0.149
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling serde v1.0.228
+   Compiling hkdf v0.12.4
+   Compiling rustynet-crypto v0.1.0 (/home/debian/Rustynet/crates/rustynet-crypto)
+   Compiling serde_derive v1.0.228
+   Compiling rustynet-policy v0.1.0 (/home/debian/Rustynet/crates/rustynet-policy)
+   Compiling itoa v1.0.17
+   Compiling memchr v2.8.0
+   Compiling rustynet-backend-api v0.1.0 (/home/debian/Rustynet/crates/rustynet-backend-api)
+   Compiling rustynet-backend-wireguard v0.1.0 (/home/debian/Rustynet/crates/rustynet-backend-wireguard)
+   Compiling rusqlite v0.32.1
+   Compiling rustynet-control v0.1.0 (/home/debian/Rustynet/crates/rustynet-control)
+   Compiling rustynetd v0.1.0 (/home/debian/Rustynet/crates/rustynetd)
+   Compiling rustynet-cli v0.1.0 (/home/debian/Rustynet/crates/rustynet-cli)
+    Finished `release` profile [optimized] target(s) in 43.28s
+[sudo] password for debian: 
+key init complete: runtime_private_key=/run/rustynet/wireguard.key encrypted_private_key=/var/lib/rustynet/keys/wireguard.key.enc public_key=/var/lib/rustynet/keys/wireguard.pub
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+membership init complete: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log watermark_reset=/var/lib/rustynet/membership.watermark owner_signing_key=/etc/rustynet/membership.owner.key
+  node_id=client-50 network_id=rn-lab-20260306-new owner_approver_id=client-50-owner
+trust signing key initialized: signing_key=/etc/rustynet/trust-evidence.key verifier_key_output=/etc/rustynet/trust-evidence.pub
+assignment signing secret initialized: [REDACTED]
+[trust-refresh] refreshed signed trust evidence at /var/lib/rustynet/rustynetd.trust
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:55:21 GMT; 132ms ago
+ Invocation: 1a94188dbefc45e2a8d0a7f2e49c8eda
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 10470 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 420K (peak: 2.1M)
+        CPU: 15ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─10470 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 986 --timeout-ms 2000
+
+Mar 07 15:55:21 vbox systemd[1]: Stopping rustynetd-privileged-helper.service - Rustynet Privileged Helper...
+Mar 07 15:55:21 vbox systemd[1]: rustynetd-privileged-helper.service: Deactivated successfully.
+Mar 07 15:55:21 vbox systemd[1]: Stopped rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+Mar 07 15:55:21 vbox systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:55:21 GMT; 172ms ago
+ Invocation: b523e24e161e47a9b1ace66c31adb88e
+    Trigger: Sat 2026-03-07 15:56:30 GMT; 1min 8s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:55:21 vbox systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:55:21 GMT; 40ms ago
+ Invocation: 70d6bb912ffb4fbea5767d8e4ad70d85
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 10471 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 10476 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 10480 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 10484 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 10488 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 10492 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 10496 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 19.7M (peak: 19.7M)
+        CPU: 64ms
+     CGroup: /system.slice/rustynetd.service
+             └─10496 /usr/local/bin/rustynetd daemon --node-id client-50 --node-role client --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --membership-snapshot /var/lib/rustynet/membership.snapshot --membership-log /var/lib/rustynet/membership.log --membership-watermark /var/lib/rustynet/membership.watermark --auto-tunnel-enforce false --auto-tunnel-bundle /var/lib/rustynet/rustynetd.assignment --auto-tunnel-verifier-key /etc/rustynet/assignment.pub --auto-tunnel-watermark /var/lib/rustynet/rustynetd.assignment.watermark --auto-tunnel-max-age-secs 300 --traversal-bundle /var/lib/rustynet/rustynetd.traversal --traversal-verifier-key /etc/rustynet/traversal.pub --traversal-watermark /var/lib/rustynet/rustynetd.traversal.watermark --traversal-max-age-secs 120 --backend linux-wireguard --wg-interface rustynet0 --wg-listen-port 51820 --wg-private-key /run/rustynet/wireguard.key --wg-encrypted-private-key /var/lib/rustynet/keys/wireguard.key.enc --wg-key-passphrase /run/credentials/rustynetd.service/wg_key_passphrase --wg-public-key /var/lib/rustynet/keys/wireguard.pub --egress-interface enp0s9 --auto-port-forward-exit false --auto-port-forward-lease-secs 1200 --dataplane-mode hybrid-native --privileged-helper-socket /run/rustynet/rustynetd-privileged.sock --privileged-helper-timeout-ms 2000 --reconcile-interval-ms 1000 --max-reconcile-failures 5 --fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs 192.168.18.0/24
+
+Mar 07 15:55:21 vbox systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:55:21 vbox systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.50 closed.
+
+[four-node-fresh] Host fedora@192.168.18.51: cleanup
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_cleanup.sh fedora@192.168.18.51:/tmp/rn_cleanup.sh
+
+
+rn_cleanup.sh                                   0%    0     0.0KB/s   --:-- ETA
+rn_cleanup.sh                                 100% 1408   252.1KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh
+
+[sudo] password for fedora: 
+Connection to 192.168.18.51 closed.
+
+[four-node-fresh] Host fedora@192.168.18.51: bootstrap latest main as client-51 (client)
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_bootstrap.sh fedora@192.168.18.51:/tmp/rn_bootstrap.sh
+
+
+rn_bootstrap.sh                                 0%    0     0.0KB/s   --:-- ETA
+rn_bootstrap.sh                               100% 6354     1.7MB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_source.tar.gz fedora@192.168.18.51:/tmp/rn_source.tar.gz
+
+
+rn_source.tar.gz                                0%    0     0.0KB/s   --:-- ETA
+rn_source.tar.gz                              100% 1189KB  16.1MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh 'client' 'client-51' 'rn-lab-20260306-new' '192.168.18.0/24' '/tmp/rn_source.tar.gz'
+
+[0m[1minfo: [0musing existing install for '1.88.0-x86_64-unknown-linux-gnu'
+[0m[1minfo: [0mdefault toolchain set to '1.88.0-x86_64-unknown-linux-gnu'
+
+  1.88.0-x86_64-unknown-linux-gnu unchanged - rustc 1.88.0 (6b00bc388 2025-06-23)
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.macl'
+   Compiling version_check v0.9.5
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.182
+   Compiling typenum v1.19.0
+   Compiling subtle v2.6.1
+   Compiling proc-macro2 v1.0.106
+   Compiling generic-array v0.14.7
+   Compiling zerocopy v0.8.40
+   Compiling quote v1.0.44
+   Compiling unicode-ident v1.0.24
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling syn v2.0.117
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling digest v0.10.7
+   Compiling zeroize v1.8.2
+   Compiling semver v1.0.27
+   Compiling ahash v0.8.12
+   Compiling rustc_version v0.4.1
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.56
+   Compiling curve25519-dalek v4.1.3
+   Compiling inout v0.1.4
+   Compiling autocfg v1.5.0
+   Compiling pkg-config v0.3.32
+   Compiling vcpkg v0.2.15
+   Compiling once_cell v1.21.3
+   Compiling cipher v0.4.4
+   Compiling memoffset v0.9.1
+   Compiling libsqlite3-sys v0.30.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling universal-hash v0.5.1
+   Compiling signature v2.2.0
+   Compiling serde_core v1.0.228
+   Compiling opaque-debug v0.3.1
+   Compiling cfg_aliases v0.2.1
+   Compiling base64ct v1.8.3
+   Compiling password-hash v0.5.0
+   Compiling nix v0.29.0
+   Compiling poly1305 v0.8.0
+   Compiling ed25519 v2.2.3
+   Compiling rand_chacha v0.3.1
+   Compiling hashbrown v0.14.5
+   Compiling chacha20 v0.9.1
+   Compiling sha2 v0.10.9
+   Compiling blake2 v0.10.6
+   Compiling aead v0.5.2
+   Compiling zmij v1.0.21
+   Compiling bitflags v2.11.0
+   Compiling ed25519-dalek v2.2.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling argon2 v0.5.3
+   Compiling hashlink v0.9.1
+   Compiling rand v0.8.5
+   Compiling hmac v0.12.1
+   Compiling serde_json v1.0.149
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling smallvec v1.15.1
+   Compiling serde v1.0.228
+   Compiling hkdf v0.12.4
+   Compiling rustynet-crypto v0.1.0 (/home/fedora/Rustynet/crates/rustynet-crypto)
+   Compiling serde_derive v1.0.228
+   Compiling memchr v2.8.0
+   Compiling itoa v1.0.17
+   Compiling rustynet-backend-api v0.1.0 (/home/fedora/Rustynet/crates/rustynet-backend-api)
+   Compiling rustynet-policy v0.1.0 (/home/fedora/Rustynet/crates/rustynet-policy)
+   Compiling rustynet-backend-wireguard v0.1.0 (/home/fedora/Rustynet/crates/rustynet-backend-wireguard)
+   Compiling rusqlite v0.32.1
+   Compiling rustynet-control v0.1.0 (/home/fedora/Rustynet/crates/rustynet-control)
+   Compiling rustynetd v0.1.0 (/home/fedora/Rustynet/crates/rustynetd)
+   Compiling rustynet-cli v0.1.0 (/home/fedora/Rustynet/crates/rustynet-cli)
+    Finished `release` profile [optimized] target(s) in 52.47s
+[sudo] password for fedora: 
+key init complete: runtime_private_key=/run/rustynet/wireguard.key encrypted_private_key=/var/lib/rustynet/keys/wireguard.key.enc public_key=/var/lib/rustynet/keys/wireguard.pub
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+membership init complete: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log watermark_reset=/var/lib/rustynet/membership.watermark owner_signing_key=/etc/rustynet/membership.owner.key
+  node_id=client-51 network_id=rn-lab-20260306-new owner_approver_id=client-51-owner
+trust signing key initialized: signing_key=/etc/rustynet/trust-evidence.key verifier_key_output=/etc/rustynet/trust-evidence.pub
+assignment signing secret initialized: [REDACTED]
+[trust-refresh] refreshed signed trust evidence at /var/lib/rustynet/rustynetd.trust
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Sat 2026-03-07 15:56:26 GMT; 484ms ago
+ Invocation: 22c13398e7ad4dc8953886940c66b6d2
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 14136 (rustynetd)
+      Tasks: 1 (limit: 4625)
+     Memory: 416K (peak: 4M)
+        CPU: 36ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─14136 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 968 --allowed-gid 968 --timeout-ms 2000
+
+Mar 07 15:56:26 fedora systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: disabled)
+     Active: active (waiting) since Sat 2026-03-07 15:56:26 GMT; 521ms ago
+ Invocation: dfba5c650ff042c8ab6ffb729ef58522
+    Trigger: Sat 2026-03-07 15:57:32 GMT; 1min 5s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:56:26 fedora systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Sat 2026-03-07 15:56:27 GMT; 56ms ago
+ Invocation: b914e6f0a9ba4758bd70552c4db7d495
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 14137 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 14146 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 14153 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 14160 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 14167 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 14174 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 14181 ((ustynetd))
+      Tasks: 2 (limit: 4625)
+     Memory: 7.5M (peak: 7.6M)
+        CPU: 106ms
+     CGroup: /system.slice/rustynetd.service
+             ├─14181 "(ustynetd)"
+             └─14186 "(sd-mkdcreds)"
+
+Mar 07 15:56:26 fedora systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:56:27 fedora systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.51 closed.
+
+[four-node-fresh] Host ubuntu@192.168.18.52: cleanup
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_cleanup.sh ubuntu@192.168.18.52:/tmp/rn_cleanup.sh
+
+
+rn_cleanup.sh                                   0%    0     0.0KB/s   --:-- ETA
+rn_cleanup.sh                                 100% 1408   274.7KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh
+
+[sudo] password for ubuntu: 
+Connection to 192.168.18.52 closed.
+
+[four-node-fresh] Host ubuntu@192.168.18.52: bootstrap latest main as client-52 (client)
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_bootstrap.sh ubuntu@192.168.18.52:/tmp/rn_bootstrap.sh
+
+
+rn_bootstrap.sh                                 0%    0     0.0KB/s   --:-- ETA
+rn_bootstrap.sh                               100% 6354     1.4MB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_source.tar.gz ubuntu@192.168.18.52:/tmp/rn_source.tar.gz
+
+
+rn_source.tar.gz                                0%    0     0.0KB/s   --:-- ETA
+rn_source.tar.gz                              100% 1189KB  16.7MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh 'client' 'client-52' 'rn-lab-20260306-new' '192.168.18.0/24' '/tmp/rn_source.tar.gz'
+
+[0m[1minfo: [0musing existing install for '1.88.0-x86_64-unknown-linux-gnu'
+[0m[1minfo: [0mdefault toolchain set to '1.88.0-x86_64-unknown-linux-gnu'
+
+  1.88.0-x86_64-unknown-linux-gnu unchanged - rustc 1.88.0 (6b00bc388 2025-06-23)
+
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.macl'
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded hkdf v0.12.4
+   Compiling version_check v0.9.5
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.182
+   Compiling typenum v1.19.0
+   Compiling subtle v2.6.1
+   Compiling proc-macro2 v1.0.106
+   Compiling generic-array v0.14.7
+   Compiling zerocopy v0.8.40
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.44
+   Compiling cpufeatures v0.2.17
+   Compiling block-buffer v0.10.4
+   Compiling syn v2.0.117
+   Compiling semver v1.0.27
+   Compiling zeroize v1.8.2
+   Compiling rustc_version v0.4.1
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling ahash v0.8.12
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.56
+   Compiling curve25519-dalek v4.1.3
+   Compiling inout v0.1.4
+   Compiling once_cell v1.21.3
+   Compiling pkg-config v0.3.32
+   Compiling vcpkg v0.2.15
+   Compiling autocfg v1.5.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling memoffset v0.9.1
+   Compiling libsqlite3-sys v0.30.1
+   Compiling cipher v0.4.4
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling universal-hash v0.5.1
+   Compiling serde_core v1.0.228
+   Compiling signature v2.2.0
+   Compiling base64ct v1.8.3
+   Compiling cfg_aliases v0.2.1
+   Compiling opaque-debug v0.3.1
+   Compiling nix v0.29.0
+   Compiling poly1305 v0.8.0
+   Compiling password-hash v0.5.0
+   Compiling ed25519 v2.2.3
+   Compiling chacha20 v0.9.1
+   Compiling hashbrown v0.14.5
+   Compiling rand_chacha v0.3.1
+   Compiling blake2 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling aead v0.5.2
+   Compiling bitflags v2.11.0
+   Compiling zmij v1.0.21
+   Compiling ed25519-dalek v2.2.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling argon2 v0.5.3
+   Compiling rand v0.8.5
+   Compiling hashlink v0.9.1
+   Compiling hmac v0.12.1
+   Compiling serde_json v1.0.149
+   Compiling fallible-iterator v0.3.0
+   Compiling smallvec v1.15.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling serde v1.0.228
+   Compiling hkdf v0.12.4
+   Compiling rustynet-crypto v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-crypto)
+   Compiling serde_derive v1.0.228
+   Compiling rustynet-policy v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-policy)
+   Compiling memchr v2.8.0
+   Compiling itoa v1.0.17
+   Compiling rustynet-backend-api v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-backend-api)
+   Compiling rustynet-backend-wireguard v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-backend-wireguard)
+   Compiling rusqlite v0.32.1
+   Compiling rustynet-control v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-control)
+   Compiling rustynetd v0.1.0 (/home/ubuntu/Rustynet/crates/rustynetd)
+   Compiling rustynet-cli v0.1.0 (/home/ubuntu/Rustynet/crates/rustynet-cli)
+    Finished `release` profile [optimized] target(s) in 50.02s
+[sudo] password for ubuntu: 
+key init complete: runtime_private_key=/run/rustynet/wireguard.key encrypted_private_key=/var/lib/rustynet/keys/wireguard.key.enc public_key=/var/lib/rustynet/keys/wireguard.pub
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+
+Credential secret file '/var/lib/systemd/credential.secret' is not located on encrypted media, using anyway.
+
+membership init complete: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log watermark_reset=/var/lib/rustynet/membership.watermark owner_signing_key=/etc/rustynet/membership.owner.key
+  node_id=client-52 network_id=rn-lab-20260306-new owner_approver_id=client-52-owner
+trust signing key initialized: signing_key=/etc/rustynet/trust-evidence.key verifier_key_output=/etc/rustynet/trust-evidence.pub
+assignment signing secret initialized: [REDACTED]
+[trust-refresh] refreshed signed trust evidence at /var/lib/rustynet/rustynetd.trust
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:27 UTC; 118ms ago
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 6364 (rustynetd)
+      Tasks: 1 (limit: 4597)
+     Memory: 1.0M (peak: 1.0M)
+        CPU: 30ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─6364 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 984 --timeout-ms 2000
+
+Mar 07 15:57:27 ubuntu systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:27 UTC; 153ms ago
+    Trigger: Sat 2026-03-07 15:58:31 UTC; 1min 3s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:27 ubuntu systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:27 UTC; 30ms ago
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 6365 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 6368 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 6371 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 6374 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 6377 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 6380 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 6383 ((ustynetd))
+      Tasks: 1 (limit: 4597)
+     Memory: 2.0M (peak: 2.8M)
+        CPU: 49ms
+     CGroup: /system.slice/rustynetd.service
+             └─6383 "(ustynetd)"
+
+Mar 07 15:57:27 ubuntu systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:57:27 ubuntu systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.52 closed.
+
+[four-node-fresh] Collecting WireGuard public keys
+[four-node-fresh] Normalizing membership ownership on debian@192.168.18.49
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo chown root:root /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark >/dev/null 2>&1 || true; sudo chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark >/dev/null 2>&1 || true
+
+[sudo] password for debian: 
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Applying signed membership updates on debian@192.168.18.49
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_membership_add.sh debian@192.168.18.49:/tmp/rn_membership_add.sh
+
+
+rn_membership_add.sh                            0%    0     0.0KB/s   --:-- ETA
+rn_membership_add.sh                          100% 1598   466.5KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 chmod 700 /tmp/rn_membership_add.sh && sudo bash /tmp/rn_membership_add.sh 'client-50' 'ef938d383fa7e250b5305cf40ab5e7d4c88d13cb7107a6833d1d3f6eb5ba8459' 'exit-49-owner'
+
+[sudo] password for debian: 
+membership proposal written: /tmp/rustynet-membership-update.1IBNIZ/add.record operation=add_node target=client-50 epoch_new=2
+membership signed update written: /tmp/rustynet-membership-update.1IBNIZ/add.signed signatures=1
+membership update applied: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log epoch_new=2
+Connection to 192.168.18.49 closed.
+
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo bash /tmp/rn_membership_add.sh 'client-51' 'a50ccb2da803803fb25c7c214524a29603c4e23942b07147215e0959c34bde6c' 'exit-49-owner'
+
+[sudo] password for debian: 
+membership proposal written: /tmp/rustynet-membership-update.2haWX0/add.record operation=add_node target=client-51 epoch_new=3
+membership signed update written: /tmp/rustynet-membership-update.2haWX0/add.signed signatures=1
+membership update applied: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log epoch_new=3
+Connection to 192.168.18.49 closed.
+
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo bash /tmp/rn_membership_add.sh 'client-52' '2fd9075d7ece719a5e9d5f0b6124716ebe9dce07b3361c2a6fbc7bf639dafc64' 'exit-49-owner'
+
+[sudo] password for debian: 
+membership proposal written: /tmp/rustynet-membership-update.TzQZ55/add.record operation=add_node target=client-52 epoch_new=4
+membership signed update written: /tmp/rustynet-membership-update.TzQZ55/add.signed signatures=1
+membership update applied: snapshot=/var/lib/rustynet/membership.snapshot log=/var/lib/rustynet/membership.log epoch_new=4
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Exporting membership state from exit
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo cp /var/lib/rustynet/membership.snapshot /tmp/rn-membership.snapshot && sudo cp /var/lib/rustynet/membership.log /tmp/rn-membership.log && sudo chown $(id -un):$(id -gn) /tmp/rn-membership.snapshot /tmp/rn-membership.log
+
+[sudo] password for debian: 
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Distributing membership state to debian@192.168.18.50
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.snapshot debian@192.168.18.50:/tmp/rn-membership.snapshot
+
+
+membership.snapshot                             0%    0     0.0KB/s   --:-- ETA
+membership.snapshot                           100% 2717   298.2KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.log debian@192.168.18.50:/tmp/rn-membership.log
+
+
+membership.log                                  0%    0     0.0KB/s   --:-- ETA
+membership.log                                100% 9118     2.2MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 sudo install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && sudo install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && sudo rm -f /var/lib/rustynet/membership.watermark
+
+[sudo] password for debian: 
+Connection to 192.168.18.50 closed.
+
+[four-node-fresh] Distributing membership state to fedora@192.168.18.51
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.snapshot fedora@192.168.18.51:/tmp/rn-membership.snapshot
+
+
+membership.snapshot                             0%    0     0.0KB/s   --:-- ETA
+membership.snapshot                           100% 2717   699.5KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.log fedora@192.168.18.51:/tmp/rn-membership.log
+
+
+membership.log                                  0%    0     0.0KB/s   --:-- ETA
+membership.log                                100% 9118     1.5MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 sudo install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && sudo install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && sudo rm -f /var/lib/rustynet/membership.watermark
+
+[sudo] password for fedora: 
+Connection to 192.168.18.51 closed.
+
+[four-node-fresh] Distributing membership state to ubuntu@192.168.18.52
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.snapshot ubuntu@192.168.18.52:/tmp/rn-membership.snapshot
+
+
+membership.snapshot                             0%    0     0.0KB/s   --:-- ETA
+membership.snapshot                           100% 2717   755.7KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/membership.log ubuntu@192.168.18.52:/tmp/rn-membership.log
+
+
+membership.log                                  0%    0     0.0KB/s   --:-- ETA
+membership.log                                100% 9118     1.8MB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 sudo install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && sudo install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && sudo rm -f /var/lib/rustynet/membership.watermark
+
+[sudo] password for ubuntu: 
+Connection to 192.168.18.52 closed.
+
+[four-node-fresh] Issuing signed assignments for all nodes
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn_issue_assignments.sh debian@192.168.18.49:/tmp/rn_issue_assignments.sh
+
+
+rn_issue_assignments.sh                         0%    0     0.0KB/s   --:-- ETA
+rn_issue_assignments.sh                       100% 1660   390.8KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/rn-assignment-input.env debian@192.168.18.49:/tmp/rn-assignment-input.env
+
+
+rn-assignment-input.env                         0%    0     0.0KB/s   --:-- ETA
+rn-assignment-input.env                       100%  599   145.0KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 chmod 700 /tmp/rn_issue_assignments.sh && sudo bash /tmp/rn_issue_assignments.sh /tmp/rn-assignment-input.env
+
+[sudo] password for debian: 
+assignment bundle issued: target=exit-49 output=/run/rustynet/assignment-issue/rn-assignment-exit-49.assignment generated_at_unix=1772899058 expires_at_unix=1772899358 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-50 output=/run/rustynet/assignment-issue/rn-assignment-client-50.assignment generated_at_unix=1772899058 expires_at_unix=1772899358 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment-client-50.pub
+assignment bundle issued: target=client-51 output=/run/rustynet/assignment-issue/rn-assignment-client-51.assignment generated_at_unix=1772899058 expires_at_unix=1772899358 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment-client-51.pub
+assignment bundle issued: target=client-52 output=/run/rustynet/assignment-issue/rn-assignment-client-52.assignment generated_at_unix=1772899058 expires_at_unix=1772899358 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment-client-52.pub
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Distributing assignment bundles
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment.pub debian@192.168.18.49:/tmp/rn-assignment-exit-49-8699.pub
+
+
+assignment.pub                                  0%    0     0.0KB/s   --:-- ETA
+assignment.pub                                100%   65    13.6KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-exit-49 debian@192.168.18.49:/tmp/rn-assignment-exit-49-8699.bundle
+
+
+assignment-exit-49                              0%    0     0.0KB/s   --:-- ETA
+assignment-exit-49                            100% 1148   324.4KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo install -m 0644 -o root -g root '/tmp/rn-assignment-exit-49-8699.pub' /etc/rustynet/assignment.pub && sudo install -m 0640 -o root -g rustynetd '/tmp/rn-assignment-exit-49-8699.bundle' /var/lib/rustynet/rustynetd.assignment && sudo rm -f /var/lib/rustynet/rustynetd.assignment.watermark && rm -f '/tmp/rn-assignment-exit-49-8699.pub' '/tmp/rn-assignment-exit-49-8699.bundle'
+
+[sudo] password for debian: 
+Connection to 192.168.18.49 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment.pub debian@192.168.18.50:/tmp/rn-assignment-client-50-8699.pub
+
+
+assignment.pub                                  0%    0     0.0KB/s   --:-- ETA
+assignment.pub                                100%   65    15.9KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-client-50 debian@192.168.18.50:/tmp/rn-assignment-client-50-8699.bundle
+
+
+assignment-client-50                            0%    0     0.0KB/s   --:-- ETA
+assignment-client-50                          100%  695    69.4KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 sudo install -m 0644 -o root -g root '/tmp/rn-assignment-client-50-8699.pub' /etc/rustynet/assignment.pub && sudo install -m 0640 -o root -g rustynetd '/tmp/rn-assignment-client-50-8699.bundle' /var/lib/rustynet/rustynetd.assignment && sudo rm -f /var/lib/rustynet/rustynetd.assignment.watermark && rm -f '/tmp/rn-assignment-client-50-8699.pub' '/tmp/rn-assignment-client-50-8699.bundle'
+
+[sudo] password for debian: 
+Connection to 192.168.18.50 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment.pub fedora@192.168.18.51:/tmp/rn-assignment-client-51-8699.pub
+
+
+assignment.pub                                  0%    0     0.0KB/s   --:-- ETA
+assignment.pub                                100%   65    14.7KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-client-51 fedora@192.168.18.51:/tmp/rn-assignment-client-51-8699.bundle
+
+
+assignment-client-51                            0%    0     0.0KB/s   --:-- ETA
+assignment-client-51                          100%  695   141.1KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 sudo install -m 0644 -o root -g root '/tmp/rn-assignment-client-51-8699.pub' /etc/rustynet/assignment.pub && sudo install -m 0640 -o root -g rustynetd '/tmp/rn-assignment-client-51-8699.bundle' /var/lib/rustynet/rustynetd.assignment && sudo rm -f /var/lib/rustynet/rustynetd.assignment.watermark && rm -f '/tmp/rn-assignment-client-51-8699.pub' '/tmp/rn-assignment-client-51-8699.bundle'
+
+[sudo] password for fedora: 
+Connection to 192.168.18.51 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment.pub ubuntu@192.168.18.52:/tmp/rn-assignment-client-52-8699.pub
+
+
+assignment.pub                                  0%    0     0.0KB/s   --:-- ETA
+assignment.pub                                100%   65    18.0KB/s   00:00    
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-client-52 ubuntu@192.168.18.52:/tmp/rn-assignment-client-52-8699.bundle
+
+
+assignment-client-52                            0%    0     0.0KB/s   --:-- ETA
+assignment-client-52                          100%  695   186.5KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 sudo install -m 0644 -o root -g root '/tmp/rn-assignment-client-52-8699.pub' /etc/rustynet/assignment.pub && sudo install -m 0640 -o root -g rustynetd '/tmp/rn-assignment-client-52-8699.bundle' /var/lib/rustynet/rustynetd.assignment && sudo rm -f /var/lib/rustynet/rustynetd.assignment.watermark && rm -f '/tmp/rn-assignment-client-52-8699.pub' '/tmp/rn-assignment-client-52-8699.bundle'
+
+[sudo] password for ubuntu: 
+Connection to 192.168.18.52 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-refresh-exit-49.env debian@192.168.18.49:/tmp/rn-assignment-refresh.env
+
+
+assignment-refresh-exit-49.env                  0%    0     0.0KB/s   --:-- ETA
+assignment-refresh-exit-49.env                100% 1033   140.8KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 sudo install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env
+
+[sudo] password for debian: 
+Connection to 192.168.18.49 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-refresh-client-50.env debian@192.168.18.50:/tmp/rn-assignment-refresh.env
+
+
+assignment-refresh-client-50.env                0%    0     0.0KB/s   --:-- ETA
+assignment-refresh-client-50.env              100% 1076   268.9KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 sudo install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env
+
+[sudo] password for debian: 
+Connection to 192.168.18.50 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-refresh-client-51.env fedora@192.168.18.51:/tmp/rn-assignment-refresh.env
+
+
+assignment-refresh-client-51.env                0%    0     0.0KB/s   --:-- ETA
+assignment-refresh-client-51.env              100% 1076   217.1KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 sudo install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env
+
+[sudo] password for fedora: 
+Connection to 192.168.18.51 closed.
+
+spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.N4YA5G/assignment-refresh-client-52.env ubuntu@192.168.18.52:/tmp/rn-assignment-refresh.env
+
+
+assignment-refresh-client-52.env                0%    0     0.0KB/s   --:-- ETA
+assignment-refresh-client-52.env              100% 1076   303.8KB/s   00:00    
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 sudo install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env
+
+[sudo] password for ubuntu: 
+Connection to 192.168.18.52 closed.
+
+[four-node-fresh] Enforcing auto-tunnel + assignment refresh on all nodes
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 EGRESS=$(ip -o -4 route show to default | awk 'NR==1 { print $5 }'); cd $HOME/Rustynet; sudo env RUSTYNET_NODE_ID='exit-49' RUSTYNET_NODE_ROLE='admin' RUSTYNET_TRUST_AUTO_REFRESH=true RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true RUSTYNET_AUTO_TUNNEL_ENFORCE=true RUSTYNET_WG_LISTEN_PORT=51820 RUSTYNET_EGRESS_INTERFACE="$EGRESS" RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS='192.168.18.0/24' ./scripts/systemd/install_rustynetd_service.sh
+
+[sudo] password for debian: 
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:51 GMT; 131ms ago
+ Invocation: 7b7495a751cd416a8d92bbabdc71d434
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 12447 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 420K (peak: 2M)
+        CPU: 35ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─12447 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 986 --timeout-ms 2000
+
+Mar 07 15:57:51 vbox systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:51 GMT; 271ms ago
+ Invocation: 57eb6870584d469db736229f603aa951
+    Trigger: Sat 2026-03-07 15:58:59 GMT; 1min 7s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:51 vbox systemd[1]: rustynetd-trust-refresh.timer: Deactivated successfully.
+Mar 07 15:57:51 vbox systemd[1]: Stopped rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+Mar 07 15:57:51 vbox systemd[1]: Stopping rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh...
+Mar 07 15:57:51 vbox systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-assignment-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:51 GMT; 171ms ago
+ Invocation: 5fc03b2de57849d0866ee7f54d8f382f
+    Trigger: Sat 2026-03-07 15:58:59 GMT; 1min 7s left
+   Triggers: ● rustynetd-assignment-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:51 vbox systemd[1]: Started rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:51 GMT; 44ms ago
+ Invocation: 9b5eba142d63404aa8b5968f4a684a26
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 12448 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 12453 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 12457 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 12461 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 12465 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 12469 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 12473 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 19.4M (peak: 19.4M)
+        CPU: 82ms
+     CGroup: /system.slice/rustynetd.service
+             └─12473 /usr/local/bin/rustynetd daemon --node-id exit-49 --node-role admin --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --membership-snapshot /var/lib/rustynet/membership.snapshot --membership-log /var/lib/rustynet/membership.log --membership-watermark /var/lib/rustynet/membership.watermark --auto-tunnel-enforce true --auto-tunnel-bundle /var/lib/rustynet/rustynetd.assignment --auto-tunnel-verifier-key /etc/rustynet/assignment.pub --auto-tunnel-watermark /var/lib/rustynet/rustynetd.assignment.watermark --auto-tunnel-max-age-secs 300 --traversal-bundle /var/lib/rustynet/rustynetd.traversal --traversal-verifier-key /etc/rustynet/traversal.pub --traversal-watermark /var/lib/rustynet/rustynetd.traversal.watermark --traversal-max-age-secs 120 --backend linux-wireguard --wg-interface rustynet0 --wg-listen-port 51820 --wg-private-key /run/rustynet/wireguard.key --wg-encrypted-private-key /var/lib/rustynet/keys/wireguard.key.enc --wg-key-passphrase /run/credentials/rustynetd.service/wg_key_passphrase --wg-public-key /var/lib/rustynet/keys/wireguard.pub --egress-interface enp0s9 --auto-port-forward-exit false --auto-port-forward-lease-secs 1200 --dataplane-mode hybrid-native --privileged-helper-socket /run/rustynet/rustynetd-privileged.sock --privileged-helper-timeout-ms 2000 --reconcile-interval-ms 1000 --max-reconcile-failures 5 --fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs 192.168.18.0/24
+
+Mar 07 15:57:51 vbox systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:57:51 vbox systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=admin wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.49 closed.
+
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.50 EGRESS=$(ip -o -4 route show to default | awk 'NR==1 { print $5 }'); cd $HOME/Rustynet; sudo env RUSTYNET_NODE_ID='client-50' RUSTYNET_NODE_ROLE='client' RUSTYNET_TRUST_AUTO_REFRESH=true RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true RUSTYNET_AUTO_TUNNEL_ENFORCE=true RUSTYNET_WG_LISTEN_PORT=51820 RUSTYNET_EGRESS_INTERFACE="$EGRESS" RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS='192.168.18.0/24' ./scripts/systemd/install_rustynetd_service.sh
+
+[sudo] password for debian: 
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:54 GMT; 140ms ago
+ Invocation: 81146918942546c9a96b73ad4b89d476
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 11582 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 424K (peak: 2M)
+        CPU: 27ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─11582 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 986 --timeout-ms 2000
+
+Mar 07 15:57:54 vbox systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:54 GMT; 308ms ago
+ Invocation: dc5d76ca7e7e4c87a389dd7c6a547704
+    Trigger: Sat 2026-03-07 15:59:03 GMT; 1min 8s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:54 vbox systemd[1]: rustynetd-trust-refresh.timer: Deactivated successfully.
+Mar 07 15:57:54 vbox systemd[1]: Stopped rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+Mar 07 15:57:54 vbox systemd[1]: Stopping rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh...
+Mar 07 15:57:54 vbox systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-assignment-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:54 GMT; 200ms ago
+ Invocation: 6b27ec79792840f0b7c5e672c679928b
+    Trigger: Sat 2026-03-07 15:59:01 GMT; 1min 6s left
+   Triggers: ● rustynetd-assignment-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:54 vbox systemd[1]: Started rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:57:54 GMT; 60ms ago
+ Invocation: 92c077af266541cf9004d89aefb0e19d
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 11583 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11588 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 11592 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11596 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 11600 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 11604 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 11608 (rustynetd)
+      Tasks: 1 (limit: 4634)
+     Memory: 19.8M (peak: 19.8M)
+        CPU: 28ms
+     CGroup: /system.slice/rustynetd.service
+             └─11608 /usr/local/bin/rustynetd daemon --node-id client-50 --node-role client --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --membership-snapshot /var/lib/rustynet/membership.snapshot --membership-log /var/lib/rustynet/membership.log --membership-watermark /var/lib/rustynet/membership.watermark --auto-tunnel-enforce true --auto-tunnel-bundle /var/lib/rustynet/rustynetd.assignment --auto-tunnel-verifier-key /etc/rustynet/assignment.pub --auto-tunnel-watermark /var/lib/rustynet/rustynetd.assignment.watermark --auto-tunnel-max-age-secs 300 --traversal-bundle /var/lib/rustynet/rustynetd.traversal --traversal-verifier-key /etc/rustynet/traversal.pub --traversal-watermark /var/lib/rustynet/rustynetd.traversal.watermark --traversal-max-age-secs 120 --backend linux-wireguard --wg-interface rustynet0 --wg-listen-port 51820 --wg-private-key /run/rustynet/wireguard.key --wg-encrypted-private-key /var/lib/rustynet/keys/wireguard.key.enc --wg-key-passphrase /run/credentials/rustynetd.service/wg_key_passphrase --wg-public-key /var/lib/rustynet/keys/wireguard.pub --egress-interface enp0s9 --auto-port-forward-exit false --auto-port-forward-lease-secs 1200 --dataplane-mode hybrid-native --privileged-helper-socket /run/rustynet/rustynetd-privileged.sock --privileged-helper-timeout-ms 2000 --reconcile-interval-ms 1000 --max-reconcile-failures 5 --fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs 192.168.18.0/24
+
+Mar 07 15:57:54 vbox systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:57:54 vbox systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.50 closed.
+
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 fedora@192.168.18.51 EGRESS=$(ip -o -4 route show to default | awk 'NR==1 { print $5 }'); cd $HOME/Rustynet; sudo env RUSTYNET_NODE_ID='client-51' RUSTYNET_NODE_ROLE='client' RUSTYNET_TRUST_AUTO_REFRESH=true RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true RUSTYNET_AUTO_TUNNEL_ENFORCE=true RUSTYNET_WG_LISTEN_PORT=51820 RUSTYNET_EGRESS_INTERFACE="$EGRESS" RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS='192.168.18.0/24' ./scripts/systemd/install_rustynetd_service.sh
+
+[sudo] password for fedora: 
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Sat 2026-03-07 15:57:58 GMT; 302ms ago
+ Invocation: d0a1b92f7ecc4c99a5b9aa53a28e3926
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 15814 (rustynetd)
+      Tasks: 1 (limit: 4625)
+     Memory: 428K (peak: 4M)
+        CPU: 36ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─15814 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 968 --allowed-gid 968 --timeout-ms 2000
+
+Mar 07 15:57:58 fedora systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: disabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:57 GMT; 498ms ago
+ Invocation: c39be9b666cf47ebaab0a884ef928430
+    Trigger: Sat 2026-03-07 15:59:03 GMT; 1min 4s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:57 fedora systemd[1]: rustynetd-trust-refresh.timer: Deactivated successfully.
+Mar 07 15:57:57 fedora systemd[1]: Stopped rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+Mar 07 15:57:57 fedora systemd[1]: Stopping rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh...
+Mar 07 15:57:57 fedora systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-assignment-refresh.timer; enabled; preset: disabled)
+     Active: active (waiting) since Sat 2026-03-07 15:57:58 GMT; 360ms ago
+ Invocation: 09514d91a46342d3869a79f62f440049
+    Trigger: Sat 2026-03-07 15:59:07 GMT; 1min 8s left
+   Triggers: ● rustynetd-assignment-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:57:58 fedora systemd[1]: Started rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: disabled)
+    Drop-In: /usr/lib/systemd/system/service.d
+             └─10-timeout-abort.conf
+     Active: active (running) since Sat 2026-03-07 15:57:58 GMT; 89ms ago
+ Invocation: 836beccd9f9245ad94d589a9916c6263
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 15815 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 15823 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 15830 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 15837 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 15844 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 15851 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 15858 (rustynetd)
+      Tasks: 1 (limit: 4625)
+     Memory: 6.5M (peak: 7.7M)
+        CPU: 111ms
+     CGroup: /system.slice/rustynetd.service
+             └─15858 /usr/local/bin/rustynetd daemon --node-id client-51 --node-role client --socket /run/rustynet/rustynetd.sock --state /var/lib/rustynet/rustynetd.state --trust-evidence /var/lib/rustynet/rustynetd.trust --trust-verifier-key /etc/rustynet/trust-evidence.pub --trust-watermark /var/lib/rustynet/rustynetd.trust.watermark --membership-snapshot /var/lib/rustynet/membership.snapshot --membership-log /var/lib/rustynet/membership.log --membership-watermark /var/lib/rustynet/membership.watermark --auto-tunnel-enforce true --auto-tunnel-bundle /var/lib/rustynet/rustynetd.assignment --auto-tunnel-verifier-key /etc/rustynet/assignment.pub --auto-tunnel-watermark /var/lib/rustynet/rustynetd.assignment.watermark --auto-tunnel-max-age-secs 300 --traversal-bundle /var/lib/rustynet/rustynetd.traversal --traversal-verifier-key /etc/rustynet/traversal.pub --traversal-watermark /var/lib/rustynet/rustynetd.traversal.watermark --traversal-max-age-secs 120 --backend linux-wireguard --wg-interface rustynet0 --wg-listen-port 51820 --wg-private-key /run/rustynet/wireguard.key --wg-encrypted-private-key /var/lib/rustynet/keys/wireguard.key.enc --wg-key-passphrase /run/credentials/rustynetd.service/wg_key_passphrase --wg-public-key /var/lib/rustynet/keys/wireguard.pub --egress-interface enp0s9 --auto-port-forward-exit false --auto-port-forward-lease-secs 1200 --dataplane-mode hybrid-native --privileged-helper-socket /run/rustynet/rustynetd-privileged.sock --privileged-helper-timeout-ms 2000 --reconcile-interval-ms 1000 --max-reconcile-failures 5 --fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs 192.168.18.0/24
+
+Mar 07 15:57:58 fedora systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:57:58 fedora systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.51 closed.
+
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@192.168.18.52 EGRESS=$(ip -o -4 route show to default | awk 'NR==1 { print $5 }'); cd $HOME/Rustynet; sudo env RUSTYNET_NODE_ID='client-52' RUSTYNET_NODE_ROLE='client' RUSTYNET_TRUST_AUTO_REFRESH=true RUSTYNET_ASSIGNMENT_AUTO_REFRESH=true RUSTYNET_AUTO_TUNNEL_ENFORCE=true RUSTYNET_WG_LISTEN_PORT=51820 RUSTYNET_EGRESS_INTERFACE="$EGRESS" RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS='192.168.18.0/24' ./scripts/systemd/install_rustynetd_service.sh
+
+[sudo] password for ubuntu: 
+● rustynetd-privileged-helper.service - Rustynet Privileged Helper
+     Loaded: loaded (/etc/systemd/system/rustynetd-privileged-helper.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:58:01 UTC; 123ms ago
+       Docs: https://github.com/Iwan-Teague/Rustynet
+   Main PID: 7815 (rustynetd)
+      Tasks: 1 (limit: 4597)
+     Memory: 680.0K (peak: 696.0K)
+        CPU: 23ms
+     CGroup: /system.slice/rustynetd-privileged-helper.service
+             └─7815 /usr/local/bin/rustynetd privileged-helper --socket /run/rustynet/rustynetd-privileged.sock --allowed-uid 997 --allowed-gid 984 --timeout-ms 2000
+
+Mar 07 15:58:01 ubuntu systemd[1]: Started rustynetd-privileged-helper.service - Rustynet Privileged Helper.
+● rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-trust-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:58:01 UTC; 334ms ago
+    Trigger: Sat 2026-03-07 15:59:03 UTC; 1min 1s left
+   Triggers: ● rustynetd-trust-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:58:01 ubuntu systemd[1]: rustynetd-trust-refresh.timer: Deactivated successfully.
+Mar 07 15:58:01 ubuntu systemd[1]: Stopped rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+Mar 07 15:58:01 ubuntu systemd[1]: Stopping rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh...
+Mar 07 15:58:01 ubuntu systemd[1]: Started rustynetd-trust-refresh.timer - Periodic Rustynet Trust Evidence Refresh.
+● rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh
+     Loaded: loaded (/etc/systemd/system/rustynetd-assignment-refresh.timer; enabled; preset: enabled)
+     Active: active (waiting) since Sat 2026-03-07 15:58:01 UTC; 208ms ago
+    Trigger: Sat 2026-03-07 15:59:07 UTC; 1min 5s left
+   Triggers: ● rustynetd-assignment-refresh.service
+       Docs: https://github.com/Iwan-Teague/Rustynet
+
+Mar 07 15:58:01 ubuntu systemd[1]: Started rustynetd-assignment-refresh.timer - Periodic Rustynet Assignment Bundle Refresh.
+● rustynetd.service - Rustynet Daemon
+     Loaded: loaded (/etc/systemd/system/rustynetd.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-03-07 15:58:01 UTC; 29ms ago
+       Docs: https://github.com/Iwan-Teague/Rustynet
+    Process: 7816 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY} (code=exited, status=0/SUCCESS)
+    Process: 7819 ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred (code=exited, status=0/SUCCESS)
+    Process: 7822 ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY} (code=exited, status=0/SUCCESS)
+    Process: 7825 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE} (code=exited, status=0/SUCCESS)
+    Process: 7828 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY} (code=exited, status=0/SUCCESS)
+    Process: 7831 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET} (code=exited, status=0/SUCCESS)
+   Main PID: 7834 ((ustynetd))
+      Tasks: 1 (limit: 4597)
+     Memory: 2.2M (peak: 2.9M)
+        CPU: 65ms
+     CGroup: /system.slice/rustynetd.service
+             └─7834 "(ustynetd)"
+
+Mar 07 15:58:01 ubuntu systemd[1]: Starting rustynetd.service - Rustynet Daemon...
+Mar 07 15:58:01 ubuntu systemd[1]: Started rustynetd.service - Rustynet Daemon.
+systemd installer completed: role=client wireguard_listen_port=51820 egress_interface=enp0s9 timeout_ms=2000
+Connection to 192.168.18.52 closed.
+
+[four-node-fresh] Advertising default route on exit node
+spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 debian@192.168.18.49 printf 'tempo\n' | sudo -S -p '' env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0
+
+route advertised: 0.0.0.0/0
+
+Connection to 192.168.18.49 closed.
+
+[four-node-fresh] Validation: latest commit on each host
+[four-node-fresh] exit-49 (debian@192.168.18.49) commit=fatal: not a git repository (or any of the parent directories): .git
+[four-node-fresh] client-50 (debian@192.168.18.50) commit=fatal: not a git repository (or any of the parent directories): .git
+[four-node-fresh] client-51 (fedora@192.168.18.51) commit=fatal: not a git repository (or any parent up to mount point /)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+[four-node-fresh] client-52 (ubuntu@192.168.18.52) commit=fatal: not a git repository (or any of the parent directories): .git
+[four-node-fresh] Validation: service status and route checks
+===== exit-49 status (debian@192.168.18.49) =====
+node_id=exit-49 node_role=admin state=ExitActive generation=2 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=17 reconcile_failures=0 last_reconcile_unix=1772899088 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772899058:1772899058140787653 membership_epoch=4 membership_active_nodes=4
+===== client-50 status (debian@192.168.18.50) =====
+node_id=client-50 node_role=client state=ExitActive generation=1 exit_node=exit-49 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=12 reconcile_failures=0 last_reconcile_unix=1772899089 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772899058:1772899058164787342 membership_epoch=4 membership_active_nodes=4
+----- client-50 route -----
+[35m1.1.1.1 [0mdev [36mrustynet0 [0mtable 51820 src [35m100.68.175.216 [0muid 1000 
+    cache 
+===== client-51 status (fedora@192.168.18.51) =====
+node_id=client-51 node_role=client state=ExitActive generation=1 exit_node=exit-49 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=10 reconcile_failures=0 last_reconcile_unix=1772899089 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772899058:1772899058188787031 membership_epoch=4 membership_active_nodes=4
+----- client-51 route -----
+[35m1.1.1.1 [0mdev [36mrustynet0 [0mtable 51820 src [35m100.82.160.108 [0muid 1000 
+    cache 
+===== client-52 status (ubuntu@192.168.18.52) =====
+node_id=client-52 node_role=client state=ExitActive generation=1 exit_node=exit-49 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=8 reconcile_failures=0 last_reconcile_unix=1772899090 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772899058:1772899058212786719 membership_epoch=4 membership_active_nodes=4
+----- client-52 route -----
+1.1.1.1 dev rustynet0 table 51820 src 100.114.50.146 uid 1000 
+    cache 
+[four-node-fresh] Fresh reinstall + four-node network setup completed

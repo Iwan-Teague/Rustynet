@@ -61,11 +61,22 @@ if {\$argc == 4} {
 set fh [open \$password_file r]
 gets \$fh password
 close \$fh
-spawn ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$target \$command
+set output ""
+match_max 2000000
+log_user 0
+spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$target \$command
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
-    eof { catch wait result; exit [lindex \$result 3] }
+    -re {.+} {
+      append output \$expect_out(buffer)
+      exp_continue
+    }
+    eof {
+      puts -nonewline \$output
+      catch wait result
+      exit [lindex \$result 3]
+    }
   }
 }
 EXPECTSSH
@@ -86,11 +97,22 @@ if {\$argc == 4} {
 set fh [open \$password_file r]
 gets \$fh password
 close \$fh
-spawn scp -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$source \$target
+set output ""
+match_max 2000000
+log_user 0
+spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$source \$target
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
-    eof { catch wait result; exit [lindex \$result 3] }
+    -re {.+} {
+      append output \$expect_out(buffer)
+      exp_continue
+    }
+    eof {
+      puts -nonewline \$output
+      catch wait result
+      exit [lindex \$result 3]
+    }
   }
 }
 EXPECTSCP

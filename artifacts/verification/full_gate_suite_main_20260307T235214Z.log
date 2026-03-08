@@ -1,0 +1,21 @@
+
+[2026-03-07T23:52:14Z] RUN ./scripts/ci/phase1_gates.sh
+Diff in /Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs:4362:
+         }
+         rewritten_lines.push(line.to_string());
+     }
+-    if !inserted
+-        && let Some(exit_node_id_value) = exit_node_id
+-    {
++    if !inserted && let Some(exit_node_id_value) = exit_node_id {
+         rewritten_lines.push(
+             format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", exit_node_id_value)
+                 .unwrap_or_else(|err| {
+Diff in /Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs:4371:
+-                    panic!(
+-                        "invalid assignment refresh exit node value {exit_node_id_value}: {err}"
+-                    )
++                    panic!("invalid assignment refresh exit node value {exit_node_id_value}: {err}")
+                 }),
+         );
+     }

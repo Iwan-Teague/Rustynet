@@ -1120,12 +1120,12 @@ fn run_phase9_backend_probes(
 }
 
 fn phase9_require_measured_mode(payload: &Map<String, Value>, label: &str) -> Result<(), String> {
-    if let Some(mode) = payload.get("evidence_mode") {
-        if mode.as_str() != Some("measured") {
-            return Err(format!(
-                "{label} must be measured evidence when evidence_mode is present; got {mode:?}"
-            ));
-        }
+    if let Some(mode) = payload.get("evidence_mode")
+        && mode.as_str() != Some("measured")
+    {
+        return Err(format!(
+            "{label} must be measured evidence when evidence_mode is present; got {mode:?}"
+        ));
     }
     Ok(())
 }
@@ -1232,10 +1232,10 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         Some((core, frac)) => (core, Some(frac)),
         None => (time_part, None),
     };
-    if let Some(frac) = fraction {
-        if frac.is_empty() || !frac.chars().all(|ch| ch.is_ascii_digit()) {
-            return Err(format!("invalid UTC timestamp for {field}: {value}"));
-        }
+    if let Some(frac) = fraction
+        && (frac.is_empty() || !frac.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
     }
     let time_fields = time_core.split(':').collect::<Vec<_>>();
     if time_fields.len() != 3 {

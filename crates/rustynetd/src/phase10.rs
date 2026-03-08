@@ -694,15 +694,15 @@ impl LinuxCommandSystem {
 
     fn ensure_failclosed_table(&mut self) -> Result<String, SystemError> {
         let target_table = self.firewall_table_name();
-        if let Some(table) = self.firewall_table.clone() {
-            if table == target_table {
-                if self.killswitch_chain_exists(table.as_str())? {
-                    return Ok(table);
-                }
-                // The expected generation table exists in state but is missing its
-                // fail-closed chain on host. Recreate this generation table.
-                self.firewall_table = None;
+        if let Some(table) = self.firewall_table.clone()
+            && table == target_table
+        {
+            if self.killswitch_chain_exists(table.as_str())? {
+                return Ok(table);
             }
+            // The expected generation table exists in state but is missing its
+            // fail-closed chain on host. Recreate this generation table.
+            self.firewall_table = None;
         }
 
         let table = target_table;
@@ -1054,13 +1054,13 @@ impl DataplaneSystem for LinuxCommandSystem {
             )
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         }
-        if let Some(previous) = previous_table {
-            if previous != table {
-                self.run_allow_failure(
-                    PrivilegedCommandProgram::Nft,
-                    &["delete", "table", "inet", previous.as_str()],
-                );
-            }
+        if let Some(previous) = previous_table
+            && previous != table
+        {
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &["delete", "table", "inet", previous.as_str()],
+            );
         }
         Ok(())
     }

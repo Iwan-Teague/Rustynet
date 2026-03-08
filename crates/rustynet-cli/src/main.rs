@@ -1629,12 +1629,12 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     let nodes_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_NODES", "assignment node map")?;
     let allow_spec = env_required_nonempty("RUSTYNET_ASSIGNMENT_ALLOW", "assignment allow rules")?;
     let exit_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?;
-    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
-        if !is_valid_node_id(exit_node_id_value) {
-            return Err(format!(
-                "exit node id contains unsupported characters: {exit_node_id_value}",
-            ));
-        }
+    if let Some(exit_node_id_value) = exit_node_id.as_deref()
+        && !is_valid_node_id(exit_node_id_value)
+    {
+        return Err(format!(
+            "exit node id contains unsupported characters: {exit_node_id_value}",
+        ));
     }
     let lan_routes = env_optional_string("RUSTYNET_ASSIGNMENT_LAN_ROUTES")?
         .map(split_csv)
@@ -1680,17 +1680,15 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
 
     let now_unix = unix_now();
-    if bundle_path.exists() {
-        if let Some(current_expires_at) =
+    if bundle_path.exists()
+        && let Some(current_expires_at) =
             read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        {
-            if current_expires_at > now_unix.saturating_add(min_remaining_secs) {
-                let remaining_secs = current_expires_at.saturating_sub(now_unix);
-                return Ok(format!(
-                    "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
-                ));
-            }
-        }
+        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
+    {
+        let remaining_secs = current_expires_at.saturating_sub(now_unix);
+        return Ok(format!(
+            "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
+        ));
     }
 
     let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
@@ -2127,10 +2125,10 @@ fn phase6_leak_report_passed(path: &Path) -> bool {
 }
 
 fn phase6_probe_host() -> String {
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        if !hostname.trim().is_empty() {
-            return hostname;
-        }
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        && !hostname.trim().is_empty()
+    {
+        return hostname;
     }
     let output = Command::new("hostname")
         .stdout(Stdio::piped())
@@ -2806,12 +2804,12 @@ fn execute_ops_set_assignment_refresh_exit_node(
     } else {
         return Err("set-assignment-refresh-exit-node is supported on Linux only".to_string());
     }
-    if let Some(exit_node_id_value) = exit_node_id.as_deref() {
-        if !is_valid_assignment_refresh_exit_node_id(exit_node_id_value) {
-            return Err(format!(
-                "invalid exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id_value}"
-            ));
-        }
+    if let Some(exit_node_id_value) = exit_node_id.as_deref()
+        && !is_valid_assignment_refresh_exit_node_id(exit_node_id_value)
+    {
+        return Err(format!(
+            "invalid exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id_value}"
+        ));
     }
 
     ensure_regular_file_no_symlink(&env_path, "assignment refresh env file")?;
@@ -3010,12 +3008,12 @@ fn execute_ops_apply_role_coupling(
             "unsupported target role for coupling: {target_role} (expected admin|client)"
         ));
     }
-    if let Some(exit_node_id) = preferred_exit_node_id.as_deref() {
-        if !is_valid_assignment_refresh_exit_node_id(exit_node_id) {
-            return Err(format!(
-                "invalid preferred exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id}"
-            ));
-        }
+    if let Some(exit_node_id) = preferred_exit_node_id.as_deref()
+        && !is_valid_assignment_refresh_exit_node_id(exit_node_id)
+    {
+        return Err(format!(
+            "invalid preferred exit node id (allowed: letters, numbers, dot, underscore, hyphen): {exit_node_id}"
+        ));
     }
 
     let mut warnings = Vec::new();
@@ -3044,14 +3042,12 @@ fn execute_ops_apply_role_coupling(
         return Err(format!("forced local assignment refresh failed: {err}"));
     }
 
-    if target_role == "admin" {
-        if enable_exit_advertise {
-            if let Err(err) =
-                send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))
-            {
-                warnings.push(format!("advertise default exit route failed: {err}"));
-            }
-        }
+    if target_role == "admin"
+        && enable_exit_advertise
+        && let Err(err) =
+            send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))
+    {
+        warnings.push(format!("advertise default exit route failed: {err}"));
     }
 
     if warnings.is_empty() {
@@ -3647,13 +3643,13 @@ fn write_atomic_text_file_with_owner_mode(
             target_path.display()
         )
     })?;
-    if let Ok(parent_metadata) = fs::symlink_metadata(parent) {
-        if parent_metadata.file_type().is_symlink() {
-            return Err(format!(
-                "target parent must not be a symlink: {}",
-                parent.display()
-            ));
-        }
+    if let Ok(parent_metadata) = fs::symlink_metadata(parent)
+        && parent_metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "target parent must not be a symlink: {}",
+            parent.display()
+        ));
     }
     let tmp = create_secure_temp_file(parent, "rustynet.ops.tmp.")?;
     if let Err(err) = write_private_bytes_to_file(tmp.as_path(), body.as_bytes()) {
@@ -4366,17 +4362,13 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
         }
         rewritten_lines.push(line.to_string());
     }
-    if !inserted {
-        if let Some(exit_node_id_value) = exit_node_id {
-            rewritten_lines.push(
-                format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", exit_node_id_value)
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "invalid assignment refresh exit node value {exit_node_id_value}: {err}"
-                        )
-                    }),
-            );
-        }
+    if !inserted && let Some(exit_node_id_value) = exit_node_id {
+        rewritten_lines.push(
+            format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", exit_node_id_value)
+                .unwrap_or_else(|err| {
+                    panic!("invalid assignment refresh exit node value {exit_node_id_value}: {err}")
+                }),
+        );
     }
     if rewritten_lines.is_empty() {
         return String::new();
