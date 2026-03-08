@@ -2,55 +2,55 @@
   "artifacts": [
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/compatibility_policy.json",
-      "artifact_sha256": "9b053d9cd41f704e607ad5f2d314510ce3fde2ce7949cb6eb665aa22def0c06e",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "1e2a6dd92f0acf67309a38f8075e86e734c6b9ef632059f5f39262d3d2f3f45b",
+      "captured_at_unix": 1772980572,
       "name": "compatibility_policy.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/slo_error_budget_report.json",
-      "artifact_sha256": "d3d813f28bc2ffccae262dc1b3a6528030ececa32475c5ecc5ed574a4feea440",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "747c8a67435ec5cb55f31cc2db14633958db46db290278d3bd072b97f8ebe12a",
+      "captured_at_unix": 1772980572,
       "name": "slo_error_budget_report.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/performance_budget_report.json",
-      "artifact_sha256": "5c463e45642b03e841d95dca12bf7da4c4f3c8beb44d6b7e8685523e13d5237d",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "f44cc3177d1dbec2f2110368b8bea867c3f8090e8928f5c1e20c725a6bc823ac",
+      "captured_at_unix": 1772980572,
       "name": "performance_budget_report.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/incident_drill_report.json",
-      "artifact_sha256": "38af40b974099212e233efd9b2985a2ff0641b1d062d89666ca6af8451047ddf",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "ec5331238a95e5029d020dd46e5f3fe752eff8621a53139a40f46455e37b7489",
+      "captured_at_unix": 1772980572,
       "name": "incident_drill_report.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/dr_failover_report.json",
-      "artifact_sha256": "ba2c3148d664c9c34c190ceebb2711fd15c1dac14eb154d2397bbf4f4b6d91e2",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "3dc335dfc21fb6ed078c61244be8b00b65566da5496553bfab696a8446dd877b",
+      "captured_at_unix": 1772980572,
       "name": "dr_failover_report.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/backend_agility_report.json",
-      "artifact_sha256": "60015ea159be34e26849b3f914f1c0fcf66b347384387c8b9b0fbdd407afb291",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "2274d9db3855f5677cb8f92627a4ecd290eabb1f1788241084989c4b8d836ddb",
+      "captured_at_unix": 1772980572,
       "name": "backend_agility_report.json"
     },
     {
       "artifact_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/crypto_deprecation_schedule.json",
-      "artifact_sha256": "0f9010762467e68d04efeb50a6d92e72824e429383b3e130a262b40245110e81",
-      "captured_at_unix": 1772978064,
+      "artifact_sha256": "cbbf1a1dab7f09a12a7e561e2618f5fe053f739848dd793593b7f473ca302ced",
+      "captured_at_unix": 1772980572,
       "name": "crypto_deprecation_schedule.json"
     }
   ],
   "command_digest_sha256": "c9f77c25bc903afe4d4f2caf3391281e679a48982dfba32187d4c6072b5a4e68",
   "environment": "ci",
-  "generated_at_unix": 1772978064,
-  "git_commit": "af5243a0ddc2cdca9e5dec7c928125ae3528d5dd",
+  "generated_at_unix": 1772980572,
+  "git_commit": "4500e386d557ef59b7d5744d188654a0035e5272",
   "host_identity": "ci-localhost",
   "phase": "phase9",
   "schema_version": 1,
-  "signature_hex": "fa077ff18a7a2c0c48c210e721a4407f43d65f43e36b4a595f7936dfe2c7de40f5f351ab09004e9241168d79ec9eb4c4c2ec2e6d2b7ac65e8060b184f2b04708",
+  "signature_hex": "7ce74d38596b7d30211faaa6fab63aedfb02526329df62f0857046330fa2140192a44132fcd4057d0b0c33d9184aa0fc281409e956a98cae85391fe62db17d0f",
   "signer_key_id": "ed25519:8016842956f60178",
   "verifier_key_hex": "910ddf4d31366ec143fef10d16160eabbbabee48e8c0040d795119ac19d5a307"
 }
