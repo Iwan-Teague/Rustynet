@@ -149,6 +149,11 @@ The summary files show:
 - return code
 - log path
 - stage description
+- run start timestamp
+- run finish timestamp
+- elapsed wall-clock runtime
+
+The terminal output also prints the run start time immediately when the script is invoked and prints total elapsed runtime again at the end of the run or dry-run.
 
 The failure digest files are intentionally smaller and optimized for triage:
 

@@ -9,6 +9,9 @@ source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
 
 SCRIPT_NAME="$(basename "$0")"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_STARTED_AT_UNIX="$(date +%s)"
+RUN_STARTED_AT_LOCAL="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 NETWORK_ID="rn-live-lab-${RUN_ID}"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 REPO_REF="working-tree"
@@ -51,6 +54,25 @@ SOURCE_MODE_EXPLICIT=0
 
 sanitize_text() {
   printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+format_elapsed_duration() {
+  local total_secs="${1:-0}"
+  local days hours minutes seconds
+  if (( total_secs < 0 )); then
+    total_secs=0
+  fi
+  days=$((total_secs / 86400))
+  hours=$(((total_secs % 86400) / 3600))
+  minutes=$(((total_secs % 3600) / 60))
+  seconds=$((total_secs % 60))
+  if (( days > 0 )); then
+    printf '%dd %02dh %02dm %02ds' "$days" "$hours" "$minutes" "$seconds"
+  elif (( hours > 0 )); then
+    printf '%02dh %02dm %02ds' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02dm %02ds' "$minutes" "$seconds"
+  fi
 }
 
 usage() {
@@ -1775,13 +1797,21 @@ PY
 }
 
 write_run_summary() {
-  python3 - "$NODES_TSV" "$STAGE_TSV" "$SUMMARY_JSON" "$SUMMARY_MD" "$RUN_ID" "$NETWORK_ID" "$REPORT_DIR" "$OVERALL_STATUS" <<'PY'
+  local finished_at_unix finished_at_local finished_at_utc elapsed_secs elapsed_human
+  finished_at_unix="$(date +%s)"
+  finished_at_local="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  elapsed_secs=$((finished_at_unix - RUN_STARTED_AT_UNIX))
+  elapsed_human="$(format_elapsed_duration "$elapsed_secs")"
+  python3 - "$NODES_TSV" "$STAGE_TSV" "$SUMMARY_JSON" "$SUMMARY_MD" "$RUN_ID" "$NETWORK_ID" "$REPORT_DIR" "$OVERALL_STATUS" "$RUN_STARTED_AT_LOCAL" "$RUN_STARTED_AT_UTC" "$RUN_STARTED_AT_UNIX" "$finished_at_local" "$finished_at_utc" "$finished_at_unix" "$elapsed_secs" "$elapsed_human" <<'PY'
 import csv
 import json
 import sys
 from pathlib import Path
 
-nodes_tsv, stages_tsv, summary_json, summary_md, run_id, network_id, report_dir, overall_status = sys.argv[1:]
+(nodes_tsv, stages_tsv, summary_json, summary_md, run_id, network_id, report_dir, overall_status,
+ started_at_local, started_at_utc, started_at_unix, finished_at_local, finished_at_utc, finished_at_unix,
+ elapsed_secs, elapsed_human) = sys.argv[1:]
 
 nodes = []
 with open(nodes_tsv, newline='', encoding='utf-8') as fh:
@@ -1821,6 +1851,14 @@ summary = {
     'network_id': network_id,
     'report_dir': report_dir,
     'overall_status': overall_status,
+    'started_at_local': started_at_local,
+    'started_at_utc': started_at_utc,
+    'started_at_unix': int(started_at_unix),
+    'finished_at_local': finished_at_local,
+    'finished_at_utc': finished_at_utc,
+    'finished_at_unix': int(finished_at_unix),
+    'elapsed_secs': int(elapsed_secs),
+    'elapsed_human': elapsed_human,
     'nodes': nodes,
     'stages': stages,
 }
@@ -1832,6 +1870,11 @@ lines.append('')
 lines.append(f'- overall_status: `{overall_status}`')
 lines.append(f'- network_id: `{network_id}`')
 lines.append(f'- report_dir: `{report_dir}`')
+lines.append(f'- started_at_local: `{started_at_local}`')
+lines.append(f'- started_at_utc: `{started_at_utc}`')
+lines.append(f'- finished_at_local: `{finished_at_local}`')
+lines.append(f'- finished_at_utc: `{finished_at_utc}`')
+lines.append(f'- elapsed: `{elapsed_human}`')
 lines.append('')
 lines.append('## Nodes')
 lines.append('')
@@ -2011,6 +2054,7 @@ remember_temp_password_files() {
 
 main() {
   parse_args "$@"
+  printf 'run started: %s (utc: %s)\n' "$RUN_STARTED_AT_LOCAL" "$RUN_STARTED_AT_UTC"
   maybe_prompt_for_default_profile
   if [[ -n "$PROFILE_PATH" ]]; then
     load_profile_file "$PROFILE_PATH"
@@ -2076,6 +2120,7 @@ main() {
       record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
     write_run_summary
+    printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
     printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
     return 0
@@ -2144,6 +2189,7 @@ main() {
   fi
 
   write_run_summary
+  printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
   printf 'run summary: %s\n' "$SUMMARY_MD"
   printf 'run summary json: %s\n' "$SUMMARY_JSON"
   printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
