@@ -146,7 +146,13 @@ live_lab_target_address() {
 
 live_lab_remote_src_dir() {
   local target="$1"
-  printf '/home/%s/Rustynet' "$(live_lab_target_user "$target")"
+  local user
+  user="$(live_lab_target_user "$target")"
+  if [[ "$user" == "root" ]]; then
+    printf '/root/Rustynet'
+    return 0
+  fi
+  printf '/home/%s/Rustynet' "$user"
 }
 
 live_lab_ssh() {
@@ -213,14 +219,14 @@ live_lab_push_sudo_password() {
   local existing
   for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
     if [[ "$existing" == "$target" ]]; then
-      live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass"
-      live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass"
+      live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
+      live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass" || return 1
       return 0
     fi
   done
   LIVE_LAB_REMOTE_CLEANUP_TARGETS+=("$target")
-  live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass"
-  live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass"
+  live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
+  live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass" || return 1
 }
 
 live_lab_run_root() {
@@ -313,16 +319,16 @@ live_lab_install_assignment_bundle() {
   local target="$1"
   local assignment_pub_local="$2"
   local assignment_bundle_local="$3"
-  live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub"
-  live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle"
-  live_lab_run_root "$target" "root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle"
+  live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
+  live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
+  live_lab_run_root "$target" "root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
 }
 
 live_lab_install_assignment_refresh_env() {
   local target="$1"
   local env_local="$2"
-  live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env"
-  live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env"
+  live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
+  live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
 }
 
 live_lab_enforce_host() {
@@ -331,7 +337,7 @@ live_lab_enforce_host() {
   local node_id="$3"
   local ssh_allow_cidrs="$4"
   local src_dir="$5"
-  live_lab_run_root "$target" "root rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'"
+  live_lab_run_root "$target" "root rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'" || return 1
 }
 
 live_lab_apply_role_coupling() {
@@ -345,7 +351,7 @@ live_lab_apply_role_coupling() {
   if [[ -n "$preferred_exit_node_id" ]]; then
     command+=" --preferred-exit-node-id '${preferred_exit_node_id}'"
   fi
-  live_lab_run_root "$target" "$command"
+  live_lab_run_root "$target" "$command" || return 1
 }
 
 live_lab_apply_lan_access_coupling() {
@@ -358,7 +364,7 @@ live_lab_apply_lan_access_coupling() {
   if [[ -n "$lan_routes" ]]; then
     command+=" --lan-routes '${lan_routes}'"
   fi
-  live_lab_run_root "$target" "$command"
+  live_lab_run_root "$target" "$command" || return 1
 }
 
 live_lab_wait_for_daemon_socket() {
@@ -366,7 +372,7 @@ live_lab_wait_for_daemon_socket() {
   local socket_path="${2:-/run/rustynet/rustynetd.sock}"
   local attempts="${3:-20}"
   local sleep_secs="${4:-2}"
-  live_lab_retry_root "$target" "root test -S '${socket_path}'" "$attempts" "$sleep_secs"
+  live_lab_retry_root "$target" "root test -S '${socket_path}'" "$attempts" "$sleep_secs" || return 1
 }
 
 live_lab_status() {
