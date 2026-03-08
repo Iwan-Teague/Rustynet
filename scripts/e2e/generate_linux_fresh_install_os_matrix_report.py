@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,7 +12,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--environment", required=True)
+    parser.add_argument("--source-mode", required=True)
     parser.add_argument("--expected-git-commit-file", required=True)
+    parser.add_argument("--git-status-file", required=True)
     parser.add_argument("--bootstrap-log", required=True)
     parser.add_argument("--baseline-log", required=True)
     parser.add_argument("--two-hop-report", required=True)
@@ -74,7 +75,7 @@ def dedupe(items):
     return out
 
 
-def load_json_report(path: Path, label: str, root: Path, head_commit: str) -> dict:
+def load_json_report(path: Path, label: str, root: Path, expected_commit: str) -> dict:
     require_file(path, label)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -82,8 +83,8 @@ def load_json_report(path: Path, label: str, root: Path, head_commit: str) -> di
     if payload.get("status") != "pass":
         fail(f"{label} status must be pass")
     git_commit = str(payload.get("git_commit", "")).lower()
-    if git_commit != head_commit:
-        fail(f"{label} git_commit mismatch: {git_commit} != {head_commit}")
+    if git_commit != expected_commit:
+        fail(f"{label} git_commit mismatch: {git_commit} != {expected_commit}")
     if payload.get("evidence_mode") != "measured":
         fail(f"{label} evidence_mode must be measured")
     payload["normalized_source_artifacts"] = normalize_source_artifacts(
@@ -103,15 +104,12 @@ expected_commit_path = require_file(Path(args.expected_git_commit_file), "expect
 expected_commit = expected_commit_path.read_text(encoding="utf-8").strip().lower()
 if len(expected_commit) != 40:
     fail(f"invalid expected git commit in {expected_commit_path}: {expected_commit}")
-head_commit = (
-    subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True)
-    .strip()
-    .lower()
-)
-if expected_commit != head_commit:
+git_status_path = require_file(Path(args.git_status_file), "git status file")
+git_status = git_status_path.read_text(encoding="utf-8", errors="ignore").strip()
+if args.source_mode == "working-tree" and git_status:
     fail(
-        "live lab source commit does not match local HEAD; "
-        f"source archive used {expected_commit} but local HEAD is {head_commit}"
+        "cannot generate commit-bound fresh install OS matrix report from a dirty "
+        "working tree; commit or stash local changes first"
     )
 
 bootstrap_log = require_file(Path(args.bootstrap_log), "bootstrap log")
@@ -131,10 +129,10 @@ role_switch_report_path = Path(args.role_switch_report)
 lan_toggle_report_path = Path(args.lan_toggle_report)
 exit_handoff_report_path = Path(args.exit_handoff_report)
 
-two_hop = load_json_report(two_hop_report_path, "two-hop report", root, head_commit)
-role_switch = load_json_report(role_switch_report_path, "role-switch report", root, head_commit)
-lan_toggle = load_json_report(lan_toggle_report_path, "LAN toggle report", root, head_commit)
-exit_handoff = load_json_report(exit_handoff_report_path, "exit handoff report", root, head_commit)
+two_hop = load_json_report(two_hop_report_path, "two-hop report", root, expected_commit)
+role_switch = load_json_report(role_switch_report_path, "role-switch report", root, expected_commit)
+lan_toggle = load_json_report(lan_toggle_report_path, "LAN toggle report", root, expected_commit)
+exit_handoff = load_json_report(exit_handoff_report_path, "exit handoff report", root, expected_commit)
 
 role_switch_source_value = role_switch.get("source_artifact")
 if not isinstance(role_switch_source_value, str) or not role_switch_source_value.strip():
@@ -250,7 +248,7 @@ report = {
     "evidence_mode": "measured",
     "environment": args.environment,
     "captured_at_unix": report_time,
-    "git_commit": head_commit,
+    "git_commit": expected_commit,
     "source_artifacts": dedupe(
         [
             bootstrap_source,

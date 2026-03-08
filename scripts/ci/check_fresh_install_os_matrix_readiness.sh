@@ -7,8 +7,9 @@ cd "$ROOT_DIR"
 REPORT_PATH="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH:-artifacts/phase10/fresh_install_os_matrix_report.json}"
 MAX_AGE_SECONDS="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_MAX_AGE_SECONDS:-604800}"
 PROFILE="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE:-cross_platform}"
+EXPECTED_GIT_COMMIT="${RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT:-}"
 
-python3 - "$REPORT_PATH" "$MAX_AGE_SECONDS" "$PROFILE" <<'PY'
+python3 - "$REPORT_PATH" "$MAX_AGE_SECONDS" "$PROFILE" "$EXPECTED_GIT_COMMIT" <<'PY'
 import json
 import re
 import subprocess
@@ -19,6 +20,7 @@ from pathlib import Path
 report_path = Path(sys.argv[1])
 max_age_seconds = int(sys.argv[2])
 profile = sys.argv[3]
+expected_git_commit_arg = sys.argv[4].strip().lower()
 now_unix = int(time.time())
 
 if profile == "cross_platform":
@@ -151,10 +153,16 @@ head_commit = (
     .strip()
     .lower()
 )
-if git_commit != head_commit:
+expected_commit = expected_git_commit_arg or head_commit
+if expected_git_commit_arg and not re.fullmatch(r"[0-9a-f]{40}", expected_git_commit_arg):
     fail(
-        "fresh install OS matrix report git_commit does not match current HEAD; "
-        "rerun matrix tests on this exact commit"
+        "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT must be a 40-char "
+        "lowercase hex SHA when set"
+    )
+if git_commit != expected_commit:
+    fail(
+        "fresh install OS matrix report git_commit does not match expected commit; "
+        f"report={git_commit} expected={expected_commit}"
     )
 
 security_assertions = payload.get("security_assertions")

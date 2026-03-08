@@ -196,7 +196,8 @@ PY
 
 overall_status="pass"
 
-git_commit="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+git_commit="${RUSTYNET_EXPECTED_GIT_COMMIT:-$(git rev-parse HEAD)}"
+git_commit="$(printf '%s' "$git_commit" | tr '[:upper:]' '[:lower:]')"
 captured_at_unix="$(date -u +%s)"
 captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

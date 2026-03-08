@@ -202,6 +202,10 @@ Important:
 - `origin-main` fetches and archives the latest committed remote `main`
 - interactive branch selection can also deploy other fetched remote branches such as `origin/testing`
 - if you want every VM on the latest committed repo state, use `origin-main`
+- formal commit-bound gate evidence is fail-closed on provenance drift:
+  - the live evidence reports are stamped with the deployed commit, not merely local workspace `HEAD`
+  - the local full gate suite refuses mixed-source attestation when the deployed commit differs from local `HEAD`
+  - the fresh-install OS matrix report refuses dirty working-tree provenance for commit-bound evidence
 
 Non-interactive, full five-node topology:
 

@@ -4,7 +4,7 @@
     "network_profile": "lan",
     "os": "debian-13"
   },
-  "captured_at_unix": 1772977801,
+  "captured_at_unix": 1772978064,
   "environment": "ci",
   "evidence_mode": "measured",
   "idle_cpu_percent": 1.31,

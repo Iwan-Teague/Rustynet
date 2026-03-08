@@ -289,7 +289,8 @@ done
 
 captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 captured_at_unix="$(date -u +%s)"
-git_commit="$(git rev-parse HEAD)"
+git_commit="${RUSTYNET_EXPECTED_GIT_COMMIT:-$(git rev-parse HEAD)}"
+git_commit="$(printf '%s' "$git_commit" | tr '[:upper:]' '[:lower:]')"
 cat > "$REPORT_PATH" <<EOF_REPORT
 {
   "phase": "phase10",

@@ -1237,6 +1237,29 @@ current_run_git_commit_short() {
   printf '%.7s' "$commit"
 }
 
+current_local_head_commit() {
+  git -C "$ROOT_DIR" rev-parse HEAD | tr '[:upper:]' '[:lower:]'
+}
+
+current_run_git_status_is_dirty() {
+  [[ -s "$STATE_DIR/git_status.txt" ]]
+}
+
+assert_local_gate_suite_provenance() {
+  local deployed_commit local_head
+  deployed_commit="$(current_run_git_commit)"
+  local_head="$(current_local_head_commit)"
+  if [[ "$deployed_commit" != "$local_head" ]]; then
+    printf 'local full gate suite refuses mixed-source attestation: deployed commit %s differs from local HEAD %s\n' \
+      "$deployed_commit" "$local_head" >&2
+    return 1
+  fi
+  if [[ "$SOURCE_MODE" == "working-tree" ]] && current_run_git_status_is_dirty; then
+    printf 'local full gate suite refuses dirty-working-tree attestation: commit-bound evidence requires a clean working tree or an explicit committed ref\n' >&2
+    return 1
+  fi
+}
+
 stage_run_live_role_switch_matrix() {
   local commit_short role_report role_source role_log
   if ! has_label entry || ! has_label aux || ! has_label extra; then
@@ -1248,6 +1271,7 @@ stage_run_live_role_switch_matrix() {
   role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
   role_source="$REPORT_DIR/source/role_switch_matrix_${commit_short}.md"
   role_log="$REPORT_DIR/live_linux_role_switch_matrix.log"
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1267,9 +1291,12 @@ stage_run_live_role_switch_matrix() {
 
 stage_run_local_full_gate_suite() {
   local gate_log="$VERIFICATION_DIR/full_gate_suite_${RUN_ID}.log"
+  assert_local_gate_suite_provenance || return 1
   mkdir -p "$VERIFICATION_DIR"
   : > "$gate_log"
   export RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=linux
+  export RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT
+  RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT="$(current_run_git_commit)"
   run_gate() {
     local script="$1"
     local rc=0
@@ -1316,6 +1343,7 @@ stage_run_live_exit_handoff() {
   fi
   alternate_target="$(node_target_for_label "$alternate_label")"
   alternate_node_id="$(node_id_for_label "$alternate_label")"
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1344,6 +1372,7 @@ stage_run_live_two_hop() {
   fi
   second_client_target="$(node_target_for_label "$second_client_label")"
   second_client_node_id="$(node_id_for_label "$second_client_label")"
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1365,6 +1394,7 @@ stage_run_live_lan_toggle() {
     printf 'LAN toggle requires aux target\n' >&2
     return 1
   fi
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1391,7 +1421,9 @@ stage_generate_fresh_install_os_matrix_report() {
   python3 "$ROOT_DIR/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py" \
     --output "$canonical_report" \
     --environment "linux-live-lab-orchestrator:${NETWORK_ID}" \
+    --source-mode "$SOURCE_MODE" \
     --expected-git-commit-file "$STATE_DIR/git_head.txt" \
+    --git-status-file "$STATE_DIR/git_status.txt" \
     --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
     --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
     --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
@@ -1436,6 +1468,7 @@ stage_run_extended_soak() {
   if [[ "$SOAK_HARD_FAIL" -eq 1 ]]; then
     severity_name="hard"
   fi
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1451,6 +1484,7 @@ stage_run_extended_soak() {
     --report-path "$REPORT_DIR/live_linux_two_hop_soak_pre_reboot_report.json" \
     --log-path "$REPORT_DIR/live_linux_two_hop_soak_pre_reboot.log"
 
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1467,6 +1501,7 @@ stage_run_extended_soak() {
     --log-path "$REPORT_DIR/live_linux_exit_handoff_soak.log" \
     --monitor-log "$REPORT_DIR/live_linux_exit_handoff_soak_monitor.log"
 
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1525,6 +1560,7 @@ stage_run_reboot_recovery_report() {
 
   if [[ "$exit_return" == "pass" && "$exit_boot_change" == "pass" ]]; then
     if has_label extra; then
+      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
         --ssh-password-file "$SSH_PASSWORD_FILE" \
         --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1540,6 +1576,7 @@ stage_run_reboot_recovery_report() {
         --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot_report.json" \
         --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log"
     else
+      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
         --ssh-password-file "$SSH_PASSWORD_FILE" \
         --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1590,6 +1627,7 @@ PY
 
   if [[ "$client_return" == "pass" && "$client_boot_change" == "pass" ]]; then
     if has_label extra; then
+      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
         --ssh-password-file "$SSH_PASSWORD_FILE" \
         --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1605,6 +1643,7 @@ PY
         --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot_report.json" \
         --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log"
     else
+      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
         --ssh-password-file "$SSH_PASSWORD_FILE" \
         --sudo-password-file "$SUDO_PASSWORD_FILE" \
@@ -1626,6 +1665,7 @@ PY
   fi
 
   if [[ "$client_return" == "fail" && -n "$extra_target" ]]; then
+    RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
       --ssh-password-file "$SSH_PASSWORD_FILE" \
       --sudo-password-file "$SUDO_PASSWORD_FILE" \
