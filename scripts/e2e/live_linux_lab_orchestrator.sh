@@ -19,6 +19,8 @@ VERIFICATION_DIR="${REPORT_DIR}/verification"
 STATE_DIR="${REPORT_DIR}/state"
 SUMMARY_JSON="${REPORT_DIR}/run_summary.json"
 SUMMARY_MD="${REPORT_DIR}/run_summary.md"
+FAILURE_DIGEST_JSON="${REPORT_DIR}/failure_digest.json"
+FAILURE_DIGEST_MD="${REPORT_DIR}/failure_digest.md"
 STAGE_TSV="${STATE_DIR}/stages.tsv"
 NODES_TSV="${STATE_DIR}/nodes.tsv"
 SOURCE_ARCHIVE="${STATE_DIR}/rustynet-source.tar.gz"
@@ -258,6 +260,8 @@ load_profile_file() {
           STATE_DIR="$REPORT_DIR/state"
           SUMMARY_JSON="$REPORT_DIR/run_summary.json"
           SUMMARY_MD="$REPORT_DIR/run_summary.md"
+          FAILURE_DIGEST_JSON="$REPORT_DIR/failure_digest.json"
+          FAILURE_DIGEST_MD="$REPORT_DIR/failure_digest.md"
           STAGE_TSV="$STATE_DIR/stages.tsv"
           NODES_TSV="$STATE_DIR/nodes.tsv"
           SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"
@@ -571,6 +575,7 @@ record_stage_skip() {
   local log_path="$LOG_DIR/${stage_name}.log"
   : > "$log_path"
   record_stage "$stage_name" "$severity" "skipped" "0" "$log_path" "$message" "$(date -u +%FT%TZ)" "$(date -u +%FT%TZ)"
+  refresh_failure_digest
 }
 
 update_overall_status() {
@@ -611,11 +616,13 @@ run_stage() {
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
     printf '[stage:%s] FAIL rc=%s\n' "$stage_name" "$rc" | tee -a "$log_path"
+    printf '[stage:%s] failure digest: %s\n' "$stage_name" "$FAILURE_DIGEST_MD" | tee -a "$log_path"
   else
     printf '[stage:%s] PASS\n' "$stage_name" | tee -a "$log_path"
   fi
   record_stage "$stage_name" "$severity" "$status" "$rc" "$log_path" "$description" "$started_at" "$finished_at"
   update_overall_status "$severity" "$status"
+  refresh_failure_digest
   if [[ "$status" == "fail" && "$severity" == "hard" ]]; then
     write_run_summary
     return "$rc"
@@ -648,7 +655,7 @@ run_parallel_node_stage() {
   local stage_name="$1"
   local worker_fn="$2"
   local scope="${3:-all}"
-  local stage_dir workers_tsv worker_count=0 failed=0
+  local stage_dir workers_tsv results_tsv worker_count=0 failed=0
   local label target node_id role pid log_path rc
 
   case "$scope" in
@@ -662,9 +669,11 @@ run_parallel_node_stage() {
 
   stage_dir="$(parallel_stage_dir "$stage_name")"
   workers_tsv="${stage_dir}/workers.tsv"
+  results_tsv="${stage_dir}/results.tsv"
   rm -rf "$stage_dir"
   mkdir -p "$stage_dir"
   : > "$workers_tsv"
+  : > "$results_tsv"
 
   while IFS=$'\t' read -r label target node_id role; do
     if ! parallel_stage_scope_matches "$scope" "$label"; then
@@ -693,6 +702,7 @@ run_parallel_node_stage() {
       rc=$?
       failed=1
     fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$role" "$rc" "$log_path" >> "$results_tsv"
     printf '[parallel:%s] %s %s rc=%s\n' "$stage_name" "$label" "$target" "$rc"
     printf -- '----- %s/%s (%s %s) BEGIN -----\n' "$stage_name" "$label" "$node_id" "$role"
     cat "$log_path"
@@ -1747,6 +1757,26 @@ Path(summary_md).write_text('\n'.join(lines) + '\n', encoding='utf-8')
 PY
 }
 
+refresh_failure_digest() {
+  if [[ ! -f "$NODES_TSV" || ! -f "$STAGE_TSV" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$ROOT_DIR/scripts/e2e/generate_live_linux_lab_failure_digest.py" ]]; then
+    return 0
+  fi
+  if ! python3 "$ROOT_DIR/scripts/e2e/generate_live_linux_lab_failure_digest.py" \
+    --nodes-tsv "$NODES_TSV" \
+    --stages-tsv "$STAGE_TSV" \
+    --report-dir "$REPORT_DIR" \
+    --run-id "$RUN_ID" \
+    --network-id "$NETWORK_ID" \
+    --overall-status "$OVERALL_STATUS" \
+    --output-json "$FAILURE_DIGEST_JSON" \
+    --output-md "$FAILURE_DIGEST_MD" >/dev/null; then
+    printf 'warning: failed to refresh condensed failure digest at %s\n' "$FAILURE_DIGEST_MD" >&2
+  fi
+}
+
 cleanup_local_password_files() {
   if [[ -n "$TEMP_SSH_PASSWORD_FILE" && -f "$TEMP_SSH_PASSWORD_FILE" ]]; then
     rm -f "$TEMP_SSH_PASSWORD_FILE"
@@ -1778,7 +1808,7 @@ parse_args() {
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
       --repo-ref) REPO_REF="$2"; SOURCE_MODE="ref"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
-      --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
+      --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; FAILURE_DIGEST_JSON="$REPORT_DIR/failure_digest.json"; FAILURE_DIGEST_MD="$REPORT_DIR/failure_digest.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
       --skip-gates) RUN_LOCAL_GATES=0; shift ;;
       --skip-soak) RUN_SOAK=0; shift ;;
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
@@ -1894,6 +1924,7 @@ main() {
   ensure_password_inputs
   remember_temp_password_files
   build_nodes_file
+  refresh_failure_digest
   validate_topology_inputs
   validate_source_mode
 
@@ -1939,6 +1970,7 @@ main() {
     fi
     write_run_summary
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
+    printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
     return 0
   fi
 
@@ -2007,6 +2039,7 @@ main() {
   write_run_summary
   printf 'run summary: %s\n' "$SUMMARY_MD"
   printf 'run summary json: %s\n' "$SUMMARY_JSON"
+  printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
   if [[ "$OVERALL_STATUS" == "fail" ]]; then
     return 1
   fi

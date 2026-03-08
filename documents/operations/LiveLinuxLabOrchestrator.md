@@ -129,6 +129,8 @@ Important outputs:
 
 - `run_summary.json`
 - `run_summary.md`
+- `failure_digest.json`
+- `failure_digest.md`
 - `logs/<stage>.log`
 - `verification/full_gate_suite_<timestamp>.log` when gates are enabled
 - live test JSON reports written by the reused `scripts/e2e/` test scripts
@@ -142,6 +144,16 @@ The summary files show:
 - return code
 - log path
 - stage description
+
+The failure digest files are intentionally smaller and optimized for triage:
+
+- one-line condensed result per completed stage
+- a single first-failure focus block
+- failing node labels/targets for parallel stages
+- most likely failure reason extracted from the relevant worker or stage log
+- direct path to the full log when deeper inspection is needed
+
+On any hard-fail stage, the orchestrator also prints the `failure_digest.md` path immediately in the terminal output so you can jump straight to the compact triage view.
 
 For parallel stages, the stage log also contains worker-delimited blocks so you can see:
 
