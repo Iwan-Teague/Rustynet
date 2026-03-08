@@ -1355,8 +1355,7 @@ fn parse_peer_latest_handshake_unix(
 ) -> Result<Option<u64>, BackendError> {
     if stdout.len() > WG_LATEST_HANDSHAKES_MAX_BYTES {
         return Err(BackendError::internal(format!(
-            "wg latest-handshakes output exceeded {} bytes",
-            WG_LATEST_HANDSHAKES_MAX_BYTES
+            "wg latest-handshakes output exceeded {WG_LATEST_HANDSHAKES_MAX_BYTES} bytes"
         )));
     }
 

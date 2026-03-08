@@ -51,6 +51,10 @@ if {\$argc < 3 || \$argc > 4} {
   puts stderr "usage: ssh_pass.expect <password-file> <target> <command> ?timeout?"
   exit 2
 }
+if {![info exists env(LIVE_LAB_KNOWN_HOSTS)] || \$env(LIVE_LAB_KNOWN_HOSTS) eq ""} {
+  puts stderr "LIVE_LAB_KNOWN_HOSTS is required"
+  exit 2
+}
 set password_file [lindex \$argv 0]
 set target [lindex \$argv 1]
 set command [lindex \$argv 2]
@@ -64,7 +68,7 @@ close \$fh
 set output ""
 match_max 2000000
 log_user 0
-spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$target \$command
+spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$target \$command
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
@@ -73,7 +77,15 @@ while {1} {
       exp_continue
     }
     eof {
-      puts -nonewline \$output
+      regsub -all "\r" \$output "" normalized
+      set cleaned ""
+      foreach line [split \$normalized "\n"] {
+        if {[string trim \$line] eq ""} {
+          continue
+        }
+        append cleaned \$line "\n"
+      }
+      puts -nonewline [string trimright \$cleaned "\n"]
       catch wait result
       exit [lindex \$result 3]
     }
@@ -85,6 +97,10 @@ EXPECTSSH
 #!/usr/bin/expect -f
 if {\$argc < 3 || \$argc > 4} {
   puts stderr "usage: scp_pass.expect <password-file> <source> <target> ?timeout?"
+  exit 2
+}
+if {![info exists env(LIVE_LAB_KNOWN_HOSTS)] || \$env(LIVE_LAB_KNOWN_HOSTS) eq ""} {
+  puts stderr "LIVE_LAB_KNOWN_HOSTS is required"
   exit 2
 }
 set password_file [lindex \$argv 0]
@@ -100,7 +116,7 @@ close \$fh
 set output ""
 match_max 2000000
 log_user 0
-spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$LIVE_LAB_KNOWN_HOSTS -o ConnectTimeout=15 -- \$source \$target
+spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$source \$target
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
@@ -109,7 +125,15 @@ while {1} {
       exp_continue
     }
     eof {
-      puts -nonewline \$output
+      regsub -all "\r" \$output "" normalized
+      set cleaned ""
+      foreach line [split \$normalized "\n"] {
+        if {[string trim \$line] eq ""} {
+          continue
+        }
+        append cleaned \$line "\n"
+      }
+      puts -nonewline [string trimright \$cleaned "\n"]
       catch wait result
       exit [lindex \$result 3]
     }
@@ -128,6 +152,14 @@ live_lab_cleanup() {
   if [[ -n "${LIVE_LAB_WORK_DIR:-}" && -d "${LIVE_LAB_WORK_DIR}" ]]; then
     rm -rf "$LIVE_LAB_WORK_DIR"
   fi
+}
+
+live_lab_prepare_worker_known_hosts() {
+  local worker_name="$1"
+  local worker_known_hosts="$LIVE_LAB_WORK_DIR/known_hosts.${worker_name}"
+  : > "$worker_known_hosts"
+  chmod 600 "$worker_known_hosts"
+  export LIVE_LAB_KNOWN_HOSTS="$worker_known_hosts"
 }
 
 live_lab_log() {
@@ -347,6 +379,7 @@ live_lab_apply_role_coupling() {
   local enable_exit_advertise="${4:-false}"
   local env_path="${5:-/etc/rustynet/assignment-refresh.env}"
   local command
+  live_lab_push_sudo_password "$target" || return 1
   command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-role-coupling --target-role '${target_role}' --enable-exit-advertise '${enable_exit_advertise}' --env-path '${env_path}'"
   if [[ -n "$preferred_exit_node_id" ]]; then
     command+=" --preferred-exit-node-id '${preferred_exit_node_id}'"
@@ -360,6 +393,7 @@ live_lab_apply_lan_access_coupling() {
   local lan_routes="${3:-}"
   local env_path="${4:-/etc/rustynet/assignment-refresh.env}"
   local command
+  live_lab_push_sudo_password "$target" || return 1
   command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-lan-access-coupling --enable '${enable}' --env-path '${env_path}'"
   if [[ -n "$lan_routes" ]]; then
     command+=" --lan-routes '${lan_routes}'"

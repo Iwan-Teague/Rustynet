@@ -12,6 +12,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 NETWORK_ID="rn-live-lab-${RUN_ID}"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 REPO_REF="working-tree"
+SOURCE_MODE="working-tree"
 REPORT_DIR="${ROOT_DIR}/artifacts/live_lab/${RUN_ID}"
 LOG_DIR="${REPORT_DIR}/logs"
 VERIFICATION_DIR="${REPORT_DIR}/verification"
@@ -39,6 +40,9 @@ CLIENT_TARGET=""
 ENTRY_TARGET=""
 AUX_TARGET=""
 EXTRA_TARGET=""
+PROFILE_PATH=""
+DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/iwan_vm_lab.env"
+SOURCE_MODE_EXPLICIT=0
 
 sanitize_text() {
   printf '%s' "$1" | tr '\t\r\n' '   '
@@ -51,6 +55,10 @@ usage: ${SCRIPT_NAME} [options]
 Interactive by default. If any required target/password input is missing, the script prompts.
 
 options:
+  --profile <path>               Load saved lab profile (.env-style)
+  --source-mode <mode>           Source mode: working-tree | local-head | origin-main
+  --use-origin-main              Fetch and archive latest committed origin/main
+  --use-local-head               Archive local committed HEAD instead of working tree
   --exit-target <user@ip|ip>     Primary exit node target
   --client-target <user@ip|ip>   Primary client node target
   --entry-target <user@ip|ip>    Entry relay / alternate exit target
@@ -60,7 +68,7 @@ options:
   --sudo-password-file <path>    File containing sudo password (defaults to SSH password)
   --network-id <id>              Override generated network ID
   --ssh-allow-cidrs <cidrs>      SSH management CIDRs (default: ${SSH_ALLOW_CIDRS})
-  --repo-ref <ref>               Git ref to archive instead of current working tree
+  --repo-ref <ref>               Explicit git ref to archive (implies source-mode=ref)
   --report-dir <path>            Override report output directory
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
@@ -95,12 +103,207 @@ prompt_secret() {
   printf '%s' "$reply"
 }
 
+prompt_yes_no() {
+  local prompt="$1"
+  local default_answer="${2:-y}"
+  local suffix='[y/N]'
+  local reply=""
+  if [[ "$default_answer" == "y" || "$default_answer" == "Y" ]]; then
+    suffix='[Y/n]'
+  fi
+  while true; do
+    printf '%s %s: ' "$prompt" "$suffix" >&2
+    read -r reply
+    reply="$(trim_ascii "$reply")"
+    if [[ -z "$reply" ]]; then
+      reply="$default_answer"
+    fi
+    case "$reply" in
+      y|Y|yes|YES|Yes) return 0 ;;
+      n|N|no|NO|No) return 1 ;;
+      *) printf 'please answer yes or no\n' >&2 ;;
+    esac
+  done
+}
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$cmd" >&2
     return 1
   fi
+}
+
+trim_ascii() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+is_valid_ipv4() {
+  local ip="$1"
+  local octet
+  local IFS='.'
+  read -r -a octets <<< "$ip"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    ((octet >= 0 && octet <= 255)) || return 1
+  done
+}
+
+host_part_from_target() {
+  local target="$1"
+  if [[ "$target" == *"@"* ]]; then
+    printf '%s' "${target#*@}"
+  else
+    printf '%s' "$target"
+  fi
+}
+
+validate_target_host() {
+  local label="$1"
+  local target="$2"
+  local host
+  host="$(host_part_from_target "$target")"
+  if [[ -z "$host" ]]; then
+    printf 'missing host for %s target\n' "$label" >&2
+    return 1
+  fi
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if ! is_valid_ipv4 "$host"; then
+      printf 'invalid IPv4 address for %s target: %s\n' "$label" "$host" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'invalid host syntax for %s target: %s\n' "$label" "$host" >&2
+    return 1
+  fi
+}
+
+load_profile_file() {
+  local profile_path="$1"
+  local line key value
+  if [[ ! -f "$profile_path" ]]; then
+    printf 'missing profile file: %s\n' "$profile_path" >&2
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim_ascii "$line")"
+    [[ -n "$line" ]] || continue
+    [[ "${line:0:1}" == "#" ]] && continue
+    if [[ "$line" != *=* ]]; then
+      printf 'invalid profile line (expected KEY=VALUE): %s\n' "$line" >&2
+      return 1
+    fi
+    key="$(trim_ascii "${line%%=*}")"
+    value="${line#*=}"
+    value="$(trim_ascii "$value")"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    case "$key" in
+      EXIT_TARGET) [[ -z "$EXIT_TARGET" ]] && EXIT_TARGET="$value" ;;
+      CLIENT_TARGET) [[ -z "$CLIENT_TARGET" ]] && CLIENT_TARGET="$value" ;;
+      ENTRY_TARGET) [[ -z "$ENTRY_TARGET" ]] && ENTRY_TARGET="$value" ;;
+      AUX_TARGET) [[ -z "$AUX_TARGET" ]] && AUX_TARGET="$value" ;;
+      EXTRA_TARGET) [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value" ;;
+      SSH_PASSWORD_FILE) [[ -z "$SSH_PASSWORD_FILE" ]] && SSH_PASSWORD_FILE="$value" ;;
+      SUDO_PASSWORD_FILE) [[ -z "$SUDO_PASSWORD_FILE" ]] && SUDO_PASSWORD_FILE="$value" ;;
+      NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
+      SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
+      SOURCE_MODE)
+        if [[ "$SOURCE_MODE" == "working-tree" && "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
+          SOURCE_MODE="$value"
+        fi
+        SOURCE_MODE_EXPLICIT=1
+        ;;
+      REPO_REF)
+        if [[ "$REPO_REF" == "working-tree" ]]; then
+          REPO_REF="$value"
+        fi
+        SOURCE_MODE="ref"
+        SOURCE_MODE_EXPLICIT=1
+        ;;
+      REPORT_DIR)
+        if [[ "$REPORT_DIR" == "${ROOT_DIR}/artifacts/live_lab/${RUN_ID}" ]]; then
+          REPORT_DIR="$value"
+          LOG_DIR="$REPORT_DIR/logs"
+          VERIFICATION_DIR="$REPORT_DIR/verification"
+          STATE_DIR="$REPORT_DIR/state"
+          SUMMARY_JSON="$REPORT_DIR/run_summary.json"
+          SUMMARY_MD="$REPORT_DIR/run_summary.md"
+          STAGE_TSV="$STATE_DIR/stages.tsv"
+          NODES_TSV="$STATE_DIR/nodes.tsv"
+          SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"
+          PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"
+          ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"
+        fi
+        ;;
+      '')
+        ;;
+      *)
+        printf 'unsupported profile key: %s\n' "$key" >&2
+        return 1
+        ;;
+    esac
+  done < "$profile_path"
+}
+
+validate_source_mode() {
+  case "$SOURCE_MODE" in
+    working-tree|local-head|origin-main|ref)
+      ;;
+    *)
+      printf 'unsupported source mode: %s\n' "$SOURCE_MODE" >&2
+      return 1
+      ;;
+  esac
+  if [[ "$SOURCE_MODE" == "ref" ]]; then
+    if [[ -z "$REPO_REF" || "$REPO_REF" == "working-tree" ]]; then
+      printf 'source-mode=ref requires --repo-ref <ref>\n' >&2
+      return 1
+    fi
+  fi
+}
+
+resolve_source_ref() {
+  case "$SOURCE_MODE" in
+    local-head)
+      printf 'HEAD'
+      ;;
+    origin-main)
+      printf 'origin/main'
+      ;;
+    ref)
+      printf '%s' "$REPO_REF"
+      ;;
+    *)
+      printf ''
+      ;;
+  esac
+}
+
+describe_source_mode() {
+  case "$SOURCE_MODE" in
+    working-tree)
+      printf 'local working tree'
+      ;;
+    local-head)
+      printf 'local committed HEAD'
+      ;;
+    origin-main)
+      printf 'latest committed origin/main'
+      ;;
+    ref)
+      printf 'git ref %s' "$REPO_REF"
+      ;;
+  esac
 }
 
 node_target_for_label() {
@@ -259,6 +462,85 @@ run_stage() {
   return 0
 }
 
+parallel_stage_dir() {
+  local stage_name="$1"
+  printf '%s/parallel-%s' "$STATE_DIR" "$stage_name"
+}
+
+parallel_stage_scope_matches() {
+  local scope="$1"
+  local label="$2"
+  case "$scope" in
+    all) return 0 ;;
+    non_exit)
+      [[ "$label" != "exit" ]]
+      return
+      ;;
+    *)
+      printf 'unsupported parallel scope: %s\n' "$scope" >&2
+      return 1
+      ;;
+  esac
+}
+
+run_parallel_node_stage() {
+  local stage_name="$1"
+  local worker_fn="$2"
+  local scope="${3:-all}"
+  local stage_dir workers_tsv worker_count=0 failed=0
+  local label target node_id role pid log_path rc
+
+  case "$scope" in
+    all|non_exit)
+      ;;
+    *)
+      printf 'unsupported parallel scope: %s\n' "$scope" >&2
+      return 1
+      ;;
+  esac
+
+  stage_dir="$(parallel_stage_dir "$stage_name")"
+  workers_tsv="${stage_dir}/workers.tsv"
+  rm -rf "$stage_dir"
+  mkdir -p "$stage_dir"
+  : > "$workers_tsv"
+
+  while IFS=$'\t' read -r label target node_id role; do
+    if ! parallel_stage_scope_matches "$scope" "$label"; then
+      continue
+    fi
+    log_path="${stage_dir}/${label}.log"
+    (
+      set -euo pipefail
+      live_lab_prepare_worker_known_hosts "${stage_name}.${label}"
+      "$worker_fn" "$label" "$target" "$node_id" "$role"
+    ) >"$log_path" 2>&1 &
+    pid=$!
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$role" "$pid" "$log_path" >> "$workers_tsv"
+    worker_count=$((worker_count + 1))
+  done < "$NODES_TSV"
+
+  if [[ "$worker_count" -eq 0 ]]; then
+    printf '[parallel:%s] no workers matched scope=%s\n' "$stage_name" "$scope"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r label target node_id role pid log_path; do
+    if wait "$pid"; then
+      rc=0
+    else
+      rc=$?
+      failed=1
+    fi
+    printf '[parallel:%s] %s %s rc=%s\n' "$stage_name" "$label" "$target" "$rc"
+    printf -- '----- %s/%s (%s %s) BEGIN -----\n' "$stage_name" "$label" "$node_id" "$role"
+    cat "$log_path"
+    printf -- '\n----- %s/%s END -----\n' "$stage_name" "$label"
+  done < "$workers_tsv"
+
+  [[ "$failed" -eq 0 ]]
+}
+
 append_env_assignment() {
   local env_path="$1"
   local key="$2"
@@ -279,6 +561,24 @@ build_nodes_file() {
   if [[ -n "$EXTRA_TARGET" ]]; then
     record_node "extra" "$EXTRA_TARGET" "client-4" "client"
   fi
+}
+
+validate_topology_inputs() {
+  local label target host
+  local seen_hosts_file="${STATE_DIR}/seen-hosts.tsv"
+  : > "$seen_hosts_file"
+  while IFS=$'\t' read -r label target _node_id _role; do
+    [[ -n "$target" ]] || continue
+    validate_target_host "$label" "$target" || return 1
+    host="$(host_part_from_target "$target")"
+    if awk -F '\t' -v host="$host" '($1 == host) { found=1; exit } END { exit(found ? 0 : 1) }' "$seen_hosts_file"; then
+      local prior_label
+      prior_label="$(awk -F '\t' -v host="$host" '($1 == host) { print $2; exit }' "$seen_hosts_file")"
+      printf 'duplicate host configured for %s and %s: %s\n' "$prior_label" "$label" "$host" >&2
+      return 1
+    fi
+    printf '%s\t%s\n' "$host" "$label" >> "$seen_hosts_file"
+  done < "$NODES_TSV"
 }
 
 register_cleanup_targets() {
@@ -481,11 +781,14 @@ EOF_ASSIGN
 }
 
 prime_remote_access() {
-  local label target
-  while IFS=$'\t' read -r label target _node_id _role; do
-    printf '[prime-remote] %s %s\n' "$label" "$target"
-    live_lab_push_sudo_password "$target" || return 1
-  done < "$NODES_TSV"
+  run_parallel_node_stage prime_remote_access prime_remote_access_worker
+}
+
+prime_remote_access_worker() {
+  local label="$1"
+  local target="$2"
+  printf '[prime-remote] %s %s\n' "$label" "$target"
+  live_lab_push_sudo_password "$target"
 }
 
 stage_preflight() {
@@ -507,8 +810,10 @@ stage_preflight() {
 }
 
 stage_prepare_source_archive() {
+  local archive_ref=""
   write_remote_scripts
-  if [[ "$REPO_REF" == "working-tree" ]]; then
+  printf 'source mode: %s\n' "$(describe_source_mode)"
+  if [[ "$SOURCE_MODE" == "working-tree" ]]; then
     tar -C "$ROOT_DIR" \
       --exclude='.git' \
       --exclude='target' \
@@ -517,49 +822,85 @@ stage_prepare_source_archive() {
       --exclude='artifacts/live_lab' \
       -czf "$SOURCE_ARCHIVE" .
   else
-    git -C "$ROOT_DIR" archive --format=tar.gz --output "$SOURCE_ARCHIVE" "$REPO_REF"
+    archive_ref="$(resolve_source_ref)"
+    if [[ "$SOURCE_MODE" == "origin-main" ]]; then
+      git -C "$ROOT_DIR" fetch origin main --quiet
+    fi
+    git -C "$ROOT_DIR" archive --format=tar.gz --output "$SOURCE_ARCHIVE" "$archive_ref"
   fi
-  git rev-parse HEAD > "$STATE_DIR/git_head.txt"
+  if [[ "$SOURCE_MODE" == "working-tree" ]]; then
+    git rev-parse HEAD > "$STATE_DIR/git_head.txt"
+  else
+    git -C "$ROOT_DIR" rev-parse "$(resolve_source_ref)" > "$STATE_DIR/git_head.txt"
+  fi
   git status --short > "$STATE_DIR/git_status.txt"
+  printf '%s\n' "$(describe_source_mode)" > "$STATE_DIR/source_mode.txt"
 }
 
 stage_cleanup_hosts() {
-  local target
-  while IFS=$'\t' read -r label target _node_id _role; do
-    printf '[cleanup] %s %s\n' "$label" "$target"
-    live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh" || return 1
-    live_lab_ssh "$target" "chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh" || return 1
-  done < "$NODES_TSV"
+  run_parallel_node_stage cleanup_hosts cleanup_host_worker
+}
+
+cleanup_host_worker() {
+  local label="$1"
+  local target="$2"
+  printf '[cleanup] %s %s\n' "$label" "$target"
+  live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh"
+  live_lab_ssh "$target" "chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh"
 }
 
 stage_bootstrap_hosts() {
-  local env_path target node_id role
-  while IFS=$'\t' read -r label target node_id role; do
-    live_lab_push_sudo_password "$target" || return 1
-    env_path="$STATE_DIR/bootstrap-${label}.env"
-    cat > "$env_path" <<EOF_ENV
+  run_parallel_node_stage bootstrap_hosts bootstrap_host_worker
+}
+
+bootstrap_host_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  local env_path
+  live_lab_push_sudo_password "$target"
+  env_path="$STATE_DIR/bootstrap-${label}.env"
+  cat > "$env_path" <<EOF_ENV
 ROLE=${role}
 NODE_ID=${node_id}
 NETWORK_ID=${NETWORK_ID}
 SSH_ALLOW_CIDRS=${SSH_ALLOW_CIDRS}
 SOURCE_ARCHIVE=/tmp/rn_source.tar.gz
 EOF_ENV
-    printf '[bootstrap] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
-    live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh" || return 1
-    live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env" || return 1
-    live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "/tmp/rn_source.tar.gz" || return 1
-    live_lab_ssh "$target" "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env" || return 1
-  done < "$NODES_TSV"
+  printf '[bootstrap] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
+  live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh"
+  live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env"
+  live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "/tmp/rn_source.tar.gz"
+  live_lab_ssh "$target" "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env"
 }
 
 stage_collect_pubkeys() {
-  local target node_id pub_hex
+  local label
+  local stage_dir
   : > "$PUBKEYS_TSV"
-  while IFS=$'\t' read -r label target node_id _role; do
-    pub_hex="$(live_lab_collect_pubkey_hex "$target")" || return 1
-    printf '%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$pub_hex" >> "$PUBKEYS_TSV"
-    printf '[pubkey] %s %s %s\n' "$label" "$target" "$pub_hex"
+  stage_dir="$(parallel_stage_dir collect_pubkeys)"
+  run_parallel_node_stage collect_pubkeys collect_pubkey_worker
+  while IFS=$'\t' read -r label _target _node_id _role; do
+    if [[ ! -f "${stage_dir}/pubkey-${label}.tsv" ]]; then
+      printf 'missing pubkey result for %s\n' "$label" >&2
+      return 1
+    fi
+    cat "${stage_dir}/pubkey-${label}.tsv" >> "$PUBKEYS_TSV"
   done < "$NODES_TSV"
+}
+
+collect_pubkey_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local pub_hex
+  local stage_dir result_path
+  stage_dir="$(parallel_stage_dir collect_pubkeys)"
+  result_path="${stage_dir}/pubkey-${label}.tsv"
+  pub_hex="$(live_lab_collect_pubkey_hex "$target")"
+  printf '%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$pub_hex" > "$result_path"
+  printf '[pubkey] %s %s %s\n' "$label" "$target" "$pub_hex"
 }
 
 build_onehop_specs() {
@@ -621,16 +962,20 @@ stage_distribute_membership_state() {
   log_local="$STATE_DIR/membership.log"
   live_lab_capture_root "$exit_target" "root cat /var/lib/rustynet/membership.snapshot" > "$snapshot_local" || return 1
   live_lab_capture_root "$exit_target" "root cat /var/lib/rustynet/membership.log" > "$log_local" || return 1
-  while IFS=$'\t' read -r label target _node_id _role; do
-    [[ "$label" == "exit" ]] && continue
-    live_lab_scp_to "$snapshot_local" "$target" "/tmp/rn-membership.snapshot" || return 1
-    live_lab_scp_to "$log_local" "$target" "/tmp/rn-membership.log" || return 1
-    live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log" || return 1
-  done < "$NODES_TSV"
+  run_parallel_node_stage distribute_membership_state distribute_membership_worker non_exit
+}
+
+distribute_membership_worker() {
+  local label="$1"
+  local target="$2"
+  printf '[membership-distribute] %s %s\n' "$label" "$target"
+  live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "/tmp/rn-membership.snapshot"
+  live_lab_scp_to "$STATE_DIR/membership.log" "$target" "/tmp/rn-membership.log"
+  live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
 }
 
 stage_issue_and_distribute_assignments() {
-  local exit_target env_path target node_id nodes_spec allow_spec assignments_spec bundle_local verifier_local refresh_env exit_node_id
+  local exit_target env_path verifier_local
   build_onehop_specs
   # shellcheck disable=SC1090
   source "$ONEHOP_STATE_ENV"
@@ -646,48 +991,109 @@ stage_issue_and_distribute_assignments() {
 
   verifier_local="$STATE_DIR/assignment.pub"
   live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment.pub" > "$verifier_local" || return 1
+  run_parallel_node_stage issue_and_distribute_assignments distribute_assignment_worker
+}
+
+distribute_assignment_worker() {
+  local _label="$1"
+  local target="$2"
+  local node_id="$3"
+  local bundle_local refresh_env exit_target exit_node_id
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
   exit_node_id="$(node_id_for_label exit)"
-  while IFS=$'\t' read -r _label target node_id _role; do
-    bundle_local="$STATE_DIR/assignment-${node_id}.bundle"
-    live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" > "$bundle_local" || return 1
-    live_lab_install_assignment_bundle "$target" "$verifier_local" "$bundle_local" || return 1
-    refresh_env="$STATE_DIR/assignment-refresh-${node_id}.env"
-    if [[ "$node_id" == "$exit_node_id" ]]; then
-      live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
-    else
-      live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC" "$exit_node_id"
-    fi
-    live_lab_install_assignment_refresh_env "$target" "$refresh_env" || return 1
-  done < "$NODES_TSV"
+  bundle_local="$STATE_DIR/assignment-${node_id}.bundle"
+  refresh_env="$STATE_DIR/assignment-refresh-${node_id}.env"
+  printf '[assignment-distribute] %s %s\n' "$node_id" "$target"
+  live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" > "$bundle_local"
+  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local"
+  if [[ "$node_id" == "$exit_node_id" ]]; then
+    live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
+  else
+    live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC" "$exit_node_id"
+  fi
+  live_lab_install_assignment_refresh_env "$target" "$refresh_env"
 }
 
 stage_enforce_baseline_runtime() {
-  local target node_id role
-  while IFS=$'\t' read -r _label target node_id role; do
-    live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")" || return 1
-    live_lab_wait_for_daemon_socket "$target" || return 1
-  done < "$NODES_TSV"
+  run_parallel_node_stage enforce_baseline_runtime enforce_runtime_worker
   live_lab_retry_root "$(node_target_for_label exit)" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2 || return 1
   sleep 5
 }
 
+enforce_runtime_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  printf '[runtime-enforce] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
+  live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
+  live_lab_wait_for_daemon_socket "$target"
+}
+
 stage_validate_baseline_runtime() {
-  local target node_id role status route_check no_plaintext nft_rules
-  while IFS=$'\t' read -r _label target node_id role; do
-    status="$(live_lab_status "$target")" || return 1
-    printf '[status] %s %s\n%s\n' "$node_id" "$target" "$status"
-    if [[ "$role" == "client" ]]; then
-      route_check="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true")" || return 1
-      printf '[route] %s %s\n%s\n' "$node_id" "$target" "$route_check"
-      grep -Fq 'dev rustynet0' <<<"$route_check" || return 1
-    fi
-    no_plaintext="$(live_lab_no_plaintext_passphrase_check "$target")" || return 1
-    printf '[plaintext-check] %s %s\n%s\n' "$node_id" "$target" "$no_plaintext"
-    grep -Fq 'no-plaintext-passphrase-files' <<<"$no_plaintext" || return 1
-  done < "$NODES_TSV"
+  local nft_rules
+  run_parallel_node_stage validate_baseline_runtime validate_runtime_worker
   nft_rules="$(live_lab_capture_root "$(node_target_for_label exit)" "root nft list ruleset || true")" || return 1
   printf '[exit-nft]\n%s\n' "$nft_rules"
   grep -Eq 'masquerade|rustynet' <<<"$nft_rules" || return 1
+}
+
+validate_runtime_worker() {
+  local _label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  local status route_check no_plaintext
+  status="$(live_lab_status "$target")"
+  printf '[status] %s %s\n%s\n' "$node_id" "$target" "$status"
+  if [[ "$role" == "client" ]]; then
+    route_check="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true")"
+    printf '[route] %s %s\n%s\n' "$node_id" "$target" "$route_check"
+    grep -Fq 'dev rustynet0' <<<"$route_check"
+  fi
+  no_plaintext="$(live_lab_no_plaintext_passphrase_check "$target")"
+  printf '[plaintext-check] %s %s\n%s\n' "$node_id" "$target" "$no_plaintext"
+  grep -Fq 'no-plaintext-passphrase-files' <<<"$no_plaintext"
+}
+
+current_run_git_commit() {
+  tr -d '[:space:]' < "$STATE_DIR/git_head.txt" | tr '[:upper:]' '[:lower:]'
+}
+
+current_run_git_commit_short() {
+  local commit
+  commit="$(current_run_git_commit)"
+  printf '%.7s' "$commit"
+}
+
+stage_run_live_role_switch_matrix() {
+  local commit_short role_report role_source role_log
+  if ! has_label entry || ! has_label aux || ! has_label extra; then
+    printf 'role switch matrix requires client, entry, aux, and extra targets\n' >&2
+    return 1
+  fi
+  commit_short="$(current_run_git_commit_short)"
+  mkdir -p "$REPORT_DIR/source"
+  role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
+  role_source="$REPORT_DIR/source/role_switch_matrix_${commit_short}.md"
+  role_log="$REPORT_DIR/live_linux_role_switch_matrix.log"
+  bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --debian-host "$(node_target_for_label client)" \
+    --debian-node-id "$(node_id_for_label client)" \
+    --ubuntu-host "$(node_target_for_label entry)" \
+    --ubuntu-node-id "$(node_id_for_label entry)" \
+    --fedora-host "$(node_target_for_label aux)" \
+    --fedora-node-id "$(node_id_for_label aux)" \
+    --mint-host "$(node_target_for_label extra)" \
+    --mint-node-id "$(node_id_for_label extra)" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$role_report" \
+    --source-path "$role_source" \
+    --log-path "$role_log"
 }
 
 stage_run_local_full_gate_suite() {
@@ -697,8 +1103,16 @@ stage_run_local_full_gate_suite() {
   export RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=linux
   run_gate() {
     local script="$1"
+    local rc=0
     printf '\n[%s] RUN %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$script" | tee -a "$gate_log"
+    set +e
     "$script" 2>&1 | tee -a "$gate_log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+      printf '[%s] FAIL %s rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$script" "$rc" | tee -a "$gate_log"
+      return "$rc"
+    fi
     printf '[%s] PASS %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$script" | tee -a "$gate_log"
   }
   run_gate ./scripts/ci/phase1_gates.sh
@@ -794,6 +1208,33 @@ stage_run_live_lan_toggle() {
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
     --report-path "$REPORT_DIR/live_linux_lan_toggle_report.json" \
     --log-path "$REPORT_DIR/live_linux_lan_toggle.log"
+}
+
+stage_generate_fresh_install_os_matrix_report() {
+  local commit_short role_report canonical_report
+  if ! has_label entry || ! has_label aux || ! has_label extra; then
+    printf 'fresh install OS matrix report generation requires entry, aux, and extra targets\n' >&2
+    return 1
+  fi
+  commit_short="$(current_run_git_commit_short)"
+  role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
+  canonical_report="$ROOT_DIR/artifacts/phase10/fresh_install_os_matrix_report.json"
+  python3 "$ROOT_DIR/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py" \
+    --output "$canonical_report" \
+    --environment "linux-live-lab-orchestrator:${NETWORK_ID}" \
+    --expected-git-commit-file "$STATE_DIR/git_head.txt" \
+    --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
+    --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
+    --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
+    --role-switch-report "$role_report" \
+    --lan-toggle-report "$REPORT_DIR/live_linux_lan_toggle_report.json" \
+    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --ubuntu-node-id "$(node_id_for_label entry)" \
+    --fedora-node-id "$(node_id_for_label aux)" \
+    --mint-node-id "$(node_id_for_label extra)"
+  cp "$canonical_report" "$REPORT_DIR/fresh_install_os_matrix_report.json"
 }
 
 ssh_wait_for_host() {
@@ -1164,6 +1605,10 @@ orchestrator_cleanup() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --profile) PROFILE_PATH="$2"; shift 2 ;;
+      --source-mode) SOURCE_MODE="$2"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
+      --use-origin-main) SOURCE_MODE="origin-main"; SOURCE_MODE_EXPLICIT=1; shift ;;
+      --use-local-head) SOURCE_MODE="local-head"; SOURCE_MODE_EXPLICIT=1; shift ;;
       --exit-target) EXIT_TARGET="$2"; shift 2 ;;
       --client-target) CLIENT_TARGET="$2"; shift 2 ;;
       --entry-target) ENTRY_TARGET="$2"; shift 2 ;;
@@ -1173,7 +1618,7 @@ parse_args() {
       --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
-      --repo-ref) REPO_REF="$2"; shift 2 ;;
+      --repo-ref) REPO_REF="$2"; SOURCE_MODE="ref"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
       --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
       --skip-gates) RUN_LOCAL_GATES=0; shift ;;
       --skip-soak) RUN_SOAK=0; shift ;;
@@ -1200,6 +1645,41 @@ prompt_missing_inputs() {
   fi
   if [[ -z "$EXTRA_TARGET" ]]; then
     EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@ip or ip, blank if none)')"
+  fi
+}
+
+maybe_prompt_for_default_profile() {
+  if [[ -n "$PROFILE_PATH" ]]; then
+    return 0
+  fi
+  if [[ -n "$EXIT_TARGET" || -n "$CLIENT_TARGET" || -n "$ENTRY_TARGET" || -n "$AUX_TARGET" || -n "$EXTRA_TARGET" ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    return 0
+  fi
+  if [[ ! -f "$DEFAULT_PROFILE_PATH" ]]; then
+    return 0
+  fi
+  if prompt_yes_no "Use saved VM lab profile (${DEFAULT_PROFILE_PATH})?" "y"; then
+    PROFILE_PATH="$DEFAULT_PROFILE_PATH"
+  fi
+}
+
+maybe_prompt_for_source_mode() {
+  if [[ "$SOURCE_MODE_EXPLICIT" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$SOURCE_MODE" != "working-tree" || "$REPO_REF" != "working-tree" ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    return 0
+  fi
+  if prompt_yes_no "Use latest committed origin/main instead of local working tree?" "n"; then
+    SOURCE_MODE="origin-main"
+  else
+    SOURCE_MODE="working-tree"
   fi
 }
 
@@ -1242,6 +1722,11 @@ remember_temp_password_files() {
 
 main() {
   parse_args "$@"
+  maybe_prompt_for_default_profile
+  if [[ -n "$PROFILE_PATH" ]]; then
+    load_profile_file "$PROFILE_PATH"
+  fi
+  maybe_prompt_for_source_mode
   mkdir -p "$LOG_DIR" "$VERIFICATION_DIR" "$STATE_DIR"
   : > "$STAGE_TSV"
   prompt_missing_inputs
@@ -1249,6 +1734,8 @@ main() {
   ensure_password_inputs
   remember_temp_password_files
   build_nodes_file
+  validate_topology_inputs
+  validate_source_mode
 
   if [[ $(node_count) -lt 2 ]]; then
     printf 'at least exit and client targets are required\n' >&2
@@ -1271,8 +1758,8 @@ main() {
     record_stage_skip "issue_and_distribute_assignments" "hard" "dry-run: not executed"
     record_stage_skip "enforce_baseline_runtime" "hard" "dry-run: not executed"
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
-    if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
-      record_stage_skip "local_full_gate_suite" "hard" "dry-run: not executed"
+    if has_label entry && has_label aux && has_label extra; then
+      record_stage_skip "live_role_switch_matrix" "hard" "dry-run: not executed"
     fi
     if has_label entry; then
       record_stage_skip "live_exit_handoff" "hard" "dry-run: not executed"
@@ -1280,9 +1767,15 @@ main() {
     if has_label entry && has_label aux; then
       record_stage_skip "live_two_hop" "hard" "dry-run: not executed"
       record_stage_skip "live_lan_toggle" "hard" "dry-run: not executed"
-      if [[ "$RUN_SOAK" -eq 1 ]]; then
-        record_stage_skip "extended_soak" "soft" "dry-run: not executed"
-      fi
+    fi
+    if has_label entry && has_label aux && has_label extra; then
+      record_stage_skip "fresh_install_os_matrix_report" "hard" "dry-run: not executed"
+    fi
+    if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+      record_stage_skip "local_full_gate_suite" "hard" "dry-run: not executed"
+    fi
+    if has_label entry && has_label aux && [[ "$RUN_SOAK" -eq 1 ]]; then
+      record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
     write_run_summary
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
@@ -1301,10 +1794,12 @@ main() {
   run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime
   run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime
 
-  if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
-    run_stage hard local_full_gate_suite 'run local full security gate suite' stage_run_local_full_gate_suite
+  if has_label entry && has_label aux && has_label extra; then
+    run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
+  elif [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+    run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
   else
-    record_stage_skip local_full_gate_suite hard 'skipped by --skip-gates'
+    record_stage_skip live_role_switch_matrix hard 'requires entry, aux, and extra targets'
   fi
 
   if has_label entry; then
@@ -1316,6 +1811,26 @@ main() {
   if has_label entry && has_label aux; then
     run_stage hard live_two_hop 'run live two-hop validation' stage_run_live_two_hop
     run_stage hard live_lan_toggle 'run LAN access toggle / blind-exit validation' stage_run_live_lan_toggle
+  else
+    record_stage_skip live_two_hop hard 'requires entry and aux targets'
+    record_stage_skip live_lan_toggle hard 'requires aux target'
+  fi
+
+  if has_label entry && has_label aux && has_label extra; then
+    run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
+  elif [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+    run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
+  else
+    record_stage_skip fresh_install_os_matrix_report hard 'requires entry, aux, and extra targets'
+  fi
+
+  if [[ "$RUN_LOCAL_GATES" -eq 1 ]]; then
+    run_stage hard local_full_gate_suite 'run local full security gate suite' stage_run_local_full_gate_suite
+  else
+    record_stage_skip local_full_gate_suite hard 'skipped by --skip-gates'
+  fi
+
+  if has_label entry && has_label aux; then
     if [[ "$RUN_SOAK" -eq 1 ]]; then
       if [[ "$SOAK_HARD_FAIL" -eq 1 ]]; then
         run_stage hard extended_soak 'run extended soak and reboot recovery validation' stage_run_extended_soak
@@ -1326,8 +1841,6 @@ main() {
       record_stage_skip extended_soak soft 'skipped by --skip-soak'
     fi
   else
-    record_stage_skip live_two_hop hard 'requires entry and aux targets'
-    record_stage_skip live_lan_toggle hard 'requires aux target'
     record_stage_skip extended_soak soft 'requires entry and aux targets'
   fi
 

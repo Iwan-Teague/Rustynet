@@ -5856,8 +5856,7 @@ fn validate_parent_directory_security(
 
     if mode & 0o022 != 0 && !root_managed_shared_runtime {
         return Err(DaemonError::InvalidConfig(format!(
-            "{label} parent directory has insecure permissions: mode {:o}",
-            mode
+            "{label} parent directory has insecure permissions: mode {mode:o}"
         )));
     }
 

@@ -30,7 +30,7 @@ Recommended topology for the full live suite:
 - `client`: primary client node
 - `entry`: entry relay / alternate exit
 - `aux`: auxiliary client / blind-exit target
-- `extra`: optional extra client
+- `extra`: extra client required for the full Linux release-gate evidence path
 
 What runs with each topology:
 
@@ -44,6 +44,10 @@ What runs with each topology:
   - plus two-hop validation
   - plus LAN toggle / blind-exit validation
   - plus extended soak / reboot recovery
+- 5 nodes:
+  - plus controlled role-switch validation
+  - plus commit-bound Linux fresh-install OS matrix report generation
+  - plus local full gate suite with fresh-install release-gate evidence rebound to the current run
 
 ## Security model
 
@@ -60,6 +64,30 @@ It uses the same secure primitives already exercised in the lab:
 - secure cleanup of materialized signing passphrases on remote hosts
 - no plaintext passphrase acceptance in the validation path
 
+## Parallel execution model
+
+The orchestrator no longer staggers independent per-host SSH/SCP work unnecessarily.
+
+The following stages now execute one worker per target in parallel:
+
+- `prime_remote_access`
+- `cleanup_hosts`
+- `bootstrap_hosts`
+- `collect_pubkeys`
+- `distribute_membership_state` for non-exit peers
+- `issue_and_distribute_assignments`
+- `enforce_baseline_runtime`
+- `validate_baseline_runtime`
+
+Security and determinism constraints for parallel work:
+
+- each worker gets its own `known_hosts` file inside the live-lab work directory
+- each worker writes its own stage log before the parent aggregates output
+- signed membership setup and assignment issuance on the primary exit remain single-authority serialized steps
+- exit route advertisement remains serialized after per-host runtime enforcement
+
+This keeps the expensive host-local work concurrent without introducing shared-state races in SSH host-key tracking or signed-control-plane mutation.
+
 ## Hard-fail vs soft-fail stages
 
 Hard-fail stages stop the run immediately with a non-zero exit code.
@@ -74,9 +102,11 @@ Default hard-fail stages:
 - assignment issuance/distribution
 - baseline runtime enforcement
 - baseline routing validation
+- controlled role switch validation
 - live exit handoff
 - live two-hop validation
 - live LAN toggle validation
+- fresh install OS matrix report generation
 - local full gate suite (unless `--skip-gates`)
 
 Soft-fail stages continue and are recorded in the summary.
@@ -102,6 +132,7 @@ Important outputs:
 - `logs/<stage>.log`
 - `verification/full_gate_suite_<timestamp>.log` when gates are enabled
 - live test JSON reports written by the reused `scripts/e2e/` test scripts
+- `fresh_install_os_matrix_report.json` in the run directory and the canonical `artifacts/phase10/` path when the full Linux evidence path runs
 
 The summary files show:
 
@@ -112,6 +143,12 @@ The summary files show:
 - log path
 - stage description
 
+For parallel stages, the stage log also contains worker-delimited blocks so you can see:
+
+- which node failed
+- the exact worker output for that node
+- whether the stage failed because of one host or multiple hosts
+
 ## Usage
 
 Interactive:
@@ -119,6 +156,38 @@ Interactive:
 ```bash
 bash scripts/e2e/live_linux_lab_orchestrator.sh
 ```
+
+When launched interactively with no targets or explicit `--profile`, the script now asks whether to use the default saved VM lab profile:
+
+- default profile: `profiles/live_lab/iwan_vm_lab.env`
+- answer `yes`: load that profile immediately
+- answer `no`: continue with the manual target prompts
+
+Saved profile:
+
+```bash
+bash scripts/e2e/live_linux_lab_orchestrator.sh \
+  --profile profiles/live_lab/iwan_vm_lab.env
+```
+
+Source selection:
+
+- default: package the current local working tree
+- interactive toggle: choose latest committed `origin/main` instead
+- explicit flags:
+  - `--source-mode working-tree`
+  - `--source-mode local-head`
+  - `--source-mode origin-main`
+  - `--use-local-head`
+  - `--use-origin-main`
+  - `--repo-ref <ref>` for an explicit git ref
+
+Important:
+
+- `working-tree` can include local uncommitted changes
+- `local-head` uses the latest local commit only
+- `origin-main` fetches and archives the latest committed remote `main`
+- if you want every VM on the latest committed repo state, use `origin-main`
 
 Non-interactive, full five-node topology:
 
@@ -151,6 +220,16 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
 
 ## Important flags
 
+- `--profile <path>`
+  - loads a saved `.env`-style lab profile
+  - CLI flags still win if both are provided
+  - passwords are best kept out of the profile and provided via secure files or prompt
+- `--source-mode <working-tree|local-head|origin-main>`
+  - selects what source archive gets installed on the lab machines
+- `--use-origin-main`
+  - shorthand for `--source-mode origin-main`
+- `--use-local-head`
+  - shorthand for `--source-mode local-head`
 - `--skip-gates`
   - skips the local full gate suite stage
 - `--skip-soak`
@@ -164,11 +243,20 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
 
 ## Current limitation
 
-The local full gate suite still validates the workspace using the repository's existing evidence/gate scripts.
+The local full gate suite still validates the local workspace at `HEAD`.
 
-That means the gate stage is faithful to the project’s current CI gates, but it is not yet rebinding every release-gate artifact to the exact orchestrator run automatically.
+The orchestrator now regenerates the Linux fresh-install OS matrix report from the current live run before calling `fresh_install_os_matrix_release_gate.sh`, but it does not attempt to rewrite unrelated historical artifacts outside that evidence path.
 
-The live-lab stages do produce run-specific reports in the orchestrator report directory.
+## Validation added for profile-driven runs
+
+The orchestrator now fails early on obvious topology mistakes before SCP/SSH work starts:
+
+- structurally invalid IPv4 literals such as `192.168.18.999`
+- duplicate hosts assigned to multiple labels, such as using the same VM for both `entry` and `aux`
+
+Saved profiles also remove most retyping mistakes for valid-but-wrong addresses such as `192.169.18.49`.
+
+That is intentional. The script assumes each label is a distinct machine unless the code is explicitly changed to support shared-role hosts.
 
 ## Recommended operating pattern
 

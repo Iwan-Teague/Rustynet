@@ -1,5 +1,5 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
-     Running tests/conformance.rs (target/debug/deps/conformance-07a51ee35b7b1171)
+     Running tests/conformance.rs (target/debug/deps/conformance-900c1cef5737e881)
 
 running 3 tests
 test wireguard_backend_follows_lifecycle_contract ... ok
