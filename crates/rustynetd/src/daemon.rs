@@ -39,6 +39,10 @@ use crate::privileged_helper::{
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
+use crate::traversal::{
+    CandidateSource as ProbeCandidateSource, TraversalCandidate as ProbeTraversalCandidate,
+    TraversalEngineConfig,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nix::sys::socket::getsockopt;
 #[cfg(any(
@@ -62,7 +66,7 @@ use rustynet_backend_wireguard::LinuxWireguardBackend;
 use rustynet_backend_wireguard::MacosWireguardBackend;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use rustynet_backend_wireguard::WireguardCommandRunner;
+use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
@@ -92,6 +96,7 @@ pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/traversal.p
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
 pub const DEFAULT_TRAVERSAL_MAX_AGE_SECS: u64 = 120;
+const TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS: u64 = 30;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
@@ -511,6 +516,16 @@ struct TraversalBundleEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalProbeStatus {
+    remote_node_id: String,
+    decision: String,
+    reason: String,
+    attempts: usize,
+    selected_endpoint: SocketEndpoint,
+    latest_handshake_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TraversalBootstrapError {
     Missing,
     Io(String),
@@ -641,6 +656,15 @@ impl PrivilegedHelperWireguardRunner {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WireguardCommandRunner for PrivilegedHelperWireguardRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+        let _ = self.run_capture(program, args)?;
+        Ok(())
+    }
+
+    fn run_capture(
+        &mut self,
+        program: &str,
+        args: &[String],
+    ) -> Result<WireguardCommandOutput, BackendError> {
         let helper_program = Self::helper_program_for(program)?;
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self
@@ -653,7 +677,10 @@ impl WireguardCommandRunner for PrivilegedHelperWireguardRunner {
             })?;
 
         if output.success() {
-            return Ok(());
+            return Ok(WireguardCommandOutput {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
         }
 
         let stderr = output.stderr.trim();
@@ -839,6 +866,19 @@ impl TunnelBackend for DaemonBackend {
         }
     }
 
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.peer_latest_handshake_unix(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.peer_latest_handshake_unix(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.peer_latest_handshake_unix(node_id),
+        }
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),
@@ -886,6 +926,31 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.shutdown(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.shutdown(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DaemonBackend {
+    fn set_test_endpoint_latest_handshake_unix(
+        &mut self,
+        endpoint: SocketEndpoint,
+        latest_handshake_unix: Option<u64>,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend
+                    .set_endpoint_latest_handshake_unix_for_test(endpoint, latest_handshake_unix);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
+                "test handshake injection is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "test handshake injection is only supported for in-memory backend",
+            )),
         }
     }
 }
@@ -939,6 +1004,7 @@ struct DaemonRuntime {
     membership_directory: MembershipDirectory,
     traversal_hint: Option<TraversalBundleEnvelope>,
     traversal_hint_error: Option<String>,
+    traversal_probe_status: Option<TraversalProbeStatus>,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
     auto_port_forward_lease_secs: u32,
@@ -1064,6 +1130,7 @@ impl DaemonRuntime {
             membership_directory: MembershipDirectory::default(),
             traversal_hint: None,
             traversal_hint_error: None,
+            traversal_probe_status: None,
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
             auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
@@ -1247,6 +1314,7 @@ impl DaemonRuntime {
             Err(err) => {
                 self.traversal_hint = None;
                 self.traversal_hint_error = Some(err.to_string());
+                self.traversal_probe_status = None;
                 return;
             }
         };
@@ -1263,6 +1331,7 @@ impl DaemonRuntime {
                 {
                     self.traversal_hint = None;
                     self.traversal_hint_error = Some(err.to_string());
+                    self.traversal_probe_status = None;
                     return;
                 }
                 self.traversal_hint = Some(envelope);
@@ -1271,10 +1340,12 @@ impl DaemonRuntime {
             Err(TraversalBootstrapError::Missing) => {
                 self.traversal_hint = None;
                 self.traversal_hint_error = None;
+                self.traversal_probe_status = None;
             }
             Err(err) => {
                 self.traversal_hint = None;
                 self.traversal_hint_error = Some(err.to_string());
+                self.traversal_probe_status = None;
             }
         }
         if let Err(err) = self.sync_traversal_runtime_state() {
@@ -1291,6 +1362,30 @@ impl DaemonRuntime {
     fn netcheck_response_line(&self) -> String {
         let (path_mode, path_reason) = self.netcheck_path_state();
         let traversal_authority = self.traversal_authority_mode().as_str();
+        let (probe_result, probe_reason, probe_attempts, probe_endpoint, probe_handshake_unix) =
+            if let Some(status) = self.traversal_probe_status.as_ref() {
+                (
+                    status.decision.as_str(),
+                    status.reason.as_str(),
+                    status.attempts.to_string(),
+                    sanitize_netcheck_value(&format!(
+                        "{}:{}",
+                        status.selected_endpoint.addr, status.selected_endpoint.port
+                    )),
+                    status
+                        .latest_handshake_unix
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                )
+            } else {
+                (
+                    "none",
+                    "none",
+                    "0".to_string(),
+                    "none".to_string(),
+                    "none".to_string(),
+                )
+            };
 
         let now = unix_now();
         let (traversal_status, source, target, generated_at, expires_at, age_secs, remaining_secs) =
@@ -1361,7 +1456,7 @@ impl DaemonRuntime {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_error={traversal_error}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_error={traversal_error}",
         )
     }
 
@@ -1387,43 +1482,68 @@ impl DaemonRuntime {
             self.controller.state(),
             DataplaneState::DataplaneApplied | DataplaneState::ExitActive
         ) {
+            self.traversal_probe_status = None;
             return Ok(());
         }
 
         if let Some(err) = self.traversal_hint_error.as_deref()
             && self.traversal_authority_mode().is_enforced()
         {
+            self.traversal_probe_status = None;
             return Err(format!(
                 "traversal authority rejected invalid traversal state: {err}"
             ));
         }
 
         let Some(envelope) = self.traversal_hint.clone() else {
+            self.traversal_probe_status = None;
             return Ok(());
         };
         let Some(remote_node_id) = self.traversal_remote_node_id(
             envelope.bundle.source_node_id.as_str(),
             envelope.bundle.target_node_id.as_str(),
         ) else {
+            self.traversal_probe_status = None;
             return Ok(());
         };
-        let (direct_endpoint, relay_endpoint) =
-            select_runtime_traversal_endpoints(&envelope.bundle.candidates);
-        if direct_endpoint.is_none() && relay_endpoint.is_none() {
+        let relay_endpoint = select_runtime_traversal_endpoints(&envelope.bundle.candidates).1;
+        let direct_candidates = traversal_direct_probe_candidates(
+            &envelope.bundle.candidates,
+            envelope.bundle.generated_at_unix,
+        );
+        if direct_candidates.is_empty() && relay_endpoint.is_none() {
+            self.traversal_probe_status = None;
             return Err(format!(
                 "traversal bundle for peer {} contains no usable runtime endpoints",
                 remote_node_id.as_str()
             ));
         }
 
-        self.controller
-            .configure_traversal_paths(&remote_node_id, direct_endpoint, relay_endpoint)
+        let report = self
+            .controller
+            .evaluate_traversal_probes(
+                &remote_node_id,
+                &direct_candidates,
+                relay_endpoint,
+                unix_now(),
+                TraversalEngineConfig::default(),
+                TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS,
+            )
             .map_err(|err| {
                 format!(
                     "traversal authority failed to program peer {}: {err}",
                     remote_node_id.as_str()
                 )
-            })
+            })?;
+        self.traversal_probe_status = Some(TraversalProbeStatus {
+            remote_node_id: remote_node_id.as_str().to_string(),
+            decision: report.decision.as_str().to_string(),
+            reason: report.reason.as_str().to_string(),
+            attempts: report.attempts,
+            selected_endpoint: report.selected_endpoint,
+            latest_handshake_unix: report.latest_handshake_unix,
+        });
+        Ok(())
     }
 
     fn traversal_authority_mode(&self) -> TraversalAuthorityMode {
@@ -1770,6 +1890,37 @@ impl DaemonRuntime {
                     .exit_port_forward_last_error
                     .as_deref()
                     .unwrap_or("none");
+                let traversal_probe_result = self
+                    .traversal_probe_status
+                    .as_ref()
+                    .map(|status| status.decision.as_str())
+                    .unwrap_or("none");
+                let traversal_probe_reason = self
+                    .traversal_probe_status
+                    .as_ref()
+                    .map(|status| status.reason.as_str())
+                    .unwrap_or("none");
+                let traversal_probe_attempts = self
+                    .traversal_probe_status
+                    .as_ref()
+                    .map(|status| status.attempts.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                let traversal_probe_endpoint = self
+                    .traversal_probe_status
+                    .as_ref()
+                    .map(|status| {
+                        format!(
+                            "{}:{}",
+                            status.selected_endpoint.addr, status.selected_endpoint.port
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                let traversal_probe_handshake = self
+                    .traversal_probe_status
+                    .as_ref()
+                    .and_then(|status| status.latest_handshake_unix)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string());
                 let serving_exit_node =
                     if self.is_serving_exit_node(self.selected_exit_node.as_deref()) {
                         "true"
@@ -1777,7 +1928,7 @@ impl DaemonRuntime {
                         "false"
                     };
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} traversal_authority={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} traversal_authority={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -1809,6 +1960,11 @@ impl DaemonRuntime {
                         "false"
                     },
                     self.traversal_authority_mode().as_str(),
+                    traversal_probe_result,
+                    traversal_probe_reason,
+                    traversal_probe_attempts,
+                    traversal_probe_endpoint,
+                    traversal_probe_handshake,
                     if self.auto_port_forward_exit {
                         "true"
                     } else {
@@ -5249,6 +5405,31 @@ fn select_runtime_traversal_endpoints(
     (direct, relay)
 }
 
+fn traversal_direct_probe_candidates(
+    candidates: &[TraversalCandidate],
+    observed_at_unix: u64,
+) -> Vec<ProbeTraversalCandidate> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let source = match candidate.candidate_type {
+                TraversalCandidateType::Host => ProbeCandidateSource::Host,
+                TraversalCandidateType::ServerReflexive => ProbeCandidateSource::ServerReflexive,
+                TraversalCandidateType::Relay => return None,
+            };
+            Some(ProbeTraversalCandidate {
+                endpoint: SocketEndpoint {
+                    addr: candidate.endpoint.ip(),
+                    port: candidate.endpoint.port(),
+                },
+                source,
+                priority: candidate.priority,
+                observed_at_unix,
+            })
+        })
+        .collect()
+}
+
 fn is_global_unicast_ipv4(value: std::net::Ipv4Addr) -> bool {
     if value.is_private()
         || value.is_loopback()
@@ -7822,7 +8003,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_runtime_auto_tunnel_traversal_authority_overrides_assignment_endpoint_before_apply() {
+    fn daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-override");
         let state_path = test_dir.join("daemon.state");
         let trust_path = test_dir.join("trust.evidence");
@@ -7885,6 +8066,135 @@ mod tests {
         assert_eq!(
             runtime.controller.managed_peer_endpoint(&exit_node),
             Some(SocketEndpoint {
+                addr: "203.0.113.77".parse().expect("ipv4 should parse"),
+                port: 443,
+            })
+        );
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(crate::phase10::PathMode::Relay)
+        );
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("traversal_authority=enforced_v1"));
+        assert!(status.message.contains("traversal_probe_result=relay"));
+        assert!(
+            status
+                .message
+                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
+        );
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
+        assert!(netcheck.message.contains("traversal_probe_result=relay"));
+        assert!(
+            netcheck
+                .message
+                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-probe-direct-recovery");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(
+                SocketEndpoint {
+                    addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+                    port: 51820,
+                },
+                Some(unix_now()),
+            )
+            .expect("test handshake injection should succeed");
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_probe_result=direct"));
+        assert!(
+            netcheck
+                .message
+                .contains("traversal_probe_reason=fresh_handshake_observed")
+        );
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
                 addr: "10.0.0.2".parse().expect("ipv4 should parse"),
                 port: 51820,
             })
@@ -7893,14 +8203,6 @@ mod tests {
             runtime.controller.peer_path(&exit_node),
             Some(crate::phase10::PathMode::Direct)
         );
-
-        let status = runtime.handle_command(IpcCommand::Status);
-        assert!(status.ok);
-        assert!(status.message.contains("traversal_authority=enforced_v1"));
-
-        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
-        assert!(netcheck.ok);
-        assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -8363,12 +8665,22 @@ mod tests {
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
-        assert!(netcheck.message.contains("path_mode=direct_active"));
-        assert!(netcheck.message.contains("path_reason=relay_armed"));
+        assert!(netcheck.message.contains("path_mode=relay_active"));
+        assert!(
+            netcheck
+                .message
+                .contains("path_reason=relay_endpoint_programmed")
+        );
         assert!(netcheck.message.contains("traversal_status=valid"));
         assert!(netcheck.message.contains("candidate_count=2"));
         assert!(netcheck.message.contains("host_candidates=1"));
         assert!(netcheck.message.contains("relay_candidates=1"));
+        assert!(netcheck.message.contains("traversal_probe_result=relay"));
+        assert!(
+            netcheck
+                .message
+                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
+        );
         assert!(runtime.controller.has_armed_relay_path());
 
         let _ = std::fs::remove_file(state_path);

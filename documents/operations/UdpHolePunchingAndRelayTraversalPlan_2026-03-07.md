@@ -13,12 +13,12 @@ while preserving Rustynet security constraints (default-deny, fail-closed, signe
 
 ## 2) Current State (Codebase Reality)
 - `Requirements.md` already requires NAT traversal + relay fallback (`3.2`).
-- `rustynetd` now validates signed traversal bundles and programs authoritative per-peer direct/relay endpoint targets into the Phase 10 runtime controller; auto-tunnel runtime applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, and netcheck reflects runtime path state instead of a static traversal slogan.
+- `rustynetd` now validates signed traversal bundles, programs authoritative per-peer direct/relay endpoint targets into the Phase 10 runtime controller, gathers backend handshake-recency evidence, and uses a bounded one-sided direct-probe loop before falling back to relay; auto-tunnel runtime applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, and netcheck reflects runtime path state instead of a static traversal slogan.
 - `rustynet-relay` currently provides relay fleet selection primitives, not full encrypted packet relay transport.
 - Auto-tunnel assignment currently carries a single signed endpoint per peer (`peer.N.endpoint`).
 
 Implication:
-- To match Tailscale-like UX, Rustynet still needs the HP-2 direct probing engine and HP-3 production relay transport path, not just signed endpoint provisioning.
+- To match Tailscale-like UX, Rustynet still needs the remainder of HP-2 beyond the current one-sided probe model, plus HP-3 production relay transport, not just signed endpoint provisioning.
 
 ## 3) External Reference Constraints (Primary Sources)
 - Tailscale design notes indicate NAT traversal and protocol behavior must share socket/port behavior to make hole punching effective, and they combine direct attempts with relay fallback.

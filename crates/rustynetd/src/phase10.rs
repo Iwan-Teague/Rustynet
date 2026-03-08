@@ -13,6 +13,9 @@ use std::os::unix::fs::MetadataExt;
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
 };
+use crate::traversal::{
+    TraversalCandidate as ProbeTraversalCandidate, TraversalEngine, TraversalEngineConfig,
+};
 use rustynet_backend_api::{
     BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
     SocketEndpoint, TunnelBackend,
@@ -132,6 +135,53 @@ pub enum PathMode {
     Relay,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalProbeDecision {
+    Direct,
+    Relay,
+}
+
+impl TraversalProbeDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraversalProbeDecision::Direct => "direct",
+            TraversalProbeDecision::Relay => "relay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalProbeReason {
+    ExistingFreshHandshake,
+    FreshHandshakeObserved,
+    NoDirectCandidatesRelayArmed,
+    DirectProbeExhaustedRelayArmed,
+}
+
+impl TraversalProbeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraversalProbeReason::ExistingFreshHandshake => "existing_fresh_handshake",
+            TraversalProbeReason::FreshHandshakeObserved => "fresh_handshake_observed",
+            TraversalProbeReason::NoDirectCandidatesRelayArmed => {
+                "no_direct_candidates_relay_armed"
+            }
+            TraversalProbeReason::DirectProbeExhaustedRelayArmed => {
+                "direct_probe_exhausted_relay_armed"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraversalProbeReport {
+    pub decision: TraversalProbeDecision,
+    pub reason: TraversalProbeReason,
+    pub attempts: usize,
+    pub selected_endpoint: SocketEndpoint,
+    pub latest_handshake_unix: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionEvent {
     pub from_state: DataplaneState,
@@ -243,6 +293,7 @@ pub enum Phase10Error {
     TrustRejected(&'static str),
     Backend(BackendError),
     System(SystemError),
+    TraversalProbeFailed(String),
     PolicyDenied,
     ExitNotSelected,
     LanAccessDenied,
@@ -258,6 +309,9 @@ impl fmt::Display for Phase10Error {
             Phase10Error::TrustRejected(msg) => write!(f, "trust rejected: {msg}"),
             Phase10Error::Backend(err) => write!(f, "backend error: {err}"),
             Phase10Error::System(err) => write!(f, "system error: {err}"),
+            Phase10Error::TraversalProbeFailed(err) => {
+                write!(f, "traversal probe failed: {err}")
+            }
             Phase10Error::PolicyDenied => f.write_str("policy denied"),
             Phase10Error::ExitNotSelected => f.write_str("exit node not selected"),
             Phase10Error::LanAccessDenied => f.write_str("lan access denied"),
@@ -2316,6 +2370,108 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .map(|peer| peer.configured.endpoint)
     }
 
+    pub fn evaluate_traversal_probes(
+        &mut self,
+        node_id: &NodeId,
+        direct_candidates: &[ProbeTraversalCandidate],
+        relay_endpoint: Option<SocketEndpoint>,
+        now_unix: u64,
+        engine_config: TraversalEngineConfig,
+        handshake_freshness_secs: u64,
+    ) -> Result<TraversalProbeReport, Phase10Error> {
+        self.ensure_started()?;
+        if handshake_freshness_secs == 0 {
+            return Err(Phase10Error::TraversalProbeFailed(
+                "handshake freshness window must be greater than zero".to_string(),
+            ));
+        }
+        if !self.managed_peers.contains_key(node_id) {
+            return Err(Phase10Error::PeerNotManaged);
+        }
+
+        if let Some(relay_endpoint) = relay_endpoint {
+            self.configure_traversal_paths(node_id, None, Some(relay_endpoint))?;
+        }
+
+        let current_endpoint = self
+            .backend
+            .current_peer_endpoint(node_id)?
+            .ok_or(Phase10Error::PeerNotManaged)?;
+        let current_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
+        if direct_candidates
+            .iter()
+            .any(|candidate| candidate.endpoint == current_endpoint)
+            && handshake_is_fresh(current_handshake, now_unix, handshake_freshness_secs)
+        {
+            return Ok(TraversalProbeReport {
+                decision: TraversalProbeDecision::Direct,
+                reason: TraversalProbeReason::ExistingFreshHandshake,
+                attempts: 0,
+                selected_endpoint: current_endpoint,
+                latest_handshake_unix: current_handshake,
+            });
+        }
+
+        let engine = TraversalEngine::new(engine_config).map_err(|err| {
+            Phase10Error::TraversalProbeFailed(format!("invalid traversal engine config: {err}"))
+        })?;
+
+        let plan = match engine.plan_remote_probes(direct_candidates) {
+            Ok(plan) => plan,
+            Err(crate::traversal::TraversalError::NoDirectCandidates) => {
+                if let Some(relay_endpoint) = relay_endpoint {
+                    self.mark_direct_failed(node_id)?;
+                    return Ok(TraversalProbeReport {
+                        decision: TraversalProbeDecision::Relay,
+                        reason: TraversalProbeReason::NoDirectCandidatesRelayArmed,
+                        attempts: 0,
+                        selected_endpoint: relay_endpoint,
+                        latest_handshake_unix: current_handshake,
+                    });
+                }
+                return Err(Phase10Error::TraversalProbeFailed(
+                    "no direct candidates and no trusted relay endpoint".to_string(),
+                ));
+            }
+            Err(err) => return Err(Phase10Error::TraversalProbeFailed(err.to_string())),
+        };
+
+        let mut observed_latest = current_handshake;
+        for attempt in &plan.attempts {
+            self.configure_traversal_paths(node_id, Some(attempt.remote.endpoint), relay_endpoint)?;
+            self.mark_direct_recovered(node_id)?;
+
+            let latest_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
+            if handshake_advanced(observed_latest, latest_handshake)
+                && handshake_is_fresh(latest_handshake, now_unix, handshake_freshness_secs)
+            {
+                return Ok(TraversalProbeReport {
+                    decision: TraversalProbeDecision::Direct,
+                    reason: TraversalProbeReason::FreshHandshakeObserved,
+                    attempts: attempt.attempt_ordinal,
+                    selected_endpoint: attempt.remote.endpoint,
+                    latest_handshake_unix: latest_handshake,
+                });
+            }
+            observed_latest = observed_latest.max(latest_handshake);
+        }
+
+        if let Some(relay_endpoint) = relay_endpoint {
+            self.mark_direct_failed(node_id)?;
+            return Ok(TraversalProbeReport {
+                decision: TraversalProbeDecision::Relay,
+                reason: TraversalProbeReason::DirectProbeExhaustedRelayArmed,
+                attempts: plan.attempts.len(),
+                selected_endpoint: relay_endpoint,
+                latest_handshake_unix: observed_latest,
+            });
+        }
+
+        Err(Phase10Error::TraversalProbeFailed(
+            "direct probes exhausted and no trusted relay endpoint is available".to_string(),
+        ))
+    }
+
     pub fn relay_path_armed(&self, node_id: &NodeId) -> bool {
         self.managed_peers
             .get(node_id)
@@ -2333,6 +2489,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.managed_peers
             .values()
             .any(|peer| peer.path == PathMode::Relay)
+    }
+
+    #[cfg(test)]
+    pub fn backend_mut_for_test(&mut self) -> &mut B {
+        &mut self.backend
     }
 
     pub fn shutdown(&mut self) -> Result<(), Phase10Error> {
@@ -2402,6 +2563,20 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Ok(());
         }
         Err(Phase10Error::NotStarted)
+    }
+}
+
+fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) -> bool {
+    value
+        .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
+        .unwrap_or(false)
+}
+
+fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
+    match (previous, current) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(previous), Some(current)) => current > previous,
     }
 }
 
@@ -2760,6 +2935,7 @@ mod tests {
     struct RecordingBackend {
         started: bool,
         peers: BTreeMap<NodeId, PeerConfig>,
+        latest_handshakes_by_endpoint: BTreeMap<String, Option<u64>>,
         routes: Vec<Route>,
         exit_mode: ExitMode,
     }
@@ -2769,9 +2945,23 @@ mod tests {
             Self {
                 started: false,
                 peers: BTreeMap::new(),
+                latest_handshakes_by_endpoint: BTreeMap::new(),
                 routes: Vec::new(),
                 exit_mode: ExitMode::Off,
             }
+        }
+    }
+
+    impl RecordingBackend {
+        fn set_handshake_for_endpoint(
+            &mut self,
+            endpoint: SocketEndpoint,
+            latest_handshake_unix: Option<u64>,
+        ) {
+            self.latest_handshakes_by_endpoint.insert(
+                format!("{}:{}", endpoint.addr, endpoint.port),
+                latest_handshake_unix,
+            );
         }
     }
 
@@ -2825,6 +3015,23 @@ mod tests {
                 return Err(BackendError::not_running("backend not started"));
             }
             Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+        }
+
+        fn peer_latest_handshake_unix(
+            &mut self,
+            node_id: &NodeId,
+        ) -> Result<Option<u64>, BackendError> {
+            if !self.started {
+                return Err(BackendError::not_running("backend not started"));
+            }
+            let Some(peer) = self.peers.get(node_id) else {
+                return Err(BackendError::invalid_input("peer is not configured"));
+            };
+            Ok(self
+                .latest_handshakes_by_endpoint
+                .get(&format!("{}:{}", peer.endpoint.addr, peer.endpoint.port))
+                .copied()
+                .flatten())
         }
 
         fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -2908,6 +3115,13 @@ mod tests {
             &self,
             _node_id: &NodeId,
         ) -> Result<Option<SocketEndpoint>, BackendError> {
+            Ok(None)
+        }
+
+        fn peer_latest_handshake_unix(
+            &mut self,
+            _node_id: &NodeId,
+        ) -> Result<Option<u64>, BackendError> {
             Ok(None)
         }
 
@@ -3745,6 +3959,198 @@ mod tests {
             .mark_direct_failed(&peer_id)
             .expect_err("relay failover must require an explicit relay endpoint");
         assert_eq!(err, Phase10Error::RelayPathUnavailable);
+    }
+
+    #[test]
+    fn traversal_probe_uses_existing_fresh_handshake_on_current_endpoint() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        let current_endpoint = controller
+            .managed_peer_endpoint(&peer_id)
+            .expect("managed endpoint should exist");
+        controller
+            .backend
+            .set_handshake_for_endpoint(current_endpoint, Some(195));
+
+        let report = controller
+            .evaluate_traversal_probes(
+                &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: current_endpoint,
+                    source: crate::traversal::CandidateSource::Host,
+                    priority: 900,
+                    observed_at_unix: 190,
+                }],
+                Some(SocketEndpoint {
+                    addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+                    port: 443,
+                }),
+                200,
+                TraversalEngineConfig::default(),
+                30,
+            )
+            .expect("existing handshake should keep direct path");
+
+        assert_eq!(report.decision, TraversalProbeDecision::Direct);
+        assert_eq!(report.reason, TraversalProbeReason::ExistingFreshHandshake);
+        assert_eq!(report.attempts, 0);
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+    }
+
+    #[test]
+    fn traversal_probe_promotes_direct_when_handshake_advances() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+        let direct_endpoint = SocketEndpoint {
+            addr: "198.51.100.55".parse::<IpAddr>().expect("ip should parse"),
+            port: 51820,
+        };
+        let relay_endpoint = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+            port: 443,
+        };
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .backend
+            .set_handshake_for_endpoint(direct_endpoint, Some(205));
+
+        let report = controller
+            .evaluate_traversal_probes(
+                &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: direct_endpoint,
+                    source: crate::traversal::CandidateSource::ServerReflexive,
+                    priority: 900,
+                    observed_at_unix: 200,
+                }],
+                Some(relay_endpoint),
+                210,
+                TraversalEngineConfig::default(),
+                30,
+            )
+            .expect("probe should promote direct candidate");
+
+        assert_eq!(report.decision, TraversalProbeDecision::Direct);
+        assert_eq!(report.reason, TraversalProbeReason::FreshHandshakeObserved);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.selected_endpoint, direct_endpoint);
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+        assert_eq!(
+            controller.managed_peer_endpoint(&peer_id),
+            Some(direct_endpoint)
+        );
+    }
+
+    #[test]
+    fn traversal_probe_falls_back_to_relay_when_handshake_does_not_advance() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+        let relay_endpoint = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+            port: 443,
+        };
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node should parse"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let report = controller
+            .evaluate_traversal_probes(
+                &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: SocketEndpoint {
+                        addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
+                        port: 51820,
+                    },
+                    source: crate::traversal::CandidateSource::ServerReflexive,
+                    priority: 700,
+                    observed_at_unix: 200,
+                }],
+                Some(relay_endpoint),
+                210,
+                TraversalEngineConfig::default(),
+                30,
+            )
+            .expect("relay fallback should be allowed");
+
+        assert_eq!(report.decision, TraversalProbeDecision::Relay);
+        assert_eq!(
+            report.reason,
+            TraversalProbeReason::DirectProbeExhaustedRelayArmed
+        );
+        assert_eq!(report.selected_endpoint, relay_endpoint);
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
+        assert_eq!(
+            controller.managed_peer_endpoint(&peer_id),
+            Some(relay_endpoint)
+        );
     }
 
     #[test]

@@ -173,6 +173,26 @@ impl ProbePlan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProbe {
+    pub remote: TraversalCandidate,
+    pub round: u8,
+    pub delay_ms: u64,
+    pub score: u64,
+    pub attempt_ordinal: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProbePlan {
+    pub attempts: Vec<RemoteProbe>,
+}
+
+impl RemoteProbePlan {
+    pub fn is_empty(&self) -> bool {
+        self.attempts.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathMode {
     Direct,
@@ -385,6 +405,47 @@ impl TraversalEngine {
 
         Ok(ProbePlan { pairs: plan_pairs })
     }
+
+    pub fn plan_remote_probes(
+        &self,
+        remote_candidates: &[TraversalCandidate],
+    ) -> Result<RemoteProbePlan, TraversalError> {
+        validate_candidates("remote", remote_candidates, self.config)?;
+
+        let mut direct_candidates = remote_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.source.direct_eligible())
+            .collect::<Vec<_>>();
+        if direct_candidates.is_empty() {
+            return Err(TraversalError::NoDirectCandidates);
+        }
+        direct_candidates.sort_by(|left, right| {
+            score_candidate(*right)
+                .cmp(&score_candidate(*left))
+                .then_with(|| right.priority.cmp(&left.priority))
+        });
+        direct_candidates.truncate(self.config.max_probe_pairs);
+
+        let mut attempts = Vec::new();
+        for round in 0..self.config.simultaneous_open_rounds {
+            let delay_ms = self
+                .config
+                .round_spacing_ms
+                .saturating_mul(u64::from(round));
+            for candidate in &direct_candidates {
+                attempts.push(RemoteProbe {
+                    remote: *candidate,
+                    round,
+                    delay_ms,
+                    score: score_candidate(*candidate),
+                    attempt_ordinal: attempts.len().saturating_add(1),
+                });
+            }
+        }
+
+        Ok(RemoteProbePlan { attempts })
+    }
 }
 
 fn validate_candidates(
@@ -428,6 +489,10 @@ fn score_pair(local: TraversalCandidate, remote: TraversalCandidate) -> u64 {
         .saturating_add(u64::from(remote.priority))
         .saturating_add(local.source.preference_score())
         .saturating_add(remote.source.preference_score())
+}
+
+fn score_candidate(candidate: TraversalCandidate) -> u64 {
+    u64::from(candidate.priority).saturating_add(candidate.source.preference_score())
 }
 
 #[cfg(test)]
@@ -650,5 +715,66 @@ mod tests {
             .expect("relay failback should trigger after configured direct probe failures");
         assert_eq!(failback.to, PathMode::Relay);
         assert_eq!(session.path, PathMode::Relay);
+    }
+
+    #[test]
+    fn remote_probe_plan_prefers_higher_priority_direct_candidates() {
+        let engine = TraversalEngine::new(TraversalEngineConfig {
+            max_candidates: 8,
+            max_probe_pairs: 2,
+            simultaneous_open_rounds: 2,
+            round_spacing_ms: 50,
+            relay_switch_after_failures: 3,
+        })
+        .expect("config should be valid");
+        let candidates = vec![
+            candidate(
+                [203, 0, 113, 20],
+                62000,
+                CandidateSource::ServerReflexive,
+                750,
+            ),
+            candidate([10, 0, 0, 20], 51820, CandidateSource::Host, 950),
+            candidate(
+                [203, 0, 113, 30],
+                62001,
+                CandidateSource::ServerReflexive,
+                600,
+            ),
+        ];
+
+        let plan = engine
+            .plan_remote_probes(&candidates)
+            .expect("remote probe plan should build");
+        assert_eq!(plan.attempts.len(), 4);
+        assert_eq!(
+            plan.attempts[0].remote.endpoint,
+            endpoint([10, 0, 0, 20], 51820)
+        );
+        assert_eq!(
+            plan.attempts[1].remote.endpoint,
+            endpoint([203, 0, 113, 20], 62000)
+        );
+        assert_eq!(plan.attempts[2].round, 1);
+        assert_eq!(plan.attempts[2].delay_ms, 50);
+        assert_eq!(plan.attempts[0].attempt_ordinal, 1);
+        assert_eq!(plan.attempts[3].attempt_ordinal, 4);
+    }
+
+    #[test]
+    fn remote_probe_plan_rejects_relay_only_candidates() {
+        let engine =
+            TraversalEngine::new(TraversalEngineConfig::default()).expect("config should be valid");
+        let candidates = vec![candidate(
+            [198, 51, 100, 10],
+            62000,
+            CandidateSource::Relay,
+            900,
+        )];
+
+        let err = engine
+            .plan_remote_probes(&candidates)
+            .expect_err("relay-only candidates must not authorize direct probes");
+        assert!(matches!(err, TraversalError::NoDirectCandidates));
     }
 }

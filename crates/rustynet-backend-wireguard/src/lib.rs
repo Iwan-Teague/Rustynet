@@ -11,12 +11,14 @@ use rustynet_backend_api::{
 
 const MACOS_ROUTE_BINARY: &str = "/sbin/route";
 const MACOS_PS_BINARY: &str = "/bin/ps";
+const WG_LATEST_HANDSHAKES_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WireguardBackend {
     running: bool,
     context: Option<RuntimeContext>,
     peers: BTreeMap<NodeId, PeerConfig>,
+    peer_latest_handshakes_by_endpoint: BTreeMap<String, Option<u64>>,
     routes: Vec<Route>,
     exit_mode: ExitMode,
     stats: TunnelStats,
@@ -28,6 +30,7 @@ impl Default for WireguardBackend {
             running: false,
             context: None,
             peers: BTreeMap::new(),
+            peer_latest_handshakes_by_endpoint: BTreeMap::new(),
             routes: Vec::new(),
             exit_mode: ExitMode::Off,
             stats: TunnelStats::default(),
@@ -48,6 +51,32 @@ impl WireguardBackend {
 
     fn refresh_stats(&mut self) {
         self.stats.peer_count = self.peers.len();
+    }
+
+    #[doc(hidden)]
+    pub fn set_peer_latest_handshake_unix_for_test(
+        &mut self,
+        node_id: &NodeId,
+        latest_handshake_unix: Option<u64>,
+    ) {
+        if let Some(peer) = self.peers.get(node_id) {
+            self.peer_latest_handshakes_by_endpoint.insert(
+                format!("{}:{}", peer.endpoint.addr, peer.endpoint.port),
+                latest_handshake_unix,
+            );
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_endpoint_latest_handshake_unix_for_test(
+        &mut self,
+        endpoint: SocketEndpoint,
+        latest_handshake_unix: Option<u64>,
+    ) {
+        self.peer_latest_handshakes_by_endpoint.insert(
+            format!("{}:{}", endpoint.addr, endpoint.port),
+            latest_handshake_unix,
+        );
     }
 }
 
@@ -80,6 +109,9 @@ impl TunnelBackend for WireguardBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
+        self.peer_latest_handshakes_by_endpoint
+            .entry(format!("{}:{}", peer.endpoint.addr, peer.endpoint.port))
+            .or_insert(None);
         self.peers.insert(peer.node_id.clone(), peer);
         self.refresh_stats();
         Ok(())
@@ -94,6 +126,9 @@ impl TunnelBackend for WireguardBackend {
         let Some(peer) = self.peers.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
+        self.peer_latest_handshakes_by_endpoint
+            .entry(format!("{}:{}", endpoint.addr, endpoint.port))
+            .or_insert(None);
         peer.endpoint = endpoint;
         Ok(())
     }
@@ -104,6 +139,25 @@ impl TunnelBackend for WireguardBackend {
     ) -> Result<Option<SocketEndpoint>, BackendError> {
         self.ensure_running()?;
         Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+    }
+
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        if !self.peers.contains_key(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        Ok(self
+            .peer_latest_handshakes_by_endpoint
+            .get(&format!("{}:{}", peer.endpoint.addr, peer.endpoint.port))
+            .copied()
+            .flatten())
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -135,6 +189,7 @@ impl TunnelBackend for WireguardBackend {
         self.running = false;
         self.context = None;
         self.peers.clear();
+        self.peer_latest_handshakes_by_endpoint.clear();
         self.routes.clear();
         self.exit_mode = ExitMode::Off;
         self.stats = TunnelStats::default();
@@ -142,8 +197,20 @@ impl TunnelBackend for WireguardBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardCommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 pub trait WireguardCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError>;
+
+    fn run_capture(
+        &mut self,
+        program: &str,
+        args: &[String],
+    ) -> Result<WireguardCommandOutput, BackendError>;
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +218,15 @@ pub struct LinuxCommandRunner;
 
 impl WireguardCommandRunner for LinuxCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+        let _ = self.run_capture(program, args)?;
+        Ok(())
+    }
+
+    fn run_capture(
+        &mut self,
+        program: &str,
+        args: &[String],
+    ) -> Result<WireguardCommandOutput, BackendError> {
         let output = Command::new(program)
             .args(args)
             .output()
@@ -168,7 +244,11 @@ impl WireguardCommandRunner for LinuxCommandRunner {
                 output.status
             )));
         }
-        Ok(())
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stdout")))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stderr")))?;
+        Ok(WireguardCommandOutput { stdout, stderr })
     }
 }
 
@@ -412,6 +492,26 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             }
         }
     }
+
+    fn read_peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        let output = self.runner.run_capture(
+            "wg",
+            &[
+                "show".to_string(),
+                self.interface_name.clone(),
+                "latest-handshakes".to_string(),
+            ],
+        )?;
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+        parse_peer_latest_handshake_unix(&output.stdout, &public_key, self.peers.len().max(1))
+    }
 }
 
 impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBackend<R> {
@@ -503,6 +603,14 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
     ) -> Result<Option<SocketEndpoint>, BackendError> {
         self.ensure_running()?;
         Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+    }
+
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        self.read_peer_latest_handshake_unix(node_id)
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -872,6 +980,26 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             ExitMode::FullTunnel => self.apply_default_route_to_tunnel(),
         }
     }
+
+    fn read_peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        let output = self.runner.run_capture(
+            "wg",
+            &[
+                "show".to_string(),
+                self.interface_name.clone(),
+                "latest-handshakes".to_string(),
+            ],
+        )?;
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+        parse_peer_latest_handshake_unix(&output.stdout, &public_key, self.peers.len().max(1))
+    }
 }
 
 impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBackend<R> {
@@ -963,6 +1091,14 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
     ) -> Result<Option<SocketEndpoint>, BackendError> {
         self.ensure_running()?;
         Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
+    }
+
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        self.read_peer_latest_handshake_unix(node_id)
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -1212,6 +1348,62 @@ fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError
     Ok(pids)
 }
 
+fn parse_peer_latest_handshake_unix(
+    stdout: &str,
+    expected_public_key: &str,
+    max_lines: usize,
+) -> Result<Option<u64>, BackendError> {
+    if stdout.len() > WG_LATEST_HANDSHAKES_MAX_BYTES {
+        return Err(BackendError::internal(format!(
+            "wg latest-handshakes output exceeded {} bytes",
+            WG_LATEST_HANDSHAKES_MAX_BYTES
+        )));
+    }
+
+    let mut lines_seen = 0usize;
+    let mut matched: Option<Option<u64>> = None;
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        lines_seen = lines_seen.saturating_add(1);
+        if lines_seen > max_lines {
+            return Err(BackendError::internal(
+                "wg latest-handshakes output exceeded expected peer count",
+            ));
+        }
+        let mut fields = line.split_whitespace();
+        let public_key = fields.next().ok_or_else(|| {
+            BackendError::internal("wg latest-handshakes line missing public key")
+        })?;
+        let handshake_raw = fields.next().ok_or_else(|| {
+            BackendError::internal("wg latest-handshakes line missing handshake timestamp")
+        })?;
+        if fields.next().is_some() {
+            return Err(BackendError::internal(
+                "wg latest-handshakes line contains unexpected trailing data",
+            ));
+        }
+        if public_key != expected_public_key {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(BackendError::internal(
+                "wg latest-handshakes output contained duplicate peer entries",
+            ));
+        }
+        let handshake_unix = handshake_raw.parse::<u64>().map_err(|err| {
+            BackendError::internal(format!(
+                "wg latest-handshakes timestamp parse failed: {err}"
+            ))
+        })?;
+        matched = Some((handshake_unix != 0).then_some(handshake_unix));
+    }
+
+    Ok(matched.flatten())
+}
+
 fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
     const BASE64_TABLE: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1250,11 +1442,29 @@ mod tests {
     struct RecordingRunner {
         calls: Vec<(String, Vec<String>)>,
         fail_program: Option<String>,
+        capture_outputs: BTreeMap<(String, Vec<String>), WireguardCommandOutput>,
     }
 
     impl RecordingRunner {
         fn fail_on(mut self, program: &str) -> Self {
             self.fail_program = Some(program.to_string());
+            self
+        }
+
+        fn capture_output(
+            mut self,
+            program: &str,
+            args: &[String],
+            stdout: &str,
+            stderr: &str,
+        ) -> Self {
+            self.capture_outputs.insert(
+                (program.to_string(), args.to_vec()),
+                WireguardCommandOutput {
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                },
+            );
             self
         }
     }
@@ -1272,6 +1482,22 @@ mod tests {
             }
             Ok(())
         }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.run(program, args)?;
+            Ok(self
+                .capture_outputs
+                .get(&(program.to_string(), args.to_vec()))
+                .cloned()
+                .unwrap_or(WireguardCommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }))
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1288,6 +1514,18 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.run(program, args)?;
+            Ok(WireguardCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
         }
     }
 
@@ -1532,6 +1770,55 @@ mod tests {
             .expect("missing route delete should be treated as idempotent");
 
         assert!(backend.routes.is_empty());
+    }
+
+    #[test]
+    fn linux_backend_reads_latest_handshake_for_configured_peer() {
+        let args = vec![
+            "show".to_string(),
+            "rustynet0".to_string(),
+            "latest-handshakes".to_string(),
+        ];
+        let runner = RecordingRunner::default().capture_output(
+            "wg",
+            &args,
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\t12345\n",
+            "",
+        );
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        let node_id = NodeId::new("peer-a").expect("id should parse");
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+
+        let latest = backend
+            .peer_latest_handshake_unix(&node_id)
+            .expect("latest handshake should parse");
+        assert_eq!(latest, Some(12_345));
+    }
+
+    #[test]
+    fn latest_handshake_parser_rejects_oversized_or_malformed_output() {
+        let oversized = "a".repeat(WG_LATEST_HANDSHAKES_MAX_BYTES + 1);
+        let err = parse_peer_latest_handshake_unix(
+            &oversized,
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            1,
+        )
+        .expect_err("oversized latest-handshakes output must fail");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+
+        let err = parse_peer_latest_handshake_unix(
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\tnot-a-number\n",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            1,
+        )
+        .expect_err("malformed timestamp must fail");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
     }
 
     #[test]

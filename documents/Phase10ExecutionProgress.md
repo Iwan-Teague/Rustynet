@@ -3,7 +3,7 @@
 Status correction (verified 2026-03-05):
 - This progress log contains historical completion claims.
 - Current code truth: `Phase10Controller` now programs per-peer direct/relay endpoints and refreshes peer endpoint bypass routing when traversal state changes.
-- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers and fail-closes on traversal runtime programming errors instead of silently swallowing them.
+- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, gathers backend handshake-recency evidence, and fail-closes on traversal runtime programming errors instead of silently swallowing them.
 - Remaining scope gap: production relay transport service and automatic health-driven failover/failback under real WAN traversal conditions are still open code work.
 - Security risk truth: resilience claims are still overstated if this is interpreted as fully completed internet-scale relay transport failover.
 

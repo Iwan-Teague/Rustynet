@@ -157,6 +157,9 @@ pub trait TunnelBackend: Send + Sync {
         node_id: &NodeId,
     ) -> Result<Option<SocketEndpoint>, BackendError>;
 
+    fn peer_latest_handshake_unix(&mut self, node_id: &NodeId)
+    -> Result<Option<u64>, BackendError>;
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError>;
 
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError>;

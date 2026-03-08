@@ -11,6 +11,7 @@ use rustynet_backend_api::{
 struct ContractBackend {
     running: bool,
     peers: BTreeMap<NodeId, PeerConfig>,
+    latest_handshakes: BTreeMap<NodeId, Option<u64>>,
     routes: Vec<Route>,
     exit_mode: ExitMode,
 }
@@ -20,6 +21,7 @@ impl Default for ContractBackend {
         Self {
             running: false,
             peers: BTreeMap::new(),
+            latest_handshakes: BTreeMap::new(),
             routes: Vec::new(),
             exit_mode: ExitMode::Off,
         }
@@ -60,6 +62,9 @@ impl TunnelBackend for ContractBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
+        self.latest_handshakes
+            .entry(peer.node_id.clone())
+            .or_insert(None);
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
     }
@@ -85,9 +90,21 @@ impl TunnelBackend for ContractBackend {
         Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        if !self.peers.contains_key(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        Ok(self.latest_handshakes.get(node_id).copied().flatten())
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
         self.peers.remove(node_id);
+        self.latest_handshakes.remove(node_id);
         Ok(())
     }
 
@@ -117,6 +134,7 @@ impl TunnelBackend for ContractBackend {
         self.ensure_running()?;
         self.running = false;
         self.peers.clear();
+        self.latest_handshakes.clear();
         self.routes.clear();
         self.exit_mode = ExitMode::Off;
         Ok(())
@@ -150,6 +168,11 @@ fn backend_contract_requires_running_state_for_mutations() {
     let err = backend
         .configure_peer(sample_peer("peer-a"))
         .expect_err("configure_peer must require running state");
+    assert_eq!(err.kind, BackendErrorKind::NotRunning);
+
+    let err = backend
+        .peer_latest_handshake_unix(&NodeId::new("peer-a").expect("valid node id"))
+        .expect_err("peer_latest_handshake_unix must require running state");
     assert_eq!(err.kind, BackendErrorKind::NotRunning);
 
     let err = backend
@@ -250,4 +273,27 @@ fn backend_contract_updates_peer_endpoint_without_replacing_peer() {
             .allowed_ips,
         vec!["100.64.1.0/24".to_string()]
     );
+}
+
+#[test]
+fn backend_contract_exposes_handshake_evidence_for_known_peers_only() {
+    let mut backend = ContractBackend::default();
+    backend
+        .start(sample_runtime_context())
+        .expect("backend should start successfully");
+    let peer = sample_peer("peer-a");
+    let node_id = peer.node_id.clone();
+    backend
+        .configure_peer(peer)
+        .expect("configure_peer should succeed");
+
+    let handshake = backend
+        .peer_latest_handshake_unix(&node_id)
+        .expect("known peer handshake lookup should succeed");
+    assert_eq!(handshake, None);
+
+    let err = backend
+        .peer_latest_handshake_unix(&NodeId::new("peer-b").expect("valid node id"))
+        .expect_err("unknown peer handshake lookup must fail");
+    assert_eq!(err.kind, BackendErrorKind::InvalidInput);
 }

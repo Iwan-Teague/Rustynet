@@ -3,7 +3,7 @@
 Status correction (verified 2026-03-05):
 - This report includes historical completion assertions.
 - Current code truth: `Phase10Controller` now stores authoritative direct/relay endpoints per peer and reprograms peer endpoint bypass routing on traversal path changes.
-- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers and fail-closes on traversal runtime programming errors instead of treating them as advisory-only state.
+- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, uses backend handshake-recency evidence in a bounded direct-probe loop, and fail-closes on traversal runtime programming errors instead of treating them as advisory-only state.
 - Remaining scope gap: production relay transport service and automatic health-driven failover/failback under real WAN traversal conditions remain open.
 - Security risk truth: resilience claims are still overstated if this is interpreted as complete transport-level failover across arbitrary NAT environments.
 
@@ -38,7 +38,7 @@ Status correction (verified 2026-03-05):
   - `perf_budget_report.json`
   - `direct_relay_failover_report.json`
   - `state_transition_audit.log`
-- Current limitation note: `direct_relay_failover_report.json` now demonstrates endpoint reprogramming plus path-mode transition coverage inside runtime; production relay transport service and automatic health-driven failover remain pending.
+- Current limitation note: `direct_relay_failover_report.json` now demonstrates endpoint reprogramming plus bounded handshake-driven direct-vs-relay path selection inside runtime; production relay transport service and automatic health-driven failover remain pending.
 
 8. Operations runbook update completed.
 - Added `documents/operations/Phase10ExitNodeDataplaneRunbook.md` with deployment, rollback, and incident procedures.

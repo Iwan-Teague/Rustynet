@@ -11,6 +11,7 @@ use rustynet_backend_api::{
 pub struct StubBackend {
     running: bool,
     peers: BTreeMap<NodeId, PeerConfig>,
+    peer_latest_handshakes: BTreeMap<NodeId, Option<u64>>,
     routes: Vec<Route>,
     exit_mode: ExitMode,
 }
@@ -20,6 +21,7 @@ impl Default for StubBackend {
         Self {
             running: false,
             peers: BTreeMap::new(),
+            peer_latest_handshakes: BTreeMap::new(),
             routes: Vec::new(),
             exit_mode: ExitMode::Off,
         }
@@ -61,6 +63,9 @@ impl TunnelBackend for StubBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
+        self.peer_latest_handshakes
+            .entry(peer.node_id.clone())
+            .or_insert(None);
         self.peers.insert(peer.node_id.clone(), peer);
         Ok(())
     }
@@ -86,9 +91,21 @@ impl TunnelBackend for StubBackend {
         Ok(self.peers.get(node_id).map(|peer| peer.endpoint))
     }
 
+    fn peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        if !self.peers.contains_key(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        Ok(self.peer_latest_handshakes.get(node_id).copied().flatten())
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
         self.peers.remove(node_id);
+        self.peer_latest_handshakes.remove(node_id);
         Ok(())
     }
 
@@ -118,6 +135,7 @@ impl TunnelBackend for StubBackend {
         self.ensure_running()?;
         self.running = false;
         self.peers.clear();
+        self.peer_latest_handshakes.clear();
         self.routes.clear();
         self.exit_mode = ExitMode::Off;
         Ok(())
