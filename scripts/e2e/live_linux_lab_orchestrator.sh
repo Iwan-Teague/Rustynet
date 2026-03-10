@@ -38,6 +38,7 @@ FAILURE_COUNT=0
 SOFT_FAILURE_COUNT=0
 SSH_PASSWORD_FILE=""
 SUDO_PASSWORD_FILE=""
+SSH_KNOWN_HOSTS_FILE=""
 TEMP_SSH_PASSWORD_FILE=""
 TEMP_SUDO_PASSWORD_FILE=""
 EXIT_TARGET=""
@@ -96,6 +97,7 @@ options:
   --extra-target <user@ip|ip>    Optional extra client target
   --ssh-password-file <path>     File containing SSH password
   --sudo-password-file <path>    File containing sudo password (defaults to SSH password)
+  --ssh-known-hosts-file <path>  Pinned SSH known_hosts file (defaults to ~/.ssh/known_hosts)
   --network-id <id>              Override generated network ID
   --ssh-allow-cidrs <cidrs>      SSH management CIDRs (default: ${SSH_ALLOW_CIDRS})
   --repo-ref <ref>               Explicit git ref to archive (implies source-mode=ref)
@@ -271,6 +273,7 @@ load_profile_file() {
         ;;
       SSH_PASSWORD_FILE) [[ -z "$SSH_PASSWORD_FILE" ]] && SSH_PASSWORD_FILE="$value" ;;
       SUDO_PASSWORD_FILE) [[ -z "$SUDO_PASSWORD_FILE" ]] && SUDO_PASSWORD_FILE="$value" ;;
+      SSH_KNOWN_HOSTS_FILE) [[ -z "$SSH_KNOWN_HOSTS_FILE" ]] && SSH_KNOWN_HOSTS_FILE="$value" ;;
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
       SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
       SOURCE_MODE)
@@ -1159,7 +1162,7 @@ stage_membership_setup() {
   exit_target="$(node_target_for_label exit)"
   exit_node_id="$(node_id_for_label exit)"
   owner_approver_id="${exit_node_id}-owner"
-  live_lab_run_root "$exit_target" "root chown root:root /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark >/dev/null 2>&1 || true; root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark >/dev/null 2>&1 || true" || return 1
+  live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown root:root /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
     live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}'" || return 1
@@ -1287,6 +1290,14 @@ current_run_git_status_is_dirty() {
   [[ -s "$STATE_DIR/git_status.txt" ]]
 }
 
+current_local_source_tree_is_dirty() {
+  git -C "$ROOT_DIR" status --short --untracked-files=no -- \
+    . \
+    ':(exclude)artifacts' \
+    ':(exclude).cargo-audit-db' \
+    ':(exclude)profiles/live_lab' | grep -q .
+}
+
 assert_local_gate_suite_provenance() {
   local deployed_commit local_head
   deployed_commit="$(current_run_git_commit)"
@@ -1298,6 +1309,10 @@ assert_local_gate_suite_provenance() {
   fi
   if [[ "$SOURCE_MODE" == "working-tree" ]] && current_run_git_status_is_dirty; then
     printf 'local full gate suite refuses dirty-working-tree attestation: commit-bound evidence requires a clean working tree or an explicit committed ref\n' >&2
+    return 1
+  fi
+  if current_local_source_tree_is_dirty; then
+    printf 'local full gate suite refuses source-tree drift: local checkout has tracked changes outside generated evidence paths, so local gate results would not be commit-bound\n' >&2
     return 1
   fi
 }
@@ -1453,6 +1468,26 @@ stage_run_live_lan_toggle() {
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
     --report-path "$REPORT_DIR/live_linux_lan_toggle_report.json" \
     --log-path "$REPORT_DIR/live_linux_lan_toggle.log"
+}
+
+stage_run_live_managed_dns() {
+  local canonical_report canonical_log
+  canonical_report="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.json"
+  canonical_log="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --signer-host "$(node_target_for_label exit)" \
+    --signer-node-id "$(node_id_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$REPORT_DIR/live_linux_managed_dns_report.json" \
+    --log-path "$REPORT_DIR/live_linux_managed_dns.log"
+  mkdir -p "$(dirname "$canonical_report")"
+  cp "$REPORT_DIR/live_linux_managed_dns_report.json" "$canonical_report"
+  cp "$REPORT_DIR/live_linux_managed_dns.log" "$canonical_log"
 }
 
 stage_generate_fresh_install_os_matrix_report() {
@@ -1941,6 +1976,7 @@ parse_args() {
       --extra-target) EXTRA_TARGET="$2"; shift 2 ;;
       --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
       --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+      --ssh-known-hosts-file) SSH_KNOWN_HOSTS_FILE="$2"; shift 2 ;;
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
       --repo-ref) REPO_REF="$2"; SOURCE_MODE="ref"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
@@ -2041,6 +2077,42 @@ ensure_password_inputs() {
   fi
 }
 
+ensure_known_hosts_input() {
+  local default_path="${HOME}/.ssh/known_hosts"
+  if [[ -z "$SSH_KNOWN_HOSTS_FILE" && -f "$default_path" ]]; then
+    SSH_KNOWN_HOSTS_FILE="$default_path"
+  fi
+  if [[ -z "$SSH_KNOWN_HOSTS_FILE" && -t 0 && -t 1 ]]; then
+    SSH_KNOWN_HOSTS_FILE="$(prompt_value 'Pinned SSH known_hosts file' "$default_path")"
+  fi
+  if [[ -z "$SSH_KNOWN_HOSTS_FILE" ]]; then
+    printf 'a pinned SSH known_hosts file is required\n' >&2
+    exit 2
+  fi
+  if [[ ! -f "$SSH_KNOWN_HOSTS_FILE" ]]; then
+    printf 'missing pinned SSH known_hosts file: %s\n' "$SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+  fi
+  if [[ -L "$SSH_KNOWN_HOSTS_FILE" ]]; then
+    printf 'pinned SSH known_hosts file must not be a symlink: %s\n' "$SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+  fi
+  if ! python3 - "$SSH_KNOWN_HOSTS_FILE" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+st = os.stat(path, follow_symlinks=False)
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o022:
+    raise SystemExit(f"pinned SSH known_hosts file must not be group/world writable: {path} ({mode:03o})")
+PY
+  then
+    exit 2
+  fi
+}
+
 remember_temp_password_files() {
   if [[ "$SSH_PASSWORD_FILE" == ${TMPDIR:-/tmp}/rustynet-lab-pass.* || "$SSH_PASSWORD_FILE" == /tmp/rustynet-lab-pass.* ]]; then
     TEMP_SSH_PASSWORD_FILE="$SSH_PASSWORD_FILE"
@@ -2065,7 +2137,9 @@ main() {
   prompt_missing_inputs
   normalize_targets
   ensure_password_inputs
+  ensure_known_hosts_input
   remember_temp_password_files
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$SSH_KNOWN_HOSTS_FILE"
   build_nodes_file
   refresh_failure_digest
   validate_topology_inputs
@@ -2104,6 +2178,7 @@ main() {
       record_stage_skip "live_two_hop" "hard" "dry-run: not executed"
       record_stage_skip "live_lan_toggle" "hard" "dry-run: not executed"
     fi
+    record_stage_skip "live_managed_dns" "hard" "dry-run: not executed"
     if has_five_node_release_gate_topology; then
       record_stage_skip "fresh_install_os_matrix_report" "hard" "dry-run: not executed"
     else
@@ -2157,6 +2232,7 @@ main() {
     record_stage_skip live_two_hop hard 'requires entry and aux targets'
     record_stage_skip live_lan_toggle hard 'requires aux target'
   fi
+  run_stage hard live_managed_dns 'run live managed DNS validation' stage_run_live_managed_dns
 
   if has_five_node_release_gate_topology; then
     run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report

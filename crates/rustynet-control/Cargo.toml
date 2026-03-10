@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+rustynet-dns-zone = { path = "../rustynet-dns-zone" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 sha2 = "0.10"

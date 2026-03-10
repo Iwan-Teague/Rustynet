@@ -8,12 +8,15 @@ use rustynetd::daemon::{
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
     DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
     DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
-    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
-    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
-    DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_LISTEN_PORT,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
-    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS, DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES,
+    DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS, DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
+    DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS,
+    DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS, DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
+    DEFAULT_TRAVERSAL_WATERMARK_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
+    DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_TRUSTED_HELPER_SOCKET_PATH,
+    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WG_LISTEN_PORT, DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -22,7 +25,8 @@ use rustynetd::key_material::{
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::net::SocketAddr;
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
     "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
@@ -451,6 +455,54 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "auto tunnel max age must be greater than 0".to_string())?;
                 index += 2;
             }
+            Some("--dns-zone-bundle") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-zone-bundle requires a value".to_string())?;
+                config.dns_zone_bundle_path = value.into();
+                index += 2;
+            }
+            Some("--dns-zone-verifier-key") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-zone-verifier-key requires a value".to_string())?;
+                config.dns_zone_verifier_key_path = value.into();
+                index += 2;
+            }
+            Some("--dns-zone-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-zone-watermark requires a value".to_string())?;
+                config.dns_zone_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--dns-zone-max-age-secs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-zone-max-age-secs requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid dns zone max age: {err}"))?;
+                config.dns_zone_max_age_secs = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "dns zone max age must be greater than 0".to_string())?;
+                index += 2;
+            }
+            Some("--dns-zone-name") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-zone-name requires a value".to_string())?;
+                config.dns_zone_name = value.clone();
+                index += 2;
+            }
+            Some("--dns-resolver-bind-addr") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--dns-resolver-bind-addr requires a value".to_string())?;
+                config.dns_resolver_bind_addr = value
+                    .parse::<SocketAddr>()
+                    .map_err(|err| format!("invalid dns resolver bind addr: {err}"))?;
+                index += 2;
+            }
             Some("--traversal-bundle") => {
                 let value = args
                     .get(index + 1)
@@ -481,6 +533,94 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .map_err(|err| format!("invalid traversal max age: {err}"))?;
                 config.traversal_max_age_secs = NonZeroU64::new(parsed)
                     .ok_or_else(|| "traversal max age must be greater than 0".to_string())?;
+                index += 2;
+            }
+            Some("--traversal-probe-max-candidates") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-probe-max-candidates requires a value".to_string()
+                })?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid traversal probe max candidates: {err}"))?;
+                config.traversal_probe_max_candidates =
+                    NonZeroUsize::new(parsed).ok_or_else(|| {
+                        "traversal probe max candidates must be greater than 0".to_string()
+                    })?;
+                index += 2;
+            }
+            Some("--traversal-probe-max-pairs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-probe-max-pairs requires a value".to_string())?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid traversal probe max pairs: {err}"))?;
+                config.traversal_probe_max_pairs = NonZeroUsize::new(parsed).ok_or_else(|| {
+                    "traversal probe max pairs must be greater than 0".to_string()
+                })?;
+                index += 2;
+            }
+            Some("--traversal-probe-rounds") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--traversal-probe-rounds requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u8>()
+                    .map_err(|err| format!("invalid traversal probe rounds: {err}"))?;
+                config.traversal_probe_simultaneous_open_rounds = NonZeroU8::new(parsed)
+                    .ok_or_else(|| "traversal probe rounds must be greater than 0".to_string())?;
+                index += 2;
+            }
+            Some("--traversal-probe-round-spacing-ms") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-probe-round-spacing-ms requires a value".to_string()
+                })?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid traversal probe round spacing: {err}"))?;
+                config.traversal_probe_round_spacing_ms =
+                    NonZeroU64::new(parsed).ok_or_else(|| {
+                        "traversal probe round spacing must be greater than 0".to_string()
+                    })?;
+                index += 2;
+            }
+            Some("--traversal-probe-relay-switch-after-failures") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-probe-relay-switch-after-failures requires a value".to_string()
+                })?;
+                let parsed = value.parse::<u8>().map_err(|err| {
+                    format!("invalid traversal probe relay switch threshold: {err}")
+                })?;
+                config.traversal_probe_relay_switch_after_failures = NonZeroU8::new(parsed)
+                    .ok_or_else(|| {
+                        "traversal probe relay switch threshold must be greater than 0".to_string()
+                    })?;
+                index += 2;
+            }
+            Some("--traversal-probe-handshake-freshness-secs") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-probe-handshake-freshness-secs requires a value".to_string()
+                })?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid traversal probe handshake freshness: {err}"))?;
+                config.traversal_probe_handshake_freshness_secs = NonZeroU64::new(parsed)
+                    .ok_or_else(|| {
+                        "traversal probe handshake freshness must be greater than 0".to_string()
+                    })?;
+                index += 2;
+            }
+            Some("--traversal-probe-reprobe-interval-secs") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-probe-reprobe-interval-secs requires a value".to_string()
+                })?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid traversal probe reprobe interval: {err}"))?;
+                config.traversal_probe_reprobe_interval_secs =
+                    NonZeroU64::new(parsed).ok_or_else(|| {
+                        "traversal probe reprobe interval must be greater than 0".to_string()
+                    })?;
                 index += 2;
             }
             Some("--backend") => {
@@ -1012,7 +1152,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -1035,6 +1175,25 @@ fn help_text() -> String {
         &format!("  traversal_verifier_key={DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH}"),
         &format!("  traversal_watermark={DEFAULT_TRAVERSAL_WATERMARK_PATH}"),
         &format!("  traversal_max_age_secs={DEFAULT_TRAVERSAL_MAX_AGE_SECS}"),
+        &format!(
+            "  traversal_probe_max_candidates={DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES}"
+        ),
+        &format!("  traversal_probe_max_pairs={DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS}"),
+        &format!(
+            "  traversal_probe_rounds={DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS}"
+        ),
+        &format!(
+            "  traversal_probe_round_spacing_ms={DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS}"
+        ),
+        &format!(
+            "  traversal_probe_relay_switch_after_failures={DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES}"
+        ),
+        &format!(
+            "  traversal_probe_handshake_freshness_secs={DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS}"
+        ),
+        &format!(
+            "  traversal_probe_reprobe_interval_secs={DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS}"
+        ),
         &format!(
             "  membership_owner_signing_key={DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH}"
         ),
@@ -1069,6 +1228,11 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::parse_daemon_config;
+    use rustynetd::daemon::{
+        DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
+        DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
+        DEFAULT_DNS_ZONE_WATERMARK_PATH,
+    };
     use rustynetd::phase10::ManagementCidr;
 
     #[test]
@@ -1162,6 +1326,20 @@ mod tests {
             "/tmp/rustynet.traversal.watermark".to_string(),
             "--traversal-max-age-secs".to_string(),
             "90".to_string(),
+            "--traversal-probe-max-candidates".to_string(),
+            "4".to_string(),
+            "--traversal-probe-max-pairs".to_string(),
+            "8".to_string(),
+            "--traversal-probe-rounds".to_string(),
+            "2".to_string(),
+            "--traversal-probe-round-spacing-ms".to_string(),
+            "40".to_string(),
+            "--traversal-probe-relay-switch-after-failures".to_string(),
+            "2".to_string(),
+            "--traversal-probe-handshake-freshness-secs".to_string(),
+            "15".to_string(),
+            "--traversal-probe-reprobe-interval-secs".to_string(),
+            "45".to_string(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -1177,6 +1355,76 @@ mod tests {
             std::path::PathBuf::from("/tmp/rustynet.traversal.watermark")
         );
         assert_eq!(config.traversal_max_age_secs.get(), 90);
+        assert_eq!(config.traversal_probe_max_candidates.get(), 4);
+        assert_eq!(config.traversal_probe_max_pairs.get(), 8);
+        assert_eq!(config.traversal_probe_simultaneous_open_rounds.get(), 2);
+        assert_eq!(config.traversal_probe_round_spacing_ms.get(), 40);
+        assert_eq!(config.traversal_probe_relay_switch_after_failures.get(), 2);
+        assert_eq!(config.traversal_probe_handshake_freshness_secs.get(), 15);
+        assert_eq!(config.traversal_probe_reprobe_interval_secs.get(), 45);
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_dns_zone_settings() {
+        let args = vec![
+            "--dns-zone-bundle".to_string(),
+            "/tmp/rustynet.dns-zone".to_string(),
+            "--dns-zone-verifier-key".to_string(),
+            "/tmp/rustynet.dns-zone.pub".to_string(),
+            "--dns-zone-watermark".to_string(),
+            "/tmp/rustynet.dns-zone.watermark".to_string(),
+            "--dns-zone-max-age-secs".to_string(),
+            "120".to_string(),
+            "--dns-zone-name".to_string(),
+            "mesh.rustynet".to_string(),
+            "--dns-resolver-bind-addr".to_string(),
+            "127.0.0.1:5300".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config.dns_zone_bundle_path,
+            std::path::PathBuf::from("/tmp/rustynet.dns-zone")
+        );
+        assert_eq!(
+            config.dns_zone_verifier_key_path,
+            std::path::PathBuf::from("/tmp/rustynet.dns-zone.pub")
+        );
+        assert_eq!(
+            config.dns_zone_watermark_path,
+            std::path::PathBuf::from("/tmp/rustynet.dns-zone.watermark")
+        );
+        assert_eq!(config.dns_zone_max_age_secs.get(), 120);
+        assert_eq!(config.dns_zone_name, "mesh.rustynet");
+        assert_eq!(
+            config.dns_resolver_bind_addr,
+            "127.0.0.1:5300".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_daemon_config_defaults_dns_zone_settings() {
+        let config = parse_daemon_config(&[]).expect("default config should parse");
+        assert_eq!(
+            config.dns_zone_bundle_path,
+            std::path::PathBuf::from(DEFAULT_DNS_ZONE_BUNDLE_PATH)
+        );
+        assert_eq!(
+            config.dns_zone_verifier_key_path,
+            std::path::PathBuf::from(DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH)
+        );
+        assert_eq!(
+            config.dns_zone_watermark_path,
+            std::path::PathBuf::from(DEFAULT_DNS_ZONE_WATERMARK_PATH)
+        );
+        assert_eq!(
+            config.dns_zone_max_age_secs.get(),
+            DEFAULT_DNS_ZONE_MAX_AGE_SECS
+        );
+        assert_eq!(config.dns_zone_name, DEFAULT_DNS_ZONE_NAME);
+        assert_eq!(
+            config.dns_resolver_bind_addr,
+            DEFAULT_DNS_RESOLVER_BIND_ADDR.parse().unwrap()
+        );
     }
 
     #[test]
@@ -1184,5 +1432,41 @@ mod tests {
         let args = vec!["--traversal-max-age-secs".to_string(), "0".to_string()];
         let err = parse_daemon_config(&args).expect_err("zero traversal max age should fail");
         assert!(err.contains("traversal max age must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_dns_zone_max_age() {
+        let args = vec!["--dns-zone-max-age-secs".to_string(), "0".to_string()];
+        let err = parse_daemon_config(&args).expect_err("zero dns zone max age should fail");
+        assert!(err.contains("dns zone max age must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_traversal_probe_rounds() {
+        let args = vec!["--traversal-probe-rounds".to_string(), "0".to_string()];
+        let err = parse_daemon_config(&args).expect_err("zero traversal probe rounds should fail");
+        assert!(err.contains("traversal probe rounds must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_traversal_probe_freshness() {
+        let args = vec![
+            "--traversal-probe-handshake-freshness-secs".to_string(),
+            "0".to_string(),
+        ];
+        let err =
+            parse_daemon_config(&args).expect_err("zero traversal probe freshness should fail");
+        assert!(err.contains("traversal probe handshake freshness must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_traversal_probe_reprobe_interval() {
+        let args = vec![
+            "--traversal-probe-reprobe-interval-secs".to_string(),
+            "0".to_string(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("zero traversal probe reprobe interval should fail");
+        assert!(err.contains("traversal probe reprobe interval must be greater than 0"));
     }
 }

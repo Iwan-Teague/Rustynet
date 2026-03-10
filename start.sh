@@ -2801,7 +2801,7 @@ disconnect_vpn() {
     local had_error=0
     print_info "Disabling exit-node mode before shutdown..."
     if [[ -S "${SOCKET_PATH}" ]]; then
-      if ! run_rustynet_cli exit-node off >/dev/null 2>&1; then
+      if ! disable_exit_selection >/dev/null 2>&1; then
         print_err "Failed to disable exit-node mode before disconnect."
         had_error=1
       fi
@@ -3312,7 +3312,7 @@ switch_node_role_mode() {
     fi
   else
     if [[ "${target_role}" == "client" && -n "${preferred_exit_node}" ]]; then
-      if ! run_rustynet_cli exit-node select "${preferred_exit_node}"; then
+      if ! apply_exit_selection_change "${preferred_exit_node}"; then
         print_err "Failed to select exit node '${preferred_exit_node}' during role switch."
         return 1
       fi
@@ -3334,10 +3334,17 @@ switch_node_role_mode() {
 restore_exit_selection() {
   local original_exit_node="$1"
   if [[ -n "${original_exit_node}" && "${original_exit_node}" != "none" ]]; then
-    run_rustynet_cli exit-node select "${original_exit_node}" >/dev/null 2>&1 || true
+    if ! apply_exit_selection_change "${original_exit_node}" >/dev/null 2>&1; then
+      print_err "Failed to restore exit node selection '${original_exit_node}' after readiness probe."
+      return 1
+    fi
   else
-    run_rustynet_cli exit-node off >/dev/null 2>&1 || true
+    if ! apply_exit_selection_change "" >/dev/null 2>&1; then
+      print_err "Failed to clear temporary exit node selection after readiness probe."
+      return 1
+    fi
   fi
+  return 0
 }
 
 extract_status_field() {
@@ -3386,7 +3393,11 @@ apply_exit_selection_change() {
     return 1
   fi
 
-  if is_linux_host && local_assignment_refresh_available; then
+  if is_linux_host; then
+    if ! local_assignment_refresh_available; then
+      print_err "Signed assignment refresh is required for exit-node changes on Linux; local assignment refresh is unavailable."
+      return 1
+    fi
     set_local_assignment_refresh_exit_node "${target_node}" || return 1
     force_local_assignment_refresh_now || return 1
     if ! wait_for_exit_node_state "${target_node}" 12; then
@@ -3399,11 +3410,61 @@ apply_exit_selection_change() {
     return 0
   fi
 
-  if [[ -n "${target_node}" ]]; then
-    run_rustynet_cli exit-node select "${target_node}"
-  else
-    run_rustynet_cli exit-node off
+  if is_macos_host; then
+    if [[ -n "${target_node}" ]]; then
+      run_rustynet_cli exit-node select "${target_node}"
+    else
+      run_rustynet_cli exit-node off
+    fi
+    return $?
   fi
+
+  print_err "Exit-node changes are unsupported on this host profile."
+  return 1
+}
+
+disable_exit_selection() {
+  if ! apply_exit_selection_change ""; then
+    print_err "Failed to disable exit node through the hardened selection path."
+    return 1
+  fi
+  return 0
+}
+
+apply_launch_profile_exit_selection() {
+  local exit_node_id="${1:-}"
+  if [[ -z "${exit_node_id}" ]]; then
+    return 0
+  fi
+  if ! apply_exit_selection_change "${exit_node_id}"; then
+    print_warn "Failed to select exit node '${exit_node_id}'."
+    return 1
+  fi
+  print_info "Exit node selected: ${exit_node_id}"
+  return 0
+}
+
+finalize_exit_chain_selection() {
+  local success_message="$1"
+  save_config
+  if ! enable_lan_access_after_exit_selection; then
+    refresh_menu_runtime_status
+    print_warn "Exit selection remains active with LAN access off; requested LAN coupling did not apply."
+    return 1
+  fi
+  refresh_menu_runtime_status
+  print_info "${success_message}"
+  return 0
+}
+
+finalize_exit_chain_disable() {
+  EXIT_CHAIN_HOPS="1"
+  EXIT_CHAIN_ENTRY_NODE_ID=""
+  EXIT_CHAIN_FINAL_NODE_ID=""
+  save_config
+  refresh_menu_runtime_status
+  print_info "Exit node selection cleared."
+  return 0
 }
 
 exit_chain_label() {
@@ -4001,7 +4062,7 @@ probe_exit_node_readiness() {
     original_exit_node=""
   fi
 
-  if ! selection_output="$(run_rustynet_cli exit-node select "${node_id}" 2>&1)"; then
+  if ! selection_output="$(apply_exit_selection_change "${node_id}" 2>&1)"; then
     if [[ "${selection_output}" == *"not active in membership state"* ]]; then
       membership_state="inactive"
       tunnel_state="skipped"
@@ -4011,7 +4072,9 @@ probe_exit_node_readiness() {
       tunnel_state="offline"
       readiness="select-failed"
     fi
-    restore_exit_selection "${original_exit_node}"
+    if ! restore_exit_selection "${original_exit_node}"; then
+      readiness="restore-failed"
+    fi
     printf '%s|%s|%s' "${membership_state}" "${tunnel_state}" "${readiness}"
     return 0
   fi
@@ -4024,7 +4087,9 @@ probe_exit_node_readiness() {
     readiness="selected-but-no-tunnel"
   fi
 
-  restore_exit_selection "${original_exit_node}"
+  if ! restore_exit_selection "${original_exit_node}"; then
+    readiness="restore-failed"
+  fi
   printf '%s|%s|%s' "${membership_state}" "${tunnel_state}" "${readiness}"
 }
 
@@ -4114,14 +4179,11 @@ select_exit_node() {
     if [[ -n "${current_exit_node}" && "${first_hop}" == "${current_exit_node}" ]]; then
       if [[ "${EXIT_CHAIN_HOPS}" == "1" && "${EXIT_CHAIN_ENTRY_NODE_ID}" == "${first_hop}" ]]; then
         print_info "Exit node '${first_hop}' is already selected. Disconnecting from exit node."
-        if ! apply_exit_selection_change ""; then
+        if ! disable_exit_selection; then
           return 1
         fi
-        EXIT_CHAIN_HOPS="1"
-        EXIT_CHAIN_ENTRY_NODE_ID=""
-        EXIT_CHAIN_FINAL_NODE_ID=""
-        save_config
-        return 0
+        finalize_exit_chain_disable
+        return $?
       fi
       print_info "Exit node '${first_hop}' is already selected. Updating chain mode to one-hop."
     else
@@ -4133,10 +4195,8 @@ select_exit_node() {
     EXIT_CHAIN_HOPS="1"
     EXIT_CHAIN_ENTRY_NODE_ID="${first_hop}"
     EXIT_CHAIN_FINAL_NODE_ID=""
-    save_config
-    print_info "One-hop exit selected: ${first_hop}"
-    enable_lan_access_after_exit_selection || true
-    return 0
+    finalize_exit_chain_selection "One-hop exit selected: ${first_hop}"
+    return $?
   fi
 
   prompt_default first_hop "First-hop entry relay node id" "${EXIT_CHAIN_ENTRY_NODE_ID}"
@@ -4180,14 +4240,11 @@ select_exit_node() {
       && "${EXIT_CHAIN_ENTRY_NODE_ID}" == "${first_hop}" \
       && "${EXIT_CHAIN_FINAL_NODE_ID}" == "${final_hop}" ]]; then
       print_info "Two-hop chain '${first_hop} -> ${final_hop}' is already selected. Disconnecting and clearing chain."
-      if ! apply_exit_selection_change ""; then
+      if ! disable_exit_selection; then
         return 1
       fi
-      EXIT_CHAIN_HOPS="1"
-      EXIT_CHAIN_ENTRY_NODE_ID=""
-      EXIT_CHAIN_FINAL_NODE_ID=""
-      save_config
-      return 0
+      finalize_exit_chain_disable
+      return $?
     fi
 
     if [[ "${current_exit_node}" != "${first_hop}" ]]; then
@@ -4205,9 +4262,7 @@ select_exit_node() {
   EXIT_CHAIN_HOPS="2"
   EXIT_CHAIN_ENTRY_NODE_ID="${first_hop}"
   EXIT_CHAIN_FINAL_NODE_ID="${final_hop}"
-  save_config
-  print_info "Two-hop chain selection saved: ${first_hop} -> ${final_hop}"
-  enable_lan_access_after_exit_selection || true
+  finalize_exit_chain_selection "Two-hop chain selection saved: ${first_hop} -> ${final_hop}"
 }
 
 advertise_route() {
@@ -4273,11 +4328,7 @@ apply_launch_profile() {
   case "${profile}" in
     quick-connect)
       if [[ -n "${exit_node_id}" ]]; then
-        if run_rustynet_cli exit-node select "${exit_node_id}"; then
-          print_info "Exit node selected: ${exit_node_id}"
-        else
-          print_warn "Failed to select exit node '${exit_node_id}'."
-        fi
+        apply_launch_profile_exit_selection "${exit_node_id}"
       fi
       ;;
     quick-exit-node)
@@ -4294,11 +4345,7 @@ apply_launch_profile() {
       ;;
     quick-hybrid)
       if [[ -n "${exit_node_id}" ]]; then
-        if run_rustynet_cli exit-node select "${exit_node_id}"; then
-          print_info "Exit node selected: ${exit_node_id}"
-        else
-          print_warn "Failed to select exit node '${exit_node_id}'."
-        fi
+        apply_launch_profile_exit_selection "${exit_node_id}"
       fi
       if run_rustynet_cli route advertise 0.0.0.0/0; then
         print_info "Exit route advertised (0.0.0.0/0)."
@@ -4407,7 +4454,7 @@ EOF
     if is_admin_role; then
       case "${choice}" in
         1) select_exit_node ;;
-        2) run_rustynet_cli exit-node off ;;
+        2) disable_exit_selection && finalize_exit_chain_disable ;;
         3) offer_device_as_exit_node ;;
         4) toggle_lan_access ;;
         5) advertise_route ;;
@@ -4421,7 +4468,7 @@ EOF
     else
       case "${choice}" in
         1) select_exit_node ;;
-        2) run_rustynet_cli exit-node off ;;
+        2) disable_exit_selection && finalize_exit_chain_disable ;;
         3) toggle_lan_access ;;
         4)
           echo "Saved admin peers:"
@@ -4499,7 +4546,7 @@ EOF
         if is_blind_exit_role; then
           start_or_restart_service
         else
-          run_rustynet_cli exit-node off
+          disable_exit_selection && finalize_exit_chain_disable
         fi
         ;;
       3) show_service_status ;;

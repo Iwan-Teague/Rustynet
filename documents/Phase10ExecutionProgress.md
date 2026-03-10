@@ -3,8 +3,9 @@
 Status correction (verified 2026-03-05):
 - This progress log contains historical completion claims.
 - Current code truth: `Phase10Controller` now programs per-peer direct/relay endpoints and refreshes peer endpoint bypass routing when traversal state changes.
-- Current code truth: auto-tunnel runtime now applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, gathers backend handshake-recency evidence, and fail-closes on traversal runtime programming errors instead of silently swallowing them.
-- Remaining scope gap: production relay transport service and automatic health-driven failover/failback under real WAN traversal conditions are still open code work.
+- Current code truth: auto-tunnel runtime now requires traversal-authoritative peer coverage for all managed peers in enforced mode, gathers backend handshake-recency evidence, fail-closes on traversal runtime programming errors instead of silently swallowing them, periodically reprobes relay-backed peers on reconcile, uses live backend handshake evidence to avoid stale cached direct-path decisions, and exposes explicit traversal probe fanout/freshness/reprobe policy through daemon config/status/netcheck.
+- Current code truth: Magic DNS now uses a shared signed DNS-zone schema/parser crate, CLI issue/verify commands, signed bundle + watermark verification inside `rustynetd`, assignment-cross-checked managed records, a loopback-only authoritative resolver for the private managed zone, a single Linux `systemd-resolved` integration path (`rustynetd-managed-dns.service`) that routes the managed zone through the Rustynet interface without `/etc/hosts` or resolver fallback, and measured live Linux evidence for valid managed-name resolution plus stale-bundle fail-closed behavior.
+- Remaining scope gap: production relay transport service and full WAN simultaneous-open traversal behavior are still open code work.
 - Security risk truth: resilience claims are still overstated if this is interpreted as fully completed internet-scale relay transport failover.
 
 ## 1) Objective and Scope Lock
@@ -32,7 +33,7 @@ Scope lock:
 - [x] `3.2` Encrypted mesh networking delivered through backend abstraction without protocol leakage.
 - [x] `3.3` Exit-node select/off with full-tunnel behavior.
 - [x] `3.4` LAN-toggle enforcement requiring toggle + route advertisement + ACL allow.
-- [x] `3.5` Magic DNS inspection path preserved and protected-DNS fail-close behavior enforced.
+- [x] `3.5` Magic DNS inspection path preserved and protected-DNS fail-close behavior enforced through signed managed-zone state and a loopback-only authoritative resolver.
 - [x] `3.6` Default-deny protocol-aware policy preserved for dataplane actions.
 - [x] `4` WireGuard modularity and backend replaceability preserved by interface boundaries.
 - [x] `4` Performance baseline harness and budgets measured/reported for Phase 10 evidence.
@@ -55,7 +56,7 @@ Scope lock:
 ### High
 - [x] API/IPC abuse detection signals for repeated failed mutation attempts.
 - [x] Backup/restore/state-integrity behavior validated for daemon state.
-- [ ] Direct/relay fallback/failback behavior validated end-to-end in real dataplane transport path (current state: runtime endpoint programming is implemented; production relay transport + health-driven automation remain open).
+- [ ] Direct/relay fallback/failback behavior validated end-to-end in real dataplane transport path (current state: runtime endpoint programming and health-driven periodic reprobe/direct failback are implemented for the signed traversal controller; production relay transport + full WAN simultaneous-open remain open).
 - [x] Incident/runbook updates completed for Phase 10 operations.
 
 ### Performance
@@ -88,7 +89,7 @@ Scope lock:
 
 ### E) E2E Harness and Operationalization
 - [x] Added Linux-focused evidence harness (`--emit-phase10-evidence`).
-- [ ] Added fail-close leak tests and direct/relay failover/failback validation (current state: controller/runtime endpoint programming is present; production relay transport integration remains open).
+- [ ] Added fail-close leak tests and direct/relay failover/failback validation (current state: controller/runtime endpoint programming and health-driven reprobe/failback are present; production relay transport integration remains open).
 - [x] Added Phase 10 runbook (`documents/operations/Phase10ExitNodeDataplaneRunbook.md`).
 - [x] Emitted mandatory artifacts under `artifacts/phase10/`.
 
@@ -101,6 +102,7 @@ Scope lock:
 | 2026-02-27T18:27:00Z | Full release/security gate chain | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo check --workspace --all-targets --all-features`, `cargo test --workspace --all-targets --all-features`, `cargo audit --deny warnings`, `cargo deny check bans licenses sources advisories`, `./scripts/ci/phase9_gates.sh`, `./scripts/ci/phase10_gates.sh` | PASS | `cargo audit` required escalated run for advisory DB lock under `~/.cargo` |
 | 2026-02-27T18:27:00Z | Emit Phase 10 evidence artifacts | `cargo run -p rustynetd -- --emit-phase10-evidence artifacts/phase10` | PASS | Generated all required `artifacts/phase10/*` files |
 | 2026-02-27T18:32:33Z | Final post-hardening verification | `./scripts/ci/phase10_gates.sh` | PASS | Confirmed final green state after Linux runtime system wiring and soak metadata update |
+| 2026-03-08T23:09:26Z | HP2 health-driven reprobe/failback hardening | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo check --workspace --all-targets --all-features`, `cargo test --workspace --all-targets --all-features`, `cargo audit --deny warnings`, `cargo deny check bans licenses sources advisories`, `./scripts/ci/phase10_hp2_gates.sh` | PASS | Added periodic relay reprobe on reconcile, live-handshake-backed direct health retention, and runtime tests proving relay->direct failback without stale cached state |
 
 ## 8) Drift Checks (Requirements/Security Refresh)
 | Timestamp (UTC) | Trigger | Files Re-read | Headings Reviewed | Drift Found | Action |
@@ -118,14 +120,17 @@ Scope lock:
 | 2026-02-27T18:20:00Z | `cargo audit` advisory-db lock failed in sandboxed `~/.cargo` | Security gate blocked | Re-ran Phase 10 gates with escalated permissions | Resolved |
 
 ## 10) Final Completion Ledger
-- [ ] All Phase 10 workstream tasks completed (status correction: production relay transport service and automatic failover/failback remain open code work).
+- [ ] All Phase 10 workstream tasks completed (status correction: production relay transport service and full WAN simultaneous-open traversal remain open code work).
 - [x] All mandatory gates passed (`fmt/clippy/check/test/audit/deny/phase9/phase10`).
 - [x] Required Phase 10 artifacts exist and validate:
   - [x] `artifacts/phase10/netns_e2e_report.json`
   - [x] `artifacts/phase10/leak_test_report.json`
   - [x] `artifacts/phase10/perf_budget_report.json`
   - [x] `artifacts/phase10/direct_relay_failover_report.json`
+  - [x] `artifacts/phase10/traversal_path_selection_report.json`
+  - [x] `artifacts/phase10/traversal_probe_security_report.json`
+  - [x] `artifacts/phase10/managed_dns_report.json`
   - [x] `artifacts/phase10/state_transition_audit.log`
-- [ ] No unresolved blockers remain (status correction: production relay transport/failover depth gap remains open).
+- [ ] No unresolved blockers remain (status correction: production relay transport and WAN traversal depth gap remain open).
 - [x] No unresolved Phase 10 TODO/FIXME/placeholders remain.
 - [x] `documents/Phase10CompletionReport.md` updated with explicit current deferment status.

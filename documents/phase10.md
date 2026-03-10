@@ -6,7 +6,7 @@
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) remains release-blocking.
 - If conflict exists, the stricter security interpretation applies and lower-precedence docs must be updated.
 - Status note (2026-03-05): this document defines **Phase 10 Linux scope**. Current repository behavior now includes additional macOS dataplane hardening and CI coverage beyond Phase 10 scope. For current platform truth, see [operations/PlatformSupportMatrix.md](./operations/PlatformSupportMatrix.md) and [operations/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md).
-- Status note (2026-03-08): `Phase10Controller` now stores authoritative per-peer traversal endpoints, reprograms peer endpoint/bypass routing on direct<->relay transitions, and executes a bounded handshake-driven direct-probe loop. Auto-tunnel runtime now also applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers and fail-closes on traversal runtime programming errors. Remaining open work is production relay transport service plus health-driven automatic failover/failback under real WAN traversal conditions.
+- Status note (2026-03-08): `Phase10Controller` now stores authoritative per-peer traversal endpoints, reprograms peer endpoint/bypass routing on direct<->relay transitions, and executes a bounded handshake-driven direct-probe loop. Auto-tunnel runtime now also requires traversal-authoritative coverage for all managed peers during bootstrap/reconcile in enforced mode, fail-closes on traversal runtime programming errors, periodically reprobes relay-backed sessions on reconcile, and uses live backend handshake evidence to keep direct-active peers from downgrading on stale cached probe state. Explicit traversal probe policy is exposed in daemon config/status/netcheck instead of relying on implicit runtime defaults. Remaining open work is production relay transport service plus full WAN simultaneous-open traversal behavior.
 
 ## 1) Phase 10 Objective
 Deliver real Linux dataplane execution so one enrolled device can act as an authorized exit node and securely route another enrolled device's traffic through encrypted transport, including signed endpoint-hint-driven direct UDP hole punching with encrypted relay fallback/failback, and mandatory fail-closed behavior for traffic and DNS.
@@ -90,6 +90,13 @@ This revised document closes those gaps.
 - Direct and relay are runtime path states under one controller, not separate legacy paths.
 - Path transitions are deterministic, auditable, and policy-gated.
 - If no trusted path is available in protected mode, transition to `fail_closed`.
+
+### 6.5 Managed DNS Contract
+- Managed-name state is accepted only from signed DNS-zone bundles with watermark/replay protection.
+- DNS records bind names to `target_node_id` and must cross-check against signed assignment-derived mesh IPs; raw arbitrary IP ownership is rejected.
+- The authoritative managed-zone resolver is loopback-only and must not listen on underlay/LAN interfaces.
+- Managed-zone queries return `SERVFAIL` when signed DNS state is missing, invalid, stale, or mismatched with assignment state.
+- Non-managed names are refused by the local authoritative resolver rather than silently handled through ad hoc local overrides.
 
 ## 7) Dataplane State Machine (Normative)
 States:
@@ -186,6 +193,7 @@ Default for Phase 10: if equivalent protections are not implemented for IPv6, en
 - Implement forwarding/NAT apply/remove.
 - Implement protected-routing kill-switch chain and rollback-safe updates.
 - Implement protected DNS egress restrictions and resolver routing.
+- Implement signed managed-zone ingestion and loopback-only authoritative resolution for the private Rustynet zone.
 
 ### Workstream D: Policy and ACL Enforcement in Dataplane
 - Enforce protocol-aware ACL decisions for exit and shared-router contexts.
@@ -283,6 +291,8 @@ cargo deny check bans licenses sources advisories
 - `perf_budget_report.json`
 - `direct_relay_failover_report.json`
 - `traversal_path_selection_report.json`
+- `traversal_probe_security_report.json`
+- `managed_dns_report.json`
 - `state_transition_audit.log`
 
 ## 14) Rollout and Rollback Plan
@@ -304,7 +314,7 @@ Rollback:
 | Requirements 3.2 | Encrypted mesh networking with NAT traversal + relay fallback | WireGuard backend + signed traversal endpoint-hint flow + deterministic path controller | `rustynet-backend-wireguard` + `rustynetd` |
 | Requirements 3.3 | Exit node selection/full-tunnel | `exit_manager` + route/firewall/NAT apply | `rustynetd` |
 | Requirements 3.4 | LAN toggle with ACL gates | toggle + advertised route + ACL precondition enforcement | `rustynetd` + `rustynet-policy` |
-| Requirements 3.5 | Magic DNS behavior safety | protected DNS routing + resolver constraints | `dns_manager` |
+| Requirements 3.5 | Magic DNS behavior safety | protected DNS routing + resolver constraints + single `systemd-resolved` integration path on Linux | `dns_manager` |
 | Requirements 3.6 | Default-deny ACL and protocol-aware rules | dataplane route/filter apply from policy decisions | `rustynet-policy` + `rustynetd` |
 | Requirements 4/5 | Reliability and security-first defaults | state machine + fail-closed + trust gating | `health_monitor` + `state_store` |
 | Security Minimum Bar Critical 1 | Proven crypto only | WireGuard-only production dataplane | backend adapter layer |

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -21,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::env_file::{format_env_assignment, parse_env_value};
 use ed25519_dalek::{Signer, SigningKey};
-use nix::unistd::{Gid, Group, Uid, chown};
+use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::membership::{
     MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
@@ -35,11 +36,17 @@ use rustynet_control::{AutoTunnelBundleRequest, ControlPlaneCore, NodeMetadata};
 use rustynet_crypto::{
     KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
 };
+use rustynet_dns_zone::{
+    canonicalize_dns_zone_name, parse_dns_zone_verifying_key, parse_signed_dns_zone_bundle_wire,
+    verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
+};
+use rustynet_local_security::validate_owner_only_socket;
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
-    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
+    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -60,6 +67,13 @@ enum CliCommand {
     LanAccessOn,
     LanAccessOff,
     DnsInspect,
+    DnsZoneIssue(Box<DnsZoneIssueCommand>),
+    DnsZoneVerify {
+        bundle_path: PathBuf,
+        verifier_key_path: PathBuf,
+        expected_zone_name: Option<String>,
+        expected_subject_node_id: Option<String>,
+    },
     RouteAdvertise(String),
     KeyRotate,
     KeyRevoke,
@@ -140,6 +154,30 @@ struct AssignmentIssueCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsZoneIssueCommand {
+    signing_secret_path: PathBuf,
+    signing_secret_passphrase_path: PathBuf,
+    subject_node_id: String,
+    output_path: PathBuf,
+    verifier_key_output_path: Option<PathBuf>,
+    nodes: Vec<AssignmentNodeSpec>,
+    allow_pairs: Vec<AssignmentAllowPair>,
+    zone_name: String,
+    records_path: PathBuf,
+    generated_at_unix: u64,
+    ttl_secs: u64,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsZoneRecordSpec {
+    label: String,
+    target_node_id: String,
+    ttl_secs: u64,
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TrustCommand {
     Keygen {
         signing_key_path: PathBuf,
@@ -182,6 +220,8 @@ enum OpsCommand {
     CollectPlatformParityBundle,
     InstallSystemd,
     PrepareSystemDirs,
+    ApplyManagedDnsRouting,
+    ClearManagedDnsRouting,
     ApplyBlindExitLockdown,
     InitMembership,
     SecureRemove {
@@ -308,6 +348,12 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd] if cmd == "lan-access" && subcmd == "on" => CliCommand::LanAccessOn,
         [cmd, subcmd] if cmd == "lan-access" && subcmd == "off" => CliCommand::LanAccessOff,
         [cmd, subcmd] if cmd == "dns" && subcmd == "inspect" => CliCommand::DnsInspect,
+        [cmd, subcmd, action, rest @ ..] if cmd == "dns" && subcmd == "zone" => {
+            match parse_dns_zone_command(action, rest) {
+                Ok(command) => command,
+                Err(_) => CliCommand::Help,
+            }
+        }
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             CliCommand::RouteAdvertise(cidr.clone())
         }
@@ -458,6 +504,18 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::PrepareSystemDirs)
         }
+        "apply-managed-dns-routing" => {
+            if args.len() != 1 {
+                return Err("ops apply-managed-dns-routing does not accept options".to_string());
+            }
+            Ok(OpsCommand::ApplyManagedDnsRouting)
+        }
+        "clear-managed-dns-routing" => {
+            if args.len() != 1 {
+                return Err("ops clear-managed-dns-routing does not accept options".to_string());
+            }
+            Ok(OpsCommand::ClearManagedDnsRouting)
+        }
         "apply-blind-exit-lockdown" => {
             if args.len() != 1 {
                 return Err("ops apply-blind-exit-lockdown does not accept options".to_string());
@@ -568,6 +626,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .parse::<u16>()
                     .map_err(|err| format!("invalid --ssh-port value: {err}"))?,
                 ssh_identity: parser.optional_path("--ssh-identity"),
+                ssh_known_hosts_file: parser.optional_path("--ssh-known-hosts-file"),
                 ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
                 ssh_sudo_mode: ops_e2e::SshSudoMode::parse(
                     parser
@@ -895,6 +954,36 @@ fn parse_trust_command(args: &[String]) -> Result<TrustCommand, String> {
     }
 }
 
+fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, String> {
+    let parser = OptionParser::parse(args)?;
+    match action {
+        "issue" => Ok(CliCommand::DnsZoneIssue(Box::new(DnsZoneIssueCommand {
+            signing_secret_path: parser.required_path("--signing-secret")?,
+            signing_secret_passphrase_path: parser
+                .required_path("--signing-secret-passphrase-file")?,
+            subject_node_id: parser.required("--subject-node-id")?,
+            output_path: parser.required_path("--output")?,
+            verifier_key_output_path: parser.optional_path("--verifier-key-output"),
+            nodes: parse_assignment_nodes(parser.required("--nodes")?.as_str())?,
+            allow_pairs: parse_assignment_allow_pairs(parser.required("--allow")?.as_str())?,
+            zone_name: parser
+                .value("--zone-name")
+                .unwrap_or_else(|| "rustynet".to_string()),
+            records_path: parser.required_path("--records-json")?,
+            generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
+            ttl_secs: parser.parse_u64_or_default("--ttl-secs", 300)?,
+            nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
+        }))),
+        "verify" => Ok(CliCommand::DnsZoneVerify {
+            bundle_path: parser.required_path("--bundle")?,
+            verifier_key_path: parser.required_path("--verifier-key")?,
+            expected_zone_name: parser.value("--expected-zone-name"),
+            expected_subject_node_id: parser.value("--expected-subject-node-id"),
+        }),
+        _ => Err(format!("unknown dns zone subcommand: {action}")),
+    }
+}
+
 fn proposal_config(
     parser: &OptionParser,
     paths: MembershipPaths,
@@ -922,6 +1011,18 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Help => Ok(help_text()),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
+        CliCommand::DnsZoneIssue(command) => execute_dns_zone_issue(*command),
+        CliCommand::DnsZoneVerify {
+            bundle_path,
+            verifier_key_path,
+            expected_zone_name,
+            expected_subject_node_id,
+        } => execute_dns_zone_verify(
+            bundle_path,
+            verifier_key_path,
+            expected_zone_name,
+            expected_subject_node_id,
+        ),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
@@ -1048,6 +1149,148 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
             ))
         }
     }
+}
+
+fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String> {
+    let DnsZoneIssueCommand {
+        signing_secret_path,
+        signing_secret_passphrase_path,
+        subject_node_id,
+        output_path,
+        verifier_key_output_path,
+        nodes,
+        allow_pairs,
+        zone_name,
+        records_path,
+        generated_at_unix,
+        ttl_secs,
+        nonce,
+    } = command;
+    ensure_regular_file_no_symlink(&records_path, "dns zone records json")?;
+    let records = load_dns_zone_records_json(&records_path)?;
+    let signing_secret =
+        load_assignment_signing_secret(&signing_secret_path, &signing_secret_passphrase_path)?;
+
+    let policy = PolicySet {
+        rules: allow_pairs
+            .iter()
+            .map(|pair| PolicyRule {
+                src: format!("node:{}", pair.source_node_id),
+                dst: format!("node:{}", pair.destination_node_id),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            })
+            .collect::<Vec<_>>(),
+    };
+
+    let core = ControlPlaneCore::new(signing_secret, policy);
+    for node in nodes {
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: node.node_id,
+                hostname: node.hostname,
+                os: node.os,
+                tags: node.tags,
+                owner: node.owner,
+                endpoint: node.endpoint,
+                last_seen_unix: generated_at_unix,
+                public_key: node.public_key,
+            })
+            .map_err(|err| format!("register node failed: {err}"))?;
+    }
+
+    let bundle = core
+        .signed_dns_zone_bundle(rustynet_control::SignedDnsZoneBundleRequest {
+            zone_name,
+            subject_node_id: subject_node_id.clone(),
+            generated_at_unix,
+            ttl_secs,
+            nonce,
+            records: records
+                .into_iter()
+                .map(|record| rustynet_control::DnsRecordRequest {
+                    label: record.label,
+                    target_node_id: record.target_node_id,
+                    ttl_secs: record.ttl_secs,
+                    rr_type: rustynet_control::DnsRecordType::A,
+                    target_addr_kind: rustynet_control::DnsTargetAddrKind::MeshIpv4,
+                    aliases: record.aliases,
+                })
+                .collect(),
+        })
+        .map_err(|err| format!("issue dns zone bundle failed: {err}"))?;
+
+    let wire = ControlPlaneCore::signed_dns_zone_bundle_to_wire(&bundle);
+    write_text_file(&output_path, &wire)?;
+
+    let verifier_key_hex = core.dns_zone_verifier_key_hex();
+    if let Some(verifier_path) = verifier_key_output_path.as_ref() {
+        write_text_file(verifier_path, &format!("{verifier_key_hex}\n"))?;
+    }
+
+    Ok(format!(
+        "dns zone bundle issued: zone_name={} subject_node_id={} output={} generated_at_unix={} expires_at_unix={} record_count={} verifier_key_output={}",
+        bundle.zone_name,
+        bundle.subject_node_id,
+        output_path.display(),
+        bundle.generated_at_unix,
+        bundle.expires_at_unix,
+        bundle.records.len(),
+        verifier_key_output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<not_written>".to_string())
+    ))
+}
+
+fn execute_dns_zone_verify(
+    bundle_path: PathBuf,
+    verifier_key_path: PathBuf,
+    expected_zone_name: Option<String>,
+    expected_subject_node_id: Option<String>,
+) -> Result<String, String> {
+    ensure_regular_file_no_symlink(&bundle_path, "dns zone bundle")?;
+    ensure_regular_file_no_symlink(&verifier_key_path, "dns zone verifier key")?;
+
+    let bundle_wire = fs::read_to_string(&bundle_path)
+        .map_err(|err| format!("read dns zone bundle failed: {err}"))?;
+    let bundle = parse_signed_dns_zone_bundle_wire(&bundle_wire)
+        .map_err(|err| format!("dns zone bundle parse failed: {err}"))?;
+
+    let verifier_contents = fs::read_to_string(&verifier_key_path)
+        .map_err(|err| format!("read dns zone verifier key failed: {err}"))?;
+    let verifying_key = parse_dns_zone_verifying_key(&verifier_contents)
+        .map_err(|err| format!("dns zone verifier key parse failed: {err}"))?;
+    verify_dns_zone_bundle(&bundle, &verifying_key)
+        .map_err(|err| format!("dns zone verification failed: {err}"))?;
+
+    if let Some(expected_zone_name) = expected_zone_name {
+        let normalized = canonicalize_dns_zone_name(&expected_zone_name)
+            .map_err(|err| format!("expected zone name is invalid: {err}"))?;
+        if bundle.zone_name != normalized {
+            return Err(format!(
+                "dns zone bundle zone_name mismatch: expected {}, got {}",
+                normalized, bundle.zone_name
+            ));
+        }
+    }
+    if let Some(expected_subject_node_id) = expected_subject_node_id
+        && bundle.subject_node_id != expected_subject_node_id
+    {
+        return Err(format!(
+            "dns zone bundle subject_node_id mismatch: expected {}, got {}",
+            expected_subject_node_id, bundle.subject_node_id
+        ));
+    }
+
+    Ok(format!(
+        "dns zone verification passed: zone_name={} subject_node_id={} generated_at_unix={} expires_at_unix={} record_count={}",
+        bundle.zone_name,
+        bundle.subject_node_id,
+        bundle.generated_at_unix,
+        bundle.expires_at_unix,
+        bundle.records.len()
+    ))
 }
 
 fn execute_operator_menu() -> Result<String, String> {
@@ -1370,6 +1613,8 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
+        OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
+        OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
         OpsCommand::ApplyBlindExitLockdown => execute_ops_apply_blind_exit_lockdown(),
         OpsCommand::InitMembership => execute_ops_init_membership(),
         OpsCommand::SecureRemove { path } => execute_ops_secure_remove(path),
@@ -2477,6 +2722,7 @@ const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assig
 const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.assignment.watermark";
 const DEFAULT_DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
+const MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS: u64 = 20;
 const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
 const DEFAULT_PHASE6_PARITY_INBOX_DIR: &str = "artifacts/release/inbox";
 const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
@@ -2524,6 +2770,55 @@ fn execute_ops_secure_remove(path: PathBuf) -> Result<String, String> {
     }
     secure_remove_file(path.as_path())?;
     Ok(format!("secure remove complete: {}", path.display()))
+}
+
+fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("apply-managed-dns-routing is supported on Linux only".to_string());
+    }
+
+    ensure_systemd_resolved_active()?;
+    let interface = managed_dns_interface_name_from_env()?;
+    wait_for_managed_dns_interface(
+        interface.as_str(),
+        Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
+    )?;
+    let zone_name = managed_dns_zone_name_from_env()?;
+    let resolver_bind_addr = managed_dns_resolver_bind_addr_from_env()?;
+    let resolver_arg = managed_dns_resolver_server_arg(resolver_bind_addr)?;
+    let routing_zone = format!("~{zone_name}");
+
+    run_resolvectl_action(&["dns", interface.as_str(), resolver_arg.as_str()])?;
+    run_resolvectl_action(&[
+        "domain",
+        interface.as_str(),
+        routing_zone.as_str(),
+        zone_name.as_str(),
+    ])?;
+    run_resolvectl_action(&["default-route", interface.as_str(), "no"])?;
+    run_resolvectl_action(&["status", interface.as_str()])?;
+
+    Ok(format!(
+        "managed DNS routing applied: interface={} zone={} resolver={}",
+        interface, zone_name, resolver_bind_addr
+    ))
+}
+
+fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("clear-managed-dns-routing is supported on Linux only".to_string());
+    }
+
+    ensure_systemd_resolved_active()?;
+    let interface = managed_dns_interface_name_from_env()?;
+    run_resolvectl_action(&["revert", interface.as_str()])?;
+
+    Ok(format!(
+        "managed DNS routing cleared: interface={}",
+        interface
+    ))
 }
 
 fn execute_ops_ensure_signing_passphrase_material() -> Result<String, String> {
@@ -3108,6 +3403,9 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
         "RUSTYNET_AUTO_TUNNEL_BUNDLE",
         "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY",
         "RUSTYNET_AUTO_TUNNEL_WATERMARK",
+        "RUSTYNET_DNS_ZONE_BUNDLE",
+        "RUSTYNET_DNS_ZONE_VERIFIER_KEY",
+        "RUSTYNET_DNS_ZONE_WATERMARK",
         "RUSTYNET_TRAVERSAL_BUNDLE",
         "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
         "RUSTYNET_TRAVERSAL_WATERMARK",
@@ -3146,6 +3444,118 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
         ordered.len(),
         host_profile
     ))
+}
+
+fn managed_dns_interface_name_from_env() -> Result<String, String> {
+    let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
+        .trim()
+        .to_string();
+    validate_managed_dns_interface_name(interface.as_str())?;
+    Ok(interface)
+}
+
+fn validate_managed_dns_interface_name(interface: &str) -> Result<(), String> {
+    if interface.is_empty() || interface.len() > 15 {
+        return Err(
+            "managed DNS routing interface name length must be between 1 and 15".to_string(),
+        );
+    }
+    if !interface
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("managed DNS routing interface contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+fn managed_dns_zone_name_from_env() -> Result<String, String> {
+    let zone_name = env_string_or_default("RUSTYNET_DNS_ZONE_NAME", DEFAULT_DNS_ZONE_NAME)?;
+    canonicalize_dns_zone_name(zone_name.as_str())
+        .map_err(|err| format!("invalid managed DNS zone name: {err}"))
+}
+
+fn managed_dns_resolver_bind_addr_from_env() -> Result<SocketAddr, String> {
+    let raw = env_string_or_default(
+        "RUSTYNET_DNS_RESOLVER_BIND_ADDR",
+        DEFAULT_DNS_RESOLVER_BIND_ADDR,
+    )?;
+    let addr = raw
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("invalid managed DNS resolver bind addr: {err}"))?;
+    if !addr.ip().is_loopback() {
+        return Err("managed DNS resolver bind addr must be loopback".to_string());
+    }
+    Ok(addr)
+}
+
+fn managed_dns_resolver_server_arg(addr: SocketAddr) -> Result<String, String> {
+    match addr {
+        SocketAddr::V4(v4) if v4.ip().is_loopback() => Ok(format!("{}:{}", v4.ip(), v4.port())),
+        SocketAddr::V6(_) => Err(
+            "managed DNS routing currently requires an IPv4 loopback resolver bind addr"
+                .to_string(),
+        ),
+        _ => Err("managed DNS resolver bind addr must be loopback".to_string()),
+    }
+}
+
+fn ensure_systemd_resolved_active() -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg("systemd-resolved.service")
+        .output()
+        .map_err(|err| {
+            format!("invoke systemctl is-active systemd-resolved.service failed: {err}")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(
+                "systemd-resolved.service must be active for managed DNS routing".to_string(),
+            );
+        }
+        return Err(format!(
+            "systemd-resolved.service must be active for managed DNS routing: {stderr}"
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_managed_dns_interface(interface: &str, timeout: Duration) -> Result<(), String> {
+    let interface_path = Path::new("/sys/class/net").join(interface);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if interface_path.exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "managed DNS routing interface did not appear within {}s: {}",
+                timeout.as_secs(),
+                interface
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn run_resolvectl_action(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("resolvectl")
+        .args(args)
+        .output()
+        .map_err(|err| format!("invoke resolvectl {} failed: {err}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("resolvectl {} failed: {}", args.join(" "), detail));
+    }
+    Ok(())
 }
 
 fn execute_ops_apply_blind_exit_lockdown() -> Result<String, String> {
@@ -5241,6 +5651,68 @@ fn parse_assignment_allow_pairs(encoded: &str) -> Result<Vec<AssignmentAllowPair
     Ok(pairs)
 }
 
+fn load_dns_zone_records_json(path: &Path) -> Result<Vec<DnsZoneRecordSpec>, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("read dns zone records json failed: {err}"))?;
+    let value: Value = serde_json::from_str(&contents)
+        .map_err(|err| format!("parse dns zone records json failed: {err}"))?;
+    let Value::Array(entries) = value else {
+        return Err("dns zone records json must be an array".to_string());
+    };
+    if entries.is_empty() {
+        return Err("dns zone records json must contain at least one record".to_string());
+    }
+
+    let mut records = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let Value::Object(mut object) = entry else {
+            return Err(format!("dns zone record {index} must be a JSON object"));
+        };
+        let label = match object.remove("label") {
+            Some(Value::String(value)) => value,
+            _ => return Err(format!("dns zone record {index} missing string label")),
+        };
+        let target_node_id = match object.remove("target_node_id") {
+            Some(Value::String(value)) => value,
+            _ => {
+                return Err(format!(
+                    "dns zone record {index} missing string target_node_id"
+                ));
+            }
+        };
+        let ttl_secs = match object.remove("ttl_secs") {
+            Some(Value::Number(value)) => value.as_u64().ok_or_else(|| {
+                format!("dns zone record {index} ttl_secs must be an unsigned integer")
+            })?,
+            _ => return Err(format!("dns zone record {index} missing integer ttl_secs")),
+        };
+        let aliases = match object.remove("aliases") {
+            Some(Value::Array(values)) => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(alias) => Ok(alias),
+                    _ => Err(format!("dns zone record {index} aliases must be strings")),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+            _ => return Err(format!("dns zone record {index} aliases must be an array")),
+        };
+        if !object.is_empty() {
+            return Err(format!(
+                "dns zone record {index} contains unsupported fields"
+            ));
+        }
+        records.push(DnsZoneRecordSpec {
+            label,
+            target_node_id,
+            ttl_secs,
+            aliases,
+        });
+    }
+
+    Ok(records)
+}
+
 fn validate_assignment_issue_config(
     nodes: &[AssignmentNodeSpec],
     allow_pairs: &[AssignmentAllowPair],
@@ -5441,6 +5913,8 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::Login
         | CliCommand::Help
         | CliCommand::OperatorMenu
+        | CliCommand::DnsZoneIssue(_)
+        | CliCommand::DnsZoneVerify { .. }
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
         | CliCommand::Trust(_)
@@ -5454,6 +5928,27 @@ fn daemon_socket_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH))
 }
 
+fn rustynetd_service_uid_for_socket(path: &Path) -> Option<u32> {
+    if !path.starts_with("/run/rustynet") {
+        return None;
+    }
+    User::from_name("rustynetd")
+        .ok()
+        .flatten()
+        .map(|user| user.uid.as_raw())
+}
+
+fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), String> {
+    let expected_uid = Uid::effective().as_raw();
+    let mut allowed_owner_uids = vec![expected_uid, 0];
+    if let Some(service_uid) = rustynetd_service_uid_for_socket(path)
+        && !allowed_owner_uids.contains(&service_uid)
+    {
+        allowed_owner_uids.push(service_uid);
+    }
+    validate_owner_only_socket(path, label, &allowed_owner_uids, &allowed_owner_uids)
+}
+
 fn send_command(command: IpcCommand) -> Result<IpcResponse, String> {
     send_command_with_socket(command, daemon_socket_path())
 }
@@ -5462,6 +5957,7 @@ fn send_command_with_socket(
     command: IpcCommand,
     socket_path: PathBuf,
 ) -> Result<IpcResponse, String> {
+    validate_control_socket_security(socket_path.as_path(), "daemon socket")?;
     let mut stream = UnixStream::connect(&socket_path)
         .map_err(|err| format!("connect {} failed: {err}", socket_path.display()))?;
 
@@ -5489,6 +5985,8 @@ fn help_text() -> String {
         "  exit-node off",
         "  lan-access on|off",
         "  dns inspect",
+        "  dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-json <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
+        "  dns zone verify --bundle <path> --verifier-key <path> [--expected-zone-name <name>] [--expected-subject-node-id <id>]",
         "  route advertise <cidr>",
         "  key rotate",
         "  key revoke",
@@ -5531,6 +6029,8 @@ fn help_text() -> String {
         "  ops collect-platform-parity-bundle",
         "  ops install-systemd",
         "  ops prepare-system-dirs",
+        "  ops apply-managed-dns-routing",
+        "  ops clear-managed-dns-routing",
         "  ops apply-blind-exit-lockdown",
         "  ops init-membership",
         "  ops secure-remove --path <absolute-path>",
@@ -5541,7 +6041,7 @@ fn help_text() -> String {
         "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
         "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
         "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
-        "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
+        "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
     ]
     .join("\n")
 }
@@ -5549,11 +6049,16 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_tampered_log, execute, load_signing_key, parse_bool_value, parse_bundle_u64_field,
-        parse_command, persist_encrypted_secret_material, phase6_validate_platform_parity_report,
+        detect_tampered_log, execute, load_dns_zone_records_json, load_signing_key,
+        managed_dns_resolver_server_arg, parse_bool_value, parse_bundle_u64_field, parse_command,
+        persist_encrypted_secret_material, phase6_validate_platform_parity_report,
         required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value,
+        validate_control_socket_security,
     };
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
@@ -5566,12 +6071,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_supports_dns_zone_commands() {
+        let issue = parse_command(&[
+            "dns".to_string(),
+            "zone".to_string(),
+            "issue".to_string(),
+            "--signing-secret".to_string(),
+            "/tmp/signing.secret".to_string(),
+            "--signing-secret-passphrase-file".to_string(),
+            "/tmp/signing.pass".to_string(),
+            "--subject-node-id".to_string(),
+            "node-a".to_string(),
+            "--nodes".to_string(),
+            "node-a|192.0.2.1:51820|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--allow".to_string(),
+            "node-a|node-a".to_string(),
+            "--records-json".to_string(),
+            "/tmp/dns-records.json".to_string(),
+            "--output".to_string(),
+            "/tmp/dns-zone.bundle".to_string(),
+        ]);
+        assert!(format!("{issue:?}").contains("DnsZoneIssue"));
+
+        let verify = parse_command(&[
+            "dns".to_string(),
+            "zone".to_string(),
+            "verify".to_string(),
+            "--bundle".to_string(),
+            "/tmp/dns-zone.bundle".to_string(),
+            "--verifier-key".to_string(),
+            "/tmp/dns-zone.pub".to_string(),
+        ]);
+        assert!(format!("{verify:?}").contains("DnsZoneVerify"));
+    }
+
+    #[test]
     fn parse_supports_key_commands() {
         let rotate = parse_command(&["key".to_string(), "rotate".to_string()]);
         assert!(format!("{rotate:?}").contains("KeyRotate"));
 
         let revoke = parse_command(&["key".to_string(), "revoke".to_string()]);
         assert!(format!("{revoke:?}").contains("KeyRevoke"));
+    }
+
+    #[test]
+    fn dns_zone_records_json_rejects_unknown_fields() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-dns-zone-records-{}-{}",
+            std::process::id(),
+            super::generate_assignment_nonce()
+        ));
+        fs::create_dir_all(&base).expect("temp dir should exist");
+        let path = base.join("records.json");
+        fs::write(
+            &path,
+            r#"[{"label":"app","target_node_id":"node-a","ttl_secs":60,"aliases":["ssh"],"unexpected":true}]"#,
+        )
+        .expect("records json should be written");
+        let err = load_dns_zone_records_json(&path).expect_err("unknown fields must fail");
+        assert!(err.contains("unsupported fields"));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -5778,6 +6338,14 @@ mod tests {
 
         let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
+
+        let apply_managed_dns =
+            parse_command(&["ops".to_string(), "apply-managed-dns-routing".to_string()]);
+        assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
+
+        let clear_managed_dns =
+            parse_command(&["ops".to_string(), "clear-managed-dns-routing".to_string()]);
+        assert!(format!("{clear_managed_dns:?}").contains("ClearManagedDnsRouting"));
 
         let blind_exit_lockdown =
             parse_command(&["ops".to_string(), "apply-blind-exit-lockdown".to_string()]);
@@ -5987,6 +6555,28 @@ mod tests {
             rewritten,
             "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def\"\n"
         );
+    }
+
+    #[test]
+    fn managed_dns_resolver_server_arg_accepts_ipv4_loopback() {
+        let server = managed_dns_resolver_server_arg(
+            "127.0.0.1:53535"
+                .parse()
+                .expect("ipv4 loopback resolver addr should parse"),
+        )
+        .expect("ipv4 loopback resolver addr should be accepted");
+        assert_eq!(server, "127.0.0.1:53535");
+    }
+
+    #[test]
+    fn managed_dns_resolver_server_arg_rejects_ipv6_loopback() {
+        let err = managed_dns_resolver_server_arg(
+            "[::1]:53535"
+                .parse()
+                .expect("ipv6 loopback resolver addr should parse"),
+        )
+        .expect_err("ipv6 loopback resolver addr should be rejected");
+        assert!(err.contains("IPv4 loopback"));
     }
 
     #[test]
@@ -6245,5 +6835,93 @@ mod tests {
 
         let _ = std::fs::remove_file(source_log);
         let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_validator_accepts_owner_only_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rnc-sock-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let socket = dir.join("rustynetd.sock");
+        let listener = UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+
+        let result = validate_control_socket_security(&socket, "daemon socket");
+        assert!(result.is_ok(), "owner-only socket should validate");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_validator_rejects_group_writable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rnc-sock-parent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
+            .expect("test dir permissions should be set");
+        let socket = dir.join("rustynetd.sock");
+        let listener = UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+
+        let err = validate_control_socket_security(&socket, "daemon socket")
+            .expect_err("group-writable parent must fail");
+        assert!(err.contains("parent directory has insecure permissions"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_validator_rejects_symlink_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let unique = format!(
+            "rnc-sock-link-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let socket = dir.join("rustynetd.sock");
+        let symlink_path = dir.join("rustynetd.sock.link");
+        let listener = UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+        symlink(&socket, &symlink_path).expect("symlink should be created");
+
+        let err = validate_control_socket_security(&symlink_path, "daemon socket")
+            .expect_err("symlink socket path must fail");
+        assert!(err.contains("must not be a symlink"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

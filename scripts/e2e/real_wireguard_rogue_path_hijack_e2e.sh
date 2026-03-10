@@ -13,6 +13,7 @@ SSH_PORT="22"
 SSH_USER="root"
 SSH_IDENTITY=""
 SSH_SUDO_MODE="auto"
+SSH_KNOWN_HOSTS_FILE="${SSH_KNOWN_HOSTS_FILE:-}"
 EXIT_HOST=""
 CLIENT_HOST=""
 ROGUE_ENDPOINT_IP=""
@@ -67,6 +68,12 @@ while [[ "$#" -gt 0 ]]; do
       FORWARD_ARGS+=("$1" "$2")
       shift 2
       ;;
+    --ssh-known-hosts-file)
+      [[ "$#" -ge 2 ]] || { echo "missing value for --ssh-known-hosts-file" >&2; exit 2; }
+      SSH_KNOWN_HOSTS_FILE="$2"
+      FORWARD_ARGS+=("$1" "$2")
+      shift 2
+      ;;
     *)
       FORWARD_ARGS+=("$1")
       shift
@@ -102,6 +109,33 @@ case "${SSH_SUDO_MODE}" in
     ;;
 esac
 
+if [[ -z "${SSH_KNOWN_HOSTS_FILE}" && -f "${HOME}/.ssh/known_hosts" ]]; then
+  SSH_KNOWN_HOSTS_FILE="${HOME}/.ssh/known_hosts"
+fi
+if [[ -z "${SSH_KNOWN_HOSTS_FILE}" ]]; then
+  echo "--ssh-known-hosts-file is required (or pre-populate ~/.ssh/known_hosts)" >&2
+  exit 2
+fi
+if [[ ! -f "${SSH_KNOWN_HOSTS_FILE}" ]]; then
+  echo "missing pinned SSH known_hosts file: ${SSH_KNOWN_HOSTS_FILE}" >&2
+  exit 2
+fi
+if [[ -L "${SSH_KNOWN_HOSTS_FILE}" ]]; then
+  echo "pinned SSH known_hosts file must not be a symlink: ${SSH_KNOWN_HOSTS_FILE}" >&2
+  exit 2
+fi
+python3 - "${SSH_KNOWN_HOSTS_FILE}" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+st = os.stat(path, follow_symlinks=False)
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o022:
+    raise SystemExit(f"pinned SSH known_hosts file must not be group/world writable: {path} ({mode:03o})")
+PY
+
 python3 - "${ROGUE_ENDPOINT_IP}" <<'PY'
 import ipaddress
 import sys
@@ -109,10 +143,17 @@ import sys
 ipaddress.IPv4Address(sys.argv[1])
 PY
 
-for cmd in ssh python3 cargo; do
+for cmd in ssh ssh-keygen python3 cargo; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
+  fi
+done
+
+for host in "${EXIT_HOST}" "${CLIENT_HOST}"; do
+  if ! ssh-keygen -F "${host}" -f "${SSH_KNOWN_HOSTS_FILE}" >/dev/null 2>&1; then
+    echo "pinned SSH known_hosts file lacks host key for ${host}: ${SSH_KNOWN_HOSTS_FILE}" >&2
+    exit 2
   fi
 done
 
@@ -121,7 +162,8 @@ mkdir -p "$(dirname "${REPORT_PATH}")"
 SSH_BASE=(
   ssh
   -o BatchMode=yes
-  -o StrictHostKeyChecking=accept-new
+  -o StrictHostKeyChecking=yes
+  -o "UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}"
   -o ConnectTimeout=15
   -p "${SSH_PORT}"
 )

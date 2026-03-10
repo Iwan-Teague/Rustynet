@@ -1,5 +1,5 @@
 {
-  "captured_at_unix": 1772980618,
+  "captured_at_unix": 1772988642,
   "checks": {
     "direct_to_relay_failover": "pass",
     "relay_to_direct_failback": "pass"

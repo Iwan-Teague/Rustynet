@@ -31,9 +31,13 @@ live_lab_init() {
   live_lab_require_file "$LIVE_LAB_SSH_PASSWORD_FILE" "ssh password file"
   live_lab_require_file "$LIVE_LAB_SUDO_PASSWORD_FILE" "sudo password file"
 
-  for cmd in expect ssh scp awk sed openssl xxd mktemp chmod tr; do
+  for cmd in expect ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr python3; do
     live_lab_require_command "$cmd"
   done
+
+  LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-${HOME}/.ssh/known_hosts}"
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE
+  live_lab_require_known_hosts_file "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE"
 
   LIVE_LAB_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")"
   LIVE_LAB_KNOWN_HOSTS="$LIVE_LAB_WORK_DIR/known_hosts"
@@ -42,8 +46,7 @@ live_lab_init() {
   LIVE_LAB_REMOTE_CLEANUP_TARGETS=()
   export LIVE_LAB_WORK_DIR LIVE_LAB_KNOWN_HOSTS LIVE_LAB_SSH_EXPECT LIVE_LAB_SCP_EXPECT
 
-  : > "$LIVE_LAB_KNOWN_HOSTS"
-  chmod 600 "$LIVE_LAB_KNOWN_HOSTS"
+  live_lab_seed_known_hosts_file "$LIVE_LAB_KNOWN_HOSTS"
 
   cat > "$LIVE_LAB_SSH_EXPECT" <<EXPECTSSH
 #!/usr/bin/expect -f
@@ -68,7 +71,7 @@ close \$fh
 set output ""
 match_max 2000000
 log_user 0
-spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$target \$command
+spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$target \$command
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
@@ -116,7 +119,7 @@ close \$fh
 set output ""
 match_max 2000000
 log_user 0
-spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$source \$target
+spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$source \$target
 while {1} {
   expect {
     -re {(?i)password:} { send -- "\$password\r"; exp_continue }
@@ -154,11 +157,56 @@ live_lab_cleanup() {
   fi
 }
 
+live_lab_require_known_hosts_file() {
+  local path="$1"
+  if [[ -z "$path" ]]; then
+    echo "pinned known_hosts file path is required" >&2
+    exit 1
+  fi
+  if [[ ! -f "$path" ]]; then
+    echo "missing pinned known_hosts file: $path" >&2
+    exit 1
+  fi
+  if [[ -L "$path" ]]; then
+    echo "pinned known_hosts file must not be a symlink: $path" >&2
+    exit 1
+  fi
+  if ! python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+st = os.stat(path, follow_symlinks=False)
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o022:
+    raise SystemExit(f"pinned known_hosts file must not be group/world writable: {path} ({mode:03o})")
+PY
+  then
+    exit 1
+  fi
+}
+
+live_lab_seed_known_hosts_file() {
+  local destination="$1"
+  cat "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" > "$destination"
+  chmod 600 "$destination"
+}
+
+live_lab_require_pinned_host_entry() {
+  local target="$1"
+  local host
+  host="$(live_lab_target_address "$target")"
+  if ! ssh-keygen -F "$host" -f "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >/dev/null 2>&1; then
+    echo "pinned known_hosts file lacks host key for ${host}: $LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >&2
+    exit 1
+  fi
+}
+
 live_lab_prepare_worker_known_hosts() {
   local worker_name="$1"
   local worker_known_hosts="$LIVE_LAB_WORK_DIR/known_hosts.${worker_name}"
-  : > "$worker_known_hosts"
-  chmod 600 "$worker_known_hosts"
+  live_lab_seed_known_hosts_file "$worker_known_hosts"
   export LIVE_LAB_KNOWN_HOSTS="$worker_known_hosts"
 }
 
@@ -191,6 +239,7 @@ live_lab_ssh() {
   local target="$1"
   local command="$2"
   local timeout="${3:-10800}"
+  live_lab_require_pinned_host_entry "$target"
   "$LIVE_LAB_SSH_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "$target" "$command" "$timeout"
 }
 
@@ -199,6 +248,7 @@ live_lab_scp_to() {
   local target="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  live_lab_require_pinned_host_entry "$target"
   "$LIVE_LAB_SCP_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "$src" "${target}:${dst}" "$timeout"
 }
 
@@ -207,6 +257,7 @@ live_lab_scp_from() {
   local src="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  live_lab_require_pinned_host_entry "$target"
   "$LIVE_LAB_SCP_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "${target}:${src}" "$dst" "$timeout"
 }
 

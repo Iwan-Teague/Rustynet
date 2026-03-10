@@ -1,5 +1,5 @@
 {
-  "captured_at_unix": 1772980618,
+  "captured_at_unix": 1772988642,
   "checks": {
     "dns_fail_closed": "pass",
     "tunnel_fail_closed": "pass"

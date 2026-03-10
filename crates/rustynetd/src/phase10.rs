@@ -2370,6 +2370,17 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .map(|peer| peer.configured.endpoint)
     }
 
+    pub fn managed_peer_latest_handshake_unix(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, Phase10Error> {
+        self.ensure_started()?;
+        if !self.managed_peers.contains_key(node_id) {
+            return Err(Phase10Error::PeerNotManaged);
+        }
+        Ok(self.backend.peer_latest_handshake_unix(node_id)?)
+    }
+
     pub fn evaluate_traversal_probes(
         &mut self,
         node_id: &NodeId,
@@ -2489,6 +2500,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.managed_peers
             .values()
             .any(|peer| peer.path == PathMode::Relay)
+    }
+
+    pub fn managed_peer_ids(&self) -> Vec<NodeId> {
+        self.managed_peers.keys().cloned().collect()
     }
 
     #[cfg(test)]

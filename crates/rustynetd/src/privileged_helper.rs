@@ -21,7 +21,8 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
-use nix::unistd::{Gid, chown};
+use nix::unistd::{Gid, Uid, chown};
+use rustynet_local_security::validate_root_managed_shared_runtime_socket;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
@@ -146,6 +147,7 @@ impl PrivilegedCommandClient {
         args: &[&str],
     ) -> Result<PrivilegedCommandOutput, String> {
         validate_request(program, args)?;
+        validate_privileged_helper_socket_security(&self.socket_path)?;
         let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
             format!(
                 "privileged helper connect failed ({}): {err}",
@@ -204,6 +206,19 @@ impl PrivilegedCommandClient {
             stderr: response.stderr.unwrap_or_default(),
         })
     }
+}
+
+fn validate_privileged_helper_socket_security(path: &Path) -> Result<(), String> {
+    let expected_uid = Uid::effective().as_raw();
+    let expected_gid = Gid::effective().as_raw();
+    let allowed_owner_uids = [expected_uid, 0];
+    validate_root_managed_shared_runtime_socket(
+        path,
+        "privileged helper socket",
+        &allowed_owner_uids,
+        &allowed_owner_uids,
+        expected_gid,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1102,12 +1117,15 @@ impl fmt::Display for PrivilegedCommandProgram {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
         HelperRequest, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
-        handle_request, is_nft_token, is_safe_token, read_request, validate_request,
+        handle_request, is_nft_token, is_safe_token, read_request,
+        validate_privileged_helper_socket_security, validate_request,
     };
 
     #[test]
@@ -1381,5 +1399,86 @@ mod tests {
             assert!(!response.ok);
             assert!(response.error.is_some());
         }
+    }
+
+    #[test]
+    fn privileged_helper_socket_validator_accepts_owner_only_socket() {
+        let unique = format!(
+            "rnh-sock-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let socket = dir.join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+
+        let result = validate_privileged_helper_socket_security(&socket);
+        assert!(result.is_ok(), "owner-only helper socket should validate");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn privileged_helper_socket_validator_rejects_group_writable_parent_directory() {
+        let unique = format!(
+            "rnh-sock-parent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
+            .expect("test dir permissions should be set");
+        let socket = dir.join("helper.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+
+        let err = validate_privileged_helper_socket_security(&socket)
+            .expect_err("group-writable parent must fail");
+        assert!(err.contains("privileged helper socket parent"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn privileged_helper_socket_validator_rejects_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let unique = format!(
+            "rnh-sock-link-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = PathBuf::from("/tmp").join(unique);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let socket = dir.join("helper.sock");
+        let symlink_path = dir.join("helper.sock.link");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode should be owner-only");
+        symlink(&socket, &symlink_path).expect("symlink should be created");
+
+        let err = validate_privileged_helper_socket_security(&symlink_path)
+            .expect_err("symlink helper socket path must fail");
+        assert!(err.contains("must not be a symlink"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

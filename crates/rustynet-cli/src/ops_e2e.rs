@@ -23,6 +23,7 @@ pub struct DebianTwoNodeE2eConfig {
     pub ssh_user: String,
     pub ssh_port: u16,
     pub ssh_identity: Option<PathBuf>,
+    pub ssh_known_hosts_file: Option<PathBuf>,
     pub ssh_allow_cidrs: String,
     pub ssh_sudo_mode: SshSudoMode,
     pub sudo_password_file: Option<PathBuf>,
@@ -76,7 +77,7 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new() -> Result<Self, String> {
+    fn new(seed_known_hosts: &Path) -> Result<Self, String> {
         let unique = unique_suffix();
         let temp_dir = PathBuf::from(format!("/tmp/rustynet-remote-e2e.{unique}"));
         fs::create_dir_all(&temp_dir).map_err(|err| {
@@ -95,8 +96,13 @@ impl Workspace {
         })?;
         set_unix_mode(control_dir.as_path(), 0o700)?;
         let known_hosts = temp_dir.join("known_hosts");
-        File::create(&known_hosts)
-            .map_err(|err| format!("failed to create {}: {err}", known_hosts.display()))?;
+        fs::copy(seed_known_hosts, &known_hosts).map_err(|err| {
+            format!(
+                "failed to seed {} from {}: {err}",
+                known_hosts.display(),
+                seed_known_hosts.display()
+            )
+        })?;
         set_unix_mode(known_hosts.as_path(), 0o600)?;
 
         Ok(Self {
@@ -769,13 +775,25 @@ pub fn execute_ops_run_debian_two_node_e2e(
     };
     ensure_command_exists("git")?;
     ensure_command_exists("ssh")?;
+    ensure_command_exists("ssh-keygen")?;
     ensure_command_exists("tar")?;
+    let known_hosts_source = resolve_ssh_known_hosts_file(config.ssh_known_hosts_file.as_deref())?;
 
     let commit_sha = rev_parse_short(repo_root.as_path(), config.repo_ref.as_str())?;
-    let workspace = Workspace::new()?;
+    let workspace = Workspace::new(known_hosts_source.as_path())?;
 
     let exit_target = qualify_target(config.exit_host.as_str(), config.ssh_user.as_str());
     let client_target = qualify_target(config.client_host.as_str(), config.ssh_user.as_str());
+    ensure_known_hosts_has_entry(
+        known_hosts_source.as_path(),
+        exit_target.address.as_str(),
+        config.ssh_port,
+    )?;
+    ensure_known_hosts_has_entry(
+        known_hosts_source.as_path(),
+        client_target.address.as_str(),
+        config.ssh_port,
+    )?;
     let ssh_opts =
         build_ssh_base_options(&workspace, config.ssh_port, config.ssh_identity.as_ref());
 
@@ -2372,6 +2390,73 @@ fn ensure_executable_file(path: &Path, label: &str) -> Result<(), String> {
     ))
 }
 
+fn resolve_ssh_known_hosts_file(path: Option<&Path>) -> Result<PathBuf, String> {
+    let resolved = if let Some(path) = path {
+        path.to_path_buf()
+    } else {
+        let Some(home) = env::var_os("HOME") else {
+            return Err(
+                "missing pinned known_hosts file; provide --ssh-known-hosts-file or set HOME"
+                    .to_string(),
+            );
+        };
+        PathBuf::from(home).join(".ssh/known_hosts")
+    };
+    let metadata = fs::symlink_metadata(&resolved).map_err(|err| {
+        format!(
+            "pinned known_hosts file check failed for {}: {err}",
+            resolved.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "pinned known_hosts file must not be a symlink: {}",
+            resolved.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "pinned known_hosts file is not a regular file: {}",
+            resolved.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "pinned known_hosts file must not be group/world writable: {:03o} ({})",
+                mode,
+                resolved.display()
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn ensure_known_hosts_has_entry(known_hosts: &Path, host: &str, port: u16) -> Result<(), String> {
+    let lookup_host = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let output = Command::new("ssh-keygen")
+        .args(["-F", lookup_host.as_str(), "-f"])
+        .arg(known_hosts)
+        .output()
+        .map_err(|err| {
+            format!("failed checking pinned known_hosts entry for {lookup_host}: {err}")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "pinned known_hosts file {} lacks host key for {lookup_host}",
+        known_hosts.display()
+    ))
+}
+
 fn clear_rustynet_nftables_state() -> Result<(), String> {
     let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
     for line in table_listing.lines() {
@@ -2476,7 +2561,7 @@ fn build_ssh_base_options(
         OsString::from("-o"),
         OsString::from("ServerAliveCountMax=3"),
         OsString::from("-o"),
-        OsString::from("StrictHostKeyChecking=accept-new"),
+        OsString::from("StrictHostKeyChecking=yes"),
         OsString::from("-o"),
         OsString::from(format!(
             "UserKnownHostsFile={}",

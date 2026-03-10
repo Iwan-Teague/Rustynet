@@ -26,12 +26,12 @@ Key mandatory constraints carried into this plan:
 - `rustynetd` parses/validates traversal bundles with strict schema, signature, freshness, and watermark replay checks.
 - `rustynet netcheck` reports traversal diagnostics.
 - `Phase10Controller` path toggles are no longer bookkeeping-only for runtime state: traversal endpoint programming updates the managed peer endpoint and bypass routing, and the controller now owns a bounded one-sided direct-probe executor driven by backend handshake-recency evidence.
-- Auto-tunnel runtime now exposes an explicit internal authority mode (`TraversalAuthorityMode::EnforcedV1`) and applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers; assignment `peer.N.endpoint` still remains the fallback input for peers that do not yet have verified traversal state.
+- Auto-tunnel runtime now exposes an explicit internal authority mode (`TraversalAuthorityMode::EnforcedV1`) and requires traversal-authoritative peer coverage for all managed peers during bootstrap/reconcile in enforced mode; assignment `peer.N.endpoint` is no longer accepted as mutable runtime authority when enforced traversal mode is active.
 - Traversal runtime programming errors now fail closed instead of being silently swallowed.
 - Backend contract already supports controlled endpoint rotation (`update_peer_endpoint` / `current_peer_endpoint`) and per-peer handshake-recency observation (`peer_latest_handshake_unix`).
 - `rustynet-relay` is still selector-only (HP-3 scope for real relay transport).
 
-Implication: HP-2 has crossed the “backend evidence + bounded probe executor” threshold, but still must expand authority from “covered peers” to all traversal-managed peers and remove remaining assignment-endpoint fallback authority for runtime mutation.
+Implication: HP-2 has crossed the “backend evidence + bounded probe executor” threshold, completed the enforced authority cutover for managed peers, and now includes health-driven periodic relay reprobe plus direct failback on the reconcile path. Remaining work is broader simultaneous-open WAN behavior and HP-3 relay transport.
 
 ## 4) HP-2 Security Contract (Non-Negotiable)
 1. Traversal artifact validity is a hard precondition for endpoint mutation.
@@ -59,11 +59,11 @@ Exit criteria:
 - Unit test proves missing traversal state blocks peer mutation in enforced mode.
 
 Status (2026-03-08):
-- partially implemented
+- implemented
 - runtime now has `TraversalAuthorityMode::EnforcedV1` in auto-tunnel mode,
-- covered peers are mutated from verified traversal state during bootstrap/reconcile,
-- inconsistent traversal runtime programming now fail-closes instead of being ignored,
-- fully blocking peers with missing traversal state remains open until the verified traversal index / multi-peer authority model is completed.
+- all managed peers are mutated only from verified traversal state during bootstrap/reconcile,
+- inconsistent traversal runtime programming fail-closes instead of being ignored,
+- missing or extra managed-peer traversal coverage now fail-closes instead of silently falling back to assignment endpoints.
 
 ---
 
@@ -142,6 +142,8 @@ Status (2026-03-08):
 - `TraversalEngine` now builds bounded one-sided remote probe plans from verified direct candidates,
 - `Phase10Controller` now executes the probe loop using backend handshake-recency evidence and records direct-vs-relay outcomes,
 - `rustynetd` now surfaces probe result/reason/attempt count in `status` and `netcheck`,
+- traversal probe fanout, round pacing, relay-switch threshold, handshake-freshness windows, and relay reprobe cadence are now explicit daemon policy instead of implicit runtime defaults,
+- `rustynetd` now periodically reprobes relay-backed peers on reconcile and uses live backend handshake evidence to avoid stale cached direct-path downgrades before failback,
 - remaining gap: this is still a one-sided proof model over signed remote candidates, not full simultaneous-open WAN traversal.
 
 ---

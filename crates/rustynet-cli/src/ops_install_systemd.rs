@@ -10,6 +10,11 @@ use std::process::Command;
 use crate::env_file::parse_env_value;
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{RngCore, rngs::OsRng};
+use rustynet_dns_zone::canonicalize_dns_zone_name;
+use rustynetd::daemon::{
+    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+    DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_DNS_ZONE_WATERMARK_PATH,
+};
 
 const ENV_DST: &str = "/etc/default/rustynetd";
 const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
@@ -36,6 +41,7 @@ const ASSIGNMENT_REFRESH_SERVICE_DST: &str =
 const ASSIGNMENT_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-assignment-refresh.timer";
 const ASSIGNMENT_REFRESH_SCRIPT_DST: &str =
     "/usr/local/libexec/rustynet/refresh_assignment_bundle.sh";
+const MANAGED_DNS_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-managed-dns.service";
 
 #[derive(Debug, Clone)]
 struct InstallSources {
@@ -47,6 +53,7 @@ struct InstallSources {
     assignment_refresh_service: PathBuf,
     assignment_refresh_timer: PathBuf,
     assignment_refresh_script: PathBuf,
+    managed_dns_service: PathBuf,
 }
 
 pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
@@ -158,6 +165,14 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         Gid::from_raw(0),
         "refresh_assignment_bundle.sh",
     )?;
+    install_file(
+        sources.managed_dns_service.as_path(),
+        Path::new(MANAGED_DNS_SERVICE_DST),
+        0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        "rustynetd-managed-dns.service",
+    )?;
 
     let socket_path = env_path_or_existing_default(
         "RUSTYNET_SOCKET",
@@ -249,6 +264,37 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     let traversal_max_age_secs =
         env_string_or_existing_default("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", "120", &existing_env)?;
+    let dns_zone_max_age_default = DEFAULT_DNS_ZONE_MAX_AGE_SECS.to_string();
+    let dns_zone_bundle_path = env_path_or_existing_default(
+        "RUSTYNET_DNS_ZONE_BUNDLE",
+        DEFAULT_DNS_ZONE_BUNDLE_PATH,
+        &existing_env,
+    )?;
+    let dns_zone_verifier_key_path = env_path_or_existing_default(
+        "RUSTYNET_DNS_ZONE_VERIFIER_KEY",
+        DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
+        &existing_env,
+    )?;
+    let dns_zone_watermark_path = env_path_or_existing_default(
+        "RUSTYNET_DNS_ZONE_WATERMARK",
+        DEFAULT_DNS_ZONE_WATERMARK_PATH,
+        &existing_env,
+    )?;
+    let dns_zone_max_age_secs = env_string_or_existing_default(
+        "RUSTYNET_DNS_ZONE_MAX_AGE_SECS",
+        dns_zone_max_age_default.as_str(),
+        &existing_env,
+    )?;
+    let dns_zone_name_raw = env_string_or_existing_default(
+        "RUSTYNET_DNS_ZONE_NAME",
+        DEFAULT_DNS_ZONE_NAME,
+        &existing_env,
+    )?;
+    let dns_resolver_bind_addr_raw = env_string_or_existing_default(
+        "RUSTYNET_DNS_RESOLVER_BIND_ADDR",
+        DEFAULT_DNS_RESOLVER_BIND_ADDR,
+        &existing_env,
+    )?;
     let node_id = env_string_or_existing_required("RUSTYNET_NODE_ID", &existing_env)?;
     let node_role = env_string_or_existing_default("RUSTYNET_NODE_ROLE", "client", &existing_env)?;
     let backend_mode =
@@ -354,6 +400,14 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
         traversal_max_age_secs.as_str(),
     )?;
+    parse_nonzero_u64(
+        "RUSTYNET_DNS_ZONE_MAX_AGE_SECS",
+        dns_zone_max_age_secs.as_str(),
+    )?;
+    let dns_zone_name = canonicalize_dns_zone_name(dns_zone_name_raw.as_str())
+        .map_err(|err| format!("invalid dns zone name: {err}"))?;
+    let dns_resolver_bind_addr =
+        parse_dns_resolver_bind_addr_install(dns_resolver_bind_addr_raw.as_str())?;
 
     if fail_closed_ssh_allow_enabled && fail_closed_ssh_allow_cidrs.trim().is_empty() {
         return Err(
@@ -391,6 +445,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         trust_watermark_path.as_path(),
         membership_watermark_path.as_path(),
         auto_tunnel_watermark_path.as_path(),
+        dns_zone_bundle_path.as_path(),
+        dns_zone_watermark_path.as_path(),
         traversal_watermark_path.as_path(),
         wireguard_private_key_path.as_path(),
     ] {
@@ -629,6 +685,12 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         0o644,
     )?;
     set_owner_mode_if_exists(
+        dns_zone_verifier_key_path.as_path(),
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o644,
+    )?;
+    set_owner_mode_if_exists(
         membership_owner_signing_key_path.as_path(),
         Uid::from_raw(0),
         Gid::from_raw(0),
@@ -716,6 +778,27 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS".to_string(),
             auto_tunnel_max_age_secs,
+        ),
+        (
+            "RUSTYNET_DNS_ZONE_BUNDLE".to_string(),
+            display_path(dns_zone_bundle_path.as_path()),
+        ),
+        (
+            "RUSTYNET_DNS_ZONE_VERIFIER_KEY".to_string(),
+            display_path(dns_zone_verifier_key_path.as_path()),
+        ),
+        (
+            "RUSTYNET_DNS_ZONE_WATERMARK".to_string(),
+            display_path(dns_zone_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_DNS_ZONE_MAX_AGE_SECS".to_string(),
+            dns_zone_max_age_secs,
+        ),
+        ("RUSTYNET_DNS_ZONE_NAME".to_string(), dns_zone_name),
+        (
+            "RUSTYNET_DNS_RESOLVER_BIND_ADDR".to_string(),
+            dns_resolver_bind_addr.to_string(),
         ),
         (
             "RUSTYNET_TRAVERSAL_BUNDLE".to_string(),
@@ -835,6 +918,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         &["enable", "rustynetd-privileged-helper.service"],
     )?;
     run_command_checked("systemctl", &["enable", "rustynetd.service"])?;
+    run_command_checked("systemctl", &["enable", "rustynetd-managed-dns.service"])?;
 
     if trust_auto_refresh_enabled {
         if !trust_signer_key_path.is_file() {
@@ -879,6 +963,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             "rustynetd-trust-refresh.timer",
             "rustynetd-assignment-refresh.service",
             "rustynetd-assignment-refresh.timer",
+            "rustynetd-managed-dns.service",
         ],
     );
 
@@ -901,6 +986,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         )?;
     }
     run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
+    run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
 
     run_command_stream(
         "systemctl",
@@ -933,6 +1019,15 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             ],
         )?;
     }
+    run_command_stream(
+        "systemctl",
+        &[
+            "--no-pager",
+            "--full",
+            "status",
+            "rustynetd-managed-dns.service",
+        ],
+    )?;
     run_command_stream(
         "systemctl",
         &["--no-pager", "--full", "status", "rustynetd.service"],
@@ -997,6 +1092,7 @@ fn install_sources(root: &Path) -> InstallSources {
             .join("scripts/systemd/rustynetd-assignment-refresh.service"),
         assignment_refresh_timer: root.join("scripts/systemd/rustynetd-assignment-refresh.timer"),
         assignment_refresh_script: root.join("scripts/systemd/refresh_assignment_bundle.sh"),
+        managed_dns_service: root.join("scripts/systemd/rustynetd-managed-dns.service"),
     }
 }
 
@@ -1011,6 +1107,7 @@ fn has_install_sources(root: &Path) -> bool {
         sources.assignment_refresh_service,
         sources.assignment_refresh_timer,
         sources.assignment_refresh_script,
+        sources.managed_dns_service,
     ]
     .iter()
     .all(|path| path.is_file())
@@ -1046,6 +1143,10 @@ fn validate_source_paths(paths: &InstallSources) -> Result<(), String> {
         (
             "refresh_assignment_bundle.sh",
             paths.assignment_refresh_script.as_path(),
+        ),
+        (
+            "rustynetd-managed-dns.service",
+            paths.managed_dns_service.as_path(),
         ),
     ] {
         validate_regular_file_non_symlink(path, label)?;
@@ -1201,6 +1302,22 @@ fn parse_nonzero_u64(key: &str, value: &str) -> Result<u64, String> {
         ));
     }
     Ok(parsed)
+}
+
+fn parse_dns_resolver_bind_addr_install(value: &str) -> Result<SocketAddr, String> {
+    let addr = value
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("invalid dns resolver bind addr: {err}"))?;
+    if !addr.ip().is_loopback() {
+        return Err("dns resolver bind addr must be loopback".to_string());
+    }
+    if !matches!(addr.ip(), IpAddr::V4(_)) {
+        return Err(
+            "dns resolver bind addr for managed DNS routing must be an IPv4 loopback address"
+                .to_string(),
+        );
+    }
+    Ok(addr)
 }
 
 fn parse_wireguard_port(value: &str) -> Result<u16, String> {
@@ -1998,8 +2115,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        assignment_peer_endpoint, bytes_to_hex, parse_dev_interface_token, parse_install_bool,
-        read_env_file_values, resolve_selected_exit_node_id,
+        assignment_peer_endpoint, bytes_to_hex, parse_dev_interface_token,
+        parse_dns_resolver_bind_addr_install, parse_install_bool, read_env_file_values,
+        resolve_selected_exit_node_id,
     };
 
     #[test]
@@ -2011,6 +2129,21 @@ mod tests {
         assert!(!parse_install_bool("TEST", "0").expect("0 should parse"));
         assert!(!parse_install_bool("TEST", "no").expect("no should parse"));
         assert!(parse_install_bool("TEST", "TRUE").is_err());
+    }
+
+    #[test]
+    fn parse_dns_resolver_bind_addr_install_requires_ipv4_loopback() {
+        let loopback = parse_dns_resolver_bind_addr_install("127.0.0.1:53535")
+            .expect("ipv4 loopback should parse");
+        assert_eq!(loopback.to_string(), "127.0.0.1:53535");
+
+        let non_loopback = parse_dns_resolver_bind_addr_install("192.0.2.10:53535")
+            .expect_err("non-loopback resolver should be rejected");
+        assert!(non_loopback.contains("loopback"));
+
+        let ipv6_loopback = parse_dns_resolver_bind_addr_install("[::1]:53535")
+            .expect_err("ipv6 loopback resolver should be rejected");
+        assert!(ipv6_loopback.contains("IPv4 loopback"));
     }
 
     #[test]

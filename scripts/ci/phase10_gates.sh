@@ -116,6 +116,7 @@ fi
 
 ./scripts/ci/run_required_test.sh rustynetd phase10::tests --all-features
 cargo test -p rustynet-backend-wireguard --all-targets --all-features
+./scripts/ci/phase10_hp2_gates.sh
 
 ./scripts/ci/security_regression_gates.sh
 

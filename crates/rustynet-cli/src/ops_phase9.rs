@@ -1842,6 +1842,24 @@ fn phase10_expected_provenance_entries(
             true,
         ),
         (
+            "source_traversal_path_selection_report",
+            "source",
+            source_dir.join("traversal_path_selection_report.json"),
+            true,
+        ),
+        (
+            "source_traversal_probe_security_report",
+            "source",
+            source_dir.join("traversal_probe_security_report.json"),
+            true,
+        ),
+        (
+            "source_managed_dns_report",
+            "source",
+            source_dir.join("managed_dns_report.json"),
+            true,
+        ),
+        (
             "source_state_transition_audit_log",
             "source",
             source_dir.join("state_transition_audit.log"),
@@ -1869,6 +1887,24 @@ fn phase10_expected_provenance_entries(
             "derived_direct_relay_failover_report",
             "derived",
             out_dir.join("direct_relay_failover_report.json"),
+            true,
+        ),
+        (
+            "derived_traversal_path_selection_report",
+            "derived",
+            out_dir.join("traversal_path_selection_report.json"),
+            true,
+        ),
+        (
+            "derived_traversal_probe_security_report",
+            "derived",
+            out_dir.join("traversal_probe_security_report.json"),
+            true,
+        ),
+        (
+            "derived_managed_dns_report",
+            "derived",
+            out_dir.join("managed_dns_report.json"),
             true,
         ),
         (
@@ -3265,16 +3301,44 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
             .as_path(),
         "direct_relay_failover_report source",
     )?;
+    let mut traversal_path_payload = read_json_object(
+        source_dir
+            .join("traversal_path_selection_report.json")
+            .as_path(),
+        "traversal_path_selection_report source",
+    )?;
+    let mut traversal_security_payload = read_json_object(
+        source_dir
+            .join("traversal_probe_security_report.json")
+            .as_path(),
+        "traversal_probe_security_report source",
+    )?;
+    let mut managed_dns_payload = read_json_object(
+        source_dir.join("managed_dns_report.json").as_path(),
+        "managed_dns_report source",
+    )?;
 
     let netns_source = source_dir.join("netns_e2e_report.json");
     let leak_source = source_dir.join("leak_test_report.json");
     let perf_source = source_dir.join("perf_budget_report.json");
     let direct_source = source_dir.join("direct_relay_failover_report.json");
+    let traversal_path_source = source_dir.join("traversal_path_selection_report.json");
+    let traversal_security_source = source_dir.join("traversal_probe_security_report.json");
+    let managed_dns_source = source_dir.join("managed_dns_report.json");
 
     ensure_regular_file(netns_source.as_path(), "raw phase10 evidence source")?;
     ensure_regular_file(leak_source.as_path(), "raw phase10 evidence source")?;
     ensure_regular_file(perf_source.as_path(), "raw phase10 evidence source")?;
     ensure_regular_file(direct_source.as_path(), "raw phase10 evidence source")?;
+    ensure_regular_file(
+        traversal_path_source.as_path(),
+        "raw phase10 evidence source",
+    )?;
+    ensure_regular_file(
+        traversal_security_source.as_path(),
+        "raw phase10 evidence source",
+    )?;
+    ensure_regular_file(managed_dns_source.as_path(), "raw phase10 evidence source")?;
 
     for (payload, source, label) in [
         (&netns_payload, netns_source.as_path(), "netns_e2e_report"),
@@ -3284,6 +3348,21 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
             &direct_payload,
             direct_source.as_path(),
             "direct_relay_failover_report",
+        ),
+        (
+            &traversal_path_payload,
+            traversal_path_source.as_path(),
+            "traversal_path_selection_report",
+        ),
+        (
+            &traversal_security_payload,
+            traversal_security_source.as_path(),
+            "traversal_probe_security_report",
+        ),
+        (
+            &managed_dns_payload,
+            managed_dns_source.as_path(),
+            "managed_dns_report",
         ),
     ] {
         phase10_require_measured_source(payload, source, label)?;
@@ -3312,6 +3391,36 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
         direct_source.as_path(),
         "direct_relay_failover_report",
     )?;
+    phase10_require_status_pass(
+        &traversal_path_payload,
+        traversal_path_source.as_path(),
+        "traversal_path_selection_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &traversal_path_payload,
+        traversal_path_source.as_path(),
+        "traversal_path_selection_report",
+    )?;
+    phase10_require_status_pass(
+        &traversal_security_payload,
+        traversal_security_source.as_path(),
+        "traversal_probe_security_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &traversal_security_payload,
+        traversal_security_source.as_path(),
+        "traversal_probe_security_report",
+    )?;
+    phase10_require_status_pass(
+        &managed_dns_payload,
+        managed_dns_source.as_path(),
+        "managed_dns_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &managed_dns_payload,
+        managed_dns_source.as_path(),
+        "managed_dns_report",
+    )?;
 
     phase10_validate_perf_budget(&perf_payload, perf_source.as_path())?;
 
@@ -3335,6 +3444,21 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
             &mut direct_payload,
             direct_source.as_path(),
             "direct_relay_failover_report.json",
+        ),
+        (
+            &mut traversal_path_payload,
+            traversal_path_source.as_path(),
+            "traversal_path_selection_report.json",
+        ),
+        (
+            &mut traversal_security_payload,
+            traversal_security_source.as_path(),
+            "traversal_probe_security_report.json",
+        ),
+        (
+            &mut managed_dns_payload,
+            managed_dns_source.as_path(),
+            "managed_dns_report.json",
         ),
     ] {
         payload.remove("gate_passed");
@@ -3503,6 +3627,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -3514,10 +3639,11 @@ mod tests {
         ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
         build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
         build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
-        hex_encode, load_key_hex_from_secure_path, read_json_object,
-        read_utf8_regular_file_with_max_bytes, sha256_hex, validate_phase10_host_identity,
-        verify_phase6_parity_attestation_document, verify_phase9_evidence_attestation_document,
-        verify_release_provenance_document, write_phase10_provenance_keypair,
+        hex_encode, load_key_hex_from_secure_path, phase10_expected_provenance_entries,
+        read_json_object, read_utf8_regular_file_with_max_bytes, sha256_hex,
+        validate_phase10_host_identity, verify_phase6_parity_attestation_document,
+        verify_phase9_evidence_attestation_document, verify_release_provenance_document,
+        write_phase10_provenance_keypair,
     };
     use ed25519_dalek::SigningKey;
 
@@ -3543,6 +3669,49 @@ mod tests {
         assert!(validate_phase10_host_identity("prod#host").is_err());
         let oversized = "a".repeat(129);
         assert!(validate_phase10_host_identity(oversized.as_str()).is_err());
+    }
+
+    #[test]
+    fn phase10_provenance_entries_include_traversal_and_managed_dns_reports() {
+        let source_dir = Path::new("/tmp/rustynet-phase10-source");
+        let out_dir = Path::new("/tmp/rustynet-phase10-out");
+        let entries = phase10_expected_provenance_entries(source_dir, out_dir);
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "source_traversal_path_selection_report"
+                && *kind == "source"
+                && *json_required
+                && path == &source_dir.join("traversal_path_selection_report.json")
+        }));
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "source_traversal_probe_security_report"
+                && *kind == "source"
+                && *json_required
+                && path == &source_dir.join("traversal_probe_security_report.json")
+        }));
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "derived_traversal_path_selection_report"
+                && *kind == "derived"
+                && *json_required
+                && path == &out_dir.join("traversal_path_selection_report.json")
+        }));
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "derived_traversal_probe_security_report"
+                && *kind == "derived"
+                && *json_required
+                && path == &out_dir.join("traversal_probe_security_report.json")
+        }));
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "source_managed_dns_report"
+                && *kind == "source"
+                && *json_required
+                && path == &source_dir.join("managed_dns_report.json")
+        }));
+        assert!(entries.iter().any(|(name, kind, path, json_required)| {
+            *name == "derived_managed_dns_report"
+                && *kind == "derived"
+                && *json_required
+                && path == &out_dir.join("managed_dns_report.json")
+        }));
     }
 
     #[test]

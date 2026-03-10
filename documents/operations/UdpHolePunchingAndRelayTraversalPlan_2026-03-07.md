@@ -13,12 +13,13 @@ while preserving Rustynet security constraints (default-deny, fail-closed, signe
 
 ## 2) Current State (Codebase Reality)
 - `Requirements.md` already requires NAT traversal + relay fallback (`3.2`).
-- `rustynetd` now validates signed traversal bundles, programs authoritative per-peer direct/relay endpoint targets into the Phase 10 runtime controller, gathers backend handshake-recency evidence, and uses a bounded one-sided direct-probe loop before falling back to relay; auto-tunnel runtime applies traversal-authoritative peer endpoints during bootstrap/reconcile for covered peers, and netcheck reflects runtime path state instead of a static traversal slogan.
+- `rustynetd` now validates signed traversal bundles, programs authoritative per-peer direct/relay endpoint targets into the Phase 10 runtime controller, gathers backend handshake-recency evidence, uses a bounded one-sided direct-probe loop before falling back to relay, periodically reprobes relay-backed peers on reconcile, and uses live backend handshake evidence to avoid stale cached direct-path downgrades; auto-tunnel runtime requires traversal-authoritative peer coverage for all managed peers in enforced mode, probe fanout/freshness/reprobe policy is now explicit in daemon config/status/netcheck, and netcheck reflects runtime path state instead of a static traversal slogan.
 - `rustynet-relay` currently provides relay fleet selection primitives, not full encrypted packet relay transport.
 - Auto-tunnel assignment currently carries a single signed endpoint per peer (`peer.N.endpoint`).
 
 Implication:
 - To match Tailscale-like UX, Rustynet still needs the remainder of HP-2 beyond the current one-sided probe model, plus HP-3 production relay transport, not just signed endpoint provisioning.
+- Health-driven periodic reprobe/direct failback is now present for the current signed traversal controller, but full WAN simultaneous-open behavior is not.
 
 ## 3) External Reference Constraints (Primary Sources)
 - Tailscale design notes indicate NAT traversal and protocol behavior must share socket/port behavior to make hole punching effective, and they combine direct attempts with relay fallback.
@@ -100,7 +101,7 @@ Acceptance:
 - `rustynet netcheck` now emits structured traversal diagnostics (path mode/reason, traversal artifact freshness, candidate counts by type, and validation error state) instead of the prior static message.
 - Traversal artifact paths are now wired through daemon config + CLI flags + Linux systemd installer/env (`RUSTYNET_TRAVERSAL_BUNDLE`, `RUSTYNET_TRAVERSAL_VERIFIER_KEY`, `RUSTYNET_TRAVERSAL_WATERMARK`, `RUSTYNET_TRAVERSAL_MAX_AGE_SECS`) and propagated into runtime launch arguments.
 - Daemon preflight now treats traversal verifier custody as conditional on traversal bundle presence: no bundle means verifier is not required, while a present bundle still fails closed if verifier key custody/validation is missing or invalid.
-- Auto-tunnel runtime now applies traversal-authoritative peer endpoints before backend peer provisioning for covered peers and fail-closes on traversal runtime programming errors instead of silently ignoring them.
+- Auto-tunnel runtime now applies traversal-authoritative peer endpoints before backend peer provisioning for all managed peers in enforced mode and fail-closes on traversal runtime programming errors instead of silently ignoring them.
 - Unit tests were added for tamper detection, replay rejection, watermark persistence, and deterministic netcheck diagnostics.
 
 ## Phase HP-2: Direct UDP Hole Punching Engine
@@ -150,10 +151,9 @@ Acceptance:
 - Port mapping can remain optional optimization, not a correctness dependency.
 
 ## 10) Immediate Next Code Work (Recommended Sequence)
-1. Implement HP-1 schema + signed endpoint hints + parser/validator tests.
-2. Add `rustynet netcheck` NAT/candidate reporting fields.
-3. Build minimal STUN probe client module in Rust (`rustynetd`) with strict parser and timeout policy.
-4. Integrate candidate set into peer endpoint selection logic.
+1. Build full simultaneous-open/STUN-assisted WAN candidate acquisition beyond the current one-sided signed-candidate proof model.
+2. Add live WAN/NAT validation harnesses and evidence for direct success, relay fallback, and secure failback.
+3. Implement HP-3 relay transport in `rustynet-relay`.
 
 ## 11) Security Test Additions Required
 - Replay/tamper tests for endpoint hints.

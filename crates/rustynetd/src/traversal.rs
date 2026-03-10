@@ -44,14 +44,20 @@ pub struct TraversalEngineConfig {
     pub relay_switch_after_failures: u8,
 }
 
+pub const DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES: usize = 8;
+pub const DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS: usize = 24;
+pub const DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 = 3;
+pub const DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = 80;
+pub const DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 = 3;
+
 impl Default for TraversalEngineConfig {
     fn default() -> Self {
         Self {
-            max_candidates: 8,
-            max_probe_pairs: 24,
-            simultaneous_open_rounds: 3,
-            round_spacing_ms: 80,
-            relay_switch_after_failures: 3,
+            max_candidates: DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES,
+            max_probe_pairs: DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS,
+            simultaneous_open_rounds: DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS,
+            round_spacing_ms: DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS,
+            relay_switch_after_failures: DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
         }
     }
 }
@@ -343,6 +349,11 @@ impl TraversalEngine {
         if config.simultaneous_open_rounds == 0 {
             return Err(TraversalError::InvalidConfig(
                 "simultaneous_open_rounds must be greater than zero",
+            ));
+        }
+        if config.round_spacing_ms == 0 {
+            return Err(TraversalError::InvalidConfig(
+                "round_spacing_ms must be greater than zero",
             ));
         }
         if config.relay_switch_after_failures == 0 {

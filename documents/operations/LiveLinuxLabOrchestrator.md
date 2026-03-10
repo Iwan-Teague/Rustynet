@@ -38,6 +38,7 @@ What runs with each topology:
   - clean install
   - bootstrap
   - one-hop routing validation
+  - live managed-DNS validation
 - 3 nodes:
   - plus live exit handoff
 - 4 or more nodes:
@@ -86,12 +87,12 @@ The following stages now execute one worker per target in parallel:
 
 Security and determinism constraints for parallel work:
 
-- each worker gets its own `known_hosts` file inside the live-lab work directory
+- each worker gets its own `known_hosts` file inside the live-lab work directory, seeded from the operator-supplied pinned host-key file
 - each worker writes its own stage log before the parent aggregates output
 - signed membership setup and assignment issuance on the primary exit remain single-authority serialized steps
 - exit route advertisement remains serialized after per-host runtime enforcement
 
-This keeps the expensive host-local work concurrent without introducing shared-state races in SSH host-key tracking or signed-control-plane mutation.
+This keeps the expensive host-local work concurrent without introducing shared-state races in SSH host-key tracking or signed-control-plane mutation. TOFU host-key acceptance is intentionally disabled.
 
 ## Hard-fail vs soft-fail stages
 
@@ -111,6 +112,7 @@ Default hard-fail stages:
 - live exit handoff
 - live two-hop validation
 - live LAN toggle validation
+- live managed-DNS validation
 - fresh install OS matrix report generation
 - local full gate suite (unless `--skip-gates`)
 
@@ -235,6 +237,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --entry-target ubuntu@192.168.18.52 \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-password-file /tmp/rustynet_ssh.pass \
   --sudo-password-file /tmp/rustynet_sudo.pass
 ```
@@ -248,6 +251,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --entry-target ubuntu@192.168.18.52 \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-password-file /tmp/rustynet_ssh.pass \
   --sudo-password-file /tmp/rustynet_sudo.pass \
   --skip-gates \
@@ -261,6 +265,10 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   - loads a saved `.env`-style lab profile
   - CLI flags still win if both are provided
   - passwords are best kept out of the profile and provided via secure files or prompt
+- `--ssh-known-hosts-file <path>`
+  - supplies the pinned SSH host-key file used for all worker SSH/SCP sessions
+  - defaults to `~/.ssh/known_hosts` if it exists
+  - must not be a symlink or group/world writable
 - `--source-mode <working-tree|local-head|origin-main>`
   - selects what source archive gets installed on the lab machines
 - `--use-origin-main`

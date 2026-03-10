@@ -23,12 +23,18 @@ use hmac::{Hmac, Mac};
 #[cfg(unix)]
 use nix::unistd::Uid;
 use rand::RngCore;
+pub use rustynet_dns_zone::{DnsRecordType, DnsTargetAddrKind, SignedDnsZoneBundle};
+use rustynet_dns_zone::{
+    DnsZoneError, DnsZoneRecordInput, build_signed_dns_zone_bundle,
+    render_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
+};
 use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 const SIGNING_SEED_HKDF_SALT_V1: &[u8] = b"rustynet-control-signing-seed-hkdf-salt-v1";
 const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-signing-v1";
+const DNS_ZONE_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-dns-zone-signing-v1";
 const ACCESS_TOKEN_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-access-token-signing-v1";
 const ENDPOINT_HINT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-endpoint-hint-signing-v1";
 
@@ -1421,6 +1427,26 @@ pub struct SignedAutoTunnelBundle {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRecordRequest {
+    pub label: String,
+    pub target_node_id: String,
+    pub ttl_secs: u64,
+    pub rr_type: DnsRecordType,
+    pub target_addr_kind: DnsTargetAddrKind,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedDnsZoneBundleRequest {
+    pub zone_name: String,
+    pub subject_node_id: String,
+    pub generated_at_unix: u64,
+    pub ttl_secs: u64,
+    pub nonce: u64,
+    pub records: Vec<DnsRecordRequest>,
+}
+
 #[derive(Debug)]
 pub struct ControlPlanePersistence {
     store: Mutex<persistence::SqliteStore>,
@@ -1548,6 +1574,8 @@ pub struct ControlPlaneCore {
     transport_policy: ControlPlaneTransportPolicy,
     assignment_signing_key: SigningKey,
     assignment_verifying_key: [u8; 32],
+    dns_zone_signing_key: SigningKey,
+    dns_zone_verifying_key: [u8; 32],
     endpoint_hint_signing_key: SigningKey,
     endpoint_hint_verifying_key: [u8; 32],
     access_token_signing_key: SigningKey,
@@ -1558,6 +1586,7 @@ impl ControlPlaneCore {
     pub fn new(mut signing_secret: Vec<u8>, policy: PolicySet) -> Self {
         let mut assignment_seed =
             derive_signing_seed(ASSIGNMENT_SIGNING_SEED_INFO_V1, &signing_secret);
+        let mut dns_zone_seed = derive_signing_seed(DNS_ZONE_SIGNING_SEED_INFO_V1, &signing_secret);
         let mut endpoint_hint_seed =
             derive_signing_seed(ENDPOINT_HINT_SIGNING_SEED_INFO_V1, &signing_secret);
         let mut access_token_seed =
@@ -1567,6 +1596,9 @@ impl ControlPlaneCore {
         let assignment_signing_key = SigningKey::from_bytes(&assignment_seed);
         assignment_seed.zeroize();
         let assignment_verifying_key = *assignment_signing_key.verifying_key().as_bytes();
+        let dns_zone_signing_key = SigningKey::from_bytes(&dns_zone_seed);
+        dns_zone_seed.zeroize();
+        let dns_zone_verifying_key = *dns_zone_signing_key.verifying_key().as_bytes();
         let endpoint_hint_signing_key = SigningKey::from_bytes(&endpoint_hint_seed);
         endpoint_hint_seed.zeroize();
         let endpoint_hint_verifying_key = *endpoint_hint_signing_key.verifying_key().as_bytes();
@@ -1581,6 +1613,8 @@ impl ControlPlaneCore {
             transport_policy: ControlPlaneTransportPolicy::default(),
             assignment_signing_key,
             assignment_verifying_key,
+            dns_zone_signing_key,
+            dns_zone_verifying_key,
             endpoint_hint_signing_key,
             endpoint_hint_verifying_key,
             access_token_signing_key,
@@ -1763,6 +1797,10 @@ impl ControlPlaneCore {
 
     pub fn assignment_verifier_key_hex(&self) -> String {
         hex_bytes(&self.assignment_verifying_key)
+    }
+
+    pub fn dns_zone_verifier_key_hex(&self) -> String {
+        hex_bytes(&self.dns_zone_verifying_key)
     }
 
     pub fn access_token_verifier_key_hex(&self) -> String {
@@ -1951,6 +1989,66 @@ impl ControlPlaneCore {
         })
     }
 
+    pub fn signed_dns_zone_bundle(
+        &self,
+        request: SignedDnsZoneBundleRequest,
+    ) -> Result<SignedDnsZoneBundle, ControlPlaneError> {
+        let subject = self
+            .nodes
+            .get(&request.subject_node_id)?
+            .ok_or_else(|| ControlPlaneError::Dns("subject node does not exist".to_string()))?;
+
+        let mut peers = self.nodes.list()?;
+        peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let tunnel_assignments =
+            Self::deterministic_tunnel_assignments(peers.iter().map(|peer| peer.node_id.as_str()))?;
+
+        let mut canonical_records = Vec::with_capacity(request.records.len());
+
+        for record in request.records {
+            let target = self
+                .nodes
+                .get(&record.target_node_id)?
+                .ok_or_else(|| ControlPlaneError::Dns("target node does not exist".to_string()))?;
+            if target.node_id != subject.node_id && !self.policy_allows_node_pair(&subject, &target)
+            {
+                return Err(ControlPlaneError::Dns(
+                    "dns record target denied by policy".to_string(),
+                ));
+            }
+
+            let expected_cidr =
+                tunnel_assignments
+                    .get(target.node_id.as_str())
+                    .ok_or_else(|| {
+                        ControlPlaneError::Dns("target node assignment is unavailable".to_string())
+                    })?;
+            let expected_ip = host_ip_from_host_cidr(expected_cidr.as_str()).ok_or_else(|| {
+                ControlPlaneError::Dns("target node assignment must be a host cidr".to_string())
+            })?;
+            canonical_records.push(DnsZoneRecordInput {
+                label: record.label,
+                target_node_id: target.node_id.clone(),
+                rr_type: record.rr_type,
+                target_addr_kind: record.target_addr_kind,
+                expected_ip,
+                ttl_secs: record.ttl_secs,
+                aliases: record.aliases,
+            });
+        }
+
+        build_signed_dns_zone_bundle(
+            &self.dns_zone_signing_key,
+            request.zone_name.as_str(),
+            subject.node_id.as_str(),
+            request.generated_at_unix,
+            request.ttl_secs,
+            request.nonce,
+            &canonical_records,
+        )
+        .map_err(map_dns_zone_error)
+    }
+
     pub fn signed_endpoint_hint_bundle(
         &self,
         request: EndpointHintBundleRequest,
@@ -2084,6 +2182,18 @@ impl ControlPlaneCore {
         format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
     }
 
+    pub fn verify_signed_dns_zone_bundle(&self, bundle: &SignedDnsZoneBundle) -> bool {
+        let verifying_key = match VerifyingKey::from_bytes(&self.dns_zone_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verify_dns_zone_bundle(bundle, &verifying_key).is_ok()
+    }
+
+    pub fn signed_dns_zone_bundle_to_wire(bundle: &SignedDnsZoneBundle) -> String {
+        render_signed_dns_zone_bundle_wire(bundle)
+    }
+
     pub fn verify_signed_auto_tunnel_bundle(&self, bundle: &SignedAutoTunnelBundle) -> bool {
         if bundle.generated_at_unix > bundle.expires_at_unix {
             return false;
@@ -2211,6 +2321,7 @@ pub enum ControlPlaneError {
     Trust(TrustStateError),
     Persistence(persistence::PersistenceError),
     Assignment(String),
+    Dns(String),
     Traversal(String),
     Internal,
 }
@@ -2223,6 +2334,7 @@ impl fmt::Display for ControlPlaneError {
             ControlPlaneError::Trust(err) => write!(f, "trust error: {err}"),
             ControlPlaneError::Persistence(err) => write!(f, "persistence error: {err}"),
             ControlPlaneError::Assignment(err) => write!(f, "assignment error: {err}"),
+            ControlPlaneError::Dns(err) => write!(f, "dns error: {err}"),
             ControlPlaneError::Traversal(err) => write!(f, "traversal error: {err}"),
             ControlPlaneError::Internal => f.write_str("control-plane internal error"),
         }
@@ -2246,6 +2358,10 @@ fn map_persisted_credential_state_to_error(state: Option<&str>) -> CredentialErr
         Some("used") | Some("created") | Some(_) => CredentialError::AlreadyConsumed,
         None => CredentialError::NotFound,
     }
+}
+
+fn map_dns_zone_error(err: DnsZoneError) -> ControlPlaneError {
+    ControlPlaneError::Dns(err.to_string())
 }
 
 fn random_nonce_hex(length_bytes: usize) -> String {
@@ -2369,6 +2485,14 @@ fn serialize_auto_tunnel_payload(
     payload
 }
 
+fn host_ip_from_host_cidr(value: &str) -> Option<String> {
+    let (ip, prefix) = value.split_once('/')?;
+    if prefix != "32" && prefix != "128" {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
 fn serialize_endpoint_hint_payload(
     source_node_id: &str,
     target_node_id: &str,
@@ -2474,12 +2598,13 @@ mod tests {
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
         ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
-        ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
-        EndpointHintCandidateType, EnrollmentRequest, LockoutConfig, PolicyCheckRequest,
-        PolicyDecision, PolicyGuard, ReplayPolicy, ReusableCredentialPolicy,
-        ReusableCredentialRequest, ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims,
-        TransportPolicyError, TrustState, derive_signing_seed, hex_bytes, load_trust_state,
-        persist_trust_state,
+        DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
+        EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+        EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
+        ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
+        SignedDnsZoneBundleRequest, ThrowawayCredentialState, ThrowawayCredentialStore,
+        TokenClaims, TransportPolicyError, TrustState, derive_signing_seed, hex_bytes,
+        load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -3028,6 +3153,171 @@ mod tests {
             payload_field(&bundle_b.payload, "peer.0.allowed_ips"),
             Some(assigned_a.clone())
         );
+    }
+
+    #[test]
+    fn dns_zone_bundle_is_signed_and_tamper_detected() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.50:51820", [51; 32]),
+            ("cred-b", "node-b", "198.51.100.51:51820", [52; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let bundle = core
+            .signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
+                zone_name: "rustynet".to_string(),
+                subject_node_id: "node-a".to_string(),
+                generated_at_unix: 200,
+                ttl_secs: 120,
+                nonce: 41,
+                records: vec![DnsRecordRequest {
+                    label: "nas".to_string(),
+                    target_node_id: "node-b".to_string(),
+                    ttl_secs: 60,
+                    rr_type: DnsRecordType::A,
+                    target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                    aliases: vec!["storage".to_string()],
+                }],
+            })
+            .expect("dns zone bundle should be emitted");
+
+        assert!(core.verify_signed_dns_zone_bundle(&bundle));
+        assert_eq!(
+            payload_field(&bundle.payload, "zone_name").as_deref(),
+            Some("rustynet")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "record.0.fqdn").as_deref(),
+            Some("nas.rustynet")
+        );
+        let expected_ip =
+            payload_field(&bundle.payload, "record.0.expected_ip").expect("expected_ip present");
+        assert!(expected_ip.parse::<std::net::Ipv4Addr>().is_ok());
+
+        let wire = ControlPlaneCore::signed_dns_zone_bundle_to_wire(&bundle);
+        assert!(wire.contains("signature="));
+
+        let mut tampered = bundle.clone();
+        tampered
+            .payload
+            .push_str("record.9.fqdn=tampered.rustynet\n");
+        assert!(!core.verify_signed_dns_zone_bundle(&tampered));
+    }
+
+    #[test]
+    fn dns_zone_bundle_is_policy_gated_and_alias_collisions_are_rejected() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:node-a".to_string(),
+                dst: "node:node-b".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("cred-a", "node-a", "198.51.100.50:51820", [51; 32]),
+            ("cred-b", "node-b", "198.51.100.51:51820", [52; 32]),
+            ("cred-c", "node-c", "198.51.100.52:51820", [53; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let denied = core.signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
+            zone_name: "rustynet".to_string(),
+            subject_node_id: "node-a".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 120,
+            nonce: 42,
+            records: vec![DnsRecordRequest {
+                label: "db".to_string(),
+                target_node_id: "node-c".to_string(),
+                ttl_secs: 60,
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                aliases: Vec::new(),
+            }],
+        });
+        assert!(matches!(denied, Err(super::ControlPlaneError::Dns(_))));
+
+        let collision = core.signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
+            zone_name: "rustynet".to_string(),
+            subject_node_id: "node-a".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 120,
+            nonce: 43,
+            records: vec![
+                DnsRecordRequest {
+                    label: "nas".to_string(),
+                    target_node_id: "node-b".to_string(),
+                    ttl_secs: 60,
+                    rr_type: DnsRecordType::A,
+                    target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                    aliases: vec!["storage".to_string()],
+                },
+                DnsRecordRequest {
+                    label: "storage".to_string(),
+                    target_node_id: "node-b".to_string(),
+                    ttl_secs: 60,
+                    rr_type: DnsRecordType::A,
+                    target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                    aliases: Vec::new(),
+                },
+            ],
+        });
+        assert!(matches!(collision, Err(super::ControlPlaneError::Dns(_))));
     }
 
     #[test]

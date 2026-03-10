@@ -541,6 +541,8 @@ dependencies = [
  "rand",
  "rustynet-control",
  "rustynet-crypto",
+ "rustynet-dns-zone",
+ "rustynet-local-security",
  "rustynet-policy",
  "rustynetd",
  "serde_json",
@@ -559,6 +561,7 @@ dependencies = [
  "rand",
  "rusqlite",
  "rustynet-crypto",
+ "rustynet-dns-zone",
  "rustynet-policy",
  "sha2",
  "zeroize",
@@ -578,6 +581,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-dns-zone"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
+name = "rustynet-local-security"
+version = "0.1.0"
+
+[[package]]
 name = "rustynet-policy"
 version = "0.1.0"
 
@@ -595,6 +610,8 @@ dependencies = [
  "rustynet-backend-wireguard",
  "rustynet-control",
  "rustynet-crypto",
+ "rustynet-dns-zone",
+ "rustynet-local-security",
  "rustynet-policy",
  "serde",
  "serde_json",

@@ -1,0 +1,38 @@
+[Unit]
+Description=Rustynet Managed DNS Routing
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=rustynetd.service systemd-resolved.service
+Requires=systemd-resolved.service
+PartOf=rustynetd.service
+BindsTo=rustynetd.service
+ConditionPathExists=/usr/bin/resolvectl
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/rustynetd
+Environment=RUSTYNET_WG_INTERFACE=rustynet0
+Environment=RUSTYNET_DNS_ZONE_NAME=rustynet
+Environment=RUSTYNET_DNS_RESOLVER_BIND_ADDR=127.0.0.1:53535
+ExecStart=/usr/local/bin/rustynet ops apply-managed-dns-routing
+ExecStop=/usr/local/bin/rustynet ops clear-managed-dns-routing
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=rustynetd.service

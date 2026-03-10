@@ -25,6 +25,9 @@ required_json = {
     "leak_test_report.json": "leak_test_report",
     "perf_budget_report.json": "perf_budget_report",
     "direct_relay_failover_report.json": "direct_relay_failover_report",
+    "traversal_path_selection_report.json": "traversal_path_selection_report",
+    "traversal_probe_security_report.json": "traversal_probe_security_report",
+    "managed_dns_report.json": "managed_dns_report",
 }
 
 required_state_log = artifact_dir / "state_transition_audit.log"
@@ -94,6 +97,63 @@ if not isinstance(failover_checks, dict) or not failover_checks:
     raise SystemExit("direct_relay_failover_report requires non-empty checks object")
 if any(value != "pass" for value in failover_checks.values()):
     raise SystemExit("direct_relay_failover_report checks must all pass")
+
+traversal_path = payloads["traversal_path_selection_report"]
+if traversal_path.get("status") != "pass":
+    raise SystemExit("traversal_path_selection_report must report status=pass")
+traversal_path_checks = traversal_path.get("checks")
+if not isinstance(traversal_path_checks, dict) or not traversal_path_checks:
+    raise SystemExit("traversal_path_selection_report requires non-empty checks object")
+for check_name in (
+    "direct_probe_success",
+    "relay_fallback_success",
+    "direct_failback_success",
+):
+    if traversal_path_checks.get(check_name) != "pass":
+        raise SystemExit(
+            f"traversal_path_selection_report check must pass: {check_name}"
+        )
+
+traversal_security = payloads["traversal_probe_security_report"]
+if traversal_security.get("status") != "pass":
+    raise SystemExit("traversal_probe_security_report must report status=pass")
+traversal_security_checks = traversal_security.get("checks")
+if not isinstance(traversal_security_checks, dict) or not traversal_security_checks:
+    raise SystemExit("traversal_probe_security_report requires non-empty checks object")
+for check_name in (
+    "replay_rejected",
+    "fail_closed_on_invalid_traversal",
+    "no_unauthorized_endpoint_mutation",
+    "managed_peer_coverage_required",
+    "unmanaged_peer_bundle_rejected",
+):
+    if traversal_security_checks.get(check_name) != "pass":
+        raise SystemExit(
+            f"traversal_probe_security_report check must pass: {check_name}"
+        )
+
+managed_dns = payloads["managed_dns_report"]
+if managed_dns.get("status") != "pass":
+    raise SystemExit("managed_dns_report must report status=pass")
+managed_dns_checks = managed_dns.get("checks")
+if not isinstance(managed_dns_checks, dict) or not managed_dns_checks:
+    raise SystemExit("managed_dns_report requires non-empty checks object")
+for check_name in (
+    "zone_issue_verify_passes",
+    "dns_inspect_valid",
+    "managed_dns_service_active",
+    "resolvectl_split_dns_configured",
+    "loopback_resolver_answers_managed_name",
+    "systemd_resolved_answers_managed_name",
+    "alias_resolves_to_expected_ip",
+    "non_managed_query_refused",
+    "stale_bundle_fail_closed",
+    "valid_bundle_restored",
+):
+    if managed_dns_checks.get(check_name) != "pass":
+        raise SystemExit(
+            f"managed_dns_report check must pass: {check_name}"
+        )
 
 perf = payloads["perf_budget_report"]
 if perf.get("soak_status") != "pass":

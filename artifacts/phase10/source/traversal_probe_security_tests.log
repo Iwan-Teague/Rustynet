@@ -1,0 +1,135 @@
+[2026-03-08T23:09:25Z] RUN cargo test -p rustynetd daemon::tests::load_traversal_bundle_rejects_tampered_signature_and_replay --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::load_traversal_bundle_rejects_tampered_signature_and_replay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:25Z] RUN cargo test -p rustynetd daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:25Z] RUN cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_requires_full_peer_coverage --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_requires_full_peer_coverage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.04s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.04s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_missing_peer_coverage --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_missing_peer_coverage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.05s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynetd traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynetd daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustynetd-09f06221022b618a)
+
+running 1 test
+test daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 141 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rustynetd-24ae9a65f3b6ab5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynet-backend-wireguard tests::latest_handshake_parser_rejects_oversized_or_malformed_output --all-targets --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_wireguard-e25aec1583a061cf)
+
+running 1 test
+test tests::latest_handshake_parser_rejects_oversized_or_malformed_output ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/conformance.rs (target/debug/deps/conformance-07a51ee35b7b1171)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+[2026-03-08T23:09:26Z] RUN cargo test -p rustynet-backend-wireguard tests::linux_backend_reads_latest_handshake_for_configured_peer --all-targets --all-features -- --exact --nocapture
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/rustynet_backend_wireguard-e25aec1583a061cf)
+
+running 1 test
+test tests::linux_backend_reads_latest_handshake_for_configured_peer ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/conformance.rs (target/debug/deps/conformance-07a51ee35b7b1171)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

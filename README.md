@@ -45,9 +45,10 @@ The wizard handles:
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
 - `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
-- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime now validates signed traversal bundles, applies traversal-authoritative peer endpoints during auto-tunnel bootstrap/reconcile for covered peers, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and runs a deterministic one-sided direct-probe loop that falls back to relay when direct cannot be proven; production WAN simultaneous-open hole punching and relay transport remain HP-2/HP-3 work
+- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime now validates signed traversal bundles, requires traversal-authoritative peer coverage for all managed peers in enforced auto-tunnel mode, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and runs a deterministic one-sided direct-probe loop that falls back to relay when direct cannot be proven; relay-backed sessions are periodically reprobed on reconcile, and direct-active peers now use live backend handshake evidence to avoid stale cached path decisions before failing back from relay when direct becomes healthy again; traversal probe fanout, freshness, and reprobe cadence are now explicit daemon policy (`--traversal-probe-max-candidates`, `--traversal-probe-max-pairs`, `--traversal-probe-rounds`, `--traversal-probe-round-spacing-ms`, `--traversal-probe-relay-switch-after-failures`, `--traversal-probe-handshake-freshness-secs`, `--traversal-probe-reprobe-interval-secs`) instead of implicit runtime defaults; production WAN simultaneous-open hole punching and relay transport remain HP-2/HP-3 work
 - `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) and uses runtime-authored path states (`direct_active`, `relay_active`, `fail_closed`) instead of a static transport string
-- traversal artifact custody is configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
+- traversal artifact custody and probe policy are configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`, `--traversal-probe-*`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
+- Magic DNS is now a signed control-plane path only: `rustynetd` loads a signed DNS-zone bundle from pinned custody paths, cross-checks every managed record against signed assignment state, answers the managed zone from a loopback-only authoritative resolver (`--dns-zone-*`, `--dns-resolver-bind-addr`), returns `SERVFAIL` for managed-name queries when signed DNS state is missing/invalid/stale, and refuses non-managed names rather than falling back to ad hoc local overrides or `/etc/hosts`; the supported Linux host-integration path is a dedicated `systemd-resolved` unit (`rustynetd-managed-dns.service`) that routes the private zone through the Rustynet interface only, with no `/etc/hosts` or raw resolver fallback
 - route advertisement and status checks
 
 Host-profile behavior:
@@ -98,6 +99,7 @@ Linux assignment-refresh behavior:
 - Trust and auto-tunnel watermark parsers are strict: only digest-bound `version=2` watermark files are accepted (legacy `version=1` is rejected fail-closed).
 - Linux assignment refresh service path is Rust-backed: `scripts/systemd/refresh_assignment_bundle.sh` is a thin wrapper to `rustynet ops refresh-assignment`.
 - Linux service installer path is Rust-backed: `scripts/systemd/install_rustynetd_service.sh` is a thin wrapper to `rustynet ops install-systemd` (with `RUSTYNET_INSTALL_SOURCE_ROOT` pinned by the wrapper).
+- Linux `start.sh` exit-node selection/disable flows now require local signed assignment refresh support; if assignment refresh is unavailable, interactive exit-node mutation fails closed instead of falling back to raw direct CLI mutation.
 - Legacy Linux WireGuard key paths are no longer implicitly migrated in custody bootstrap/install flows; canonical paths must be present, or operators must perform explicit key re-enrollment/rotation.
 - Linux signing artifact custody expects `/etc/rustynet` parent directory mode
   `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
@@ -150,6 +152,47 @@ rustynet assignment init-signing-secret \
 - `rustynetd` no longer ships with a stale `eth0` assumption: daemon default `egress_interface` is `auto`, and service startup resolves the actual default-route interface before dataplane preflight.
 - Keep assignment TTL aligned to `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS` (default max-age is 300s). If TTL exceeds max-age, max-age still enforces fail-closed expiration.
 
+Signed Magic DNS zone issuance and verification:
+- Issue a signed managed-zone bundle from the same control-plane signing root used for other signed artifacts:
+```bash
+rustynet dns zone issue \
+  --signing-secret /etc/rustynet/membership.owner.key \
+  --signing-secret-passphrase-file /run/credentials/rustynetd-trust-refresh.service/membership_owner_signing_key_passphrase \
+  --subject-node-id client-40 \
+  --nodes "client-40|192.168.18.40:51820|<client_pubkey_hex>;exit-37|192.168.18.37:51820|<exit_pubkey_hex>" \
+  --allow "client-40|exit-37" \
+  --records-json /tmp/dns-zone-records.json \
+  --output /tmp/client-40.dns-zone \
+  --verifier-key-output /tmp/dns-zone.pub \
+  --zone-name rustynet \
+  --ttl-secs 300
+```
+- Verify a signed managed-zone bundle before deployment:
+```bash
+rustynet dns zone verify \
+  --bundle /tmp/client-40.dns-zone \
+  --verifier-key /tmp/dns-zone.pub \
+  --expected-zone-name rustynet \
+  --expected-subject-node-id client-40
+```
+- `--records-json` must be a JSON array of strict objects:
+  - required: `label`, `target_node_id`, `ttl_secs`
+  - optional: `aliases`
+  - unsupported fields are rejected fail-closed
+- `rustynetd` authoritative DNS defaults:
+  - zone bundle: `/var/lib/rustynet/rustynetd.dns-zone`
+  - verifier key: `/etc/rustynet/dns-zone.pub`
+  - watermark: `/var/lib/rustynet/rustynetd.dns-zone.watermark`
+  - max age: `300s`
+  - managed zone: `rustynet`
+  - loopback bind: `127.0.0.1:53535`
+- The authoritative resolver is loopback-only; non-loopback bind addresses are rejected fail-closed.
+- Linux systemd install now also wires a dedicated managed-DNS routing unit:
+  - unit: `rustynetd-managed-dns.service`
+  - resolver integration: `systemd-resolved` via `resolvectl`
+  - routing scope: the Rustynet interface only (`RUSTYNET_WG_INTERFACE`)
+  - Linux managed-DNS routing currently requires an IPv4 loopback resolver bind such as `127.0.0.1:53535`
+
 ## Automated Debian Pair Clean Install + Tunnel Validation
 
 To repeat a full two-node Debian 13 clean install and secure tunnel validation from one operator machine:
@@ -160,6 +203,7 @@ umask 077 && printf 'tempo\n' > /tmp/rustynet_sudo.pass
   --exit-host 192.168.18.37 \
   --client-host 192.168.18.40 \
   --ssh-user debian \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --sudo-password-file /tmp/rustynet_sudo.pass \
   --ssh-allow-cidrs 192.168.18.2/32 \
   --skip-apt
@@ -178,6 +222,7 @@ What this script does:
 
 Important:
 - `--ssh-allow-cidrs` is required and should be your management CIDR(s), not `0.0.0.0/0`.
+- SSH host trust is pinned: provide `--ssh-known-hosts-file` or pre-populate `~/.ssh/known_hosts` with the target host keys. TOFU (`accept-new`) is intentionally disabled.
 - SSH control-master sessions are used; password-based SSH is supported interactively.
 - When SSH user is non-root, provide `--sudo-password-file` (mode `0600`); this keeps sudo secrets out of command arguments.
 
@@ -190,6 +235,7 @@ Run hardened, active-network adversarial tests against real hosts:
   --exit-host 192.168.18.49 \
   --client-host 192.168.18.50 \
   --ssh-user root \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-allow-cidrs 192.168.18.2/32 \
   --skip-apt
 
@@ -197,6 +243,7 @@ Run hardened, active-network adversarial tests against real hosts:
   --exit-host 192.168.18.49 \
   --client-host 192.168.18.50 \
   --ssh-user root \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-allow-cidrs 192.168.18.2/32 \
   --rogue-endpoint-ip 203.0.113.250 \
   --skip-apt
@@ -212,6 +259,7 @@ Optional combined gate wrapper:
 RUSTYNET_ACTIVE_NET_EXIT_HOST=192.168.18.49 \
 RUSTYNET_ACTIVE_NET_CLIENT_HOST=192.168.18.50 \
 RUSTYNET_ACTIVE_NET_SSH_USER=root \
+RUSTYNET_ACTIVE_NET_SSH_KNOWN_HOSTS_FILE=~/.ssh/known_hosts \
 RUSTYNET_ACTIVE_NET_SSH_ALLOW_CIDRS=192.168.18.2/32 \
 RUSTYNET_ACTIVE_NET_ROGUE_ENDPOINT_IP=203.0.113.250 \
 RUSTYNET_ACTIVE_NET_SKIP_APT=1 \
@@ -228,14 +276,17 @@ Additional live Linux regression scenarios on the active VM lab:
 umask 077 && printf 'tempo\n' > /tmp/rustynet_lab.pass
 
 ./scripts/e2e/live_linux_two_hop_test.sh \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-password-file /tmp/rustynet_lab.pass \
   --sudo-password-file /tmp/rustynet_lab.pass
 
 ./scripts/e2e/live_linux_exit_handoff_test.sh \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-password-file /tmp/rustynet_lab.pass \
   --sudo-password-file /tmp/rustynet_lab.pass
 
 ./scripts/e2e/live_linux_lan_toggle_test.sh \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --ssh-password-file /tmp/rustynet_lab.pass \
   --sudo-password-file /tmp/rustynet_lab.pass
 ```
@@ -322,6 +373,9 @@ Raw measured inputs must exist first:
   - `leak_test_report.json`
   - `perf_budget_report.json`
   - `direct_relay_failover_report.json`
+  - `traversal_path_selection_report.json`
+  - `traversal_probe_security_report.json`
+  - `managed_dns_report.json`
   - `state_transition_audit.log`
 - `artifacts/phase10/fresh_install_os_matrix_report.json` cross-platform fresh-install release evidence:
   - must include Debian/Ubuntu/Fedora/Mint/macOS clean-install checks

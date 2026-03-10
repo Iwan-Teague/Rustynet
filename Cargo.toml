@@ -1,5 +1,7 @@
 [workspace]
 members = [
+  "crates/rustynet-dns-zone",
+  "crates/rustynet-local-security",
   "crates/rustynet-control",
   "crates/rustynetd",
   "crates/rustynet-cli",
