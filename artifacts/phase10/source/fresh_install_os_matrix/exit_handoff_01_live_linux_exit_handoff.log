@@ -1,0 +1,22 @@
+[exit-handoff] Collecting WireGuard public keys
+[exit-handoff] Issuing signed handoff assignments on debian@192.168.18.49
+signing passphrase materialized at /tmp/rn-handoff-passphrase.sydpFu
+assignment bundle issued: target=exit-1 output=/run/rustynet/assignment-issue/rn-assignment-exit-1.assignment generated_at_unix=1772978997 expires_at_unix=1772979297 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-2 output=/run/rustynet/assignment-issue/rn-assignment-client-2.assignment generated_at_unix=1772978997 expires_at_unix=1772979297 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub
+assignment bundle issued: target=client-1 output=/run/rustynet/assignment-issue/rn-assignment-client-1.assignment generated_at_unix=1772978997 expires_at_unix=1772979297 verifier_key_output=/run/rustynet/assignment-issue/rn-assignment.pub[exit-handoff] Distributing signed assignments
+[exit-handoff] Enforcing runtime roles
+[exit-handoff] Advertising default route on both exits
+[exit-handoff] Switching client exit to client-2
+[exit-handoff] Final client status
+node_id=client-1 node_role=client state=ExitActive generation=1 exit_node=client-2 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=80 reconcile_failures=0 last_reconcile_unix=1772979148 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772979067:1772979067091908269 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final exit A status
+node_id=exit-1 node_role=admin state=ExitActive generation=3 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=128 reconcile_failures=0 last_reconcile_unix=1772979148 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772979137:1772979137589586776 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final exit B status
+node_id=client-2 node_role=admin state=ExitActive generation=2 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=134 reconcile_failures=0 last_reconcile_unix=1772979148 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978997:1772978997722980624 membership_epoch=5 membership_active_nodes=5
+[exit-handoff] Final client route
+1.1.1.1 dev rustynet0 table 51820 src 100.68.223.117 uid 1000 
+    cache 
+[exit-handoff] Final client endpoints
+lFPgl1Lla+NVAJ/9DSLEDPBOZsjZOFsXg411DdEP9m4=	192.168.18.52:51820
+2PmTC6vMOu3eGR4Kr5AfAawDMYKPDgm1swXPmFiAOXY=	192.168.18.49:51820
+[exit-handoff] Exit handoff report written: /Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json

@@ -1,0 +1,80 @@
+[stage:validate_baseline_runtime] START validate one-hop routing and no-plaintext-passphrase state
+[parallel:validate_baseline_runtime] exit debian@192.168.18.49 rc=0
+----- validate_baseline_runtime/exit (exit-1 admin) BEGIN -----
+[status] exit-1 debian@192.168.18.49
+node_id=exit-1 node_role=admin state=ExitActive generation=2 exit_node=none serving_exit_node=true lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=7 reconcile_failures=0 last_reconcile_unix=1772978910 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978893:1772978893910786765 membership_epoch=5 membership_active_nodes=5
+[plaintext-check] exit-1 debian@192.168.18.49
+no-plaintext-passphrase-files
+
+----- validate_baseline_runtime/exit END -----
+[parallel:validate_baseline_runtime] client debian@192.168.18.50 rc=0
+----- validate_baseline_runtime/client (client-1 client) BEGIN -----
+[status] client-1 debian@192.168.18.50
+node_id=client-1 node_role=client state=ExitActive generation=1 exit_node=exit-1 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=9 reconcile_failures=0 last_reconcile_unix=1772978910 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978893:1772978893950783599 membership_epoch=5 membership_active_nodes=5
+[route] client-1 debian@192.168.18.50
+1.1.1.1 dev rustynet0 table 51820 src 100.68.223.117 uid 1000 
+    cache 
+[plaintext-check] client-1 debian@192.168.18.50
+no-plaintext-passphrase-files
+
+----- validate_baseline_runtime/client END -----
+[parallel:validate_baseline_runtime] entry ubuntu@192.168.18.52 rc=0
+----- validate_baseline_runtime/entry (client-2 client) BEGIN -----
+[status] client-2 ubuntu@192.168.18.52
+node_id=client-2 node_role=client state=ExitActive generation=1 exit_node=exit-1 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=8 reconcile_failures=0 last_reconcile_unix=1772978910 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978893:1772978893986780745 membership_epoch=5 membership_active_nodes=5
+[route] client-2 ubuntu@192.168.18.52
+1.1.1.1 dev rustynet0 table 51820 src 100.68.216.196 uid 1000 
+    cache 
+[plaintext-check] client-2 ubuntu@192.168.18.52
+no-plaintext-passphrase-files
+
+----- validate_baseline_runtime/entry END -----
+[parallel:validate_baseline_runtime] aux fedora@192.168.18.51 rc=0
+----- validate_baseline_runtime/aux (client-3 client) BEGIN -----
+[status] client-3 fedora@192.168.18.51
+node_id=client-3 node_role=client state=ExitActive generation=1 exit_node=exit-1 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=8 reconcile_failures=0 last_reconcile_unix=1772978911 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978894:1772978894022777896 membership_epoch=5 membership_active_nodes=5
+[route] client-3 fedora@192.168.18.51
+1.1.1.1 dev rustynet0 table 51820 src 100.91.193.62 uid 1000 
+    cache 
+[plaintext-check] client-3 fedora@192.168.18.51
+no-plaintext-passphrase-files
+
+----- validate_baseline_runtime/aux END -----
+[parallel:validate_baseline_runtime] extra mint@192.168.18.53 rc=0
+----- validate_baseline_runtime/extra (client-4 client) BEGIN -----
+[status] client-4 mint@192.168.18.53
+node_id=client-4 node_role=client state=ExitActive generation=1 exit_node=exit-1 serving_exit_node=false lan_access=off restricted_safe_mode=false restriction_mode=None bootstrap_error=none reconcile_attempts=8 reconcile_failures=0 last_reconcile_unix=1772978910 last_reconcile_error=none encrypted_key_store=true auto_tunnel_enforce=true traversal_authority=enforced_v1 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1772978894:1772978894062774730 membership_epoch=5 membership_active_nodes=5
+[route] client-4 mint@192.168.18.53
+1.1.1.1 dev rustynet0 table 51820 src 100.109.136.181 uid 1000 
+    cache 
+[plaintext-check] client-4 mint@192.168.18.53
+no-plaintext-passphrase-files
+
+----- validate_baseline_runtime/extra END -----
+[exit-nft]
+table inet rustynet_g2 {
+	chain killswitch {
+		type filter hook output priority filter; policy drop;
+		ip daddr 192.168.18.0/24 tcp sport 22 accept
+		oifname "lo" accept
+		ct state established,related accept
+		oifname "rustynet0" accept
+		oifname "enp0s9" accept
+		udp dport 53 oifname != "rustynet0" drop
+		tcp dport 53 oifname != "rustynet0" drop
+		udp dport 53 accept
+		tcp dport 53 accept
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+		iifname "rustynet0" oifname "enp0s9" accept
+	}
+}
+table ip rustynet_nat_g2 {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "enp0s9" masquerade
+	}
+}
+[stage:validate_baseline_runtime] PASS

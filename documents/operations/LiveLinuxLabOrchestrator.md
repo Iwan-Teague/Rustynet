@@ -142,6 +142,7 @@ Important outputs:
 - `verification/full_gate_suite_<timestamp>.log` when gates are enabled
 - live test JSON reports written by the reused `scripts/e2e/` test scripts
 - `fresh_install_os_matrix_report.json` in the run directory and the canonical `artifacts/phase10/` path when the full Linux evidence path runs
+- canonical fresh-install matrix inputs rebound under `artifacts/phase10/source/fresh_install_os_matrix/` so the committed report no longer depends on gitignored `artifacts/live_lab/...` evidence paths
 
 The summary files show:
 

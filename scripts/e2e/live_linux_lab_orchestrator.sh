@@ -1491,7 +1491,9 @@ stage_run_live_managed_dns() {
 }
 
 stage_generate_fresh_install_os_matrix_report() {
-  local commit_short role_report canonical_report
+  local commit_short role_report canonical_report canonical_source_dir manifest_json
+  local canonical_bootstrap_log canonical_baseline_log canonical_two_hop_report
+  local canonical_role_switch_report canonical_lan_toggle_report canonical_exit_handoff_report
   if ! has_five_node_release_gate_topology; then
     printf 'fresh install OS matrix report generation requires the full five-node topology (entry, aux, and extra targets)\n' >&2
     return 1
@@ -1499,18 +1501,64 @@ stage_generate_fresh_install_os_matrix_report() {
   commit_short="$(current_run_git_commit_short)"
   role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
   canonical_report="$ROOT_DIR/artifacts/phase10/fresh_install_os_matrix_report.json"
+  canonical_source_dir="$ROOT_DIR/artifacts/phase10/source/fresh_install_os_matrix"
+  manifest_json="$STATE_DIR/fresh_install_os_matrix_inputs.json"
+  python3 "$ROOT_DIR/scripts/e2e/rebind_linux_fresh_install_os_matrix_inputs.py" \
+    --dest-dir "$canonical_source_dir" \
+    --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
+    --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
+    --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
+    --role-switch-report "$role_report" \
+    --lan-toggle-report "$REPORT_DIR/live_linux_lan_toggle_report.json" \
+    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" > "$manifest_json"
+  canonical_bootstrap_log="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["bootstrap_log"])
+PY
+)"
+  canonical_baseline_log="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["baseline_log"])
+PY
+)"
+  canonical_two_hop_report="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["two_hop_report"])
+PY
+)"
+  canonical_role_switch_report="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["role_switch_report"])
+PY
+)"
+  canonical_lan_toggle_report="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["lan_toggle_report"])
+PY
+)"
+  canonical_exit_handoff_report="$(python3 - "$manifest_json" <<'PY'
+import json
+import sys
+print(json.loads(open(sys.argv[1], encoding="utf-8").read())["exit_handoff_report"])
+PY
+)"
   python3 "$ROOT_DIR/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py" \
     --output "$canonical_report" \
     --environment "linux-live-lab-orchestrator:${NETWORK_ID}" \
     --source-mode "$SOURCE_MODE" \
     --expected-git-commit-file "$STATE_DIR/git_head.txt" \
     --git-status-file "$STATE_DIR/git_status.txt" \
-    --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
-    --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
-    --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
-    --role-switch-report "$role_report" \
-    --lan-toggle-report "$REPORT_DIR/live_linux_lan_toggle_report.json" \
-    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" \
+    --bootstrap-log "$canonical_bootstrap_log" \
+    --baseline-log "$canonical_baseline_log" \
+    --two-hop-report "$canonical_two_hop_report" \
+    --role-switch-report "$canonical_role_switch_report" \
+    --lan-toggle-report "$canonical_lan_toggle_report" \
+    --exit-handoff-report "$canonical_exit_handoff_report" \
     --exit-node-id "$(node_id_for_label exit)" \
     --client-node-id "$(node_id_for_label client)" \
     --ubuntu-node-id "$(node_id_for_label entry)" \

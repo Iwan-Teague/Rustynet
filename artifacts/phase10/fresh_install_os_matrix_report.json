@@ -2,20 +2,20 @@
   "schema_version": 1,
   "evidence_mode": "measured",
   "environment": "linux-live-lab-orchestrator:rn-live-lab-20260308T140632Z",
-  "captured_at_unix": 1772979245,
+  "captured_at_unix": 1773233797,
   "git_commit": "4500e386d557ef59b7d5744d188654a0035e5272",
   "source_artifacts": [
-    "artifacts/live_lab/20260308T140632Z/logs/bootstrap_hosts.log",
-    "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log",
-    "artifacts/live_lab/20260308T140632Z/live_linux_two_hop_report.json",
-    "artifacts/live_lab/20260308T140632Z/role_switch_matrix_report_4500e38.json",
-    "artifacts/live_lab/20260308T140632Z/live_linux_lan_toggle_report.json",
-    "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json",
-    "artifacts/live_lab/20260308T140632Z/source/role_switch_matrix_4500e38.md",
-    "artifacts/live_lab/20260308T140632Z/live_linux_two_hop.log",
-    "artifacts/live_lab/20260308T140632Z/live_linux_lan_toggle.log",
-    "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff.log",
-    "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_monitor.log"
+    "artifacts/phase10/source/fresh_install_os_matrix/bootstrap_hosts.log",
+    "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log",
+    "artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json",
+    "artifacts/phase10/source/fresh_install_os_matrix/role_switch_matrix_report_4500e38.json",
+    "artifacts/phase10/source/fresh_install_os_matrix/live_linux_lan_toggle_report.json",
+    "artifacts/phase10/source/fresh_install_os_matrix/live_linux_exit_handoff_report.json",
+    "artifacts/phase10/source/fresh_install_os_matrix/role_switch_source_role_switch_matrix_4500e38.md",
+    "artifacts/phase10/source/fresh_install_os_matrix/two_hop_01_live_linux_two_hop.log",
+    "artifacts/phase10/source/fresh_install_os_matrix/lan_toggle_01_live_linux_lan_toggle.log",
+    "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_01_live_linux_exit_handoff.log",
+    "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_02_live_linux_exit_handoff_monitor.log"
   ],
   "security_assertions": {
     "no_plaintext_secrets_at_rest": true,
@@ -34,8 +34,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/bootstrap_hosts.log",
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/bootstrap_hosts.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log"
         ],
         "checks": {
           "host_pristine": "pass",
@@ -50,10 +50,10 @@
         "hop_count": 1,
         "captured_at_unix": 1772979150,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_monitor.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_exit_handoff_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_01_live_linux_exit_handoff.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_02_live_linux_exit_handoff_monitor.log"
         ],
         "checks": {
           "tunnel_established": "pass",
@@ -68,8 +68,8 @@
         "hop_count": 2,
         "captured_at_unix": 1772979189,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/two_hop_01_live_linux_two_hop.log"
         ],
         "checks": {
           "chain_enforced": "pass",
@@ -83,8 +83,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/role_switch_matrix_report_4500e38.json",
-          "artifacts/live_lab/20260308T140632Z/source/role_switch_matrix_4500e38.md"
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_matrix_report_4500e38.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_source_role_switch_matrix_4500e38.md"
         ],
         "checks": {
           "switch_execution": "pass",
@@ -110,8 +110,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/bootstrap_hosts.log",
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/bootstrap_hosts.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log"
         ],
         "checks": {
           "host_pristine": "pass",
@@ -126,10 +126,10 @@
         "hop_count": 1,
         "captured_at_unix": 1772979150,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_monitor.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_exit_handoff_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_01_live_linux_exit_handoff.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_02_live_linux_exit_handoff_monitor.log"
         ],
         "checks": {
           "tunnel_established": "pass",
@@ -144,8 +144,8 @@
         "hop_count": 2,
         "captured_at_unix": 1772979189,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/two_hop_01_live_linux_two_hop.log"
         ],
         "checks": {
           "chain_enforced": "pass",
@@ -159,8 +159,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/role_switch_matrix_report_4500e38.json",
-          "artifacts/live_lab/20260308T140632Z/source/role_switch_matrix_4500e38.md"
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_matrix_report_4500e38.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_source_role_switch_matrix_4500e38.md"
         ],
         "checks": {
           "switch_execution": "pass",
@@ -186,8 +186,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/bootstrap_hosts.log",
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/bootstrap_hosts.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log"
         ],
         "checks": {
           "host_pristine": "pass",
@@ -202,10 +202,10 @@
         "hop_count": 1,
         "captured_at_unix": 1772979150,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_monitor.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_exit_handoff_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_01_live_linux_exit_handoff.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_02_live_linux_exit_handoff_monitor.log"
         ],
         "checks": {
           "tunnel_established": "pass",
@@ -220,8 +220,8 @@
         "hop_count": 2,
         "captured_at_unix": 1772979189,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/two_hop_01_live_linux_two_hop.log"
         ],
         "checks": {
           "chain_enforced": "pass",
@@ -235,8 +235,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/role_switch_matrix_report_4500e38.json",
-          "artifacts/live_lab/20260308T140632Z/source/role_switch_matrix_4500e38.md"
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_matrix_report_4500e38.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_source_role_switch_matrix_4500e38.md"
         ],
         "checks": {
           "switch_execution": "pass",
@@ -262,8 +262,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/bootstrap_hosts.log",
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/bootstrap_hosts.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log"
         ],
         "checks": {
           "host_pristine": "pass",
@@ -278,10 +278,10 @@
         "hop_count": 1,
         "captured_at_unix": 1772979150,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/logs/validate_baseline_runtime.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff.log",
-          "artifacts/live_lab/20260308T140632Z/live_linux_exit_handoff_monitor.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/validate_baseline_runtime.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_exit_handoff_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_01_live_linux_exit_handoff.log",
+          "artifacts/phase10/source/fresh_install_os_matrix/exit_handoff_02_live_linux_exit_handoff_monitor.log"
         ],
         "checks": {
           "tunnel_established": "pass",
@@ -296,8 +296,8 @@
         "hop_count": 2,
         "captured_at_unix": 1772979189,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop_report.json",
-          "artifacts/live_lab/20260308T140632Z/live_linux_two_hop.log"
+          "artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/two_hop_01_live_linux_two_hop.log"
         ],
         "checks": {
           "chain_enforced": "pass",
@@ -311,8 +311,8 @@
         "status": "pass",
         "captured_at_unix": 1772978914,
         "source_artifacts": [
-          "artifacts/live_lab/20260308T140632Z/role_switch_matrix_report_4500e38.json",
-          "artifacts/live_lab/20260308T140632Z/source/role_switch_matrix_4500e38.md"
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_matrix_report_4500e38.json",
+          "artifacts/phase10/source/fresh_install_os_matrix/role_switch_source_role_switch_matrix_4500e38.md"
         ],
         "checks": {
           "switch_execution": "pass",
