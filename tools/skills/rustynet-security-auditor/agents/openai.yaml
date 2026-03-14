@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rustynet Security Auditor"
+  short_description: "Audit Rustynet and run its live security validators"
+  default_prompt: "Use $rustynet-security-auditor to audit the Rustynet repository, run the canonical Rustynet live-lab validators, and produce prioritized hardening findings with coverage decisions."
+policy:
+  allow_implicit_invocation: false

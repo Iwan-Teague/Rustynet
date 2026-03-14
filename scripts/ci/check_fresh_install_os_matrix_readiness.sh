@@ -108,18 +108,111 @@ def validate_timestamp(value: int, label: str) -> None:
         fail(f"{label} evidence is stale; refresh OS matrix evidence")
 
 
-def validate_source_artifacts(payload: dict, label: str) -> None:
-    artifacts = payload.get("source_artifacts")
+def resolve_artifact_path(artifact: str, label: str) -> Path:
+    if not isinstance(artifact, str) or not artifact.strip():
+        fail(f"{label} has invalid source artifact entry")
+    candidate = Path(artifact)
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    if not candidate.exists():
+        fail(f"{label} source artifact does not exist: {artifact}")
+    return candidate
+
+
+def validate_measured_child_report(
+    report_path: Path,
+    label: str,
+    expected_commit: str,
+    visited_reports: set[Path],
+) -> None:
+    report_path = report_path.resolve()
+    if report_path in visited_reports:
+        return
+    visited_reports.add(report_path)
+
+    if report_path.suffix.lower() != ".json":
+        return
+
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        fail(f"{label} source artifact is not valid JSON: {report_path} ({err})")
+
+    if not isinstance(payload, dict):
+        fail(f"{label} source artifact JSON must be an object: {report_path}")
+
+    structured_markers = {
+        "evidence_mode",
+        "git_commit",
+        "captured_at_unix",
+        "source_artifacts",
+        "source_artifact",
+    }
+    if not structured_markers.intersection(payload.keys()):
+        return
+
+    if payload.get("evidence_mode") != "measured":
+        fail(f"{label} child report must set evidence_mode=measured: {report_path}")
+
+    child_commit = require_nonempty_string(payload, "git_commit", label)
+    if not re.fullmatch(r"[0-9a-f]{40}", child_commit):
+        fail(f"{label} child report git_commit must be a 40-char lowercase hex SHA")
+    if child_commit != expected_commit:
+        fail(
+            f"{label} child report git_commit does not match expected commit; "
+            f"report={child_commit} expected={expected_commit} path={report_path}"
+        )
+
+    child_captured_at = require_positive_int(payload, "captured_at_unix", label)
+    validate_timestamp(child_captured_at, label)
+
+    child_status = payload.get("status")
+    if child_status is not None and child_status != "pass":
+        fail(f"{label} child report status must be pass: {report_path}")
+
+    child_source_artifacts = payload.get("source_artifacts")
+    child_source_artifact = payload.get("source_artifact")
+    if child_source_artifacts is None and child_source_artifact is None:
+        fail(
+            f"{label} child report must declare source_artifacts or source_artifact: {report_path}"
+        )
+
+    if child_source_artifacts is not None:
+        validate_source_artifact_entries(
+            child_source_artifacts,
+            f"{label}.child_sources",
+            expected_commit,
+            visited_reports,
+        )
+    if child_source_artifact is not None:
+        validate_single_source_artifact(
+            child_source_artifact,
+            f"{label}.child_source",
+            expected_commit,
+            visited_reports,
+        )
+
+
+def validate_single_source_artifact(
+    artifact: str,
+    label: str,
+    expected_commit: str,
+    visited_reports: set[Path],
+) -> None:
+    candidate = resolve_artifact_path(artifact, label)
+    validate_measured_child_report(candidate, label, expected_commit, visited_reports)
+
+
+def validate_source_artifact_entries(
+    artifacts,
+    label: str,
+    expected_commit: str,
+    visited_reports: set[Path],
+) -> None:
     if not isinstance(artifacts, list) or not artifacts:
         fail(f"{label} requires non-empty source_artifacts list")
     for artifact in artifacts:
-        if not isinstance(artifact, str) or not artifact.strip():
-            fail(f"{label} has invalid source artifact entry")
-        candidate = Path(artifact)
-        if not candidate.is_absolute():
-            candidate = (Path.cwd() / candidate).resolve()
-        if not candidate.exists():
-            fail(f"{label} source artifact does not exist: {artifact}")
+        validate_single_source_artifact(artifact, label, expected_commit, visited_reports)
 
 
 if not report_path.is_file():
@@ -141,7 +234,6 @@ captured_at_unix = require_positive_int(
     payload, "captured_at_unix", "fresh_install_os_matrix_report"
 )
 validate_timestamp(captured_at_unix, "fresh_install_os_matrix_report")
-validate_source_artifacts(payload, "fresh_install_os_matrix_report")
 
 git_commit = require_nonempty_string(
     payload, "git_commit", "fresh_install_os_matrix_report"
@@ -164,6 +256,14 @@ if git_commit != expected_commit:
         "fresh install OS matrix report git_commit does not match expected commit; "
         f"report={git_commit} expected={expected_commit}"
     )
+
+visited_reports: set[Path] = {report_path.resolve()}
+validate_source_artifact_entries(
+    payload.get("source_artifacts"),
+    "fresh_install_os_matrix_report",
+    expected_commit,
+    visited_reports,
+)
 
 security_assertions = payload.get("security_assertions")
 if not isinstance(security_assertions, dict):
@@ -217,7 +317,12 @@ for os_id, expected_profile in required_os_profiles.items():
             fail(f"{section_label}.status must be pass")
         section_time = require_positive_int(section, "captured_at_unix", section_label)
         validate_timestamp(section_time, section_label)
-        validate_source_artifacts(section, section_label)
+        validate_source_artifact_entries(
+            section.get("source_artifacts"),
+            section_label,
+            expected_commit,
+            visited_reports,
+        )
         checks = section.get("checks")
         if not isinstance(checks, dict):
             fail(f"{section_label}.checks must be an object")

@@ -26,10 +26,14 @@ require_cargo_subcommand() {
 require_command cargo
 require_command rustup
 require_command rg
+require_command python3
 require_cargo_subcommand fmt
 require_cargo_subcommand clippy
 require_cargo_subcommand audit
 require_cargo_subcommand deny
+
+# Self-test the fresh-install readiness gate logic before relying on tracked evidence.
+./scripts/ci/test_check_fresh_install_os_matrix_readiness.sh
 
 # Fail closed early when required measured OS-matrix evidence is missing/stale.
 ./scripts/ci/fresh_install_os_matrix_release_gate.sh
