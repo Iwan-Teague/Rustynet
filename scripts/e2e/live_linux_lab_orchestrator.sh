@@ -914,14 +914,42 @@ install_prereqs() {
     run_root env DEBIAN_FRONTEND=noninteractive apt-get update
     run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev \
-      clang llvm nftables wireguard-tools openssl rustup
+      clang llvm nftables wireguard-tools openssl systemd-resolved libnss-resolve rustup
   else
     echo "unsupported package manager; expected apt-get or dnf" >&2
     exit 1
   fi
 }
 
+repair_managed_dns_prereqs() {
+  local os_id=""
+  local os_like=""
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id="${ID:-}"
+    os_like="${ID_LIKE:-}"
+  fi
+  if [[ "${os_id}" != "debian" && "${os_id}" != "ubuntu" && "${os_id}" != "linuxmint" && "${os_like}" != *"debian"* ]]; then
+    return 0
+  fi
+  if ! command -v resolvectl >/dev/null 2>&1; then
+    echo "managed DNS routing requires resolvectl on Debian-like hosts" >&2
+    exit 1
+  fi
+  run_root systemctl enable --now systemd-resolved.service
+  if ! run_root resolvectl status >/dev/null 2>&1; then
+    run_root systemctl reload dbus
+    run_root systemctl restart systemd-resolved.service
+    run_root resolvectl status >/dev/null 2>&1 || {
+      echo "managed DNS control plane remained unhealthy after dbus reload and systemd-resolved restart" >&2
+      exit 1
+    }
+  fi
+}
+
 install_prereqs
+repair_managed_dns_prereqs
 if ! command -v rustup >/dev/null 2>&1; then
   echo "rustup is required on test hosts; missing after prerequisite install" >&2
   exit 1

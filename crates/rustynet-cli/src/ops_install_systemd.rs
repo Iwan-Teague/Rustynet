@@ -912,6 +912,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         0o644,
     )?;
 
+    ensure_managed_dns_control_plane_ready()?;
     run_command_checked("systemctl", &["daemon-reload"])?;
     run_command_checked(
         "systemctl",
@@ -2063,6 +2064,27 @@ fn run_command_capture(command: &str, args: &[&str]) -> Result<String, String> {
 
 fn run_command_checked(command: &str, args: &[&str]) -> Result<(), String> {
     run_command_capture(command, args).map(|_| ())
+}
+
+fn ensure_managed_dns_control_plane_ready() -> Result<(), String> {
+    if !Path::new("/usr/bin/resolvectl").is_file() {
+        return Err(
+            "managed DNS routing requires /usr/bin/resolvectl; install and enable systemd-resolved before running install-systemd"
+                .to_string(),
+        );
+    }
+
+    if let Err(initial_err) = run_command_checked("resolvectl", &["status"]) {
+        run_command_checked("systemctl", &["reload", "dbus"])?;
+        run_command_checked("systemctl", &["restart", "systemd-resolved.service"])?;
+        if let Err(retry_err) = run_command_checked("resolvectl", &["status"]) {
+            return Err(format!(
+                "managed DNS control plane is unhealthy after dbus reload and systemd-resolved restart: initial_check={initial_err}; retry_check={retry_err}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn run_command_stream(command: &str, args: &[&str]) -> Result<(), String> {

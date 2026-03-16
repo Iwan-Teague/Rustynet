@@ -2004,10 +2004,18 @@ fn run_status(
     if output.status.success() {
         return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "no stdout/stderr output".to_string(),
+        (true, false) => format!("stderr={stderr}"),
+        (false, true) => format!("stdout={stdout}"),
+        (false, false) => format!("stdout={stdout}; stderr={stderr}"),
+    };
     Err(format!(
-        "{context}: status={} stderr={}",
+        "{context}: status={} {}",
         output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stderr).trim()
+        detail
     ))
 }
 
@@ -2139,6 +2147,8 @@ fn install_linux_e2e_prerequisites() -> Result<(), String> {
                 "nftables",
                 "wireguard-tools",
                 "openssl",
+                "systemd-resolved",
+                "libnss-resolve",
                 "rustup",
             ],
             &[],
