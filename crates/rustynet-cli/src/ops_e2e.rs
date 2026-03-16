@@ -12,9 +12,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::unistd::Uid;
 use rand::{RngCore, rngs::OsRng};
+use rustynet_control::{
+    ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
+    EndpointHintCandidateType, NodeMetadata,
+};
+use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
 
-use crate::env_file::format_env_assignment;
+use crate::{env_file::format_env_assignment, unix_now};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebianTwoNodeE2eConfig {
@@ -67,19 +72,25 @@ struct Workspace {
     control_dir: PathBuf,
     known_hosts: PathBuf,
     local_archive: PathBuf,
+    bootstrap_script_local: PathBuf,
     membership_snapshot_local: PathBuf,
     membership_log_local: PathBuf,
     assignment_pub_local: PathBuf,
     assignment_exit_local: PathBuf,
     assignment_client_local: PathBuf,
+    traversal_pub_local: PathBuf,
+    traversal_exit_local: PathBuf,
+    traversal_client_local: PathBuf,
     assignment_refresh_exit_local: PathBuf,
     assignment_refresh_client_local: PathBuf,
 }
 
+const REMOTE_SUDO_PROMPT: &str = "rustynet-e2e-sudo:";
+
 impl Workspace {
     fn new(seed_known_hosts: &Path) -> Result<Self, String> {
         let unique = unique_suffix();
-        let temp_dir = PathBuf::from(format!("/tmp/rustynet-remote-e2e.{unique}"));
+        let temp_dir = PathBuf::from(format!("/tmp/rnre.{unique}"));
         fs::create_dir_all(&temp_dir).map_err(|err| {
             format!(
                 "failed to create temporary workspace {}: {err}",
@@ -87,7 +98,7 @@ impl Workspace {
             )
         })?;
         set_unix_mode(temp_dir.as_path(), 0o700)?;
-        let control_dir = temp_dir.join("control");
+        let control_dir = temp_dir.join("c");
         fs::create_dir_all(&control_dir).map_err(|err| {
             format!(
                 "failed to create ssh control dir {}: {err}",
@@ -110,11 +121,15 @@ impl Workspace {
             control_dir,
             known_hosts,
             local_archive: temp_dir.join("repo.tar"),
+            bootstrap_script_local: temp_dir.join("remote-bootstrap-host.sh"),
             membership_snapshot_local: temp_dir.join("membership.snapshot"),
             membership_log_local: temp_dir.join("membership.log"),
             assignment_pub_local: temp_dir.join("assignment.pub"),
             assignment_exit_local: temp_dir.join("exit.assignment"),
             assignment_client_local: temp_dir.join("client.assignment"),
+            traversal_pub_local: temp_dir.join("traversal.pub"),
+            traversal_exit_local: temp_dir.join("exit.traversal"),
+            traversal_client_local: temp_dir.join("client.traversal"),
             assignment_refresh_exit_local: temp_dir.join("assignment-refresh-exit.env"),
             assignment_refresh_client_local: temp_dir.join("assignment-refresh-client.env"),
         })
@@ -454,6 +469,26 @@ pub fn execute_ops_e2e_bootstrap_host(
 
         run_status(
             "rustynet",
+            &["ops", "install-systemd"],
+            &[
+                ("RUSTYNET_NODE_ID", node_id.as_str()),
+                ("RUSTYNET_NODE_ROLE", role.as_str()),
+                ("RUSTYNET_TRUST_AUTO_REFRESH", "true"),
+                ("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false"),
+                ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false"),
+                ("RUSTYNET_WG_LISTEN_PORT", "51820"),
+                ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
+                (
+                    "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
+                    ssh_allow_cidrs.as_str(),
+                ),
+                ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
+            ],
+            "install-systemd failed during e2e bootstrap",
+        )?;
+
+        run_status(
+            "rustynet",
             &["ops", "refresh-trust"],
             &[
                 (
@@ -472,26 +507,6 @@ pub fn execute_ops_e2e_bootstrap_host(
                 ("RUSTYNET_TRUST_AUTO_REFRESH", "true"),
             ],
             "refresh trust failed during e2e bootstrap",
-        )?;
-
-        run_status(
-            "rustynet",
-            &["ops", "install-systemd"],
-            &[
-                ("RUSTYNET_NODE_ID", node_id.as_str()),
-                ("RUSTYNET_NODE_ROLE", role.as_str()),
-                ("RUSTYNET_TRUST_AUTO_REFRESH", "true"),
-                ("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false"),
-                ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false"),
-                ("RUSTYNET_WG_LISTEN_PORT", "51820"),
-                ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
-                (
-                    "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
-                    ssh_allow_cidrs.as_str(),
-                ),
-                ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
-            ],
-            "install-systemd failed during e2e bootstrap",
         )?;
         Ok(())
     })();
@@ -780,6 +795,35 @@ pub fn execute_ops_e2e_issue_assignments(
             &[],
             "issuing client assignment failed",
         )?;
+
+        let signing_secret = crate::load_assignment_signing_secret(
+            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(passphrase_path.as_str()),
+        )?;
+        let traversal_artifacts = issue_two_node_traversal_artifacts(
+            signing_secret.as_slice(),
+            exit_node_id.as_str(),
+            client_node_id.as_str(),
+            exit_endpoint.as_str(),
+            client_endpoint.as_str(),
+            exit_pubkey_hex.as_str(),
+            client_pubkey_hex.as_str(),
+        )?;
+        fs::write(
+            "/tmp/rustynet-traversal.pub",
+            format!("{}\n", traversal_artifacts.verifier_key_hex),
+        )
+        .map_err(|err| format!("write traversal verifier key failed: {err}"))?;
+        fs::write(
+            "/tmp/rustynet-exit.traversal",
+            traversal_artifacts.exit_bundle_wire,
+        )
+        .map_err(|err| format!("write exit traversal bundle failed: {err}"))?;
+        fs::write(
+            "/tmp/rustynet-client.traversal",
+            traversal_artifacts.client_bundle_wire,
+        )
+        .map_err(|err| format!("write client traversal bundle failed: {err}"))?;
         Ok(())
     })();
     secure_remove_file(Path::new(passphrase_path.as_str()));
@@ -788,6 +832,118 @@ pub fn execute_ops_e2e_issue_assignments(
     Ok(format!(
         "e2e assignment issuance complete: exit_node_id={exit_node_id} client_node_id={client_node_id}",
     ))
+}
+
+struct TwoNodeTraversalArtifacts {
+    verifier_key_hex: String,
+    exit_bundle_wire: String,
+    client_bundle_wire: String,
+}
+
+fn issue_two_node_traversal_artifacts(
+    signing_secret: &[u8],
+    exit_node_id: &str,
+    client_node_id: &str,
+    exit_endpoint: &str,
+    client_endpoint: &str,
+    exit_pubkey_hex: &str,
+    client_pubkey_hex: &str,
+) -> Result<TwoNodeTraversalArtifacts, String> {
+    ensure_hex_32("exit-pubkey-hex", exit_pubkey_hex)?;
+    ensure_hex_32("client-pubkey-hex", client_pubkey_hex)?;
+    let now_unix = unix_now();
+    let policy = PolicySet {
+        rules: vec![
+            PolicyRule {
+                src: format!("node:{exit_node_id}"),
+                dst: format!("node:{client_node_id}"),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            },
+            PolicyRule {
+                src: format!("node:{client_node_id}"),
+                dst: format!("node:{exit_node_id}"),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            },
+        ],
+    };
+    let core = ControlPlaneCore::new(signing_secret.to_vec(), policy);
+    core.nodes
+        .upsert(NodeMetadata {
+            node_id: exit_node_id.to_string(),
+            hostname: exit_node_id.to_string(),
+            os: "linux".to_string(),
+            tags: Vec::new(),
+            owner: exit_node_id.to_string(),
+            endpoint: exit_endpoint.to_string(),
+            last_seen_unix: now_unix,
+            public_key: decode_hex_32(exit_pubkey_hex)?,
+        })
+        .map_err(|err| format!("register exit node failed: {err}"))?;
+    core.nodes
+        .upsert(NodeMetadata {
+            node_id: client_node_id.to_string(),
+            hostname: client_node_id.to_string(),
+            os: "linux".to_string(),
+            tags: Vec::new(),
+            owner: client_node_id.to_string(),
+            endpoint: client_endpoint.to_string(),
+            last_seen_unix: now_unix,
+            public_key: decode_hex_32(client_pubkey_hex)?,
+        })
+        .map_err(|err| format!("register client node failed: {err}"))?;
+
+    let exit_bundle = core
+        .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: exit_node_id.to_string(),
+            target_node_id: client_node_id.to_string(),
+            generated_at_unix: now_unix,
+            ttl_secs: 120,
+            nonce: traversal_nonce(now_unix, 0),
+            candidates: vec![EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: client_endpoint.to_string(),
+                relay_id: None,
+                priority: 900,
+            }],
+        })
+        .map_err(|err| format!("issue exit traversal bundle failed: {err}"))?;
+    if !core.verify_signed_endpoint_hint_bundle(&exit_bundle) {
+        return Err("self-verify failed for exit traversal bundle".to_string());
+    }
+
+    let client_bundle = core
+        .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: client_node_id.to_string(),
+            target_node_id: exit_node_id.to_string(),
+            generated_at_unix: now_unix,
+            ttl_secs: 120,
+            nonce: traversal_nonce(now_unix, 1),
+            candidates: vec![EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: exit_endpoint.to_string(),
+                relay_id: None,
+                priority: 900,
+            }],
+        })
+        .map_err(|err| format!("issue client traversal bundle failed: {err}"))?;
+    if !core.verify_signed_endpoint_hint_bundle(&client_bundle) {
+        return Err("self-verify failed for client traversal bundle".to_string());
+    }
+
+    Ok(TwoNodeTraversalArtifacts {
+        verifier_key_hex: core.endpoint_hint_verifier_key_hex(),
+        exit_bundle_wire: ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&exit_bundle),
+        client_bundle_wire: ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&client_bundle),
+    })
+}
+
+fn traversal_nonce(now_unix: u64, offset: u64) -> u64 {
+    now_unix
+        .saturating_mul(1_000)
+        .saturating_add(u64::from(std::process::id()))
+        .saturating_add(offset)
 }
 
 pub fn execute_ops_run_debian_two_node_e2e(
@@ -865,8 +1021,10 @@ pub fn execute_ops_run_debian_two_node_e2e(
         config.repo_ref.as_str(),
         workspace.local_archive.as_path(),
     )?;
+    write_debian_remote_bootstrap_script(workspace.bootstrap_script_local.as_path())?;
 
     let remote_src_dir = format!("{}/src", config.remote_root.display());
+    let remote_bootstrap_script = format!("{}/bootstrap-host.sh", config.remote_root.display());
 
     copy_local_archive_to_host(
         ssh_opts.as_slice(),
@@ -885,47 +1043,33 @@ pub fn execute_ops_run_debian_two_node_e2e(
         remote_src_dir.as_str(),
     )?;
 
-    run_remote_cargo_ops_command(
+    run_remote_debian_bootstrap_host(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
         needs_exit_sudo,
         sudo_password.as_str(),
+        workspace.bootstrap_script_local.as_path(),
+        remote_bootstrap_script.as_str(),
+        "admin",
+        config.exit_node_id.as_str(),
+        config.network_id.as_str(),
         remote_src_dir.as_str(),
-        &[
-            "e2e-bootstrap-host",
-            "--role",
-            "admin",
-            "--node-id",
-            config.exit_node_id.as_str(),
-            "--network-id",
-            config.network_id.as_str(),
-            "--src-dir",
-            remote_src_dir.as_str(),
-            "--ssh-allow-cidrs",
-            config.ssh_allow_cidrs.as_str(),
-            if config.skip_apt { "--skip-apt" } else { "" },
-        ],
+        config.ssh_allow_cidrs.as_str(),
+        config.skip_apt,
     )?;
-    run_remote_cargo_ops_command(
+    run_remote_debian_bootstrap_host(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
         needs_client_sudo,
         sudo_password.as_str(),
+        workspace.bootstrap_script_local.as_path(),
+        remote_bootstrap_script.as_str(),
+        "client",
+        config.client_node_id.as_str(),
+        config.network_id.as_str(),
         remote_src_dir.as_str(),
-        &[
-            "e2e-bootstrap-host",
-            "--role",
-            "client",
-            "--node-id",
-            config.client_node_id.as_str(),
-            "--network-id",
-            config.network_id.as_str(),
-            "--src-dir",
-            remote_src_dir.as_str(),
-            "--ssh-allow-cidrs",
-            config.ssh_allow_cidrs.as_str(),
-            if config.skip_apt { "--skip-apt" } else { "" },
-        ],
+        config.ssh_allow_cidrs.as_str(),
+        config.skip_apt,
     )?;
 
     normalize_membership_permissions(
@@ -1116,6 +1260,39 @@ pub fn execute_ops_run_debian_two_node_e2e(
         "/tmp/rustynet-client.assignment",
         workspace.assignment_client_local.as_path(),
     )?;
+    copy_remote_file_to_local(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        if needs_exit_sudo {
+            Some(sudo_password.as_str())
+        } else {
+            None
+        },
+        "/tmp/rustynet-traversal.pub",
+        workspace.traversal_pub_local.as_path(),
+    )?;
+    copy_remote_file_to_local(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        if needs_exit_sudo {
+            Some(sudo_password.as_str())
+        } else {
+            None
+        },
+        "/tmp/rustynet-exit.traversal",
+        workspace.traversal_exit_local.as_path(),
+    )?;
+    copy_remote_file_to_local(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        if needs_exit_sudo {
+            Some(sudo_password.as_str())
+        } else {
+            None
+        },
+        "/tmp/rustynet-client.traversal",
+        workspace.traversal_client_local.as_path(),
+    )?;
 
     copy_local_file_to_remote(
         ssh_opts.as_slice(),
@@ -1135,6 +1312,28 @@ pub fn execute_ops_run_debian_two_node_e2e(
         sudo_password.as_str(),
         workspace.assignment_exit_local.as_path(),
         "/var/lib/rustynet/rustynetd.assignment",
+        "root",
+        "rustynetd",
+        "0640",
+    )?;
+    copy_local_file_to_remote(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        needs_exit_sudo,
+        sudo_password.as_str(),
+        workspace.traversal_pub_local.as_path(),
+        "/etc/rustynet/traversal.pub",
+        "root",
+        "root",
+        "0644",
+    )?;
+    copy_local_file_to_remote(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        needs_exit_sudo,
+        sudo_password.as_str(),
+        workspace.traversal_exit_local.as_path(),
+        "/var/lib/rustynet/rustynetd.traversal",
         "root",
         "rustynetd",
         "0640",
@@ -1161,6 +1360,28 @@ pub fn execute_ops_run_debian_two_node_e2e(
         "rustynetd",
         "0640",
     )?;
+    copy_local_file_to_remote(
+        ssh_opts.as_slice(),
+        client_target.qualified.as_str(),
+        needs_client_sudo,
+        sudo_password.as_str(),
+        workspace.traversal_pub_local.as_path(),
+        "/etc/rustynet/traversal.pub",
+        "root",
+        "root",
+        "0644",
+    )?;
+    copy_local_file_to_remote(
+        ssh_opts.as_slice(),
+        client_target.qualified.as_str(),
+        needs_client_sudo,
+        sudo_password.as_str(),
+        workspace.traversal_client_local.as_path(),
+        "/var/lib/rustynet/rustynetd.traversal",
+        "root",
+        "rustynetd",
+        "0640",
+    )?;
 
     run_remote_program_checked(
         ssh_opts.as_slice(),
@@ -1174,9 +1395,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         &[
             "-f",
             "/var/lib/rustynet/rustynetd.assignment.watermark",
+            "/var/lib/rustynet/rustynetd.traversal.watermark",
             "/tmp/rustynet-assignment.pub",
             "/tmp/rustynet-exit.assignment",
             "/tmp/rustynet-client.assignment",
+            "/tmp/rustynet-traversal.pub",
+            "/tmp/rustynet-exit.traversal",
+            "/tmp/rustynet-client.traversal",
         ],
         &[],
     )?;
@@ -1189,7 +1414,11 @@ pub fn execute_ops_run_debian_two_node_e2e(
             None
         },
         "rm",
-        &["-f", "/var/lib/rustynet/rustynetd.assignment.watermark"],
+        &[
+            "-f",
+            "/var/lib/rustynet/rustynetd.assignment.watermark",
+            "/var/lib/rustynet/rustynetd.traversal.watermark",
+        ],
         &[],
     )?;
 
@@ -2008,6 +2237,26 @@ fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+    ensure_hex_32("hex", value)?;
+    let mut out = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_string())?;
+        let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_string())?;
+        out[index] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn ensure_running_as_root() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
@@ -2684,7 +2933,11 @@ fn run_remote_program(
     let mut command = Command::new("ssh");
     command.args(options).arg(host);
     if sudo_password.is_some() {
-        command.arg("sudo").arg("-S").arg("-p").arg("");
+        command
+            .arg("sudo")
+            .arg("-S")
+            .arg("-p")
+            .arg(REMOTE_SUDO_PROMPT);
     }
     if !envs.is_empty() {
         command.arg("env");
@@ -2779,7 +3032,7 @@ fn copy_local_archive_to_host(
             .arg("sudo")
             .arg("-S")
             .arg("-p")
-            .arg("")
+            .arg(REMOTE_SUDO_PROMPT)
             .arg("tar")
             .arg("-xf")
             .arg("-")
@@ -2802,42 +3055,205 @@ fn copy_local_archive_to_host(
     run_command_with_input(command, payload.as_slice()).map(|_| ())
 }
 
-fn run_remote_cargo_ops_command(
+fn write_debian_remote_bootstrap_script(path: &Path) -> Result<(), String> {
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 6 ]]; then
+  echo "usage: remote-bootstrap-host.sh <role> <node-id> <network-id> <src-dir> <ssh-allow-cidrs> <skip-apt>" >&2
+  exit 2
+fi
+
+ROLE="$1"
+NODE_ID="$2"
+NETWORK_ID="$3"
+SRC_DIR="$4"
+SSH_ALLOW_CIDRS="$5"
+SKIP_APT="$6"
+
+export DEBIAN_FRONTEND=noninteractive
+
+repair_local_hostname_resolution() {
+  local current_hostname
+  current_hostname="$(hostname)"
+  [[ -n "${current_hostname}" ]] || return 0
+  if grep -Eq "(^|[[:space:]])${current_hostname}([[:space:]]|$)" /etc/hosts; then
+    return 0
+  fi
+  printf '\n127.0.1.1\t%s\n' "${current_hostname}" >> /etc/hosts
+}
+
+repair_local_nsswitch_hosts() {
+  if grep -Eq '^[[:space:]]*hosts:.*\bresolve\b' /etc/nsswitch.conf; then
+    sed -i 's/^[[:space:]]*hosts:.*/hosts:          files dns/' /etc/nsswitch.conf
+  fi
+}
+
+repair_local_dns_resolution() {
+  local gateway
+  local resolver
+  local resolvers=()
+  if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+    return 0
+  fi
+  gateway="$(ip route show default | awk '/default/ { print $3; exit }')"
+  if [[ -n "${gateway}" ]]; then
+    resolvers+=("${gateway}")
+  fi
+  resolvers+=("1.1.1.1" "8.8.8.8")
+  for resolver in "${resolvers[@]}"; do
+    rm -f /etc/resolv.conf
+    printf 'nameserver %s\noptions timeout:2 attempts:2\n' "${resolver}" > /etc/resolv.conf
+    if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  echo "DNS repair failed for static.rust-lang.org via resolvers: ${resolvers[*]}" >&2
+  return 1
+}
+
+install_prereqs() {
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libsqlite3-dev \
+    clang \
+    llvm \
+    nftables \
+    wireguard-tools \
+    openssl \
+    systemd-resolved \
+    rustup
+}
+
+clear_residual_rustynet_state() {
+  local kind family table
+  for unit in rustynetd.service rustynetd-privileged-helper.service rustynetd-trust-refresh.service rustynetd-trust-refresh.timer rustynetd-assignment-refresh.service rustynetd-assignment-refresh.timer rustynetd-managed-dns.service; do
+    systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+  done
+  pkill -f 'rustynetd daemon' >/dev/null 2>&1 || true
+  pkill -f 'rustynetd privileged-helper' >/dev/null 2>&1 || true
+  ip link delete rustynet0 >/dev/null 2>&1 || true
+  for _ in 1 2 3; do
+    nft list tables 2>/dev/null | while read -r kind family table; do
+      [ "${kind}" = "table" ] || continue
+      case "${table}" in
+        rustynet*)
+          nft flush table "${family}" "${table}" >/dev/null 2>&1 || true
+          nft delete table "${family}" "${table}" >/dev/null 2>&1 || true
+          ;;
+      esac
+    done
+  done
+}
+
+clear_residual_rustynet_state
+repair_local_hostname_resolution
+repair_local_nsswitch_hosts
+repair_local_dns_resolution
+if [[ "${SKIP_APT}" != "true" ]]; then
+  install_prereqs
+fi
+repair_local_nsswitch_hosts
+repair_local_dns_resolution
+systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+
+if ! command -v rustup >/dev/null 2>&1; then
+  echo "rustup missing after prerequisite install" >&2
+  exit 1
+fi
+
+RUST_TOOLCHAIN_CHANNEL="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${SRC_DIR}/rust-toolchain.toml" 2>/dev/null | head -n 1)"
+if [[ -z "${RUST_TOOLCHAIN_CHANNEL}" ]]; then
+  echo "failed to determine required Rust toolchain from rust-toolchain.toml" >&2
+  exit 1
+fi
+
+export PATH="/root/.cargo/bin:${PATH}"
+rustup set profile minimal
+if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo --version >/dev/null 2>&1; then
+  rustup toolchain install "${RUST_TOOLCHAIN_CHANNEL}" --profile minimal --component rustfmt --component clippy
+fi
+rustup default "${RUST_TOOLCHAIN_CHANNEL}"
+
+rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --manifest-path "${SRC_DIR}/Cargo.toml" -p rustynetd -p rustynet-cli
+install -m 0755 "${SRC_DIR}/target/release/rustynetd" /usr/local/bin/rustynetd
+install -m 0755 "${SRC_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
+getent group rustynetd >/dev/null 2>&1 || groupadd --system rustynetd
+
+RUSTYNET_INSTALL_SOURCE_ROOT="${SRC_DIR}" rustynet ops e2e-bootstrap-host \
+  --role "${ROLE}" \
+  --node-id "${NODE_ID}" \
+  --network-id "${NETWORK_ID}" \
+  --src-dir "${SRC_DIR}" \
+  --ssh-allow-cidrs "${SSH_ALLOW_CIDRS}" \
+  --skip-apt
+"#;
+    fs::write(path, script.as_bytes())
+        .map_err(|err| format!("failed writing {}: {err}", path.display()))?;
+    set_unix_mode(path, 0o700)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_remote_debian_bootstrap_host(
     options: &[OsString],
     host: &str,
     needs_sudo: bool,
     sudo_password: &str,
+    local_script_path: &Path,
+    remote_script_path: &str,
+    role: &str,
+    node_id: &str,
+    network_id: &str,
     remote_src_dir: &str,
-    ops_args: &[&str],
+    ssh_allow_cidrs: &str,
+    skip_apt: bool,
 ) -> Result<(), String> {
-    ensure_safe_remote_path(remote_src_dir)?;
-    let manifest_path = format!("{remote_src_dir}/Cargo.toml");
-    let mut remote_args = vec![
-        "run".to_string(),
-        "--release".to_string(),
-        "--manifest-path".to_string(),
-        manifest_path,
-        "-p".to_string(),
-        "rustynet-cli".to_string(),
-        "--".to_string(),
-        "ops".to_string(),
-    ];
-    for arg in ops_args {
-        if arg.is_empty() {
-            continue;
-        }
-        ensure_safe_token("remote-arg", arg)?;
-        remote_args.push((*arg).to_string());
-    }
-    let remote_refs = remote_args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_remote_program_command(
+    ensure_safe_remote_path(remote_script_path)?;
+    ensure_safe_token("role", role)?;
+    ensure_safe_token("node-id", node_id)?;
+    ensure_safe_token("network-id", network_id)?;
+    ensure_safe_token("ssh-allow-cidrs", ssh_allow_cidrs)?;
+    copy_local_file_to_remote(
         options,
         host,
         needs_sudo,
         sudo_password,
-        "cargo",
-        &remote_refs,
-    )
+        local_script_path,
+        remote_script_path,
+        "root",
+        "root",
+        "0700",
+    )?;
+    let sudo = if needs_sudo {
+        Some(sudo_password)
+    } else {
+        None
+    };
+    let result = run_remote_program_checked(
+        options,
+        host,
+        sudo,
+        "bash",
+        &[
+            remote_script_path,
+            role,
+            node_id,
+            network_id,
+            remote_src_dir,
+            ssh_allow_cidrs,
+            if skip_apt { "true" } else { "false" },
+        ],
+        &[],
+    );
+    let _ = run_remote_program_checked(options, host, sudo, "rm", &["-f", remote_script_path], &[]);
+    result
 }
 
 fn run_remote_rustynet_ops_command(
@@ -2858,6 +3274,7 @@ fn run_remote_rustynet_ops_command(
         host,
         needs_sudo,
         sudo_password,
+        &[],
         "/usr/local/bin/rustynet",
         &remote_refs,
     )
@@ -2868,16 +3285,28 @@ fn run_remote_program_command(
     host: &str,
     needs_sudo: bool,
     sudo_password: &str,
+    envs: &[(&str, &str)],
     program: &str,
     args: &[&str],
 ) -> Result<(), String> {
     let mut command = Command::new("ssh");
     command.args(options).arg(host);
     if needs_sudo {
-        command.arg("sudo").arg("-S").arg("-p").arg("").arg(program);
-    } else {
-        command.arg(program);
+        command
+            .arg("sudo")
+            .arg("-S")
+            .arg("-p")
+            .arg(REMOTE_SUDO_PROMPT);
     }
+    if !envs.is_empty() {
+        command.arg("env");
+        for (key, value) in envs {
+            ensure_safe_token("remote-env-key", key)?;
+            ensure_safe_token("remote-env-value", value)?;
+            command.arg(format!("{key}={value}"));
+        }
+    }
+    command.arg(program);
     command.args(args);
 
     let mut payload = Vec::new();
@@ -2930,7 +3359,11 @@ fn copy_local_file_to_remote(
     let mut command = Command::new("ssh");
     command.args(options).arg(host);
     if needs_sudo {
-        command.arg("sudo").arg("-S").arg("-p").arg("");
+        command
+            .arg("sudo")
+            .arg("-S")
+            .arg("-p")
+            .arg(REMOTE_SUDO_PROMPT);
     }
     command
         .arg("install")
@@ -3307,8 +3740,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        AssignmentRefreshEnv, decode_base64, ensure_safe_token, extract_last_assignment_generated,
-        write_assignment_refresh_env,
+        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, decode_base64, decode_hex_32,
+        ensure_safe_token, extract_last_assignment_generated,
+        issue_two_node_traversal_artifacts, write_assignment_refresh_env,
     };
 
     #[test]
@@ -3323,6 +3757,15 @@ mod tests {
         assert_eq!(bytes.len(), 32);
         assert_eq!(bytes[0], 1);
         assert_eq!(bytes[31], 32);
+    }
+
+    #[test]
+    fn decode_hex_32_roundtrip_shape() {
+        let bytes =
+            decode_hex_32("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("hex decode should work");
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[31], 31);
     }
 
     #[test]
@@ -3354,5 +3797,33 @@ mod tests {
         ));
         assert!(body.contains("RUSTYNET_ASSIGNMENT_ALLOW=\"client-50|exit-49;exit-49|client-50\""));
         assert!(body.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\""));
+    }
+
+    #[test]
+    fn remote_sudo_prompt_is_non_empty() {
+        assert!(!REMOTE_SUDO_PROMPT.is_empty());
+    }
+
+    #[test]
+    fn two_node_traversal_artifacts_are_directional_and_signed() {
+        let artifacts = issue_two_node_traversal_artifacts(
+            &[7u8; 32],
+            "exit-node",
+            "client-node",
+            "192.168.64.22:51820",
+            "192.168.64.24:51820",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("traversal artifacts should issue");
+        assert!(!artifacts.verifier_key_hex.is_empty());
+        assert!(artifacts.exit_bundle_wire.contains("source_node_id=exit-node"));
+        assert!(artifacts.exit_bundle_wire.contains("target_node_id=client-node"));
+        assert!(artifacts.exit_bundle_wire.contains("candidate.0.addr=192.168.64.24"));
+        assert!(artifacts.client_bundle_wire.contains("source_node_id=client-node"));
+        assert!(artifacts.client_bundle_wire.contains("target_node_id=exit-node"));
+        assert!(artifacts.client_bundle_wire.contains("candidate.0.addr=192.168.64.22"));
+        assert!(artifacts.exit_bundle_wire.contains("signature="));
+        assert!(artifacts.client_bundle_wire.contains("signature="));
     }
 }
