@@ -877,12 +877,12 @@ if command -v nft >/dev/null 2>&1; then
       run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
       run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
     done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
-    if ! run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { exit 0 } END { exit 1 }'; then
+    if ! run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
       break
     fi
     sleep 1
   done
-  if run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { exit 0 } END { exit 1 }'; then
+  if run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
     echo "residual rustynet nftables state remained after cleanup" >&2
     exit 1
   fi
