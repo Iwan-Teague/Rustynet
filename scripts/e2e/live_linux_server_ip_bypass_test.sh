@@ -12,6 +12,7 @@ export LIVE_LAB_LOG_PREFIX
 
 CLIENT_HOST=""
 PROBE_HOST=""
+PROBE_BIND_IP=""
 SSH_PASSWORD_FILE=""
 SUDO_PASSWORD_FILE=""
 SSH_ALLOW_CIDRS="192.168.18.0/24"
@@ -26,6 +27,7 @@ usage: live_linux_server_ip_bypass_test.sh --ssh-password-file <path> --sudo-pas
 options:
   --client-host <user@host>
   --probe-host <user@host>         Existing mesh peer whose underlay IP will host the forbidden service probe.
+  --probe-bind-ip <ipv4>           Explicit IPv4 to bind on probe host. Default: probe host underlay IP.
   --ssh-allow-cidrs <cidr[,cidr]>  Explicit management bypass CIDRs. Default: 192.168.18.0/24
   --probe-port <port>              Default: 18080
   --report-path <path>
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --probe-host) PROBE_HOST="$2"; shift 2 ;;
+    --probe-bind-ip) PROBE_BIND_IP="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     --probe-port) PROBE_PORT="$2"; shift 2 ;;
     --report-path) REPORT_PATH="$2"; shift 2 ;;
@@ -59,7 +62,8 @@ if [[ "$CLIENT_HOST" == "$PROBE_HOST" ]]; then
 fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
-exec > >(tee "$LOG_PATH") 2>&1
+: > "$LOG_PATH"
+exec >> "$LOG_PATH" 2>&1
 
 live_lab_init "rustynet-server-ip-bypass" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
 trap 'live_lab_cleanup' EXIT
@@ -122,7 +126,17 @@ print("probe-ok")
 PY
 chmod 700 "$SERVER_SCRIPT" "$PROBE_SCRIPT"
 
-PROBE_IP="$(live_lab_target_address "$PROBE_HOST")"
+if [[ -n "$PROBE_BIND_IP" ]]; then
+  python3 - "$PROBE_BIND_IP" <<'PY'
+import ipaddress
+import sys
+
+ipaddress.IPv4Address(sys.argv[1])
+PY
+  PROBE_IP="$PROBE_BIND_IP"
+else
+  PROBE_IP="$(live_lab_target_address "$PROBE_HOST")"
+fi
 PROBE_PID_PATH="/tmp/rn-underlay-http-server.pid"
 PROBE_LOG_PATH="/tmp/rn-underlay-http-server.log"
 

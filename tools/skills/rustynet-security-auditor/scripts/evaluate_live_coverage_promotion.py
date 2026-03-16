@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
-from live_lab_catalog import LIVE_VALIDATIONS, MODE_INDEX, ValidationSpec
+from live_lab_catalog import LIVE_VALIDATIONS, ValidationSpec
+from validate_live_lab_reports import load_payload, validate_payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +58,7 @@ def selected_specs(raw: str) -> list[ValidationSpec]:
 def load_reports(paths: list[Path]) -> dict[str, dict[str, Any]]:
     loaded: dict[str, dict[str, Any]] = {}
     for path in paths:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_payload(path)
         mode = payload.get("mode")
         if isinstance(mode, str):
             loaded[mode] = {"path": path, "payload": payload}
@@ -74,6 +74,13 @@ def evaluate_spec(spec: ValidationSpec, loaded: dict[str, dict[str, Any]]) -> di
             "report_path": "[missing]",
         }
     payload = record["payload"]
+    schema_errors = validate_payload(record["path"], payload)
+    if schema_errors:
+        return {
+            "eligible": False,
+            "reason": "report schema validation failed",
+            "report_path": str(record["path"]),
+        }
     checks = payload.get("checks", {})
     if payload.get("status") != "pass":
         return {

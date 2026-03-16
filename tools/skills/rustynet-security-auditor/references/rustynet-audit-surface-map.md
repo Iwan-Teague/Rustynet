@@ -21,6 +21,18 @@ Primary Rustynet live validators currently used by the skill:
 
 Canonical runner:
 - `tools/skills/rustynet-security-auditor/scripts/run_rustynet_live_validations.py`
+- runner preflight requirements:
+  - pinned `known_hosts` file
+  - host-key presence for every targeted host
+  - active SSH reachability for every targeted host before validators start
+  - required remote binaries present on every targeted host:
+    - `rustynet`
+    - `rustynetd`
+    - `wg`
+    - `systemctl`
+    - `ss`
+    - `python3`
+  - `rustynetd.service` present and active on every targeted host before validators start
 
 ## Rustynet Comparative Coverage
 

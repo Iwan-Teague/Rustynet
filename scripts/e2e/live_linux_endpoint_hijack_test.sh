@@ -61,7 +61,8 @@ ipaddress.IPv4Address(sys.argv[1])
 PY
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
-exec > >(tee "$LOG_PATH") 2>&1
+: > "$LOG_PATH"
+exec >> "$LOG_PATH" 2>&1
 
 live_lab_init "rustynet-endpoint-hijack" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
 

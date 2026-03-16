@@ -540,6 +540,35 @@ has_five_node_release_gate_topology() {
   has_four_node_live_topology && has_label extra
 }
 
+cross_network_network_id_for_label() {
+  local label="$1"
+  printf '%s-%s' "$NETWORK_ID" "$label"
+}
+
+cross_network_relay_label() {
+  if has_label entry; then
+    printf 'entry'
+    return 0
+  fi
+  if has_label aux; then
+    printf 'aux'
+    return 0
+  fi
+  return 1
+}
+
+cross_network_probe_label() {
+  if has_label aux; then
+    printf 'aux'
+    return 0
+  fi
+  if has_label entry; then
+    printf 'entry'
+    return 0
+  fi
+  return 1
+}
+
 normalize_target() {
   local label="$1"
   local value="$2"
@@ -1490,6 +1519,118 @@ stage_run_live_managed_dns() {
   cp "$REPORT_DIR/live_linux_managed_dns.log" "$canonical_log"
 }
 
+stage_run_cross_network_direct_remote_exit() {
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$REPORT_DIR/cross_network_direct_remote_exit_report.json" \
+    --log-path "$REPORT_DIR/cross_network_direct_remote_exit.log"
+}
+
+stage_run_cross_network_relay_remote_exit() {
+  local relay_label
+  if ! relay_label="$(cross_network_relay_label)"; then
+    printf 'cross-network relay remote-exit validation requires entry or aux target\n' >&2
+    return 1
+  fi
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --relay-host "$(node_target_for_label "$relay_label")" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --relay-node-id "$(node_id_for_label "$relay_label")" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$REPORT_DIR/cross_network_relay_remote_exit_report.json" \
+    --log-path "$REPORT_DIR/cross_network_relay_remote_exit.log"
+}
+
+stage_run_cross_network_failback_roaming() {
+  local relay_label
+  if ! relay_label="$(cross_network_relay_label)"; then
+    printf 'cross-network failback and roaming validation requires entry or aux target\n' >&2
+    return 1
+  fi
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --relay-host "$(node_target_for_label "$relay_label")" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --relay-node-id "$(node_id_for_label "$relay_label")" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$REPORT_DIR/cross_network_failback_roaming_report.json" \
+    --log-path "$REPORT_DIR/cross_network_failback_roaming.log"
+}
+
+stage_run_cross_network_traversal_adversarial() {
+  local probe_label
+  if ! probe_label="$(cross_network_probe_label)"; then
+    printf 'cross-network traversal adversarial validation requires entry or aux target\n' >&2
+    return 1
+  fi
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --probe-host "$(node_target_for_label "$probe_label")" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --report-path "$REPORT_DIR/cross_network_traversal_adversarial_report.json" \
+    --log-path "$REPORT_DIR/cross_network_traversal_adversarial.log"
+}
+
+stage_run_cross_network_remote_exit_dns() {
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$REPORT_DIR/cross_network_remote_exit_dns_report.json" \
+    --log-path "$REPORT_DIR/cross_network_remote_exit_dns.log"
+}
+
+stage_run_cross_network_remote_exit_soak_placeholder() {
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh" \
+    --ssh-password-file "$SSH_PASSWORD_FILE" \
+    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --report-path "$REPORT_DIR/cross_network_remote_exit_soak_report.json" \
+    --log-path "$REPORT_DIR/cross_network_remote_exit_soak.log"
+}
+
 stage_generate_fresh_install_os_matrix_report() {
   local commit_short role_report canonical_report canonical_source_dir manifest_json
   local canonical_bootstrap_log canonical_baseline_log canonical_two_hop_report
@@ -2242,6 +2383,21 @@ main() {
     if has_four_node_live_topology && [[ "$RUN_SOAK" -eq 1 ]]; then
       record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
+    record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: not executed"
+    if cross_network_relay_label >/dev/null 2>&1; then
+      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: not executed"
+      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: not executed"
+    else
+      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because entry or aux target is not configured"
+      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because entry or aux target is not configured"
+    fi
+    if cross_network_probe_label >/dev/null 2>&1; then
+      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: not executed"
+    else
+      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because entry or aux target is not configured"
+    fi
+    record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: not executed"
+    record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: not executed"
     write_run_summary
     printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
@@ -2310,6 +2466,57 @@ main() {
     fi
   else
     record_stage_skip extended_soak soft 'requires entry and aux targets'
+  fi
+
+  local cross_network_stage_rc=0 stage_rc=0
+  set +e
+  run_stage hard cross_network_direct_remote_exit 'run cross-network direct remote-exit validation' stage_run_cross_network_direct_remote_exit
+  stage_rc=$?
+  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+    cross_network_stage_rc="$stage_rc"
+  fi
+
+  if cross_network_relay_label >/dev/null 2>&1; then
+    run_stage hard cross_network_relay_remote_exit 'run cross-network relay remote-exit validation' stage_run_cross_network_relay_remote_exit
+    stage_rc=$?
+    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+      cross_network_stage_rc="$stage_rc"
+    fi
+    run_stage hard cross_network_failback_roaming 'run cross-network failback and endpoint-roaming validation' stage_run_cross_network_failback_roaming
+    stage_rc=$?
+    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+      cross_network_stage_rc="$stage_rc"
+    fi
+  else
+    record_stage_skip cross_network_relay_remote_exit hard 'requires entry or aux target'
+    record_stage_skip cross_network_failback_roaming hard 'requires entry or aux target'
+  fi
+
+  if cross_network_probe_label >/dev/null 2>&1; then
+    run_stage hard cross_network_traversal_adversarial 'run cross-network traversal adversarial validation' stage_run_cross_network_traversal_adversarial
+    stage_rc=$?
+    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+      cross_network_stage_rc="$stage_rc"
+    fi
+  else
+    record_stage_skip cross_network_traversal_adversarial hard 'requires entry or aux target'
+  fi
+
+  run_stage hard cross_network_remote_exit_dns 'run cross-network remote-exit DNS validation' stage_run_cross_network_remote_exit_dns
+  stage_rc=$?
+  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+    cross_network_stage_rc="$stage_rc"
+  fi
+  run_stage hard cross_network_remote_exit_soak 'run future cross-network remote-exit soak placeholder (expected hard fail until implemented)' stage_run_cross_network_remote_exit_soak_placeholder
+  stage_rc=$?
+  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+    cross_network_stage_rc="$stage_rc"
+  fi
+  set -e
+
+  if [[ "$cross_network_stage_rc" -ne 0 ]]; then
+    write_run_summary
+    return "$cross_network_stage_rc"
   fi
 
   write_run_summary

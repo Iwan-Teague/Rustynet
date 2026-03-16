@@ -74,6 +74,9 @@ Do not hand-stitch validator runs unless you are debugging the runner itself.
 The runner is the canonical path because it:
 - executes the selected Rustynet validators
 - emits canonical JSON reports
+- requires a pinned SSH `known_hosts` path and validates host-key presence before any validator starts
+- verifies SSH reachability to every targeted host before any validator starts
+- verifies the required remote binaries and the `rustynetd.service` unit are present before any validator starts
 - validates report schema
 - generates prioritized findings
 - evaluates whether comparative coverage can be promoted

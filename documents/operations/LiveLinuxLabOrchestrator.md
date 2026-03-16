@@ -15,6 +15,7 @@ This script automates the live Linux lab workflow that was previously being run 
 - run the baseline live validations
 - optionally run the local full gate suite
 - optionally run an extended soak, including reboot recovery checks
+- run explicit hard-fail cross-network remote-exit stages after the current live suite
 - emit structured reports with explicit hard-fail and soft-fail stages
 
 ## Target topology
@@ -49,6 +50,7 @@ What runs with each topology:
   - plus controlled role-switch validation
   - plus commit-bound Linux fresh-install OS matrix report generation
   - plus local full gate suite with fresh-install release-gate evidence rebound to the current run
+  - plus the same explicit cross-network remote-exit stages that currently fail closed until the feature exists
 
 Security note:
 
@@ -115,6 +117,12 @@ Default hard-fail stages:
 - live managed-DNS validation
 - fresh install OS matrix report generation
 - local full gate suite (unless `--skip-gates`)
+- cross-network direct remote-exit validation
+- cross-network relay remote-exit validation
+- cross-network failback / roaming validation
+- cross-network traversal adversarial validation
+- cross-network remote-exit DNS validation
+- cross-network remote-exit soak placeholder
 
 Soft-fail stages continue and are recorded in the summary.
 
@@ -143,6 +151,7 @@ Important outputs:
 - live test JSON reports written by the reused `scripts/e2e/` test scripts
 - `fresh_install_os_matrix_report.json` in the run directory and the canonical `artifacts/phase10/` path when the full Linux evidence path runs
 - canonical fresh-install matrix inputs rebound under `artifacts/phase10/source/fresh_install_os_matrix/` so the committed report no longer depends on gitignored `artifacts/live_lab/...` evidence paths
+- cross-network reports written in the run directory for each future remote-exit suite so missing implementation is explicit and measured
 
 The summary files show:
 
@@ -169,6 +178,56 @@ The failure digest files are intentionally smaller and optimized for triage:
 For reboot/soak failures, the digest now prefers the structured reboot recovery report over the raw stage log so the first failure reason reflects the actual failed checks instead of a generic stage trailer.
 
 On any hard-fail stage, the orchestrator also prints the `failure_digest.md` path immediately in the terminal output so you can jump straight to the compact triage view.
+
+## Cross-Network Placeholder Stage
+
+The orchestrator now includes six explicit cross-network remote-exit stages at the end of the current live workflow:
+
+- `cross_network_direct_remote_exit`
+- `cross_network_relay_remote_exit`
+- `cross_network_failback_roaming`
+- `cross_network_traversal_adversarial`
+- `cross_network_remote_exit_dns`
+- `cross_network_remote_exit_soak`
+
+Current behavior:
+
+- `cross_network_direct_remote_exit`
+  - runs a real validator that provisions a two-node direct remote-exit path using signed assignments, verifies full-tunnel routing, and reuses the server-IP bypass validator to prove leak resistance and narrow bypass scope
+  - still fails closed if the measured topology does not provide credible cross-network proof, for example when the client and exit underlay addresses are on the same local prefix
+- `cross_network_relay_remote_exit`
+  - runs a real three-node validator that provisions a client -> relay -> exit chain through signed assignments, verifies relay and final-exit steady state, and reuses the server-IP bypass validator to prove leak resistance and narrow bypass scope
+  - still fails closed if the measured topology cannot credibly prove a cross-network claim
+- `cross_network_failback_roaming`
+  - runs a real validator that first proves the relay path, then measures relay -> direct failback and signed endpoint-roam recovery on the live path
+  - still fails closed if failback timing, endpoint adoption, or post-roam leak resistance cannot be proven
+- `cross_network_traversal_adversarial`
+  - runs a real validator that combines local signed traversal tamper/replay regression tests with live rogue-endpoint denial and control-surface exposure checks
+- `cross_network_remote_exit_dns`
+  - runs a real validator that first proves the direct remote-exit path, then validates managed DNS issuance, split-DNS resolution, and fail-closed stale-bundle behavior on that remote-exit client
+- the remaining one stage still calls a schema-valid skeleton validator that always:
+  - emit measured JSON reports in the run directory
+  - record `status=fail`
+  - exit non-zero with an explicit `not implemented yet` failure summary
+
+This is intentional. The direct, relay, failback/roaming, traversal-adversarial, and remote-exit DNS stages now measure real security properties, but the suite as a whole still fails closed so the orchestrator cannot imply that cross-network remote-exit support exists before the remaining soak validator, full HP2/HP3 work, and release-gate evidence are complete.
+
+Topology requirements for the cross-network stages:
+
+- `cross_network_direct_remote_exit`
+  - requires `exit` and `client`
+- `cross_network_relay_remote_exit`
+  - requires `exit`, `client`, and either `entry` or `aux`
+- `cross_network_failback_roaming`
+  - requires `exit`, `client`, and either `entry` or `aux`
+- `cross_network_traversal_adversarial`
+  - requires `exit`, `client`, and either `aux` or `entry`
+- `cross_network_remote_exit_dns`
+  - requires `exit` and `client`
+- `cross_network_remote_exit_soak`
+  - requires `exit` and `client`
+
+Until the remaining soak validator exists, a successful orchestrator run should not be expected to pass beyond that final placeholder stage.
 
 For parallel stages, the stage log also contains worker-delimited blocks so you can see:
 

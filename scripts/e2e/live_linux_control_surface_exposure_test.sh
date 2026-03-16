@@ -98,7 +98,8 @@ if [[ -z "$PROBE_HOST" ]]; then
 fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
-exec > >(tee "$LOG_PATH") 2>&1
+: > "$LOG_PATH"
+exec >> "$LOG_PATH" 2>&1
 
 live_lab_init "rustynet-control-surface" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
 trap 'live_lab_cleanup' EXIT

@@ -86,7 +86,8 @@ if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
 fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
-exec > >(tee "$LOG_PATH") 2>&1
+: > "$LOG_PATH"
+exec >> "$LOG_PATH" 2>&1
 
 live_lab_init "rustynet-managed-dns" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
 cleanup_all() {
