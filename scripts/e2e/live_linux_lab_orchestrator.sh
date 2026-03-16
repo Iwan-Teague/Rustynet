@@ -843,6 +843,13 @@ run_root() {
   sudo -S -p '' "$@" < /tmp/rn_sudo.pass
 }
 
+run_root pkill -f '/tmp/rn_bootstrap.sh' >/dev/null 2>&1 || true
+run_root pkill -f '/tmp/rn_bootstrap.env' >/dev/null 2>&1 || true
+run_root pkill -f 'apt-get update' >/dev/null 2>&1 || true
+run_root pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
+run_root pkill -f 'dnf install -y' >/dev/null 2>&1 || true
+run_root pkill -f 'cargo build --release -p rustynetd -p rustynet-cli' >/dev/null 2>&1 || true
+
 run_root systemctl disable --now \
   rustynetd.service \
   rustynetd-privileged-helper.service \
@@ -911,6 +918,21 @@ run_root() {
   sudo -S -p '' "$@" < /tmp/rn_sudo.pass
 }
 
+wait_for_package_manager_idle() {
+  local pattern="$1"
+  local label="$2"
+  local attempt
+  for attempt in $(seq 1 60); do
+    if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${label} remained busy after waiting for prior lab processes to exit" >&2
+  pgrep -af "$pattern" >&2 || true
+  exit 1
+}
+
 install_prereqs() {
   local os_id=""
   local os_like=""
@@ -921,10 +943,12 @@ install_prereqs() {
     os_like="${ID_LIKE:-}"
   fi
   if [[ "${os_id}" == "fedora" || "${os_like}" == *"fedora"* || "${os_like}" == *"rhel"* ]]; then
+    wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
     run_root dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
       sqlite-devel clang llvm nftables wireguard-tools rustup
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
     run_root env DEBIAN_FRONTEND=noninteractive apt-get update
     run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev \
