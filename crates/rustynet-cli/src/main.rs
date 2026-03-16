@@ -40,7 +40,9 @@ use rustynet_dns_zone::{
     canonicalize_dns_zone_name, parse_dns_zone_verifying_key, parse_signed_dns_zone_bundle_wire,
     verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
 };
-use rustynet_local_security::validate_owner_only_socket;
+use rustynet_local_security::{
+    validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
+};
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
@@ -5938,6 +5940,16 @@ fn rustynetd_service_uid_for_socket(path: &Path) -> Option<u32> {
         .map(|user| user.uid.as_raw())
 }
 
+fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
+    if !path.starts_with("/run/rustynet") {
+        return None;
+    }
+    Group::from_name("rustynetd")
+        .ok()
+        .flatten()
+        .map(|group| group.gid.as_raw())
+}
+
 fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), String> {
     let expected_uid = Uid::effective().as_raw();
     let mut allowed_owner_uids = vec![expected_uid, 0];
@@ -5945,6 +5957,15 @@ fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), Stri
         && !allowed_owner_uids.contains(&service_uid)
     {
         allowed_owner_uids.push(service_uid);
+    }
+    if let Some(service_gid) = rustynetd_service_gid_for_socket(path) {
+        return validate_root_managed_shared_runtime_socket(
+            path,
+            label,
+            &allowed_owner_uids,
+            &allowed_owner_uids,
+            service_gid,
+        );
     }
     validate_owner_only_socket(path, label, &allowed_owner_uids, &allowed_owner_uids)
 }
