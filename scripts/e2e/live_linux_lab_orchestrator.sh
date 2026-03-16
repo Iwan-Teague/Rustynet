@@ -846,6 +846,7 @@ run_root() {
 run_root systemctl disable --now \
   rustynetd.service \
   rustynetd-privileged-helper.service \
+  rustynetd-managed-dns.service \
   rustynetd-trust-refresh.service \
   rustynetd-trust-refresh.timer \
   rustynetd-assignment-refresh.service \
@@ -857,11 +858,17 @@ run_root ip link delete rustynet0 >/dev/null 2>&1 || true
 run_root ip route flush table 51820 >/dev/null 2>&1 || true
 run_root ip -6 route flush table 51820 >/dev/null 2>&1 || true
 if command -v nft >/dev/null 2>&1; then
-  while read -r family table_name; do
-    [[ -n "${family}" && -n "${table_name}" ]] || continue
-    run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
-    run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
-  done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
+  for _attempt in 1 2 3; do
+    while read -r family table_name; do
+      [[ -n "${family}" && -n "${table_name}" ]] || continue
+      run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
+      run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
+    done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
+    if ! run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { exit 0 } END { exit 1 }'; then
+      break
+    fi
+    sleep 1
+  done
   if run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { exit 0 } END { exit 1 }'; then
     echo "residual rustynet nftables state remained after cleanup" >&2
     exit 1
@@ -870,6 +877,7 @@ fi
 run_root rm -f \
   /etc/systemd/system/rustynetd.service \
   /etc/systemd/system/rustynetd-privileged-helper.service \
+  /etc/systemd/system/rustynetd-managed-dns.service \
   /etc/systemd/system/rustynetd-trust-refresh.service \
   /etc/systemd/system/rustynetd-trust-refresh.timer \
   /etc/systemd/system/rustynetd-assignment-refresh.service \

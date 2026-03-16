@@ -231,8 +231,11 @@ pub fn execute_ops_e2e_bootstrap_host(
     for service in [
         "rustynetd.service",
         "rustynetd-privileged-helper.service",
+        "rustynetd-managed-dns.service",
         "rustynetd-trust-refresh.service",
         "rustynetd-trust-refresh.timer",
+        "rustynetd-assignment-refresh.service",
+        "rustynetd-assignment-refresh.timer",
     ] {
         run_allow_failure("systemctl", &["disable", "--now", service], &[]);
     }
@@ -2468,23 +2471,26 @@ fn ensure_known_hosts_has_entry(known_hosts: &Path, host: &str, port: u16) -> Re
 }
 
 fn clear_rustynet_nftables_state() -> Result<(), String> {
-    let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
-    for line in table_listing.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
-            run_allow_failure("nft", &["flush", "table", tokens[1], tokens[2]], &[]);
-            run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
+    for _attempt in 0..3 {
+        let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
+        for line in table_listing.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
+                run_allow_failure("nft", &["flush", "table", tokens[1], tokens[2]], &[]);
+                run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
+            }
         }
+        let residual = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
+        if !residual.lines().any(|line| {
+            line.split_whitespace()
+                .nth(2)
+                .is_some_and(|name| name.starts_with("rustynet"))
+        }) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    let residual = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
-    if residual.lines().any(|line| {
-        line.split_whitespace()
-            .nth(2)
-            .is_some_and(|name| name.starts_with("rustynet"))
-    }) {
-        return Err("residual rustynet nftables state remained after cleanup".to_string());
-    }
-    Ok(())
+    Err("residual rustynet nftables state remained after cleanup".to_string())
 }
 
 fn qualify_target(raw: &str, ssh_user: &str) -> Target {
