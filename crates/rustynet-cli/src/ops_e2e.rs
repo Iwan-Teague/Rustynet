@@ -231,7 +231,6 @@ pub fn execute_ops_e2e_bootstrap_host(
     for service in [
         "rustynetd.service",
         "rustynetd-privileged-helper.service",
-        "rustynetd-managed-dns.service",
         "rustynetd-trust-refresh.service",
         "rustynetd-trust-refresh.timer",
         "rustynetd-assignment-refresh.service",
@@ -239,6 +238,32 @@ pub fn execute_ops_e2e_bootstrap_host(
     ] {
         run_allow_failure("systemctl", &["disable", "--now", service], &[]);
     }
+    run_allow_failure(
+        "systemctl",
+        &["disable", "rustynetd-managed-dns.service"],
+        &[],
+    );
+    if run_status(
+        "resolvectl",
+        &["status"],
+        &[],
+        "managed DNS status probe failed",
+    )
+    .is_ok()
+    {
+        run_allow_failure(
+            "timeout",
+            &["30", "systemctl", "stop", "rustynetd-managed-dns.service"],
+            &[],
+        );
+    } else {
+        run_allow_failure("systemctl", &["kill", "rustynetd-managed-dns.service"], &[]);
+    }
+    run_allow_failure(
+        "systemctl",
+        &["reset-failed", "rustynetd-managed-dns.service"],
+        &[],
+    );
     run_allow_failure("pkill", &["-f", "rustynetd daemon"], &[]);
     run_allow_failure("pkill", &["-f", "rustynetd privileged-helper"], &[]);
     run_allow_failure("ip", &["link", "delete", "rustynet0"], &[]);

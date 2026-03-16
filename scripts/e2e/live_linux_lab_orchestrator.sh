@@ -846,11 +846,17 @@ run_root() {
 run_root systemctl disable --now \
   rustynetd.service \
   rustynetd-privileged-helper.service \
-  rustynetd-managed-dns.service \
   rustynetd-trust-refresh.service \
   rustynetd-trust-refresh.timer \
   rustynetd-assignment-refresh.service \
   rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
+run_root systemctl disable rustynetd-managed-dns.service >/dev/null 2>&1 || true
+if command -v resolvectl >/dev/null 2>&1 && run_root resolvectl status >/dev/null 2>&1; then
+  run_root timeout 30 systemctl stop rustynetd-managed-dns.service >/dev/null 2>&1 || true
+else
+  run_root systemctl kill rustynetd-managed-dns.service >/dev/null 2>&1 || true
+fi
+run_root systemctl reset-failed rustynetd-managed-dns.service >/dev/null 2>&1 || true
 run_root pkill -f 'rustynetd daemon' >/dev/null 2>&1 || true
 run_root pkill -f 'rustynetd privileged-helper' >/dev/null 2>&1 || true
 run_root ip link set rustynet0 down >/dev/null 2>&1 || true
