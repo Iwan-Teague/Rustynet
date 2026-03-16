@@ -121,3 +121,28 @@ Security effect:
 - no fallback or disablement of traversal authority was introduced
 - the E2E path now satisfies the same signed-state contract the daemon already requires
 - the daemon continues to fail closed if the traversal state is missing or invalid
+
+## Additional blocker discovered after traversal provisioning
+The next rerun progressed into traversal-authoritative reconcile and exposed a privileged-helper allowlist mismatch.
+
+Observed daemon error on both hosts:
+```text
+traversal authority failed to read handshake evidence for peer <peer>: backend error: Internal: privileged helper wg invocation failed: unsupported wg argument schema
+```
+
+Why it broke:
+- the traversal runtime now reads WireGuard handshake freshness through:
+  - `wg show <interface> latest-handshakes`
+- the backend already emits that command
+- the privileged helper allowlist still rejected that `wg` argument schema
+
+Repo-side fix:
+- File: [crates/rustynetd/src/privileged_helper.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs)
+- Changes:
+  - allowed `wg show <interface> latest-handshakes`
+  - added a focused regression test for that accepted schema
+
+Security effect:
+- this does not broaden `wg` access generally
+- it adds one specific read-only schema already required by the backend
+- all other unsupported `wg` invocations remain rejected

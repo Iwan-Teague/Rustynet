@@ -7,8 +7,9 @@ use std::net::IpAddr;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use nix::sys::socket::getsockopt;
 #[cfg(any(
@@ -344,7 +345,7 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
         }
 
         let response = match read_request(&mut stream) {
-            Ok(request) => handle_request(request),
+            Ok(request) => handle_request_with_timeout(request, config.io_timeout),
             Err(err) => HelperResponse::error(err),
         };
         let _ = write_response(&mut stream, response);
@@ -419,7 +420,15 @@ fn write_response(stream: &mut UnixStream, response: HelperResponse) -> Result<(
         .map_err(|err| format!("flush response failed: {err}"))
 }
 
+#[cfg(test)]
 fn handle_request(request: HelperRequest) -> HelperResponse {
+    handle_request_with_timeout(
+        request,
+        Duration::from_millis(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS),
+    )
+}
+
+fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> HelperResponse {
     let program = match PrivilegedCommandProgram::parse(&request.program) {
         Some(program) => program,
         None => {
@@ -441,17 +450,51 @@ fn handle_request(request: HelperRequest) -> HelperResponse {
         }
     };
 
-    match Command::new(binary).args(&request.args).output() {
+    match run_privileged_subprocess(binary, &request.args, timeout) {
         Ok(output) => {
-            let status = output.status.code().unwrap_or(-1);
+            let status = exit_status_code(output.status);
             let stdout = truncate_lossy(&output.stdout, MAX_OUTPUT_BYTES);
             let stderr = truncate_lossy(&output.stderr, MAX_OUTPUT_BYTES);
             HelperResponse::success(status, stdout, stderr)
         }
-        Err(err) => {
-            HelperResponse::error(format!("{program} command spawn failed ({binary}): {err}",))
+        Err(err) => HelperResponse::error(format!(
+            "{program} command execution failed ({binary}): {err}",
+        )),
+    }
+}
+
+fn run_privileged_subprocess(
+    binary: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait().map_err(|err| err.to_string())? {
+            Some(_status) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("wait for privileged subprocess failed: {err}"));
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {} ms", timeout.as_millis()));
+            }
+            None => sleep(Duration::from_millis(10)),
         }
     }
+}
+
+fn exit_status_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(-1)
 }
 
 fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
@@ -931,6 +974,7 @@ fn validate_nft_args(args: &[&str]) -> Result<(), String> {
 fn validate_wg_args(args: &[&str]) -> Result<(), String> {
     match args {
         ["--version"] => Ok(()),
+        ["show", interface, "latest-handshakes"] if is_interface_name(interface) => Ok(()),
         [
             "set",
             interface,
@@ -1119,12 +1163,13 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
         HelperRequest, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
-        handle_request, is_nft_token, is_safe_token, read_request,
+        handle_request, is_nft_token, is_safe_token, read_request, run_privileged_subprocess,
         validate_privileged_helper_socket_security, validate_request,
     };
 
@@ -1190,6 +1235,15 @@ mod tests {
         )
         .expect_err("unknown wg schema should be rejected");
         assert!(err.contains("unsupported wg argument schema"));
+    }
+
+    #[test]
+    fn validate_request_accepts_latest_handshakes_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Wg,
+            &["show", "rustynet0", "latest-handshakes"],
+        )
+        .expect("wg latest-handshakes schema should be accepted");
     }
 
     #[test]
@@ -1399,6 +1453,20 @@ mod tests {
             assert!(!response.ok);
             assert!(response.error.is_some());
         }
+    }
+
+    #[test]
+    fn privileged_subprocess_times_out_and_is_killed() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let err = run_privileged_subprocess(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 1".to_string()],
+            Duration::from_millis(50),
+        )
+        .expect_err("sleeping subprocess should time out");
+        assert!(err.contains("timed out after 50 ms"));
     }
 
     #[test]
