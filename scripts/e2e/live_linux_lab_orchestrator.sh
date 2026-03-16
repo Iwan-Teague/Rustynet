@@ -918,6 +918,30 @@ run_root() {
   sudo -S -p '' "$@" < /tmp/rn_sudo.pass
 }
 
+clear_residual_rustynet_state() {
+  run_root ip link set rustynet0 down >/dev/null 2>&1 || true
+  run_root ip link delete rustynet0 >/dev/null 2>&1 || true
+  run_root ip route flush table 51820 >/dev/null 2>&1 || true
+  run_root ip -6 route flush table 51820 >/dev/null 2>&1 || true
+  if command -v nft >/dev/null 2>&1; then
+    for _attempt in $(seq 1 3); do
+      while read -r family table_name; do
+        [[ -n "${family}" && -n "${table_name}" ]] || continue
+        run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
+        run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
+      done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
+      if ! run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+        break
+      fi
+      sleep 1
+    done
+    if run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+      echo "residual rustynet nftables state remained before bootstrap" >&2
+      exit 1
+    fi
+  fi
+}
+
 wait_for_package_manager_idle() {
   local pattern="$1"
   local label="$2"
@@ -986,6 +1010,7 @@ repair_managed_dns_prereqs() {
   fi
 }
 
+clear_residual_rustynet_state
 install_prereqs
 repair_managed_dns_prereqs
 if ! command -v rustup >/dev/null 2>&1; then
