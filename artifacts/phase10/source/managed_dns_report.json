@@ -1,0 +1,30 @@
+{
+  "phase": "phase10",
+  "mode": "live_linux_managed_dns",
+  "evidence_mode": "measured",
+  "captured_at": "2026-03-18T19:34:28Z",
+  "captured_at_unix": 1773862468,
+  "git_commit": "7a6406309979c1d2e9fe79d4a4aff014396be32f",
+  "status": "pass",
+  "zone_name": "rustynet",
+  "signer_host": "debian@192.168.64.22",
+  "client_host": "debian@192.168.64.24",
+  "managed_fqdn": "exit.rustynet",
+  "managed_alias_fqdn": "gateway.rustynet",
+  "expected_ip": "100.109.33.213",
+  "checks": {
+    "zone_issue_verify_passes": "pass",
+    "dns_inspect_valid": "pass",
+    "managed_dns_service_active": "pass",
+    "resolvectl_split_dns_configured": "pass",
+    "loopback_resolver_answers_managed_name": "pass",
+    "systemd_resolved_answers_managed_name": "pass",
+    "alias_resolves_to_expected_ip": "pass",
+    "non_managed_query_refused": "pass",
+    "stale_bundle_fail_closed": "pass",
+    "valid_bundle_restored": "pass"
+  },
+  "source_artifacts": [
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260318T191901Z/live_linux_managed_dns.log"
+  ]
+}
