@@ -10,8 +10,8 @@ source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
 LIVE_LAB_LOG_PREFIX="role-switch-live"
 export LIVE_LAB_LOG_PREFIX
 
-DEBIAN_HOST="debian@192.168.18.50"
-DEBIAN_NODE_ID="client-50"
+DEBIAN_HOST="debian@192.168.18.65"
+DEBIAN_NODE_ID="client-65"
 UBUNTU_HOST="ubuntu@192.168.18.52"
 UBUNTU_NODE_ID="client-52"
 FEDORA_HOST="fedora@192.168.18.51"

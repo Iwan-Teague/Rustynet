@@ -43,8 +43,9 @@ live_lab_init() {
   LIVE_LAB_KNOWN_HOSTS="$LIVE_LAB_WORK_DIR/known_hosts"
   LIVE_LAB_SSH_EXPECT="$LIVE_LAB_WORK_DIR/ssh_pass.expect"
   LIVE_LAB_SCP_EXPECT="$LIVE_LAB_WORK_DIR/scp_pass.expect"
+  LIVE_LAB_SUDO_ASKPASS_LOCAL="$LIVE_LAB_WORK_DIR/sudo_askpass.sh"
   LIVE_LAB_REMOTE_CLEANUP_TARGETS=()
-  export LIVE_LAB_WORK_DIR LIVE_LAB_KNOWN_HOSTS LIVE_LAB_SSH_EXPECT LIVE_LAB_SCP_EXPECT
+  export LIVE_LAB_WORK_DIR LIVE_LAB_KNOWN_HOSTS LIVE_LAB_SSH_EXPECT LIVE_LAB_SCP_EXPECT LIVE_LAB_SUDO_ASKPASS_LOCAL
 
   live_lab_seed_known_hosts_file "$LIVE_LAB_KNOWN_HOSTS"
 
@@ -145,12 +146,18 @@ while {1} {
 EXPECTSCP
 
   chmod 700 "$LIVE_LAB_SSH_EXPECT" "$LIVE_LAB_SCP_EXPECT"
+
+  cat > "$LIVE_LAB_SUDO_ASKPASS_LOCAL" <<'EXPECTASKPASS'
+#!/usr/bin/env sh
+cat /tmp/rn_sudo.pass
+EXPECTASKPASS
+  chmod 700 "$LIVE_LAB_SUDO_ASKPASS_LOCAL"
 }
 
 live_lab_cleanup() {
   local target
   for target in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
-    live_lab_run_root "$target" "root rustynet ops secure-remove --path /tmp/rn_sudo.pass >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    live_lab_run_root "$target" "root rustynet ops secure-remove --path /tmp/rn_sudo.pass >/dev/null 2>&1 || true; root rm -f /tmp/rn_sudo_askpass.sh >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
   done
   if [[ -n "${LIVE_LAB_WORK_DIR:-}" && -d "${LIVE_LAB_WORK_DIR}" ]]; then
     rm -rf "$LIVE_LAB_WORK_DIR"
@@ -294,27 +301,46 @@ live_lab_capture() {
 
 live_lab_rootify() {
   local body="$1"
-  printf 'root(){ sudo -S -p "" "$@" < /tmp/rn_sudo.pass; }; set -euo pipefail; %s' "$body"
+  printf 'root(){ SUDO_ASKPASS=/tmp/rn_sudo_askpass.sh sudo -A -p "" "$@"; }; set -euo pipefail; %s' "$body"
+}
+
+live_lab_verify_sudo() {
+  local target="$1"
+  local hostname_precheck_cmd
+  local verify_cmd
+  hostname_precheck_cmd="current_hostname=\$(hostname); if ! grep -Eq \"(^|[[:space:]])\${current_hostname}([[:space:]]|$)\" /etc/hosts; then printf 'local hostname %s is missing from /etc/hosts\\n' \"\$current_hostname\"; exit 1; fi"
+  live_lab_ssh "$target" "$hostname_precheck_cmd" || return 1
+  verify_cmd="tmp_sudo_verify_output=\$(mktemp /tmp/rn-sudo-verify.XXXXXX) && if timeout 15 env SUDO_ASKPASS=/tmp/rn_sudo_askpass.sh sudo -A -p '' -k true >\"\$tmp_sudo_verify_output\" 2>&1; then rm -f \"\$tmp_sudo_verify_output\"; else cat \"\$tmp_sudo_verify_output\"; rm -f \"\$tmp_sudo_verify_output\"; printf 'sudo validation failed for user %s\\n' \"\$(id -un)\"; printf 'groups: %s\\n' \"\$(id -Gn)\"; exit 1; fi"
+  live_lab_ssh "$target" "$verify_cmd"
 }
 
 live_lab_push_sudo_password() {
   local target="$1"
   local existing
+  local cleanup_cmd
+  cleanup_cmd="rm -f /tmp/rn_sudo.pass /tmp/rn_sudo_askpass.sh >/dev/null 2>&1 || true; sudo -S -p 'password:' -k rm -f /tmp/rn_sudo.pass /tmp/rn_sudo_askpass.sh || true"
   for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
     if [[ "$existing" == "$target" ]]; then
+      live_lab_ssh "$target" "$cleanup_cmd" || return 1
       live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
-      live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass" || return 1
+      live_lab_scp_to "$LIVE_LAB_SUDO_ASKPASS_LOCAL" "$target" "/tmp/rn_sudo_askpass.sh" || return 1
+      live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass && chmod 700 /tmp/rn_sudo_askpass.sh" || return 1
+      live_lab_verify_sudo "$target" || return 1
       return 0
     fi
   done
   LIVE_LAB_REMOTE_CLEANUP_TARGETS+=("$target")
+  live_lab_ssh "$target" "$cleanup_cmd" || return 1
   live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
-  live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass" || return 1
+  live_lab_scp_to "$LIVE_LAB_SUDO_ASKPASS_LOCAL" "$target" "/tmp/rn_sudo_askpass.sh" || return 1
+  live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass && chmod 700 /tmp/rn_sudo_askpass.sh" || return 1
+  live_lab_verify_sudo "$target" || return 1
 }
 
 live_lab_run_root() {
   local target="$1"
   local body="$2"
+  live_lab_push_sudo_password "$target" || return 1
   live_lab_ssh "$target" "$(live_lab_rootify "$body")"
 }
 
@@ -338,6 +364,7 @@ live_lab_retry_root() {
 live_lab_capture_root() {
   local target="$1"
   local body="$2"
+  live_lab_push_sudo_password "$target" || return 1
   live_lab_capture "$target" "$(live_lab_rootify "$body")"
 }
 

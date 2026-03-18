@@ -33,6 +33,8 @@ SOAK_HARD_FAIL=0
 RUN_LOCAL_GATES=1
 RUN_SOAK=1
 DRY_RUN=0
+CROSS_NETWORK_MODE="auto"
+CROSS_NETWORK_SKIP_REASON=""
 OVERALL_STATUS="pass"
 FAILURE_COUNT=0
 SOFT_FAILURE_COUNT=0
@@ -52,6 +54,7 @@ EXTRA_TARGET_DECLARED=0
 PROFILE_PATH=""
 DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
+TRAVERSAL_TTL_SECS=120
 
 sanitize_text() {
   printf '%s' "$1" | tr '\t\r\n' '   '
@@ -102,8 +105,11 @@ options:
   --ssh-allow-cidrs <cidrs>      SSH management CIDRs (default: ${SSH_ALLOW_CIDRS})
   --repo-ref <ref>               Explicit git ref to archive (implies source-mode=ref)
   --report-dir <path>            Override report output directory
+  --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-120, default: ${TRAVERSAL_TTL_SECS})
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
+  --skip-cross-network           Skip cross-network validator stages
+  --force-cross-network          Force cross-network validator stages even on same-prefix underlay targets
   --reboot-hard-fail             Treat reboot soak failures as hard failures
   --dry-run                      Validate config and planned stages without touching hosts
   -h, --help                     Show this help
@@ -188,6 +194,15 @@ trim_ascii() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value <= 0 )); then
+    printf '%s must be a positive integer (got: %s)\n' "$name" "$value" >&2
+    return 1
+  fi
 }
 
 is_valid_ipv4() {
@@ -276,6 +291,7 @@ load_profile_file() {
       SSH_KNOWN_HOSTS_FILE) [[ -z "$SSH_KNOWN_HOSTS_FILE" ]] && SSH_KNOWN_HOSTS_FILE="$value" ;;
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
       SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
+      TRAVERSAL_TTL_SECS) [[ "$TRAVERSAL_TTL_SECS" == "120" ]] && TRAVERSAL_TTL_SECS="$value" ;;
       SOURCE_MODE)
         if [[ "$SOURCE_MODE" == "working-tree" && "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
           SOURCE_MODE="$value"
@@ -313,7 +329,9 @@ load_profile_file() {
         return 1
         ;;
     esac
+    :
   done < "$profile_path"
+  return 0
 }
 
 validate_source_mode() {
@@ -567,6 +585,55 @@ cross_network_probe_label() {
     return 0
   fi
   return 1
+}
+
+cross_network_stages_applicable() {
+  local client_target exit_target client_addr exit_addr same_prefix_rc
+  CROSS_NETWORK_SKIP_REASON=""
+  if [[ "$CROSS_NETWORK_MODE" == "skip" ]]; then
+    CROSS_NETWORK_SKIP_REASON="skipped by --skip-cross-network"
+    return 1
+  fi
+  if [[ "$CROSS_NETWORK_MODE" == "force" ]]; then
+    return 0
+  fi
+  client_target="$(node_target_for_label client)"
+  exit_target="$(node_target_for_label exit)"
+  if [[ -z "$client_target" || -z "$exit_target" ]]; then
+    CROSS_NETWORK_SKIP_REASON="requires client and exit targets"
+    return 1
+  fi
+  client_addr="$(live_lab_target_address "$client_target")"
+  exit_addr="$(live_lab_target_address "$exit_target")"
+  set +e
+  python3 - "$client_addr" "$exit_addr" <<'PY'
+import ipaddress
+import sys
+
+try:
+    client_ip = ipaddress.ip_address(sys.argv[1])
+    exit_ip = ipaddress.ip_address(sys.argv[2])
+except ValueError:
+    raise SystemExit(2)
+
+if client_ip.version != exit_ip.version:
+    raise SystemExit(1)
+
+prefix = 24 if client_ip.version == 4 else 64
+client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
+exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
+raise SystemExit(0 if client_net == exit_net else 1)
+PY
+  same_prefix_rc=$?
+  set -e
+  if [[ "$same_prefix_rc" -eq 0 ]]; then
+    CROSS_NETWORK_SKIP_REASON="requires distinct client/exit underlay prefixes (client=${client_addr}, exit=${exit_addr}); use --force-cross-network to override"
+    return 1
+  fi
+  if [[ "$same_prefix_rc" -eq 2 ]]; then
+    return 0
+  fi
+  return 0
 }
 
 normalize_target() {
@@ -843,46 +910,62 @@ run_root() {
   sudo -S -p '' "$@" < /tmp/rn_sudo.pass
 }
 
+run_root_timed() {
+  local timeout_secs="$1"
+  shift
+  timeout "$timeout_secs" sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
 run_root pkill -f '/tmp/rn_bootstrap.sh' >/dev/null 2>&1 || true
 run_root pkill -f '/tmp/rn_bootstrap.env' >/dev/null 2>&1 || true
+run_root pkill -f 'rn-sudo-verify' >/dev/null 2>&1 || true
+run_root pkill -f 'sudo -A -p .* -k true' >/dev/null 2>&1 || true
+run_root pkill -f 'sudo -S -p .* -k true' >/dev/null 2>&1 || true
 run_root pkill -f 'apt-get update' >/dev/null 2>&1 || true
 run_root pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
 run_root pkill -f 'dnf install -y' >/dev/null 2>&1 || true
 run_root pkill -f 'cargo build --release -p rustynetd -p rustynet-cli' >/dev/null 2>&1 || true
 
-run_root systemctl disable --now \
+run_root_timed 30 systemctl stop \
   rustynetd.service \
   rustynetd-privileged-helper.service \
   rustynetd-trust-refresh.service \
   rustynetd-trust-refresh.timer \
   rustynetd-assignment-refresh.service \
   rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
-run_root systemctl disable rustynetd-managed-dns.service >/dev/null 2>&1 || true
-if command -v resolvectl >/dev/null 2>&1 && run_root resolvectl status >/dev/null 2>&1; then
-  run_root timeout 30 systemctl stop rustynetd-managed-dns.service >/dev/null 2>&1 || true
+run_root_timed 30 systemctl disable \
+  rustynetd.service \
+  rustynetd-privileged-helper.service \
+  rustynetd-trust-refresh.service \
+  rustynetd-trust-refresh.timer \
+  rustynetd-assignment-refresh.service \
+  rustynetd-assignment-refresh.timer >/dev/null 2>&1 || true
+run_root_timed 30 systemctl disable rustynetd-managed-dns.service >/dev/null 2>&1 || true
+if command -v resolvectl >/dev/null 2>&1 && run_root_timed 15 resolvectl status >/dev/null 2>&1; then
+  run_root_timed 30 systemctl stop rustynetd-managed-dns.service >/dev/null 2>&1 || true
 else
-  run_root systemctl kill rustynetd-managed-dns.service >/dev/null 2>&1 || true
+  run_root_timed 30 systemctl kill rustynetd-managed-dns.service >/dev/null 2>&1 || true
 fi
-run_root systemctl reset-failed rustynetd-managed-dns.service >/dev/null 2>&1 || true
+run_root_timed 30 systemctl reset-failed rustynetd-managed-dns.service >/dev/null 2>&1 || true
 run_root pkill -f 'rustynetd daemon' >/dev/null 2>&1 || true
 run_root pkill -f 'rustynetd privileged-helper' >/dev/null 2>&1 || true
-run_root ip link set rustynet0 down >/dev/null 2>&1 || true
-run_root ip link delete rustynet0 >/dev/null 2>&1 || true
-run_root ip route flush table 51820 >/dev/null 2>&1 || true
-run_root ip -6 route flush table 51820 >/dev/null 2>&1 || true
+run_root_timed 30 ip link set rustynet0 down >/dev/null 2>&1 || true
+run_root_timed 30 ip link delete rustynet0 >/dev/null 2>&1 || true
+run_root_timed 30 ip route flush table 51820 >/dev/null 2>&1 || true
+run_root_timed 30 ip -6 route flush table 51820 >/dev/null 2>&1 || true
 if command -v nft >/dev/null 2>&1; then
   for _attempt in 1 2 3; do
     while read -r family table_name; do
       [[ -n "${family}" && -n "${table_name}" ]] || continue
-      run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
-      run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
-    done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
-    if ! run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+      run_root_timed 30 nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
+      run_root_timed 30 nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
+    done < <(run_root_timed 30 nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
+    if ! run_root_timed 30 nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
       break
     fi
     sleep 1
   done
-  if run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+  if run_root_timed 30 nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
     echo "residual rustynet nftables state remained after cleanup" >&2
     exit 1
   fi
@@ -895,7 +978,7 @@ run_root rm -f \
   /etc/systemd/system/rustynetd-trust-refresh.timer \
   /etc/systemd/system/rustynetd-assignment-refresh.service \
   /etc/systemd/system/rustynetd-assignment-refresh.timer
-run_root systemctl daemon-reload >/dev/null 2>&1 || true
+run_root_timed 30 systemctl daemon-reload >/dev/null 2>&1 || true
 run_root rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet
 run_root rm -f /usr/local/bin/rustynet /usr/local/bin/rustynetd
 rm -f /tmp/rn_sudo.pass /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
@@ -918,24 +1001,36 @@ run_root() {
   sudo -S -p '' "$@" < /tmp/rn_sudo.pass
 }
 
+run_root_timed() {
+  local timeout_secs="$1"
+  shift
+  timeout "$timeout_secs" sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
+run_local_timed() {
+  local timeout_secs="$1"
+  shift
+  timeout "$timeout_secs" "$@"
+}
+
 clear_residual_rustynet_state() {
-  run_root ip link set rustynet0 down >/dev/null 2>&1 || true
-  run_root ip link delete rustynet0 >/dev/null 2>&1 || true
-  run_root ip route flush table 51820 >/dev/null 2>&1 || true
-  run_root ip -6 route flush table 51820 >/dev/null 2>&1 || true
+  run_root_timed 30 ip link set rustynet0 down >/dev/null 2>&1 || true
+  run_root_timed 30 ip link delete rustynet0 >/dev/null 2>&1 || true
+  run_root_timed 30 ip route flush table 51820 >/dev/null 2>&1 || true
+  run_root_timed 30 ip -6 route flush table 51820 >/dev/null 2>&1 || true
   if command -v nft >/dev/null 2>&1; then
     for _attempt in $(seq 1 3); do
       while read -r family table_name; do
         [[ -n "${family}" && -n "${table_name}" ]] || continue
-        run_root nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
-        run_root nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
-      done < <(run_root nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
-      if ! run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+        run_root_timed 30 nft flush table "${family}" "${table_name}" >/dev/null 2>&1 || true
+        run_root_timed 30 nft delete table "${family}" "${table_name}" >/dev/null 2>&1 || true
+      done < <(run_root_timed 30 nft list tables 2>/dev/null | awk '/^table / && $3 ~ /^rustynet/ { print $2 " " $3 }' | tr -d '\r')
+      if ! run_root_timed 30 nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
         break
       fi
       sleep 1
     done
-    if run_root nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
+    if run_root_timed 30 nft list tables 2>/dev/null | grep -qE '^table [^[:space:]]+ rustynet'; then
       echo "residual rustynet nftables state remained before bootstrap" >&2
       exit 1
     fi
@@ -957,6 +1052,45 @@ wait_for_package_manager_idle() {
   exit 1
 }
 
+build_bootstrap_prereqs_present() {
+  local PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+  local missing=0
+  local cmd
+  for cmd in curl git make pkg-config clang nft wg rustup; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      echo "[bootstrap] missing prerequisite command: ${cmd}" >&2
+      missing=1
+    fi
+  done
+  if ! command -v gcc >/dev/null 2>&1 && ! command -v cc >/dev/null 2>&1; then
+    echo "[bootstrap] missing C compiler command (gcc/cc)" >&2
+    missing=1
+  fi
+  if ! command -v g++ >/dev/null 2>&1 && ! command -v c++ >/dev/null 2>&1; then
+    echo "[bootstrap] missing C++ compiler command (g++/c++)" >&2
+    missing=1
+  fi
+  if ! command -v llvm-config >/dev/null 2>&1 && ! command -v llvm-config-19 >/dev/null 2>&1; then
+    echo "[bootstrap] missing llvm-config command" >&2
+    missing=1
+  fi
+  if command -v pkg-config >/dev/null 2>&1; then
+    if ! pkg-config --exists openssl >/dev/null 2>&1; then
+      echo "[bootstrap] missing pkg-config openssl development metadata" >&2
+      missing=1
+    fi
+    if ! pkg-config --exists sqlite3 >/dev/null 2>&1; then
+      echo "[bootstrap] missing pkg-config sqlite3 development metadata" >&2
+      missing=1
+    fi
+  fi
+  if [[ ! -r /etc/ssl/certs/ca-certificates.crt ]]; then
+    echo "[bootstrap] missing readable CA certificate bundle at /etc/ssl/certs/ca-certificates.crt" >&2
+    missing=1
+  fi
+  [[ "${missing}" -eq 0 ]]
+}
+
 install_prereqs() {
   local os_id=""
   local os_like=""
@@ -966,21 +1100,98 @@ install_prereqs() {
     os_id="${ID:-}"
     os_like="${ID_LIKE:-}"
   fi
+  if build_bootstrap_prereqs_present; then
+    echo "[bootstrap] prerequisite toolchain already present; skipping package manager mutation" >&2
+    return 0
+  fi
   if [[ "${os_id}" == "fedora" || "${os_like}" == *"fedora"* || "${os_like}" == *"rhel"* ]]; then
     wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
-    run_root dnf install -y \
+    run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
       sqlite-devel clang llvm nftables wireguard-tools rustup
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
-    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
-    run_root env DEBIAN_FRONTEND=noninteractive apt-get update
-    run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    run_apt_update_hardened
+    run_apt_install_hardened \
       ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev \
       clang llvm nftables wireguard-tools openssl systemd-resolved libnss-resolve rustup
   else
     echo "unsupported package manager; expected apt-get or dnf" >&2
     exit 1
   fi
+  if ! build_bootstrap_prereqs_present; then
+    echo "[bootstrap] prerequisite verification failed after package installation" >&2
+    exit 1
+  fi
+}
+
+run_apt_update_hardened() {
+  local attempt
+  local apt_log
+  local -a apt_network_opts
+  apt_network_opts=(
+    -o Acquire::Retries=3
+    -o Acquire::http::Timeout=20
+    -o Acquire::https::Timeout=20
+  )
+  if [[ -z "$(ip -6 route show default 2>/dev/null | head -n 1)" ]]; then
+    apt_network_opts+=(-o Acquire::ForceIPv4=true)
+  fi
+  for attempt in $(seq 1 3); do
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
+    apt_log="$(mktemp /tmp/rn-apt-update.XXXXXX.log)"
+    if run_root_timed 240 env DEBIAN_FRONTEND=noninteractive apt-get \
+      "${apt_network_opts[@]}" \
+      update 2>&1 | tee "${apt_log}"; then
+      if ! grep -Eiq '(^W: Failed to fetch|Temporary failure resolving|Some index files failed to download)' "${apt_log}"; then
+        rm -f "${apt_log}"
+        return 0
+      fi
+      echo "[bootstrap] apt-get update reported fetch warnings; treating as failure" >&2
+    fi
+    rm -f "${apt_log}"
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] apt-get update attempt ${attempt} failed; retrying after DNS repair" >&2
+      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+      repair_bootstrap_dns_state
+      sleep 2
+    fi
+  done
+  echo "[bootstrap] apt-get update failed after retries" >&2
+  emit_bootstrap_network_diagnostics "deb.debian.org"
+  return 1
+}
+
+run_apt_install_hardened() {
+  local attempt
+  local -a apt_network_opts
+  apt_network_opts=(
+    -o Acquire::Retries=3
+    -o Acquire::http::Timeout=20
+    -o Acquire::https::Timeout=20
+  )
+  if [[ -z "$(ip -6 route show default 2>/dev/null | head -n 1)" ]]; then
+    apt_network_opts+=(-o Acquire::ForceIPv4=true)
+  fi
+  if [[ "$#" -eq 0 ]]; then
+    echo "run_apt_install_hardened requires package names" >&2
+    return 2
+  fi
+  for attempt in $(seq 1 3); do
+    if run_root_timed 2400 env DEBIAN_FRONTEND=noninteractive apt-get \
+      "${apt_network_opts[@]}" \
+      install -y --no-install-recommends "$@"; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
+      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+      repair_bootstrap_dns_state
+      sleep 2
+    fi
+  done
+  echo "[bootstrap] apt-get install failed after retries" >&2
+  emit_bootstrap_network_diagnostics "deb.debian.org"
+  return 1
 }
 
 repair_managed_dns_prereqs() {
@@ -1010,7 +1221,111 @@ repair_managed_dns_prereqs() {
   fi
 }
 
+repair_local_hostname_resolution() {
+  local current_hostname=""
+  current_hostname="$(hostname)"
+  [[ -n "${current_hostname}" ]] || return 0
+  if grep -Eq "(^|[[:space:]])${current_hostname}([[:space:]]|$)" /etc/hosts; then
+    return 0
+  fi
+  run_root sh -c 'printf "\n127.0.1.1\t%s\n" "$1" >> /etc/hosts' sh "${current_hostname}"
+}
+
+repair_rustup_toolchain_state() {
+  local channel="$1"
+  rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+  rm -rf "$HOME/.rustup/tmp"
+  mkdir -p "$HOME/.rustup/downloads" "$HOME/.rustup/toolchains"
+  find "$HOME/.rustup/downloads" -maxdepth 1 -type f -delete 2>/dev/null || true
+  rm -rf "$HOME/.rustup/toolchains/${channel}" "$HOME/.rustup/toolchains/${channel}.tmp"*
+}
+
+repair_bootstrap_dns_state() {
+  local default_iface=""
+  local default_gateway=""
+  default_iface="$(ip -4 route show default 2>/dev/null | awk '/default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+  default_gateway="$(ip -4 route show default 2>/dev/null | awk '/default/ { print $3; exit }')"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    run_root_timed 30 systemctl reload dbus >/dev/null 2>&1 || true
+    run_root_timed 30 systemctl enable --now systemd-resolved.service >/dev/null 2>&1 || true
+    run_root_timed 30 systemctl restart systemd-resolved.service >/dev/null 2>&1 || true
+  fi
+  if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+    run_root_timed 30 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf >/dev/null 2>&1 || true
+  fi
+  if command -v resolvectl >/dev/null 2>&1; then
+    if [[ -n "${default_iface}" ]]; then
+      run_root_timed 30 resolvectl revert "${default_iface}" >/dev/null 2>&1 || true
+      if [[ -n "${default_gateway}" ]]; then
+        run_root_timed 30 resolvectl dns "${default_iface}" "${default_gateway}" >/dev/null 2>&1 || true
+      fi
+      run_root_timed 30 resolvectl domain "${default_iface}" "~." >/dev/null 2>&1 || true
+      run_root_timed 30 resolvectl default-route "${default_iface}" yes >/dev/null 2>&1 || true
+    fi
+    run_root_timed 30 resolvectl flush-caches >/dev/null 2>&1 || true
+  elif [[ -n "${default_gateway}" ]]; then
+    run_root sh -c 'printf "nameserver %s\noptions timeout:2 attempts:2\n" "$1" > /etc/resolv.conf' sh "${default_gateway}"
+  fi
+}
+
+emit_bootstrap_network_diagnostics() {
+  local host="$1"
+  echo "[bootstrap] network diagnostics for host=${host}" >&2
+  echo "--- /etc/resolv.conf ---" >&2
+  cat /etc/resolv.conf >&2 || true
+  echo "--- ip -4 route ---" >&2
+  ip -4 route >&2 || true
+  echo "--- ip -4 addr ---" >&2
+  ip -4 addr >&2 || true
+  if command -v resolvectl >/dev/null 2>&1; then
+    echo "--- resolvectl status ---" >&2
+    run_root_timed 30 resolvectl status >&2 || true
+    echo "--- resolvectl query ${host} ---" >&2
+    run_root_timed 30 resolvectl query "${host}" >&2 || true
+  fi
+  echo "--- getent ahosts ${host} ---" >&2
+  getent ahosts "${host}" >&2 || true
+}
+
+wait_for_bootstrap_rustup_endpoint() {
+  local channel="$1"
+  local endpoint="https://static.rust-lang.org/dist/channel-rust-${channel}.toml.sha256"
+  local attempt
+  for attempt in $(seq 1 8); do
+    if run_local_timed 60 curl --fail --silent --show-error --head "${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    repair_bootstrap_dns_state
+    sleep 2
+  done
+  echo "[bootstrap] failed to reach Rust toolchain endpoint: ${endpoint}" >&2
+  emit_bootstrap_network_diagnostics "static.rust-lang.org"
+  return 1
+}
+
+install_rust_toolchain_hardened() {
+  local channel="$1"
+  local attempt
+  wait_for_bootstrap_rustup_endpoint "${channel}" || return 1
+  for attempt in $(seq 1 3); do
+    if run_local_timed 1800 rustup toolchain install "${channel}" --profile minimal --component rustfmt --component clippy; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] rustup install attempt ${attempt} failed; retrying after DNS repair" >&2
+      repair_bootstrap_dns_state
+      wait_for_bootstrap_rustup_endpoint "${channel}" || true
+      sleep 2
+    fi
+  done
+  echo "[bootstrap] rustup toolchain install failed after retries for channel ${channel}" >&2
+  emit_bootstrap_network_diagnostics "static.rust-lang.org"
+  return 1
+}
+
 clear_residual_rustynet_state
+repair_local_hostname_resolution
 install_prereqs
 repair_managed_dns_prereqs
 if ! command -v rustup >/dev/null 2>&1; then
@@ -1032,11 +1347,12 @@ fi
 export PATH="${HOME}/.cargo/bin:${PATH}"
 rustup set profile minimal
 if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo --version >/dev/null 2>&1; then
-  rustup toolchain install "${RUST_TOOLCHAIN_CHANNEL}" --profile minimal --component rustfmt --component clippy
+  repair_rustup_toolchain_state "${RUST_TOOLCHAIN_CHANNEL}"
+  install_rust_toolchain_hardened "${RUST_TOOLCHAIN_CHANNEL}"
 fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
-rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
+run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
@@ -1114,6 +1430,118 @@ for entry in "$@"; do
 done
 EOF_ASSIGN
   chmod 700 "$STATE_DIR/rn_issue_assignments.sh"
+
+  cat > "$STATE_DIR/rn_issue_traversal.sh" <<'EOF_TRAV'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: rn_issue_traversal.sh <env-file>" >&2
+  exit 2
+fi
+
+source "$1"
+
+run_root() {
+  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
+PASS_FILE="$(mktemp /tmp/rn-traversal-passphrase.XXXXXX)"
+cleanup() {
+  if [[ -f "$PASS_FILE" ]]; then
+    run_root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+run_root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
+run_root chmod 0600 "$PASS_FILE"
+
+ISSUE_DIR="/run/rustynet/traversal-issue"
+run_root rm -rf "$ISSUE_DIR"
+run_root install -d -m 0700 "$ISSUE_DIR"
+SNAPSHOT_GENERATED_AT="$(date +%s)"
+SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
+
+declare -a node_ids=()
+declare -A endpoint_by_node=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $NODES_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r node_id endpoint _rest <<< "$entry"
+  [[ -n "$node_id" && -n "$endpoint" ]] || continue
+  node_ids+=("$node_id")
+  endpoint_by_node["$node_id"]="$endpoint"
+done
+
+if [[ "${#node_ids[@]}" -lt 2 ]]; then
+  echo "traversal issue requires at least two nodes in NODES_SPEC" >&2
+  exit 1
+fi
+
+issue_pair_bundle() {
+  local source_node_id="$1"
+  local target_node_id="$2"
+  local target_endpoint="${endpoint_by_node[$target_node_id]}"
+  local relay_id="relay-${target_node_id}"
+  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
+  if [[ ! "$TRAVERSAL_TTL_SECS" =~ ^[0-9]+$ ]] || (( TRAVERSAL_TTL_SECS <= 0 || TRAVERSAL_TTL_SECS > 120 )); then
+    echo "TRAVERSAL_TTL_SECS must be a positive integer <= 120 (got: ${TRAVERSAL_TTL_SECS})" >&2
+    exit 2
+  fi
+  run_root rustynet traversal issue \
+    --source-node-id "$source_node_id" \
+    --target-node-id "$target_node_id" \
+    --nodes "$NODES_SPEC" \
+    --allow "$ALLOW_SPEC" \
+    --signing-secret /etc/rustynet/assignment.signing.secret \
+    --signing-secret-passphrase-file "$PASS_FILE" \
+    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
+    --generated-at "$SNAPSHOT_GENERATED_AT" \
+    --nonce "$SNAPSHOT_NONCE" \
+    --output "$ISSUE_DIR/$output_name" \
+    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
+    --ttl-secs "$TRAVERSAL_TTL_SECS"
+}
+
+declare -a allow_sources=()
+declare -a allow_targets=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $ALLOW_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r source_node_id target_node_id <<< "$entry"
+  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
+  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
+    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
+    exit 1
+  fi
+  issue_pair_bundle "$source_node_id" "$target_node_id"
+  allow_sources+=("$source_node_id")
+  allow_targets+=("$target_node_id")
+done
+
+for node_id in "${node_ids[@]}"; do
+  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
+  run_root rm -f "$aggregate_path"
+  run_root sh -c ': > "$1"' sh "$aggregate_path"
+  for idx in "${!allow_sources[@]}"; do
+    source_node_id="${allow_sources[$idx]}"
+    target_node_id="${allow_targets[$idx]}"
+    if [[ "$source_node_id" == "$node_id" ]]; then
+      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
+      run_root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
+      run_root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
+    fi
+  done
+done
+EOF_TRAV
+  chmod 700 "$STATE_DIR/rn_issue_traversal.sh"
 }
 
 prime_remote_access() {
@@ -1348,6 +1776,42 @@ distribute_assignment_worker() {
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC" "$exit_node_id"
   fi
   live_lab_install_assignment_refresh_env "$target" "$refresh_env"
+}
+
+stage_issue_and_distribute_traversal() {
+  local exit_target env_path verifier_local
+  build_onehop_specs
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
+  env_path="$STATE_DIR/issue_traversal.env"
+  : > "$env_path"
+  append_env_assignment "$env_path" "NODES_SPEC" "$NODES_SPEC"
+  append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
+  append_env_assignment "$env_path" "TRAVERSAL_TTL_SECS" "$TRAVERSAL_TTL_SECS"
+  live_lab_scp_to "$STATE_DIR/rn_issue_traversal.sh" "$exit_target" "/tmp/rn_issue_traversal.sh" || return 1
+  live_lab_scp_to "$env_path" "$exit_target" "/tmp/rn_issue_traversal.env" || return 1
+  live_lab_run_root "$exit_target" "root chmod 700 /tmp/rn_issue_traversal.sh && root bash /tmp/rn_issue_traversal.sh /tmp/rn_issue_traversal.env && root rm -f /tmp/rn_issue_traversal.sh /tmp/rn_issue_traversal.env" || return 1
+
+  verifier_local="$STATE_DIR/traversal.pub"
+  live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$verifier_local" || return 1
+  run_parallel_node_stage issue_and_distribute_traversal distribute_traversal_worker
+}
+
+distribute_traversal_worker() {
+  local _label="$1"
+  local target="$2"
+  local node_id="$3"
+  local bundle_local exit_target
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
+  bundle_local="$STATE_DIR/traversal-${node_id}.bundle"
+  printf '[traversal-distribute] %s %s\n' "$node_id" "$target"
+  live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" > "$bundle_local"
+  live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
+  live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
+  live_lab_run_root "$target" "root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
 }
 
 stage_enforce_baseline_runtime() {
@@ -2259,10 +2723,13 @@ parse_args() {
       --ssh-known-hosts-file) SSH_KNOWN_HOSTS_FILE="$2"; shift 2 ;;
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
+      --traversal-ttl-secs) TRAVERSAL_TTL_SECS="$2"; shift 2 ;;
       --repo-ref) REPO_REF="$2"; SOURCE_MODE="ref"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
       --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; FAILURE_DIGEST_JSON="$REPORT_DIR/failure_digest.json"; FAILURE_DIGEST_MD="$REPORT_DIR/failure_digest.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
       --skip-gates) RUN_LOCAL_GATES=0; shift ;;
       --skip-soak) RUN_SOAK=0; shift ;;
+      --skip-cross-network) CROSS_NETWORK_MODE="skip"; shift ;;
+      --force-cross-network) CROSS_NETWORK_MODE="force"; shift ;;
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -2424,6 +2891,11 @@ main() {
   refresh_failure_digest
   validate_topology_inputs
   validate_source_mode
+  validate_positive_integer "traversal TTL seconds" "$TRAVERSAL_TTL_SECS"
+  if (( TRAVERSAL_TTL_SECS > 120 )); then
+    printf 'traversal TTL seconds must be <= 120 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
+    exit 2
+  fi
 
   if [[ $(node_count) -lt 2 ]]; then
     printf 'at least exit and client targets are required\n' >&2
@@ -2444,6 +2916,7 @@ main() {
     record_stage_skip "membership_setup" "hard" "dry-run: not executed"
     record_stage_skip "distribute_membership_state" "hard" "dry-run: not executed"
     record_stage_skip "issue_and_distribute_assignments" "hard" "dry-run: not executed"
+    record_stage_skip "issue_and_distribute_traversal" "hard" "dry-run: not executed"
     record_stage_skip "enforce_baseline_runtime" "hard" "dry-run: not executed"
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
     if has_five_node_release_gate_topology; then
@@ -2474,21 +2947,30 @@ main() {
     if has_four_node_live_topology && [[ "$RUN_SOAK" -eq 1 ]]; then
       record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
-    record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: not executed"
-    if cross_network_relay_label >/dev/null 2>&1; then
-      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: not executed"
-      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: not executed"
+    if cross_network_stages_applicable; then
+      record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: not executed"
+      if cross_network_relay_label >/dev/null 2>&1; then
+        record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: not executed"
+        record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: not executed"
+      else
+        record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because entry or aux target is not configured"
+        record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because entry or aux target is not configured"
+      fi
+      if cross_network_probe_label >/dev/null 2>&1; then
+        record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: not executed"
+      else
+        record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because entry or aux target is not configured"
+      fi
+      record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: not executed"
+      record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: not executed"
     else
-      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because entry or aux target is not configured"
-      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because entry or aux target is not configured"
+      record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
     fi
-    if cross_network_probe_label >/dev/null 2>&1; then
-      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: not executed"
-    else
-      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because entry or aux target is not configured"
-    fi
-    record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: not executed"
-    record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: not executed"
     write_run_summary
     printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
@@ -2505,6 +2987,7 @@ main() {
   run_stage hard membership_setup 'apply signed membership updates on primary exit' stage_membership_setup
   run_stage hard distribute_membership_state 'export and install membership state to peers' stage_distribute_membership_state
   run_stage hard issue_and_distribute_assignments 'issue signed one-hop assignments and install refresh env files' stage_issue_and_distribute_assignments
+  run_stage hard issue_and_distribute_traversal 'issue and distribute signed traversal bundles for all managed peers' stage_issue_and_distribute_traversal
   run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime
   run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime
 
@@ -2560,50 +3043,59 @@ main() {
   fi
 
   local cross_network_stage_rc=0 stage_rc=0
-  set +e
-  run_stage hard cross_network_direct_remote_exit 'run cross-network direct remote-exit validation' stage_run_cross_network_direct_remote_exit
-  stage_rc=$?
-  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-    cross_network_stage_rc="$stage_rc"
-  fi
+  if cross_network_stages_applicable; then
+    set +e
+    run_stage hard cross_network_direct_remote_exit 'run cross-network direct remote-exit validation' stage_run_cross_network_direct_remote_exit
+    stage_rc=$?
+    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+      cross_network_stage_rc="$stage_rc"
+    fi
 
-  if cross_network_relay_label >/dev/null 2>&1; then
-    run_stage hard cross_network_relay_remote_exit 'run cross-network relay remote-exit validation' stage_run_cross_network_relay_remote_exit
+    if cross_network_relay_label >/dev/null 2>&1; then
+      run_stage hard cross_network_relay_remote_exit 'run cross-network relay remote-exit validation' stage_run_cross_network_relay_remote_exit
+      stage_rc=$?
+      if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+        cross_network_stage_rc="$stage_rc"
+      fi
+      run_stage hard cross_network_failback_roaming 'run cross-network failback and endpoint-roaming validation' stage_run_cross_network_failback_roaming
+      stage_rc=$?
+      if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+        cross_network_stage_rc="$stage_rc"
+      fi
+    else
+      record_stage_skip cross_network_relay_remote_exit hard 'requires entry or aux target'
+      record_stage_skip cross_network_failback_roaming hard 'requires entry or aux target'
+    fi
+
+    if cross_network_probe_label >/dev/null 2>&1; then
+      run_stage hard cross_network_traversal_adversarial 'run cross-network traversal adversarial validation' stage_run_cross_network_traversal_adversarial
+      stage_rc=$?
+      if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+        cross_network_stage_rc="$stage_rc"
+      fi
+    else
+      record_stage_skip cross_network_traversal_adversarial hard 'requires entry or aux target'
+    fi
+
+    run_stage hard cross_network_remote_exit_dns 'run cross-network remote-exit DNS validation' stage_run_cross_network_remote_exit_dns
     stage_rc=$?
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"
     fi
-    run_stage hard cross_network_failback_roaming 'run cross-network failback and endpoint-roaming validation' stage_run_cross_network_failback_roaming
+    run_stage hard cross_network_remote_exit_soak 'run future cross-network remote-exit soak placeholder (expected hard fail until implemented)' stage_run_cross_network_remote_exit_soak_placeholder
     stage_rc=$?
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"
     fi
+    set -e
   else
-    record_stage_skip cross_network_relay_remote_exit hard 'requires entry or aux target'
-    record_stage_skip cross_network_failback_roaming hard 'requires entry or aux target'
+    record_stage_skip cross_network_direct_remote_exit hard "$CROSS_NETWORK_SKIP_REASON"
+    record_stage_skip cross_network_relay_remote_exit hard "$CROSS_NETWORK_SKIP_REASON"
+    record_stage_skip cross_network_failback_roaming hard "$CROSS_NETWORK_SKIP_REASON"
+    record_stage_skip cross_network_traversal_adversarial hard "$CROSS_NETWORK_SKIP_REASON"
+    record_stage_skip cross_network_remote_exit_dns hard "$CROSS_NETWORK_SKIP_REASON"
+    record_stage_skip cross_network_remote_exit_soak hard "$CROSS_NETWORK_SKIP_REASON"
   fi
-
-  if cross_network_probe_label >/dev/null 2>&1; then
-    run_stage hard cross_network_traversal_adversarial 'run cross-network traversal adversarial validation' stage_run_cross_network_traversal_adversarial
-    stage_rc=$?
-    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-      cross_network_stage_rc="$stage_rc"
-    fi
-  else
-    record_stage_skip cross_network_traversal_adversarial hard 'requires entry or aux target'
-  fi
-
-  run_stage hard cross_network_remote_exit_dns 'run cross-network remote-exit DNS validation' stage_run_cross_network_remote_exit_dns
-  stage_rc=$?
-  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-    cross_network_stage_rc="$stage_rc"
-  fi
-  run_stage hard cross_network_remote_exit_soak 'run future cross-network remote-exit soak placeholder (expected hard fail until implemented)' stage_run_cross_network_remote_exit_soak_placeholder
-  stage_rc=$?
-  if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-    cross_network_stage_rc="$stage_rc"
-  fi
-  set -e
 
   if [[ "$cross_network_stage_rc" -ne 0 ]]; then
     write_run_summary

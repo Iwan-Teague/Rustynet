@@ -261,7 +261,7 @@ Tracked lab profiles:
 - `profiles/live_lab/default_four_node.env`
   - default four-node topology that avoids the unstable `192.168.18.50` VM
 - `profiles/live_lab/default_five_node.env`
-  - full five-node topology for release-gate evidence runs
+  - full five-node topology for release-gate evidence runs using the replacement Debian node `192.168.18.65`
 
 Source selection:
 
@@ -293,7 +293,7 @@ Non-interactive, full five-node topology:
 ```bash
 bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --exit-target debian@192.168.18.49 \
-  --client-target debian@192.168.18.50 \
+  --client-target debian@192.168.18.65 \
   --entry-target ubuntu@192.168.18.52 \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
@@ -307,7 +307,7 @@ Dry-run validation only:
 ```bash
 bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --exit-target debian@192.168.18.49 \
-  --client-target debian@192.168.18.50 \
+  --client-target debian@192.168.18.65 \
   --entry-target ubuntu@192.168.18.52 \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
@@ -345,6 +345,9 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   - archives a git ref instead of the current working tree
 - `--report-dir <path>`
   - writes reports to an explicit location
+- `--traversal-ttl-secs <seconds>`
+  - sets traversal endpoint-hint TTL used by orchestrator-issued signed traversal bundles
+  - constrained to `1..120` to match control-plane security bounds; higher values fail closed
 
 ## Current limitation
 

@@ -12,10 +12,10 @@ export LIVE_LAB_LOG_PREFIX
 
 EXIT_A_HOST="debian@192.168.18.49"
 EXIT_B_HOST="mint@192.168.18.53"
-CLIENT_HOST="debian@192.168.18.50"
+CLIENT_HOST="debian@192.168.18.65"
 EXIT_A_NODE_ID="exit-49"
 EXIT_B_NODE_ID="client-53"
-CLIENT_NODE_ID="client-50"
+CLIENT_NODE_ID="client-65"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 SSH_PASSWORD_FILE=""
 SUDO_PASSWORD_FILE=""
@@ -24,6 +24,8 @@ LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_exit_handoff.log"
 MONITOR_LOG="$ROOT_DIR/artifacts/phase10/source/live_linux_exit_handoff_monitor.log"
 SWITCH_ITERATION=20
 MONITOR_ITERATIONS=55
+TRAVERSAL_TTL_SECS=120
+TRAVERSAL_REFRESH_INTERVAL_SECS=45
 
 usage() {
   cat <<USAGE
@@ -39,10 +41,20 @@ options:
   --ssh-allow-cidrs <cidrs>
   --switch-iteration <n>
   --monitor-iterations <n>
+  --traversal-ttl-secs <n>   (1-120)
   --report-path <path>
   --log-path <path>
   --monitor-log <path>
 USAGE
+}
+
+validate_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value <= 0 )); then
+    printf '%s must be a positive integer (got: %s)\n' "$name" "$value" >&2
+    exit 2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -58,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     --switch-iteration) SWITCH_ITERATION="$2"; shift 2 ;;
     --monitor-iterations) MONITOR_ITERATIONS="$2"; shift 2 ;;
+    --traversal-ttl-secs) TRAVERSAL_TTL_SECS="$2"; shift 2 ;;
     --report-path) REPORT_PATH="$2"; shift 2 ;;
     --log-path) LOG_PATH="$2"; shift 2 ;;
     --monitor-log) MONITOR_LOG="$2"; shift 2 ;;
@@ -71,11 +84,29 @@ if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
   exit 2
 fi
 
+validate_positive_integer "switch iteration" "$SWITCH_ITERATION"
+validate_positive_integer "monitor iterations" "$MONITOR_ITERATIONS"
+if [[ ! "$TRAVERSAL_TTL_SECS" =~ ^[0-9]+$ ]]; then
+  printf 'traversal ttl seconds must be an integer (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
+  exit 2
+fi
+if (( TRAVERSAL_TTL_SECS > 120 )); then
+  printf 'traversal ttl seconds must be <= 120 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
+  exit 2
+fi
+validate_positive_integer "traversal ttl seconds" "$TRAVERSAL_TTL_SECS"
+if (( TRAVERSAL_TTL_SECS <= 30 )); then
+  TRAVERSAL_REFRESH_INTERVAL_SECS=10
+else
+  TRAVERSAL_REFRESH_INTERVAL_SECS=$((TRAVERSAL_TTL_SECS / 2))
+fi
+
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")" "$(dirname "$MONITOR_LOG")"
 exec > >(tee "$LOG_PATH") 2>&1
 
 live_lab_init "rustynet-exit-handoff" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
 trap 'live_lab_cleanup' EXIT
+live_lab_log "Traversal bundle TTL for handoff stage: ${TRAVERSAL_TTL_SECS}s (refresh every ${TRAVERSAL_REFRESH_INTERVAL_SECS}s)"
 
 ISSUE_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_handoff.sh"
 ISSUE_ENV="$LIVE_LAB_WORK_DIR/rn_issue_handoff.env"
@@ -86,6 +117,12 @@ CLIENT_ASSIGNMENT_LOCAL="$LIVE_LAB_WORK_DIR/assignment-client"
 EXIT_A_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-exit-a.env"
 EXIT_B_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-exit-b.env"
 CLIENT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-client.env"
+TRAVERSAL_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_handoff_traversal.sh"
+TRAVERSAL_ENV="$LIVE_LAB_WORK_DIR/rn_issue_handoff_traversal.env"
+TRAVERSAL_PUB_LOCAL="$LIVE_LAB_WORK_DIR/traversal.pub"
+EXIT_A_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-exit-a"
+EXIT_B_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-exit-b"
+CLIENT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-client"
 
 for host in "$EXIT_A_HOST" "$EXIT_B_HOST" "$CLIENT_HOST"; do
   live_lab_push_sudo_password "$host"
@@ -155,6 +192,113 @@ issue_bundle "$CLIENT_NODE_ID" "rn-assignment-$CLIENT_NODE_ID.assignment" --exit
 ISSUEEOF
 chmod 700 "$ISSUE_SCRIPT"
 
+cat > "$TRAVERSAL_SCRIPT" <<'TRAVEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: rn_issue_handoff_traversal.sh <env-file>" >&2
+  exit 2
+fi
+
+source "$1"
+
+root() {
+  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
+if [[ ! "$TRAVERSAL_TTL_SECS" =~ ^[0-9]+$ ]] || (( TRAVERSAL_TTL_SECS <= 0 || TRAVERSAL_TTL_SECS > 120 )); then
+  echo "TRAVERSAL_TTL_SECS must be a positive integer <= 120 (got: ${TRAVERSAL_TTL_SECS})" >&2
+  exit 2
+fi
+
+PASS_FILE="$(mktemp /tmp/rn-handoff-traversal-passphrase.XXXXXX)"
+cleanup() {
+  if [[ -f "$PASS_FILE" ]]; then
+    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
+root chmod 0600 "$PASS_FILE"
+
+ISSUE_DIR="/run/rustynet/traversal-issue"
+root rm -rf "$ISSUE_DIR"
+root install -d -m 0700 "$ISSUE_DIR"
+SNAPSHOT_GENERATED_AT="$(date +%s)"
+SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
+
+declare -a node_ids=()
+declare -A endpoint_by_node=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $NODES_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r node_id endpoint _rest <<< "$entry"
+  [[ -n "$node_id" && -n "$endpoint" ]] || continue
+  node_ids+=("$node_id")
+  endpoint_by_node["$node_id"]="$endpoint"
+done
+
+issue_pair_bundle() {
+  local source_node_id="$1"
+  local target_node_id="$2"
+  local target_endpoint="${endpoint_by_node[$target_node_id]}"
+  local relay_id="relay-${target_node_id}"
+  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
+  root rustynet traversal issue \
+    --source-node-id "$source_node_id" \
+    --target-node-id "$target_node_id" \
+    --nodes "$NODES_SPEC" \
+    --allow "$ALLOW_SPEC" \
+    --signing-secret /etc/rustynet/assignment.signing.secret \
+    --signing-secret-passphrase-file "$PASS_FILE" \
+    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
+    --generated-at "$SNAPSHOT_GENERATED_AT" \
+    --nonce "$SNAPSHOT_NONCE" \
+    --output "$ISSUE_DIR/$output_name" \
+    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
+    --ttl-secs "$TRAVERSAL_TTL_SECS"
+}
+
+declare -a allow_sources=()
+declare -a allow_targets=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $ALLOW_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r source_node_id target_node_id <<< "$entry"
+  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
+  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
+    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
+    exit 1
+  fi
+  issue_pair_bundle "$source_node_id" "$target_node_id"
+  allow_sources+=("$source_node_id")
+  allow_targets+=("$target_node_id")
+done
+
+for node_id in "${node_ids[@]}"; do
+  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
+  root rm -f "$aggregate_path"
+  for idx in "${!allow_sources[@]}"; do
+    source_node_id="${allow_sources[$idx]}"
+    target_node_id="${allow_targets[$idx]}"
+    if [[ "$source_node_id" == "$node_id" ]]; then
+      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
+      root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
+      root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
+    fi
+  done
+done
+TRAVEOF
+chmod 700 "$TRAVERSAL_SCRIPT"
+
 : > "$ISSUE_ENV"
 live_lab_append_env_assignment "$ISSUE_ENV" "EXIT_A_NODE_ID" "$EXIT_A_NODE_ID"
 live_lab_append_env_assignment "$ISSUE_ENV" "EXIT_B_NODE_ID" "$EXIT_B_NODE_ID"
@@ -186,6 +330,39 @@ live_lab_install_assignment_refresh_env "$EXIT_A_HOST" "$EXIT_A_REFRESH_LOCAL"
 live_lab_install_assignment_refresh_env "$EXIT_B_HOST" "$EXIT_B_REFRESH_LOCAL"
 live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$CLIENT_REFRESH_LOCAL"
 
+: > "$TRAVERSAL_ENV"
+live_lab_append_env_assignment "$TRAVERSAL_ENV" "NODES_SPEC" "$NODES_SPEC"
+live_lab_append_env_assignment "$TRAVERSAL_ENV" "ALLOW_SPEC" "$ALLOW_SPEC"
+live_lab_append_env_assignment "$TRAVERSAL_ENV" "TRAVERSAL_TTL_SECS" "$TRAVERSAL_TTL_SECS"
+
+install_traversal_bundle() {
+  local host="$1"
+  local bundle_local="$2"
+  live_lab_scp_to "$TRAVERSAL_PUB_LOCAL" "$host" "/tmp/rn-traversal.pub"
+  live_lab_scp_to "$bundle_local" "$host" "/tmp/rn-traversal.bundle"
+  live_lab_run_root "$host" "root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+}
+
+refresh_traversal_bundles() {
+  live_lab_log "Issuing signed traversal bundles for handoff topology"
+  live_lab_scp_to "$TRAVERSAL_SCRIPT" "$EXIT_A_HOST" "/tmp/rn_issue_handoff_traversal.sh"
+  live_lab_scp_to "$TRAVERSAL_ENV" "$EXIT_A_HOST" "/tmp/rn_issue_handoff_traversal.env"
+  live_lab_run_root "$EXIT_A_HOST" "root chmod 700 /tmp/rn_issue_handoff_traversal.sh && root bash /tmp/rn_issue_handoff_traversal.sh /tmp/rn_issue_handoff_traversal.env"
+  live_lab_run_root "$EXIT_A_HOST" "root rm -f /tmp/rn_issue_handoff_traversal.sh /tmp/rn_issue_handoff_traversal.env"
+
+  live_lab_capture_root "$EXIT_A_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$TRAVERSAL_PUB_LOCAL"
+  live_lab_capture_root "$EXIT_A_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$EXIT_A_NODE_ID.traversal" > "$EXIT_A_TRAVERSAL_LOCAL"
+  live_lab_capture_root "$EXIT_A_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$EXIT_B_NODE_ID.traversal" > "$EXIT_B_TRAVERSAL_LOCAL"
+  live_lab_capture_root "$EXIT_A_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$CLIENT_NODE_ID.traversal" > "$CLIENT_TRAVERSAL_LOCAL"
+
+  live_lab_log "Distributing signed traversal bundles"
+  install_traversal_bundle "$EXIT_A_HOST" "$EXIT_A_TRAVERSAL_LOCAL"
+  install_traversal_bundle "$EXIT_B_HOST" "$EXIT_B_TRAVERSAL_LOCAL"
+  install_traversal_bundle "$CLIENT_HOST" "$CLIENT_TRAVERSAL_LOCAL"
+}
+
+refresh_traversal_bundles
+
 live_lab_log "Enforcing runtime roles"
 live_lab_enforce_host "$EXIT_A_HOST" "admin" "$EXIT_A_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_A_HOST")"
 live_lab_enforce_host "$EXIT_B_HOST" "admin" "$EXIT_B_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$EXIT_B_HOST")"
@@ -202,8 +379,15 @@ sleep 5
 : > "$MONITOR_LOG"
 
 switch_ts=0
+last_traversal_refresh_ts="$(date +%s)"
 for ((i=1; i<=MONITOR_ITERATIONS; i++)); do
   ts="$(date +%s)"
+  if (( ts - last_traversal_refresh_ts >= TRAVERSAL_REFRESH_INTERVAL_SECS )); then
+    live_lab_log "Refreshing signed traversal bundles during handoff monitor"
+    refresh_traversal_bundles
+    last_traversal_refresh_ts="$(date +%s)"
+    ts="$last_traversal_refresh_ts"
+  fi
   status="$(live_lab_status "$CLIENT_HOST" | tr -s ' ' | tr -d '\n')"
   route_line="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true" | tr -s ' ' | tr -d '\n')"
   endpoints="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints 2>/dev/null || true" | tr -s ' ' | tr '\n' ';' | tr -d '\r')"
@@ -217,6 +401,9 @@ for ((i=1; i<=MONITOR_ITERATIONS; i++)); do
     "$ts" "$i" "$ping_rc" "$route_line" "$status" "$endpoints" >> "$MONITOR_LOG"
 
   if (( i == SWITCH_ITERATION )); then
+    live_lab_log "Refreshing signed traversal bundles before exit switch"
+    refresh_traversal_bundles
+    last_traversal_refresh_ts="$(date +%s)"
     switch_ts="$ts"
     live_lab_log "Switching client exit to ${EXIT_B_NODE_ID}"
     live_lab_apply_role_coupling "$CLIENT_HOST" "client" "$EXIT_B_NODE_ID" "false" "/etc/rustynet/assignment-refresh.env"

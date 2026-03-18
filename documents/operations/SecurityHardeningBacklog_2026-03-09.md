@@ -45,5 +45,5 @@ Priority: security first, efficiency only when it does not widen trust or create
 
 ## Notes
 
-- Four-node live validation is the current default because VM `192.168.18.50` remains unstable under reboot.
+- Four-node live validation remains the current default because the original Debian client VM `192.168.18.50` was unstable under reboot; the replacement five-node topology now uses `192.168.18.65`.
 - Five-node release-gate evidence still requires a healthy fifth node.

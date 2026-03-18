@@ -6,6 +6,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 
 use crate::env_file::parse_env_value;
 use nix::unistd::{Gid, Group, Uid, User, chown};
@@ -988,6 +990,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     }
     run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
     run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
+    wait_for_unit_active("rustynetd.service", 40, 250)?;
+    wait_for_unit_active("rustynetd-managed-dns.service", 40, 250)?;
 
     run_command_stream(
         "systemctl",
@@ -2064,6 +2068,35 @@ fn run_command_capture(command: &str, args: &[&str]) -> Result<String, String> {
 
 fn run_command_checked(command: &str, args: &[&str]) -> Result<(), String> {
     run_command_capture(command, args).map(|_| ())
+}
+
+fn wait_for_unit_active(unit: &str, attempts: usize, sleep_ms: u64) -> Result<(), String> {
+    let mut last_state = String::new();
+    for attempt in 1..=attempts {
+        let output = Command::new("systemctl")
+            .args(["is-active", unit])
+            .output()
+            .map_err(|err| format!("execute systemctl is-active {unit} failed: {err}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        last_state = if !stdout.is_empty() {
+            stdout
+        } else if !stderr.is_empty() {
+            stderr
+        } else {
+            "unknown".to_string()
+        };
+        if output.status.success() && last_state == "active" {
+            return Ok(());
+        }
+        if attempt < attempts {
+            sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+    Err(format!(
+        "systemd unit {unit} failed to reach active state after {} attempts (last_state={last_state})",
+        attempts
+    ))
 }
 
 fn ensure_managed_dns_control_plane_ready() -> Result<(), String> {

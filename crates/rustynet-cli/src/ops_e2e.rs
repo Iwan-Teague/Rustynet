@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nix::unistd::Uid;
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::{
-    ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
-    EndpointHintCandidateType, NodeMetadata,
+    ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+    NodeMetadata,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
@@ -3740,9 +3740,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, decode_base64, decode_hex_32,
-        ensure_safe_token, extract_last_assignment_generated,
-        issue_two_node_traversal_artifacts, write_assignment_refresh_env,
+        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, decode_base64, decode_hex_32, ensure_safe_token,
+        extract_last_assignment_generated, issue_two_node_traversal_artifacts,
+        write_assignment_refresh_env,
     };
 
     #[test]
@@ -3817,12 +3817,36 @@ mod tests {
         )
         .expect("traversal artifacts should issue");
         assert!(!artifacts.verifier_key_hex.is_empty());
-        assert!(artifacts.exit_bundle_wire.contains("source_node_id=exit-node"));
-        assert!(artifacts.exit_bundle_wire.contains("target_node_id=client-node"));
-        assert!(artifacts.exit_bundle_wire.contains("candidate.0.addr=192.168.64.24"));
-        assert!(artifacts.client_bundle_wire.contains("source_node_id=client-node"));
-        assert!(artifacts.client_bundle_wire.contains("target_node_id=exit-node"));
-        assert!(artifacts.client_bundle_wire.contains("candidate.0.addr=192.168.64.22"));
+        assert!(
+            artifacts
+                .exit_bundle_wire
+                .contains("source_node_id=exit-node")
+        );
+        assert!(
+            artifacts
+                .exit_bundle_wire
+                .contains("target_node_id=client-node")
+        );
+        assert!(
+            artifacts
+                .exit_bundle_wire
+                .contains("candidate.0.addr=192.168.64.24")
+        );
+        assert!(
+            artifacts
+                .client_bundle_wire
+                .contains("source_node_id=client-node")
+        );
+        assert!(
+            artifacts
+                .client_bundle_wire
+                .contains("target_node_id=exit-node")
+        );
+        assert!(
+            artifacts
+                .client_bundle_wire
+                .contains("candidate.0.addr=192.168.64.22")
+        );
         assert!(artifacts.exit_bundle_wire.contains("signature="));
         assert!(artifacts.client_bundle_wire.contains("signature="));
     }

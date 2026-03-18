@@ -146,3 +146,36 @@ Security effect:
 - this does not broaden `wg` access generally
 - it adds one specific read-only schema already required by the backend
 - all other unsupported `wg` invocations remain rejected
+
+## Current blocker after both fixes
+The latest rerun on commit `7a64063` still fails at:
+
+```text
+rustynet route advertise 0.0.0.0/0
+```
+
+But the reason is now the actual traversal-runtime limitation:
+
+```text
+traversal authority failed to program peer <peer>: traversal probe failed: direct probes exhausted and no trusted relay endpoint is available
+```
+
+Observed daemon state on both hosts:
+- `auto_tunnel_enforce=true`
+- `traversal_authority=enforced_v1`
+- `traversal_peer_count=1`
+- `restricted_safe_mode=true`
+- `restriction_mode=Permanent`
+
+What this means:
+- the socket-validator bug is fixed
+- traversal bundles are now present and accepted
+- handshake evidence collection through the privileged helper is fixed
+- the remaining failure is the product/runtime behavior itself:
+  - the current HP2 one-sided direct-probe path cannot prove the direct tunnel on this two-node deployment
+  - no trusted relay endpoint exists, so the daemon correctly fails closed
+
+Security interpretation:
+- no fail-open behavior was observed
+- the daemon is enforcing its signed traversal contract honestly
+- the blocker is now a real capability gap between the enforced traversal model and the current two-node E2E topology

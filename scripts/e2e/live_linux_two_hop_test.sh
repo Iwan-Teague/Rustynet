@@ -11,11 +11,11 @@ LIVE_LAB_LOG_PREFIX="two-hop-live"
 export LIVE_LAB_LOG_PREFIX
 
 FINAL_EXIT_HOST="debian@192.168.18.49"
-CLIENT_HOST="debian@192.168.18.50"
+CLIENT_HOST="debian@192.168.18.65"
 ENTRY_HOST="ubuntu@192.168.18.52"
 SECOND_CLIENT_HOST="fedora@192.168.18.51"
 FINAL_EXIT_NODE_ID="exit-49"
-CLIENT_NODE_ID="client-50"
+CLIENT_NODE_ID="client-65"
 ENTRY_NODE_ID="client-52"
 SECOND_CLIENT_NODE_ID="client-51"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
@@ -85,6 +85,13 @@ FINAL_EXIT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-final-exit.env"
 CLIENT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-client.env"
 ENTRY_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-entry.env"
 SECOND_CLIENT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-second-client.env"
+TRAVERSAL_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_twohop_traversal.sh"
+TRAVERSAL_ENV="$LIVE_LAB_WORK_DIR/rn_issue_twohop_traversal.env"
+TRAVERSAL_PUB_LOCAL="$LIVE_LAB_WORK_DIR/traversal.pub"
+FINAL_EXIT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-final-exit"
+CLIENT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-client"
+ENTRY_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-entry"
+SECOND_CLIENT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-second-client"
 
 for host in "$FINAL_EXIT_HOST" "$CLIENT_HOST" "$ENTRY_HOST" "$SECOND_CLIENT_HOST"; do
   live_lab_push_sudo_password "$host"
@@ -157,6 +164,109 @@ issue_bundle "$SECOND_CLIENT_NODE_ID" "rn-assignment-$SECOND_CLIENT_NODE_ID.assi
 ISSUEEOF
 chmod 700 "$ISSUE_SCRIPT"
 
+cat > "$TRAVERSAL_SCRIPT" <<'TRAVEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: rn_issue_twohop_traversal.sh <env-file>" >&2
+  exit 2
+fi
+
+source "$1"
+
+root() {
+  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
+PASS_FILE="$(mktemp /tmp/rn-twohop-traversal-passphrase.XXXXXX)"
+cleanup() {
+  if [[ -f "$PASS_FILE" ]]; then
+    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
+root chmod 0600 "$PASS_FILE"
+
+ISSUE_DIR="/run/rustynet/traversal-issue"
+root rm -rf "$ISSUE_DIR"
+root install -d -m 0700 "$ISSUE_DIR"
+SNAPSHOT_GENERATED_AT="$(date +%s)"
+SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
+
+declare -a node_ids=()
+declare -A endpoint_by_node=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $NODES_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r node_id endpoint _rest <<< "$entry"
+  [[ -n "$node_id" && -n "$endpoint" ]] || continue
+  node_ids+=("$node_id")
+  endpoint_by_node["$node_id"]="$endpoint"
+done
+
+issue_pair_bundle() {
+  local source_node_id="$1"
+  local target_node_id="$2"
+  local target_endpoint="${endpoint_by_node[$target_node_id]}"
+  local relay_id="relay-${target_node_id}"
+  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
+  root rustynet traversal issue \
+    --source-node-id "$source_node_id" \
+    --target-node-id "$target_node_id" \
+    --nodes "$NODES_SPEC" \
+    --allow "$ALLOW_SPEC" \
+    --signing-secret /etc/rustynet/assignment.signing.secret \
+    --signing-secret-passphrase-file "$PASS_FILE" \
+    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
+    --generated-at "$SNAPSHOT_GENERATED_AT" \
+    --nonce "$SNAPSHOT_NONCE" \
+    --output "$ISSUE_DIR/$output_name" \
+    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
+    --ttl-secs 120
+}
+
+declare -a allow_sources=()
+declare -a allow_targets=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $ALLOW_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r source_node_id target_node_id <<< "$entry"
+  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
+  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
+    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
+    exit 1
+  fi
+  issue_pair_bundle "$source_node_id" "$target_node_id"
+  allow_sources+=("$source_node_id")
+  allow_targets+=("$target_node_id")
+done
+
+for node_id in "${node_ids[@]}"; do
+  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
+  root rm -f "$aggregate_path"
+  root sh -c ': > "$1"' sh "$aggregate_path"
+  for idx in "${!allow_sources[@]}"; do
+    source_node_id="${allow_sources[$idx]}"
+    target_node_id="${allow_targets[$idx]}"
+    if [[ "$source_node_id" == "$node_id" ]]; then
+      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
+      root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
+      root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
+    fi
+  done
+done
+TRAVEOF
+chmod 700 "$TRAVERSAL_SCRIPT"
+
 : > "$ISSUE_ENV"
 live_lab_append_env_assignment "$ISSUE_ENV" "FINAL_EXIT_NODE_ID" "$FINAL_EXIT_NODE_ID"
 live_lab_append_env_assignment "$ISSUE_ENV" "CLIENT_NODE_ID" "$CLIENT_NODE_ID"
@@ -192,6 +302,36 @@ live_lab_install_assignment_refresh_env "$FINAL_EXIT_HOST" "$FINAL_EXIT_REFRESH_
 live_lab_install_assignment_refresh_env "$CLIENT_HOST" "$CLIENT_REFRESH_LOCAL"
 live_lab_install_assignment_refresh_env "$ENTRY_HOST" "$ENTRY_REFRESH_LOCAL"
 live_lab_install_assignment_refresh_env "$SECOND_CLIENT_HOST" "$SECOND_CLIENT_REFRESH_LOCAL"
+
+: > "$TRAVERSAL_ENV"
+live_lab_append_env_assignment "$TRAVERSAL_ENV" "NODES_SPEC" "$NODES_SPEC"
+live_lab_append_env_assignment "$TRAVERSAL_ENV" "ALLOW_SPEC" "$ALLOW_SPEC"
+
+live_lab_log "Issuing signed traversal bundles for two-hop topology"
+live_lab_scp_to "$TRAVERSAL_SCRIPT" "$FINAL_EXIT_HOST" "/tmp/rn_issue_twohop_traversal.sh"
+live_lab_scp_to "$TRAVERSAL_ENV" "$FINAL_EXIT_HOST" "/tmp/rn_issue_twohop_traversal.env"
+live_lab_run_root "$FINAL_EXIT_HOST" "root chmod 700 /tmp/rn_issue_twohop_traversal.sh && root bash /tmp/rn_issue_twohop_traversal.sh /tmp/rn_issue_twohop_traversal.env"
+live_lab_run_root "$FINAL_EXIT_HOST" "root rm -f /tmp/rn_issue_twohop_traversal.sh /tmp/rn_issue_twohop_traversal.env"
+
+live_lab_capture_root "$FINAL_EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$TRAVERSAL_PUB_LOCAL"
+live_lab_capture_root "$FINAL_EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$FINAL_EXIT_NODE_ID.traversal" > "$FINAL_EXIT_TRAVERSAL_LOCAL"
+live_lab_capture_root "$FINAL_EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$CLIENT_NODE_ID.traversal" > "$CLIENT_TRAVERSAL_LOCAL"
+live_lab_capture_root "$FINAL_EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$ENTRY_NODE_ID.traversal" > "$ENTRY_TRAVERSAL_LOCAL"
+live_lab_capture_root "$FINAL_EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$SECOND_CLIENT_NODE_ID.traversal" > "$SECOND_CLIENT_TRAVERSAL_LOCAL"
+
+install_traversal_bundle() {
+  local host="$1"
+  local bundle_local="$2"
+  live_lab_scp_to "$TRAVERSAL_PUB_LOCAL" "$host" "/tmp/rn-traversal.pub"
+  live_lab_scp_to "$bundle_local" "$host" "/tmp/rn-traversal.bundle"
+  live_lab_run_root "$host" "root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+}
+
+live_lab_log "Distributing signed traversal bundles"
+install_traversal_bundle "$FINAL_EXIT_HOST" "$FINAL_EXIT_TRAVERSAL_LOCAL"
+install_traversal_bundle "$CLIENT_HOST" "$CLIENT_TRAVERSAL_LOCAL"
+install_traversal_bundle "$ENTRY_HOST" "$ENTRY_TRAVERSAL_LOCAL"
+install_traversal_bundle "$SECOND_CLIENT_HOST" "$SECOND_CLIENT_TRAVERSAL_LOCAL"
 
 live_lab_log "Enforcing runtime roles"
 live_lab_enforce_host "$FINAL_EXIT_HOST" "admin" "$FINAL_EXIT_NODE_ID" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$FINAL_EXIT_HOST")"

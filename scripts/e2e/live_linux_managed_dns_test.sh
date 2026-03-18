@@ -108,6 +108,11 @@ QUERY_SCRIPT="$LIVE_LAB_WORK_DIR/rn-dns-query.py"
 VERIFIER_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone.pub"
 VALID_BUNDLE_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone-valid.bundle"
 STALE_BUNDLE_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone-stale.bundle"
+TRAVERSAL_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_dns_traversal.sh"
+TRAVERSAL_ENV="$LIVE_LAB_WORK_DIR/rn_issue_dns_traversal.env"
+TRAVERSAL_PUB_LOCAL="$LIVE_LAB_WORK_DIR/traversal.pub"
+SIGNER_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-signer"
+CLIENT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-client"
 MANAGED_FQDN="${MANAGED_LABEL}.${ZONE_NAME}"
 MANAGED_ALIAS_FQDN="${MANAGED_ALIAS}.${ZONE_NAME}"
 STALE_GENERATED_AT="$(( $(date -u +%s) - 7200 ))"
@@ -165,35 +170,46 @@ question = b"".join(
     for label in qname.split(".")
 ) + b"\x00" + struct.pack("!HH", 1, 1)
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(3.0)
-sock.sendto(header + question, (server, port))
-response, _ = sock.recvfrom(512)
-sock.close()
+result = {
+    "rcode": -1,
+    "answer_count": 0,
+    "answer_ip": "",
+    "answer_ttl": 0,
+    "error": "",
+}
 
-flags = struct.unpack("!H", response[2:4])[0]
-rcode = flags & 0x000F
-answer_count = struct.unpack("!H", response[6:8])[0]
-offset = 12
-while offset < len(response) and response[offset] != 0:
-    offset += 1 + response[offset]
-offset += 5
-answer_ip = ""
-answer_ttl = 0
-if answer_count > 0 and offset + 12 <= len(response):
-    offset += 2
-    rr_type, rr_class, ttl, rdlen = struct.unpack("!HHIH", response[offset:offset + 10])
-    offset += 10
-    if rr_type == 1 and rr_class == 1 and rdlen == 4 and offset + 4 <= len(response):
-        answer_ip = ".".join(str(byte) for byte in response[offset:offset + 4])
-        answer_ttl = ttl
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3.0)
+    sock.sendto(header + question, (server, port))
+    response, _ = sock.recvfrom(512)
+    sock.close()
 
-print(json.dumps({
-    "rcode": rcode,
-    "answer_count": answer_count,
-    "answer_ip": answer_ip,
-    "answer_ttl": answer_ttl,
-}, separators=(",", ":")))
+    flags = struct.unpack("!H", response[2:4])[0]
+    rcode = flags & 0x000F
+    answer_count = struct.unpack("!H", response[6:8])[0]
+    offset = 12
+    while offset < len(response) and response[offset] != 0:
+        offset += 1 + response[offset]
+    offset += 5
+    answer_ip = ""
+    answer_ttl = 0
+    if answer_count > 0 and offset + 12 <= len(response):
+        offset += 2
+        rr_type, rr_class, ttl, rdlen = struct.unpack("!HHIH", response[offset:offset + 10])
+        offset += 10
+        if rr_type == 1 and rr_class == 1 and rdlen == 4 and offset + 4 <= len(response):
+            answer_ip = ".".join(str(byte) for byte in response[offset:offset + 4])
+            answer_ttl = ttl
+
+    result["rcode"] = rcode
+    result["answer_count"] = answer_count
+    result["answer_ip"] = answer_ip
+    result["answer_ttl"] = answer_ttl
+except Exception as exc:
+    result["error"] = str(exc)
+
+print(json.dumps(result, separators=(",", ":")))
 PY
 chmod 700 "$QUERY_SCRIPT"
 
@@ -248,6 +264,109 @@ issue_bundle "stale.dns-zone" --generated-at "$STALE_GENERATED_AT" --ttl-secs 30
 ISSUEEOF
 chmod 700 "$ISSUE_SCRIPT"
 
+cat > "$TRAVERSAL_SCRIPT" <<'TRAVEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: rn_issue_dns_traversal.sh <env-file>" >&2
+  exit 2
+fi
+
+source "$1"
+
+root() {
+  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+}
+
+PASS_FILE="$(mktemp /tmp/rn-dns-traversal-passphrase.XXXXXX)"
+cleanup() {
+  if [[ -f "$PASS_FILE" ]]; then
+    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
+root chmod 0600 "$PASS_FILE"
+
+ISSUE_DIR="/run/rustynet/traversal-issue"
+root rm -rf "$ISSUE_DIR"
+root install -d -m 0700 "$ISSUE_DIR"
+SNAPSHOT_GENERATED_AT="$(date +%s)"
+SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
+
+declare -a node_ids=()
+declare -A endpoint_by_node=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $NODES_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r node_id endpoint _rest <<< "$entry"
+  [[ -n "$node_id" && -n "$endpoint" ]] || continue
+  node_ids+=("$node_id")
+  endpoint_by_node["$node_id"]="$endpoint"
+done
+
+issue_pair_bundle() {
+  local source_node_id="$1"
+  local target_node_id="$2"
+  local target_endpoint="${endpoint_by_node[$target_node_id]}"
+  local relay_id="relay-${target_node_id}"
+  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
+  root rustynet traversal issue \
+    --source-node-id "$source_node_id" \
+    --target-node-id "$target_node_id" \
+    --nodes "$NODES_SPEC" \
+    --allow "$ALLOW_SPEC" \
+    --signing-secret /etc/rustynet/assignment.signing.secret \
+    --signing-secret-passphrase-file "$PASS_FILE" \
+    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
+    --generated-at "$SNAPSHOT_GENERATED_AT" \
+    --nonce "$SNAPSHOT_NONCE" \
+    --output "$ISSUE_DIR/$output_name" \
+    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
+    --ttl-secs 120
+}
+
+declare -a allow_sources=()
+declare -a allow_targets=()
+OLD_IFS="$IFS"
+IFS=';'
+set -- $ALLOW_SPEC
+IFS="$OLD_IFS"
+for entry in "$@"; do
+  [[ -n "$entry" ]] || continue
+  IFS='|' read -r source_node_id target_node_id <<< "$entry"
+  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
+  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
+    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
+    exit 1
+  fi
+  issue_pair_bundle "$source_node_id" "$target_node_id"
+  allow_sources+=("$source_node_id")
+  allow_targets+=("$target_node_id")
+done
+
+for node_id in "${node_ids[@]}"; do
+  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
+  root rm -f "$aggregate_path"
+  root sh -c ': > "$1"' sh "$aggregate_path"
+  for idx in "${!allow_sources[@]}"; do
+    source_node_id="${allow_sources[$idx]}"
+    target_node_id="${allow_targets[$idx]}"
+    if [[ "$source_node_id" == "$node_id" ]]; then
+      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
+      root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
+      root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
+    fi
+  done
+done
+TRAVEOF
+chmod 700 "$TRAVERSAL_SCRIPT"
+
 : > "$ISSUE_ENV"
 live_lab_append_env_assignment "$ISSUE_ENV" "CLIENT_NODE_ID" "$CLIENT_NODE_ID"
 live_lab_append_env_assignment "$ISSUE_ENV" "NODES_SPEC" "$NODES_SPEC"
@@ -265,49 +384,76 @@ live_lab_capture_root "$SIGNER_HOST" "root cat /run/rustynet/dns-zone-issue/vali
 live_lab_capture_root "$SIGNER_HOST" "root cat /run/rustynet/dns-zone-issue/stale.dns-zone" > "$STALE_BUNDLE_LOCAL"
 live_lab_run_root "$SIGNER_HOST" "root rm -f /tmp/rn_issue_dns_zone.sh /tmp/rn_issue_dns_zone.env /tmp/rn-dns-records.json"
 
-live_lab_log "Verifying signed managed DNS bundles locally"
-rustynet dns zone verify \
-  --bundle "$VALID_BUNDLE_LOCAL" \
-  --verifier-key "$VERIFIER_LOCAL" \
-  --expected-zone-name "$ZONE_NAME" \
-  --expected-subject-node-id "$CLIENT_NODE_ID" >/dev/null
-rustynet dns zone verify \
-  --bundle "$STALE_BUNDLE_LOCAL" \
-  --verifier-key "$VERIFIER_LOCAL" \
-  --expected-zone-name "$ZONE_NAME" \
-  --expected-subject-node-id "$CLIENT_NODE_ID" >/dev/null
+live_lab_log "Verifying signed managed DNS bundles on signer host"
+live_lab_run_root "$SIGNER_HOST" "root rustynet dns zone verify --bundle /run/rustynet/dns-zone-issue/valid.dns-zone --verifier-key /run/rustynet/dns-zone-issue/rn-dns-zone.pub --expected-zone-name ${ZONE_NAME} --expected-subject-node-id ${CLIENT_NODE_ID} >/dev/null"
+live_lab_run_root "$SIGNER_HOST" "root rustynet dns zone verify --bundle /run/rustynet/dns-zone-issue/stale.dns-zone --verifier-key /run/rustynet/dns-zone-issue/rn-dns-zone.pub --expected-zone-name ${ZONE_NAME} --expected-subject-node-id ${CLIENT_NODE_ID} >/dev/null"
 
 live_lab_log "Installing DNS query helper on client"
 live_lab_scp_to "$QUERY_SCRIPT" "$CLIENT_HOST" "/tmp/rn-dns-query.py"
 live_lab_run_root "$CLIENT_HOST" "root chmod 700 /tmp/rn-dns-query.py"
 
+refresh_traversal_bundles() {
+  : > "$TRAVERSAL_ENV"
+  live_lab_append_env_assignment "$TRAVERSAL_ENV" "NODES_SPEC" "$NODES_SPEC"
+  live_lab_append_env_assignment "$TRAVERSAL_ENV" "ALLOW_SPEC" "$ALLOW_SPEC"
+  live_lab_log "Issuing signed traversal bundles on $SIGNER_HOST"
+  live_lab_scp_to "$TRAVERSAL_SCRIPT" "$SIGNER_HOST" "/tmp/rn_issue_dns_traversal.sh"
+  live_lab_scp_to "$TRAVERSAL_ENV" "$SIGNER_HOST" "/tmp/rn_issue_dns_traversal.env"
+  live_lab_run_root "$SIGNER_HOST" "root chmod 700 /tmp/rn_issue_dns_traversal.sh && root bash /tmp/rn_issue_dns_traversal.sh /tmp/rn_issue_dns_traversal.env"
+  live_lab_run_root "$SIGNER_HOST" "root rm -f /tmp/rn_issue_dns_traversal.sh /tmp/rn_issue_dns_traversal.env"
+
+  live_lab_capture_root "$SIGNER_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$TRAVERSAL_PUB_LOCAL"
+  live_lab_capture_root "$SIGNER_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$SIGNER_NODE_ID.traversal" > "$SIGNER_TRAVERSAL_LOCAL"
+  live_lab_capture_root "$SIGNER_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$CLIENT_NODE_ID.traversal" > "$CLIENT_TRAVERSAL_LOCAL"
+
+  install_traversal_bundle() {
+    local host="$1"
+    local bundle_local="$2"
+    live_lab_scp_to "$TRAVERSAL_PUB_LOCAL" "$host" "/tmp/rn-traversal.pub"
+    live_lab_scp_to "$bundle_local" "$host" "/tmp/rn-traversal.bundle"
+    live_lab_run_root "$host" "root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+  }
+
+  live_lab_log "Distributing signed traversal bundles"
+  install_traversal_bundle "$SIGNER_HOST" "$SIGNER_TRAVERSAL_LOCAL"
+  install_traversal_bundle "$CLIENT_HOST" "$CLIENT_TRAVERSAL_LOCAL"
+}
+
 install_dns_bundle() {
   local bundle_local="$1"
+  local restart_services="${2:-true}"
   live_lab_scp_to "$VERIFIER_LOCAL" "$CLIENT_HOST" "/tmp/rn-dns-zone.pub"
   live_lab_scp_to "$bundle_local" "$CLIENT_HOST" "/tmp/rn-dns-zone.bundle"
   live_lab_run_root "$CLIENT_HOST" "root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle"
-  live_lab_run_root "$CLIENT_HOST" "root systemctl restart rustynetd.service rustynetd-managed-dns.service"
-  live_lab_wait_for_daemon_socket "$CLIENT_HOST"
-  live_lab_retry_root "$CLIENT_HOST" "root systemctl is-active rustynetd-managed-dns.service | grep -qx active" 15 2
+  if [[ "$restart_services" == "true" ]]; then
+    refresh_traversal_bundles
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl stop rustynetd-managed-dns.service rustynetd.service >/dev/null 2>&1 || true; root systemctl reset-failed rustynetd.service rustynetd-managed-dns.service >/dev/null 2>&1 || true" 5 2
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl start rustynetd.service" 5 2
+    live_lab_wait_for_daemon_socket "$CLIENT_HOST"
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.service" 5 2
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl is-active rustynetd-managed-dns.service | grep -qx active" 15 2
+  fi
 }
 
 extract_expected_ip() {
   local inspect_output="$1"
-  printf '%s\n' "$inspect_output" | awk -v fqdn="$MANAGED_FQDN" '
-    index($0, "fqdn=" fqdn " ") {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^expected_ip=/) {
-          sub(/^expected_ip=/, "", $i)
-          print $i
-          exit
-        }
-      }
-    }
-  '
+  python3 - "$MANAGED_FQDN" "$inspect_output" <<'PY'
+import re
+import sys
+
+fqdn = sys.argv[1]
+inspect_output = sys.argv[2]
+pattern = r"fqdn=" + re.escape(fqdn) + r"\s+.*?expected_ip=([^\s]+)"
+match = re.search(pattern, inspect_output)
+if match:
+    print(match.group(1))
+else:
+    print("")
+PY
 }
 
 live_lab_log "Installing valid managed DNS bundle on $CLIENT_HOST"
-install_dns_bundle "$VALID_BUNDLE_LOCAL"
+install_dns_bundle "$VALID_BUNDLE_LOCAL" "true"
 
 DNS_INSPECT_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
 RESOLVECTL_STATUS_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root resolvectl status ${DNS_INTERFACE} || true")"
@@ -332,18 +478,24 @@ live_lab_log "Valid resolvectl query"
 printf '%s\n' "$RESOLVECTL_QUERY_VALID"
 
 live_lab_log "Installing stale managed DNS bundle on $CLIENT_HOST"
-install_dns_bundle "$STALE_BUNDLE_LOCAL"
-
-DNS_INSPECT_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
+install_dns_bundle "$STALE_BUNDLE_LOCAL" "false"
+refresh_traversal_bundles
+live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd.service || true" 5 2
+live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.service || true" 5 2
+DNS_INSPECT_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect || true")"
+RUSTYNETD_STATE_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root systemctl is-active rustynetd.service || true")"
+RUSTYNETD_JOURNAL_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root journalctl -u rustynetd.service -n 40 --no-pager || true")"
 DIRECT_QUERY_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-dns-query.py ${DNS_SERVER} ${DNS_PORT} ${MANAGED_FQDN}")"
 
 live_lab_log "Stale dns inspect"
 printf '%s\n' "$DNS_INSPECT_STALE"
+live_lab_log "Stale rustynetd state"
+printf '%s\n' "$RUSTYNETD_STATE_STALE"
 live_lab_log "Stale loopback DNS query"
 printf '%s\n' "$DIRECT_QUERY_STALE"
 
 live_lab_log "Restoring valid managed DNS bundle on $CLIENT_HOST"
-install_dns_bundle "$VALID_BUNDLE_LOCAL"
+install_dns_bundle "$VALID_BUNDLE_LOCAL" "true"
 DNS_INSPECT_RESTORED="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
 
 check_zone_issue_verify="pass"
@@ -363,7 +515,7 @@ fi
 if live_lab_run_root "$CLIENT_HOST" "root systemctl is-active rustynetd-managed-dns.service | grep -qx active" >/dev/null 2>&1; then
   check_managed_dns_service_active="pass"
 fi
-if grep -Fq "~${ZONE_NAME}" <<<"$RESOLVECTL_STATUS_VALID" && grep -Fq "${DNS_BIND_ADDR}" <<<"$RESOLVECTL_STATUS_VALID"; then
+if grep -Fq "${DNS_BIND_ADDR}" <<<"$RESOLVECTL_STATUS_VALID" && (grep -Fq "~${ZONE_NAME}" <<<"$RESOLVECTL_STATUS_VALID" || grep -Fq "DNS Domain: ${ZONE_NAME}" <<<"$RESOLVECTL_STATUS_VALID"); then
   check_resolvectl_split_dns="pass"
 fi
 if [[ "$(json_field "$DIRECT_QUERY_VALID" "rcode")" == "0" && "$(json_field "$DIRECT_QUERY_VALID" "answer_ip")" == "$EXPECTED_IP" ]]; then
@@ -378,8 +530,10 @@ fi
 if [[ "$(json_field "$NON_MANAGED_DIRECT_QUERY" "rcode")" == "5" ]]; then
   check_non_managed_refused="pass"
 fi
-if grep -Fq "dns inspect: state=invalid" <<<"$DNS_INSPECT_STALE" && grep -Fqi "stale" <<<"$DNS_INSPECT_STALE" && [[ "$(json_field "$DIRECT_QUERY_STALE" "rcode")" == "2" ]]; then
-  check_stale_bundle_fail_closed="pass"
+if [[ "$RUSTYNETD_STATE_STALE" != "active" ]] && grep -Fqi "dns zone preflight failed" <<<"$RUSTYNETD_JOURNAL_STALE" && grep -Fqi "stale" <<<"$RUSTYNETD_JOURNAL_STALE"; then
+  if [[ "$(json_field "$DIRECT_QUERY_STALE" "rcode")" != "0" || -n "$(json_field "$DIRECT_QUERY_STALE" "error")" ]]; then
+    check_stale_bundle_fail_closed="pass"
+  fi
 fi
 if grep -Fq "dns inspect: state=valid" <<<"$DNS_INSPECT_RESTORED"; then
   check_valid_bundle_restored="pass"

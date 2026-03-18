@@ -32,7 +32,10 @@ use rustynet_control::membership::{
     load_membership_snapshot, persist_membership_snapshot, replay_membership_snapshot_and_log,
     sign_update_record, write_membership_audit_log,
 };
-use rustynet_control::{AutoTunnelBundleRequest, ControlPlaneCore, NodeMetadata};
+use rustynet_control::{
+    AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
+    EndpointHintCandidateType, NodeMetadata,
+};
 use rustynet_crypto::{
     KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
 };
@@ -77,6 +80,7 @@ enum CliCommand {
         expected_subject_node_id: Option<String>,
     },
     RouteAdvertise(String),
+    TraversalIssue(Box<TraversalIssueCommand>),
     KeyRotate,
     KeyRevoke,
     Assignment(Box<AssignmentCommand>),
@@ -177,6 +181,30 @@ struct DnsZoneRecordSpec {
     target_node_id: String,
     ttl_secs: u64,
     aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalIssueCommand {
+    signing_secret_path: PathBuf,
+    signing_secret_passphrase_path: PathBuf,
+    source_node_id: String,
+    target_node_id: String,
+    output_path: PathBuf,
+    verifier_key_output_path: Option<PathBuf>,
+    nodes: Vec<AssignmentNodeSpec>,
+    allow_pairs: Vec<AssignmentAllowPair>,
+    candidates: Vec<TraversalCandidateSpec>,
+    generated_at_unix: u64,
+    ttl_secs: u64,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalCandidateSpec {
+    candidate_type: EndpointHintCandidateType,
+    endpoint: String,
+    relay_id: Option<String>,
+    priority: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +384,10 @@ fn parse_command(args: &[String]) -> CliCommand {
                 Err(_) => CliCommand::Help,
             }
         }
+        [cmd, rest @ ..] if cmd == "traversal" => match parse_traversal_command(rest) {
+            Ok(command) => CliCommand::TraversalIssue(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             CliCommand::RouteAdvertise(cidr.clone())
         }
@@ -986,6 +1018,31 @@ fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, S
     }
 }
 
+fn parse_traversal_command(args: &[String]) -> Result<TraversalIssueCommand, String> {
+    if args.is_empty() {
+        return Err("traversal subcommand is required".to_string());
+    }
+    let subcommand = args[0].as_str();
+    if subcommand != "issue" {
+        return Err(format!("unknown traversal subcommand: {subcommand}"));
+    }
+    let parser = OptionParser::parse(&args[1..])?;
+    Ok(TraversalIssueCommand {
+        signing_secret_path: parser.required_path("--signing-secret")?,
+        signing_secret_passphrase_path: parser.required_path("--signing-secret-passphrase-file")?,
+        source_node_id: parser.required("--source-node-id")?,
+        target_node_id: parser.required("--target-node-id")?,
+        output_path: parser.required_path("--output")?,
+        verifier_key_output_path: parser.optional_path("--verifier-key-output"),
+        nodes: parse_assignment_nodes(&parser.required("--nodes")?)?,
+        allow_pairs: parse_assignment_allow_pairs(&parser.required("--allow")?)?,
+        candidates: parse_traversal_candidates(&parser.required("--candidates")?)?,
+        generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
+        ttl_secs: parser.parse_u64_or_default("--ttl-secs", 120)?,
+        nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
+    })
+}
+
 fn proposal_config(
     parser: &OptionParser,
     paths: MembershipPaths,
@@ -1025,6 +1082,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
             expected_zone_name,
             expected_subject_node_id,
         ),
+        CliCommand::TraversalIssue(command) => execute_traversal_issue(*command),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
@@ -1238,6 +1296,93 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
         bundle.generated_at_unix,
         bundle.expires_at_unix,
         bundle.records.len(),
+        verifier_key_output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<not_written>".to_string())
+    ))
+}
+
+fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, String> {
+    let TraversalIssueCommand {
+        signing_secret_path,
+        signing_secret_passphrase_path,
+        source_node_id,
+        target_node_id,
+        output_path,
+        verifier_key_output_path,
+        nodes,
+        allow_pairs,
+        candidates,
+        generated_at_unix,
+        ttl_secs,
+        nonce,
+    } = command;
+    let signing_secret =
+        load_assignment_signing_secret(&signing_secret_path, &signing_secret_passphrase_path)?;
+
+    let policy = PolicySet {
+        rules: allow_pairs
+            .iter()
+            .map(|pair| PolicyRule {
+                src: format!("node:{}", pair.source_node_id),
+                dst: format!("node:{}", pair.destination_node_id),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            })
+            .collect::<Vec<_>>(),
+    };
+
+    let core = ControlPlaneCore::new(signing_secret, policy);
+    for node in nodes {
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: node.node_id,
+                hostname: node.hostname,
+                os: node.os,
+                tags: node.tags,
+                owner: node.owner,
+                endpoint: node.endpoint,
+                last_seen_unix: generated_at_unix,
+                public_key: node.public_key,
+            })
+            .map_err(|err| format!("register node failed: {err}"))?;
+    }
+
+    let bundle = core
+        .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            generated_at_unix,
+            ttl_secs,
+            nonce,
+            candidates: candidates
+                .into_iter()
+                .map(|candidate| EndpointHintCandidate {
+                    candidate_type: candidate.candidate_type,
+                    endpoint: candidate.endpoint,
+                    relay_id: candidate.relay_id,
+                    priority: candidate.priority,
+                })
+                .collect(),
+        })
+        .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
+
+    let wire = ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle);
+    write_text_file(&output_path, &wire)?;
+
+    let verifier_key_hex = core.endpoint_hint_verifier_key_hex();
+    if let Some(verifier_path) = verifier_key_output_path.as_ref() {
+        write_text_file(verifier_path, &format!("{verifier_key_hex}\n"))?;
+    }
+
+    Ok(format!(
+        "traversal bundle issued: source_node_id={} target_node_id={} output={} generated_at_unix={} expires_at_unix={} verifier_key_output={}",
+        source_node_id,
+        target_node_id,
+        output_path.display(),
+        bundle.generated_at_unix,
+        bundle.expires_at_unix,
         verifier_key_output_path
             .as_ref()
             .map(|path| path.display().to_string())
@@ -5653,6 +5798,60 @@ fn parse_assignment_allow_pairs(encoded: &str) -> Result<Vec<AssignmentAllowPair
     Ok(pairs)
 }
 
+fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpec>, String> {
+    let mut candidates = Vec::new();
+    for raw in encoded
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let fields = raw.split('|').map(str::trim).collect::<Vec<_>>();
+        if fields.len() < 3 || fields.len() > 4 {
+            return Err(
+                "invalid --candidates entry format; expected type|endpoint|priority[|relay_id]"
+                    .to_string(),
+            );
+        }
+        let candidate_type = match fields[0] {
+            "host" => EndpointHintCandidateType::Host,
+            "srflx" => EndpointHintCandidateType::ServerReflexive,
+            "relay" => EndpointHintCandidateType::Relay,
+            other => {
+                return Err(format!(
+                    "unsupported candidate type {other}; expected host|srflx|relay"
+                ));
+            }
+        };
+        let endpoint = fields[1].to_string();
+        endpoint
+            .parse::<SocketAddr>()
+            .map_err(|_| format!("invalid traversal candidate endpoint: {endpoint}"))?;
+        let priority = fields[2]
+            .parse::<u16>()
+            .map_err(|err| format!("invalid traversal candidate priority: {err}"))?;
+        let relay_id = fields
+            .get(3)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if matches!(candidate_type, EndpointHintCandidateType::Relay) && relay_id.is_none() {
+            return Err("relay traversal candidates require relay_id".to_string());
+        }
+        if !matches!(candidate_type, EndpointHintCandidateType::Relay) && relay_id.is_some() {
+            return Err("relay_id is only valid for relay traversal candidates".to_string());
+        }
+        candidates.push(TraversalCandidateSpec {
+            candidate_type,
+            endpoint,
+            relay_id,
+            priority,
+        });
+    }
+    if candidates.is_empty() {
+        return Err("at least one traversal candidate is required in --candidates".to_string());
+    }
+    Ok(candidates)
+}
+
 fn load_dns_zone_records_json(path: &Path) -> Result<Vec<DnsZoneRecordSpec>, String> {
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("read dns zone records json failed: {err}"))?;
@@ -5917,6 +6116,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
+        | CliCommand::TraversalIssue(_)
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
         | CliCommand::Trust(_)
@@ -6008,6 +6208,7 @@ fn help_text() -> String {
         "  dns inspect",
         "  dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-json <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
         "  dns zone verify --bundle <path> --verifier-key <path> [--expected-zone-name <name>] [--expected-subject-node-id <id>]",
+        "  traversal issue --signing-secret <path> --signing-secret-passphrase-file <path> --source-node-id <id> --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --candidates <type|endpoint|priority[|relay_id];...> --output <path> [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
         "  route advertise <cidr>",
         "  key rotate",
         "  key revoke",
