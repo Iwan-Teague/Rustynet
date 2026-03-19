@@ -47,6 +47,7 @@ Every report is rejected if:
 4. `client_network_id == exit_network_id`.
 5. `status = pass` but any required check is not `pass`.
 6. `status = fail` but `failure_summary` is missing.
+7. `source_artifacts` or `log_artifacts` include symlinks, non-files, control-character paths, or files outside the report directory / repository root trust boundary.
 
 ## 5. Suite-Specific Required Checks
 ### 5.1 `cross_network_direct_remote_exit`
@@ -80,6 +81,10 @@ Every report is rejected if:
 - `long_soak_stable`
 - `remote_exit_no_underlay_leak`
 - `remote_exit_server_ip_bypass_is_narrow`
+- `cross_network_topology_heuristic`
+- `direct_remote_exit_ready`
+- `post_soak_bypass_ready`
+- `no_plaintext_passphrase_files`
 
 ## 6. Suite-Specific Participants
 ### 6.1 Direct remote exit
@@ -113,6 +118,8 @@ Every report is rejected if:
 Every report must include:
 - `client_network_id`
 - `exit_network_id`
+- `nat_profile`
+- `impairment_profile`
 
 Reports that require a relay also include:
 - `relay_network_id`

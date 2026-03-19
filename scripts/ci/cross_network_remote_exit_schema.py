@@ -29,7 +29,12 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_direct_remote_exit",
         title="Cross-Network Direct Remote Exit",
         required_participants=("client_host", "exit_host"),
-        required_network_fields=("client_network_id", "exit_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "direct_remote_exit_success",
             "remote_exit_no_underlay_leak",
@@ -41,7 +46,13 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_relay_remote_exit",
         title="Cross-Network Relay Remote Exit",
         required_participants=("client_host", "exit_host", "relay_host"),
-        required_network_fields=("client_network_id", "exit_network_id", "relay_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "relay_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "relay_remote_exit_success",
             "remote_exit_no_underlay_leak",
@@ -53,7 +64,13 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_failback_roaming",
         title="Cross-Network Failback and Roaming",
         required_participants=("client_host", "exit_host", "relay_host"),
-        required_network_fields=("client_network_id", "exit_network_id", "relay_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "relay_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "relay_to_direct_failback_success",
             "endpoint_roam_recovery_success",
@@ -65,7 +82,12 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_traversal_adversarial",
         title="Cross-Network Traversal Adversarial",
         required_participants=("client_host", "exit_host", "probe_host"),
-        required_network_fields=("client_network_id", "exit_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "forged_traversal_rejected",
             "stale_traversal_rejected",
@@ -79,7 +101,12 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_remote_exit_dns",
         title="Cross-Network Remote Exit DNS",
         required_participants=("client_host", "exit_host"),
-        required_network_fields=("client_network_id", "exit_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "managed_dns_resolution_success",
             "remote_exit_dns_fail_closed",
@@ -91,11 +118,20 @@ REPORT_SPECS: tuple[CrossNetworkReportSpec, ...] = (
         suite="cross_network_remote_exit_soak",
         title="Cross-Network Remote Exit Soak",
         required_participants=("client_host", "exit_host"),
-        required_network_fields=("client_network_id", "exit_network_id"),
+        required_network_fields=(
+            "client_network_id",
+            "exit_network_id",
+            "nat_profile",
+            "impairment_profile",
+        ),
         required_checks=(
             "long_soak_stable",
             "remote_exit_no_underlay_leak",
             "remote_exit_server_ip_bypass_is_narrow",
+            "cross_network_topology_heuristic",
+            "direct_remote_exit_ready",
+            "post_soak_bypass_ready",
+            "no_plaintext_passphrase_files",
         ),
     ),
 )
@@ -109,6 +145,14 @@ def resolve_artifact_path(report_path: Path, raw_path: str) -> Path:
     if candidate.is_absolute():
         return candidate
     return (report_path.parent / candidate).resolve()
+
+
+def path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def validate_report_payload(
@@ -191,6 +235,8 @@ def validate_report_payload(
         ):
             problems.append("client_network_id and exit_network_id must differ")
 
+    report_dir = report_path.parent.resolve()
+    repo_root = Path.cwd().resolve()
     for field_name in ("source_artifacts", "log_artifacts"):
         field_value = payload.get(field_name)
         if not isinstance(field_value, list) or not field_value:
@@ -200,9 +246,26 @@ def validate_report_payload(
             if not isinstance(raw_path, str) or not raw_path.strip():
                 problems.append(f"{field_name} contains an invalid path entry")
                 continue
+            if any(ch in raw_path for ch in ("\n", "\r", "\t")):
+                problems.append(f"{field_name} contains control characters in path entry")
+                continue
             artifact_path = resolve_artifact_path(report_path, raw_path)
             if not artifact_path.exists():
                 problems.append(f"{field_name} path does not exist: {raw_path}")
+                continue
+            if artifact_path.is_symlink():
+                problems.append(f"{field_name} path must not be a symlink: {raw_path}")
+                continue
+            if not artifact_path.is_file():
+                problems.append(f"{field_name} path must be a regular file: {raw_path}")
+                continue
+            if not (
+                path_is_within(artifact_path, report_dir)
+                or path_is_within(artifact_path, repo_root)
+            ):
+                problems.append(
+                    f"{field_name} path must stay within report directory or repository root: {raw_path}"
+                )
 
     checks = payload.get("checks")
     if not isinstance(checks, dict):

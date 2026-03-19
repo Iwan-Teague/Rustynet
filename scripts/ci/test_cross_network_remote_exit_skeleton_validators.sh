@@ -16,7 +16,7 @@ run_expect_fail() {
   local script_path="$1"
   shift
   if bash "$script_path" "$@"; then
-    echo "expected skeleton validator to fail: $script_path" >&2
+    echo "expected validator to fail without live lab prerequisites: $script_path" >&2
     exit 1
   fi
 }
@@ -100,4 +100,4 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak
   --artifact-dir "$temp_dir" \
   --output "$temp_dir/skeleton_validation.md"
 
-echo "Cross-network remote-exit validator bootstrap tests: PASS"
+echo "Cross-network remote-exit fail-closed bootstrap tests: PASS"

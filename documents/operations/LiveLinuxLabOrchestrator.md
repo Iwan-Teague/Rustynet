@@ -50,7 +50,7 @@ What runs with each topology:
   - plus controlled role-switch validation
   - plus commit-bound Linux fresh-install OS matrix report generation
   - plus local full gate suite with fresh-install release-gate evidence rebound to the current run
-  - plus the same explicit cross-network remote-exit stages that currently fail closed until the feature exists
+  - plus the full explicit cross-network remote-exit validation stages
 
 Security note:
 
@@ -117,12 +117,14 @@ Default hard-fail stages:
 - live managed-DNS validation
 - fresh install OS matrix report generation
 - local full gate suite (unless `--skip-gates`)
+- cross-network preflight (time skew + host capabilities)
 - cross-network direct remote-exit validation
 - cross-network relay remote-exit validation
 - cross-network failback / roaming validation
 - cross-network traversal adversarial validation
 - cross-network remote-exit DNS validation
-- cross-network remote-exit soak placeholder
+- cross-network remote-exit soak validation
+- cross-network NAT matrix coverage validation
 
 Soft-fail stages continue and are recorded in the summary.
 
@@ -151,7 +153,7 @@ Important outputs:
 - live test JSON reports written by the reused `scripts/e2e/` test scripts
 - `fresh_install_os_matrix_report.json` in the run directory and the canonical `artifacts/phase10/` path when the full Linux evidence path runs
 - canonical fresh-install matrix inputs rebound under `artifacts/phase10/source/fresh_install_os_matrix/` so the committed report no longer depends on gitignored `artifacts/live_lab/...` evidence paths
-- cross-network reports written in the run directory for each future remote-exit suite so missing implementation is explicit and measured
+- cross-network reports written in the run directory for each remote-exit suite
 
 The summary files show:
 
@@ -179,19 +181,34 @@ For reboot/soak failures, the digest now prefers the structured reboot recovery 
 
 On any hard-fail stage, the orchestrator also prints the `failure_digest.md` path immediately in the terminal output so you can jump straight to the compact triage view.
 
-## Cross-Network Placeholder Stage
+For cross-network stage failures, the orchestrator now also captures a forensic bundle under:
+
+- `artifacts/live_lab/<timestamp>/forensics/<stage>/<timestamp>/`
+
+The bundle captures redacted status/routes/endpoints, nftables ruleset, `ss` output, service status, and recent `journalctl` tails from each configured node.
+
+## Cross-Network Remote-Exit Stages
 
 The orchestrator now includes six explicit cross-network remote-exit stages at the end of the current live workflow:
 
+- `cross_network_preflight`
 - `cross_network_direct_remote_exit`
 - `cross_network_relay_remote_exit`
 - `cross_network_failback_roaming`
 - `cross_network_traversal_adversarial`
 - `cross_network_remote_exit_dns`
 - `cross_network_remote_exit_soak`
+- `cross_network_nat_matrix`
 
 Current behavior:
 
+- `cross_network_preflight`
+  - verifies host clocks stay within a strict skew bound before cross-network validators run
+  - verifies required binaries/services and daemon socket readiness on each host
+  - verifies each host has a global IPv4 address, default IPv4 route, and local hostname resolution
+  - verifies hardened runtime posture (`bootstrap_error=none`, encrypted key store enabled, auto-tunnel enforcement enabled, traversal authority enforced, no plaintext passphrase files)
+  - verifies signed assignment/traversal/trust/dns artifact chain custody and freshness on every host before cross-network mutation stages
+  - generates one discovery bundle per host and validates it with strict schema/secret/custody checks before any cross-network validator executes
 - `cross_network_direct_remote_exit`
   - runs a real validator that provisions a two-node direct remote-exit path using signed assignments, verifies full-tunnel routing, and reuses the server-IP bypass validator to prove leak resistance and narrow bypass scope
   - still fails closed if the measured topology does not provide credible cross-network proof, for example when the client and exit underlay addresses are on the same local prefix
@@ -205,15 +222,17 @@ Current behavior:
   - runs a real validator that combines local signed traversal tamper/replay regression tests with live rogue-endpoint denial and control-surface exposure checks
 - `cross_network_remote_exit_dns`
   - runs a real validator that first proves the direct remote-exit path, then validates managed DNS issuance, split-DNS resolution, and fail-closed stale-bundle behavior on that remote-exit client
-- the remaining one stage still calls a schema-valid skeleton validator that always:
-  - emit measured JSON reports in the run directory
-  - record `status=fail`
-  - exit non-zero with an explicit `not implemented yet` failure summary
-
-This is intentional. The direct, relay, failback/roaming, traversal-adversarial, and remote-exit DNS stages now measure real security properties, but the suite as a whole still fails closed so the orchestrator cannot imply that cross-network remote-exit support exists before the remaining soak validator, full HP2/HP3 work, and release-gate evidence are complete.
+- `cross_network_remote_exit_soak`
+  - runs a real validator that bootstraps direct remote-exit, samples runtime health over a timed soak window, and re-runs server-IP bypass/leak checks after soak
+  - fails closed unless soak evidence proves stability, no underlay leak before and after soak, narrow bypass scope, cross-network topology credibility, and no plaintext passphrase files
+- `cross_network_nat_matrix`
+  - validates that the run produced schema-valid, pass-status evidence for every required NAT profile across every cross-network suite
+  - fails closed if any suite/profile combination is missing
 
 Topology requirements for the cross-network stages:
 
+- `cross_network_preflight`
+  - requires `exit` and `client`
 - `cross_network_direct_remote_exit`
   - requires `exit` and `client`
 - `cross_network_relay_remote_exit`
@@ -226,8 +245,8 @@ Topology requirements for the cross-network stages:
   - requires `exit` and `client`
 - `cross_network_remote_exit_soak`
   - requires `exit` and `client`
-
-Until the remaining soak validator exists, a successful orchestrator run should not be expected to pass beyond that final placeholder stage.
+- `cross_network_nat_matrix`
+  - requires completed cross-network report artifacts in the run directory
 
 For parallel stages, the stage log also contains worker-delimited blocks so you can see:
 
@@ -348,6 +367,20 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
 - `--traversal-ttl-secs <seconds>`
   - sets traversal endpoint-hint TTL used by orchestrator-issued signed traversal bundles
   - constrained to `1..120` to match control-plane security bounds; higher values fail closed
+- `--cross-network-nat-profiles <csv>`
+  - runs the cross-network validation suite once per NAT profile label
+  - first profile writes canonical report names; additional profiles write suffixed report/log artifacts
+- `--cross-network-required-nat-profiles <csv>`
+  - defines the NAT profiles that must be present for matrix validation pass
+- `--cross-network-impairment-profile <profile>`
+  - applies a deterministic stage-scoped `tc netem` impairment profile (`none`, `latency_50ms_loss_1pct`, `latency_120ms_loss_3pct`, `loss_5pct`) to `rustynet0` on participating hosts and tags each cross-network report with that profile
+  - impairment cleanup is mandatory; cleanup failure is fail-closed for the stage
+- `--cross-network-max-time-skew-secs <seconds>`
+  - strict maximum allowed per-host clock skew before cross-network stages start
+- `--cross-network-discovery-max-age-secs <seconds>`
+  - strict maximum allowed age for preflight discovery bundles
+- `--cross-network-signed-artifact-max-age-secs <seconds>`
+  - strict maximum allowed age for signed assignment/traversal/trust/dns runtime artifacts in cross-network preflight
 
 ## Current limitation
 

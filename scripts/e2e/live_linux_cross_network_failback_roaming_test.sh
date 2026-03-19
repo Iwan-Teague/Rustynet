@@ -21,6 +21,8 @@ RELAY_NODE_ID=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
 RELAY_NETWORK_ID=""
+NAT_PROFILE="baseline_lan"
+IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/cross_network_failback_roaming_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/cross_network_failback_roaming.log"
@@ -51,6 +53,8 @@ usage() {
 usage: live_linux_cross_network_failback_roaming_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
 
 options:
+  --nat-profile <profile>
+  --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
   --report-path <path>
   --log-path <path>
@@ -73,6 +77,8 @@ write_report() {
     --client-network-id "$CLIENT_NETWORK_ID"
     --exit-network-id "$EXIT_NETWORK_ID"
     --relay-network-id "$RELAY_NETWORK_ID"
+    --nat-profile "$NAT_PROFILE"
+    --impairment-profile "$IMPAIRMENT_PROFILE"
     --source-artifact "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh"
     --check "relay_to_direct_failback_success=${CHECK_RELAY_TO_DIRECT_FAILBACK_SUCCESS}"
     --check "endpoint_roam_recovery_success=${CHECK_ENDPOINT_ROAM_RECOVERY_SUCCESS}"
@@ -121,6 +127,8 @@ while [[ $# -gt 0 ]]; do
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
     --relay-network-id) RELAY_NETWORK_ID="$2"; shift 2 ;;
+    --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
+    --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     --report-path) REPORT_PATH="$2"; shift 2 ;;
     --log-path) LOG_PATH="$2"; shift 2 ;;
@@ -131,6 +139,10 @@ done
 
 if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$RELAY_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$RELAY_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" || -z "$RELAY_NETWORK_ID" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
+  echo "--nat-profile and --impairment-profile must be non-empty" >&2
   exit 2
 fi
 
@@ -177,6 +189,8 @@ main() {
       --client-network-id "$CLIENT_NETWORK_ID" \
       --exit-network-id "$EXIT_NETWORK_ID" \
       --relay-network-id "$RELAY_NETWORK_ID" \
+      --nat-profile "$NAT_PROFILE" \
+      --impairment-profile "$IMPAIRMENT_PROFILE" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
       --report-path "$RELAY_REPORT_PATH" \
       --log-path "$RELAY_LOG_PATH"; then

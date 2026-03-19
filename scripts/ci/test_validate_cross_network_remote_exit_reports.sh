@@ -50,7 +50,12 @@ write_report(
         "suite": "cross_network_direct_remote_exit",
         "status": "pass",
         "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-b",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "direct_remote_exit_success": "pass",
             "remote_exit_no_underlay_leak": "pass",
@@ -74,6 +79,8 @@ write_report(
             "client_network_id": "net-a",
             "exit_network_id": "net-b",
             "relay_network_id": "net-c",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
         },
         "checks": {
             "relay_remote_exit_success": "pass",
@@ -98,6 +105,8 @@ write_report(
             "client_network_id": "net-a",
             "exit_network_id": "net-b",
             "relay_network_id": "net-c",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
         },
         "checks": {
             "relay_to_direct_failback_success": "pass",
@@ -118,7 +127,12 @@ write_report(
             "exit_host": "exit@example",
             "probe_host": "probe@example",
         },
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-b",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "forged_traversal_rejected": "pass",
             "stale_traversal_rejected": "pass",
@@ -136,7 +150,12 @@ write_report(
         "suite": "cross_network_remote_exit_dns",
         "status": "pass",
         "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-b",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "managed_dns_resolution_success": "pass",
             "remote_exit_dns_fail_closed": "pass",
@@ -152,11 +171,20 @@ write_report(
         "suite": "cross_network_remote_exit_soak",
         "status": "pass",
         "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-b",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "long_soak_stable": "pass",
             "remote_exit_no_underlay_leak": "pass",
             "remote_exit_server_ip_bypass_is_narrow": "pass",
+            "cross_network_topology_heuristic": "pass",
+            "direct_remote_exit_ready": "pass",
+            "post_soak_bypass_ready": "pass",
+            "no_plaintext_passphrase_files": "pass",
         },
     },
 )
@@ -168,7 +196,12 @@ write_report(
         "suite": "cross_network_direct_remote_exit",
         "status": "pass",
         "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-a"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-a",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "direct_remote_exit_success": "pass",
             "remote_exit_no_underlay_leak": "pass",
@@ -192,6 +225,8 @@ write_report(
             "client_network_id": "net-a",
             "exit_network_id": "net-b",
             "relay_network_id": "net-c",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
         },
         "checks": {
             "relay_remote_exit_success": "fail",
@@ -212,7 +247,12 @@ write_report(
             "exit_host": "exit@example",
             "probe_host": "probe@example",
         },
-        "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+        "network_context": {
+            "client_network_id": "net-a",
+            "exit_network_id": "net-b",
+            "nat_profile": "baseline_lan",
+            "impairment_profile": "none",
+        },
         "checks": {
             "forged_traversal_rejected": "fail",
             "stale_traversal_rejected": "pass",
@@ -221,6 +261,69 @@ write_report(
             "control_surface_exposure_blocked": "pass",
         },
     },
+)
+PY
+
+symlink_source="$temp_dir/source-link.txt"
+ln -sf "$source_file" "$symlink_source"
+
+python3 - "$temp_dir" "$symlink_source" "$log_file" "$current_commit" "$captured_at_unix" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+temp_dir = Path(sys.argv[1])
+symlink_source = sys.argv[2]
+log_file = sys.argv[3]
+git_commit = sys.argv[4]
+captured_at_unix = int(sys.argv[5])
+
+common = {
+    "schema_version": 1,
+    "phase": "phase10",
+    "suite": "cross_network_direct_remote_exit",
+    "environment": "ci",
+    "evidence_mode": "measured",
+    "captured_at_unix": captured_at_unix,
+    "git_commit": git_commit,
+    "status": "pass",
+    "participants": {"client_host": "client@example", "exit_host": "exit@example"},
+    "network_context": {
+        "client_network_id": "net-a",
+        "exit_network_id": "net-b",
+        "nat_profile": "baseline_lan",
+        "impairment_profile": "none",
+    },
+    "checks": {
+        "direct_remote_exit_success": "pass",
+        "remote_exit_no_underlay_leak": "pass",
+        "remote_exit_server_ip_bypass_is_narrow": "pass",
+    },
+    "log_artifacts": [log_file],
+}
+
+(temp_dir / "invalid_symlink_artifact.json").write_text(
+    json.dumps(
+        {
+            **common,
+            "source_artifacts": [symlink_source],
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+
+(temp_dir / "invalid_outside_artifact.json").write_text(
+    json.dumps(
+        {
+            **common,
+            "source_artifacts": ["/etc/hosts"],
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
 )
 PY
 
@@ -243,6 +346,18 @@ fi
 if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
   --reports "$temp_dir/invalid_fail_without_summary.json"; then
   echo "expected invalid_fail_without_summary.json to fail validation" >&2
+  exit 1
+fi
+
+if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+  --reports "$temp_dir/invalid_symlink_artifact.json"; then
+  echo "expected invalid_symlink_artifact.json to fail validation" >&2
+  exit 1
+fi
+
+if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+  --reports "$temp_dir/invalid_outside_artifact.json"; then
+  echo "expected invalid_outside_artifact.json to fail validation" >&2
   exit 1
 fi
 
@@ -274,7 +389,12 @@ payload = {
     "git_commit": git_commit,
     "status": "fail",
     "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-    "network_context": {"client_network_id": "net-a", "exit_network_id": "net-b"},
+    "network_context": {
+        "client_network_id": "net-a",
+        "exit_network_id": "net-b",
+        "nat_profile": "baseline_lan",
+        "impairment_profile": "none",
+    },
     "checks": {
         "direct_remote_exit_success": "fail",
         "remote_exit_no_underlay_leak": "pass",

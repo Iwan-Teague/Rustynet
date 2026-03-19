@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--client-network-id", default="", help="Client network id.")
     parser.add_argument("--exit-network-id", default="", help="Exit network id.")
     parser.add_argument("--relay-network-id", default="", help="Relay network id.")
+    parser.add_argument("--nat-profile", default="baseline_lan", help="Cross-network NAT profile label.")
+    parser.add_argument(
+        "--impairment-profile",
+        default="none",
+        help="Network impairment profile label.",
+    )
     parser.add_argument("--check", action="append", default=[], help="Check override in key=status form.")
     return parser.parse_args()
 
@@ -109,6 +115,10 @@ def main() -> int:
         network_context["exit_network_id"] = args.exit_network_id
     if args.relay_network_id:
         network_context["relay_network_id"] = args.relay_network_id
+    if args.nat_profile:
+        network_context["nat_profile"] = args.nat_profile
+    if args.impairment_profile:
+        network_context["impairment_profile"] = args.impairment_profile
 
     checks = {name: "fail" for name in spec.required_checks}
     checks.update(parse_check_overrides(args.check))

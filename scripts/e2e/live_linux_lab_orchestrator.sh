@@ -55,6 +55,14 @@ PROFILE_PATH=""
 DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
 TRAVERSAL_TTL_SECS=120
+CROSS_NETWORK_NAT_PROFILES="${RUSTYNET_CROSS_NETWORK_NAT_PROFILES:-baseline_lan}"
+CROSS_NETWORK_REQUIRED_NAT_PROFILES="${RUSTYNET_CROSS_NETWORK_REQUIRED_NAT_PROFILES:-}"
+CROSS_NETWORK_IMPAIRMENT_PROFILE="${RUSTYNET_CROSS_NETWORK_IMPAIRMENT_PROFILE:-none}"
+CROSS_NETWORK_MAX_TIME_SKEW_SECS="${RUSTYNET_CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}"
+CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="${RUSTYNET_CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS:-900}"
+CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="${RUSTYNET_CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}"
+CROSS_NETWORK_NAT_PROFILE_LIST=()
+CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST=()
 
 sanitize_text() {
   printf '%s' "$1" | tr '\t\r\n' '   '
@@ -110,6 +118,18 @@ options:
   --skip-soak                    Skip extended soak/reboot stages
   --skip-cross-network           Skip cross-network validator stages
   --force-cross-network          Force cross-network validator stages even on same-prefix underlay targets
+  --cross-network-nat-profiles <csv>
+                                 Cross-network NAT profile matrix to execute (default: ${CROSS_NETWORK_NAT_PROFILES})
+  --cross-network-required-nat-profiles <csv>
+                                 NAT profiles that must be present for matrix pass (default: same as --cross-network-nat-profiles)
+  --cross-network-impairment-profile <profile>
+                                 Deterministic stage-scoped impairment profile: none | latency_50ms_loss_1pct | latency_120ms_loss_3pct | loss_5pct (default: ${CROSS_NETWORK_IMPAIRMENT_PROFILE})
+  --cross-network-max-time-skew-secs <secs>
+                                 Maximum allowed host clock skew before cross-network validators run (default: ${CROSS_NETWORK_MAX_TIME_SKEW_SECS})
+  --cross-network-discovery-max-age-secs <secs>
+                                 Maximum allowed age for discovery bundles generated during preflight (default: ${CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS})
+  --cross-network-signed-artifact-max-age-secs <secs>
+                                 Maximum allowed age for signed runtime artifacts in preflight (default: ${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS})
   --reboot-hard-fail             Treat reboot soak failures as hard failures
   --dry-run                      Validate config and planned stages without touching hosts
   -h, --help                     Show this help
@@ -205,6 +225,135 @@ validate_positive_integer() {
   fi
 }
 
+is_valid_profile_label() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+is_supported_impairment_profile() {
+  local value="$1"
+  case "$value" in
+    none|latency_50ms_loss_1pct|latency_120ms_loss_3pct|loss_5pct) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_profile_csv_to_array() {
+  local raw="$1"
+  local target_array_name="$2"
+  local item trimmed existing duplicate
+  local -a items=()
+  local -a parsed=()
+  IFS=',' read -r -a items <<< "$raw"
+  for item in "${items[@]}"; do
+    trimmed="$(trim_ascii "$item")"
+    [[ -n "$trimmed" ]] || continue
+    if ! is_valid_profile_label "$trimmed"; then
+      printf 'invalid profile label: %s\n' "$trimmed" >&2
+      return 1
+    fi
+    duplicate=0
+    for existing in "${parsed[@]}"; do
+      if [[ "$existing" == "$trimmed" ]]; then
+        duplicate=1
+        break
+      fi
+    done
+    [[ "$duplicate" -eq 1 ]] && continue
+    parsed+=("$trimmed")
+  done
+  if [[ "${#parsed[@]}" -eq 0 ]]; then
+    printf 'profile list must include at least one non-empty label\n' >&2
+    return 1
+  fi
+  case "$target_array_name" in
+    CROSS_NETWORK_NAT_PROFILE_LIST)
+      CROSS_NETWORK_NAT_PROFILE_LIST=("${parsed[@]}")
+      ;;
+    CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST)
+      CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST=("${parsed[@]}")
+      ;;
+    *)
+      printf 'unsupported profile array target: %s\n' "$target_array_name" >&2
+      return 1
+      ;;
+  esac
+}
+
+join_csv() {
+  local IFS=','
+  printf '%s' "$*"
+}
+
+prepare_cross_network_profile_config() {
+  parse_profile_csv_to_array "$CROSS_NETWORK_NAT_PROFILES" CROSS_NETWORK_NAT_PROFILE_LIST || return 1
+  if [[ -z "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" ]]; then
+    CROSS_NETWORK_REQUIRED_NAT_PROFILES="$(join_csv "${CROSS_NETWORK_NAT_PROFILE_LIST[@]}")"
+  fi
+  parse_profile_csv_to_array "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST || return 1
+  if [[ -z "$CROSS_NETWORK_IMPAIRMENT_PROFILE" ]]; then
+    printf 'cross-network impairment profile must be non-empty\n' >&2
+    return 1
+  fi
+  if ! is_valid_profile_label "$CROSS_NETWORK_IMPAIRMENT_PROFILE"; then
+    printf 'invalid cross-network impairment profile: %s\n' "$CROSS_NETWORK_IMPAIRMENT_PROFILE" >&2
+    return 1
+  fi
+  if ! is_supported_impairment_profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE"; then
+    printf 'unsupported cross-network impairment profile: %s (supported: none, latency_50ms_loss_1pct, latency_120ms_loss_3pct, loss_5pct)\n' "$CROSS_NETWORK_IMPAIRMENT_PROFILE" >&2
+    return 1
+  fi
+  local required profile found
+  for required in "${CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST[@]}"; do
+    found=0
+    for profile in "${CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+      if [[ "$profile" == "$required" ]]; then
+        found=1
+        break
+      fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+      printf 'required NAT profile %s is not present in configured cross-network NAT profiles (%s)\n' \
+        "$required" "$CROSS_NETWORK_NAT_PROFILES" >&2
+      return 1
+    fi
+  done
+}
+
+cross_network_stage_suffix_for_profile_index() {
+  local index="$1"
+  local profile="$2"
+  if [[ "$index" -eq 0 ]]; then
+    printf ''
+  else
+    printf '_%s' "$profile"
+  fi
+}
+
+cross_network_report_path_for_profile() {
+  local base_name="$1"
+  local index="$2"
+  local profile="$3"
+  if [[ "$index" -eq 0 ]]; then
+    printf '%s/%s' "$REPORT_DIR" "$base_name"
+  else
+    local stem="${base_name%.json}"
+    printf '%s/%s_%s.json' "$REPORT_DIR" "$stem" "$profile"
+  fi
+}
+
+cross_network_log_path_for_profile() {
+  local base_name="$1"
+  local index="$2"
+  local profile="$3"
+  if [[ "$index" -eq 0 ]]; then
+    printf '%s/%s' "$REPORT_DIR" "$base_name"
+  else
+    local stem="${base_name%.log}"
+    printf '%s/%s_%s.log' "$REPORT_DIR" "$stem" "$profile"
+  fi
+}
+
 is_valid_ipv4() {
   local ip="$1"
   local octet
@@ -292,6 +441,12 @@ load_profile_file() {
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
       SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
       TRAVERSAL_TTL_SECS) [[ "$TRAVERSAL_TTL_SECS" == "120" ]] && TRAVERSAL_TTL_SECS="$value" ;;
+      CROSS_NETWORK_NAT_PROFILES) [[ "$CROSS_NETWORK_NAT_PROFILES" == "${RUSTYNET_CROSS_NETWORK_NAT_PROFILES:-baseline_lan}" ]] && CROSS_NETWORK_NAT_PROFILES="$value" ;;
+      CROSS_NETWORK_REQUIRED_NAT_PROFILES) [[ -z "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" ]] && CROSS_NETWORK_REQUIRED_NAT_PROFILES="$value" ;;
+      CROSS_NETWORK_IMPAIRMENT_PROFILE) [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" == "${RUSTYNET_CROSS_NETWORK_IMPAIRMENT_PROFILE:-none}" ]] && CROSS_NETWORK_IMPAIRMENT_PROFILE="$value" ;;
+      CROSS_NETWORK_MAX_TIME_SKEW_SECS) [[ "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" == "${RUSTYNET_CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" ]] && CROSS_NETWORK_MAX_TIME_SKEW_SECS="$value" ;;
+      CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS) [[ "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="$value" ;;
+      CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS) [[ "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="$value" ;;
       SOURCE_MODE)
         if [[ "$SOURCE_MODE" == "working-tree" && "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
           SOURCE_MODE="$value"
@@ -587,6 +742,104 @@ cross_network_probe_label() {
   return 1
 }
 
+cross_network_impairment_remote_script() {
+  local target="$1"
+  local remote_src
+  remote_src="$(live_lab_remote_src_dir "$target")"
+  printf '%s/scripts/e2e/apply_cross_network_impairment_profile.sh' "$remote_src"
+}
+
+cross_network_apply_impairment_profile_target() {
+  local target="$1"
+  local script_path
+  script_path="$(cross_network_impairment_remote_script "$target")"
+  live_lab_run_root "$target" \
+    "root test -f '$script_path' && root bash '$script_path' --mode apply --profile '$CROSS_NETWORK_IMPAIRMENT_PROFILE' --interface rustynet0"
+}
+
+cross_network_clear_impairment_profile_target() {
+  local target="$1"
+  local script_path
+  script_path="$(cross_network_impairment_remote_script "$target")"
+  live_lab_run_root "$target" \
+    "root test -f '$script_path' && root bash '$script_path' --mode clear --profile '$CROSS_NETWORK_IMPAIRMENT_PROFILE' --interface rustynet0"
+}
+
+cross_network_stage_labels_for_impairment() {
+  local stage_kind="$1"
+  local relay_label probe_label
+  case "$stage_kind" in
+    direct|dns|soak)
+      printf '%s\n' client exit
+      ;;
+    relay|failback)
+      relay_label="$(cross_network_relay_label)" || return 1
+      printf '%s\n' client exit "$relay_label"
+      ;;
+    adversarial)
+      probe_label="$(cross_network_probe_label)" || return 1
+      printf '%s\n' client exit "$probe_label"
+      ;;
+    *)
+      printf 'unsupported cross-network stage kind for impairment: %s\n' "$stage_kind" >&2
+      return 1
+      ;;
+  esac
+}
+
+run_cross_network_stage_with_impairment() {
+  local stage_kind="$1"
+  shift
+  local -a cmd=("$@")
+  local -a labels=()
+  local -a targets=()
+  local -a applied_targets=()
+  local label target
+  local rc=0
+  local cleanup_failed=0
+
+  if [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" == "none" ]]; then
+    "${cmd[@]}"
+    return $?
+  fi
+
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    target="$(node_target_for_label "$label")"
+    if [[ -z "$target" ]]; then
+      printf 'missing target for impairment label: %s\n' "$label" >&2
+      return 1
+    fi
+    labels+=("$label")
+    targets+=("$target")
+  done < <(cross_network_stage_labels_for_impairment "$stage_kind")
+
+  set +e
+  for target in "${targets[@]}"; do
+    if ! cross_network_apply_impairment_profile_target "$target"; then
+      rc=1
+      break
+    fi
+    applied_targets+=("$target")
+  done
+  if [[ "$rc" -eq 0 ]]; then
+    "${cmd[@]}"
+    rc=$?
+  fi
+  for target in "${applied_targets[@]}"; do
+    if ! cross_network_clear_impairment_profile_target "$target"; then
+      cleanup_failed=1
+    fi
+  done
+  set -e
+
+  if [[ "$cleanup_failed" -ne 0 ]]; then
+    printf 'failed to clear impairment profile (%s) on one or more targets\n' "$CROSS_NETWORK_IMPAIRMENT_PROFILE" >&2
+    return 1
+  fi
+  return "$rc"
+}
+
 cross_network_stages_applicable() {
   local client_target exit_target client_addr exit_addr same_prefix_rc
   CROSS_NETWORK_SKIP_REASON=""
@@ -736,6 +989,138 @@ update_overall_status() {
   OVERALL_STATUS="fail"
 }
 
+stage_requires_forensics_bundle() {
+  local stage_name="$1"
+  [[ "$stage_name" == cross_network_* ]]
+}
+
+redact_forensics_text() {
+  python3 - <<'PY'
+import re
+import sys
+
+line_redact_patterns = (
+    re.compile(r"BEGIN [A-Z ]*PRIVATE KEY", re.IGNORECASE),
+    re.compile(r"PRIVATE KEY-----", re.IGNORECASE),
+)
+value_redact_patterns = (
+    re.compile(r"(?i)\b(passphrase|password|secret|token)\b(\s*[:=]\s*)(\S+)"),
+)
+
+for raw_line in sys.stdin:
+    line = raw_line.rstrip("\n")
+    if any(pattern.search(line) for pattern in line_redact_patterns):
+        print("[REDACTED sensitive key material]")
+        continue
+    redacted = line
+    for pattern in value_redact_patterns:
+        redacted = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", redacted)
+    print(redacted)
+PY
+}
+
+capture_forensics_user() {
+  local target="$1"
+  local command="$2"
+  local output_path="$3"
+  local raw rc
+  set +e
+  raw="$(live_lab_capture "$target" "$command" 120 2>&1)"
+  rc=$?
+  set -e
+  {
+    printf 'target=%s\n' "$target"
+    printf 'capture_mode=user\n'
+    printf 'capture_rc=%s\n' "$rc"
+    printf 'command=%s\n' "$command"
+    printf -- '---\n'
+    printf '%s\n' "$raw" | redact_forensics_text
+  } > "$output_path"
+}
+
+capture_forensics_root() {
+  local target="$1"
+  local command="$2"
+  local output_path="$3"
+  local raw rc
+  set +e
+  raw="$(live_lab_capture_root "$target" "$command" 120 2>&1)"
+  rc=$?
+  set -e
+  {
+    printf 'target=%s\n' "$target"
+    printf 'capture_mode=root\n'
+    printf 'capture_rc=%s\n' "$rc"
+    printf 'command=%s\n' "$command"
+    printf -- '---\n'
+    printf '%s\n' "$raw" | redact_forensics_text
+  } > "$output_path"
+}
+
+collect_cross_network_failure_forensics() {
+  local stage_name="$1"
+  local collected_at stage_dir node_dir label target node_id role manifest_path
+  collected_at="$(date -u +%Y%m%dT%H%M%SZ)"
+  stage_dir="$REPORT_DIR/forensics/${stage_name}/${collected_at}"
+  mkdir -p "$stage_dir"
+
+  while IFS=$'\t' read -r label target node_id role; do
+    [[ -n "$target" ]] || continue
+    node_dir="$stage_dir/${label}"
+    mkdir -p "$node_dir"
+
+    capture_forensics_root "$target" "root date -u +%Y-%m-%dT%H:%M:%SZ || true; root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status || true" "$node_dir/status.txt" || true
+    capture_forensics_user "$target" "ip -4 route show table main || true; ip -4 route show table 51820 || true; ip -4 route get 1.1.1.1 || true" "$node_dir/routes.txt" || true
+    capture_forensics_user "$target" "ip -br addr || true; ip -br link || true" "$node_dir/interfaces.txt" || true
+    capture_forensics_root "$target" "root wg show rustynet0 endpoints || true" "$node_dir/wg_endpoints.txt" || true
+    capture_forensics_root "$target" "root nft list ruleset || true" "$node_dir/nft_ruleset.txt" || true
+    capture_forensics_root "$target" "root ss -tulpn || true" "$node_dir/ss_tulpn.txt" || true
+    capture_forensics_root "$target" "root ls -l /run/rustynet || true; root test -S /run/rustynet/rustynetd.sock && echo daemon_socket_present || echo daemon_socket_missing" "$node_dir/daemon_socket.txt" || true
+    capture_forensics_root "$target" "root systemctl status rustynetd.service rustynetd-privileged-helper.service --no-pager -l || true" "$node_dir/systemd_status.txt" || true
+    capture_forensics_root "$target" "root journalctl -u rustynetd.service -u rustynetd-privileged-helper.service -n 250 --no-pager --output=short-iso || true" "$node_dir/journal_tail.txt" || true
+    {
+      printf 'label=%s\n' "$label"
+      printf 'target=%s\n' "$target"
+      printf 'node_id=%s\n' "$node_id"
+      printf 'role=%s\n' "$role"
+    } > "$node_dir/node_identity.txt"
+  done < "$NODES_TSV"
+
+  manifest_path="$stage_dir/manifest.json"
+  python3 - "$stage_name" "$collected_at" "$stage_dir" "$manifest_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+stage_name = sys.argv[1]
+collected_at = sys.argv[2]
+stage_dir = Path(sys.argv[3]).resolve()
+manifest_path = Path(sys.argv[4]).resolve()
+
+nodes = []
+for node_dir in sorted(path for path in stage_dir.iterdir() if path.is_dir()):
+    files = [str(path.resolve()) for path in sorted(node_dir.glob("*")) if path.is_file()]
+    nodes.append(
+        {
+            "label": node_dir.name,
+            "files": files,
+        }
+    )
+
+payload = {
+    "schema_version": 1,
+    "mode": "cross_network_failure_forensics",
+    "stage": stage_name,
+    "collected_at_utc": collected_at,
+    "bundle_dir": str(stage_dir),
+    "nodes": nodes,
+}
+manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+
+  printf '%s' "$stage_dir"
+}
+
 run_stage() {
   local severity="$1"
   local stage_name="$2"
@@ -746,6 +1131,7 @@ run_stage() {
   local finished_at
   local rc
   local status="pass"
+  local forensics_dir=""
   printf '[stage:%s] START %s\n' "$stage_name" "$description" | tee "$log_path"
   set +e
   (
@@ -757,6 +1143,13 @@ run_stage() {
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
     printf '[stage:%s] FAIL rc=%s\n' "$stage_name" "$rc" | tee -a "$log_path"
+    if stage_requires_forensics_bundle "$stage_name"; then
+      if forensics_dir="$(collect_cross_network_failure_forensics "$stage_name")"; then
+        printf '[stage:%s] forensics bundle: %s\n' "$stage_name" "$forensics_dir" | tee -a "$log_path"
+      else
+        printf '[stage:%s] warning: failed to collect forensics bundle\n' "$stage_name" | tee -a "$log_path"
+      fi
+    fi
     printf '[stage:%s] failure digest: %s\n' "$stage_name" "$FAILURE_DIGEST_MD" | tee -a "$log_path"
   else
     printf '[stage:%s] PASS\n' "$stage_name" | tee -a "$log_path"
@@ -2075,8 +2468,12 @@ stage_run_live_managed_dns() {
 }
 
 stage_run_cross_network_direct_remote_exit() {
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh" \
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_direct_remote_exit_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_direct_remote_exit.log}"
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
@@ -2085,19 +2482,27 @@ stage_run_cross_network_direct_remote_exit() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/cross_network_direct_remote_exit_report.json" \
-    --log-path "$REPORT_DIR/cross_network_direct_remote_exit.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment direct "${cmd[@]}"
 }
 
 stage_run_cross_network_relay_remote_exit() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_relay_remote_exit_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_relay_remote_exit.log}"
   local relay_label
   if ! relay_label="$(cross_network_relay_label)"; then
     printf 'cross-network relay remote-exit validation requires entry or aux target\n' >&2
     return 1
   fi
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh" \
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
@@ -2109,19 +2514,27 @@ stage_run_cross_network_relay_remote_exit() {
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
     --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/cross_network_relay_remote_exit_report.json" \
-    --log-path "$REPORT_DIR/cross_network_relay_remote_exit.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment relay "${cmd[@]}"
 }
 
 stage_run_cross_network_failback_roaming() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_failback_roaming_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_failback_roaming.log}"
   local relay_label
   if ! relay_label="$(cross_network_relay_label)"; then
     printf 'cross-network failback and roaming validation requires entry or aux target\n' >&2
     return 1
   fi
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh" \
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
@@ -2133,19 +2546,27 @@ stage_run_cross_network_failback_roaming() {
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
     --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/cross_network_failback_roaming_report.json" \
-    --log-path "$REPORT_DIR/cross_network_failback_roaming.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment failback "${cmd[@]}"
 }
 
 stage_run_cross_network_traversal_adversarial() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_traversal_adversarial_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_traversal_adversarial.log}"
   local probe_label
   if ! probe_label="$(cross_network_probe_label)"; then
     printf 'cross-network traversal adversarial validation requires entry or aux target\n' >&2
     return 1
   fi
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh" \
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
@@ -2153,13 +2574,21 @@ stage_run_cross_network_traversal_adversarial() {
     --probe-host "$(node_target_for_label "$probe_label")" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
-    --report-path "$REPORT_DIR/cross_network_traversal_adversarial_report.json" \
-    --log-path "$REPORT_DIR/cross_network_traversal_adversarial.log"
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment adversarial "${cmd[@]}"
 }
 
 stage_run_cross_network_remote_exit_dns() {
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh" \
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_remote_exit_dns_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_remote_exit_dns.log}"
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
@@ -2168,22 +2597,363 @@ stage_run_cross_network_remote_exit_dns() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/cross_network_remote_exit_dns_report.json" \
-    --log-path "$REPORT_DIR/cross_network_remote_exit_dns.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment dns "${cmd[@]}"
 }
 
-stage_run_cross_network_remote_exit_soak_placeholder() {
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh" \
+stage_run_cross_network_remote_exit_soak() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_remote_exit_soak_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_remote_exit_soak.log}"
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh"
     --ssh-password-file "$SSH_PASSWORD_FILE" \
     --sudo-password-file "$SUDO_PASSWORD_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
-    --report-path "$REPORT_DIR/cross_network_remote_exit_soak_report.json" \
-    --log-path "$REPORT_DIR/cross_network_remote_exit_soak.log"
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment soak "${cmd[@]}"
+}
+
+cross_network_verify_signed_artifact_chain() {
+  local target="$1"
+  live_lab_capture_root "$target" "
+max_age='${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}'
+now=\$(date +%s)
+for p in \
+  /var/lib/rustynet/rustynetd.assignment \
+  /var/lib/rustynet/rustynetd.assignment.watermark \
+  /etc/rustynet/assignment.pub \
+  /var/lib/rustynet/rustynetd.traversal \
+  /var/lib/rustynet/rustynetd.traversal.watermark \
+  /etc/rustynet/traversal.pub \
+  /var/lib/rustynet/rustynetd.trust \
+  /var/lib/rustynet/rustynetd.trust.watermark \
+  /etc/rustynet/trust-evidence.pub \
+  /var/lib/rustynet/rustynetd.dns-zone \
+  /var/lib/rustynet/rustynetd.dns-zone.watermark \
+  /etc/rustynet/dns-zone.pub
+do
+  root test -f \"\$p\" || { echo missing:\$p; exit 1; }
+  root test ! -L \"\$p\" || { echo symlink:\$p; exit 1; }
+  mode=\$(root stat -c '%a' \"\$p\")
+  owner=\$(root stat -c '%U:%G' \"\$p\")
+  size=\$(root stat -c '%s' \"\$p\")
+  mtime=\$(root stat -c '%Y' \"\$p\")
+  if [[ ! \"\$owner\" =~ ^root: ]]; then
+    echo owner_mismatch:\$p:\$owner
+    exit 1
+  fi
+  if (( (8#\$mode) & 022 )); then
+    echo mode_too_permissive:\$p:\$mode
+    exit 1
+  fi
+  if (( size <= 0 )); then
+    echo empty_file:\$p
+    exit 1
+  fi
+  if [[ \"\$p\" != /etc/rustynet/*.pub ]]; then
+    age=\$((now - mtime))
+    if (( age > max_age )); then
+      echo stale_artifact:\$p:age=\$age:max=\$max_age
+      exit 1
+    fi
+    echo artifact:\$p:owner=\$owner:mode=\$mode:age=\$age
+  else
+    echo verifier:\$p:owner=\$owner:mode=\$mode
+  fi
+done
+echo signed_artifact_chain_ok
+"
+}
+
+cross_network_preflight_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local _role="$4"
+  local stage_dir capability_path
+  local remote_unix local_unix skew
+  local cmd
+  local required_user_cmds=(rustynet rustynetd wg systemctl ss python3 ip nft journalctl)
+  local required_root_cmds=(wg systemctl ss ip nft journalctl)
+  local status_snapshot route_snapshot endpoint_snapshot
+  local netcheck_snapshot dns_inspect_snapshot artifact_chain_snapshot
+  local global_ipv4 hostname_resolution_snapshot plaintext_snapshot
+  local last_assignment_unix assignment_age
+  local remote_src discovery_script_path discovery_remote_path discovery_local_path discovery_validation_path
+  local discovery_hash
+
+  stage_dir="$(parallel_stage_dir cross_network_preflight)"
+  capability_path="${stage_dir}/capabilities-${label}.txt"
+  : > "$capability_path"
+
+  live_lab_push_sudo_password "$target"
+  live_lab_wait_for_daemon_socket "$target"
+  local_unix="${CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX:-0}"
+  if [[ ! "$local_unix" =~ ^[0-9]+$ ]] || (( local_unix <= 0 )); then
+    printf 'invalid preflight local unix reference for %s (%s): %s\n' "$label" "$target" "$local_unix" >&2
+    return 1
+  fi
+  remote_unix="$(live_lab_capture "$target" "date -u +%s" | tr -d '[:space:]')"
+  if [[ ! "$remote_unix" =~ ^[0-9]+$ ]]; then
+    printf 'unable to read remote unix timestamp for %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if (( local_unix >= remote_unix )); then
+    skew=$((local_unix - remote_unix))
+  else
+    skew=$((remote_unix - local_unix))
+  fi
+  if (( skew > CROSS_NETWORK_MAX_TIME_SKEW_SECS )); then
+    printf 'clock skew too large for %s (%s): skew=%ss max=%ss\n' "$label" "$target" "$skew" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >&2
+    return 1
+  fi
+
+  if [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" != "none" ]]; then
+    required_user_cmds+=(tc)
+    required_root_cmds+=(tc)
+  fi
+
+  for cmd in "${required_user_cmds[@]}"; do
+    if ! live_lab_capture "$target" "command -v '$cmd'" >/dev/null 2>&1; then
+      printf 'missing required user command on %s (%s): %s\n' "$label" "$target" "$cmd" >&2
+      return 1
+    fi
+  done
+  for cmd in "${required_root_cmds[@]}"; do
+    if ! live_lab_run_root "$target" "root command -v '$cmd' >/dev/null"; then
+      printf 'missing required root command on %s (%s): %s\n' "$label" "$target" "$cmd" >&2
+      return 1
+    fi
+  done
+
+  remote_src="$(live_lab_remote_src_dir "$target")"
+  discovery_script_path="${remote_src}/scripts/operations/collect_network_discovery_info.sh"
+  if ! live_lab_run_root "$target" "root test -f '$discovery_script_path'"; then
+    printf 'missing discovery script on %s (%s): %s\n' "$label" "$target" "$discovery_script_path" >&2
+    return 1
+  fi
+  if [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" != "none" ]]; then
+    if ! live_lab_run_root "$target" "root test -f '${remote_src}/scripts/e2e/apply_cross_network_impairment_profile.sh'"; then
+      printf 'missing impairment profile script on %s (%s)\n' "$label" "$target" >&2
+      return 1
+    fi
+  fi
+
+  global_ipv4="$(live_lab_capture "$target" "ip -4 -o addr show up scope global | awk '{print \$4; exit}' | cut -d/ -f1" | tr -d '[:space:]')"
+  if [[ -z "$global_ipv4" ]]; then
+    printf 'missing global IPv4 address on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if ! live_lab_capture "$target" "ip -4 route show default | awk '/^default/{found=1} END{exit(found?0:1)}'" >/dev/null 2>&1; then
+    printf 'missing default IPv4 route on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  hostname_resolution_snapshot="$(live_lab_capture "$target" 'current_hostname="$(hostname)"; getent hosts "$current_hostname" 2>/dev/null | head -n 1 || true')"
+  if [[ -z "$(printf '%s' "$hostname_resolution_snapshot" | tr -d '[:space:]')" ]]; then
+    printf 'hostname does not resolve locally on %s (%s); fix /etc/hosts or local resolver\n' "$label" "$target" >&2
+    return 1
+  fi
+
+  artifact_chain_snapshot="$(cross_network_verify_signed_artifact_chain "$target")"
+  if [[ "$artifact_chain_snapshot" != *"signed_artifact_chain_ok"* ]]; then
+    printf 'signed artifact chain verification failed on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+
+  live_lab_run_root "$target" "root test -S /run/rustynet/rustynetd.sock"
+  live_lab_run_root "$target" "root systemctl is-active --quiet rustynetd.service"
+  live_lab_run_root "$target" "root systemctl is-active --quiet rustynetd-privileged-helper.service"
+
+  status_snapshot="$(live_lab_status "$target")"
+  if [[ "$status_snapshot" != *"bootstrap_error=none"* ]]; then
+    printf 'runtime bootstrap_error is not none on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ "$status_snapshot" != *"encrypted_key_store=true"* ]]; then
+    printf 'encrypted key store is not enforced on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ "$status_snapshot" != *"auto_tunnel_enforce=true"* ]]; then
+    printf 'auto tunnel enforcement is not enabled on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ "$status_snapshot" != *"last_reconcile_error=none"* ]]; then
+    printf 'last reconcile error is not none on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ ! "$status_snapshot" =~ traversal_authority=enforced ]]; then
+    printf 'traversal authority is not enforced on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  last_assignment_unix="$(printf '%s\n' "$status_snapshot" | sed -n 's/.*last_assignment=\([0-9][0-9]*\):[0-9][0-9]*.*/\1/p' | head -n 1)"
+  if [[ ! "$last_assignment_unix" =~ ^[0-9]+$ ]]; then
+    printf 'unable to parse last_assignment timestamp on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if (( remote_unix >= last_assignment_unix )); then
+    assignment_age=$((remote_unix - last_assignment_unix))
+  else
+    assignment_age=$((last_assignment_unix - remote_unix))
+  fi
+  if (( assignment_age > CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS )); then
+    printf 'last_assignment is stale on %s (%s): age=%ss max=%ss\n' "$label" "$target" "$assignment_age" "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >&2
+    return 1
+  fi
+  if [[ "$status_snapshot" == *"restricted_safe_mode=true"* || "$status_snapshot" == *"state=FailClosed"* ]]; then
+    printf 'runtime is in restricted/fail-closed state on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  netcheck_snapshot="$(live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck")"
+  if [[ "$netcheck_snapshot" != *"traversal_status=valid"* ]]; then
+    printf 'netcheck traversal status is not valid on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ "$netcheck_snapshot" != *"traversal_error=none"* ]]; then
+    printf 'netcheck traversal error is not none on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  if [[ "$netcheck_snapshot" == *"path_mode=fail_closed"* ]]; then
+    printf 'netcheck path mode is fail_closed on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  dns_inspect_snapshot="$(live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
+  if [[ "$dns_inspect_snapshot" != *"dns inspect: state=valid"* ]]; then
+    printf 'dns inspect is not valid on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+  plaintext_snapshot="$(live_lab_no_plaintext_passphrase_check "$target" || true)"
+  if [[ "$plaintext_snapshot" != *"no-plaintext-passphrase-files"* ]]; then
+    printf 'plaintext passphrase files detected on %s (%s)\n' "$label" "$target" >&2
+    return 1
+  fi
+
+  discovery_remote_path="/tmp/rn-cross-network-discovery-${label}.json"
+  discovery_local_path="${stage_dir}/discovery-${label}.json"
+  discovery_validation_path="${stage_dir}/discovery-${label}.md"
+  live_lab_run_root "$target" "root bash '$discovery_script_path' --quiet --output '$discovery_remote_path'"
+  live_lab_scp_from "$target" "$discovery_remote_path" "$discovery_local_path"
+  live_lab_run_root "$target" "root rustynet ops secure-remove --path '$discovery_remote_path' >/dev/null 2>&1 || root rm -f '$discovery_remote_path'" || true
+  python3 "$ROOT_DIR/scripts/ci/validate_network_discovery_bundle.py" \
+    --bundle "$discovery_local_path" \
+    --max-age-seconds "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" \
+    --require-verifier-keys \
+    --require-daemon-active \
+    --require-socket-present \
+    --output "$discovery_validation_path"
+  discovery_hash="$(python3 - "$discovery_local_path" <<'PY'
+import hashlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as handle:
+    print(hashlib.sha256(handle.read()).hexdigest())
+PY
+)"
+
+  route_snapshot="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true" || true)"
+  endpoint_snapshot="$(live_lab_capture_root "$target" "root wg show rustynet0 endpoints || true" || true)"
+
+  printf 'label=%s\n' "$label" >> "$capability_path"
+  printf 'target=%s\n' "$target" >> "$capability_path"
+  printf 'node_id=%s\n' "$node_id" >> "$capability_path"
+  printf 'local_unix=%s\n' "$local_unix" >> "$capability_path"
+  printf 'remote_unix=%s\n' "$remote_unix" >> "$capability_path"
+  printf 'clock_skew_secs=%s\n' "$skew" >> "$capability_path"
+  printf 'max_clock_skew_secs=%s\n' "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >> "$capability_path"
+  printf 'signed_artifact_max_age_secs=%s\n' "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >> "$capability_path"
+  printf 'last_assignment_age_secs=%s\n' "$assignment_age" >> "$capability_path"
+  printf 'discovery_bundle_max_age_secs=%s\n' "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" >> "$capability_path"
+  printf 'global_ipv4=%s\n' "$global_ipv4" >> "$capability_path"
+  printf 'discovery_bundle_path=%s\n' "$discovery_local_path" >> "$capability_path"
+  printf 'discovery_bundle_sha256=%s\n' "$discovery_hash" >> "$capability_path"
+  printf 'discovery_validation_report=%s\n' "$discovery_validation_path" >> "$capability_path"
+  printf 'hostname_resolution_snapshot=%s\n' "$(printf '%s' "$hostname_resolution_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'artifact_chain_snapshot=%s\n' "$(printf '%s' "$artifact_chain_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'plaintext_snapshot=%s\n' "$(printf '%s' "$plaintext_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'status_snapshot=%s\n' "$(printf '%s' "$status_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'netcheck_snapshot=%s\n' "$(printf '%s' "$netcheck_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'dns_inspect_snapshot=%s\n' "$(printf '%s' "$dns_inspect_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'route_snapshot=%s\n' "$(printf '%s' "$route_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'endpoint_snapshot=%s\n' "$(printf '%s' "$endpoint_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+}
+
+stage_run_cross_network_preflight() {
+  local stage_dir report_path
+  CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX="$(date +%s)"
+  export CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX
+  run_parallel_node_stage cross_network_preflight cross_network_preflight_worker
+
+  stage_dir="$(parallel_stage_dir cross_network_preflight)"
+  report_path="$REPORT_DIR/cross_network_preflight_report.json"
+  python3 - "$NODES_TSV" "$stage_dir" "$report_path" "$CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+nodes_tsv = Path(sys.argv[1])
+stage_dir = Path(sys.argv[2])
+report_path = Path(sys.argv[3])
+reference_unix = int(sys.argv[4])
+max_skew = int(sys.argv[5])
+discovery_max_age = int(sys.argv[6])
+signed_artifact_max_age = int(sys.argv[7])
+
+nodes = []
+for line in nodes_tsv.read_text(encoding="utf-8").splitlines():
+    parts = line.split("\t")
+    if len(parts) != 4:
+        continue
+    label, target, node_id, role = parts
+    capability_file = stage_dir / f"capabilities-{label}.txt"
+    nodes.append(
+        {
+            "label": label,
+            "target": target,
+            "node_id": node_id,
+            "role": role,
+            "capability_file": str(capability_file.resolve()),
+            "capability_file_exists": capability_file.exists(),
+        }
+    )
+
+payload = {
+    "schema_version": 1,
+    "mode": "cross_network_preflight",
+    "reference_unix": reference_unix,
+    "max_clock_skew_secs": max_skew,
+    "discovery_max_age_secs": discovery_max_age,
+    "signed_artifact_max_age_secs": signed_artifact_max_age,
+    "nodes": nodes,
+}
+report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+stage_run_cross_network_nat_matrix() {
+  local output_path="$REPORT_DIR/cross_network_remote_exit_nat_matrix_validation.md"
+  python3 "$ROOT_DIR/scripts/ci/validate_cross_network_nat_matrix.py" \
+    --artifact-dir "$REPORT_DIR" \
+    --required-nat-profiles "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" \
+    --expected-git-commit "$(current_run_git_commit)" \
+    --require-pass-status \
+    --output "$output_path"
 }
 
 stage_generate_fresh_install_os_matrix_report() {
@@ -2730,6 +3500,12 @@ parse_args() {
       --skip-soak) RUN_SOAK=0; shift ;;
       --skip-cross-network) CROSS_NETWORK_MODE="skip"; shift ;;
       --force-cross-network) CROSS_NETWORK_MODE="force"; shift ;;
+      --cross-network-nat-profiles) CROSS_NETWORK_NAT_PROFILES="$2"; shift 2 ;;
+      --cross-network-required-nat-profiles) CROSS_NETWORK_REQUIRED_NAT_PROFILES="$2"; shift 2 ;;
+      --cross-network-impairment-profile) CROSS_NETWORK_IMPAIRMENT_PROFILE="$2"; shift 2 ;;
+      --cross-network-max-time-skew-secs) CROSS_NETWORK_MAX_TIME_SKEW_SECS="$2"; shift 2 ;;
+      --cross-network-discovery-max-age-secs) CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="$2"; shift 2 ;;
+      --cross-network-signed-artifact-max-age-secs) CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="$2"; shift 2 ;;
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -2892,6 +3668,22 @@ main() {
   validate_topology_inputs
   validate_source_mode
   validate_positive_integer "traversal TTL seconds" "$TRAVERSAL_TTL_SECS"
+  validate_positive_integer "cross-network max time skew seconds" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS"
+  validate_positive_integer "cross-network discovery max age seconds" "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS"
+  validate_positive_integer "cross-network signed artifact max age seconds" "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS"
+  if (( CROSS_NETWORK_MAX_TIME_SKEW_SECS > 30 )); then
+    printf 'cross-network max time skew seconds must be <= 30 (got: %s)\n' "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >&2
+    exit 2
+  fi
+  if (( CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS > 86400 )); then
+    printf 'cross-network discovery max age seconds must be <= 86400 (got: %s)\n' "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" >&2
+    exit 2
+  fi
+  if (( CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS > 86400 )); then
+    printf 'cross-network signed artifact max age seconds must be <= 86400 (got: %s)\n' "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >&2
+    exit 2
+  fi
+  prepare_cross_network_profile_config
   if (( TRAVERSAL_TTL_SECS > 120 )); then
     printf 'traversal TTL seconds must be <= 120 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
     exit 2
@@ -2948,28 +3740,42 @@ main() {
       record_stage_skip "extended_soak" "soft" "dry-run: not executed"
     fi
     if cross_network_stages_applicable; then
-      record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: not executed"
-      if cross_network_relay_label >/dev/null 2>&1; then
-        record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: not executed"
-        record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: not executed"
-      else
-        record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because entry or aux target is not configured"
-        record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because entry or aux target is not configured"
-      fi
-      if cross_network_probe_label >/dev/null 2>&1; then
-        record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: not executed"
-      else
-        record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because entry or aux target is not configured"
-      fi
-      record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: not executed"
-      record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: not executed"
+      local nat_profile nat_idx stage_suffix
+      record_stage_skip "cross_network_preflight" "hard" "dry-run: not executed"
+      for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+        nat_profile="${CROSS_NETWORK_NAT_PROFILE_LIST[$nat_idx]}"
+        stage_suffix="$(cross_network_stage_suffix_for_profile_index "$nat_idx" "$nat_profile")"
+        record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" "hard" "dry-run: not executed"
+        if cross_network_relay_label >/dev/null 2>&1; then
+          record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: not executed"
+          record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: not executed"
+        else
+          record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
+          record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
+        fi
+        if cross_network_probe_label >/dev/null 2>&1; then
+          record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" "hard" "dry-run: not executed"
+        else
+          record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
+        fi
+        record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" "hard" "dry-run: not executed"
+        record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" "hard" "dry-run: not executed"
+      done
+      record_stage_skip "cross_network_nat_matrix" "hard" "dry-run: not executed"
     else
-      record_stage_skip "cross_network_direct_remote_exit" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
-      record_stage_skip "cross_network_relay_remote_exit" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
-      record_stage_skip "cross_network_failback_roaming" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
-      record_stage_skip "cross_network_traversal_adversarial" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
-      record_stage_skip "cross_network_remote_exit_dns" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
-      record_stage_skip "cross_network_remote_exit_soak" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      local nat_profile nat_idx stage_suffix
+      record_stage_skip "cross_network_preflight" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+        nat_profile="${CROSS_NETWORK_NAT_PROFILE_LIST[$nat_idx]}"
+        stage_suffix="$(cross_network_stage_suffix_for_profile_index "$nat_idx" "$nat_profile")"
+        record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+      done
+      record_stage_skip "cross_network_nat_matrix" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
     fi
     write_run_summary
     printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
@@ -3044,57 +3850,103 @@ main() {
 
   local cross_network_stage_rc=0 stage_rc=0
   if cross_network_stages_applicable; then
+    local nat_profile nat_idx stage_suffix profile_report profile_log
     set +e
-    run_stage hard cross_network_direct_remote_exit 'run cross-network direct remote-exit validation' stage_run_cross_network_direct_remote_exit
+    run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, signed artifact chain freshness, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
     stage_rc=$?
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"
     fi
+    if [[ "$cross_network_stage_rc" -eq 0 ]]; then
+      for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+        nat_profile="${CROSS_NETWORK_NAT_PROFILE_LIST[$nat_idx]}"
+        stage_suffix="$(cross_network_stage_suffix_for_profile_index "$nat_idx" "$nat_profile")"
 
-    if cross_network_relay_label >/dev/null 2>&1; then
-      run_stage hard cross_network_relay_remote_exit 'run cross-network relay remote-exit validation' stage_run_cross_network_relay_remote_exit
+        profile_report="$(cross_network_report_path_for_profile "cross_network_direct_remote_exit_report.json" "$nat_idx" "$nat_profile")"
+        profile_log="$(cross_network_log_path_for_profile "cross_network_direct_remote_exit.log" "$nat_idx" "$nat_profile")"
+        run_stage hard "cross_network_direct_remote_exit${stage_suffix}" "run cross-network direct remote-exit validation (nat_profile=${nat_profile})" stage_run_cross_network_direct_remote_exit "$nat_profile" "$profile_report" "$profile_log"
+        stage_rc=$?
+        if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+          cross_network_stage_rc="$stage_rc"
+          break
+        fi
+
+        if cross_network_relay_label >/dev/null 2>&1; then
+          profile_report="$(cross_network_report_path_for_profile "cross_network_relay_remote_exit_report.json" "$nat_idx" "$nat_profile")"
+          profile_log="$(cross_network_log_path_for_profile "cross_network_relay_remote_exit.log" "$nat_idx" "$nat_profile")"
+          run_stage hard "cross_network_relay_remote_exit${stage_suffix}" "run cross-network relay remote-exit validation (nat_profile=${nat_profile})" stage_run_cross_network_relay_remote_exit "$nat_profile" "$profile_report" "$profile_log"
+          stage_rc=$?
+          if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+            cross_network_stage_rc="$stage_rc"
+            break
+          fi
+          profile_report="$(cross_network_report_path_for_profile "cross_network_failback_roaming_report.json" "$nat_idx" "$nat_profile")"
+          profile_log="$(cross_network_log_path_for_profile "cross_network_failback_roaming.log" "$nat_idx" "$nat_profile")"
+          run_stage hard "cross_network_failback_roaming${stage_suffix}" "run cross-network failback and endpoint-roaming validation (nat_profile=${nat_profile})" stage_run_cross_network_failback_roaming "$nat_profile" "$profile_report" "$profile_log"
+          stage_rc=$?
+          if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+            cross_network_stage_rc="$stage_rc"
+            break
+          fi
+        else
+          record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" hard 'requires entry or aux target'
+          record_stage_skip "cross_network_failback_roaming${stage_suffix}" hard 'requires entry or aux target'
+        fi
+
+        if cross_network_probe_label >/dev/null 2>&1; then
+          profile_report="$(cross_network_report_path_for_profile "cross_network_traversal_adversarial_report.json" "$nat_idx" "$nat_profile")"
+          profile_log="$(cross_network_log_path_for_profile "cross_network_traversal_adversarial.log" "$nat_idx" "$nat_profile")"
+          run_stage hard "cross_network_traversal_adversarial${stage_suffix}" "run cross-network traversal adversarial validation (nat_profile=${nat_profile})" stage_run_cross_network_traversal_adversarial "$nat_profile" "$profile_report" "$profile_log"
+          stage_rc=$?
+          if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+            cross_network_stage_rc="$stage_rc"
+            break
+          fi
+        else
+          record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" hard 'requires entry or aux target'
+        fi
+
+        profile_report="$(cross_network_report_path_for_profile "cross_network_remote_exit_dns_report.json" "$nat_idx" "$nat_profile")"
+        profile_log="$(cross_network_log_path_for_profile "cross_network_remote_exit_dns.log" "$nat_idx" "$nat_profile")"
+        run_stage hard "cross_network_remote_exit_dns${stage_suffix}" "run cross-network remote-exit DNS validation (nat_profile=${nat_profile})" stage_run_cross_network_remote_exit_dns "$nat_profile" "$profile_report" "$profile_log"
+        stage_rc=$?
+        if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+          cross_network_stage_rc="$stage_rc"
+          break
+        fi
+
+        profile_report="$(cross_network_report_path_for_profile "cross_network_remote_exit_soak_report.json" "$nat_idx" "$nat_profile")"
+        profile_log="$(cross_network_log_path_for_profile "cross_network_remote_exit_soak.log" "$nat_idx" "$nat_profile")"
+        run_stage hard "cross_network_remote_exit_soak${stage_suffix}" "run cross-network remote-exit soak stability validation (nat_profile=${nat_profile})" stage_run_cross_network_remote_exit_soak "$nat_profile" "$profile_report" "$profile_log"
+        stage_rc=$?
+        if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+          cross_network_stage_rc="$stage_rc"
+          break
+        fi
+      done
+    fi
+    if [[ "$cross_network_stage_rc" -eq 0 ]]; then
+      run_stage hard cross_network_nat_matrix "validate cross-network NAT matrix coverage (${CROSS_NETWORK_REQUIRED_NAT_PROFILES})" stage_run_cross_network_nat_matrix
       stage_rc=$?
       if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
         cross_network_stage_rc="$stage_rc"
       fi
-      run_stage hard cross_network_failback_roaming 'run cross-network failback and endpoint-roaming validation' stage_run_cross_network_failback_roaming
-      stage_rc=$?
-      if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-        cross_network_stage_rc="$stage_rc"
-      fi
-    else
-      record_stage_skip cross_network_relay_remote_exit hard 'requires entry or aux target'
-      record_stage_skip cross_network_failback_roaming hard 'requires entry or aux target'
-    fi
-
-    if cross_network_probe_label >/dev/null 2>&1; then
-      run_stage hard cross_network_traversal_adversarial 'run cross-network traversal adversarial validation' stage_run_cross_network_traversal_adversarial
-      stage_rc=$?
-      if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-        cross_network_stage_rc="$stage_rc"
-      fi
-    else
-      record_stage_skip cross_network_traversal_adversarial hard 'requires entry or aux target'
-    fi
-
-    run_stage hard cross_network_remote_exit_dns 'run cross-network remote-exit DNS validation' stage_run_cross_network_remote_exit_dns
-    stage_rc=$?
-    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-      cross_network_stage_rc="$stage_rc"
-    fi
-    run_stage hard cross_network_remote_exit_soak 'run future cross-network remote-exit soak placeholder (expected hard fail until implemented)' stage_run_cross_network_remote_exit_soak_placeholder
-    stage_rc=$?
-    if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
-      cross_network_stage_rc="$stage_rc"
     fi
     set -e
   else
-    record_stage_skip cross_network_direct_remote_exit hard "$CROSS_NETWORK_SKIP_REASON"
-    record_stage_skip cross_network_relay_remote_exit hard "$CROSS_NETWORK_SKIP_REASON"
-    record_stage_skip cross_network_failback_roaming hard "$CROSS_NETWORK_SKIP_REASON"
-    record_stage_skip cross_network_traversal_adversarial hard "$CROSS_NETWORK_SKIP_REASON"
-    record_stage_skip cross_network_remote_exit_dns hard "$CROSS_NETWORK_SKIP_REASON"
-    record_stage_skip cross_network_remote_exit_soak hard "$CROSS_NETWORK_SKIP_REASON"
+    local nat_profile nat_idx stage_suffix
+    record_stage_skip cross_network_preflight hard "$CROSS_NETWORK_SKIP_REASON"
+    for nat_idx in "${!CROSS_NETWORK_NAT_PROFILE_LIST[@]}"; do
+      nat_profile="${CROSS_NETWORK_NAT_PROFILE_LIST[$nat_idx]}"
+      stage_suffix="$(cross_network_stage_suffix_for_profile_index "$nat_idx" "$nat_profile")"
+      record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_failback_roaming${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+    done
+    record_stage_skip cross_network_nat_matrix hard "$CROSS_NETWORK_SKIP_REASON"
   fi
 
   if [[ "$cross_network_stage_rc" -ne 0 ]]; then

@@ -18,6 +18,8 @@ CLIENT_NODE_ID=""
 EXIT_NODE_ID=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
+NAT_PROFILE="baseline_lan"
+IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/cross_network_direct_remote_exit_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/cross_network_direct_remote_exit.log"
@@ -51,6 +53,8 @@ usage() {
 usage: live_linux_cross_network_direct_remote_exit_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --nat-profile <profile>
+  --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
   --report-path <path>
   --log-path <path>
@@ -63,6 +67,7 @@ write_report() {
   export REPORT_FAILURE_SUMMARY="$FAILURE_SUMMARY"
   export REPORT_PATH LOG_PATH CLIENT_HOST EXIT_HOST CLIENT_NODE_ID EXIT_NODE_ID
   export CLIENT_NETWORK_ID EXIT_NETWORK_ID CLIENT_ADDR EXIT_ADDR
+  export NAT_PROFILE IMPAIRMENT_PROFILE
   export CHECK_DIRECT_REMOTE_EXIT_SUCCESS CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK
   export CHECK_REMOTE_EXIT_SERVER_IP_BYPASS_IS_NARROW CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC
   export CHECK_CLIENT_EXIT_SELECTED CHECK_EXIT_SERVING_ROUTE CHECK_CLIENT_ROUTE_VIA_RUSTYNET
@@ -191,6 +196,8 @@ payload = {
     "network_context": {
         "client_network_id": env_text("CLIENT_NETWORK_ID"),
         "exit_network_id": env_text("EXIT_NETWORK_ID"),
+        "nat_profile": env_text("NAT_PROFILE"),
+        "impairment_profile": env_text("IMPAIRMENT_PROFILE"),
         "client_underlay_ip": env_text("CLIENT_ADDR"),
         "exit_underlay_ip": env_text("EXIT_ADDR"),
     },
@@ -208,6 +215,8 @@ payload = {
         "exit_node_id": env_text("EXIT_NODE_ID"),
         "same_underlay_prefix_heuristic": topology_same_prefix,
         "topology_heuristic_basis": "shared /24 for IPv4 or shared /64 for IPv6 is not treated as cross-network proof",
+        "nat_profile": env_text("NAT_PROFILE"),
+        "impairment_profile": env_text("IMPAIRMENT_PROFILE"),
         "client_status": read_text_file(env_text("CLIENT_STATUS_FILE")),
         "exit_status": read_text_file(env_text("EXIT_STATUS_FILE")),
         "client_internet_route": read_text_file(env_text("CLIENT_INTERNET_ROUTE_FILE")),
@@ -253,6 +262,8 @@ while [[ $# -gt 0 ]]; do
     --exit-node-id) EXIT_NODE_ID="$2"; shift 2 ;;
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
+    --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
+    --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     --report-path) REPORT_PATH="$2"; shift 2 ;;
     --log-path) LOG_PATH="$2"; shift 2 ;;
@@ -263,6 +274,10 @@ done
 
 if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
+  echo "--nat-profile and --impairment-profile must be non-empty" >&2
   exit 2
 fi
 

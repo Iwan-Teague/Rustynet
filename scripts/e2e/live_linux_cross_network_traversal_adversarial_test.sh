@@ -12,6 +12,8 @@ EXIT_HOST=""
 PROBE_HOST=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
+NAT_PROFILE="baseline_lan"
+IMPAIRMENT_PROFILE="none"
 ROGUE_ENDPOINT_IP="${RUSTYNET_ROGUE_ENDPOINT_IP:-203.0.113.44}"
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/cross_network_traversal_adversarial_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/cross_network_traversal_adversarial.log"
@@ -33,6 +35,8 @@ usage() {
 usage: live_linux_cross_network_traversal_adversarial_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --probe-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --nat-profile <profile>
+  --impairment-profile <profile>
   --rogue-endpoint-ip <ipv4>
   --report-path <path>
   --log-path <path>
@@ -54,6 +58,8 @@ write_report() {
     --probe-host "$PROBE_HOST"
     --client-network-id "$CLIENT_NETWORK_ID"
     --exit-network-id "$EXIT_NETWORK_ID"
+    --nat-profile "$NAT_PROFILE"
+    --impairment-profile "$IMPAIRMENT_PROFILE"
     --source-artifact "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh"
     --check "forged_traversal_rejected=${CHECK_FORGED_TRAVERSAL_REJECTED}"
     --check "stale_traversal_rejected=${CHECK_STALE_TRAVERSAL_REJECTED}"
@@ -102,6 +108,8 @@ while [[ $# -gt 0 ]]; do
     --probe-host) PROBE_HOST="$2"; shift 2 ;;
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
+    --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
+    --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --rogue-endpoint-ip) ROGUE_ENDPOINT_IP="$2"; shift 2 ;;
     --report-path) REPORT_PATH="$2"; shift 2 ;;
     --log-path) LOG_PATH="$2"; shift 2 ;;
@@ -112,6 +120,10 @@ done
 
 if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$PROBE_HOST" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
+  echo "--nat-profile and --impairment-profile must be non-empty" >&2
   exit 2
 fi
 

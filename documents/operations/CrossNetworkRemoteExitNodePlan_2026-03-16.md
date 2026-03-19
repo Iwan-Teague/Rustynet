@@ -340,6 +340,7 @@ At minimum, the following tracked measured artifacts must exist under `artifacts
 Each artifact must be:
 - `evidence_mode = measured`
 - commit-bound to the current `HEAD`
+- tagged with `nat_profile` and `impairment_profile`
 - sourced from canonical tracked inputs, not gitignored run-only paths
 - rejected if stale, incomplete, or schema-invalid
 
@@ -362,11 +363,16 @@ The measured reports must prove all of the following checks as `pass`:
 11. `rogue_endpoint_rejected`
 12. `control_surface_exposure_blocked`
 13. `long_soak_stable`
+14. `cross_network_topology_heuristic`
+15. `direct_remote_exit_ready`
+16. `post_soak_bypass_ready`
+17. `no_plaintext_passphrase_files`
 
 ### 9.4 Required gate wiring
 The repo should add or extend gate entry points so this evidence is enforced automatically:
 1. Add a dedicated gate bundle:
    - [phase10_cross_network_exit_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_cross_network_exit_gates.sh)
+   - include [validate_cross_network_nat_matrix.py](/Users/iwanteague/Desktop/Rustynet/scripts/ci/validate_cross_network_nat_matrix.py) as a hard-fail matrix coverage check
 2. Keep `scripts/ci/phase10_hp2_gates.sh` for traversal engine correctness, but do not treat it as sufficient evidence for remote exit-node readiness.
 3. Extend [check_phase10_readiness.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/check_phase10_readiness.sh) to require every cross-network remote-exit artifact and its mandatory checks.
    - that readiness path must invoke [validate_cross_network_remote_exit_reports.py](/Users/iwanteague/Desktop/Rustynet/scripts/ci/validate_cross_network_remote_exit_reports.py) before interpreting pass/fail checks

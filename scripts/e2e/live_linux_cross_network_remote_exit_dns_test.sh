@@ -13,6 +13,8 @@ CLIENT_NODE_ID=""
 EXIT_NODE_ID=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
+NAT_PROFILE="baseline_lan"
+IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 ZONE_NAME="rustynet"
 DNS_INTERFACE="rustynet0"
@@ -40,6 +42,8 @@ usage() {
 usage: live_linux_cross_network_remote_exit_dns_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --nat-profile <profile>
+  --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
   --zone-name <name>
   --dns-interface <name>
@@ -64,6 +68,8 @@ write_report() {
     --exit-host "$EXIT_HOST"
     --client-network-id "$CLIENT_NETWORK_ID"
     --exit-network-id "$EXIT_NETWORK_ID"
+    --nat-profile "$NAT_PROFILE"
+    --impairment-profile "$IMPAIRMENT_PROFILE"
     --source-artifact "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh"
     --check "managed_dns_resolution_success=${CHECK_MANAGED_DNS_RESOLUTION_SUCCESS}"
     --check "remote_exit_dns_fail_closed=${CHECK_REMOTE_EXIT_DNS_FAIL_CLOSED}"
@@ -104,6 +110,8 @@ while [[ $# -gt 0 ]]; do
     --exit-node-id) EXIT_NODE_ID="$2"; shift 2 ;;
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
+    --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
+    --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     --zone-name) ZONE_NAME="$2"; shift 2 ;;
     --dns-interface) DNS_INTERFACE="$2"; shift 2 ;;
@@ -117,6 +125,10 @@ done
 
 if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
+  echo "--nat-profile and --impairment-profile must be non-empty" >&2
   exit 2
 fi
 
@@ -157,6 +169,8 @@ main() {
       --exit-node-id "$EXIT_NODE_ID" \
       --client-network-id "$CLIENT_NETWORK_ID" \
       --exit-network-id "$EXIT_NETWORK_ID" \
+      --nat-profile "$NAT_PROFILE" \
+      --impairment-profile "$IMPAIRMENT_PROFILE" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
       --report-path "$DIRECT_REPORT_PATH" \
       --log-path "$DIRECT_LOG_PATH"; then
