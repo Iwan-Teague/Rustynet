@@ -2766,11 +2766,16 @@ start_or_restart_service() {
   fi
 
   if is_linux_host; then
-    run_root systemctl daemon-reload
-    run_root systemctl enable rustynetd.service
-    run_root systemctl restart rustynetd.service
-    if ! run_root systemctl --no-pager --full status rustynetd.service; then
-      print_warn "Unable to read rustynetd.service status after restart."
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_err "rustynet CLI is required for Linux runtime service status."
+      return 1
+    fi
+    local rust_runtime_status_output=""
+    if ! rust_runtime_status_output="$(run_root rustynet ops show-runtime-service-status 2>&1)"; then
+      print_warn "Unable to read rustynetd.service status after Rust-backed restart."
+      [[ -n "${rust_runtime_status_output}" ]] && print_warn "${rust_runtime_status_output}"
+    elif [[ -n "${rust_runtime_status_output}" ]]; then
+      printf '%s\n' "${rust_runtime_status_output}"
     fi
     return
   fi
@@ -2786,7 +2791,17 @@ start_or_restart_service() {
 
 stop_service() {
   if is_linux_host; then
-    run_root systemctl stop rustynetd.service
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_err "rustynet CLI is required for Linux runtime service stop."
+      return 1
+    fi
+    local rust_stop_output=""
+    if ! rust_stop_output="$(run_root rustynet ops stop-runtime-service 2>&1)"; then
+      print_err "Rust-backed runtime stop failed."
+      [[ -n "${rust_stop_output}" ]] && print_err "${rust_stop_output}"
+      return 1
+    fi
+    [[ -n "${rust_stop_output}" ]] && print_info "${rust_stop_output}"
     return
   fi
   if is_macos_host; then
@@ -2847,106 +2862,36 @@ disconnect_vpn() {
   fi
 
   require_linux_dataplane "disconnect_vpn" || return 0
-  local had_error=0
-  print_info "Stopping Rustynet service..."
-  if run_root systemctl is-active --quiet rustynetd.service 2>/dev/null; then
-    if ! run_root systemctl stop rustynetd.service 2>/dev/null; then
-      print_err "Rustynet service is active but failed to stop cleanly."
-      had_error=1
-    fi
-  else
-    print_info "Rustynet service is already stopped."
-  fi
-
-  print_info "Removing WireGuard interface ${WG_INTERFACE}..."
-  if run_root ip link show dev "${WG_INTERFACE}" >/dev/null 2>&1; then
-    if run_root ip link del dev "${WG_INTERFACE}" 2>/dev/null; then
-      print_info "Interface ${WG_INTERFACE} removed (all associated routes cleared)."
-    else
-      print_err "Failed to remove interface ${WG_INTERFACE}."
-      had_error=1
-    fi
-  else
-    print_info "Interface ${WG_INTERFACE} was not present."
-  fi
-
-  print_info "Flushing exit-node routing table 51820..."
-  local routes_51820=""
-  routes_51820="$(run_root ip route show table 51820 2>/dev/null || true)"
-  if [[ -n "${routes_51820}" ]]; then
-    if ! run_root ip route flush table 51820 2>/dev/null; then
-      print_err "Failed to flush routing table 51820."
-      had_error=1
-    fi
-  else
-    print_info "No routes present in table 51820."
-  fi
-
-  print_info "Removing exit-node IP policy rule (table 51820)..."
-  local removed_rule=0
-  while run_root ip rule list 2>/dev/null | grep -Eq '(^|[[:space:]])lookup[[:space:]]+51820($|[[:space:]])'; do
-    removed_rule=1
-    if ! run_root ip rule del table 51820 2>/dev/null; then
-      print_err "Failed to remove one or more policy rules for table 51820."
-      had_error=1
-      break
-    fi
-  done
-  if [[ "${removed_rule}" -eq 0 ]]; then
-    print_info "No policy rules found for table 51820."
-  fi
-
-  print_info "Removing Rustynet nftables firewall and NAT tables..."
-  if command -v nft >/dev/null 2>&1; then
-    local tables_output
-    if ! tables_output="$(run_root nft list tables 2>/dev/null)"; then
-      print_err "Failed to enumerate nftables tables."
-      had_error=1
-      tables_output=""
-    fi
-    while IFS= read -r line; do
-      case "${line}" in
-        "table inet rustynet_g"*)
-          local t="${line#table inet }"
-          if run_root nft delete table inet "${t}" 2>/dev/null; then
-            print_info "Removed nft table: inet ${t}"
-          else
-            print_err "Failed to remove nft table: inet ${t}"
-            had_error=1
-          fi
-          ;;
-        "table ip rustynet_nat_g"*)
-          local t="${line#table ip }"
-          if run_root nft delete table ip "${t}" 2>/dev/null; then
-            print_info "Removed nft table: ip ${t}"
-          else
-            print_err "Failed to remove nft table: ip ${t}"
-            had_error=1
-          fi
-          ;;
-      esac
-    done <<< "${tables_output}"
-  fi
-
-  print_info "Restoring IPv6 (disabled during VPN operation)..."
-  if ! run_root sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; then
-    print_err "Failed to restore IPv6 global setting."
-    had_error=1
-  fi
-
-  if [[ "${had_error}" -ne 0 ]]; then
-    print_err "Rustynet disconnect completed with residual-state errors."
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_err "rustynet CLI is required for Linux disconnect cleanup."
     return 1
   fi
 
+  local rust_disconnect_output=""
+  if ! rust_disconnect_output="$(run_root env \
+    RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
+    rustynet ops disconnect-cleanup 2>&1)"; then
+    print_err "Rust-backed disconnect cleanup failed; operation is fail-closed."
+    [[ -n "${rust_disconnect_output}" ]] && print_err "${rust_disconnect_output}"
+    return 1
+  fi
+  [[ -n "${rust_disconnect_output}" ]] && print_info "${rust_disconnect_output}"
   print_info "Rustynet VPN disconnected. Device is now using normal internet connectivity."
 }
 
 show_service_status() {
   if is_linux_host; then
-    if ! run_root systemctl --no-pager --full status rustynetd.service; then
-      print_warn "Unable to read rustynetd.service status."
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_warn "rustynet CLI is required to inspect Linux runtime service status."
+      return
     fi
+    local rust_runtime_status_output=""
+    if ! rust_runtime_status_output="$(run_root rustynet ops show-runtime-service-status 2>&1)"; then
+      print_warn "Unable to read rustynetd.service status."
+      [[ -n "${rust_runtime_status_output}" ]] && print_warn "${rust_runtime_status_output}"
+      return
+    fi
+    [[ -n "${rust_runtime_status_output}" ]] && printf '%s\n' "${rust_runtime_status_output}"
     return
   fi
   if is_macos_host; then
@@ -3204,14 +3149,28 @@ force_local_assignment_refresh_now() {
 
   print_info "Forcing local assignment bundle refresh (signed) to apply role/exit changes immediately."
   run_root rm -f "${AUTO_TUNNEL_BUNDLE_PATH}" "${AUTO_TUNNEL_WATERMARK_PATH}"
-  if ! run_root systemctl start rustynetd-assignment-refresh.service; then
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_warn "rustynet CLI is required to run local assignment refresh service."
+    return 1
+  fi
+  local rust_assignment_refresh_output=""
+  if ! rust_assignment_refresh_output="$(run_root rustynet ops start-assignment-refresh-service 2>&1)"; then
     print_warn "Failed to run rustynetd-assignment-refresh.service."
+    [[ -n "${rust_assignment_refresh_output}" ]] && print_warn "${rust_assignment_refresh_output}"
     return 1
   fi
-  if ! run_root systemctl restart rustynetd.service; then
+  [[ -n "${rust_assignment_refresh_output}" ]] && print_info "${rust_assignment_refresh_output}"
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_warn "rustynet CLI is required to restart runtime after forced assignment refresh."
+    return 1
+  fi
+  local rust_restart_output=""
+  if ! rust_restart_output="$(run_root rustynet ops restart-runtime-service 2>&1)"; then
     print_warn "Failed to restart rustynetd.service after forced assignment refresh."
+    [[ -n "${rust_restart_output}" ]] && print_warn "${rust_restart_output}"
     return 1
   fi
+  [[ -n "${rust_restart_output}" ]] && print_info "${rust_restart_output}"
   if ! wait_for_daemon_socket_ready 20; then
     print_warn "Daemon socket did not become ready after assignment refresh restart."
     return 1

@@ -19,6 +19,8 @@ Success criteria:
 - Phase D baseline complete: added optional Rust operator UX entrypoint via `rustynet operator menu` while retaining `start.sh` as compatibility UI wrapper.
 - Phase E started: added Rust ops `prepare-system-dirs`, `apply-blind-exit-lockdown`, `init-membership`, and `refresh-signed-trust`; migrated `start.sh` privilege paths are Rust-only and fail closed.
 - Phase E progress: `ensure_wireguard_keys` is enforced through `rustynet ops bootstrap-wireguard-custody` with fail-closed behavior.
+- Phase E progress: Linux disconnect cleanup is Rust-backed via `rustynet ops disconnect-cleanup`; `start.sh` Linux `disconnect_vpn` now dispatches to the Rust op and fails closed on error.
+- Phase E progress: Linux runtime service lifecycle control is Rust-backed via `rustynet ops restart-runtime-service`, `rustynet ops stop-runtime-service`, `rustynet ops show-runtime-service-status`, and `rustynet ops start-assignment-refresh-service`; `start.sh` Linux service paths now dispatch to Rust ops instead of direct `systemctl` mutation.
 - Phase F complete: Phase 6 parity probe/report/bundle generators are Rust-backed (`rustynet ops collect-platform-probe`, `rustynet ops generate-platform-parity-report`, `rustynet ops collect-platform-parity-bundle`); release scripts are thin wrappers that only dispatch to Rust commands.
 - Phase G complete: Phase9/Phase10 evidence pipeline is Rust-backed (`rustynet ops collect-phase9-raw-evidence`, `rustynet ops generate-phase9-artifacts`, `rustynet ops generate-phase10-artifacts`); shell/Python collection/generation logic removed from active scripts.
 - Phase H complete: phase1 measured input collection + baseline orchestration are Rust-backed (`rustynet ops collect-phase1-measured-input`, `rustynet ops run-phase1-baseline`); legacy shell/Python collector logic and shell `source` ingestion are removed from the active path.
@@ -226,8 +228,8 @@ Priority is based on: `privilege level` + `secret handling` + `state mutation ri
 - `configure_trust_material`
 - `refresh_signed_trust_evidence`
 - `write_daemon_environment`
-- `start_or_restart_service`
-- `disconnect_vpn`
+- `start_or_restart_service` (macOS launchd branch + shell orchestration only; Linux lifecycle control path is Rust-backed)
+- `disconnect_vpn` (macOS launchd/PF branch only; Linux cleanup path is Rust-backed)
 
 2. E2E hardening follow-up (in progress)
 - `rustynet ops run-debian-two-node-e2e`: collect fresh lab dry-run evidence for the argv-only remote execution path and retain regression checks to prevent shell-path reintroduction.

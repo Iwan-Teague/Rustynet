@@ -3194,26 +3194,120 @@ repair_local_nsswitch_hosts() {
   fi
 }
 
-repair_local_dns_resolution() {
-  local gateway
-  local resolver
-  local resolvers=()
-  if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+is_valid_dns_resolver_literal() {
+  local resolver="$1"
+  if [[ "$resolver" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local IFS='.'
+    local octets=()
+    local octet
+    read -r -a octets <<< "$resolver"
+    [[ "${#octets[@]}" -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+      [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+      ((octet >= 0 && octet <= 255)) || return 1
+    done
     return 0
   fi
-  gateway="$(ip route show default | awk '/default/ { print $3; exit }')"
-  if [[ -n "${gateway}" ]]; then
-    resolvers+=("${gateway}")
-  fi
-  resolvers+=("1.1.1.1" "8.8.8.8")
-  for resolver in "${resolvers[@]}"; do
-    rm -f /etc/resolv.conf
-    printf 'nameserver %s\noptions timeout:2 attempts:2\n' "${resolver}" > /etc/resolv.conf
-    if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+  [[ "$resolver" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
+is_loopback_dns_resolver() {
+  local resolver="$1"
+  case "$resolver" in
+    127.*|::1|0.0.0.0|::)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_unique_dns_resolver() {
+  local resolver="$1"
+  local existing
+  for existing in "${TRUSTED_DNS_RESOLVERS[@]:-}"; do
+    if [[ "$existing" == "$resolver" ]]; then
       return 0
     fi
   done
-  echo "DNS repair failed for static.rust-lang.org via resolvers: ${resolvers[*]}" >&2
+  TRUSTED_DNS_RESOLVERS+=("$resolver")
+}
+
+collect_trusted_dns_resolvers_from_profile() {
+  local raw configured resolver
+  raw="${RUSTYNET_BOOTSTRAP_TRUSTED_DNS_RESOLVERS:-}"
+  [[ -n "$raw" ]] || return 0
+  configured="${raw//,/ }"
+  for resolver in $configured; do
+    resolver="${resolver%%\%*}"
+    if ! is_valid_dns_resolver_literal "$resolver"; then
+      echo "invalid resolver in RUSTYNET_BOOTSTRAP_TRUSTED_DNS_RESOLVERS: ${resolver}" >&2
+      return 1
+    fi
+    if is_loopback_dns_resolver "$resolver"; then
+      echo "loopback resolver is not allowed in RUSTYNET_BOOTSTRAP_TRUSTED_DNS_RESOLVERS: ${resolver}" >&2
+      return 1
+    fi
+    append_unique_dns_resolver "$resolver"
+  done
+}
+
+collect_trusted_dns_resolvers_from_file() {
+  local path="$1"
+  local resolver
+  [[ -f "$path" ]] || return 0
+  while IFS= read -r resolver; do
+    resolver="${resolver%%\%*}"
+    resolver="${resolver#"${resolver%%[![:space:]]*}"}"
+    resolver="${resolver%"${resolver##*[![:space:]]}"}"
+    [[ -n "$resolver" ]] || continue
+    if ! is_valid_dns_resolver_literal "$resolver"; then
+      continue
+    fi
+    if is_loopback_dns_resolver "$resolver"; then
+      continue
+    fi
+    append_unique_dns_resolver "$resolver"
+  done < <(awk '$1 == "nameserver" { print $2 }' "$path")
+}
+
+repair_local_dns_resolution() {
+  local resolver tmp_resolv backup_resolv
+  TRUSTED_DNS_RESOLVERS=()
+  if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+    return 0
+  fi
+  collect_trusted_dns_resolvers_from_profile || return 1
+  collect_trusted_dns_resolvers_from_file /run/systemd/resolve/resolv.conf
+  collect_trusted_dns_resolvers_from_file /etc/resolv.conf
+  if [[ "${#TRUSTED_DNS_RESOLVERS[@]}" -eq 0 ]]; then
+    echo "DNS repair failed: no trusted resolver sources found in host configuration/profile" >&2
+    return 1
+  fi
+
+  tmp_resolv="$(mktemp /tmp/rn-resolv.XXXXXX)"
+  backup_resolv="$(mktemp /tmp/rn-resolv-backup.XXXXXX)"
+  if [[ -f /etc/resolv.conf ]]; then
+    cp -L /etc/resolv.conf "$backup_resolv" >/dev/null 2>&1 || true
+  fi
+  {
+    for resolver in "${TRUSTED_DNS_RESOLVERS[@]}"; do
+      printf 'nameserver %s\n' "${resolver}"
+    done
+    printf 'options timeout:2 attempts:2\n'
+  } > "$tmp_resolv"
+  install -m 0644 "$tmp_resolv" /etc/resolv.conf
+  rm -f "$tmp_resolv"
+  if timeout 5 getent hosts static.rust-lang.org >/dev/null 2>&1; then
+    rm -f "$backup_resolv"
+    return 0
+  fi
+  if [[ -s "$backup_resolv" ]]; then
+    install -m 0644 "$backup_resolv" /etc/resolv.conf
+  fi
+  rm -f "$backup_resolv"
+  echo "DNS repair failed for static.rust-lang.org via trusted resolvers: ${TRUSTED_DNS_RESOLVERS[*]}" >&2
   return 1
 }
 

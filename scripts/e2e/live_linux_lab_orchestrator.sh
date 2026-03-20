@@ -14,8 +14,8 @@ RUN_STARTED_AT_LOCAL="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 NETWORK_ID="rn-live-lab-${RUN_ID}"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
-REPO_REF="working-tree"
-SOURCE_MODE="working-tree"
+REPO_REF="HEAD"
+SOURCE_MODE="local-head"
 REPORT_DIR="${ROOT_DIR}/artifacts/live_lab/${RUN_ID}"
 LOG_DIR="${REPORT_DIR}/logs"
 VERIFICATION_DIR="${REPORT_DIR}/verification"
@@ -90,14 +90,14 @@ usage: ${SCRIPT_NAME} [options]
 
 Interactive by default. If any required target/input is missing, the script prompts.
 Interactive source selection now also supports:
-  - use local working tree, or
+  - use local committed HEAD (default), or
   - update from latest git and pick a branch from a numbered list
 
 options:
   --profile <path>               Load saved lab profile (.env-style)
   --source-mode <mode>           Source mode: working-tree | local-head | origin-main
   --use-origin-main              Fetch and archive latest committed origin/main
-  --use-local-head               Archive local committed HEAD instead of working tree
+  --use-local-head               Archive local committed HEAD (default)
   --exit-target <user@ip|ip>     Primary exit node target
   --client-target <user@ip|ip>   Primary client node target
   --entry-target <user@ip|ip>    Entry relay / alternate exit target
@@ -447,17 +447,19 @@ load_profile_file() {
       CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS) [[ "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="$value" ;;
       CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS) [[ "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="$value" ;;
       SOURCE_MODE)
-        if [[ "$SOURCE_MODE" == "working-tree" && "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
+        if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
           SOURCE_MODE="$value"
+          SOURCE_MODE_EXPLICIT=1
         fi
-        SOURCE_MODE_EXPLICIT=1
         ;;
       REPO_REF)
-        if [[ "$REPO_REF" == "working-tree" ]]; then
+        if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 || "$SOURCE_MODE" == "ref" ]]; then
           REPO_REF="$value"
+          if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
+            SOURCE_MODE="ref"
+            SOURCE_MODE_EXPLICIT=1
+          fi
         fi
-        SOURCE_MODE="ref"
-        SOURCE_MODE_EXPLICIT=1
         ;;
       REPORT_DIR)
         if [[ "$REPORT_DIR" == "${ROOT_DIR}/artifacts/live_lab/${RUN_ID}" ]]; then
@@ -498,7 +500,7 @@ validate_source_mode() {
       ;;
   esac
   if [[ "$SOURCE_MODE" == "ref" ]]; then
-    if [[ -z "$REPO_REF" || "$REPO_REF" == "working-tree" ]]; then
+    if [[ -z "$REPO_REF" ]]; then
       printf 'source-mode=ref requires --repo-ref <ref>\n' >&2
       return 1
     fi
@@ -2279,7 +2281,7 @@ current_run_git_status_is_dirty() {
 }
 
 current_local_source_tree_is_dirty() {
-  git -C "$ROOT_DIR" status --short --untracked-files=no -- \
+  git -C "$ROOT_DIR" status --short --untracked-files=all -- \
     . \
     ':(exclude)artifacts' \
     ':(exclude).cargo-audit-db' \
@@ -2300,7 +2302,7 @@ assert_local_gate_suite_provenance() {
     return 1
   fi
   if current_local_source_tree_is_dirty; then
-    printf 'local full gate suite refuses source-tree drift: local checkout has tracked changes outside generated evidence paths, so local gate results would not be commit-bound\n' >&2
+    printf 'local full security gate suite refuses dirty source tree: tracked/untracked changes outside generated evidence paths make provenance non-commit-bound\n' >&2
     return 1
   fi
 }
@@ -3466,17 +3468,17 @@ maybe_prompt_for_source_mode() {
   if [[ "$SOURCE_MODE_EXPLICIT" -eq 1 ]]; then
     return 0
   fi
-  if [[ "$SOURCE_MODE" != "working-tree" || "$REPO_REF" != "working-tree" ]]; then
+  if [[ "$SOURCE_MODE" != "local-head" || "$REPO_REF" != "HEAD" ]]; then
     return 0
   fi
   if [[ ! -t 0 || ! -t 1 ]]; then
     return 0
   fi
-  if prompt_yes_no "Update from latest git instead of local working tree?" "n"; then
+  if prompt_yes_no "Update from latest git instead of local committed HEAD?" "n"; then
     prompt_for_git_branch_source
   else
-    SOURCE_MODE="working-tree"
-    REPO_REF="working-tree"
+    SOURCE_MODE="local-head"
+    REPO_REF="HEAD"
   fi
 }
 

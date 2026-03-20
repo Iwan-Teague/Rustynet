@@ -285,8 +285,8 @@ Tracked lab profiles:
 
 Source selection:
 
-- default: package the current local working tree
-- interactive toggle: ask whether to update from latest git instead of the local working tree
+- default: package the current local committed `HEAD` (commit-bound provenance)
+- interactive toggle: ask whether to update from latest git instead of local committed `HEAD`
 - if you answer `yes`, the script fetches `origin`, prints the available branch names, and lets you choose by number or branch name
 - explicit flags:
   - `--source-mode working-tree`
@@ -306,6 +306,7 @@ Important:
 - formal commit-bound gate evidence is fail-closed on provenance drift:
   - the live evidence reports are stamped with the deployed commit, not merely local workspace `HEAD`
   - the local full gate suite refuses mixed-source attestation when the deployed commit differs from local `HEAD`
+  - the local full gate suite refuses dirty source-tree provenance (tracked or untracked changes outside generated evidence paths)
   - the fresh-install OS matrix report refuses dirty working-tree provenance for commit-bound evidence
 
 Non-interactive, full five-node topology:

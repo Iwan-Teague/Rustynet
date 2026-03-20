@@ -289,8 +289,13 @@ enum OpsCommand {
     CollectPlatformParityBundle,
     InstallSystemd,
     PrepareSystemDirs,
+    RestartRuntimeService,
+    StopRuntimeService,
+    ShowRuntimeServiceStatus,
+    StartAssignmentRefreshService,
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
+    DisconnectCleanup,
     ApplyBlindExitLockdown,
     InitMembership,
     SecureRemove {
@@ -578,6 +583,32 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::PrepareSystemDirs)
         }
+        "restart-runtime-service" => {
+            if args.len() != 1 {
+                return Err("ops restart-runtime-service does not accept options".to_string());
+            }
+            Ok(OpsCommand::RestartRuntimeService)
+        }
+        "stop-runtime-service" => {
+            if args.len() != 1 {
+                return Err("ops stop-runtime-service does not accept options".to_string());
+            }
+            Ok(OpsCommand::StopRuntimeService)
+        }
+        "show-runtime-service-status" => {
+            if args.len() != 1 {
+                return Err("ops show-runtime-service-status does not accept options".to_string());
+            }
+            Ok(OpsCommand::ShowRuntimeServiceStatus)
+        }
+        "start-assignment-refresh-service" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops start-assignment-refresh-service does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::StartAssignmentRefreshService)
+        }
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
                 return Err("ops apply-managed-dns-routing does not accept options".to_string());
@@ -589,6 +620,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops clear-managed-dns-routing does not accept options".to_string());
             }
             Ok(OpsCommand::ClearManagedDnsRouting)
+        }
+        "disconnect-cleanup" => {
+            if args.len() != 1 {
+                return Err("ops disconnect-cleanup does not accept options".to_string());
+            }
+            Ok(OpsCommand::DisconnectCleanup)
         }
         "apply-blind-exit-lockdown" => {
             if args.len() != 1 {
@@ -1954,8 +1991,13 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
+        OpsCommand::RestartRuntimeService => execute_ops_restart_runtime_service(),
+        OpsCommand::StopRuntimeService => execute_ops_stop_runtime_service(),
+        OpsCommand::ShowRuntimeServiceStatus => execute_ops_show_runtime_service_status(),
+        OpsCommand::StartAssignmentRefreshService => execute_ops_start_assignment_refresh_service(),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
+        OpsCommand::DisconnectCleanup => execute_ops_disconnect_cleanup(),
         OpsCommand::ApplyBlindExitLockdown => execute_ops_apply_blind_exit_lockdown(),
         OpsCommand::InitMembership => execute_ops_init_membership(),
         OpsCommand::SecureRemove { path } => execute_ops_secure_remove(path),
@@ -3070,6 +3112,9 @@ const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
 const DEFAULT_PHASE6_PARITY_INBOX_DIR: &str = "artifacts/release/inbox";
 const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
 const DEFAULT_PHASE10_LEAK_REPORT_PATH: &str = "artifacts/phase10/leak_test_report.json";
+const DEFAULT_RUNTIME_SYSTEMD_SERVICE: &str = "rustynetd.service";
+const DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE: &str = "rustynetd-assignment-refresh.service";
+const DEFAULT_DISCONNECT_ROUTE_TABLE: &str = "51820";
 const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
@@ -3160,6 +3205,404 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
     Ok(format!(
         "managed DNS routing cleared: interface={interface}"
     ))
+}
+
+fn execute_ops_restart_runtime_service() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("restart-runtime-service is supported on Linux only".to_string());
+    }
+
+    let restart_output =
+        run_command_capture("systemctl", &["restart", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
+    if !restart_output.status.success() {
+        return Err(format!(
+            "restart {} failed: {}",
+            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+            command_failure_detail(&restart_output)
+        ));
+    }
+
+    let active_output = run_command_capture(
+        "systemctl",
+        &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
+    )?;
+    if !active_output.status.success() {
+        return Err(format!(
+            "runtime service is not active after restart: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+        ));
+    }
+
+    Ok(format!(
+        "runtime service restarted: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+    ))
+}
+
+fn execute_ops_stop_runtime_service() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("stop-runtime-service is supported on Linux only".to_string());
+    }
+
+    let stop_output = run_command_capture("systemctl", &["stop", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
+    if !stop_output.status.success() {
+        return Err(format!(
+            "stop {} failed: {}",
+            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+            command_failure_detail(&stop_output)
+        ));
+    }
+
+    let active_output = run_command_capture(
+        "systemctl",
+        &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
+    )?;
+    if active_output.status.success() {
+        return Err(format!(
+            "runtime service remains active after stop: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+        ));
+    }
+
+    Ok(format!(
+        "runtime service stopped: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+    ))
+}
+
+fn execute_ops_show_runtime_service_status() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("show-runtime-service-status is supported on Linux only".to_string());
+    }
+
+    let status_output = run_command_capture(
+        "systemctl",
+        &[
+            "--no-pager",
+            "--full",
+            "status",
+            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+        ],
+    )?;
+    if !status_output.status.success() {
+        return Err(format!(
+            "status {} failed: {}",
+            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+            command_failure_detail(&status_output)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&status_output.stdout)
+        .trim()
+        .to_string();
+    if !stdout.is_empty() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&status_output.stderr)
+        .trim()
+        .to_string();
+    if !stderr.is_empty() {
+        return Ok(stderr);
+    }
+    Ok(format!(
+        "runtime service status available: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+    ))
+}
+
+fn execute_ops_start_assignment_refresh_service() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("start-assignment-refresh-service is supported on Linux only".to_string());
+    }
+
+    let start_output = run_command_capture(
+        "systemctl",
+        &["start", DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE],
+    )?;
+    if !start_output.status.success() {
+        return Err(format!(
+            "start {} failed: {}",
+            DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE,
+            command_failure_detail(&start_output)
+        ));
+    }
+
+    Ok(format!(
+        "assignment refresh service started: {DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE}"
+    ))
+}
+
+fn execute_ops_disconnect_cleanup() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("disconnect-cleanup is supported on Linux only".to_string());
+    }
+
+    let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
+        .trim()
+        .to_string();
+    validate_managed_dns_interface_name(interface.as_str())?;
+
+    let mut errors = Vec::new();
+    let mut service_was_active = false;
+    let mut service_stopped = false;
+    let mut interface_present = false;
+    let mut interface_removed = false;
+    let mut routes_flushed = false;
+    let mut policy_rules_removed = 0usize;
+    let mut nft_tables_removed = 0usize;
+    let mut ipv6_restored = false;
+
+    match run_command_capture(
+        "systemctl",
+        &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
+    ) {
+        Ok(output) => {
+            if output.status.success() {
+                service_was_active = true;
+                match run_command_capture("systemctl", &["stop", DEFAULT_RUNTIME_SYSTEMD_SERVICE]) {
+                    Ok(stop_output) => {
+                        if stop_output.status.success() {
+                            service_stopped = true;
+                        } else {
+                            errors.push(format!(
+                                "stop {} failed: {}",
+                                DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+                                command_failure_detail(&stop_output)
+                            ));
+                        }
+                    }
+                    Err(err) => errors.push(err),
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    match run_command_capture("ip", &["link", "show", "dev", interface.as_str()]) {
+        Ok(show_output) => {
+            if show_output.status.success() {
+                interface_present = true;
+                match run_command_capture("ip", &["link", "del", "dev", interface.as_str()]) {
+                    Ok(delete_output) => {
+                        if delete_output.status.success() {
+                            interface_removed = true;
+                        } else {
+                            errors.push(format!(
+                                "remove interface {} failed: {}",
+                                interface,
+                                command_failure_detail(&delete_output)
+                            ));
+                        }
+                    }
+                    Err(err) => errors.push(err),
+                }
+            } else {
+                let detail = command_failure_detail(&show_output);
+                if !is_interface_absent_detail(detail.as_str()) {
+                    errors.push(format!("inspect interface {interface} failed: {detail}"));
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    match run_command_capture(
+        "ip",
+        &["route", "show", "table", DEFAULT_DISCONNECT_ROUTE_TABLE],
+    ) {
+        Ok(routes_output) => {
+            if !routes_output.status.success() {
+                errors.push(format!(
+                    "inspect route table {} failed: {}",
+                    DEFAULT_DISCONNECT_ROUTE_TABLE,
+                    command_failure_detail(&routes_output)
+                ));
+            } else {
+                let has_routes = !String::from_utf8_lossy(&routes_output.stdout)
+                    .trim()
+                    .is_empty();
+                if has_routes {
+                    match run_command_capture(
+                        "ip",
+                        &["route", "flush", "table", DEFAULT_DISCONNECT_ROUTE_TABLE],
+                    ) {
+                        Ok(flush_output) => {
+                            if flush_output.status.success() {
+                                routes_flushed = true;
+                            } else {
+                                errors.push(format!(
+                                    "flush route table {} failed: {}",
+                                    DEFAULT_DISCONNECT_ROUTE_TABLE,
+                                    command_failure_detail(&flush_output)
+                                ));
+                            }
+                        }
+                        Err(err) => errors.push(err),
+                    }
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    loop {
+        match run_command_capture("ip", &["rule", "list"]) {
+            Ok(rule_output) => {
+                if !rule_output.status.success() {
+                    errors.push(format!(
+                        "list ip rules failed: {}",
+                        command_failure_detail(&rule_output)
+                    ));
+                    break;
+                }
+                let rules = String::from_utf8_lossy(&rule_output.stdout);
+                if !contains_ip_rule_lookup_table(rules.as_ref(), DEFAULT_DISCONNECT_ROUTE_TABLE) {
+                    break;
+                }
+                match run_command_capture(
+                    "ip",
+                    &["rule", "del", "table", DEFAULT_DISCONNECT_ROUTE_TABLE],
+                ) {
+                    Ok(delete_output) => {
+                        if delete_output.status.success() {
+                            policy_rules_removed += 1;
+                        } else {
+                            errors.push(format!(
+                                "remove policy rule lookup {} failed: {}",
+                                DEFAULT_DISCONNECT_ROUTE_TABLE,
+                                command_failure_detail(&delete_output)
+                            ));
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        errors.push(err);
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                errors.push(err);
+                break;
+            }
+        }
+    }
+
+    if command_available("nft") {
+        match run_command_capture("nft", &["list", "tables"]) {
+            Ok(tables_output) => {
+                if !tables_output.status.success() {
+                    errors.push(format!(
+                        "enumerate nft tables failed: {}",
+                        command_failure_detail(&tables_output)
+                    ));
+                } else {
+                    let tables = String::from_utf8_lossy(&tables_output.stdout);
+                    for line in tables.lines() {
+                        let fields = line.split_whitespace().collect::<Vec<_>>();
+                        if fields.len() != 3 || fields[0] != "table" {
+                            continue;
+                        }
+                        let family = fields[1];
+                        let table_name = fields[2];
+                        let managed = (family == "inet" && table_name.starts_with("rustynet_g"))
+                            || (family == "ip" && table_name.starts_with("rustynet_nat_g"));
+                        if !managed {
+                            continue;
+                        }
+                        match run_command_capture("nft", &["delete", "table", family, table_name]) {
+                            Ok(delete_output) => {
+                                if delete_output.status.success() {
+                                    nft_tables_removed += 1;
+                                } else {
+                                    errors.push(format!(
+                                        "delete nft table {} {} failed: {}",
+                                        family,
+                                        table_name,
+                                        command_failure_detail(&delete_output)
+                                    ));
+                                }
+                            }
+                            Err(err) => errors.push(err),
+                        }
+                    }
+                }
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    match run_command_capture("sysctl", &["-w", "net.ipv6.conf.all.disable_ipv6=0"]) {
+        Ok(sysctl_output) => {
+            if sysctl_output.status.success() {
+                ipv6_restored = true;
+            } else {
+                errors.push(format!(
+                    "restore IPv6 sysctl failed: {}",
+                    command_failure_detail(&sysctl_output)
+                ));
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "disconnect cleanup completed with residual-state errors: {}",
+            errors.join(" | ")
+        ));
+    }
+
+    Ok(format!(
+        "disconnect cleanup complete: service_was_active={service_was_active} service_stopped={service_stopped} interface_present={interface_present} interface_removed={interface_removed} routes_flushed={routes_flushed} policy_rules_removed={policy_rules_removed} nft_tables_removed={nft_tables_removed} ipv6_restored={ipv6_restored}"
+    ))
+}
+
+fn run_command_capture(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("invoke {} {} failed: {err}", program, args.join(" ")))
+}
+
+fn command_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
+}
+
+fn is_interface_absent_detail(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    normalized.contains("cannot find device")
+        || normalized.contains("does not exist")
+        || normalized.contains("no such device")
+}
+
+fn contains_ip_rule_lookup_table(body: &str, table: &str) -> bool {
+    body.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields
+            .windows(2)
+            .any(|window| window[0] == "lookup" && window[1] == table)
+    })
+}
+
+fn command_available(program: &str) -> bool {
+    match Command::new(program)
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(_) => true,
+        Err(err) => err.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn execute_ops_ensure_signing_passphrase_material() -> Result<String, String> {
@@ -6448,8 +6891,13 @@ fn help_text() -> String {
         "  ops collect-platform-parity-bundle",
         "  ops install-systemd",
         "  ops prepare-system-dirs",
+        "  ops restart-runtime-service",
+        "  ops stop-runtime-service",
+        "  ops show-runtime-service-status",
+        "  ops start-assignment-refresh-service",
         "  ops apply-managed-dns-routing",
         "  ops clear-managed-dns-routing",
+        "  ops disconnect-cleanup",
         "  ops apply-blind-exit-lockdown",
         "  ops init-membership",
         "  ops secure-remove --path <absolute-path>",
@@ -6468,12 +6916,12 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_tampered_log, execute, load_dns_zone_records_json, load_signing_key,
-        managed_dns_resolver_server_arg, parse_bool_value, parse_bundle_u64_field, parse_command,
-        persist_encrypted_secret_material, phase6_validate_platform_parity_report,
-        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value,
-        validate_control_socket_security,
+        contains_ip_rule_lookup_table, detect_tampered_log, execute, is_interface_absent_detail,
+        load_dns_zone_records_json, load_signing_key, managed_dns_resolver_server_arg,
+        parse_bool_value, parse_bundle_u64_field, parse_command, persist_encrypted_secret_material,
+        phase6_validate_platform_parity_report, required_macos_tunnel_keychain_account,
+        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
+        rewrite_env_key_value, validate_control_socket_security,
     };
     use std::fs;
     use std::os::unix::net::UnixListener;
@@ -6797,6 +7245,23 @@ mod tests {
         let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
 
+        let restart_runtime =
+            parse_command(&["ops".to_string(), "restart-runtime-service".to_string()]);
+        assert!(format!("{restart_runtime:?}").contains("RestartRuntimeService"));
+
+        let stop_runtime = parse_command(&["ops".to_string(), "stop-runtime-service".to_string()]);
+        assert!(format!("{stop_runtime:?}").contains("StopRuntimeService"));
+
+        let runtime_status =
+            parse_command(&["ops".to_string(), "show-runtime-service-status".to_string()]);
+        assert!(format!("{runtime_status:?}").contains("ShowRuntimeServiceStatus"));
+
+        let start_assignment_refresh = parse_command(&[
+            "ops".to_string(),
+            "start-assignment-refresh-service".to_string(),
+        ]);
+        assert!(format!("{start_assignment_refresh:?}").contains("StartAssignmentRefreshService"));
+
         let apply_managed_dns =
             parse_command(&["ops".to_string(), "apply-managed-dns-routing".to_string()]);
         assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
@@ -6804,6 +7269,10 @@ mod tests {
         let clear_managed_dns =
             parse_command(&["ops".to_string(), "clear-managed-dns-routing".to_string()]);
         assert!(format!("{clear_managed_dns:?}").contains("ClearManagedDnsRouting"));
+
+        let disconnect_cleanup =
+            parse_command(&["ops".to_string(), "disconnect-cleanup".to_string()]);
+        assert!(format!("{disconnect_cleanup:?}").contains("DisconnectCleanup"));
 
         let blind_exit_lockdown =
             parse_command(&["ops".to_string(), "apply-blind-exit-lockdown".to_string()]);
@@ -7038,6 +7507,22 @@ mod tests {
         )
         .expect_err("ipv6 loopback resolver addr should be rejected");
         assert!(err.contains("IPv4 loopback"));
+    }
+
+    #[test]
+    fn contains_ip_rule_lookup_table_matches_expected_rule() {
+        let body = "0:\tfrom all lookup local\n32765:\tfrom all lookup 51820\n32766:\tfrom all lookup main\n";
+        assert!(contains_ip_rule_lookup_table(body, "51820"));
+        assert!(!contains_ip_rule_lookup_table(body, "60000"));
+    }
+
+    #[test]
+    fn interface_absent_detail_detection_is_case_insensitive() {
+        assert!(is_interface_absent_detail(
+            "Cannot find device \"rustynet0\""
+        ));
+        assert!(is_interface_absent_detail("No such device"));
+        assert!(!is_interface_absent_detail("operation not permitted"));
     }
 
     #[test]
