@@ -293,6 +293,14 @@ enum OpsCommand {
     StopRuntimeService,
     ShowRuntimeServiceStatus,
     StartAssignmentRefreshService,
+    CheckAssignmentRefreshAvailability,
+    InstallTrustMaterial {
+        verifier_source: PathBuf,
+        trust_source: PathBuf,
+        verifier_dest: PathBuf,
+        trust_dest: PathBuf,
+        daemon_group: String,
+    },
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
     DisconnectCleanup,
@@ -609,6 +617,23 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::StartAssignmentRefreshService)
         }
+        "check-assignment-refresh-availability" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops check-assignment-refresh-availability does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::CheckAssignmentRefreshAvailability)
+        }
+        "install-trust-material" => Ok(OpsCommand::InstallTrustMaterial {
+            verifier_source: parser.required_path("--verifier-source")?,
+            trust_source: parser.required_path("--trust-source")?,
+            verifier_dest: parser.required_path("--verifier-dest")?,
+            trust_dest: parser.required_path("--trust-dest")?,
+            daemon_group: parser
+                .value("--daemon-group")
+                .unwrap_or_else(|| "rustynetd".to_string()),
+        }),
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
                 return Err("ops apply-managed-dns-routing does not accept options".to_string());
@@ -1995,6 +2020,22 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::StopRuntimeService => execute_ops_stop_runtime_service(),
         OpsCommand::ShowRuntimeServiceStatus => execute_ops_show_runtime_service_status(),
         OpsCommand::StartAssignmentRefreshService => execute_ops_start_assignment_refresh_service(),
+        OpsCommand::CheckAssignmentRefreshAvailability => {
+            execute_ops_check_assignment_refresh_availability()
+        }
+        OpsCommand::InstallTrustMaterial {
+            verifier_source,
+            trust_source,
+            verifier_dest,
+            trust_dest,
+            daemon_group,
+        } => execute_ops_install_trust_material(
+            verifier_source,
+            trust_source,
+            verifier_dest,
+            trust_dest,
+            daemon_group,
+        ),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
         OpsCommand::DisconnectCleanup => execute_ops_disconnect_cleanup(),
@@ -3115,6 +3156,11 @@ const DEFAULT_PHASE10_LEAK_REPORT_PATH: &str = "artifacts/phase10/leak_test_repo
 const DEFAULT_RUNTIME_SYSTEMD_SERVICE: &str = "rustynetd.service";
 const DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE: &str = "rustynetd-assignment-refresh.service";
 const DEFAULT_DISCONNECT_ROUTE_TABLE: &str = "51820";
+const DEFAULT_MACOS_LAUNCHD_DAEMON_LABEL: &str = "com.rustynet.rustynetd";
+const DEFAULT_MACOS_LAUNCHD_HELPER_LABEL: &str = "com.rustynet.rustynetd-privileged";
+const DEFAULT_MACOS_LAUNCHD_HELPER_PLIST_PATH: &str =
+    "/Library/LaunchDaemons/com.rustynet.rustynetd-privileged.plist";
+const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
 const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
@@ -3240,72 +3286,81 @@ fn execute_ops_restart_runtime_service() -> Result<String, String> {
 
 fn execute_ops_stop_runtime_service() -> Result<String, String> {
     require_root_execution()?;
-    if !cfg!(target_os = "linux") {
-        return Err("stop-runtime-service is supported on Linux only".to_string());
-    }
+    if cfg!(target_os = "linux") {
+        let stop_output =
+            run_command_capture("systemctl", &["stop", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
+        if !stop_output.status.success() {
+            return Err(format!(
+                "stop {} failed: {}",
+                DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+                command_failure_detail(&stop_output)
+            ));
+        }
 
-    let stop_output = run_command_capture("systemctl", &["stop", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
-    if !stop_output.status.success() {
-        return Err(format!(
-            "stop {} failed: {}",
-            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
-            command_failure_detail(&stop_output)
+        let active_output = run_command_capture(
+            "systemctl",
+            &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
+        )?;
+        if active_output.status.success() {
+            return Err(format!(
+                "runtime service remains active after stop: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+            ));
+        }
+
+        return Ok(format!(
+            "runtime service stopped: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
         ));
     }
 
-    let active_output = run_command_capture(
-        "systemctl",
-        &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
-    )?;
-    if active_output.status.success() {
-        return Err(format!(
-            "runtime service remains active after stop: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
-        ));
+    if cfg!(target_os = "macos") {
+        return execute_ops_stop_runtime_service_macos();
     }
 
-    Ok(format!(
-        "runtime service stopped: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
-    ))
+    Err("stop-runtime-service is supported on Linux and macOS only".to_string())
 }
 
 fn execute_ops_show_runtime_service_status() -> Result<String, String> {
     require_root_execution()?;
-    if !cfg!(target_os = "linux") {
-        return Err("show-runtime-service-status is supported on Linux only".to_string());
-    }
+    if cfg!(target_os = "linux") {
+        let status_output = run_command_capture(
+            "systemctl",
+            &[
+                "--no-pager",
+                "--full",
+                "status",
+                DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+            ],
+        )?;
+        if !status_output.status.success() {
+            return Err(format!(
+                "status {} failed: {}",
+                DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+                command_failure_detail(&status_output)
+            ));
+        }
 
-    let status_output = run_command_capture(
-        "systemctl",
-        &[
-            "--no-pager",
-            "--full",
-            "status",
-            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
-        ],
-    )?;
-    if !status_output.status.success() {
-        return Err(format!(
-            "status {} failed: {}",
-            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
-            command_failure_detail(&status_output)
+        let stdout = String::from_utf8_lossy(&status_output.stdout)
+            .trim()
+            .to_string();
+        if !stdout.is_empty() {
+            return Ok(stdout);
+        }
+        let stderr = String::from_utf8_lossy(&status_output.stderr)
+            .trim()
+            .to_string();
+        if !stderr.is_empty() {
+            return Ok(stderr);
+        }
+        return Ok(format!(
+            "runtime service status available: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&status_output.stdout)
-        .trim()
-        .to_string();
-    if !stdout.is_empty() {
-        return Ok(stdout);
+    if cfg!(target_os = "macos") {
+        return execute_ops_show_runtime_service_status_macos();
     }
-    let stderr = String::from_utf8_lossy(&status_output.stderr)
-        .trim()
-        .to_string();
-    if !stderr.is_empty() {
-        return Ok(stderr);
-    }
-    Ok(format!(
-        "runtime service status available: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
-    ))
+
+    Err("show-runtime-service-status is supported on Linux and macOS only".to_string())
 }
 
 fn execute_ops_start_assignment_refresh_service() -> Result<String, String> {
@@ -3331,10 +3386,224 @@ fn execute_ops_start_assignment_refresh_service() -> Result<String, String> {
     ))
 }
 
-fn execute_ops_disconnect_cleanup() -> Result<String, String> {
+fn execute_ops_check_assignment_refresh_availability() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("disconnect-cleanup is supported on Linux only".to_string());
+        return Err("check-assignment-refresh-availability is supported on Linux only".to_string());
+    }
+
+    let env_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
+        DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH,
+    )?;
+    ensure_regular_file_no_symlink(env_path.as_path(), "assignment refresh env file")?;
+
+    let cat_output = run_command_capture(
+        "systemctl",
+        &["cat", DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE],
+    )?;
+    if !cat_output.status.success() {
+        return Err(format!(
+            "assignment refresh service unavailable ({}): {}",
+            DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE,
+            command_failure_detail(&cat_output)
+        ));
+    }
+
+    Ok(format!(
+        "assignment refresh available: env={} service={}",
+        env_path.display(),
+        DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE
+    ))
+}
+
+fn execute_ops_install_trust_material(
+    verifier_source: PathBuf,
+    trust_source: PathBuf,
+    verifier_dest: PathBuf,
+    trust_dest: PathBuf,
+    daemon_group: String,
+) -> Result<String, String> {
+    for (path, label) in [
+        (verifier_source.as_path(), "verifier source"),
+        (trust_source.as_path(), "trust source"),
+        (verifier_dest.as_path(), "verifier destination"),
+        (trust_dest.as_path(), "trust destination"),
+    ] {
+        if !path.is_absolute() {
+            return Err(format!("{label} path must be absolute: {}", path.display()));
+        }
+    }
+    ensure_regular_file_no_symlink(&verifier_source, "trust verifier source")?;
+    ensure_regular_file_no_symlink(&trust_source, "trust evidence source")?;
+
+    let daemon_group = daemon_group.trim().to_string();
+    if daemon_group.is_empty() {
+        return Err("daemon group must not be empty".to_string());
+    }
+
+    let host_profile = match env_string_or_default("RUSTYNET_HOST_PROFILE", detect_host_profile())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "linux" => SigningPassphraseHostProfile::Linux,
+        "macos" | "darwin" => SigningPassphraseHostProfile::Macos,
+        other => {
+            return Err(format!(
+                "unsupported host profile for trust material install: {other}"
+            ));
+        }
+    };
+
+    let (owner_uid, verifier_group_gid, verifier_mode, trust_group_gid, trust_mode, trust_group) =
+        match host_profile {
+            SigningPassphraseHostProfile::Linux => {
+                if !cfg!(target_os = "linux") {
+                    return Err(
+                        "linux host profile for install-trust-material is supported on Linux only"
+                            .to_string(),
+                    );
+                }
+                require_root_execution()?;
+                let owner_uid = Uid::from_raw(0);
+                let verifier_group_gid = Gid::from_raw(0);
+                let (trust_group_gid, trust_mode, trust_group) =
+                    match Group::from_name(daemon_group.as_str()).map_err(|err| {
+                        format!("resolve daemon group {daemon_group} failed: {err}")
+                    })? {
+                        Some(group) => (group.gid, 0o640, daemon_group.clone()),
+                        None => (Gid::from_raw(0), 0o644, "root".to_string()),
+                    };
+                (
+                    owner_uid,
+                    verifier_group_gid,
+                    0o644,
+                    trust_group_gid,
+                    trust_mode,
+                    trust_group,
+                )
+            }
+            SigningPassphraseHostProfile::Macos => {
+                if !cfg!(target_os = "macos") {
+                    return Err(
+                        "macos host profile for install-trust-material is supported on macOS only"
+                            .to_string(),
+                    );
+                }
+                (
+                    Uid::effective(),
+                    Gid::effective(),
+                    0o644,
+                    Gid::effective(),
+                    0o600,
+                    Gid::effective().as_raw().to_string(),
+                )
+            }
+        };
+
+    install_trust_material_file(
+        verifier_source.as_path(),
+        verifier_dest.as_path(),
+        owner_uid,
+        verifier_group_gid,
+        verifier_mode,
+        "trust verifier key",
+    )?;
+    install_trust_material_file(
+        trust_source.as_path(),
+        trust_dest.as_path(),
+        owner_uid,
+        trust_group_gid,
+        trust_mode,
+        "trust evidence",
+    )?;
+
+    Ok(format!(
+        "trust material installed: verifier={} trust={} trust_group={} trust_mode={:03o}",
+        verifier_dest.display(),
+        trust_dest.display(),
+        trust_group,
+        trust_mode
+    ))
+}
+
+fn install_trust_material_file(
+    source_path: &Path,
+    destination_path: &Path,
+    owner: Uid,
+    group: Gid,
+    mode: u32,
+    label: &str,
+) -> Result<(), String> {
+    if let Ok(destination_metadata) = fs::symlink_metadata(destination_path) {
+        if destination_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{label} destination must not be a symlink: {}",
+                destination_path.display()
+            ));
+        }
+        if !destination_metadata.file_type().is_file() {
+            return Err(format!(
+                "{label} destination must be a regular file: {}",
+                destination_path.display()
+            ));
+        }
+    }
+
+    let destination_parent = destination_path.parent().ok_or_else(|| {
+        format!(
+            "{label} destination has no parent directory: {}",
+            destination_path.display()
+        )
+    })?;
+    let destination_parent_metadata = fs::symlink_metadata(destination_parent).map_err(|err| {
+        format!(
+            "inspect {label} destination parent failed ({}): {err}",
+            destination_parent.display()
+        )
+    })?;
+    if destination_parent_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} destination parent must not be a symlink: {}",
+            destination_parent.display()
+        ));
+    }
+    if !destination_parent_metadata.file_type().is_dir() {
+        return Err(format!(
+            "{label} destination parent must be a directory: {}",
+            destination_parent.display()
+        ));
+    }
+
+    let temp_path = create_secure_temp_file(destination_parent, "rustynet.ops.trust-material.")?;
+    if let Err(err) = fs::copy(source_path, temp_path.as_path()) {
+        let _ = remove_file_if_present(temp_path.as_path());
+        return Err(format!(
+            "copy {label} source {} failed: {err}",
+            source_path.display()
+        ));
+    }
+    if let Err(err) = publish_file_with_owner_mode(
+        temp_path.as_path(),
+        destination_path,
+        owner,
+        group,
+        mode,
+        label,
+    ) {
+        let _ = remove_file_if_present(temp_path.as_path());
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn execute_ops_disconnect_cleanup() -> Result<String, String> {
+    require_root_execution()?;
+    if cfg!(target_os = "macos") {
+        return execute_ops_disconnect_cleanup_macos();
+    }
+    if !cfg!(target_os = "linux") {
+        return Err("disconnect-cleanup is supported on Linux and macOS only".to_string());
     }
 
     let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
@@ -3556,6 +3825,393 @@ fn execute_ops_disconnect_cleanup() -> Result<String, String> {
     Ok(format!(
         "disconnect cleanup complete: service_was_active={service_was_active} service_stopped={service_stopped} interface_present={interface_present} interface_removed={interface_removed} routes_flushed={routes_flushed} policy_rules_removed={policy_rules_removed} nft_tables_removed={nft_tables_removed} ipv6_restored={ipv6_restored}"
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosRuntimeServiceContext {
+    daemon_uid: u32,
+    daemon_domain: String,
+    daemon_label: String,
+    helper_label: String,
+    daemon_target: String,
+    helper_target: String,
+    daemon_plist_path: PathBuf,
+    helper_plist_path: PathBuf,
+    daemon_socket_path: PathBuf,
+    helper_socket_path: PathBuf,
+}
+
+fn execute_ops_stop_runtime_service_macos() -> Result<String, String> {
+    let context = macos_runtime_service_context_from_env()?;
+    launchctl_bootout_unit(
+        context.daemon_domain.as_str(),
+        context.daemon_label.as_str(),
+        context.daemon_plist_path.as_path(),
+    )?;
+    launchctl_bootout_unit(
+        "system",
+        context.helper_label.as_str(),
+        context.helper_plist_path.as_path(),
+    )?;
+    remove_socket_if_present(context.daemon_socket_path.as_path(), "daemon socket")?;
+    remove_socket_if_present(
+        context.helper_socket_path.as_path(),
+        "privileged helper socket",
+    )?;
+    Ok(format!(
+        "runtime service stopped: daemon_target={} helper_target={} daemon_socket={} helper_socket={}",
+        context.daemon_target,
+        context.helper_target,
+        context.daemon_socket_path.display(),
+        context.helper_socket_path.display()
+    ))
+}
+
+fn execute_ops_show_runtime_service_status_macos() -> Result<String, String> {
+    let context = macos_runtime_service_context_from_env()?;
+
+    let daemon_loaded =
+        run_command_capture("launchctl", &["print", context.daemon_target.as_str()])?
+            .status
+            .success();
+    let helper_loaded =
+        run_command_capture("launchctl", &["print", context.helper_target.as_str()])?
+            .status
+            .success();
+    let daemon_socket_present =
+        socket_exists_and_is_socket(context.daemon_socket_path.as_path(), "daemon socket")?;
+    let helper_socket_present = socket_exists_and_is_socket(
+        context.helper_socket_path.as_path(),
+        "privileged helper socket",
+    )?;
+
+    Ok(format!(
+        "runtime service status (macos):\ndaemon_target={} loaded={}\nhelper_target={} loaded={}\ndaemon_socket={} present={}\nhelper_socket={} present={}",
+        context.daemon_target,
+        daemon_loaded,
+        context.helper_target,
+        helper_loaded,
+        context.daemon_socket_path.display(),
+        daemon_socket_present,
+        context.helper_socket_path.display(),
+        helper_socket_present,
+    ))
+}
+
+fn execute_ops_disconnect_cleanup_macos() -> Result<String, String> {
+    let context = macos_runtime_service_context_from_env()?;
+    let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
+        .trim()
+        .to_string();
+    validate_managed_dns_interface_name(interface.as_str())?;
+
+    let mut errors = Vec::new();
+    let mut service_stopped = false;
+    let mut wireguard_go_killed = 0usize;
+    let mut pf_anchors_flushed = 0usize;
+
+    match execute_ops_stop_runtime_service_macos() {
+        Ok(_) => {
+            service_stopped = true;
+        }
+        Err(err) => errors.push(err),
+    }
+
+    match run_command_capture("ps", &["-ax", "-o", "pid=", "-o", "command="]) {
+        Ok(ps_output) => {
+            if !ps_output.status.success() {
+                errors.push(format!(
+                    "enumerate process list failed: {}",
+                    command_failure_detail(&ps_output)
+                ));
+            } else {
+                let ps_body = String::from_utf8_lossy(&ps_output.stdout);
+                match parse_wireguard_go_pids_from_ps(ps_body.as_ref(), interface.as_str()) {
+                    Ok(pids) => {
+                        for pid in pids {
+                            let pid_raw = pid.to_string();
+                            match run_command_capture("kill", &["-TERM", pid_raw.as_str()]) {
+                                Ok(kill_output) => {
+                                    if kill_output.status.success() {
+                                        wireguard_go_killed += 1;
+                                    } else {
+                                        let detail = command_failure_detail(&kill_output);
+                                        if !detail.contains("No such process") {
+                                            errors.push(format!(
+                                                "terminate wireguard-go pid {pid} failed: {detail}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => errors.push(err),
+                            }
+                        }
+                    }
+                    Err(err) => errors.push(err),
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    match run_command_capture("pfctl", &["-s", "Anchors"]) {
+        Ok(anchor_output) => {
+            if !anchor_output.status.success() {
+                errors.push(format!(
+                    "enumerate PF anchors failed: {}",
+                    command_failure_detail(&anchor_output)
+                ));
+            } else {
+                let body = String::from_utf8_lossy(&anchor_output.stdout);
+                for anchor in parse_managed_pf_anchors(body.as_ref()) {
+                    match run_command_capture("pfctl", &["-a", anchor.as_str(), "-F", "all"]) {
+                        Ok(flush_output) => {
+                            if flush_output.status.success() {
+                                pf_anchors_flushed += 1;
+                            } else {
+                                errors.push(format!(
+                                    "flush PF anchor {} failed: {}",
+                                    anchor,
+                                    command_failure_detail(&flush_output)
+                                ));
+                            }
+                        }
+                        Err(err) => errors.push(err),
+                    }
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "disconnect cleanup completed with residual-state errors: {}",
+            errors.join(" | ")
+        ));
+    }
+
+    Ok(format!(
+        "disconnect cleanup complete: host=macos service_stopped={} daemon_target={} helper_target={} wireguard_go_killed={} pf_anchors_flushed={}",
+        service_stopped,
+        context.daemon_target,
+        context.helper_target,
+        wireguard_go_killed,
+        pf_anchors_flushed
+    ))
+}
+
+fn parse_managed_pf_anchors(body: &str) -> Vec<String> {
+    let mut anchors = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("com.apple/rustynet_g"))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    anchors.sort();
+    anchors.dedup();
+    anchors
+}
+
+fn parse_wireguard_go_pids_from_ps(ps_output: &str, interface: &str) -> Result<Vec<i32>, String> {
+    let mut pids = Vec::new();
+    for line in ps_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let Some(pid_token) = fields.next() else {
+            continue;
+        };
+        let pid = pid_token
+            .parse::<i32>()
+            .map_err(|_| format!("invalid pid token in ps output: {pid_token}"))?;
+        if pid <= 0 {
+            return Err(format!("invalid pid value in ps output: {pid}"));
+        }
+        let command_tokens = fields.collect::<Vec<_>>();
+        if command_tokens
+            .windows(2)
+            .any(|window| window[0].ends_with("wireguard-go") && window[1] == interface)
+        {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+fn macos_runtime_service_context_from_env() -> Result<MacosRuntimeServiceContext, String> {
+    let daemon_uid = macos_daemon_uid_from_env()?;
+    let daemon_domain = macos_launchd_domain_for_uid(daemon_uid);
+    let daemon_label = env_string_or_default(
+        "RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL",
+        DEFAULT_MACOS_LAUNCHD_DAEMON_LABEL,
+    )?;
+    validate_launchd_label(daemon_label.as_str(), "daemon launchd label")?;
+    let helper_label = env_string_or_default(
+        "RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL",
+        DEFAULT_MACOS_LAUNCHD_HELPER_LABEL,
+    )?;
+    validate_launchd_label(helper_label.as_str(), "helper launchd label")?;
+
+    let daemon_plist_path = resolve_macos_daemon_plist_path(daemon_uid, daemon_label.as_str())?;
+    let helper_plist_path = env_path_or_default(
+        "RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST",
+        DEFAULT_MACOS_LAUNCHD_HELPER_PLIST_PATH,
+    )?;
+    let daemon_socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let helper_socket_path = env_path_or_default(
+        "RUSTYNET_PRIVILEGED_HELPER_SOCKET",
+        DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+    )?;
+
+    Ok(MacosRuntimeServiceContext {
+        daemon_uid,
+        daemon_domain: daemon_domain.clone(),
+        daemon_label: daemon_label.clone(),
+        helper_label: helper_label.clone(),
+        daemon_target: format!("{daemon_domain}/{daemon_label}"),
+        helper_target: format!("system/{helper_label}"),
+        daemon_plist_path,
+        helper_plist_path,
+        daemon_socket_path,
+        helper_socket_path,
+    })
+}
+
+fn macos_daemon_uid_from_env() -> Result<u32, String> {
+    let raw_uid = match env_optional_string("RUSTYNET_MACOS_DAEMON_UID")? {
+        Some(value) => value,
+        None => env_optional_string("SUDO_UID")?
+            .unwrap_or_else(|| Uid::effective().as_raw().to_string()),
+    };
+    let daemon_uid = raw_uid
+        .parse::<u32>()
+        .map_err(|err| format!("invalid daemon uid value '{raw_uid}': {err}"))?;
+    if daemon_uid == 0 {
+        return Err("daemon uid must be a non-root user on macOS".to_string());
+    }
+    Ok(daemon_uid)
+}
+
+fn macos_launchd_domain_for_uid(uid: u32) -> String {
+    let gui_domain = format!("gui/{uid}");
+    match run_command_capture("launchctl", &["print", gui_domain.as_str()]) {
+        Ok(output) if output.status.success() => gui_domain,
+        _ => format!("user/{uid}"),
+    }
+}
+
+fn validate_launchd_label(label: &str, field_name: &str) -> Result<(), String> {
+    if label.trim().is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    if !label
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(format!("{field_name} contains invalid characters"));
+    }
+    Ok(())
+}
+
+fn resolve_macos_daemon_plist_path(daemon_uid: u32, daemon_label: &str) -> Result<PathBuf, String> {
+    if let Some(explicit_path) = env_optional_string("RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST")? {
+        let path = PathBuf::from(explicit_path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "daemon launchd plist path must be absolute: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+
+    let user = User::from_uid(Uid::from_raw(daemon_uid))
+        .map_err(|err| format!("resolve daemon uid {daemon_uid} failed: {err}"))?
+        .ok_or_else(|| format!("daemon uid {daemon_uid} does not exist"))?;
+    Ok(user
+        .dir
+        .join("Library/LaunchAgents")
+        .join(format!("{daemon_label}.plist")))
+}
+
+fn launchctl_bootout_unit(domain: &str, label: &str, plist_path: &Path) -> Result<(), String> {
+    if !plist_path.is_absolute() {
+        return Err(format!(
+            "launchd plist path must be absolute: {}",
+            plist_path.display()
+        ));
+    }
+    let target = format!("{domain}/{label}");
+    let plist_arg = plist_path.to_string_lossy().to_string();
+
+    let target_output = run_command_capture("launchctl", &["bootout", target.as_str()])?;
+    if target_output.status.success() {
+        return Ok(());
+    }
+
+    let domain_output = run_command_capture("launchctl", &["bootout", domain, plist_arg.as_str()])?;
+    if domain_output.status.success() {
+        return Ok(());
+    }
+
+    let print_output = run_command_capture("launchctl", &["print", target.as_str()])?;
+    if !print_output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "failed to unload launchd unit {}: {}",
+        target,
+        command_failure_detail(&domain_output)
+    ))
+}
+
+fn socket_exists_and_is_socket(path: &Path, label: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("{label} must not be a symlink: {}", path.display()));
+            }
+            if !metadata.file_type().is_socket() {
+                return Err(format!("{label} must be a unix socket: {}", path.display()));
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!(
+            "inspect {label} failed ({}): {err}",
+            path.display()
+        )),
+    }
+}
+
+fn remove_socket_if_present(path: &Path, label: &str) -> Result<bool, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("{label} must not be a symlink: {}", path.display()));
+            }
+            if !metadata.file_type().is_socket() {
+                return Err(format!("{label} must be a unix socket: {}", path.display()));
+            }
+            fs::remove_file(path)
+                .map_err(|err| format!("remove {label} failed ({}): {err}", path.display()))?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!(
+            "inspect {label} failed ({}): {err}",
+            path.display()
+        )),
+    }
 }
 
 fn run_command_capture(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -6895,6 +7551,8 @@ fn help_text() -> String {
         "  ops stop-runtime-service",
         "  ops show-runtime-service-status",
         "  ops start-assignment-refresh-service",
+        "  ops check-assignment-refresh-availability",
+        "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
         "  ops apply-managed-dns-routing",
         "  ops clear-managed-dns-routing",
         "  ops disconnect-cleanup",
@@ -6918,7 +7576,8 @@ mod tests {
     use super::{
         contains_ip_rule_lookup_table, detect_tampered_log, execute, is_interface_absent_detail,
         load_dns_zone_records_json, load_signing_key, managed_dns_resolver_server_arg,
-        parse_bool_value, parse_bundle_u64_field, parse_command, persist_encrypted_secret_material,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
         phase6_validate_platform_parity_report, required_macos_tunnel_keychain_account,
         rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
         rewrite_env_key_value, validate_control_socket_security,
@@ -7262,6 +7921,30 @@ mod tests {
         ]);
         assert!(format!("{start_assignment_refresh:?}").contains("StartAssignmentRefreshService"));
 
+        let check_assignment_refresh = parse_command(&[
+            "ops".to_string(),
+            "check-assignment-refresh-availability".to_string(),
+        ]);
+        assert!(
+            format!("{check_assignment_refresh:?}").contains("CheckAssignmentRefreshAvailability")
+        );
+
+        let install_trust_material = parse_command(&[
+            "ops".to_string(),
+            "install-trust-material".to_string(),
+            "--verifier-source".to_string(),
+            "/tmp/trust.pub".to_string(),
+            "--trust-source".to_string(),
+            "/tmp/rustynetd.trust".to_string(),
+            "--verifier-dest".to_string(),
+            "/etc/rustynet/trust-evidence.pub".to_string(),
+            "--trust-dest".to_string(),
+            "/var/lib/rustynet/rustynetd.trust".to_string(),
+            "--daemon-group".to_string(),
+            "rustynetd".to_string(),
+        ]);
+        assert!(format!("{install_trust_material:?}").contains("InstallTrustMaterial"));
+
         let apply_managed_dns =
             parse_command(&["ops".to_string(), "apply-managed-dns-routing".to_string()]);
         assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
@@ -7517,6 +8200,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_managed_pf_anchors_filters_and_deduplicates() {
+        let body = "com.apple/rustynet_g100\ncom.apple/rustynet_g100\ncom.apple/rustynet_nat_g5\ncom.apple/rustynet_g200\n";
+        let anchors = parse_managed_pf_anchors(body);
+        assert_eq!(
+            anchors,
+            vec![
+                "com.apple/rustynet_g100".to_string(),
+                "com.apple/rustynet_g200".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_wireguard_go_pids_matches_interface_exactly() {
+        let ps_body = " 101 /usr/local/bin/wireguard-go rustynet0\n 202 /usr/local/bin/wireguard-go rustynet1\n 303 /usr/bin/other-process rustynet0\n";
+        let pids =
+            parse_wireguard_go_pids_from_ps(ps_body, "rustynet0").expect("parse should succeed");
+        assert_eq!(pids, vec![101]);
+    }
+
+    #[test]
     fn interface_absent_detail_detection_is_case_insensitive() {
         assert!(is_interface_absent_detail(
             "Cannot find device \"rustynet0\""
@@ -7741,6 +8445,93 @@ mod tests {
         assert_eq!(mode, 0o600, "secure temp files must be owner-only");
 
         super::secure_remove_file(&temp).expect("cleanup should succeed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_trust_material_file_rejects_symlink_destination() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let unique = format!(
+            "rustynet-cli-trust-material-symlink-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+
+        let source = dir.join("trust.source");
+        std::fs::write(&source, b"version=1\n").expect("source should be written");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("source mode should be strict");
+
+        let destination_target = dir.join("trust.dest.target");
+        std::fs::write(&destination_target, b"old\n").expect("target file should exist");
+        let destination = dir.join("trust.dest");
+        symlink(&destination_target, &destination).expect("destination symlink should exist");
+
+        let err = super::install_trust_material_file(
+            source.as_path(),
+            destination.as_path(),
+            nix::unistd::Uid::effective(),
+            nix::unistd::Gid::effective(),
+            0o600,
+            "trust evidence",
+        )
+        .expect_err("symlink destination must fail");
+        assert!(err.contains("must not be a symlink"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_trust_material_file_copies_with_expected_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-cli-trust-material-copy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+
+        let source = dir.join("trust.source");
+        std::fs::write(&source, b"version=1\nupdated_at_unix=1\n")
+            .expect("source should be written");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("source mode should be strict");
+
+        let destination = dir.join("trust.dest");
+        super::install_trust_material_file(
+            source.as_path(),
+            destination.as_path(),
+            nix::unistd::Uid::effective(),
+            nix::unistd::Gid::effective(),
+            0o640,
+            "trust evidence",
+        )
+        .expect("file install should succeed");
+
+        let copied = std::fs::read(&destination).expect("destination should be readable");
+        assert_eq!(copied, b"version=1\nupdated_at_unix=1\n");
+        let mode = std::fs::metadata(&destination)
+            .expect("destination metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "destination mode should match requested mode");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

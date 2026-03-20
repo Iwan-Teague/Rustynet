@@ -2116,6 +2116,26 @@ refresh_signed_trust_evidence() {
 }
 
 configure_trust_material() {
+  install_trust_material_with_rust() {
+    local verifier_source="$1"
+    local trust_source="$2"
+    local rust_install_output=""
+    if ! rust_install_output="$(
+      run_rustynet_ops_with_scope install-trust-material \
+        --verifier-source "${verifier_source}" \
+        --trust-source "${trust_source}" \
+        --verifier-dest "${TRUST_VERIFIER_KEY_PATH}" \
+        --trust-dest "${TRUST_EVIDENCE_PATH}" \
+        --daemon-group "${RUSTYNET_DAEMON_GROUP:-rustynetd}" 2>&1
+    )"; then
+      print_err "Rust-backed trust material install failed; setup is fail-closed."
+      [[ -n "${rust_install_output}" ]] && print_err "${rust_install_output}"
+      return 1
+    fi
+    [[ -n "${rust_install_output}" ]] && print_info "${rust_install_output}"
+    return 0
+  }
+
   if is_blind_exit_role; then
     print_info "blind_exit role detected: provisioning local trust material for unattended operation."
     local signing_passphrase_file=""
@@ -2145,24 +2165,8 @@ configure_trust_material() {
     local source_trust
     prompt_default source_verifier "Path to verifier key (32-byte hex line)" "${TRUST_VERIFIER_KEY_PATH}"
     prompt_default source_trust "Path to signed trust evidence file" "${TRUST_EVIDENCE_PATH}"
-    if [[ "${source_verifier}" != "${TRUST_VERIFIER_KEY_PATH}" || ! -f "${TRUST_VERIFIER_KEY_PATH}" ]]; then
-      run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
-    fi
-    if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
-      local trust_group="root"
-      local trust_mode="0600"
-      if is_linux_host; then
-        trust_mode="0644"
-        local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
-        if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
-          trust_group="${daemon_group}"
-          trust_mode="0640"
-        fi
-      fi
-      run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
-      if is_macos_host; then
-        run_root chown "$(id -u):$(id -g)" "${TRUST_EVIDENCE_PATH}"
-      fi
+    if ! install_trust_material_with_rust "${source_verifier}" "${source_trust}"; then
+      return 1
     fi
     AUTO_REFRESH_TRUST="0"
     return 0
@@ -2211,28 +2215,8 @@ configure_trust_material() {
   local source_trust
   prompt_default source_verifier "Path to verifier key (32-byte hex line)" "${TRUST_VERIFIER_KEY_PATH}"
   prompt_default source_trust "Path to signed trust evidence file" "${TRUST_EVIDENCE_PATH}"
-
-  if [[ "${source_verifier}" != "${TRUST_VERIFIER_KEY_PATH}" ]]; then
-    run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
-  elif [[ ! -f "${TRUST_VERIFIER_KEY_PATH}" ]]; then
-    run_root install -m 0644 "${source_verifier}" "${TRUST_VERIFIER_KEY_PATH}"
-  fi
-
-  if [[ "${source_trust}" != "${TRUST_EVIDENCE_PATH}" || ! -f "${TRUST_EVIDENCE_PATH}" ]]; then
-    local trust_group="root"
-    local trust_mode="0600"
-    if is_linux_host; then
-      trust_mode="0644"
-      local daemon_group="${RUSTYNET_DAEMON_GROUP:-rustynetd}"
-      if command -v getent >/dev/null 2>&1 && getent group "${daemon_group}" >/dev/null 2>&1; then
-        trust_group="${daemon_group}"
-        trust_mode="0640"
-      fi
-    fi
-    run_root install -m "${trust_mode}" -o root -g "${trust_group}" "${source_trust}" "${TRUST_EVIDENCE_PATH}"
-    if is_macos_host; then
-      run_root chown "$(id -u):$(id -g)" "${TRUST_EVIDENCE_PATH}"
-    fi
+  if ! install_trust_material_with_rust "${source_verifier}" "${source_trust}"; then
+    return 1
   fi
 
   if prompt_yes_no "Do you also have signer key access for auto-refresh?" "n"; then
@@ -2805,7 +2789,25 @@ stop_service() {
     return
   fi
   if is_macos_host; then
-    macos_stop_launchd_services
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_err "rustynet CLI is required for macOS runtime service stop."
+      return 1
+    fi
+    local rust_stop_output=""
+    if ! rust_stop_output="$(run_root env \
+      RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
+      RUSTYNET_SOCKET="${SOCKET_PATH}" \
+      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+      rustynet ops stop-runtime-service 2>&1)"; then
+      print_err "Rust-backed macOS runtime stop failed."
+      [[ -n "${rust_stop_output}" ]] && print_err "${rust_stop_output}"
+      return 1
+    fi
+    [[ -n "${rust_stop_output}" ]] && print_info "${rust_stop_output}"
     return
   fi
   require_linux_dataplane "stop_service" || return 0
@@ -2823,36 +2825,27 @@ disconnect_vpn() {
     else
       print_info "Daemon socket not present; skipping exit-node disable."
     fi
-    print_info "Stopping Rustynet daemon + privileged helper..."
-    if ! stop_service; then
-      print_err "Failed to stop Rustynet launchd services cleanly."
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_err "rustynet CLI is required for macOS disconnect cleanup."
+      return 1
+    fi
+    local rust_disconnect_output=""
+    if ! rust_disconnect_output="$(run_root env \
+      RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
+      RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
+      RUSTYNET_SOCKET="${SOCKET_PATH}" \
+      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+      rustynet ops disconnect-cleanup 2>&1)"; then
+      print_err "Rust-backed macOS disconnect cleanup failed."
+      [[ -n "${rust_disconnect_output}" ]] && print_err "${rust_disconnect_output}"
       had_error=1
+    elif [[ -n "${rust_disconnect_output}" ]]; then
+      print_info "${rust_disconnect_output}"
     fi
-    print_info "Stopping any remaining wireguard-go process for ${WG_INTERFACE}..."
-    if run_root pgrep -f "wireguard-go ${WG_INTERFACE}" >/dev/null 2>&1; then
-      if ! run_root pkill -f "wireguard-go ${WG_INTERFACE}" 2>/dev/null; then
-        print_err "Failed to stop wireguard-go process for ${WG_INTERFACE}."
-        had_error=1
-      fi
-    else
-      print_info "No wireguard-go process found for ${WG_INTERFACE}."
-    fi
-    print_info "Flushing Rustynet PF anchors..."
-    local anchors_output=""
-    if ! anchors_output="$(run_root pfctl -s Anchors 2>/dev/null)"; then
-      print_err "Failed to enumerate PF anchors."
-      had_error=1
-      anchors_output=""
-    fi
-    while IFS= read -r anchor; do
-      [[ -z "${anchor}" ]] && continue
-      if [[ "${anchor}" == com.apple/rustynet_g* ]]; then
-        if ! run_root pfctl -a "${anchor}" -F all 2>/dev/null; then
-          print_err "Failed to flush PF anchor ${anchor}."
-          had_error=1
-        fi
-      fi
-    done <<<"${anchors_output}"
     if [[ "${had_error}" -ne 0 ]]; then
       print_err "Rustynet disconnect completed with residual-state errors."
       return 1
@@ -2895,30 +2888,25 @@ show_service_status() {
     return
   fi
   if is_macos_host; then
-    local daemon_domain daemon_target helper_target
-    daemon_domain="$(macos_launchd_domain)"
-    daemon_target="${daemon_domain}/${MACOS_LAUNCHD_DAEMON_LABEL}"
-    helper_target="system/${MACOS_LAUNCHD_HELPER_LABEL}"
-    if launchctl print "${daemon_target}" >/dev/null 2>&1; then
-      print_info "rustynetd launchd unit loaded (${daemon_target})"
-    else
-      print_warn "rustynetd launchd unit is not loaded (${daemon_target})."
+    if ! command -v rustynet >/dev/null 2>&1; then
+      print_warn "rustynet CLI is required to inspect macOS runtime service status."
+      return
     fi
-    if run_root launchctl print "${helper_target}" >/dev/null 2>&1; then
-      print_info "privileged helper launchd unit loaded (${helper_target})"
-    else
-      print_warn "privileged helper launchd unit is not loaded (${helper_target})."
+    local rust_runtime_status_output=""
+    if ! rust_runtime_status_output="$(run_root env \
+      RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
+      RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
+      RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
+      RUSTYNET_SOCKET="${SOCKET_PATH}" \
+      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+      rustynet ops show-runtime-service-status 2>&1)"; then
+      print_warn "Unable to read macOS runtime service status."
+      [[ -n "${rust_runtime_status_output}" ]] && print_warn "${rust_runtime_status_output}"
+      return
     fi
-    if [[ -S "${SOCKET_PATH}" ]]; then
-      print_info "daemon IPC socket present (${SOCKET_PATH})"
-    else
-      print_warn "daemon IPC socket missing (${SOCKET_PATH})"
-    fi
-    if [[ -S "${PRIVILEGED_HELPER_SOCKET_PATH}" ]]; then
-      print_info "privileged helper socket present (${PRIVILEGED_HELPER_SOCKET_PATH})"
-    else
-      print_warn "privileged helper socket missing (${PRIVILEGED_HELPER_SOCKET_PATH})"
-    fi
+    [[ -n "${rust_runtime_status_output}" ]] && printf '%s\n' "${rust_runtime_status_output}"
     return
   fi
   require_linux_dataplane "show_service_status" || return 0
@@ -3090,8 +3078,12 @@ local_assignment_refresh_available() {
   if ! is_linux_host; then
     return 1
   fi
-  run_root test -f "${ASSIGNMENT_REFRESH_ENV_PATH}" >/dev/null 2>&1 || return 1
-  run_root systemctl cat rustynetd-assignment-refresh.service >/dev/null 2>&1 || return 1
+  if ! command -v rustynet >/dev/null 2>&1; then
+    return 1
+  fi
+  run_root env \
+    RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH="${ASSIGNMENT_REFRESH_ENV_PATH}" \
+    rustynet ops check-assignment-refresh-availability >/dev/null 2>&1 || return 1
   return 0
 }
 
