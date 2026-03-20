@@ -155,6 +155,7 @@ live_lab_ssh() {
   local timeout="${3:-10800}"
   local ssh_args=(
     ssh
+    -n
     -o LogLevel=ERROR
     -o BatchMode=yes
     -o StrictHostKeyChecking=yes

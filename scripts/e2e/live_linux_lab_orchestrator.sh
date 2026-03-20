@@ -52,6 +52,9 @@ PROFILE_PATH=""
 DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
 TRAVERSAL_TTL_SECS=120
+MANAGED_DNS_FATAL_PATTERN_1='rustynetd-managed-dns\.service failed to reach active state'
+MANAGED_DNS_FATAL_PATTERN_2='command failed \(systemctl restart rustynetd-managed-dns\.service\)'
+MANAGED_DNS_FATAL_PATTERN_3='Job for rustynetd-managed-dns\.service canceled'
 CROSS_NETWORK_NAT_PROFILES="${RUSTYNET_CROSS_NETWORK_NAT_PROFILES:-baseline_lan}"
 CROSS_NETWORK_REQUIRED_NAT_PROFILES="${RUSTYNET_CROSS_NETWORK_REQUIRED_NAT_PROFILES:-}"
 CROSS_NETWORK_IMPAIRMENT_PROFILE="${RUSTYNET_CROSS_NETWORK_IMPAIRMENT_PROFILE:-none}"
@@ -128,7 +131,7 @@ options:
                                  Maximum allowed age for discovery bundles generated during preflight (default: ${CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS})
   --cross-network-signed-artifact-max-age-secs <secs>
                                  Maximum allowed age for signed runtime artifacts in preflight (default: ${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS})
-  --reboot-hard-fail             Treat reboot soak failures as hard failures
+  --reboot-hard-fail             Deprecated: extended soak is hard-fail by default
   --dry-run                      Validate config and planned stages without touching hosts
   -h, --help                     Show this help
 USAGE
@@ -243,7 +246,7 @@ parse_profile_csv_to_array() {
   local -a items=()
   local -a parsed=()
   IFS=',' read -r -a items <<< "$raw"
-  for item in "${items[@]}"; do
+  for item in "${items[@]-}"; do
     trimmed="$(trim_ascii "$item")"
     [[ -n "$trimmed" ]] || continue
     if ! is_valid_profile_label "$trimmed"; then
@@ -251,7 +254,7 @@ parse_profile_csv_to_array() {
       return 1
     fi
     duplicate=0
-    for existing in "${parsed[@]}"; do
+    for existing in "${parsed[@]-}"; do
       if [[ "$existing" == "$trimmed" ]]; then
         duplicate=1
         break
@@ -281,6 +284,49 @@ parse_profile_csv_to_array() {
 join_csv() {
   local IFS=','
   printf '%s' "$*"
+}
+
+derive_ipv4_cidr_24() {
+  local address="$1"
+  if [[ "$address" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}$ ]]; then
+    printf '%s.%s.%s.0/24' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+auto_adjust_default_ssh_allow_cidrs_for_targets() {
+  local legacy_default="192.168.18.0/24"
+  local target address cidr existing duplicate
+  local -a derived=()
+  if [[ "$SSH_ALLOW_CIDRS" != "$legacy_default" ]]; then
+    return 0
+  fi
+  for target in "$EXIT_TARGET" "$CLIENT_TARGET" "$ENTRY_TARGET" "$AUX_TARGET" "$EXTRA_TARGET"; do
+    [[ -n "$target" ]] || continue
+    address="$(live_lab_target_address "$target")"
+    if ! cidr="$(derive_ipv4_cidr_24 "$address")"; then
+      # Keep explicit/default value unchanged for non-IPv4 targets.
+      return 0
+    fi
+    duplicate=0
+    for existing in "${derived[@]-}"; do
+      if [[ "$existing" == "$cidr" ]]; then
+        duplicate=1
+        break
+      fi
+    done
+    if [[ "$duplicate" -eq 0 ]]; then
+      derived+=("$cidr")
+    fi
+  done
+  if [[ "${#derived[@]}" -gt 0 ]]; then
+    SSH_ALLOW_CIDRS="$(join_csv "${derived[@]}")"
+    if [[ "$SSH_ALLOW_CIDRS" != "$legacy_default" ]]; then
+      printf 'auto-adjusted SSH allow CIDRs from %s to %s based on target underlay addresses\n' \
+        "$legacy_default" "$SSH_ALLOW_CIDRS"
+    fi
+  fi
 }
 
 prepare_cross_network_profile_config() {
@@ -1146,12 +1192,14 @@ run_stage() {
   local status="pass"
   local forensics_dir=""
   printf '[stage:%s] START %s\n' "$stage_name" "$description" | tee "$log_path"
-  set +e
-  (
+  if (
+    set -euo pipefail
     "$@"
-  ) 2>&1 | tee -a "$log_path"
-  rc=$?
-  set -e
+  ) 2>&1 | tee -a "$log_path"; then
+    rc=0
+  else
+    rc=$?
+  fi
   finished_at="$(date -u +%FT%TZ)"
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
@@ -2456,10 +2504,61 @@ stage_run_live_lan_toggle() {
     --log-path "$REPORT_DIR/live_linux_lan_toggle.log"
 }
 
+assert_json_report_status_pass() {
+  local report_path="$1"
+  local label="$2"
+  if [[ ! -f "$report_path" ]]; then
+    printf '%s report missing: %s\n' "$label" "$report_path" >&2
+    return 1
+  fi
+  python3 - "$report_path" "$label" <<'PY'
+import json
+import sys
+
+report_path, label = sys.argv[1], sys.argv[2]
+with open(report_path, encoding="utf-8") as fh:
+    payload = json.load(fh)
+status = payload.get("status")
+if status != "pass":
+    raise SystemExit(f"{label} report status is not pass: {status!r}")
+PY
+}
+
+assert_log_absent_patterns() {
+  local log_path="$1"
+  local label="$2"
+  shift 2
+  local pattern
+  if [[ ! -f "$log_path" ]]; then
+    printf '%s log missing: %s\n' "$label" "$log_path" >&2
+    return 1
+  fi
+  for pattern in "$@"; do
+    if rg -n -- "$pattern" "$log_path" >/dev/null 2>&1; then
+      printf '%s log contains forbidden pattern (%s): %s\n' "$label" "$pattern" "$log_path" >&2
+      rg -n -- "$pattern" "$log_path" >&2 || true
+      return 1
+    fi
+  done
+}
+
+assert_no_managed_dns_service_errors() {
+  local log_path="$1"
+  local label="$2"
+  assert_log_absent_patterns \
+    "$log_path" \
+    "$label" \
+    "$MANAGED_DNS_FATAL_PATTERN_1" \
+    "$MANAGED_DNS_FATAL_PATTERN_2" \
+    "$MANAGED_DNS_FATAL_PATTERN_3"
+}
+
 stage_run_live_managed_dns() {
-  local canonical_report canonical_log
+  local canonical_report canonical_log stage_report stage_log
   canonical_report="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.json"
   canonical_log="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
+  stage_report="$REPORT_DIR/live_linux_managed_dns_report.json"
+  stage_log="$REPORT_DIR/live_linux_managed_dns.log"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -2468,11 +2567,13 @@ stage_run_live_managed_dns() {
     --client-host "$(node_target_for_label client)" \
     --client-node-id "$(node_id_for_label client)" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_managed_dns_report.json" \
-    --log-path "$REPORT_DIR/live_linux_managed_dns.log"
-  mkdir -p "$(dirname "$canonical_report")"
-  cp "$REPORT_DIR/live_linux_managed_dns_report.json" "$canonical_report"
-  cp "$REPORT_DIR/live_linux_managed_dns.log" "$canonical_log"
+    --report-path "$stage_report" \
+    --log-path "$stage_log" || return 1
+  assert_json_report_status_pass "$stage_report" "live managed DNS" || return 1
+  assert_no_managed_dns_service_errors "$stage_log" "live managed DNS" || return 1
+  mkdir -p "$(dirname "$canonical_report")" || return 1
+  cp "$stage_report" "$canonical_report" || return 1
+  cp "$stage_log" "$canonical_log" || return 1
 }
 
 stage_run_cross_network_direct_remote_exit() {
@@ -2979,10 +3080,14 @@ run_host_reboot() {
 }
 
 stage_run_extended_soak() {
-  local handoff_rc=0 two_hop_rc=0 lan_rc=0 reboot_rc=0 severity_name="soft"
-  if [[ "$SOAK_HARD_FAIL" -eq 1 ]]; then
-    severity_name="hard"
-  fi
+  local two_hop_pre_report="$REPORT_DIR/live_linux_two_hop_soak_pre_reboot_report.json"
+  local two_hop_pre_log="$REPORT_DIR/live_linux_two_hop_soak_pre_reboot.log"
+  local handoff_report="$REPORT_DIR/live_linux_exit_handoff_soak_report.json"
+  local handoff_log="$REPORT_DIR/live_linux_exit_handoff_soak.log"
+  local lan_report="$REPORT_DIR/live_linux_lan_toggle_soak_report.json"
+  local lan_log="$REPORT_DIR/live_linux_lan_toggle_soak.log"
+  local reboot_report="$REPORT_DIR/live_linux_reboot_recovery_report.json"
+  local reboot_log="$REPORT_DIR/live_linux_reboot_recovery.log"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -2995,8 +3100,10 @@ stage_run_extended_soak() {
     --second-client-host "$(node_target_for_label aux)" \
     --second-client-node-id "$(node_id_for_label aux)" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_two_hop_soak_pre_reboot_report.json" \
-    --log-path "$REPORT_DIR/live_linux_two_hop_soak_pre_reboot.log"
+    --report-path "$two_hop_pre_report" \
+    --log-path "$two_hop_pre_log" || return 1
+  assert_json_report_status_pass "$two_hop_pre_report" "extended soak pre-reboot two-hop" || return 1
+  assert_no_managed_dns_service_errors "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
 
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
@@ -3010,9 +3117,11 @@ stage_run_extended_soak() {
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
     --switch-iteration 60 \
     --monitor-iterations 180 \
-    --report-path "$REPORT_DIR/live_linux_exit_handoff_soak_report.json" \
-    --log-path "$REPORT_DIR/live_linux_exit_handoff_soak.log" \
-    --monitor-log "$REPORT_DIR/live_linux_exit_handoff_soak_monitor.log"
+    --report-path "$handoff_report" \
+    --log-path "$handoff_log" \
+    --monitor-log "$REPORT_DIR/live_linux_exit_handoff_soak_monitor.log" || return 1
+  assert_json_report_status_pass "$handoff_report" "extended soak exit handoff" || return 1
+  assert_no_managed_dns_service_errors "$handoff_log" "extended soak exit handoff" || return 1
 
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
@@ -3024,10 +3133,24 @@ stage_run_extended_soak() {
     --blind-exit-host "$(node_target_for_label aux)" \
     --blind-exit-node-id "$(node_id_for_label aux)" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_lan_toggle_soak_report.json" \
-    --log-path "$REPORT_DIR/live_linux_lan_toggle_soak.log"
+    --report-path "$lan_report" \
+    --log-path "$lan_log" || return 1
+  assert_json_report_status_pass "$lan_report" "extended soak lan toggle" || return 1
+  assert_no_managed_dns_service_errors "$lan_log" "extended soak lan toggle" || return 1
 
-  stage_run_reboot_recovery_report
+  stage_run_reboot_recovery_report || return 1
+  assert_json_report_status_pass "$reboot_report" "extended soak reboot recovery" || return 1
+  assert_no_managed_dns_service_errors "$reboot_log" "extended soak reboot recovery" || return 1
+
+  if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" ]]; then
+    assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" "extended soak post-exit-reboot two-hop" || return 1
+  fi
+  if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" ]]; then
+    assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" "extended soak post-client-reboot two-hop" || return 1
+  fi
+  if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" ]]; then
+    assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" "extended soak salvage two-hop" || return 1
+  fi
 }
 
 stage_run_reboot_recovery_report() {
@@ -3072,37 +3195,44 @@ stage_run_reboot_recovery_report() {
 
   if [[ "$exit_return" == "pass" && "$exit_boot_change" == "pass" ]]; then
     if has_label extra; then
-      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-      bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-identity-file "$SSH_IDENTITY_FILE" \
-        --final-exit-host "$exit_target" \
-        --final-exit-node-id "$(node_id_for_label exit)" \
-        --client-host "$client_target" \
-        --client-node-id "$(node_id_for_label client)" \
-        --entry-host "$entry_target" \
-        --entry-node-id "$(node_id_for_label entry)" \
-        --second-client-host "$extra_target" \
-        --second-client-node-id "$(node_id_for_label extra)" \
-        --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-        --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot_report.json" \
-        --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log"
+      if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+        bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+          --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --final-exit-host "$exit_target" \
+          --final-exit-node-id "$(node_id_for_label exit)" \
+          --client-host "$client_target" \
+          --client-node-id "$(node_id_for_label client)" \
+          --entry-host "$entry_target" \
+          --entry-node-id "$(node_id_for_label entry)" \
+          --second-client-host "$extra_target" \
+          --second-client-node-id "$(node_id_for_label extra)" \
+          --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+          --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot_report.json" \
+          --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log"; then
+        post_exit_twohop="pass"
+      else
+        post_exit_twohop="fail"
+      fi
     else
-      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-      bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-identity-file "$SSH_IDENTITY_FILE" \
-        --final-exit-host "$exit_target" \
-        --final-exit-node-id "$(node_id_for_label exit)" \
-        --client-host "$client_target" \
-        --client-node-id "$(node_id_for_label client)" \
-        --entry-host "$entry_target" \
-        --entry-node-id "$(node_id_for_label entry)" \
-        --second-client-host "$aux_target" \
-        --second-client-node-id "$(node_id_for_label aux)" \
-        --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-        --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot_report.json" \
-        --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log"
+      if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+        bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+          --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --final-exit-host "$exit_target" \
+          --final-exit-node-id "$(node_id_for_label exit)" \
+          --client-host "$client_target" \
+          --client-node-id "$(node_id_for_label client)" \
+          --entry-host "$entry_target" \
+          --entry-node-id "$(node_id_for_label entry)" \
+          --second-client-host "$aux_target" \
+          --second-client-node-id "$(node_id_for_label aux)" \
+          --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+          --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot_report.json" \
+          --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log"; then
+        post_exit_twohop="pass"
+      else
+        post_exit_twohop="fail"
+      fi
     fi
-    post_exit_twohop="pass"
   else
     post_exit_twohop="fail"
   fi
@@ -3137,57 +3267,67 @@ PY
 
   if [[ "$client_return" == "pass" && "$client_boot_change" == "pass" ]]; then
     if has_label extra; then
-      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-      bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-identity-file "$SSH_IDENTITY_FILE" \
-        --final-exit-host "$exit_target" \
-        --final-exit-node-id "$(node_id_for_label exit)" \
-        --client-host "$client_target" \
-        --client-node-id "$(node_id_for_label client)" \
-        --entry-host "$entry_target" \
-        --entry-node-id "$(node_id_for_label entry)" \
-        --second-client-host "$extra_target" \
-        --second-client-node-id "$(node_id_for_label extra)" \
-        --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-        --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot_report.json" \
-        --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log"
+      if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+        bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+          --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --final-exit-host "$exit_target" \
+          --final-exit-node-id "$(node_id_for_label exit)" \
+          --client-host "$client_target" \
+          --client-node-id "$(node_id_for_label client)" \
+          --entry-host "$entry_target" \
+          --entry-node-id "$(node_id_for_label entry)" \
+          --second-client-host "$extra_target" \
+          --second-client-node-id "$(node_id_for_label extra)" \
+          --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+          --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot_report.json" \
+          --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log"; then
+        post_client_twohop="pass"
+      else
+        post_client_twohop="fail"
+      fi
     else
-      RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-      bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-identity-file "$SSH_IDENTITY_FILE" \
-        --final-exit-host "$exit_target" \
-        --final-exit-node-id "$(node_id_for_label exit)" \
-        --client-host "$client_target" \
-        --client-node-id "$(node_id_for_label client)" \
-        --entry-host "$entry_target" \
-        --entry-node-id "$(node_id_for_label entry)" \
-        --second-client-host "$aux_target" \
-        --second-client-node-id "$(node_id_for_label aux)" \
-        --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-        --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot_report.json" \
-        --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log"
+      if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+        bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+          --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --final-exit-host "$exit_target" \
+          --final-exit-node-id "$(node_id_for_label exit)" \
+          --client-host "$client_target" \
+          --client-node-id "$(node_id_for_label client)" \
+          --entry-host "$entry_target" \
+          --entry-node-id "$(node_id_for_label entry)" \
+          --second-client-host "$aux_target" \
+          --second-client-node-id "$(node_id_for_label aux)" \
+          --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+          --report-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot_report.json" \
+          --log-path "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log"; then
+        post_client_twohop="pass"
+      else
+        post_client_twohop="fail"
+      fi
     fi
-    post_client_twohop="pass"
   else
     post_client_twohop="fail"
   fi
 
   if [[ "$client_return" == "fail" && -n "$extra_target" ]]; then
-    RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-    bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-      --ssh-identity-file "$SSH_IDENTITY_FILE" \
-      --final-exit-host "$exit_target" \
-      --final-exit-node-id "$(node_id_for_label exit)" \
-      --client-host "$aux_target" \
-      --client-node-id "$(node_id_for_label aux)" \
-      --entry-host "$entry_target" \
-      --entry-node-id "$(node_id_for_label entry)" \
-      --second-client-host "$extra_target" \
-      --second-client-node-id "$(node_id_for_label extra)" \
-      --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-      --report-path "$REPORT_DIR/live_linux_two_hop_soak_salvage_report.json" \
-      --log-path "$REPORT_DIR/live_linux_two_hop_soak_salvage.log"
-    salvage_twohop="pass"
+    if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+      bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+        --ssh-identity-file "$SSH_IDENTITY_FILE" \
+        --final-exit-host "$exit_target" \
+        --final-exit-node-id "$(node_id_for_label exit)" \
+        --client-host "$aux_target" \
+        --client-node-id "$(node_id_for_label aux)" \
+        --entry-host "$entry_target" \
+        --entry-node-id "$(node_id_for_label entry)" \
+        --second-client-host "$extra_target" \
+        --second-client-node-id "$(node_id_for_label extra)" \
+        --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+        --report-path "$REPORT_DIR/live_linux_two_hop_soak_salvage_report.json" \
+        --log-path "$REPORT_DIR/live_linux_two_hop_soak_salvage.log"; then
+      salvage_twohop="pass"
+    else
+      salvage_twohop="fail"
+    fi
   elif [[ -n "$extra_target" ]]; then
     salvage_twohop="skipped"
   fi
@@ -3392,9 +3532,9 @@ parse_args() {
       --use-local-head) SOURCE_MODE="local-head"; SOURCE_MODE_EXPLICIT=1; shift ;;
       --exit-target) EXIT_TARGET="$2"; shift 2 ;;
       --client-target) CLIENT_TARGET="$2"; shift 2 ;;
-      --entry-target) ENTRY_TARGET="$2"; shift 2 ;;
-      --aux-target) AUX_TARGET="$2"; shift 2 ;;
-      --extra-target) EXTRA_TARGET="$2"; shift 2 ;;
+      --entry-target) ENTRY_TARGET="$2"; ENTRY_TARGET_DECLARED=1; shift 2 ;;
+      --aux-target) AUX_TARGET="$2"; AUX_TARGET_DECLARED=1; shift 2 ;;
+      --extra-target) EXTRA_TARGET="$2"; EXTRA_TARGET_DECLARED=1; shift 2 ;;
       --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --ssh-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --sudo-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
@@ -3554,6 +3694,7 @@ main() {
   : > "$STAGE_TSV"
   prompt_missing_inputs
   normalize_targets
+  auto_adjust_default_ssh_allow_cidrs_for_targets
   ensure_password_inputs
   ensure_known_hosts_input
   remember_temp_password_files
@@ -3632,7 +3773,7 @@ main() {
       fi
     fi
     if has_four_node_live_topology && [[ "$RUN_SOAK" -eq 1 ]]; then
-      record_stage_skip "extended_soak" "soft" "dry-run: not executed"
+      record_stage_skip "extended_soak" "hard" "dry-run: not executed"
     fi
     if cross_network_stages_applicable; then
       local nat_profile nat_idx stage_suffix
@@ -3731,16 +3872,12 @@ main() {
 
   if has_four_node_live_topology; then
     if [[ "$RUN_SOAK" -eq 1 ]]; then
-      if [[ "$SOAK_HARD_FAIL" -eq 1 ]]; then
-        run_stage hard extended_soak 'run extended soak and reboot recovery validation' stage_run_extended_soak
-      else
-        run_stage soft extended_soak 'run extended soak and reboot recovery validation' stage_run_extended_soak
-      fi
+      run_stage hard extended_soak 'run extended soak and reboot recovery validation' stage_run_extended_soak
     else
-      record_stage_skip extended_soak soft 'skipped by --skip-soak'
+      record_stage_skip extended_soak hard 'skipped by --skip-soak'
     fi
   else
-    record_stage_skip extended_soak soft 'requires entry and aux targets'
+    record_stage_skip extended_soak hard 'requires entry and aux targets'
   fi
 
   local cross_network_stage_rc=0 stage_rc=0

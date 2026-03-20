@@ -9,7 +9,6 @@ ConditionPathExists=/usr/local/libexec/rustynet/refresh_assignment_bundle.sh
 Type=oneshot
 EnvironmentFile=-/etc/default/rustynetd
 EnvironmentFile=-/etc/rustynet/assignment-refresh.env
-Environment=RUSTYNET_ASSIGNMENT_AUTO_REFRESH=false
 Environment=RUSTYNET_ASSIGNMENT_SIGNING_SECRET=/etc/rustynet/assignment.signing.secret
 Environment=RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE=%d/signing_key_passphrase
 Environment=RUSTYNET_ASSIGNMENT_OUTPUT=/var/lib/rustynet/rustynetd.assignment

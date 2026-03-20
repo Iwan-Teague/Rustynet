@@ -425,7 +425,9 @@ install_dns_bundle() {
   live_lab_run_root "$CLIENT_HOST" "root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle"
   if [[ "$restart_services" == "true" ]]; then
     refresh_traversal_bundles
-    live_lab_retry_root "$CLIENT_HOST" "root systemctl stop rustynetd-managed-dns.service rustynetd.service >/dev/null 2>&1 || true; root systemctl reset-failed rustynetd.service rustynetd-managed-dns.service >/dev/null 2>&1 || true" 5 2
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl stop rustynetd-managed-dns.service rustynetd.service rustynetd-privileged-helper.service >/dev/null 2>&1 || true; root systemctl reset-failed rustynetd.service rustynetd-managed-dns.service rustynetd-privileged-helper.service >/dev/null 2>&1 || true" 5 2
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl start rustynetd-privileged-helper.service" 5 2
+    live_lab_retry_root "$CLIENT_HOST" "root systemctl is-active rustynetd-privileged-helper.service | grep -qx active" 15 2
     live_lab_retry_root "$CLIENT_HOST" "root systemctl start rustynetd.service" 5 2
     live_lab_wait_for_daemon_socket "$CLIENT_HOST"
     live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.service" 5 2
@@ -478,8 +480,11 @@ printf '%s\n' "$RESOLVECTL_QUERY_VALID"
 live_lab_log "Installing stale managed DNS bundle on $CLIENT_HOST"
 install_dns_bundle "$STALE_BUNDLE_LOCAL" "false"
 refresh_traversal_bundles
-live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd.service || true" 5 2
-live_lab_retry_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.service || true" 5 2
+live_lab_retry_root "$CLIENT_HOST" "root systemctl stop rustynetd-managed-dns.service rustynetd.service rustynetd-privileged-helper.service >/dev/null 2>&1 || true; root systemctl reset-failed rustynetd.service rustynetd-managed-dns.service rustynetd-privileged-helper.service >/dev/null 2>&1 || true" 5 2
+live_lab_retry_root "$CLIENT_HOST" "root systemctl start rustynetd-privileged-helper.service" 5 2
+live_lab_retry_root "$CLIENT_HOST" "root systemctl is-active rustynetd-privileged-helper.service | grep -qx active" 15 2
+live_lab_run_root "$CLIENT_HOST" "root systemctl start rustynetd.service || true" >/dev/null 2>&1
+live_lab_run_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.service || true" >/dev/null 2>&1
 DNS_INSPECT_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect || true")"
 RUSTYNETD_STATE_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root systemctl is-active rustynetd.service || true")"
 RUSTYNETD_JOURNAL_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root journalctl -u rustynetd.service -n 40 --no-pager || true")"
