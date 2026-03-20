@@ -23,6 +23,7 @@ Success criteria:
 - Phase E progress: Linux runtime service lifecycle control is Rust-backed via `rustynet ops restart-runtime-service`, `rustynet ops stop-runtime-service`, `rustynet ops show-runtime-service-status`, `rustynet ops start-assignment-refresh-service`, and `rustynet ops check-assignment-refresh-availability`; `start.sh` Linux service paths now dispatch to Rust ops instead of direct `systemctl` mutation.
 - Phase E progress: trust material import/install is Rust-backed via `rustynet ops install-trust-material`; `start.sh` `configure_trust_material` client/external-signed branches now dispatch to the Rust op instead of direct shell `install/chown/chmod`.
 - Phase E progress: macOS runtime lifecycle and cleanup control is Rust-backed via `rustynet ops restart-runtime-service`, `rustynet ops stop-runtime-service`, `rustynet ops show-runtime-service-status`, and `rustynet ops disconnect-cleanup`; `start.sh` macOS start/stop/status/disconnect paths now dispatch to Rust ops instead of direct `launchctl`/plist install/`pfctl`/`pkill` mutation loops.
+- Phase E progress: dormant macOS legacy shell launchd functions in `start.sh` now fail-closed wrappers that dispatch to Rust ops (`restart-runtime-service`/`stop-runtime-service`) so no direct shell launchd mutation path remains even for direct function calls.
 - Phase F complete: Phase 6 parity probe/report/bundle generators are Rust-backed (`rustynet ops collect-platform-probe`, `rustynet ops generate-platform-parity-report`, `rustynet ops collect-platform-parity-bundle`); release scripts are thin wrappers that only dispatch to Rust commands.
 - Phase G complete: Phase9/Phase10 evidence pipeline is Rust-backed (`rustynet ops collect-phase9-raw-evidence`, `rustynet ops generate-phase9-artifacts`, `rustynet ops generate-phase10-artifacts`); shell/Python collection/generation logic removed from active scripts.
 - Phase H complete: phase1 measured input collection + baseline orchestration are Rust-backed (`rustynet ops collect-phase1-measured-input`, `rustynet ops run-phase1-baseline`); legacy shell/Python collector logic and shell `source` ingestion are removed from the active path.
@@ -230,8 +231,6 @@ Priority is based on: `privilege level` + `secret handling` + `state mutation ri
 - `configure_trust_material`
 - `refresh_signed_trust_evidence`
 - `write_daemon_environment`
-- `start_or_restart_service` (macOS launchd branch + shell orchestration only; Linux lifecycle control path is Rust-backed)
-- `disconnect_vpn` (macOS launchd/PF branch only; Linux cleanup path is Rust-backed)
 
 2. E2E hardening follow-up (in progress)
 - `rustynet ops run-debian-two-node-e2e`: collect fresh lab dry-run evidence for the argv-only remote execution path and retain regression checks to prevent shell-path reintroduction.

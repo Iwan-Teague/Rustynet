@@ -2446,291 +2446,140 @@ configure_macos_binary_path_env() {
   export RUSTYNET_DAEMON_BINARY_PATH="${rustynetd_bin}"
 }
 
-xml_escape() {
-  local value="$1"
-  value="${value//&/&amp;}"
-  value="${value//</&lt;}"
-  value="${value//>/&gt;}"
-  value="${value//\"/&quot;}"
-  value="${value//\'/&apos;}"
-  printf '%s' "${value}"
+macos_restart_runtime_service_rust_only() {
+  local invocation_context="${1:-macOS runtime service restart}"
+  if ! is_macos_host; then
+    print_err "${invocation_context} is only supported on macOS hosts."
+    return 1
+  fi
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_err "rustynet CLI is required for macOS runtime service restart."
+    return 1
+  fi
+  if ! configure_macos_binary_path_env; then
+    print_err "Failed to resolve macOS privileged binary paths."
+    return 1
+  fi
+  if ! validate_macos_passphrase_source_contract; then
+    print_err "macOS passphrase source contract failed; refusing daemon restart."
+    return 1
+  fi
+
+  local auto_tunnel_enforce_bool fail_closed_ssh_allow_bool
+  auto_tunnel_enforce_bool="false"
+  fail_closed_ssh_allow_bool="false"
+  if [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]]; then
+    auto_tunnel_enforce_bool="true"
+  fi
+  if [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]]; then
+    fail_closed_ssh_allow_bool="true"
+  fi
+
+  local rust_restart_output=""
+  if ! rust_restart_output="$(run_root env \
+    RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
+    RUSTYNET_MACOS_DAEMON_GID="$(id -g)" \
+    RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
+    RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
+    RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
+    RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
+    RUSTYNET_MACOS_RUNTIME_BASE="${MACOS_RUNTIME_BASE}" \
+    RUSTYNET_MACOS_LOG_BASE="${MACOS_LOG_BASE}" \
+    RUSTYNET_MACOS_DAEMON_LOG_PATH="${MACOS_DAEMON_LOG_PATH}" \
+    RUSTYNET_MACOS_HELPER_LOG_PATH="${MACOS_HELPER_LOG_PATH}" \
+    RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+    RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
+    RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
+    RUSTYNET_SOCKET="${SOCKET_PATH}" \
+    RUSTYNET_STATE="${STATE_PATH}" \
+    RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
+    RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+    RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
+    RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
+    RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
+    RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_ENFORCE="${auto_tunnel_enforce_bool}" \
+    RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
+    RUSTYNET_TRAVERSAL_BUNDLE="${TRAVERSAL_BUNDLE_PATH}" \
+    RUSTYNET_TRAVERSAL_VERIFIER_KEY="${TRAVERSAL_VERIFIER_KEY_PATH}" \
+    RUSTYNET_TRAVERSAL_WATERMARK="${TRAVERSAL_WATERMARK_PATH}" \
+    RUSTYNET_TRAVERSAL_MAX_AGE_SECS="${TRAVERSAL_MAX_AGE_SECS}" \
+    RUSTYNET_BACKEND="${BACKEND_MODE}" \
+    RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
+    RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
+    RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
+    RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
+    RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
+    RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
+    RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
+    RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
+    RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
+    RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+    RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
+    RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
+    RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
+    RUSTYNET_FAIL_CLOSED_SSH_ALLOW="${fail_closed_ssh_allow_bool}" \
+    RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
+    RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
+    RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
+    RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
+    RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
+    RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
+    RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
+    RUSTYNET_DAEMON_BINARY_PATH="${RUSTYNET_DAEMON_BINARY_PATH}" \
+    rustynet ops restart-runtime-service 2>&1)"; then
+    print_err "Rust-backed macOS runtime restart failed (${invocation_context})."
+    [[ -n "${rust_restart_output}" ]] && print_err "${rust_restart_output}"
+    return 1
+  fi
+  [[ -n "${rust_restart_output}" ]] && print_info "${rust_restart_output}"
+  return 0
 }
 
-macos_launchd_domain() {
-  local uid
-  uid="$(id -u)"
-  if launchctl print "gui/${uid}" >/dev/null 2>&1; then
-    printf 'gui/%s' "${uid}"
-  else
-    printf 'user/%s' "${uid}"
+macos_stop_runtime_service_rust_only() {
+  local invocation_context="${1:-macOS runtime service stop}"
+  if ! is_macos_host; then
+    print_err "${invocation_context} is only supported on macOS hosts."
+    return 1
   fi
-}
-
-macos_launchd_bootout_unit() {
-  local domain="$1"
-  local label="$2"
-  local plist_path="$3"
-  local use_root="${4:-0}"
-  local target="${domain}/${label}"
-  if [[ "${use_root}" == "1" ]]; then
-    if run_root launchctl bootout "${target}" 2>/dev/null; then
-      return 0
-    fi
-    if run_root launchctl bootout "${domain}" "${plist_path}" 2>/dev/null; then
-      return 0
-    fi
-    if ! run_root launchctl print "${target}" >/dev/null 2>&1; then
-      return 0
-    fi
-  else
-    if launchctl bootout "${target}" 2>/dev/null; then
-      return 0
-    fi
-    if launchctl bootout "${domain}" "${plist_path}" 2>/dev/null; then
-      return 0
-    fi
-    if ! launchctl print "${target}" >/dev/null 2>&1; then
-      return 0
-    fi
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_err "rustynet CLI is required for macOS runtime service stop."
+    return 1
   fi
-  print_err "Failed to unload launchd unit '${target}'."
-  return 1
+  local rust_stop_output=""
+  if ! rust_stop_output="$(run_root env \
+    RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
+    RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
+    RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
+    RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
+    RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
+    RUSTYNET_SOCKET="${SOCKET_PATH}" \
+    RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
+    rustynet ops stop-runtime-service 2>&1)"; then
+    print_err "Rust-backed macOS runtime stop failed (${invocation_context})."
+    [[ -n "${rust_stop_output}" ]] && print_err "${rust_stop_output}"
+    return 1
+  fi
+  [[ -n "${rust_stop_output}" ]] && print_info "${rust_stop_output}"
+  return 0
 }
 
 macos_install_launchd_units() {
-  configure_macos_binary_path_env || return 1
-  validate_macos_passphrase_source_contract || return 1
-
-  local uid gid
-  uid="$(id -u)"
-  gid="$(id -g)"
-
-  run_root install -d -m 0700 "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
-  run_root chown "${uid}:${gid}" "${MACOS_RUNTIME_BASE}" "${MACOS_LOG_BASE}"
-  install -d -m 0700 "$(dirname "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}")"
-  run_root install -d -m 0755 /Library/LaunchDaemons
-
-  local helper_plist_tmp daemon_plist_tmp
-  helper_plist_tmp="$(mktemp)"
-  daemon_plist_tmp="$(mktemp)"
-
-  local bool_auto_tunnel bool_fail_closed_ssh
-  bool_auto_tunnel="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )"
-  bool_fail_closed_ssh="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )"
-
-  local esc_rustynetd esc_helper_socket esc_timeout esc_uid esc_gid esc_keychain_account
-  local esc_wg_bin esc_wg_go_bin esc_ifconfig_bin esc_route_bin esc_pfctl_bin esc_kill_bin
-  esc_rustynetd="$(xml_escape "${RUSTYNET_DAEMON_BINARY_PATH}")"
-  esc_helper_socket="$(xml_escape "${PRIVILEGED_HELPER_SOCKET_PATH}")"
-  esc_timeout="$(xml_escape "${PRIVILEGED_HELPER_TIMEOUT_MS}")"
-  esc_uid="$(xml_escape "${uid}")"
-  esc_gid="$(xml_escape "${gid}")"
-  esc_wg_bin="$(xml_escape "${RUSTYNET_WG_BINARY_PATH}")"
-  esc_wg_go_bin="$(xml_escape "${RUSTYNET_WIREGUARD_GO_BINARY_PATH}")"
-  esc_ifconfig_bin="$(xml_escape "${RUSTYNET_IFCONFIG_BINARY_PATH}")"
-  esc_route_bin="$(xml_escape "${RUSTYNET_ROUTE_BINARY_PATH}")"
-  esc_pfctl_bin="$(xml_escape "${RUSTYNET_PFCTL_BINARY_PATH}")"
-  esc_kill_bin="$(xml_escape "${RUSTYNET_KILL_BINARY_PATH}")"
-  esc_keychain_account="$(xml_escape "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}")"
-
-  cat >"${helper_plist_tmp}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${MACOS_LAUNCHD_HELPER_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${esc_rustynetd}</string>
-    <string>privileged-helper</string>
-    <string>--socket</string>
-    <string>${esc_helper_socket}</string>
-    <string>--allowed-uid</string>
-    <string>${esc_uid}</string>
-    <string>--allowed-gid</string>
-    <string>${esc_gid}</string>
-    <string>--timeout-ms</string>
-    <string>${esc_timeout}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RUSTYNET_WG_BINARY_PATH</key>
-    <string>${esc_wg_bin}</string>
-    <key>RUSTYNET_WIREGUARD_GO_BINARY_PATH</key>
-    <string>${esc_wg_go_bin}</string>
-    <key>RUSTYNET_IFCONFIG_BINARY_PATH</key>
-    <string>${esc_ifconfig_bin}</string>
-    <key>RUSTYNET_ROUTE_BINARY_PATH</key>
-    <string>${esc_route_bin}</string>
-    <key>RUSTYNET_PFCTL_BINARY_PATH</key>
-    <string>${esc_pfctl_bin}</string>
-    <key>RUSTYNET_KILL_BINARY_PATH</key>
-    <string>${esc_kill_bin}</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$(xml_escape "${MACOS_HELPER_LOG_PATH}")</string>
-  <key>StandardErrorPath</key>
-  <string>$(xml_escape "${MACOS_HELPER_LOG_PATH}")</string>
-</dict>
-</plist>
-EOF
-
-  cat >"${daemon_plist_tmp}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${MACOS_LAUNCHD_DAEMON_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${esc_rustynetd}</string>
-    <string>daemon</string>
-    <string>--node-id</string>
-    <string>$(xml_escape "${DEVICE_NODE_ID}")</string>
-    <string>--node-role</string>
-    <string>$(xml_escape "${NODE_ROLE}")</string>
-    <string>--socket</string>
-    <string>$(xml_escape "${SOCKET_PATH}")</string>
-    <string>--state</string>
-    <string>$(xml_escape "${STATE_PATH}")</string>
-    <string>--trust-evidence</string>
-    <string>$(xml_escape "${TRUST_EVIDENCE_PATH}")</string>
-    <string>--trust-verifier-key</string>
-    <string>$(xml_escape "${TRUST_VERIFIER_KEY_PATH}")</string>
-    <string>--trust-watermark</string>
-    <string>$(xml_escape "${TRUST_WATERMARK_PATH}")</string>
-    <string>--membership-snapshot</string>
-    <string>$(xml_escape "${MEMBERSHIP_SNAPSHOT_PATH}")</string>
-    <string>--membership-log</string>
-    <string>$(xml_escape "${MEMBERSHIP_LOG_PATH}")</string>
-    <string>--membership-watermark</string>
-    <string>$(xml_escape "${MEMBERSHIP_WATERMARK_PATH}")</string>
-    <string>--auto-tunnel-enforce</string>
-    <string>$(xml_escape "${bool_auto_tunnel}")</string>
-    <string>--auto-tunnel-bundle</string>
-    <string>$(xml_escape "${AUTO_TUNNEL_BUNDLE_PATH}")</string>
-    <string>--auto-tunnel-verifier-key</string>
-    <string>$(xml_escape "${AUTO_TUNNEL_VERIFIER_KEY_PATH}")</string>
-    <string>--auto-tunnel-watermark</string>
-    <string>$(xml_escape "${AUTO_TUNNEL_WATERMARK_PATH}")</string>
-    <string>--auto-tunnel-max-age-secs</string>
-    <string>$(xml_escape "${AUTO_TUNNEL_MAX_AGE_SECS}")</string>
-    <string>--traversal-bundle</string>
-    <string>$(xml_escape "${TRAVERSAL_BUNDLE_PATH}")</string>
-    <string>--traversal-verifier-key</string>
-    <string>$(xml_escape "${TRAVERSAL_VERIFIER_KEY_PATH}")</string>
-    <string>--traversal-watermark</string>
-    <string>$(xml_escape "${TRAVERSAL_WATERMARK_PATH}")</string>
-    <string>--traversal-max-age-secs</string>
-    <string>$(xml_escape "${TRAVERSAL_MAX_AGE_SECS}")</string>
-    <string>--backend</string>
-    <string>$(xml_escape "${BACKEND_MODE}")</string>
-    <string>--wg-interface</string>
-    <string>$(xml_escape "${WG_INTERFACE}")</string>
-    <string>--wg-listen-port</string>
-    <string>$(xml_escape "${WG_LISTEN_PORT}")</string>
-    <string>--wg-private-key</string>
-    <string>$(xml_escape "${WG_PRIVATE_KEY_PATH}")</string>
-    <string>--wg-encrypted-private-key</string>
-    <string>$(xml_escape "${WG_ENCRYPTED_PRIVATE_KEY_PATH}")</string>
-    <string>--wg-key-passphrase</string>
-    <string>$(xml_escape "${WG_KEY_PASSPHRASE_PATH}")</string>
-    <string>--wg-public-key</string>
-    <string>$(xml_escape "${WG_PUBLIC_KEY_PATH}")</string>
-    <string>--egress-interface</string>
-    <string>$(xml_escape "${EGRESS_INTERFACE}")</string>
-    <string>--dataplane-mode</string>
-    <string>$(xml_escape "${DATAPLANE_MODE}")</string>
-    <string>--privileged-helper-socket</string>
-    <string>${esc_helper_socket}</string>
-    <string>--privileged-helper-timeout-ms</string>
-    <string>${esc_timeout}</string>
-    <string>--reconcile-interval-ms</string>
-    <string>$(xml_escape "${RECONCILE_INTERVAL_MS}")</string>
-    <string>--max-reconcile-failures</string>
-    <string>$(xml_escape "${MAX_RECONCILE_FAILURES}")</string>
-    <string>--fail-closed-ssh-allow</string>
-    <string>$(xml_escape "${bool_fail_closed_ssh}")</string>
-    <string>--fail-closed-ssh-allow-cidrs</string>
-    <string>$(xml_escape "${FAIL_CLOSED_SSH_ALLOW_CIDRS}")</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RUSTYNET_WG_BINARY_PATH</key>
-    <string>${esc_wg_bin}</string>
-    <key>RUSTYNET_WIREGUARD_GO_BINARY_PATH</key>
-    <string>${esc_wg_go_bin}</string>
-    <key>RUSTYNET_IFCONFIG_BINARY_PATH</key>
-    <string>${esc_ifconfig_bin}</string>
-    <key>RUSTYNET_ROUTE_BINARY_PATH</key>
-    <string>${esc_route_bin}</string>
-    <key>RUSTYNET_PFCTL_BINARY_PATH</key>
-    <string>${esc_pfctl_bin}</string>
-    <key>RUSTYNET_KILL_BINARY_PATH</key>
-    <string>${esc_kill_bin}</string>
-    <key>RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT</key>
-    <string>${esc_keychain_account}</string>
-    <key>RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH</key>
-    <string>$(xml_escape "${WG_KEY_PASSPHRASE_PATH}")</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$(xml_escape "${MACOS_DAEMON_LOG_PATH}")</string>
-  <key>StandardErrorPath</key>
-  <string>$(xml_escape "${MACOS_DAEMON_LOG_PATH}")</string>
-</dict>
-</plist>
-EOF
-
-  run_root install -m 0644 "${helper_plist_tmp}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
-  if ! run_root chown root:wheel "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" 2>/dev/null; then
-    run_root chown root:root "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
-  fi
-  install -m 0644 "${daemon_plist_tmp}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}"
-
-  rm -f "${helper_plist_tmp}" "${daemon_plist_tmp}"
+  print_warn "Legacy shell launchd install is disabled; dispatching to Rust-only runtime service control."
+  macos_restart_runtime_service_rust_only "legacy shell wrapper: macos_install_launchd_units"
 }
 
 macos_start_launchd_services() {
-  macos_install_launchd_units || return 1
-  local daemon_domain
-  daemon_domain="$(macos_launchd_domain)"
-
-  macos_launchd_bootout_unit "system" "${MACOS_LAUNCHD_HELPER_LABEL}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "1" || return 1
-  macos_launchd_bootout_unit "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_LABEL}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "0" || return 1
-
-  run_root launchctl bootstrap system "${MACOS_LAUNCHD_HELPER_PLIST_PATH}"
-  run_root launchctl kickstart -k "system/${MACOS_LAUNCHD_HELPER_LABEL}"
-  launchctl bootstrap "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}"
-  launchctl kickstart -k "${daemon_domain}/${MACOS_LAUNCHD_DAEMON_LABEL}"
-
-  if ! macos_wait_for_socket "${PRIVILEGED_HELPER_SOCKET_PATH}"; then
-    print_err "Timed out waiting for macOS privileged helper socket at ${PRIVILEGED_HELPER_SOCKET_PATH}."
-    return 1
-  fi
-  if ! macos_wait_for_socket "${SOCKET_PATH}"; then
-    print_err "Timed out waiting for rustynetd socket at ${SOCKET_PATH}."
-    tail -n 40 "${MACOS_DAEMON_LOG_PATH}" 2>/dev/null || true
-    return 1
-  fi
+  print_warn "Legacy shell launchd start is disabled; dispatching to Rust-only runtime service control."
+  macos_restart_runtime_service_rust_only "legacy shell wrapper: macos_start_launchd_services"
 }
 
 macos_stop_launchd_services() {
-  local daemon_domain
-  daemon_domain="$(macos_launchd_domain)"
-  macos_launchd_bootout_unit "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_LABEL}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" "0" || return 1
-  macos_launchd_bootout_unit "system" "${MACOS_LAUNCHD_HELPER_LABEL}" "${MACOS_LAUNCHD_HELPER_PLIST_PATH}" "1" || return 1
-  rm -f "${SOCKET_PATH}" "${PRIVILEGED_HELPER_SOCKET_PATH}"
-  return 0
+  print_warn "Legacy shell launchd stop is disabled; dispatching to Rust-only runtime service control."
+  macos_stop_runtime_service_rust_only "legacy shell wrapper: macos_stop_launchd_services"
 }
 
 start_or_restart_service() {
@@ -2765,79 +2614,9 @@ start_or_restart_service() {
   fi
 
   if is_macos_host; then
-    if ! command -v rustynet >/dev/null 2>&1; then
-      print_err "rustynet CLI is required for macOS runtime service restart."
+    if ! macos_restart_runtime_service_rust_only "start_or_restart_service"; then
       return 1
     fi
-    if ! configure_macos_binary_path_env; then
-      print_err "Failed to resolve macOS privileged binary paths."
-      return 1
-    fi
-    if ! validate_macos_passphrase_source_contract; then
-      print_err "macOS passphrase source contract failed; refusing daemon restart."
-      return 1
-    fi
-    local rust_restart_output=""
-    if ! rust_restart_output="$(run_root env \
-      RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
-      RUSTYNET_MACOS_DAEMON_GID="$(id -g)" \
-      RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
-      RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
-      RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
-      RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
-      RUSTYNET_MACOS_RUNTIME_BASE="${MACOS_RUNTIME_BASE}" \
-      RUSTYNET_MACOS_LOG_BASE="${MACOS_LOG_BASE}" \
-      RUSTYNET_MACOS_DAEMON_LOG_PATH="${MACOS_DAEMON_LOG_PATH}" \
-      RUSTYNET_MACOS_HELPER_LOG_PATH="${MACOS_HELPER_LOG_PATH}" \
-      RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
-      RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
-      RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
-      RUSTYNET_SOCKET="${SOCKET_PATH}" \
-      RUSTYNET_STATE="${STATE_PATH}" \
-      RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
-      RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
-      RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
-      RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
-      RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
-      RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
-      RUSTYNET_TRAVERSAL_BUNDLE="${TRAVERSAL_BUNDLE_PATH}" \
-      RUSTYNET_TRAVERSAL_VERIFIER_KEY="${TRAVERSAL_VERIFIER_KEY_PATH}" \
-      RUSTYNET_TRAVERSAL_WATERMARK="${TRAVERSAL_WATERMARK_PATH}" \
-      RUSTYNET_TRAVERSAL_MAX_AGE_SECS="${TRAVERSAL_MAX_AGE_SECS}" \
-      RUSTYNET_BACKEND="${BACKEND_MODE}" \
-      RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
-      RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
-      RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
-      RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-      RUSTYNET_WG_KEY_PASSPHRASE="${WG_KEY_PASSPHRASE_PATH}" \
-      RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
-      RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
-      RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
-      RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
-      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
-      RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
-      RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
-      RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
-      RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
-      RUSTYNET_WG_BINARY_PATH="${RUSTYNET_WG_BINARY_PATH}" \
-      RUSTYNET_WIREGUARD_GO_BINARY_PATH="${RUSTYNET_WIREGUARD_GO_BINARY_PATH}" \
-      RUSTYNET_IFCONFIG_BINARY_PATH="${RUSTYNET_IFCONFIG_BINARY_PATH}" \
-      RUSTYNET_ROUTE_BINARY_PATH="${RUSTYNET_ROUTE_BINARY_PATH}" \
-      RUSTYNET_PFCTL_BINARY_PATH="${RUSTYNET_PFCTL_BINARY_PATH}" \
-      RUSTYNET_KILL_BINARY_PATH="${RUSTYNET_KILL_BINARY_PATH}" \
-      RUSTYNET_DAEMON_BINARY_PATH="${RUSTYNET_DAEMON_BINARY_PATH}" \
-      rustynet ops restart-runtime-service 2>&1)"; then
-      print_err "Rust-backed macOS runtime restart failed."
-      [[ -n "${rust_restart_output}" ]] && print_err "${rust_restart_output}"
-      return 1
-    fi
-    [[ -n "${rust_restart_output}" ]] && print_info "${rust_restart_output}"
     show_service_status
     return
   fi
@@ -2861,25 +2640,9 @@ stop_service() {
     return
   fi
   if is_macos_host; then
-    if ! command -v rustynet >/dev/null 2>&1; then
-      print_err "rustynet CLI is required for macOS runtime service stop."
+    if ! macos_stop_runtime_service_rust_only "stop_service"; then
       return 1
     fi
-    local rust_stop_output=""
-    if ! rust_stop_output="$(run_root env \
-      RUSTYNET_MACOS_DAEMON_UID="$(id -u)" \
-      RUSTYNET_MACOS_LAUNCHD_DAEMON_LABEL="${MACOS_LAUNCHD_DAEMON_LABEL}" \
-      RUSTYNET_MACOS_LAUNCHD_HELPER_LABEL="${MACOS_LAUNCHD_HELPER_LABEL}" \
-      RUSTYNET_MACOS_LAUNCHD_DAEMON_PLIST="${MACOS_LAUNCHD_DAEMON_PLIST_PATH}" \
-      RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST="${MACOS_LAUNCHD_HELPER_PLIST_PATH}" \
-      RUSTYNET_SOCKET="${SOCKET_PATH}" \
-      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
-      rustynet ops stop-runtime-service 2>&1)"; then
-      print_err "Rust-backed macOS runtime stop failed."
-      [[ -n "${rust_stop_output}" ]] && print_err "${rust_stop_output}"
-      return 1
-    fi
-    [[ -n "${rust_stop_output}" ]] && print_info "${rust_stop_output}"
     return
   fi
   require_linux_dataplane "stop_service" || return 0
