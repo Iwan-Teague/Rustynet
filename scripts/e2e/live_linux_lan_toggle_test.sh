@@ -17,8 +17,7 @@ EXIT_NODE_ID="exit-49"
 CLIENT_NODE_ID="client-65"
 BLIND_EXIT_NODE_ID="client-51"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/live_linux_lan_toggle_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_lan_toggle.log"
 LAN_TEST_INTERFACE="rnlan0"
@@ -28,7 +27,7 @@ LAN_TEST_CIDR="192.168.1.0/24"
 
 usage() {
   cat <<USAGE
-usage: $0 --ssh-password-file <path> --sudo-password-file <path> [options]
+usage: $0 --ssh-identity-file <path> [options]
 
 options:
   --exit-host <user@host>
@@ -65,8 +64,7 @@ wait_for_lan_probe_state() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --blind-exit-host) BLIND_EXIT_HOST="$2"; shift 2 ;;
@@ -81,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" ]]; then
   usage >&2
   exit 2
 fi
@@ -89,7 +87,7 @@ fi
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 exec > >(tee "$LOG_PATH") 2>&1
 
-live_lab_init "rustynet-lan-toggle" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-lan-toggle" "$SSH_IDENTITY_FILE"
 cleanup_all() {
   if [[ -n "${EXIT_HOST:-}" ]]; then
     live_lab_run_root "$EXIT_HOST" "root ip link delete ${LAN_TEST_INTERFACE}" >/dev/null 2>&1 || true
@@ -142,7 +140,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-lan-passphrase.XXXXXX)"
@@ -194,7 +192,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-lan-traversal-passphrase.XXXXXX)"

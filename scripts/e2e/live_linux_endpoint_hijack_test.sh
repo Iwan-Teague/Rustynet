@@ -12,8 +12,7 @@ export LIVE_LAB_LOG_PREFIX
 
 CLIENT_HOST=""
 ROGUE_ENDPOINT_IP=""
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 SOCKET_PATH="/run/rustynet/rustynetd.sock"
 ASSIGNMENT_PATH="/var/lib/rustynet/rustynetd.assignment"
 ASSIGNMENT_WATERMARK_PATH="/var/lib/rustynet/rustynetd.assignment.watermark"
@@ -22,7 +21,7 @@ LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_endpoint_hijack.log"
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_endpoint_hijack_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --rogue-endpoint-ip <ipv4> [options]
+usage: live_linux_endpoint_hijack_test.sh --ssh-identity-file <path> --client-host <user@host> --rogue-endpoint-ip <ipv4> [options]
 
 options:
   --client-host <user@host>
@@ -36,8 +35,7 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --rogue-endpoint-ip) ROGUE_ENDPOINT_IP="$2"; shift 2 ;;
     --socket-path) SOCKET_PATH="$2"; shift 2 ;;
@@ -49,7 +47,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$ROGUE_ENDPOINT_IP" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$ROGUE_ENDPOINT_IP" ]]; then
   usage >&2
   exit 2
 fi
@@ -64,7 +62,7 @@ mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
 exec >> "$LOG_PATH" 2>&1
 
-live_lab_init "rustynet-endpoint-hijack" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-endpoint-hijack" "$SSH_IDENTITY_FILE"
 
 BACKUP_PATH=""
 ASSIGNMENT_TIMER_WAS_ACTIVE=0

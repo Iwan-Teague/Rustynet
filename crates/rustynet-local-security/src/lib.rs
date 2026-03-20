@@ -79,8 +79,7 @@ pub fn validate_owner_only_socket(
     let parent_owner = parent.uid();
     if !owner_allowed(parent_owner, allowed_parent_owner_uids) {
         return Err(format!(
-            "{label} parent directory owner uid mismatch: allowed {:?}, found {}",
-            allowed_parent_owner_uids, parent_owner
+            "{label} parent directory owner uid mismatch: allowed {allowed_parent_owner_uids:?}, found {parent_owner}",
         ));
     }
     Ok(())
@@ -134,8 +133,7 @@ pub fn validate_root_managed_shared_runtime_socket(
         parent_owner == 0 && parent_gid == expected_gid && parent_mode == 0o770;
     if !owner_allowed(parent_owner, allowed_parent_owner_uids) && !root_managed_shared_runtime {
         return Err(format!(
-            "{label} parent directory owner uid mismatch: allowed {:?}, found {}",
-            allowed_parent_owner_uids, parent_owner
+            "{label} parent directory owner uid mismatch: allowed {allowed_parent_owner_uids:?}, found {parent_owner}",
         ));
     }
     if parent_mode & 0o020 != 0 && !root_managed_shared_runtime && parent_gid != expected_gid {

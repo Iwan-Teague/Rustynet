@@ -5,8 +5,7 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 CLIENT_HOST=""
 EXIT_HOST=""
 CLIENT_NODE_ID=""
@@ -39,7 +38,7 @@ LOG_ARTIFACTS=()
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_cross_network_remote_exit_dns_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
+usage: live_linux_cross_network_remote_exit_dns_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
   --nat-profile <profile>
@@ -102,8 +101,7 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-node-id) CLIENT_NODE_ID="$2"; shift 2 ;;
@@ -123,7 +121,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
   exit 2
 fi
@@ -161,8 +159,7 @@ main() {
   FAILURE_SUMMARY="bootstrapping direct remote-exit path for DNS validation"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --exit-host "$EXIT_HOST" \
       --client-node-id "$CLIENT_NODE_ID" \
@@ -215,8 +212,7 @@ PY
   FAILURE_SUMMARY="running managed DNS validation on the remote-exit client"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --signer-host "$EXIT_HOST" \
       --client-host "$CLIENT_HOST" \
       --signer-node-id "$EXIT_NODE_ID" \

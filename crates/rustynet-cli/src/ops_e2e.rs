@@ -688,6 +688,7 @@ pub fn execute_ops_e2e_issue_assignments(
     client_endpoint: String,
     exit_pubkey_hex: String,
     client_pubkey_hex: String,
+    artifact_dir: Option<PathBuf>,
 ) -> Result<String, String> {
     ensure_running_as_root()?;
     for (label, value) in [
@@ -700,6 +701,79 @@ pub fn execute_ops_e2e_issue_assignments(
     }
     ensure_hex_32("exit-pubkey-hex", exit_pubkey_hex.as_str())?;
     ensure_hex_32("client-pubkey-hex", client_pubkey_hex.as_str())?;
+
+    let artifact_dir = artifact_dir.unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "/run/rustynet/e2e-issue-artifacts.{}.{}",
+            std::process::id(),
+            unique_suffix()
+        ))
+    });
+    if !artifact_dir.is_absolute() {
+        return Err(format!(
+            "--artifact-dir must be an absolute path: {}",
+            artifact_dir.display()
+        ));
+    }
+    let artifact_dir_text = artifact_dir.display().to_string();
+    ensure_safe_remote_path(artifact_dir_text.as_str())?;
+    match fs::symlink_metadata(&artifact_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "--artifact-dir must not be a symlink: {}",
+                    artifact_dir.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "--artifact-dir must be a directory: {}",
+                    artifact_dir.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&artifact_dir).map_err(|create_err| {
+                format!(
+                    "failed to create artifact directory {}: {create_err}",
+                    artifact_dir.display()
+                )
+            })?;
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect artifact directory {}: {err}",
+                artifact_dir.display()
+            ));
+        }
+    }
+    set_unix_mode(artifact_dir.as_path(), 0o700)?;
+
+    let assignment_pub_path = artifact_dir.join("rustynet-assignment.pub");
+    let assignment_exit_path = artifact_dir.join("rustynet-exit.assignment");
+    let assignment_client_path = artifact_dir.join("rustynet-client.assignment");
+    let traversal_pub_path = artifact_dir.join("rustynet-traversal.pub");
+    let traversal_exit_path = artifact_dir.join("rustynet-exit.traversal");
+    let traversal_client_path = artifact_dir.join("rustynet-client.traversal");
+    for output_path in [
+        assignment_pub_path.as_path(),
+        assignment_exit_path.as_path(),
+        assignment_client_path.as_path(),
+        traversal_pub_path.as_path(),
+        traversal_exit_path.as_path(),
+        traversal_client_path.as_path(),
+    ] {
+        if output_path.exists() {
+            return Err(format!(
+                "artifact output path already exists: {}",
+                output_path.display()
+            ));
+        }
+    }
+
+    let assignment_pub_path_text = assignment_pub_path.display().to_string();
+    let assignment_exit_path_text = assignment_exit_path.display().to_string();
+    let assignment_client_path_text = assignment_client_path.display().to_string();
 
     let passphrase_path = format!(
         "/tmp/rustynet-assignment-passphrase.{}.{}",
@@ -759,9 +833,9 @@ pub fn execute_ops_e2e_issue_assignments(
                 "--signing-secret-passphrase-file",
                 passphrase_path.as_str(),
                 "--output",
-                "/tmp/rustynet-exit.assignment",
+                assignment_exit_path_text.as_str(),
                 "--verifier-key-output",
-                "/tmp/rustynet-assignment.pub",
+                assignment_pub_path_text.as_str(),
                 "--ttl-secs",
                 "300",
             ],
@@ -784,9 +858,9 @@ pub fn execute_ops_e2e_issue_assignments(
                 "--signing-secret-passphrase-file",
                 passphrase_path.as_str(),
                 "--output",
-                "/tmp/rustynet-client.assignment",
+                assignment_client_path_text.as_str(),
                 "--verifier-key-output",
-                "/tmp/rustynet-assignment.pub",
+                assignment_pub_path_text.as_str(),
                 "--exit-node-id",
                 exit_node_id.as_str(),
                 "--ttl-secs",
@@ -810,27 +884,38 @@ pub fn execute_ops_e2e_issue_assignments(
             client_pubkey_hex.as_str(),
         )?;
         fs::write(
-            "/tmp/rustynet-traversal.pub",
+            traversal_pub_path.as_path(),
             format!("{}\n", traversal_artifacts.verifier_key_hex),
         )
         .map_err(|err| format!("write traversal verifier key failed: {err}"))?;
         fs::write(
-            "/tmp/rustynet-exit.traversal",
+            traversal_exit_path.as_path(),
             traversal_artifacts.exit_bundle_wire,
         )
         .map_err(|err| format!("write exit traversal bundle failed: {err}"))?;
         fs::write(
-            "/tmp/rustynet-client.traversal",
+            traversal_client_path.as_path(),
             traversal_artifacts.client_bundle_wire,
         )
         .map_err(|err| format!("write client traversal bundle failed: {err}"))?;
+        for output_path in [
+            assignment_pub_path.as_path(),
+            assignment_exit_path.as_path(),
+            assignment_client_path.as_path(),
+            traversal_pub_path.as_path(),
+            traversal_exit_path.as_path(),
+            traversal_client_path.as_path(),
+        ] {
+            set_unix_mode(output_path, 0o600)?;
+        }
         Ok(())
     })();
     secure_remove_file(Path::new(passphrase_path.as_str()));
     result?;
 
     Ok(format!(
-        "e2e assignment issuance complete: exit_node_id={exit_node_id} client_node_id={client_node_id}",
+        "e2e assignment issuance complete: exit_node_id={exit_node_id} client_node_id={client_node_id} artifact_dir={}",
+        artifact_dir.display(),
     ))
 }
 
@@ -1205,6 +1290,18 @@ pub fn execute_ops_run_debian_two_node_e2e(
 
     let exit_endpoint = format!("{}:51820", exit_target.address);
     let client_endpoint = format!("{}:51820", client_target.address);
+    let remote_artifact_dir = format!(
+        "/run/rustynet/e2e-issue-artifacts.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    );
+    ensure_safe_remote_path(remote_artifact_dir.as_str())?;
+    let remote_assignment_pub = format!("{remote_artifact_dir}/rustynet-assignment.pub");
+    let remote_assignment_exit = format!("{remote_artifact_dir}/rustynet-exit.assignment");
+    let remote_assignment_client = format!("{remote_artifact_dir}/rustynet-client.assignment");
+    let remote_traversal_pub = format!("{remote_artifact_dir}/rustynet-traversal.pub");
+    let remote_traversal_exit = format!("{remote_artifact_dir}/rustynet-exit.traversal");
+    let remote_traversal_client = format!("{remote_artifact_dir}/rustynet-client.traversal");
     run_remote_rustynet_ops_command(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
@@ -1224,6 +1321,8 @@ pub fn execute_ops_run_debian_two_node_e2e(
             exit_wg_pub_hex.as_str(),
             "--client-pubkey-hex",
             client_wg_pub_hex.as_str(),
+            "--artifact-dir",
+            remote_artifact_dir.as_str(),
         ],
     )?;
 
@@ -1235,7 +1334,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-assignment.pub",
+        remote_assignment_pub.as_str(),
         workspace.assignment_pub_local.as_path(),
     )?;
     copy_remote_file_to_local(
@@ -1246,7 +1345,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-exit.assignment",
+        remote_assignment_exit.as_str(),
         workspace.assignment_exit_local.as_path(),
     )?;
     copy_remote_file_to_local(
@@ -1257,7 +1356,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-client.assignment",
+        remote_assignment_client.as_str(),
         workspace.assignment_client_local.as_path(),
     )?;
     copy_remote_file_to_local(
@@ -1268,7 +1367,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-traversal.pub",
+        remote_traversal_pub.as_str(),
         workspace.traversal_pub_local.as_path(),
     )?;
     copy_remote_file_to_local(
@@ -1279,7 +1378,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-exit.traversal",
+        remote_traversal_exit.as_str(),
         workspace.traversal_exit_local.as_path(),
     )?;
     copy_remote_file_to_local(
@@ -1290,7 +1389,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         } else {
             None
         },
-        "/tmp/rustynet-client.traversal",
+        remote_traversal_client.as_str(),
         workspace.traversal_client_local.as_path(),
     )?;
 
@@ -1396,13 +1495,19 @@ pub fn execute_ops_run_debian_two_node_e2e(
             "-f",
             "/var/lib/rustynet/rustynetd.assignment.watermark",
             "/var/lib/rustynet/rustynetd.traversal.watermark",
-            "/tmp/rustynet-assignment.pub",
-            "/tmp/rustynet-exit.assignment",
-            "/tmp/rustynet-client.assignment",
-            "/tmp/rustynet-traversal.pub",
-            "/tmp/rustynet-exit.traversal",
-            "/tmp/rustynet-client.traversal",
         ],
+        &[],
+    )?;
+    run_remote_program_checked(
+        ssh_opts.as_slice(),
+        exit_target.qualified.as_str(),
+        if needs_exit_sudo {
+            Some(sudo_password.as_str())
+        } else {
+            None
+        },
+        "rm",
+        &["-rf", remote_artifact_dir.as_str()],
         &[],
     )?;
     run_remote_program_checked(
@@ -3801,7 +3906,8 @@ mod tests {
 
     #[test]
     fn remote_sudo_prompt_is_non_empty() {
-        assert!(!REMOTE_SUDO_PROMPT.is_empty());
+        let prompt = REMOTE_SUDO_PROMPT.to_string();
+        assert!(!prompt.is_empty());
     }
 
     #[test]

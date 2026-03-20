@@ -728,6 +728,234 @@ fn map_dns_zone_parse_error(err: DnsZoneError) -> DnsZoneBootstrapError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTrustVerificationReport {
+    pub updated_at_unix: u64,
+    pub nonce: u64,
+    pub payload_digest_sha256: String,
+    pub tls13_valid: bool,
+    pub signed_control_valid: bool,
+    pub signed_data_age_secs: u64,
+    pub clock_skew_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAssignmentVerificationReport {
+    pub node_id: String,
+    pub generated_at_unix: u64,
+    pub nonce: u64,
+    pub payload_digest_sha256: String,
+    pub peer_count: usize,
+    pub route_count: usize,
+    pub selected_exit_node: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTraversalVerificationReport {
+    pub generated_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: u64,
+    pub payload_digest_sha256: String,
+    pub bundle_count: usize,
+    pub source_node_ids: Vec<String>,
+    pub target_node_ids: Vec<String>,
+}
+
+pub fn verify_signed_trust_state_artifact(
+    evidence_path: &Path,
+    verifier_key_path: &Path,
+    watermark_path: &Path,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
+) -> Result<SignedTrustVerificationReport, String> {
+    if max_age_secs == 0 {
+        return Err("trust max age seconds must be greater than zero".to_string());
+    }
+    if max_clock_skew_secs == 0 {
+        return Err("trust max clock skew seconds must be greater than zero".to_string());
+    }
+
+    let previous_watermark = load_trust_watermark(watermark_path).map_err(|err| err.to_string())?;
+    let previous_watermark = previous_watermark
+        .ok_or_else(|| format!("trust watermark is missing: {}", watermark_path.display()))?;
+    let trust_policy = TrustPolicy {
+        max_signed_data_age_secs: max_age_secs,
+        max_clock_skew_secs,
+    };
+    let envelope = load_trust_evidence(
+        evidence_path,
+        verifier_key_path,
+        trust_policy,
+        Some(previous_watermark),
+    )
+    .map_err(|err| err.to_string())?;
+    if !envelope.evidence.tls13_valid {
+        return Err("trust evidence tls13_valid=false".to_string());
+    }
+    if !envelope.evidence.signed_control_valid {
+        return Err("trust evidence signed_control_valid=false".to_string());
+    }
+    if envelope.evidence.signed_data_age_secs > max_age_secs {
+        return Err(format!(
+            "trust evidence signed_data_age_secs exceeds max age: {} > {}",
+            envelope.evidence.signed_data_age_secs, max_age_secs
+        ));
+    }
+    if envelope.evidence.clock_skew_secs > max_clock_skew_secs {
+        return Err(format!(
+            "trust evidence clock_skew_secs exceeds max skew: {} > {}",
+            envelope.evidence.clock_skew_secs, max_clock_skew_secs
+        ));
+    }
+    let payload_digest = envelope
+        .watermark
+        .payload_digest
+        .ok_or_else(|| "trust watermark payload digest is missing".to_string())?;
+
+    Ok(SignedTrustVerificationReport {
+        updated_at_unix: envelope.watermark.updated_at_unix,
+        nonce: envelope.watermark.nonce,
+        payload_digest_sha256: encode_hex(&payload_digest),
+        tls13_valid: envelope.evidence.tls13_valid,
+        signed_control_valid: envelope.evidence.signed_control_valid,
+        signed_data_age_secs: envelope.evidence.signed_data_age_secs,
+        clock_skew_secs: envelope.evidence.clock_skew_secs,
+    })
+}
+
+pub fn verify_signed_assignment_state_artifact(
+    bundle_path: &Path,
+    verifier_key_path: &Path,
+    watermark_path: &Path,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
+    expected_node_id: Option<&str>,
+) -> Result<SignedAssignmentVerificationReport, String> {
+    if max_age_secs == 0 {
+        return Err("assignment max age seconds must be greater than zero".to_string());
+    }
+    if max_clock_skew_secs == 0 {
+        return Err("assignment max clock skew seconds must be greater than zero".to_string());
+    }
+
+    let previous_watermark =
+        load_auto_tunnel_watermark(watermark_path).map_err(|err| err.to_string())?;
+    let previous_watermark = previous_watermark.ok_or_else(|| {
+        format!(
+            "assignment watermark is missing: {}",
+            watermark_path.display()
+        )
+    })?;
+    let trust_policy = TrustPolicy {
+        max_signed_data_age_secs: max_age_secs,
+        max_clock_skew_secs,
+    };
+    let envelope = load_auto_tunnel_bundle(
+        bundle_path,
+        verifier_key_path,
+        max_age_secs,
+        trust_policy,
+        Some(previous_watermark),
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(expected_node_id) = expected_node_id
+        && envelope.bundle.node_id != expected_node_id
+    {
+        return Err(format!(
+            "assignment bundle node_id mismatch: expected {}, got {}",
+            expected_node_id, envelope.bundle.node_id
+        ));
+    }
+    let payload_digest = envelope
+        .watermark
+        .payload_digest
+        .ok_or_else(|| "assignment watermark payload digest is missing".to_string())?;
+
+    Ok(SignedAssignmentVerificationReport {
+        node_id: envelope.bundle.node_id,
+        generated_at_unix: envelope.watermark.generated_at_unix,
+        nonce: envelope.watermark.nonce,
+        payload_digest_sha256: encode_hex(&payload_digest),
+        peer_count: envelope.bundle.peers.len(),
+        route_count: envelope.bundle.routes.len(),
+        selected_exit_node: envelope.bundle.selected_exit_node,
+    })
+}
+
+pub fn verify_signed_traversal_state_artifact(
+    bundle_path: &Path,
+    verifier_key_path: &Path,
+    watermark_path: &Path,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
+    expected_source_node_id: Option<&str>,
+) -> Result<SignedTraversalVerificationReport, String> {
+    if max_age_secs == 0 {
+        return Err("traversal max age seconds must be greater than zero".to_string());
+    }
+    if max_clock_skew_secs == 0 {
+        return Err("traversal max clock skew seconds must be greater than zero".to_string());
+    }
+
+    let previous_watermark =
+        load_traversal_watermark(watermark_path).map_err(|err| err.to_string())?;
+    let previous_watermark = previous_watermark.ok_or_else(|| {
+        format!(
+            "traversal watermark is missing: {}",
+            watermark_path.display()
+        )
+    })?;
+    let trust_policy = TrustPolicy {
+        max_signed_data_age_secs: max_age_secs,
+        max_clock_skew_secs,
+    };
+    let envelope = load_traversal_bundle_set(
+        bundle_path,
+        verifier_key_path,
+        max_age_secs,
+        trust_policy,
+        Some(previous_watermark),
+    )
+    .map_err(|err| err.to_string())?;
+    if envelope.bundles.is_empty() {
+        return Err("verified traversal bundle set is empty".to_string());
+    }
+
+    let mut source_node_ids = BTreeSet::new();
+    let mut target_node_ids = BTreeSet::new();
+    for bundle in &envelope.bundles {
+        if let Some(expected_source_node_id) = expected_source_node_id
+            && bundle.bundle.source_node_id != expected_source_node_id
+        {
+            return Err(format!(
+                "traversal bundle source_node_id mismatch: expected {}, got {}",
+                expected_source_node_id, bundle.bundle.source_node_id
+            ));
+        }
+        source_node_ids.insert(bundle.bundle.source_node_id.clone());
+        target_node_ids.insert(bundle.bundle.target_node_id.clone());
+    }
+
+    let first_bundle = envelope
+        .bundles
+        .first()
+        .ok_or_else(|| "verified traversal bundle set is empty".to_string())?;
+    let payload_digest = envelope
+        .watermark
+        .payload_digest
+        .ok_or_else(|| "traversal watermark payload digest is missing".to_string())?;
+
+    Ok(SignedTraversalVerificationReport {
+        generated_at_unix: first_bundle.bundle.generated_at_unix,
+        expires_at_unix: first_bundle.bundle.expires_at_unix,
+        nonce: first_bundle.bundle.nonce,
+        payload_digest_sha256: encode_hex(&payload_digest),
+        bundle_count: envelope.bundles.len(),
+        source_node_ids: source_node_ids.into_iter().collect(),
+        target_node_ids: target_node_ids.into_iter().collect(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MembershipBootstrapError {
     MissingSnapshot,
     MissingLog,
@@ -6843,8 +7071,7 @@ fn collect_assignment_mesh_ip_map(
             .expect("exactly one deduped mesh host ip should remain");
         if !seen_ips.insert(mesh_ip.clone()) {
             return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
-                "duplicate mesh ip {} in signed assignment state",
-                mesh_ip
+                "duplicate mesh ip {mesh_ip} in signed assignment state",
             )));
         }
         ip_map.insert(peer.node_id.to_string(), mesh_ip);

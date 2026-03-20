@@ -10,8 +10,7 @@ source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
 LIVE_LAB_LOG_PREFIX="cross-network-relay-remote-exit"
 export LIVE_LAB_LOG_PREFIX
 
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 CLIENT_HOST=""
 EXIT_HOST=""
 RELAY_HOST=""
@@ -50,7 +49,7 @@ LOG_ARTIFACTS=()
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_cross_network_relay_remote_exit_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
+usage: live_linux_cross_network_relay_remote_exit_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
 
 options:
   --nat-profile <profile>
@@ -117,8 +116,7 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --relay-host) RELAY_HOST="$2"; shift 2 ;;
@@ -138,7 +136,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$RELAY_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$RELAY_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" || -z "$RELAY_NETWORK_ID" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$RELAY_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$RELAY_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" || -z "$RELAY_NETWORK_ID" ]]; then
   usage >&2
   exit 2
 fi
@@ -171,7 +169,7 @@ main() {
   local artifact_dir
 
   FAILURE_SUMMARY="initializing relay remote-exit live-lab runtime"
-  live_lab_init "rustynet-cross-network-relay-remote-exit" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+  live_lab_init "rustynet-cross-network-relay-remote-exit" "$SSH_IDENTITY_FILE"
 
   issue_script="$LIVE_LAB_WORK_DIR/rn_issue_cross_network_relay.sh"
   issue_env="$LIVE_LAB_WORK_DIR/rn_issue_cross_network_relay.env"
@@ -221,7 +219,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-cross-network-relay-passphrase.XXXXXX)"
@@ -273,7 +271,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-cross-network-relay-traversal-passphrase.XXXXXX)"
@@ -502,8 +500,7 @@ PY
   FAILURE_SUMMARY="validating narrow server-IP bypass and leak resistance on relay remote-exit path"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_server_ip_bypass_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --probe-host "$EXIT_HOST" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \

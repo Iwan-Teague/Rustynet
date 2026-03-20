@@ -2094,8 +2094,7 @@ fn wait_for_unit_active(unit: &str, attempts: usize, sleep_ms: u64) -> Result<()
         }
     }
     Err(format!(
-        "systemd unit {unit} failed to reach active state after {} attempts (last_state={last_state})",
-        attempts
+        "systemd unit {unit} failed to reach active state after {attempts} attempts (last_state={last_state})",
     ))
 }
 

@@ -48,10 +48,12 @@ use rustynet_local_security::{
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
-    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
-    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
+    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
+    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
+    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -60,6 +62,9 @@ use rustynetd::key_material::{
 };
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
+
+const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
+const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 90;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -80,7 +85,7 @@ enum CliCommand {
         expected_subject_node_id: Option<String>,
     },
     RouteAdvertise(String),
-    TraversalIssue(Box<TraversalIssueCommand>),
+    Traversal(Box<TraversalCommand>),
     KeyRotate,
     KeyRevoke,
     Assignment(Box<AssignmentCommand>),
@@ -88,6 +93,12 @@ enum CliCommand {
     Trust(Box<TrustCommand>),
     Ops(Box<OpsCommand>),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraversalCommand {
+    Issue(Box<TraversalIssueCommand>),
+    Verify(TraversalVerifyCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +145,7 @@ enum MembershipCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AssignmentCommand {
     Issue(Box<AssignmentIssueCommand>),
+    Verify(AssignmentVerifyCommand),
     InitSigningSecret {
         output_path: PathBuf,
         signing_secret_passphrase_path: PathBuf,
@@ -157,6 +169,16 @@ struct AssignmentIssueCommand {
     generated_at_unix: u64,
     ttl_secs: u64,
     nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentVerifyCommand {
+    bundle_path: PathBuf,
+    verifier_key_path: PathBuf,
+    watermark_path: PathBuf,
+    expected_node_id: Option<String>,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +222,16 @@ struct TraversalIssueCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalVerifyCommand {
+    bundle_path: PathBuf,
+    verifier_key_path: PathBuf,
+    watermark_path: PathBuf,
+    expected_source_node_id: Option<String>,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TraversalCandidateSpec {
     candidate_type: EndpointHintCandidateType,
     endpoint: String,
@@ -226,6 +258,13 @@ enum TrustCommand {
         output_path: PathBuf,
         updated_at_unix: u64,
         nonce: u64,
+    },
+    Verify {
+        evidence_path: PathBuf,
+        verifier_key_path: PathBuf,
+        watermark_path: PathBuf,
+        max_age_secs: u64,
+        max_clock_skew_secs: u64,
     },
 }
 
@@ -315,6 +354,7 @@ enum OpsCommand {
         client_endpoint: String,
         exit_pubkey_hex: String,
         client_pubkey_hex: String,
+        artifact_dir: Option<PathBuf>,
     },
 }
 
@@ -385,7 +425,7 @@ fn parse_command(args: &[String]) -> CliCommand {
             }
         }
         [cmd, rest @ ..] if cmd == "traversal" => match parse_traversal_command(rest) {
-            Ok(command) => CliCommand::TraversalIssue(Box::new(command)),
+            Ok(command) => CliCommand::Traversal(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
@@ -716,6 +756,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             client_endpoint: parser.required("--client-endpoint")?,
             exit_pubkey_hex: parser.required("--exit-pubkey-hex")?,
             client_pubkey_hex: parser.required("--client-pubkey-hex")?,
+            artifact_dir: parser.optional_path("--artifact-dir"),
         }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
@@ -937,6 +978,18 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
                 nonce,
             })))
         }
+        "verify" => Ok(AssignmentCommand::Verify(AssignmentVerifyCommand {
+            bundle_path: parser.required_path("--bundle")?,
+            verifier_key_path: parser.required_path("--verifier-key")?,
+            watermark_path: parser.required_path("--watermark")?,
+            expected_node_id: parser.value("--expected-node-id"),
+            max_age_secs: parser
+                .parse_u64_or_default("--max-age-secs", DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)?,
+            max_clock_skew_secs: parser.parse_u64_or_default(
+                "--max-clock-skew-secs",
+                DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
+            )?,
+        })),
         "init-signing-secret" => {
             let output_path = parser.required_path("--output")?;
             let signing_secret_passphrase_path =
@@ -984,6 +1037,17 @@ fn parse_trust_command(args: &[String]) -> Result<TrustCommand, String> {
             updated_at_unix: parser.parse_u64_or_default("--updated-at-unix", unix_now())?,
             nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
         }),
+        "verify" => Ok(TrustCommand::Verify {
+            evidence_path: parser.required_path("--evidence")?,
+            verifier_key_path: parser.required_path("--verifier-key")?,
+            watermark_path: parser.required_path("--watermark")?,
+            max_age_secs: parser
+                .parse_u64_or_default("--max-age-secs", DEFAULT_TRUST_MAX_AGE_SECS)?,
+            max_clock_skew_secs: parser.parse_u64_or_default(
+                "--max-clock-skew-secs",
+                DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
+            )?,
+        }),
         _ => Err(format!("unknown trust subcommand: {subcommand}")),
     }
 }
@@ -1018,29 +1082,42 @@ fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, S
     }
 }
 
-fn parse_traversal_command(args: &[String]) -> Result<TraversalIssueCommand, String> {
+fn parse_traversal_command(args: &[String]) -> Result<TraversalCommand, String> {
     if args.is_empty() {
         return Err("traversal subcommand is required".to_string());
     }
     let subcommand = args[0].as_str();
-    if subcommand != "issue" {
-        return Err(format!("unknown traversal subcommand: {subcommand}"));
-    }
     let parser = OptionParser::parse(&args[1..])?;
-    Ok(TraversalIssueCommand {
-        signing_secret_path: parser.required_path("--signing-secret")?,
-        signing_secret_passphrase_path: parser.required_path("--signing-secret-passphrase-file")?,
-        source_node_id: parser.required("--source-node-id")?,
-        target_node_id: parser.required("--target-node-id")?,
-        output_path: parser.required_path("--output")?,
-        verifier_key_output_path: parser.optional_path("--verifier-key-output"),
-        nodes: parse_assignment_nodes(&parser.required("--nodes")?)?,
-        allow_pairs: parse_assignment_allow_pairs(&parser.required("--allow")?)?,
-        candidates: parse_traversal_candidates(&parser.required("--candidates")?)?,
-        generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
-        ttl_secs: parser.parse_u64_or_default("--ttl-secs", 120)?,
-        nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
-    })
+    match subcommand {
+        "issue" => Ok(TraversalCommand::Issue(Box::new(TraversalIssueCommand {
+            signing_secret_path: parser.required_path("--signing-secret")?,
+            signing_secret_passphrase_path: parser
+                .required_path("--signing-secret-passphrase-file")?,
+            source_node_id: parser.required("--source-node-id")?,
+            target_node_id: parser.required("--target-node-id")?,
+            output_path: parser.required_path("--output")?,
+            verifier_key_output_path: parser.optional_path("--verifier-key-output"),
+            nodes: parse_assignment_nodes(&parser.required("--nodes")?)?,
+            allow_pairs: parse_assignment_allow_pairs(&parser.required("--allow")?)?,
+            candidates: parse_traversal_candidates(&parser.required("--candidates")?)?,
+            generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
+            ttl_secs: parser.parse_u64_or_default("--ttl-secs", 120)?,
+            nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
+        }))),
+        "verify" => Ok(TraversalCommand::Verify(TraversalVerifyCommand {
+            bundle_path: parser.required_path("--bundle")?,
+            verifier_key_path: parser.required_path("--verifier-key")?,
+            watermark_path: parser.required_path("--watermark")?,
+            expected_source_node_id: parser.value("--expected-source-node-id"),
+            max_age_secs: parser
+                .parse_u64_or_default("--max-age-secs", DEFAULT_TRAVERSAL_MAX_AGE_SECS)?,
+            max_clock_skew_secs: parser.parse_u64_or_default(
+                "--max-clock-skew-secs",
+                DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
+            )?,
+        })),
+        _ => Err(format!("unknown traversal subcommand: {subcommand}")),
+    }
 }
 
 fn proposal_config(
@@ -1082,7 +1159,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
             expected_zone_name,
             expected_subject_node_id,
         ),
-        CliCommand::TraversalIssue(command) => execute_traversal_issue(*command),
+        CliCommand::Traversal(command) => execute_traversal(*command),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
@@ -1100,6 +1177,13 @@ fn execute(command: CliCommand) -> Result<String, String> {
                 Err(err) => Err(format!("daemon unreachable: {err}")),
             }
         }
+    }
+}
+
+fn execute_traversal(command: TraversalCommand) -> Result<String, String> {
+    match command {
+        TraversalCommand::Issue(command) => execute_traversal_issue(*command),
+        TraversalCommand::Verify(command) => execute_traversal_verify(command),
     }
 }
 
@@ -1186,6 +1270,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                     .unwrap_or_else(|| "<not_written>".to_string())
             ))
         }
+        AssignmentCommand::Verify(command) => execute_assignment_verify(command),
         AssignmentCommand::InitSigningSecret {
             output_path,
             signing_secret_passphrase_path,
@@ -1387,6 +1472,72 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "<not_written>".to_string())
+    ))
+}
+
+fn execute_assignment_verify(command: AssignmentVerifyCommand) -> Result<String, String> {
+    let AssignmentVerifyCommand {
+        bundle_path,
+        verifier_key_path,
+        watermark_path,
+        expected_node_id,
+        max_age_secs,
+        max_clock_skew_secs,
+    } = command;
+    ensure_regular_file_no_symlink(&bundle_path, "assignment bundle")?;
+    ensure_regular_file_no_symlink(&verifier_key_path, "assignment verifier key")?;
+    ensure_regular_file_no_symlink(&watermark_path, "assignment watermark")?;
+
+    let report = verify_signed_assignment_state_artifact(
+        &bundle_path,
+        &verifier_key_path,
+        &watermark_path,
+        max_age_secs,
+        max_clock_skew_secs,
+        expected_node_id.as_deref(),
+    )?;
+    Ok(format!(
+        "assignment verification passed: node_id={} generated_at_unix={} nonce={} peer_count={} route_count={} selected_exit_node={} payload_digest_sha256={}",
+        report.node_id,
+        report.generated_at_unix,
+        report.nonce,
+        report.peer_count,
+        report.route_count,
+        report.selected_exit_node.as_deref().unwrap_or("none"),
+        report.payload_digest_sha256
+    ))
+}
+
+fn execute_traversal_verify(command: TraversalVerifyCommand) -> Result<String, String> {
+    let TraversalVerifyCommand {
+        bundle_path,
+        verifier_key_path,
+        watermark_path,
+        expected_source_node_id,
+        max_age_secs,
+        max_clock_skew_secs,
+    } = command;
+    ensure_regular_file_no_symlink(&bundle_path, "traversal bundle")?;
+    ensure_regular_file_no_symlink(&verifier_key_path, "traversal verifier key")?;
+    ensure_regular_file_no_symlink(&watermark_path, "traversal watermark")?;
+
+    let report = verify_signed_traversal_state_artifact(
+        &bundle_path,
+        &verifier_key_path,
+        &watermark_path,
+        max_age_secs,
+        max_clock_skew_secs,
+        expected_source_node_id.as_deref(),
+    )?;
+    Ok(format!(
+        "traversal verification passed: generated_at_unix={} expires_at_unix={} nonce={} bundle_count={} sources={} targets={} payload_digest_sha256={}",
+        report.generated_at_unix,
+        report.expires_at_unix,
+        report.nonce,
+        report.bundle_count,
+        report.source_node_ids.join(","),
+        report.target_node_ids.join(","),
+        report.payload_digest_sha256
     ))
 }
 
@@ -1728,7 +1879,50 @@ fn execute_trust(command: TrustCommand) -> Result<String, String> {
                 nonce
             ))
         }
+        TrustCommand::Verify {
+            evidence_path,
+            verifier_key_path,
+            watermark_path,
+            max_age_secs,
+            max_clock_skew_secs,
+        } => execute_trust_verify(
+            evidence_path,
+            verifier_key_path,
+            watermark_path,
+            max_age_secs,
+            max_clock_skew_secs,
+        ),
     }
+}
+
+fn execute_trust_verify(
+    evidence_path: PathBuf,
+    verifier_key_path: PathBuf,
+    watermark_path: PathBuf,
+    max_age_secs: u64,
+    max_clock_skew_secs: u64,
+) -> Result<String, String> {
+    ensure_regular_file_no_symlink(&evidence_path, "trust evidence")?;
+    ensure_regular_file_no_symlink(&verifier_key_path, "trust verifier key")?;
+    ensure_regular_file_no_symlink(&watermark_path, "trust watermark")?;
+
+    let report = verify_signed_trust_state_artifact(
+        &evidence_path,
+        &verifier_key_path,
+        &watermark_path,
+        max_age_secs,
+        max_clock_skew_secs,
+    )?;
+    Ok(format!(
+        "trust verification passed: updated_at_unix={} nonce={} tls13_valid={} signed_control_valid={} signed_data_age_secs={} clock_skew_secs={} payload_digest_sha256={}",
+        report.updated_at_unix,
+        report.nonce,
+        report.tls13_valid,
+        report.signed_control_valid,
+        report.signed_data_age_secs,
+        report.clock_skew_secs,
+        report.payload_digest_sha256
+    ))
 }
 
 fn execute_ops(command: OpsCommand) -> Result<String, String> {
@@ -1841,6 +2035,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             client_endpoint,
             exit_pubkey_hex,
             client_pubkey_hex,
+            artifact_dir,
         } => ops_e2e::execute_ops_e2e_issue_assignments(
             exit_node_id,
             client_node_id,
@@ -1848,6 +2043,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             client_endpoint,
             exit_pubkey_hex,
             client_pubkey_hex,
+            artifact_dir,
         ),
     }
 }
@@ -2947,8 +3143,7 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
     run_resolvectl_action(&["status", interface.as_str()])?;
 
     Ok(format!(
-        "managed DNS routing applied: interface={} zone={} resolver={}",
-        interface, zone_name, resolver_bind_addr
+        "managed DNS routing applied: interface={interface} zone={zone_name} resolver={resolver_bind_addr}"
     ))
 }
 
@@ -2963,8 +3158,7 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
     run_resolvectl_action(&["revert", interface.as_str()])?;
 
     Ok(format!(
-        "managed DNS routing cleared: interface={}",
-        interface
+        "managed DNS routing cleared: interface={interface}"
     ))
 }
 
@@ -6116,7 +6310,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
-        | CliCommand::TraversalIssue(_)
+        | CliCommand::Traversal(_)
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
         | CliCommand::Trust(_)
@@ -6209,10 +6403,12 @@ fn help_text() -> String {
         "  dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-json <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
         "  dns zone verify --bundle <path> --verifier-key <path> [--expected-zone-name <name>] [--expected-subject-node-id <id>]",
         "  traversal issue --signing-secret <path> --signing-secret-passphrase-file <path> --source-node-id <id> --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --candidates <type|endpoint|priority[|relay_id];...> --output <path> [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
+        "  traversal verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-source-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
         "  route advertise <cidr>",
         "  key rotate",
         "  key revoke",
         "  assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --signing-secret-passphrase-file <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]",
+        "  assignment verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
         "  assignment init-signing-secret --output <path> --signing-secret-passphrase-file <path> [--length-bytes <n>] [--force]",
         "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv];... ",
         "    allow_specs format: source_node_id|destination_node_id;...",
@@ -6232,6 +6428,7 @@ fn help_text() -> String {
         "  trust keygen --signing-key-output <path> --signing-key-passphrase-file <path> --verifier-key-output <path> [--force]",
         "  trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>",
         "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
+        "  trust verify --evidence <path> --verifier-key <path> --watermark <path> [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
         "  ops refresh-trust",
         "  ops refresh-signed-trust",
         "  ops bootstrap-wireguard-custody",
@@ -6325,6 +6522,45 @@ mod tests {
             "/tmp/dns-zone.pub".to_string(),
         ]);
         assert!(format!("{verify:?}").contains("DnsZoneVerify"));
+    }
+
+    #[test]
+    fn parse_supports_signed_state_verify_commands() {
+        let assignment_verify = parse_command(&[
+            "assignment".to_string(),
+            "verify".to_string(),
+            "--bundle".to_string(),
+            "/tmp/rustynetd.assignment".to_string(),
+            "--verifier-key".to_string(),
+            "/tmp/assignment.pub".to_string(),
+            "--watermark".to_string(),
+            "/tmp/rustynetd.assignment.watermark".to_string(),
+        ]);
+        assert!(format!("{assignment_verify:?}").contains("Verify"));
+
+        let traversal_verify = parse_command(&[
+            "traversal".to_string(),
+            "verify".to_string(),
+            "--bundle".to_string(),
+            "/tmp/rustynetd.traversal".to_string(),
+            "--verifier-key".to_string(),
+            "/tmp/traversal.pub".to_string(),
+            "--watermark".to_string(),
+            "/tmp/rustynetd.traversal.watermark".to_string(),
+        ]);
+        assert!(format!("{traversal_verify:?}").contains("Traversal"));
+
+        let trust_verify = parse_command(&[
+            "trust".to_string(),
+            "verify".to_string(),
+            "--evidence".to_string(),
+            "/tmp/rustynetd.trust".to_string(),
+            "--verifier-key".to_string(),
+            "/tmp/trust-evidence.pub".to_string(),
+            "--watermark".to_string(),
+            "/tmp/rustynetd.trust.watermark".to_string(),
+        ]);
+        assert!(format!("{trust_verify:?}").contains("Trust"));
     }
 
     #[test]
@@ -6723,8 +6959,11 @@ mod tests {
             "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
             "--client-pubkey-hex".to_string(),
             "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
+            "--artifact-dir".to_string(),
+            "/run/rustynet/e2e-issue-artifacts.test".to_string(),
         ]);
         assert!(format!("{assignments:?}").contains("E2eIssueAssignments"));
+        assert!(format!("{assignments:?}").contains("e2e-issue-artifacts.test"));
     }
 
     #[test]

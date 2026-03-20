@@ -19,8 +19,7 @@ FEDORA_NODE_ID="client-51"
 MINT_HOST="mint@192.168.18.53"
 MINT_NODE_ID="client-53"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/role_switch_matrix_report.json"
 SOURCE_PATH="$ROOT_DIR/artifacts/phase10/source/role_switch_matrix.md"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_role_switch_matrix.log"
@@ -28,7 +27,7 @@ LAN_TEST_CIDR="192.168.1.0/24"
 
 usage() {
   cat <<USAGE
-usage: $0 --ssh-password-file <path> --sudo-password-file <path> [options]
+usage: $0 --ssh-identity-file <path> [options]
 
 options:
   --debian-host <user@host>
@@ -48,8 +47,7 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --debian-host) DEBIAN_HOST="$2"; shift 2 ;;
     --debian-node-id) DEBIAN_NODE_ID="$2"; shift 2 ;;
     --ubuntu-host) UBUNTU_HOST="$2"; shift 2 ;;
@@ -67,7 +65,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" ]]; then
   usage >&2
   exit 2
 fi
@@ -75,7 +73,7 @@ fi
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$SOURCE_PATH")" "$(dirname "$LOG_PATH")"
 exec > >(tee "$LOG_PATH") 2>&1
 
-live_lab_init "rustynet-role-switch-live" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-role-switch-live" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 
 TMP_JSON="$LIVE_LAB_WORK_DIR/role_switch_hosts.json"

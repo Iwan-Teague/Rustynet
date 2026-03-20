@@ -15,8 +15,7 @@ CLIENT_HOST="ubuntu@192.168.18.52"
 SIGNER_NODE_ID="exit-49"
 CLIENT_NODE_ID="client-52"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
 ZONE_NAME="rustynet"
@@ -27,7 +26,7 @@ MANAGED_ALIAS="gateway"
 
 usage() {
   cat <<USAGE
-usage: $0 --ssh-password-file <path> --sudo-password-file <path> [options]
+usage: $0 --ssh-identity-file <path> [options]
 
 options:
   --signer-host <user@host>
@@ -63,8 +62,7 @@ PY
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --signer-host) SIGNER_HOST="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --signer-node-id) SIGNER_NODE_ID="$2"; shift 2 ;;
@@ -80,7 +78,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" ]]; then
   usage >&2
   exit 2
 fi
@@ -89,7 +87,7 @@ mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
 exec >> "$LOG_PATH" 2>&1
 
-live_lab_init "rustynet-managed-dns" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-managed-dns" "$SSH_IDENTITY_FILE"
 cleanup_all() {
   if [[ -n "${CLIENT_HOST:-}" ]]; then
     live_lab_run_root "$CLIENT_HOST" "root rm -f /tmp/rn-dns-query.py /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" >/dev/null 2>&1 || true
@@ -225,7 +223,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-dns-zone-passphrase.XXXXXX)"
@@ -276,7 +274,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-dns-traversal-passphrase.XXXXXX)"

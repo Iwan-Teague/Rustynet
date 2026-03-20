@@ -38,11 +38,8 @@ CROSS_NETWORK_SKIP_REASON=""
 OVERALL_STATUS="pass"
 FAILURE_COUNT=0
 SOFT_FAILURE_COUNT=0
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 SSH_KNOWN_HOSTS_FILE=""
-TEMP_SSH_PASSWORD_FILE=""
-TEMP_SUDO_PASSWORD_FILE=""
 EXIT_TARGET=""
 CLIENT_TARGET=""
 ENTRY_TARGET=""
@@ -91,7 +88,7 @@ usage() {
   cat <<USAGE
 usage: ${SCRIPT_NAME} [options]
 
-Interactive by default. If any required target/password input is missing, the script prompts.
+Interactive by default. If any required target/input is missing, the script prompts.
 Interactive source selection now also supports:
   - use local working tree, or
   - update from latest git and pick a branch from a numbered list
@@ -106,8 +103,9 @@ options:
   --entry-target <user@ip|ip>    Entry relay / alternate exit target
   --aux-target <user@ip|ip>      Auxiliary client / blind-exit target
   --extra-target <user@ip|ip>    Optional extra client target
-  --ssh-password-file <path>     File containing SSH password
-  --sudo-password-file <path>    File containing sudo password (defaults to SSH password)
+  --ssh-identity-file <path>     SSH private key for key-based authentication
+  --ssh-password-file <path>     Deprecated alias of --ssh-identity-file
+  --sudo-password-file <path>    Deprecated alias of --ssh-identity-file
   --ssh-known-hosts-file <path>  Pinned SSH known_hosts file (defaults to ~/.ssh/known_hosts)
   --network-id <id>              Override generated network ID
   --ssh-allow-cidrs <cidrs>      SSH management CIDRs (default: ${SSH_ALLOW_CIDRS})
@@ -435,8 +433,9 @@ load_profile_file() {
         EXTRA_TARGET_DECLARED=1
         [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value"
         ;;
-      SSH_PASSWORD_FILE) [[ -z "$SSH_PASSWORD_FILE" ]] && SSH_PASSWORD_FILE="$value" ;;
-      SUDO_PASSWORD_FILE) [[ -z "$SUDO_PASSWORD_FILE" ]] && SUDO_PASSWORD_FILE="$value" ;;
+      SSH_IDENTITY_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
+      SSH_PASSWORD_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
+      SUDO_PASSWORD_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
       SSH_KNOWN_HOSTS_FILE) [[ -z "$SSH_KNOWN_HOSTS_FILE" ]] && SSH_KNOWN_HOSTS_FILE="$value" ;;
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
       SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
@@ -913,25 +912,37 @@ ensure_password_file() {
   local provided_path="$1"
   local prompt="$2"
   local __resultvar="$3"
-  local temp_path=""
-  local secret=""
-  if [[ -n "$provided_path" ]]; then
-    if [[ ! -f "$provided_path" ]]; then
-      printf 'missing password file: %s\n' "$provided_path" >&2
-      return 1
-    fi
-    printf -v "$__resultvar" '%s' "$provided_path"
-    return 0
+  local selected_path="$provided_path"
+  if [[ -z "$selected_path" && -t 0 && -t 1 ]]; then
+    selected_path="$(prompt_value "$prompt")"
   fi
-  secret="$(prompt_secret "$prompt")"
-  if [[ -z "$secret" ]]; then
-    printf 'password cannot be empty for %s\n' "$prompt" >&2
+  if [[ -z "$selected_path" ]]; then
+    printf 'missing required file path for %s\n' "$prompt" >&2
     return 1
   fi
-  temp_path="$(mktemp "${TMPDIR:-/tmp}/rustynet-lab-pass.XXXXXX")"
-  chmod 600 "$temp_path"
-  printf '%s\n' "$secret" > "$temp_path"
-  printf -v "$__resultvar" '%s' "$temp_path"
+  if [[ ! -f "$selected_path" ]]; then
+    printf 'missing file: %s\n' "$selected_path" >&2
+    return 1
+  fi
+  if [[ -L "$selected_path" ]]; then
+    printf 'path must not be a symlink: %s\n' "$selected_path" >&2
+    return 1
+  fi
+  if ! python3 - "$selected_path" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+st = os.stat(path, follow_symlinks=False)
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o077:
+    raise SystemExit(f"file must be owner-only (0400/0600): {path} ({mode:03o})")
+PY
+  then
+    return 1
+  fi
+  printf -v "$__resultvar" '%s' "$selected_path"
 }
 
 record_node() {
@@ -1300,13 +1311,13 @@ write_remote_scripts() {
 set -euo pipefail
 
 run_root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 run_root_timed() {
   local timeout_secs="$1"
   shift
-  timeout "$timeout_secs" sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  timeout "$timeout_secs" sudo -n "$@"
 }
 
 run_root pkill -f '/tmp/rn_bootstrap.sh' >/dev/null 2>&1 || true
@@ -1374,7 +1385,7 @@ run_root rm -f \
 run_root_timed 30 systemctl daemon-reload >/dev/null 2>&1 || true
 run_root rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet
 run_root rm -f /usr/local/bin/rustynet /usr/local/bin/rustynetd
-rm -f /tmp/rn_sudo.pass /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
+rm -f /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
 rm -rf "${HOME}/Rustynet"
 EOF_CLEANUP
   chmod 700 "$STATE_DIR/rn_cleanup.sh"
@@ -1391,13 +1402,13 @@ fi
 source "$1"
 
 run_root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 run_root_timed() {
   local timeout_secs="$1"
   shift
-  timeout "$timeout_secs" sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  timeout "$timeout_secs" sudo -n "$@"
 }
 
 run_local_timed() {
@@ -1771,7 +1782,7 @@ fi
 source "$1"
 
 run_root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-assignment-passphrase.XXXXXX)"
@@ -1836,7 +1847,7 @@ fi
 source "$1"
 
 run_root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-traversal-passphrase.XXXXXX)"
@@ -2307,8 +2318,7 @@ stage_run_live_role_switch_matrix() {
   role_log="$REPORT_DIR/live_linux_role_switch_matrix.log"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --debian-host "$(node_target_for_label client)" \
     --debian-node-id "$(node_id_for_label client)" \
     --ubuntu-host "$(node_target_for_label entry)" \
@@ -2383,8 +2393,7 @@ stage_run_live_exit_handoff() {
   alternate_node_id="$(node_id_for_label "$alternate_label")"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --exit-a-host "$(node_target_for_label exit)" \
     --exit-a-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2412,8 +2421,7 @@ stage_run_live_two_hop() {
   second_client_node_id="$(node_id_for_label "$second_client_label")"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --final-exit-host "$(node_target_for_label exit)" \
     --final-exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2434,8 +2442,7 @@ stage_run_live_lan_toggle() {
   fi
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2453,8 +2460,7 @@ stage_run_live_managed_dns() {
   canonical_log="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --signer-host "$(node_target_for_label exit)" \
     --signer-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2474,8 +2480,7 @@ stage_run_cross_network_direct_remote_exit() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --client-node-id "$(node_id_for_label client)" \
@@ -2503,8 +2508,7 @@ stage_run_cross_network_relay_remote_exit() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --relay-host "$(node_target_for_label "$relay_label")" \
@@ -2535,8 +2539,7 @@ stage_run_cross_network_failback_roaming() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --relay-host "$(node_target_for_label "$relay_label")" \
@@ -2567,8 +2570,7 @@ stage_run_cross_network_traversal_adversarial() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --probe-host "$(node_target_for_label "$probe_label")" \
@@ -2589,8 +2591,7 @@ stage_run_cross_network_remote_exit_dns() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --client-node-id "$(node_id_for_label client)" \
@@ -2613,8 +2614,7 @@ stage_run_cross_network_remote_exit_soak() {
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh"
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --client-host "$(node_target_for_label client)" \
     --exit-host "$(node_target_for_label exit)" \
     --client-node-id "$(node_id_for_label client)" \
@@ -2632,52 +2632,34 @@ stage_run_cross_network_remote_exit_soak() {
 
 cross_network_verify_signed_artifact_chain() {
   local target="$1"
+  local node_id="$2"
   live_lab_capture_root "$target" "
-max_age='${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}'
-now=\$(date +%s)
-for p in \
-  /var/lib/rustynet/rustynetd.assignment \
-  /var/lib/rustynet/rustynetd.assignment.watermark \
-  /etc/rustynet/assignment.pub \
-  /var/lib/rustynet/rustynetd.traversal \
-  /var/lib/rustynet/rustynetd.traversal.watermark \
-  /etc/rustynet/traversal.pub \
-  /var/lib/rustynet/rustynetd.trust \
-  /var/lib/rustynet/rustynetd.trust.watermark \
-  /etc/rustynet/trust-evidence.pub \
-  /var/lib/rustynet/rustynetd.dns-zone \
-  /var/lib/rustynet/rustynetd.dns-zone.watermark \
-  /etc/rustynet/dns-zone.pub
-do
-  root test -f \"\$p\" || { echo missing:\$p; exit 1; }
-  root test ! -L \"\$p\" || { echo symlink:\$p; exit 1; }
-  mode=\$(root stat -c '%a' \"\$p\")
-  owner=\$(root stat -c '%U:%G' \"\$p\")
-  size=\$(root stat -c '%s' \"\$p\")
-  mtime=\$(root stat -c '%Y' \"\$p\")
-  if [[ ! \"\$owner\" =~ ^root: ]]; then
-    echo owner_mismatch:\$p:\$owner
-    exit 1
-  fi
-  if (( (8#\$mode) & 022 )); then
-    echo mode_too_permissive:\$p:\$mode
-    exit 1
-  fi
-  if (( size <= 0 )); then
-    echo empty_file:\$p
-    exit 1
-  fi
-  if [[ \"\$p\" != /etc/rustynet/*.pub ]]; then
-    age=\$((now - mtime))
-    if (( age > max_age )); then
-      echo stale_artifact:\$p:age=\$age:max=\$max_age
-      exit 1
-    fi
-    echo artifact:\$p:owner=\$owner:mode=\$mode:age=\$age
-  else
-    echo verifier:\$p:owner=\$owner:mode=\$mode
-  fi
-done
+set -euo pipefail
+root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet assignment verify \
+  --bundle /var/lib/rustynet/rustynetd.assignment \
+  --verifier-key /etc/rustynet/assignment.pub \
+  --watermark /var/lib/rustynet/rustynetd.assignment.watermark \
+  --expected-node-id '${node_id}' \
+  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
+  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
+root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet traversal verify \
+  --bundle /var/lib/rustynet/rustynetd.traversal \
+  --verifier-key /etc/rustynet/traversal.pub \
+  --watermark /var/lib/rustynet/rustynetd.traversal.watermark \
+  --expected-source-node-id '${node_id}' \
+  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
+  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
+root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet trust verify \
+  --evidence /var/lib/rustynet/rustynetd.trust \
+  --verifier-key /etc/rustynet/trust-evidence.pub \
+  --watermark /var/lib/rustynet/rustynetd.trust.watermark \
+  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
+  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
+root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns zone verify \
+  --bundle /var/lib/rustynet/rustynetd.dns-zone \
+  --verifier-key /etc/rustynet/dns-zone.pub \
+  --expected-zone-name rustynet \
+  --expected-subject-node-id '${node_id}'
 echo signed_artifact_chain_ok
 "
 }
@@ -2692,10 +2674,8 @@ cross_network_preflight_worker() {
   local cmd
   local required_user_cmds=(rustynet rustynetd wg systemctl ss python3 ip nft journalctl)
   local required_root_cmds=(wg systemctl ss ip nft journalctl)
-  local status_snapshot route_snapshot endpoint_snapshot
-  local netcheck_snapshot dns_inspect_snapshot artifact_chain_snapshot
+  local signed_state_snapshot route_snapshot endpoint_snapshot
   local global_ipv4 hostname_resolution_snapshot plaintext_snapshot
-  local last_assignment_unix assignment_age
   local remote_src discovery_script_path discovery_remote_path discovery_local_path discovery_validation_path
   local discovery_hash
 
@@ -2771,8 +2751,8 @@ cross_network_preflight_worker() {
     return 1
   fi
 
-  artifact_chain_snapshot="$(cross_network_verify_signed_artifact_chain "$target")"
-  if [[ "$artifact_chain_snapshot" != *"signed_artifact_chain_ok"* ]]; then
+  signed_state_snapshot="$(cross_network_verify_signed_artifact_chain "$target" "$node_id")"
+  if [[ "$signed_state_snapshot" != *"signed_artifact_chain_ok"* ]]; then
     printf 'signed artifact chain verification failed on %s (%s)\n' "$label" "$target" >&2
     return 1
   fi
@@ -2780,64 +2760,6 @@ cross_network_preflight_worker() {
   live_lab_run_root "$target" "root test -S /run/rustynet/rustynetd.sock"
   live_lab_run_root "$target" "root systemctl is-active --quiet rustynetd.service"
   live_lab_run_root "$target" "root systemctl is-active --quiet rustynetd-privileged-helper.service"
-
-  status_snapshot="$(live_lab_status "$target")"
-  if [[ "$status_snapshot" != *"bootstrap_error=none"* ]]; then
-    printf 'runtime bootstrap_error is not none on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ "$status_snapshot" != *"encrypted_key_store=true"* ]]; then
-    printf 'encrypted key store is not enforced on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ "$status_snapshot" != *"auto_tunnel_enforce=true"* ]]; then
-    printf 'auto tunnel enforcement is not enabled on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ "$status_snapshot" != *"last_reconcile_error=none"* ]]; then
-    printf 'last reconcile error is not none on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ ! "$status_snapshot" =~ traversal_authority=enforced ]]; then
-    printf 'traversal authority is not enforced on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  last_assignment_unix="$(printf '%s\n' "$status_snapshot" | sed -n 's/.*last_assignment=\([0-9][0-9]*\):[0-9][0-9]*.*/\1/p' | head -n 1)"
-  if [[ ! "$last_assignment_unix" =~ ^[0-9]+$ ]]; then
-    printf 'unable to parse last_assignment timestamp on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if (( remote_unix >= last_assignment_unix )); then
-    assignment_age=$((remote_unix - last_assignment_unix))
-  else
-    assignment_age=$((last_assignment_unix - remote_unix))
-  fi
-  if (( assignment_age > CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS )); then
-    printf 'last_assignment is stale on %s (%s): age=%ss max=%ss\n' "$label" "$target" "$assignment_age" "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >&2
-    return 1
-  fi
-  if [[ "$status_snapshot" == *"restricted_safe_mode=true"* || "$status_snapshot" == *"state=FailClosed"* ]]; then
-    printf 'runtime is in restricted/fail-closed state on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  netcheck_snapshot="$(live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck")"
-  if [[ "$netcheck_snapshot" != *"traversal_status=valid"* ]]; then
-    printf 'netcheck traversal status is not valid on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ "$netcheck_snapshot" != *"traversal_error=none"* ]]; then
-    printf 'netcheck traversal error is not none on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  if [[ "$netcheck_snapshot" == *"path_mode=fail_closed"* ]]; then
-    printf 'netcheck path mode is fail_closed on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
-  dns_inspect_snapshot="$(live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
-  if [[ "$dns_inspect_snapshot" != *"dns inspect: state=valid"* ]]; then
-    printf 'dns inspect is not valid on %s (%s)\n' "$label" "$target" >&2
-    return 1
-  fi
   plaintext_snapshot="$(live_lab_no_plaintext_passphrase_check "$target" || true)"
   if [[ "$plaintext_snapshot" != *"no-plaintext-passphrase-files"* ]]; then
     printf 'plaintext passphrase files detected on %s (%s)\n' "$label" "$target" >&2
@@ -2878,18 +2800,14 @@ PY
   printf 'clock_skew_secs=%s\n' "$skew" >> "$capability_path"
   printf 'max_clock_skew_secs=%s\n' "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >> "$capability_path"
   printf 'signed_artifact_max_age_secs=%s\n' "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >> "$capability_path"
-  printf 'last_assignment_age_secs=%s\n' "$assignment_age" >> "$capability_path"
   printf 'discovery_bundle_max_age_secs=%s\n' "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" >> "$capability_path"
   printf 'global_ipv4=%s\n' "$global_ipv4" >> "$capability_path"
   printf 'discovery_bundle_path=%s\n' "$discovery_local_path" >> "$capability_path"
   printf 'discovery_bundle_sha256=%s\n' "$discovery_hash" >> "$capability_path"
   printf 'discovery_validation_report=%s\n' "$discovery_validation_path" >> "$capability_path"
   printf 'hostname_resolution_snapshot=%s\n' "$(printf '%s' "$hostname_resolution_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
-  printf 'artifact_chain_snapshot=%s\n' "$(printf '%s' "$artifact_chain_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'signed_state_snapshot=%s\n' "$(printf '%s' "$signed_state_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
   printf 'plaintext_snapshot=%s\n' "$(printf '%s' "$plaintext_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
-  printf 'status_snapshot=%s\n' "$(printf '%s' "$status_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
-  printf 'netcheck_snapshot=%s\n' "$(printf '%s' "$netcheck_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
-  printf 'dns_inspect_snapshot=%s\n' "$(printf '%s' "$dns_inspect_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
   printf 'route_snapshot=%s\n' "$(printf '%s' "$route_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
   printf 'endpoint_snapshot=%s\n' "$(printf '%s' "$endpoint_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
 }
@@ -3055,7 +2973,7 @@ capture_boot_id() {
 run_host_reboot() {
   local target="$1"
   live_lab_push_sudo_password "$target"
-  live_lab_ssh "$target" "sudo -S -p '' systemctl reboot < /tmp/rn_sudo.pass" 20 >/dev/null 2>&1 || true
+  live_lab_ssh "$target" "sudo -n systemctl reboot" 20 >/dev/null 2>&1 || true
 }
 
 stage_run_extended_soak() {
@@ -3065,8 +2983,7 @@ stage_run_extended_soak() {
   fi
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --final-exit-host "$(node_target_for_label exit)" \
     --final-exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -3081,8 +2998,7 @@ stage_run_extended_soak() {
 
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --exit-a-host "$(node_target_for_label exit)" \
     --exit-a-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -3098,8 +3014,7 @@ stage_run_extended_soak() {
 
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
-    --ssh-password-file "$SSH_PASSWORD_FILE" \
-    --sudo-password-file "$SUDO_PASSWORD_FILE" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -3157,8 +3072,7 @@ stage_run_reboot_recovery_report() {
     if has_label extra; then
       RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-password-file "$SSH_PASSWORD_FILE" \
-        --sudo-password-file "$SUDO_PASSWORD_FILE" \
+        --ssh-identity-file "$SSH_IDENTITY_FILE" \
         --final-exit-host "$exit_target" \
         --final-exit-node-id "$(node_id_for_label exit)" \
         --client-host "$client_target" \
@@ -3173,8 +3087,7 @@ stage_run_reboot_recovery_report() {
     else
       RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-password-file "$SSH_PASSWORD_FILE" \
-        --sudo-password-file "$SUDO_PASSWORD_FILE" \
+        --ssh-identity-file "$SSH_IDENTITY_FILE" \
         --final-exit-host "$exit_target" \
         --final-exit-node-id "$(node_id_for_label exit)" \
         --client-host "$client_target" \
@@ -3224,8 +3137,7 @@ PY
     if has_label extra; then
       RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-password-file "$SSH_PASSWORD_FILE" \
-        --sudo-password-file "$SUDO_PASSWORD_FILE" \
+        --ssh-identity-file "$SSH_IDENTITY_FILE" \
         --final-exit-host "$exit_target" \
         --final-exit-node-id "$(node_id_for_label exit)" \
         --client-host "$client_target" \
@@ -3240,8 +3152,7 @@ PY
     else
       RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-        --ssh-password-file "$SSH_PASSWORD_FILE" \
-        --sudo-password-file "$SUDO_PASSWORD_FILE" \
+        --ssh-identity-file "$SSH_IDENTITY_FILE" \
         --final-exit-host "$exit_target" \
         --final-exit-node-id "$(node_id_for_label exit)" \
         --client-host "$client_target" \
@@ -3262,8 +3173,7 @@ PY
   if [[ "$client_return" == "fail" && -n "$extra_target" ]]; then
     RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --final-exit-host "$exit_target" \
       --final-exit-node-id "$(node_id_for_label exit)" \
       --client-host "$aux_target" \
@@ -3463,12 +3373,7 @@ refresh_failure_digest() {
 }
 
 cleanup_local_password_files() {
-  if [[ -n "$TEMP_SSH_PASSWORD_FILE" && -f "$TEMP_SSH_PASSWORD_FILE" ]]; then
-    rm -f "$TEMP_SSH_PASSWORD_FILE"
-  fi
-  if [[ -n "$TEMP_SUDO_PASSWORD_FILE" && -f "$TEMP_SUDO_PASSWORD_FILE" ]]; then
-    rm -f "$TEMP_SUDO_PASSWORD_FILE"
-  fi
+  return 0
 }
 
 orchestrator_cleanup() {
@@ -3488,8 +3393,9 @@ parse_args() {
       --entry-target) ENTRY_TARGET="$2"; shift 2 ;;
       --aux-target) AUX_TARGET="$2"; shift 2 ;;
       --extra-target) EXTRA_TARGET="$2"; shift 2 ;;
-      --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-      --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+      --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+      --ssh-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+      --sudo-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --ssh-known-hosts-file) SSH_KNOWN_HOSTS_FILE="$2"; shift 2 ;;
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
@@ -3589,15 +3495,9 @@ normalize_targets() {
 }
 
 ensure_password_inputs() {
-  local ssh_file sudo_file
-  ensure_password_file "$SSH_PASSWORD_FILE" 'SSH password' ssh_file
-  SSH_PASSWORD_FILE="$ssh_file"
-  if [[ -z "$SUDO_PASSWORD_FILE" ]]; then
-    SUDO_PASSWORD_FILE="$SSH_PASSWORD_FILE"
-  else
-    ensure_password_file "$SUDO_PASSWORD_FILE" 'sudo password' sudo_file
-    SUDO_PASSWORD_FILE="$sudo_file"
-  fi
+  local ssh_file
+  ensure_password_file "$SSH_IDENTITY_FILE" 'SSH private key path' ssh_file
+  SSH_IDENTITY_FILE="$ssh_file"
 }
 
 ensure_known_hosts_input() {
@@ -3637,14 +3537,7 @@ PY
 }
 
 remember_temp_password_files() {
-  if [[ "$SSH_PASSWORD_FILE" == ${TMPDIR:-/tmp}/rustynet-lab-pass.* || "$SSH_PASSWORD_FILE" == /tmp/rustynet-lab-pass.* ]]; then
-    TEMP_SSH_PASSWORD_FILE="$SSH_PASSWORD_FILE"
-  fi
-  if [[ "$SUDO_PASSWORD_FILE" == ${TMPDIR:-/tmp}/rustynet-lab-pass.* || "$SUDO_PASSWORD_FILE" == /tmp/rustynet-lab-pass.* ]]; then
-    if [[ "$SUDO_PASSWORD_FILE" != "$SSH_PASSWORD_FILE" ]]; then
-      TEMP_SUDO_PASSWORD_FILE="$SUDO_PASSWORD_FILE"
-    fi
-  fi
+  return 0
 }
 
 main() {
@@ -3694,7 +3587,7 @@ main() {
     exit 2
   fi
 
-  live_lab_init "rustynet-live-lab" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+  live_lab_init "rustynet-live-lab" "$SSH_IDENTITY_FILE"
   register_cleanup_targets
   trap orchestrator_cleanup EXIT
 
@@ -3852,7 +3745,7 @@ main() {
   if cross_network_stages_applicable; then
     local nat_profile nat_idx stage_suffix profile_report profile_log
     set +e
-    run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, signed artifact chain freshness, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
+    run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, cryptographic signed-state verification, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
     stage_rc=$?
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"

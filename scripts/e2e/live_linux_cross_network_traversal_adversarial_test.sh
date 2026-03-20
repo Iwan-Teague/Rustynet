@@ -5,8 +5,7 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 CLIENT_HOST=""
 EXIT_HOST=""
 PROBE_HOST=""
@@ -32,7 +31,7 @@ LOG_ARTIFACTS=()
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_cross_network_traversal_adversarial_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --probe-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
+usage: live_linux_cross_network_traversal_adversarial_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --probe-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
   --nat-profile <profile>
@@ -101,8 +100,7 @@ run_local_test() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --probe-host) PROBE_HOST="$2"; shift 2 ;;
@@ -118,7 +116,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$PROBE_HOST" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$PROBE_HOST" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
   exit 2
 fi
@@ -171,8 +169,7 @@ main() {
   FAILURE_SUMMARY="running live rogue-endpoint hijack denial test"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_endpoint_hijack_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --rogue-endpoint-ip "$ROGUE_ENDPOINT_IP" \
       --report-path "$endpoint_report" \
@@ -205,8 +202,7 @@ PY
   FAILURE_SUMMARY="running live control-surface exposure validation"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_control_surface_exposure_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --exit-host "$EXIT_HOST" \
       --client-host "$CLIENT_HOST" \
       --probe-host "$PROBE_HOST" \

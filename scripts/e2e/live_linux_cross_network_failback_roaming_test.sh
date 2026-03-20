@@ -10,8 +10,7 @@ source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
 LIVE_LAB_LOG_PREFIX="cross-network-failback-roaming"
 export LIVE_LAB_LOG_PREFIX
 
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 CLIENT_HOST=""
 EXIT_HOST=""
 RELAY_HOST=""
@@ -50,7 +49,7 @@ ROAM_PREFIX=""
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_cross_network_failback_roaming_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
+usage: live_linux_cross_network_failback_roaming_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
 
 options:
   --nat-profile <profile>
@@ -116,8 +115,7 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --relay-host) RELAY_HOST="$2"; shift 2 ;;
@@ -137,7 +135,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$RELAY_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$RELAY_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" || -z "$RELAY_NETWORK_ID" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$RELAY_HOST" || -z "$CLIENT_NODE_ID" || -z "$EXIT_NODE_ID" || -z "$RELAY_NODE_ID" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" || -z "$RELAY_NETWORK_ID" ]]; then
   usage >&2
   exit 2
 fi
@@ -178,8 +176,7 @@ main() {
 
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --exit-host "$EXIT_HOST" \
       --relay-host "$RELAY_HOST" \
@@ -226,7 +223,7 @@ PY
   fi
 
   FAILURE_SUMMARY="initializing failback and roaming live-lab runtime"
-  live_lab_init "rustynet-cross-network-failback-roaming" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+  live_lab_init "rustynet-cross-network-failback-roaming" "$SSH_IDENTITY_FILE"
   live_lab_push_sudo_password "$EXIT_HOST"
   live_lab_push_sudo_password "$RELAY_HOST"
   live_lab_push_sudo_password "$CLIENT_HOST"
@@ -341,7 +338,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-cross-network-roam-passphrase.XXXXXX)"
@@ -437,8 +434,7 @@ ISSUEEOF
   FAILURE_SUMMARY="validating narrow server-IP bypass and leak resistance after endpoint roam"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_server_ip_bypass_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --probe-host "$EXIT_HOST" \
       --probe-bind-ip "$ROAM_ALIAS_IP" \

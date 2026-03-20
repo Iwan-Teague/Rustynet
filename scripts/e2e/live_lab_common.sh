@@ -18,20 +18,38 @@ live_lab_require_file() {
 }
 
 live_lab_init() {
-  if [[ $# -ne 3 ]]; then
-    echo "usage: live_lab_init <prefix> <ssh-password-file> <sudo-password-file>" >&2
+  if [[ $# -lt 2 || $# -gt 3 ]]; then
+    echo "usage: live_lab_init <prefix> <ssh-identity-file> [deprecated-auth-file]" >&2
     exit 2
   fi
 
   local prefix="$1"
-  LIVE_LAB_SSH_PASSWORD_FILE="$2"
-  LIVE_LAB_SUDO_PASSWORD_FILE="$3"
-  export LIVE_LAB_SSH_PASSWORD_FILE LIVE_LAB_SUDO_PASSWORD_FILE
+  LIVE_LAB_SSH_IDENTITY_FILE="$2"
+  export LIVE_LAB_SSH_IDENTITY_FILE
 
-  live_lab_require_file "$LIVE_LAB_SSH_PASSWORD_FILE" "ssh password file"
-  live_lab_require_file "$LIVE_LAB_SUDO_PASSWORD_FILE" "sudo password file"
+  live_lab_require_file "$LIVE_LAB_SSH_IDENTITY_FILE" "ssh identity file"
+  if [[ -L "$LIVE_LAB_SSH_IDENTITY_FILE" ]]; then
+    echo "ssh identity file must not be a symlink: $LIVE_LAB_SSH_IDENTITY_FILE" >&2
+    exit 1
+  fi
+  if ! python3 - "$LIVE_LAB_SSH_IDENTITY_FILE" <<'PY'
+import os
+import stat
+import sys
 
-  for cmd in expect ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr python3; do
+path = sys.argv[1]
+st = os.stat(path, follow_symlinks=False)
+mode = stat.S_IMODE(st.st_mode)
+if mode & 0o077:
+    raise SystemExit(
+        f"ssh identity file must be owner-only (0400/0600): {path} ({mode:03o})"
+    )
+PY
+  then
+    exit 1
+  fi
+
+  for cmd in ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr python3; do
     live_lab_require_command "$cmd"
   done
 
@@ -41,124 +59,13 @@ live_lab_init() {
 
   LIVE_LAB_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")"
   LIVE_LAB_KNOWN_HOSTS="$LIVE_LAB_WORK_DIR/known_hosts"
-  LIVE_LAB_SSH_EXPECT="$LIVE_LAB_WORK_DIR/ssh_pass.expect"
-  LIVE_LAB_SCP_EXPECT="$LIVE_LAB_WORK_DIR/scp_pass.expect"
-  LIVE_LAB_SUDO_ASKPASS_LOCAL="$LIVE_LAB_WORK_DIR/sudo_askpass.sh"
   LIVE_LAB_REMOTE_CLEANUP_TARGETS=()
-  export LIVE_LAB_WORK_DIR LIVE_LAB_KNOWN_HOSTS LIVE_LAB_SSH_EXPECT LIVE_LAB_SCP_EXPECT LIVE_LAB_SUDO_ASKPASS_LOCAL
+  export LIVE_LAB_WORK_DIR LIVE_LAB_KNOWN_HOSTS
 
   live_lab_seed_known_hosts_file "$LIVE_LAB_KNOWN_HOSTS"
-
-  cat > "$LIVE_LAB_SSH_EXPECT" <<EXPECTSSH
-#!/usr/bin/expect -f
-if {\$argc < 3 || \$argc > 4} {
-  puts stderr "usage: ssh_pass.expect <password-file> <target> <command> ?timeout?"
-  exit 2
-}
-if {![info exists env(LIVE_LAB_KNOWN_HOSTS)] || \$env(LIVE_LAB_KNOWN_HOSTS) eq ""} {
-  puts stderr "LIVE_LAB_KNOWN_HOSTS is required"
-  exit 2
-}
-set password_file [lindex \$argv 0]
-set target [lindex \$argv 1]
-set command [lindex \$argv 2]
-set timeout 10800
-if {\$argc == 4} {
-  set timeout [lindex \$argv 3]
-}
-set fh [open \$password_file r]
-gets \$fh password
-close \$fh
-set output ""
-match_max 2000000
-log_user 0
-spawn ssh -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$target \$command
-while {1} {
-  expect {
-    -re {(?i)password:} { send -- "\$password\r"; exp_continue }
-    -re {.+} {
-      append output \$expect_out(buffer)
-      exp_continue
-    }
-    eof {
-      regsub -all "\r" \$output "" normalized
-      set cleaned ""
-      foreach line [split \$normalized "\n"] {
-        if {[string trim \$line] eq ""} {
-          continue
-        }
-        append cleaned \$line "\n"
-      }
-      puts -nonewline [string trimright \$cleaned "\n"]
-      catch wait result
-      exit [lindex \$result 3]
-    }
-  }
-}
-EXPECTSSH
-
-  cat > "$LIVE_LAB_SCP_EXPECT" <<EXPECTSCP
-#!/usr/bin/expect -f
-if {\$argc < 3 || \$argc > 4} {
-  puts stderr "usage: scp_pass.expect <password-file> <source> <target> ?timeout?"
-  exit 2
-}
-if {![info exists env(LIVE_LAB_KNOWN_HOSTS)] || \$env(LIVE_LAB_KNOWN_HOSTS) eq ""} {
-  puts stderr "LIVE_LAB_KNOWN_HOSTS is required"
-  exit 2
-}
-set password_file [lindex \$argv 0]
-set source [lindex \$argv 1]
-set target [lindex \$argv 2]
-set timeout 10800
-if {\$argc == 4} {
-  set timeout [lindex \$argv 3]
-}
-set fh [open \$password_file r]
-gets \$fh password
-close \$fh
-set output ""
-match_max 2000000
-log_user 0
-spawn scp -q -o LogLevel=ERROR -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\$env(LIVE_LAB_KNOWN_HOSTS) -o ConnectTimeout=15 -- \$source \$target
-while {1} {
-  expect {
-    -re {(?i)password:} { send -- "\$password\r"; exp_continue }
-    -re {.+} {
-      append output \$expect_out(buffer)
-      exp_continue
-    }
-    eof {
-      regsub -all "\r" \$output "" normalized
-      set cleaned ""
-      foreach line [split \$normalized "\n"] {
-        if {[string trim \$line] eq ""} {
-          continue
-        }
-        append cleaned \$line "\n"
-      }
-      puts -nonewline [string trimright \$cleaned "\n"]
-      catch wait result
-      exit [lindex \$result 3]
-    }
-  }
-}
-EXPECTSCP
-
-  chmod 700 "$LIVE_LAB_SSH_EXPECT" "$LIVE_LAB_SCP_EXPECT"
-
-  cat > "$LIVE_LAB_SUDO_ASKPASS_LOCAL" <<'EXPECTASKPASS'
-#!/usr/bin/env sh
-cat /tmp/rn_sudo.pass
-EXPECTASKPASS
-  chmod 700 "$LIVE_LAB_SUDO_ASKPASS_LOCAL"
 }
 
 live_lab_cleanup() {
-  local target
-  for target in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
-    live_lab_run_root "$target" "root rustynet ops secure-remove --path /tmp/rn_sudo.pass >/dev/null 2>&1 || true; root rm -f /tmp/rn_sudo_askpass.sh >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
-  done
   if [[ -n "${LIVE_LAB_WORK_DIR:-}" && -d "${LIVE_LAB_WORK_DIR}" ]]; then
     rm -rf "$LIVE_LAB_WORK_DIR"
   fi
@@ -246,8 +153,25 @@ live_lab_ssh() {
   local target="$1"
   local command="$2"
   local timeout="${3:-10800}"
+  local ssh_args=(
+    ssh
+    -o LogLevel=ERROR
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
+    -o ConnectTimeout=15
+    -o ServerAliveInterval=20
+    -o ServerAliveCountMax=3
+    -o IdentitiesOnly=yes
+    -i "$LIVE_LAB_SSH_IDENTITY_FILE"
+    -- "$target" "$command"
+  )
   live_lab_require_pinned_host_entry "$target"
-  "$LIVE_LAB_SSH_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "$target" "$command" "$timeout"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout" "${ssh_args[@]}"
+    return
+  fi
+  "${ssh_args[@]}"
 }
 
 live_lab_scp_to() {
@@ -255,8 +179,24 @@ live_lab_scp_to() {
   local target="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  local scp_args=(
+    scp
+    -q
+    -o LogLevel=ERROR
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
+    -o ConnectTimeout=15
+    -o IdentitiesOnly=yes
+    -i "$LIVE_LAB_SSH_IDENTITY_FILE"
+    -- "$src" "${target}:${dst}"
+  )
   live_lab_require_pinned_host_entry "$target"
-  "$LIVE_LAB_SCP_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "$src" "${target}:${dst}" "$timeout"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout" "${scp_args[@]}"
+    return
+  fi
+  "${scp_args[@]}"
 }
 
 live_lab_scp_from() {
@@ -264,8 +204,24 @@ live_lab_scp_from() {
   local src="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  local scp_args=(
+    scp
+    -q
+    -o LogLevel=ERROR
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
+    -o ConnectTimeout=15
+    -o IdentitiesOnly=yes
+    -i "$LIVE_LAB_SSH_IDENTITY_FILE"
+    -- "${target}:${src}" "$dst"
+  )
   live_lab_require_pinned_host_entry "$target"
-  "$LIVE_LAB_SCP_EXPECT" "$LIVE_LAB_SSH_PASSWORD_FILE" "${target}:${src}" "$dst" "$timeout"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout" "${scp_args[@]}"
+    return
+  fi
+  "${scp_args[@]}"
 }
 
 live_lab_capture() {
@@ -301,7 +257,7 @@ live_lab_capture() {
 
 live_lab_rootify() {
   local body="$1"
-  printf 'root(){ SUDO_ASKPASS=/tmp/rn_sudo_askpass.sh sudo -A -p "" "$@"; }; set -euo pipefail; %s' "$body"
+  printf 'root(){ sudo -n "$@"; }; set -euo pipefail; %s' "$body"
 }
 
 live_lab_verify_sudo() {
@@ -310,30 +266,20 @@ live_lab_verify_sudo() {
   local verify_cmd
   hostname_precheck_cmd="current_hostname=\$(hostname); if ! grep -Eq \"(^|[[:space:]])\${current_hostname}([[:space:]]|$)\" /etc/hosts; then printf 'local hostname %s is missing from /etc/hosts\\n' \"\$current_hostname\"; exit 1; fi"
   live_lab_ssh "$target" "$hostname_precheck_cmd" || return 1
-  verify_cmd="tmp_sudo_verify_output=\$(mktemp /tmp/rn-sudo-verify.XXXXXX) && if timeout 15 env SUDO_ASKPASS=/tmp/rn_sudo_askpass.sh sudo -A -p '' -k true >\"\$tmp_sudo_verify_output\" 2>&1; then rm -f \"\$tmp_sudo_verify_output\"; else cat \"\$tmp_sudo_verify_output\"; rm -f \"\$tmp_sudo_verify_output\"; printf 'sudo validation failed for user %s\\n' \"\$(id -un)\"; printf 'groups: %s\\n' \"\$(id -Gn)\"; exit 1; fi"
+  verify_cmd="if timeout 15 sudo -n -k true >/dev/null 2>&1; then :; else printf 'passwordless sudo (sudo -n) is required for live lab automation\\n'; printf 'user: %s\\n' \"\$(id -un)\"; printf 'groups: %s\\n' \"\$(id -Gn)\"; exit 1; fi"
   live_lab_ssh "$target" "$verify_cmd"
 }
 
 live_lab_push_sudo_password() {
   local target="$1"
   local existing
-  local cleanup_cmd
-  cleanup_cmd="rm -f /tmp/rn_sudo.pass /tmp/rn_sudo_askpass.sh >/dev/null 2>&1 || true; sudo -S -p 'password:' -k rm -f /tmp/rn_sudo.pass /tmp/rn_sudo_askpass.sh || true"
   for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
     if [[ "$existing" == "$target" ]]; then
-      live_lab_ssh "$target" "$cleanup_cmd" || return 1
-      live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
-      live_lab_scp_to "$LIVE_LAB_SUDO_ASKPASS_LOCAL" "$target" "/tmp/rn_sudo_askpass.sh" || return 1
-      live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass && chmod 700 /tmp/rn_sudo_askpass.sh" || return 1
       live_lab_verify_sudo "$target" || return 1
       return 0
     fi
   done
   LIVE_LAB_REMOTE_CLEANUP_TARGETS+=("$target")
-  live_lab_ssh "$target" "$cleanup_cmd" || return 1
-  live_lab_scp_to "$LIVE_LAB_SUDO_PASSWORD_FILE" "$target" "/tmp/rn_sudo.pass" || return 1
-  live_lab_scp_to "$LIVE_LAB_SUDO_ASKPASS_LOCAL" "$target" "/tmp/rn_sudo_askpass.sh" || return 1
-  live_lab_ssh "$target" "chmod 600 /tmp/rn_sudo.pass && chmod 700 /tmp/rn_sudo_askpass.sh" || return 1
   live_lab_verify_sudo "$target" || return 1
 }
 

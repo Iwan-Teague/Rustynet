@@ -17,8 +17,7 @@ EXIT_A_NODE_ID="exit-49"
 EXIT_B_NODE_ID="client-53"
 CLIENT_NODE_ID="client-65"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/live_linux_exit_handoff_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_exit_handoff.log"
 MONITOR_LOG="$ROOT_DIR/artifacts/phase10/source/live_linux_exit_handoff_monitor.log"
@@ -29,7 +28,7 @@ TRAVERSAL_REFRESH_INTERVAL_SECS=45
 
 usage() {
   cat <<USAGE
-usage: $0 --ssh-password-file <path> --sudo-password-file <path> [options]
+usage: $0 --ssh-identity-file <path> [options]
 
 options:
   --exit-a-host <user@host>
@@ -59,8 +58,7 @@ validate_positive_integer() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --exit-a-host) EXIT_A_HOST="$2"; shift 2 ;;
     --exit-b-host) EXIT_B_HOST="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
@@ -79,7 +77,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" ]]; then
   usage >&2
   exit 2
 fi
@@ -104,7 +102,7 @@ fi
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")" "$(dirname "$MONITOR_LOG")"
 exec > >(tee "$LOG_PATH") 2>&1
 
-live_lab_init "rustynet-exit-handoff" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-exit-handoff" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 live_lab_log "Traversal bundle TTL for handoff stage: ${TRAVERSAL_TTL_SECS}s (refresh every ${TRAVERSAL_REFRESH_INTERVAL_SECS}s)"
 
@@ -152,7 +150,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 PASS_FILE="$(mktemp /tmp/rn-handoff-passphrase.XXXXXX)"
@@ -204,7 +202,7 @@ fi
 source "$1"
 
 root() {
-  sudo -S -p '' "$@" < /tmp/rn_sudo.pass
+  sudo -n "$@"
 }
 
 if [[ ! "$TRAVERSAL_TTL_SECS" =~ ^[0-9]+$ ]] || (( TRAVERSAL_TTL_SECS <= 0 || TRAVERSAL_TTL_SECS > 120 )); then

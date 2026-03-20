@@ -16,8 +16,7 @@ ENTRY_HOST=""
 AUX_HOST=""
 EXTRA_HOST=""
 PROBE_HOST=""
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 DNS_BIND_ADDR="127.0.0.1:53535"
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/live_linux_control_surface_exposure_report.json"
 LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_control_surface_exposure.log"
@@ -27,7 +26,7 @@ declare -a HOST_TARGETS=()
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_control_surface_exposure_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> [options]
+usage: live_linux_control_surface_exposure_test.sh --ssh-identity-file <path> --client-host <user@host> [options]
 
 options:
   --exit-host <user@host>
@@ -53,8 +52,7 @@ append_host() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --entry-host) ENTRY_HOST="$2"; shift 2 ;;
@@ -69,7 +67,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" ]]; then
   usage >&2
   exit 2
 fi
@@ -101,7 +99,7 @@ mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
 exec >> "$LOG_PATH" 2>&1
 
-live_lab_init "rustynet-control-surface" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-control-surface" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 
 QUERY_SCRIPT="$LIVE_LAB_WORK_DIR/rn-dns-query-timeout.py"

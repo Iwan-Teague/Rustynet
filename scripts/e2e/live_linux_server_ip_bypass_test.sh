@@ -13,8 +13,7 @@ export LIVE_LAB_LOG_PREFIX
 CLIENT_HOST=""
 PROBE_HOST=""
 PROBE_BIND_IP=""
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 PROBE_PORT="18080"
 REPORT_PATH="$ROOT_DIR/artifacts/phase10/live_linux_server_ip_bypass_report.json"
@@ -22,7 +21,7 @@ LOG_PATH="$ROOT_DIR/artifacts/phase10/source/live_linux_server_ip_bypass.log"
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_server_ip_bypass_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --probe-host <user@host> [options]
+usage: live_linux_server_ip_bypass_test.sh --ssh-identity-file <path> --client-host <user@host> --probe-host <user@host> [options]
 
 options:
   --client-host <user@host>
@@ -37,8 +36,7 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --probe-host) PROBE_HOST="$2"; shift 2 ;;
     --probe-bind-ip) PROBE_BIND_IP="$2"; shift 2 ;;
@@ -51,7 +49,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$PROBE_HOST" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$PROBE_HOST" ]]; then
   usage >&2
   exit 2
 fi
@@ -65,7 +63,7 @@ mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
 exec >> "$LOG_PATH" 2>&1
 
-live_lab_init "rustynet-server-ip-bypass" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+live_lab_init "rustynet-server-ip-bypass" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 
 SERVER_SCRIPT="$LIVE_LAB_WORK_DIR/rn-underlay-http-server.py"

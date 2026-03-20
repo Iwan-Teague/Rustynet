@@ -206,8 +206,9 @@ Current behavior:
   - verifies host clocks stay within a strict skew bound before cross-network validators run
   - verifies required binaries/services and daemon socket readiness on each host
   - verifies each host has a global IPv4 address, default IPv4 route, and local hostname resolution
-  - verifies hardened runtime posture (`bootstrap_error=none`, encrypted key store enabled, auto-tunnel enforcement enabled, traversal authority enforced, no plaintext passphrase files)
-  - verifies signed assignment/traversal/trust/dns artifact chain custody and freshness on every host before cross-network mutation stages
+  - verifies no plaintext passphrase files are present on each host
+  - verifies signed assignment/traversal/trust runtime state with first-class `rustynet assignment|traversal|trust verify` cryptographic commands (signature, freshness, watermark replay/rollback checks)
+  - verifies signed DNS-zone bundles with `rustynet dns zone verify` before cross-network mutation stages
   - generates one discovery bundle per host and validates it with strict schema/secret/custody checks before any cross-network validator executes
 - `cross_network_direct_remote_exit`
   - runs a real validator that provisions a two-node direct remote-exit path using signed assignments, verifies full-tunnel routing, and reuses the server-IP bypass validator to prove leak resistance and narrow bypass scope
@@ -317,8 +318,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
   --ssh-known-hosts-file ~/.ssh/known_hosts \
-  --ssh-password-file /tmp/rustynet_ssh.pass \
-  --sudo-password-file /tmp/rustynet_sudo.pass
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
 ```
 
 Dry-run validation only:
@@ -331,8 +331,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   --aux-target fedora@192.168.18.51 \
   --extra-target mint@192.168.18.53 \
   --ssh-known-hosts-file ~/.ssh/known_hosts \
-  --ssh-password-file /tmp/rustynet_ssh.pass \
-  --sudo-password-file /tmp/rustynet_sudo.pass \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --skip-gates \
   --skip-soak \
   --dry-run
@@ -343,7 +342,11 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
 - `--profile <path>`
   - loads a saved `.env`-style lab profile
   - CLI flags still win if both are provided
-  - passwords are best kept out of the profile and provided via secure files or prompt
+  - do not store private-key paths for shared operator environments unless you control profile file permissions
+- `--ssh-identity-file <path>`
+  - required for non-interactive runs
+  - must be a regular file with owner-only permissions (`0400` or `0600`)
+  - password-based SSH/sudo transport is intentionally removed from active execution paths
 - `--ssh-known-hosts-file <path>`
   - supplies the pinned SSH host-key file used for all worker SSH/SCP sessions
   - defaults to `~/.ssh/known_hosts` if it exists

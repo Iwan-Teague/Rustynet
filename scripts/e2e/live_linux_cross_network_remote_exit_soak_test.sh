@@ -10,8 +10,7 @@ source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
 LIVE_LAB_LOG_PREFIX="cross-network-remote-exit-soak"
 export LIVE_LAB_LOG_PREFIX
 
-SSH_PASSWORD_FILE=""
-SUDO_PASSWORD_FILE=""
+SSH_IDENTITY_FILE=""
 CLIENT_HOST=""
 EXIT_HOST=""
 CLIENT_NODE_ID="client-1"
@@ -51,7 +50,7 @@ WORK_DIR=""
 
 usage() {
   cat <<'USAGE'
-usage: live_linux_cross_network_remote_exit_soak_test.sh --ssh-password-file <path> --sudo-password-file <path> --client-host <user@host> --exit-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
+usage: live_linux_cross_network_remote_exit_soak_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
   --client-node-id <id>                Default: client-1
@@ -131,8 +130,7 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ssh-password-file) SSH_PASSWORD_FILE="$2"; shift 2 ;;
-    --sudo-password-file) SUDO_PASSWORD_FILE="$2"; shift 2 ;;
+    --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-node-id) CLIENT_NODE_ID="$2"; shift 2 ;;
@@ -153,7 +151,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$SSH_PASSWORD_FILE" || -z "$SUDO_PASSWORD_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
+if [[ -z "$SSH_IDENTITY_FILE" || -z "$CLIENT_HOST" || -z "$EXIT_HOST" || -z "$CLIENT_NETWORK_ID" || -z "$EXIT_NETWORK_ID" ]]; then
   usage >&2
   exit 2
 fi
@@ -214,8 +212,7 @@ main() {
   FAILURE_SUMMARY="bootstrapping secure direct remote-exit baseline for soak validation"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --exit-host "$EXIT_HOST" \
       --client-node-id "$CLIENT_NODE_ID" \
@@ -287,7 +284,7 @@ PY
   fi
 
   FAILURE_SUMMARY="initializing live runtime monitor for cross-network soak"
-  live_lab_init "rustynet-cross-network-remote-exit-soak" "$SSH_PASSWORD_FILE" "$SUDO_PASSWORD_FILE"
+  live_lab_init "rustynet-cross-network-remote-exit-soak" "$SSH_IDENTITY_FILE"
   live_lab_push_sudo_password "$EXIT_HOST"
   live_lab_push_sudo_password "$CLIENT_HOST"
   live_lab_wait_for_daemon_socket "$EXIT_HOST"
@@ -379,8 +376,7 @@ PY
   FAILURE_SUMMARY="running post-soak leak and bypass verification"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
     bash "$ROOT_DIR/scripts/e2e/live_linux_server_ip_bypass_test.sh" \
-      --ssh-password-file "$SSH_PASSWORD_FILE" \
-      --sudo-password-file "$SUDO_PASSWORD_FILE" \
+      --ssh-identity-file "$SSH_IDENTITY_FILE" \
       --client-host "$CLIENT_HOST" \
       --probe-host "$EXIT_HOST" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
