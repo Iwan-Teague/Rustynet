@@ -3161,6 +3161,7 @@ const DEFAULT_MACOS_LAUNCHD_HELPER_LABEL: &str = "com.rustynet.rustynetd-privile
 const DEFAULT_MACOS_LAUNCHD_HELPER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.rustynet.rustynetd-privileged.plist";
 const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
+const MACOS_RUNTIME_SOCKET_WAIT_SECS: u64 = 5;
 const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
@@ -3255,33 +3256,37 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
 
 fn execute_ops_restart_runtime_service() -> Result<String, String> {
     require_root_execution()?;
-    if !cfg!(target_os = "linux") {
-        return Err("restart-runtime-service is supported on Linux only".to_string());
-    }
+    if cfg!(target_os = "linux") {
+        let restart_output =
+            run_command_capture("systemctl", &["restart", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
+        if !restart_output.status.success() {
+            return Err(format!(
+                "restart {} failed: {}",
+                DEFAULT_RUNTIME_SYSTEMD_SERVICE,
+                command_failure_detail(&restart_output)
+            ));
+        }
 
-    let restart_output =
-        run_command_capture("systemctl", &["restart", DEFAULT_RUNTIME_SYSTEMD_SERVICE])?;
-    if !restart_output.status.success() {
-        return Err(format!(
-            "restart {} failed: {}",
-            DEFAULT_RUNTIME_SYSTEMD_SERVICE,
-            command_failure_detail(&restart_output)
+        let active_output = run_command_capture(
+            "systemctl",
+            &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
+        )?;
+        if !active_output.status.success() {
+            return Err(format!(
+                "runtime service is not active after restart: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
+            ));
+        }
+
+        return Ok(format!(
+            "runtime service restarted: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
         ));
     }
 
-    let active_output = run_command_capture(
-        "systemctl",
-        &["is-active", "--quiet", DEFAULT_RUNTIME_SYSTEMD_SERVICE],
-    )?;
-    if !active_output.status.success() {
-        return Err(format!(
-            "runtime service is not active after restart: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
-        ));
+    if cfg!(target_os = "macos") {
+        return execute_ops_restart_runtime_service_macos();
     }
 
-    Ok(format!(
-        "runtime service restarted: {DEFAULT_RUNTIME_SYSTEMD_SERVICE}"
-    ))
+    Err("restart-runtime-service is supported on Linux and macOS only".to_string())
 }
 
 fn execute_ops_stop_runtime_service() -> Result<String, String> {
@@ -3839,6 +3844,744 @@ struct MacosRuntimeServiceContext {
     helper_plist_path: PathBuf,
     daemon_socket_path: PathBuf,
     helper_socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosLaunchdRestartConfig {
+    service: MacosRuntimeServiceContext,
+    daemon_gid: u32,
+    runtime_base: PathBuf,
+    log_base: PathBuf,
+    daemon_log_path: PathBuf,
+    helper_log_path: PathBuf,
+    helper_program_arguments: Vec<String>,
+    daemon_program_arguments: Vec<String>,
+    helper_environment: Vec<(String, String)>,
+    daemon_environment: Vec<(String, String)>,
+}
+
+fn execute_ops_restart_runtime_service_macos() -> Result<String, String> {
+    let config = macos_launchd_restart_config_from_env()?;
+    let daemon_uid = Uid::from_raw(config.service.daemon_uid);
+    let daemon_gid = Gid::from_raw(config.daemon_gid);
+
+    ensure_directory_with_mode_owner(
+        config.runtime_base.as_path(),
+        0o700,
+        Some(daemon_uid),
+        Some(daemon_gid),
+    )?;
+    ensure_directory_with_mode_owner(
+        config.log_base.as_path(),
+        0o700,
+        Some(daemon_uid),
+        Some(daemon_gid),
+    )?;
+
+    let daemon_plist_parent = config
+        .service
+        .daemon_plist_path
+        .parent()
+        .ok_or_else(|| {
+            format!(
+                "daemon launchd plist path has no parent: {}",
+                config.service.daemon_plist_path.display()
+            )
+        })?
+        .to_path_buf();
+    ensure_directory_with_mode_owner(
+        daemon_plist_parent.as_path(),
+        0o700,
+        Some(daemon_uid),
+        Some(daemon_gid),
+    )?;
+
+    ensure_directory_with_mode_owner(
+        Path::new("/Library/LaunchDaemons"),
+        0o755,
+        Some(Uid::from_raw(0)),
+        Some(Gid::from_raw(0)),
+    )?;
+
+    let helper_group = Group::from_name("wheel")
+        .map_err(|err| format!("resolve group wheel failed: {err}"))?
+        .map(|group| group.gid)
+        .unwrap_or_else(|| Gid::from_raw(0));
+
+    write_launchd_plist(
+        config.service.helper_plist_path.as_path(),
+        build_helper_launchd_plist(&config).as_str(),
+        Uid::from_raw(0),
+        helper_group,
+        "macOS privileged helper launchd plist",
+    )?;
+    write_launchd_plist(
+        config.service.daemon_plist_path.as_path(),
+        build_daemon_launchd_plist(&config).as_str(),
+        daemon_uid,
+        daemon_gid,
+        "macOS daemon launchd plist",
+    )?;
+
+    launchctl_bootout_unit(
+        "system",
+        config.service.helper_label.as_str(),
+        config.service.helper_plist_path.as_path(),
+    )?;
+    launchctl_bootout_unit(
+        config.service.daemon_domain.as_str(),
+        config.service.daemon_label.as_str(),
+        config.service.daemon_plist_path.as_path(),
+    )?;
+
+    run_launchctl_action(
+        &[
+            "bootstrap",
+            "system",
+            config.service.helper_plist_path.to_string_lossy().as_ref(),
+        ],
+        "launchd helper bootstrap",
+    )?;
+    run_launchctl_action(
+        &["kickstart", "-k", config.service.helper_target.as_str()],
+        "launchd helper kickstart",
+    )?;
+    run_launchctl_action(
+        &[
+            "bootstrap",
+            config.service.daemon_domain.as_str(),
+            config.service.daemon_plist_path.to_string_lossy().as_ref(),
+        ],
+        "launchd daemon bootstrap",
+    )?;
+    run_launchctl_action(
+        &["kickstart", "-k", config.service.daemon_target.as_str()],
+        "launchd daemon kickstart",
+    )?;
+
+    wait_for_unix_socket(
+        config.service.helper_socket_path.as_path(),
+        "privileged helper socket",
+        Duration::from_secs(MACOS_RUNTIME_SOCKET_WAIT_SECS),
+    )?;
+    wait_for_unix_socket(
+        config.service.daemon_socket_path.as_path(),
+        "daemon socket",
+        Duration::from_secs(MACOS_RUNTIME_SOCKET_WAIT_SECS),
+    )
+    .map_err(|err| {
+        let tail =
+            tail_utf8_lines(config.daemon_log_path.as_path(), 40).unwrap_or_else(|_| String::new());
+        if tail.is_empty() {
+            err
+        } else {
+            format!("{err}; recent daemon log:\n{tail}")
+        }
+    })?;
+
+    Ok(format!(
+        "runtime service restarted: host=macos daemon_target={} helper_target={} daemon_socket={} helper_socket={}",
+        config.service.daemon_target,
+        config.service.helper_target,
+        config.service.daemon_socket_path.display(),
+        config.service.helper_socket_path.display()
+    ))
+}
+
+fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, String> {
+    let service = macos_runtime_service_context_from_env()?;
+    let daemon_gid = macos_daemon_gid_from_env(service.daemon_uid)?;
+
+    let runtime_base = env_required_path("RUSTYNET_MACOS_RUNTIME_BASE")?;
+    let log_base = env_required_path("RUSTYNET_MACOS_LOG_BASE")?;
+    let daemon_log_path = env_required_path("RUSTYNET_MACOS_DAEMON_LOG_PATH")?;
+    let helper_log_path = env_required_path("RUSTYNET_MACOS_HELPER_LOG_PATH")?;
+    if !daemon_log_path.starts_with(log_base.as_path()) {
+        return Err(format!(
+            "daemon log path must remain under log base: {}",
+            daemon_log_path.display()
+        ));
+    }
+    if !helper_log_path.starts_with(log_base.as_path()) {
+        return Err(format!(
+            "helper log path must remain under log base: {}",
+            helper_log_path.display()
+        ));
+    }
+
+    let daemon_binary_path =
+        binary_path_from_env_or_command("RUSTYNET_DAEMON_BINARY_PATH", "rustynetd", "rustynetd")?;
+    let wg_binary_path = binary_path_from_env_or_command("RUSTYNET_WG_BINARY_PATH", "wg", "wg")?;
+    let wireguard_go_binary_path = binary_path_from_env_or_command(
+        "RUSTYNET_WIREGUARD_GO_BINARY_PATH",
+        "wireguard-go",
+        "wireguard-go",
+    )?;
+    let ifconfig_binary_path =
+        binary_path_from_env_or_command("RUSTYNET_IFCONFIG_BINARY_PATH", "ifconfig", "ifconfig")?;
+    let route_binary_path =
+        binary_path_from_env_or_command("RUSTYNET_ROUTE_BINARY_PATH", "route", "route")?;
+    let pfctl_binary_path =
+        binary_path_from_env_or_command("RUSTYNET_PFCTL_BINARY_PATH", "pfctl", "pfctl")?;
+    let kill_binary_path =
+        binary_path_from_env_or_command("RUSTYNET_KILL_BINARY_PATH", "kill", "kill")?;
+
+    let keychain_account = required_macos_tunnel_keychain_account(
+        env_string_or_default("RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT", "")?.as_str(),
+    )?;
+    let keychain_service = env_required_nonempty(
+        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE",
+        "macOS tunnel keychain service",
+    )?;
+    if keychain_service.trim().is_empty() {
+        return Err("macOS tunnel keychain service must not be empty".to_string());
+    }
+
+    let wg_passphrase_path = env_required_path("RUSTYNET_WG_KEY_PASSPHRASE")?;
+    validate_macos_wg_passphrase_placeholder_path(wg_passphrase_path.as_path())?;
+
+    let helper_timeout_ms =
+        parse_env_u64_with_default("RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS", 2000)?;
+
+    let auto_tunnel_enforce = parse_bool_value(
+        "RUSTYNET_AUTO_TUNNEL_ENFORCE",
+        env_string_or_default("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false")?.as_str(),
+    )?;
+    let fail_closed_ssh_allow = parse_bool_value(
+        "RUSTYNET_FAIL_CLOSED_SSH_ALLOW",
+        env_string_or_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "false")?.as_str(),
+    )?;
+    let wg_interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
+        .trim()
+        .to_string();
+    validate_managed_dns_interface_name(wg_interface.as_str())?;
+    let wg_listen_port = env_string_or_default("RUSTYNET_WG_LISTEN_PORT", "51820")?
+        .parse::<u16>()
+        .map_err(|err| format!("invalid wireguard listen port: {err}"))?;
+    if wg_listen_port == 0 {
+        return Err("wireguard listen port must be between 1 and 65535".to_string());
+    }
+
+    let helper_program_arguments = vec![
+        daemon_binary_path.display().to_string(),
+        "privileged-helper".to_string(),
+        "--socket".to_string(),
+        service.helper_socket_path.display().to_string(),
+        "--allowed-uid".to_string(),
+        service.daemon_uid.to_string(),
+        "--allowed-gid".to_string(),
+        daemon_gid.to_string(),
+        "--timeout-ms".to_string(),
+        helper_timeout_ms.to_string(),
+    ];
+
+    let daemon_program_arguments = vec![
+        daemon_binary_path.display().to_string(),
+        "daemon".to_string(),
+        "--node-id".to_string(),
+        env_required_nonempty("RUSTYNET_NODE_ID", "node id")?,
+        "--node-role".to_string(),
+        env_required_nonempty("RUSTYNET_NODE_ROLE", "node role")?,
+        "--socket".to_string(),
+        service.daemon_socket_path.display().to_string(),
+        "--state".to_string(),
+        env_required_path("RUSTYNET_STATE")?.display().to_string(),
+        "--trust-evidence".to_string(),
+        env_required_path("RUSTYNET_TRUST_EVIDENCE")?
+            .display()
+            .to_string(),
+        "--trust-verifier-key".to_string(),
+        env_required_path("RUSTYNET_TRUST_VERIFIER_KEY")?
+            .display()
+            .to_string(),
+        "--trust-watermark".to_string(),
+        env_required_path("RUSTYNET_TRUST_WATERMARK")?
+            .display()
+            .to_string(),
+        "--membership-snapshot".to_string(),
+        env_required_path("RUSTYNET_MEMBERSHIP_SNAPSHOT")?
+            .display()
+            .to_string(),
+        "--membership-log".to_string(),
+        env_required_path("RUSTYNET_MEMBERSHIP_LOG")?
+            .display()
+            .to_string(),
+        "--membership-watermark".to_string(),
+        env_required_path("RUSTYNET_MEMBERSHIP_WATERMARK")?
+            .display()
+            .to_string(),
+        "--auto-tunnel-enforce".to_string(),
+        if auto_tunnel_enforce {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+        "--auto-tunnel-bundle".to_string(),
+        env_required_path("RUSTYNET_AUTO_TUNNEL_BUNDLE")?
+            .display()
+            .to_string(),
+        "--auto-tunnel-verifier-key".to_string(),
+        env_required_path("RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY")?
+            .display()
+            .to_string(),
+        "--auto-tunnel-watermark".to_string(),
+        env_required_path("RUSTYNET_AUTO_TUNNEL_WATERMARK")?
+            .display()
+            .to_string(),
+        "--auto-tunnel-max-age-secs".to_string(),
+        parse_env_u64_with_default(
+            "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS",
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+        )?
+        .to_string(),
+        "--traversal-bundle".to_string(),
+        env_required_path("RUSTYNET_TRAVERSAL_BUNDLE")?
+            .display()
+            .to_string(),
+        "--traversal-verifier-key".to_string(),
+        env_required_path("RUSTYNET_TRAVERSAL_VERIFIER_KEY")?
+            .display()
+            .to_string(),
+        "--traversal-watermark".to_string(),
+        env_required_path("RUSTYNET_TRAVERSAL_WATERMARK")?
+            .display()
+            .to_string(),
+        "--traversal-max-age-secs".to_string(),
+        parse_env_u64_with_default(
+            "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+        )?
+        .to_string(),
+        "--backend".to_string(),
+        env_required_nonempty("RUSTYNET_BACKEND", "backend mode")?,
+        "--wg-interface".to_string(),
+        wg_interface,
+        "--wg-listen-port".to_string(),
+        wg_listen_port.to_string(),
+        "--wg-private-key".to_string(),
+        env_required_path("RUSTYNET_WG_PRIVATE_KEY")?
+            .display()
+            .to_string(),
+        "--wg-encrypted-private-key".to_string(),
+        env_required_path("RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY")?
+            .display()
+            .to_string(),
+        "--wg-key-passphrase".to_string(),
+        wg_passphrase_path.display().to_string(),
+        "--wg-public-key".to_string(),
+        env_required_path("RUSTYNET_WG_PUBLIC_KEY")?
+            .display()
+            .to_string(),
+        "--egress-interface".to_string(),
+        env_string_or_default("RUSTYNET_EGRESS_INTERFACE", "")?,
+        "--dataplane-mode".to_string(),
+        env_required_nonempty("RUSTYNET_DATAPLANE_MODE", "dataplane mode")?,
+        "--privileged-helper-socket".to_string(),
+        service.helper_socket_path.display().to_string(),
+        "--privileged-helper-timeout-ms".to_string(),
+        helper_timeout_ms.to_string(),
+        "--reconcile-interval-ms".to_string(),
+        parse_env_u64_with_default("RUSTYNET_RECONCILE_INTERVAL_MS", 1000)?.to_string(),
+        "--max-reconcile-failures".to_string(),
+        parse_env_u64_with_default("RUSTYNET_MAX_RECONCILE_FAILURES", 5)?.to_string(),
+        "--fail-closed-ssh-allow".to_string(),
+        if fail_closed_ssh_allow {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+        "--fail-closed-ssh-allow-cidrs".to_string(),
+        env_string_or_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS", "")?,
+    ];
+
+    let helper_environment = vec![
+        (
+            "RUSTYNET_WG_BINARY_PATH".to_string(),
+            wg_binary_path.display().to_string(),
+        ),
+        (
+            "RUSTYNET_WIREGUARD_GO_BINARY_PATH".to_string(),
+            wireguard_go_binary_path.display().to_string(),
+        ),
+        (
+            "RUSTYNET_IFCONFIG_BINARY_PATH".to_string(),
+            ifconfig_binary_path.display().to_string(),
+        ),
+        (
+            "RUSTYNET_ROUTE_BINARY_PATH".to_string(),
+            route_binary_path.display().to_string(),
+        ),
+        (
+            "RUSTYNET_PFCTL_BINARY_PATH".to_string(),
+            pfctl_binary_path.display().to_string(),
+        ),
+        (
+            "RUSTYNET_KILL_BINARY_PATH".to_string(),
+            kill_binary_path.display().to_string(),
+        ),
+    ];
+
+    let mut daemon_environment = helper_environment.clone();
+    daemon_environment.push((
+        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT".to_string(),
+        keychain_account,
+    ));
+    daemon_environment.push((
+        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE".to_string(),
+        keychain_service,
+    ));
+    daemon_environment.push((
+        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH".to_string(),
+        wg_passphrase_path.display().to_string(),
+    ));
+
+    Ok(MacosLaunchdRestartConfig {
+        service,
+        daemon_gid,
+        runtime_base,
+        log_base,
+        daemon_log_path,
+        helper_log_path,
+        helper_program_arguments,
+        daemon_program_arguments,
+        helper_environment,
+        daemon_environment,
+    })
+}
+
+fn macos_daemon_gid_from_env(daemon_uid: u32) -> Result<u32, String> {
+    if let Some(raw) = env_optional_string("RUSTYNET_MACOS_DAEMON_GID")? {
+        return raw
+            .parse::<u32>()
+            .map_err(|err| format!("invalid daemon gid value '{raw}': {err}"));
+    }
+    if let Some(raw) = env_optional_string("SUDO_GID")? {
+        return raw
+            .parse::<u32>()
+            .map_err(|err| format!("invalid sudo gid value '{raw}': {err}"));
+    }
+    let user = User::from_uid(Uid::from_raw(daemon_uid))
+        .map_err(|err| format!("resolve daemon uid {daemon_uid} failed: {err}"))?
+        .ok_or_else(|| format!("daemon uid {daemon_uid} does not exist"))?;
+    Ok(user.gid.as_raw())
+}
+
+fn binary_path_from_env_or_command(
+    env_key: &str,
+    command_name: &str,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let path = if let Some(raw) = env_optional_string(env_key)? {
+        let candidate = PathBuf::from(raw);
+        if !candidate.is_absolute() {
+            return Err(format!(
+                "{label} binary path must be absolute: {}",
+                candidate.display()
+            ));
+        }
+        candidate
+    } else {
+        resolve_absolute_command_path(command_name)?
+    };
+    validate_root_owned_executable_path(path.as_path(), label)?;
+    Ok(path)
+}
+
+fn resolve_absolute_command_path(command_name: &str) -> Result<PathBuf, String> {
+    if command_name.trim().is_empty() {
+        return Err("command name must not be empty".to_string());
+    }
+    if command_name.contains('/') {
+        let path = PathBuf::from(command_name);
+        if !path.is_absolute() {
+            return Err(format!("command path must be absolute: {}", path.display()));
+        }
+        return Ok(path);
+    }
+    let path_env = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_string())?;
+    for base in std::env::split_paths(path_env.as_os_str()) {
+        let candidate = base.join(command_name);
+        if let Ok(metadata) = fs::metadata(candidate.as_path()) {
+            if metadata.is_file() && (metadata.mode() & 0o111) != 0 {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!(
+        "unable to resolve absolute path for command: {command_name}"
+    ))
+}
+
+fn validate_root_owned_executable_path(path: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{label} binary path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("inspect {label} binary failed ({}): {err}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} binary path must reference a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "{label} binary must be root-owned for privileged runtime safety: {}",
+            path.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    if (mode & 0o022) != 0 {
+        return Err(format!(
+            "{label} binary permissions too broad ({mode:03o}); group/other write is not allowed: {}",
+            path.display()
+        ));
+    }
+    if (mode & 0o111) == 0 {
+        return Err(format!(
+            "{label} binary must be executable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_macos_wg_passphrase_placeholder_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "macOS passphrase placeholder path must be absolute: {}",
+            path.display()
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "persistent passphrase placeholder path must not be a symlink: {}",
+                    path.display()
+                ));
+            }
+            if metadata.file_type().is_file() {
+                return Err(format!(
+                    "persistent plaintext passphrase file is not allowed on macOS: {}",
+                    path.display()
+                ));
+            }
+            return Err(format!(
+                "passphrase placeholder path is occupied and cannot be used: {}",
+                path.display()
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect macOS passphrase placeholder path failed ({}): {err}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_helper_launchd_plist(config: &MacosLaunchdRestartConfig) -> String {
+    render_launchd_plist(
+        config.service.helper_label.as_str(),
+        config.helper_program_arguments.as_slice(),
+        config.helper_environment.as_slice(),
+        config.helper_log_path.as_path(),
+        config.helper_log_path.as_path(),
+    )
+}
+
+fn build_daemon_launchd_plist(config: &MacosLaunchdRestartConfig) -> String {
+    render_launchd_plist(
+        config.service.daemon_label.as_str(),
+        config.daemon_program_arguments.as_slice(),
+        config.daemon_environment.as_slice(),
+        config.daemon_log_path.as_path(),
+        config.daemon_log_path.as_path(),
+    )
+}
+
+fn render_launchd_plist(
+    label: &str,
+    program_arguments: &[String],
+    environment: &[(String, String)],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> String {
+    let program_args_xml = render_launchd_string_array(program_arguments, "    ");
+    let environment_xml = render_launchd_environment_dict(environment, "  ");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+  <key>Label</key>\n\
+  <string>{}</string>\n\
+  <key>ProgramArguments</key>\n\
+  <array>\n\
+{}\n\
+  </array>\n\
+{}\n\
+  <key>RunAtLoad</key>\n\
+  <true/>\n\
+  <key>KeepAlive</key>\n\
+  <true/>\n\
+  <key>StandardOutPath</key>\n\
+  <string>{}</string>\n\
+  <key>StandardErrorPath</key>\n\
+  <string>{}</string>\n\
+</dict>\n\
+</plist>\n",
+        launchd_xml_escape(label),
+        program_args_xml,
+        environment_xml,
+        launchd_xml_escape(stdout_path.to_string_lossy().as_ref()),
+        launchd_xml_escape(stderr_path.to_string_lossy().as_ref()),
+    )
+}
+
+fn render_launchd_string_array(values: &[String], indent: &str) -> String {
+    values
+        .iter()
+        .map(|value| {
+            format!(
+                "{indent}<string>{}</string>",
+                launchd_xml_escape(value.as_str())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_launchd_environment_dict(values: &[(String, String)], indent: &str) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let child_indent = format!("{indent}  ");
+    let mut rows = Vec::new();
+    rows.push(format!("{indent}<key>EnvironmentVariables</key>"));
+    rows.push(format!("{indent}<dict>"));
+    for (key, value) in values {
+        rows.push(format!(
+            "{child_indent}<key>{}</key>",
+            launchd_xml_escape(key.as_str())
+        ));
+        rows.push(format!(
+            "{child_indent}<string>{}</string>",
+            launchd_xml_escape(value.as_str())
+        ));
+    }
+    rows.push(format!("{indent}</dict>"));
+    rows.join("\n")
+}
+
+fn launchd_xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_launchd_plist(
+    destination_path: &Path,
+    body: &str,
+    owner: Uid,
+    group: Gid,
+    label: &str,
+) -> Result<(), String> {
+    let parent = destination_path.parent().ok_or_else(|| {
+        format!(
+            "{label} destination path has no parent directory: {}",
+            destination_path.display()
+        )
+    })?;
+    if let Ok(parent_metadata) = fs::symlink_metadata(parent)
+        && parent_metadata.file_type().is_symlink()
+    {
+        return Err(format!(
+            "{label} destination parent must not be a symlink: {}",
+            parent.display()
+        ));
+    }
+
+    let temp_path = create_secure_temp_file(parent, "rustynet.ops.launchd.")?;
+    if let Err(err) = write_private_bytes_to_file(temp_path.as_path(), body.as_bytes()) {
+        let _ = remove_file_if_present(temp_path.as_path());
+        return Err(err);
+    }
+    if let Err(err) = publish_file_with_owner_mode(
+        temp_path.as_path(),
+        destination_path,
+        owner,
+        group,
+        0o644,
+        label,
+    ) {
+        let _ = remove_file_if_present(temp_path.as_path());
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn run_launchctl_action(args: &[&str], label: &str) -> Result<(), String> {
+    let output = run_command_capture("launchctl", args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} failed: {}",
+        label,
+        command_failure_detail(&output)
+    ))
+}
+
+fn wait_for_unix_socket(path: &Path, label: &str, timeout: Duration) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!("{label} must not be a symlink: {}", path.display()));
+                }
+                if metadata.file_type().is_socket() {
+                    return Ok(());
+                }
+                return Err(format!("{label} must be a unix socket: {}", path.display()));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "inspect {label} failed ({}): {err}",
+                    path.display()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {label}: {}", path.display()));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn tail_utf8_lines(path: &Path, max_lines: usize) -> Result<String, String> {
+    if max_lines == 0 {
+        return Ok(String::new());
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read daemon log failed ({}): {err}", path.display()))?;
+    let lines = body.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines[start..].join("\n"))
 }
 
 fn execute_ops_stop_runtime_service_macos() -> Result<String, String> {
@@ -7575,10 +8318,11 @@ fn help_text() -> String {
 mod tests {
     use super::{
         contains_ip_rule_lookup_table, detect_tampered_log, execute, is_interface_absent_detail,
-        load_dns_zone_records_json, load_signing_key, managed_dns_resolver_server_arg,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
-        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_validate_platform_parity_report, required_macos_tunnel_keychain_account,
+        launchd_xml_escape, load_dns_zone_records_json, load_signing_key,
+        managed_dns_resolver_server_arg, parse_bool_value, parse_bundle_u64_field, parse_command,
+        parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
+        persist_encrypted_secret_material, phase6_validate_platform_parity_report,
+        render_launchd_plist, required_macos_tunnel_keychain_account,
         rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
         rewrite_env_key_value, validate_control_socket_security,
     };
@@ -8218,6 +8962,36 @@ mod tests {
         let pids =
             parse_wireguard_go_pids_from_ps(ps_body, "rustynet0").expect("parse should succeed");
         assert_eq!(pids, vec![101]);
+    }
+
+    #[test]
+    fn launchd_xml_escape_escapes_reserved_characters() {
+        let escaped = launchd_xml_escape("a<&>\"'b");
+        assert_eq!(escaped, "a&lt;&amp;&gt;&quot;&apos;b");
+    }
+
+    #[test]
+    fn render_launchd_plist_includes_expected_structure() {
+        let plist = render_launchd_plist(
+            "com.rustynet.test",
+            &[
+                "/usr/local/bin/rustynetd".to_string(),
+                "daemon".to_string(),
+                "--node-id".to_string(),
+                "node-1".to_string(),
+            ],
+            &[(
+                "RUSTYNET_WG_BINARY_PATH".to_string(),
+                "/usr/bin/wg".to_string(),
+            )],
+            std::path::Path::new("/tmp/rustynetd.log"),
+            std::path::Path::new("/tmp/rustynetd.log"),
+        );
+        assert!(plist.contains("<key>Label</key>"));
+        assert!(plist.contains("com.rustynet.test"));
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(plist.contains("RUSTYNET_WG_BINARY_PATH"));
     }
 
     #[test]
