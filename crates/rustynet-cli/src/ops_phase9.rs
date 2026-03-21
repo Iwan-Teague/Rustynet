@@ -120,6 +120,12 @@ pub struct WritePhase10Hp2TraversalReportsConfig {
     pub probe_security_log: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteUnsignedReleaseProvenanceConfig {
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
 fn env_optional_string(key: &str) -> Result<Option<String>, String> {
     match std::env::var(key) {
         Ok(value) => {
@@ -4531,6 +4537,20 @@ pub fn execute_ops_verify_required_test_output(
     ))
 }
 
+pub fn execute_ops_write_unsigned_release_provenance(
+    config: WriteUnsignedReleaseProvenanceConfig,
+) -> Result<String, String> {
+    let mut provenance = read_json_object(config.input_path.as_path(), "release provenance input")?;
+    object_string_field(&provenance, "signature_hex", "release provenance input")?;
+    provenance.remove("signature_hex");
+    write_json_secure(config.output_path.as_path(), &Value::Object(provenance))?;
+    Ok(format!(
+        "unsigned release provenance written: input={} output={}",
+        config.input_path.display(),
+        config.output_path.display()
+    ))
+}
+
 pub fn execute_ops_sign_release_artifact() -> Result<String, String> {
     let artifact_path = release_artifact_path_from_env_or_default()?;
     let sbom_path = release_sbom_path_from_env_or_default()?;
@@ -4624,10 +4644,11 @@ mod tests {
         Phase6ParityAttestationBuildInputs, Phase6ParityAttestationVerifyInputs,
         Phase9EvidenceAttestationBuildInputs, Phase9EvidenceAttestationVerifyInputs,
         ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
-        WritePhase10Hp2TraversalReportsConfig, build_phase6_parity_attestation_document,
-        build_phase9_evidence_attestation_document, build_release_provenance_document,
-        contains_generation_marker, decode_hex_to_fixed,
-        execute_ops_write_phase10_hp2_traversal_reports, hex_encode, load_key_hex_from_secure_path,
+        WritePhase10Hp2TraversalReportsConfig, WriteUnsignedReleaseProvenanceConfig,
+        build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
+        build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
+        execute_ops_write_phase10_hp2_traversal_reports,
+        execute_ops_write_unsigned_release_provenance, hex_encode, load_key_hex_from_secure_path,
         parse_required_test_output_total_passed, phase10_expected_provenance_entries,
         read_json_object, read_utf8_regular_file_with_max_bytes, sha256_hex,
         validate_phase10_host_identity, verify_phase6_parity_attestation_document,
@@ -5088,6 +5109,49 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         fs::remove_file(sbom_digest_path.as_path()).expect("remove sbom digest");
         fs::remove_file(sbom_path.as_path()).expect("remove sbom");
         fs::remove_file(artifact_path.as_path()).expect("remove artifact");
+        fs::remove_dir(root_dir.as_path()).expect("remove temp root");
+    }
+
+    #[test]
+    fn write_unsigned_release_provenance_removes_signature_field() {
+        let unique = format!(
+            "ops-release-provenance-strip-signature-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(root_dir.as_path()).expect("create temp root");
+
+        let input_path = root_dir.join("signed.provenance.json");
+        let output_path = root_dir.join("unsigned.provenance.json");
+        let input = json!({
+            "phase": "release",
+            "artifact_path": "/tmp/rustynetd",
+            "signature_hex": "11",
+        });
+        let mut body = serde_json::to_string_pretty(&input).expect("serialize input");
+        body.push('\n');
+        fs::write(input_path.as_path(), body.as_bytes()).expect("write input");
+
+        execute_ops_write_unsigned_release_provenance(WriteUnsignedReleaseProvenanceConfig {
+            input_path: input_path.clone(),
+            output_path: output_path.clone(),
+        })
+        .expect("write unsigned provenance");
+
+        let output = read_json_object(output_path.as_path(), "unsigned release provenance output")
+            .expect("read output");
+        assert_eq!(
+            output.get("phase").and_then(|value| value.as_str()),
+            Some("release")
+        );
+        assert!(output.get("signature_hex").is_none());
+
+        fs::remove_file(output_path.as_path()).expect("remove output");
+        fs::remove_file(input_path.as_path()).expect("remove input");
         fs::remove_dir(root_dir.as_path()).expect("remove temp root");
     }
 

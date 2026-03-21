@@ -40,7 +40,7 @@ live_lab_init() {
     exit 1
   fi
 
-  for cmd in ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr python3; do
+  for cmd in ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr; do
     live_lab_require_command "$cmd"
   done
 

@@ -420,6 +420,9 @@ enum OpsCommand {
     VerifyLinuxFreshInstallOsMatrixReadiness {
         config: ops_fresh_install_os_matrix::VerifyLinuxFreshInstallOsMatrixReadinessConfig,
     },
+    WriteUnsignedReleaseProvenance {
+        config: ops_phase9::WriteUnsignedReleaseProvenanceConfig,
+    },
     SignReleaseArtifact,
     VerifyReleaseArtifact,
     CollectPlatformProbe,
@@ -1502,6 +1505,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
             })
         }
+        "write-unsigned-release-provenance" => Ok(OpsCommand::WriteUnsignedReleaseProvenance {
+            config: ops_phase9::WriteUnsignedReleaseProvenanceConfig {
+                input_path: parser.required_path("--input")?,
+                output_path: parser.required_path("--output")?,
+            },
+        }),
         "sign-release-artifact" => {
             if args.len() != 1 {
                 return Err("ops sign-release-artifact does not accept options".to_string());
@@ -3116,6 +3125,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_fresh_install_os_matrix::execute_ops_verify_linux_fresh_install_os_matrix_readiness(
                 config,
             )
+        }
+        OpsCommand::WriteUnsignedReleaseProvenance { config } => {
+            ops_phase9::execute_ops_write_unsigned_release_provenance(config)
         }
         OpsCommand::SignReleaseArtifact => ops_phase9::execute_ops_sign_release_artifact(),
         OpsCommand::VerifyReleaseArtifact => ops_phase9::execute_ops_verify_release_artifact(),
@@ -9454,6 +9466,7 @@ fn help_text() -> String {
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
+        "  ops write-unsigned-release-provenance --input <path> --output <path>",
         "  ops sign-release-artifact",
         "  ops verify-release-artifact",
         "  ops collect-platform-probe",
@@ -10667,6 +10680,19 @@ mod tests {
         assert!(
             format!("{verify_fresh_install_report:?}")
                 .contains("VerifyLinuxFreshInstallOsMatrixReadiness")
+        );
+
+        let write_unsigned_release_provenance = parse_command(&[
+            "ops".to_string(),
+            "write-unsigned-release-provenance".to_string(),
+            "--input".to_string(),
+            "artifacts/release/rustynetd.provenance.json".to_string(),
+            "--output".to_string(),
+            "artifacts/release/unsigned.provenance.json".to_string(),
+        ]);
+        assert!(
+            format!("{write_unsigned_release_provenance:?}")
+                .contains("WriteUnsignedReleaseProvenance")
         );
 
         let sign_release_artifact =

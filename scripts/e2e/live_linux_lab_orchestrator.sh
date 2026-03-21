@@ -1955,7 +1955,6 @@ stage_preflight() {
   require_cmd git
   require_cmd tar
   require_cmd expect
-  require_cmd python3
   require_cmd rg
   require_cmd awk
   require_cmd openssl
@@ -2715,7 +2714,7 @@ cross_network_preflight_worker() {
   local stage_dir capability_path
   local remote_unix local_unix skew
   local cmd
-  local required_user_cmds=(rustynet rustynetd wg systemctl ss python3 ip nft journalctl)
+  local required_user_cmds=(rustynet rustynetd wg systemctl ss ip nft journalctl)
   local required_root_cmds=(wg systemctl ss ip nft journalctl)
   local signed_state_snapshot route_snapshot endpoint_snapshot
   local global_ipv4 hostname_resolution_snapshot plaintext_snapshot

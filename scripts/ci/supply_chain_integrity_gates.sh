@@ -24,7 +24,6 @@ require_cargo_subcommand() {
 require_command cargo
 require_command rustup
 require_command rustc
-require_command python3
 require_cargo_subcommand audit
 require_cargo_subcommand deny
 
@@ -134,19 +133,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp "$RELEASE_PROVENANCE_PATH" "$UNSIGNED_PROVENANCE_PATH"
-python3 - "$UNSIGNED_PROVENANCE_PATH" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8") as handle:
-    payload = json.load(handle)
-payload.pop("signature_hex", None)
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
+cargo run --quiet -p rustynet-cli -- ops write-unsigned-release-provenance \
+  --input "$RELEASE_PROVENANCE_PATH" \
+  --output "$UNSIGNED_PROVENANCE_PATH"
 
 if RUSTYNET_RELEASE_ARTIFACT_PATH="$RELEASE_ARTIFACT_PATH" \
   RUSTYNET_RELEASE_TRACK="$RELEASE_TRACK" \
