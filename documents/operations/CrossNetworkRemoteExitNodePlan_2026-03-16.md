@@ -42,7 +42,7 @@ The phrase "from anywhere" is not acceptable as a claim until the direct path an
 
 Primary source references:
 - [README.md:48](/Users/iwanteague/Desktop/Rustynet/README.md#L48)
-- [Phase10ExecutionProgress.md:5](/Users/iwanteague/Desktop/Rustynet/documents/Phase10ExecutionProgress.md#L5)
+- [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
 - [traversal_path_selection_report.json](/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/traversal_path_selection_report.json)
 - [traversal_probe_security_report.json](/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/traversal_probe_security_report.json)
 
@@ -53,8 +53,7 @@ Primary source references:
 
 Primary source references:
 - [README.md:48](/Users/iwanteague/Desktop/Rustynet/README.md#L48)
-- [Phase10ExecutionProgress.md:8](/Users/iwanteague/Desktop/Rustynet/documents/Phase10ExecutionProgress.md#L8)
-- [Phase10ExecutionProgress.md:59](/Users/iwanteague/Desktop/Rustynet/documents/Phase10ExecutionProgress.md#L59)
+- [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
 - [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:17](/Users/iwanteague/Desktop/Rustynet/documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md#L17)
 
 ### 4.3 Important architecture truth
@@ -110,7 +109,7 @@ Tasks:
 
 Primary touchpoints:
 - [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
-- [Phase10ExecutionProgress.md](/Users/iwanteague/Desktop/Rustynet/documents/Phase10ExecutionProgress.md)
+- [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
 - [tools/skills/rustynet-security-auditor](/Users/iwanteague/Desktop/Rustynet/tools/skills/rustynet-security-auditor/SKILL.md)
 
 Acceptance:
