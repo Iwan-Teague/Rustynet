@@ -66,64 +66,6 @@ exec >> "$LOG_PATH" 2>&1
 live_lab_init "rustynet-server-ip-bypass" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 
-SERVER_SCRIPT="$LIVE_LAB_WORK_DIR/rn-underlay-http-server.py"
-PROBE_SCRIPT="$LIVE_LAB_WORK_DIR/rn-tcp-probe.py"
-cat > "$SERVER_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import http.server
-import socketserver
-import sys
-
-if len(sys.argv) != 3:
-    raise SystemExit("usage: rn-underlay-http-server.py <bind-ip> <port>")
-
-bind_ip = sys.argv[1]
-port = int(sys.argv[2])
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"probe-ok"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, fmt, *args):
-        pass
-
-class ReusableTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
-
-with ReusableTCPServer((bind_ip, port), Handler) as httpd:
-    httpd.serve_forever()
-PY
-cat > "$PROBE_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import socket
-import sys
-
-if len(sys.argv) != 4:
-    raise SystemExit("usage: rn-tcp-probe.py <host> <port> <timeout-secs>")
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-timeout = float(sys.argv[3])
-
-sock = socket.create_connection((host, port), timeout)
-try:
-    sock.sendall(b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n")
-    response = sock.recv(64)
-finally:
-    sock.close()
-
-if b"probe-ok" not in response:
-    raise SystemExit("probe-ok marker missing from response")
-
-print("probe-ok")
-PY
-chmod 700 "$SERVER_SCRIPT" "$PROBE_SCRIPT"
-
 if [[ -n "$PROBE_BIND_IP" ]]; then
   cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$PROBE_BIND_IP" >/dev/null
   PROBE_IP="$PROBE_BIND_IP"
@@ -134,8 +76,7 @@ PROBE_PID_PATH="/tmp/rn-underlay-http-server.pid"
 PROBE_LOG_PATH="/tmp/rn-underlay-http-server.log"
 
 cleanup_probe_server() {
-  live_lab_run_root "$PROBE_HOST" "root test -f '$PROBE_PID_PATH' && root kill \"\$(cat '$PROBE_PID_PATH')\" >/dev/null 2>&1 || true; root rm -f '$PROBE_PID_PATH' '$PROBE_LOG_PATH' /tmp/rn-underlay-http-server.py /tmp/rn-tcp-probe.py" >/dev/null 2>&1 || true
-  live_lab_run_root "$CLIENT_HOST" "root rm -f /tmp/rn-tcp-probe.py" >/dev/null 2>&1 || true
+  live_lab_run_root "$PROBE_HOST" "root test -f '$PROBE_PID_PATH' && root kill \"\$(cat '$PROBE_PID_PATH')\" >/dev/null 2>&1 || true; root rm -f '$PROBE_PID_PATH' '$PROBE_LOG_PATH'" >/dev/null 2>&1 || true
 }
 trap 'cleanup_probe_server; live_lab_cleanup' EXIT
 
@@ -144,25 +85,19 @@ live_lab_push_sudo_password "$PROBE_HOST"
 live_lab_wait_for_daemon_socket "$CLIENT_HOST"
 live_lab_wait_for_daemon_socket "$PROBE_HOST"
 
-live_lab_scp_to "$SERVER_SCRIPT" "$PROBE_HOST" "/tmp/rn-underlay-http-server.py"
-live_lab_scp_to "$PROBE_SCRIPT" "$PROBE_HOST" "/tmp/rn-tcp-probe.py"
-live_lab_scp_to "$PROBE_SCRIPT" "$CLIENT_HOST" "/tmp/rn-tcp-probe.py"
-live_lab_run_root "$PROBE_HOST" "root chmod 700 /tmp/rn-underlay-http-server.py /tmp/rn-tcp-probe.py"
-live_lab_run_root "$CLIENT_HOST" "root chmod 700 /tmp/rn-tcp-probe.py"
-
 live_lab_log "Starting underlay HTTP probe service on $PROBE_HOST ($PROBE_IP:$PROBE_PORT)"
-live_lab_run_root "$PROBE_HOST" "root rm -f '$PROBE_PID_PATH' '$PROBE_LOG_PATH'; root nohup python3 /tmp/rn-underlay-http-server.py '$PROBE_IP' '$PROBE_PORT' >'$PROBE_LOG_PATH' 2>&1 </dev/null & echo \$! > '$PROBE_PID_PATH'"
-live_lab_retry_root "$PROBE_HOST" "root python3 /tmp/rn-tcp-probe.py '$PROBE_IP' '$PROBE_PORT' 2 >/dev/null" 15 1
+live_lab_run_root "$PROBE_HOST" "root rm -f '$PROBE_PID_PATH' '$PROBE_LOG_PATH'; root nohup rustynet ops e2e-http-probe-server --bind-ip '$PROBE_IP' --port '$PROBE_PORT' --response-body 'probe-ok' >'$PROBE_LOG_PATH' 2>&1 </dev/null & echo \$! > '$PROBE_PID_PATH'"
+live_lab_retry_root "$PROBE_HOST" "root rustynet ops e2e-http-probe-client --host '$PROBE_IP' --port '$PROBE_PORT' --timeout-ms 2000 --expect-marker probe-ok >/dev/null" 15 1
 
 CLIENT_STATUS="$(live_lab_status "$CLIENT_HOST")"
 CLIENT_INTERNET_ROUTE="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
 CLIENT_PROBE_ROUTE="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get '$PROBE_IP' || true")"
 CLIENT_TABLE_51820="$(live_lab_capture "$CLIENT_HOST" "ip -4 route show table 51820 || true")"
 CLIENT_ENDPOINTS="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints || true")"
-PROBE_SELF_TEST="$(live_lab_capture_root "$PROBE_HOST" "root python3 /tmp/rn-tcp-probe.py '$PROBE_IP' '$PROBE_PORT' 2 || true")"
-PROBE_FROM_CLIENT_OUTPUT="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-tcp-probe.py '$PROBE_IP' '$PROBE_PORT' 2 || true")"
+PROBE_SELF_TEST="$(live_lab_capture_root "$PROBE_HOST" "root rustynet ops e2e-http-probe-client --host '$PROBE_IP' --port '$PROBE_PORT' --timeout-ms 2000 --expect-marker probe-ok || true")"
+PROBE_FROM_CLIENT_OUTPUT="$(live_lab_capture_root "$CLIENT_HOST" "root rustynet ops e2e-http-probe-client --host '$PROBE_IP' --port '$PROBE_PORT' --timeout-ms 2000 --expect-marker probe-ok || true")"
 
-if live_lab_run_root "$CLIENT_HOST" "root python3 /tmp/rn-tcp-probe.py '$PROBE_IP' '$PROBE_PORT' 2 >/dev/null" >/dev/null 2>&1; then
+if live_lab_run_root "$CLIENT_HOST" "root rustynet ops e2e-http-probe-client --host '$PROBE_IP' --port '$PROBE_PORT' --timeout-ms 2000 --expect-marker probe-ok >/dev/null" >/dev/null 2>&1; then
   PROBE_FROM_CLIENT_STATUS="fail"
 else
   PROBE_FROM_CLIENT_STATUS="pass"

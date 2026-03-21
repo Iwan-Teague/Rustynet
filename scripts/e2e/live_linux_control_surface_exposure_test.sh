@@ -102,39 +102,6 @@ exec >> "$LOG_PATH" 2>&1
 live_lab_init "rustynet-control-surface" "$SSH_IDENTITY_FILE"
 trap 'live_lab_cleanup' EXIT
 
-QUERY_SCRIPT="$LIVE_LAB_WORK_DIR/rn-dns-query-timeout.py"
-cat > "$QUERY_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import json
-import socket
-import sys
-
-if len(sys.argv) != 4:
-    raise SystemExit("usage: rn-dns-query-timeout.py <server> <port> <qname>")
-
-server = sys.argv[1]
-port = int(sys.argv[2])
-qname = sys.argv[3].rstrip(".")
-
-labels = qname.split(".")
-qname_wire = b"".join(len(label).to_bytes(1, "big") + label.encode("ascii") for label in labels) + b"\x00"
-packet = b"\x13\x37" + b"\x01\x00" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + qname_wire + b"\x00\x01\x00\x01"
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(1.0)
-sock.sendto(packet, (server, port))
-result = {"received": False, "error": "timeout"}
-try:
-    data, _ = sock.recvfrom(512)
-    result = {"received": True, "size": len(data), "error": "none"}
-finally:
-    sock.close()
-
-print(json.dumps(result))
-sys.exit(0 if result["received"] else 1)
-PY
-chmod 700 "$QUERY_SCRIPT"
-
 for target in "${HOST_TARGETS[@]}"; do
   live_lab_push_sudo_password "$target"
   live_lab_wait_for_daemon_socket "$target"
@@ -162,17 +129,14 @@ if [[ -n "$PROBE_HOST" && "$PROBE_HOST" != "$CLIENT_HOST" && -f "$client_dns_sta
   DNS_SERVER="${DNS_BIND_ADDR%:*}"
   DNS_PORT="${DNS_BIND_ADDR##*:}"
   CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
-  live_lab_scp_to "$QUERY_SCRIPT" "$PROBE_HOST" "/tmp/rn-dns-query-timeout.py"
-  live_lab_run_root "$PROBE_HOST" "root chmod 700 /tmp/rn-dns-query-timeout.py"
-  if REMOTE_DNS_PROBE_OUTPUT="$(live_lab_capture_root "$PROBE_HOST" "root python3 /tmp/rn-dns-query-timeout.py '${CLIENT_ADDR}' '${DNS_PORT}' blocked-probe.rustynet || true")"; then
+  if REMOTE_DNS_PROBE_OUTPUT="$(live_lab_capture_root "$PROBE_HOST" "root rustynet ops e2e-dns-query --server '${CLIENT_ADDR}' --port '${DNS_PORT}' --qname blocked-probe.rustynet --timeout-ms 1000 || true")"; then
     :
   fi
-  if live_lab_run_root "$PROBE_HOST" "root python3 /tmp/rn-dns-query-timeout.py '${CLIENT_ADDR}' '${DNS_PORT}' blocked-probe.rustynet" >/dev/null 2>&1; then
+  if live_lab_run_root "$PROBE_HOST" "root rustynet ops e2e-dns-query --server '${CLIENT_ADDR}' --port '${DNS_PORT}' --qname blocked-probe.rustynet --timeout-ms 1000 --fail-on-no-response" >/dev/null 2>&1; then
     REMOTE_DNS_PROBE_STATUS="fail"
   else
     REMOTE_DNS_PROBE_STATUS="pass"
   fi
-  live_lab_run_root "$PROBE_HOST" "root rm -f /tmp/rn-dns-query-timeout.py" >/dev/null 2>&1 || true
 fi
 
 captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

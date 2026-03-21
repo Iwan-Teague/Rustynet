@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
@@ -40,6 +41,14 @@ pub struct GenerateLinuxFreshInstallOsMatrixReportConfig {
     pub ubuntu_os_version: String,
     pub fedora_os_version: String,
     pub mint_os_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyLinuxFreshInstallOsMatrixReadinessConfig {
+    pub report_path: PathBuf,
+    pub max_age_seconds: u64,
+    pub profile: String,
+    pub expected_git_commit: String,
 }
 
 fn unix_now() -> u64 {
@@ -302,6 +311,255 @@ fn as_string_vec(value: &Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+struct FreshInstallVerifyContext<'a> {
+    expected_commit: &'a str,
+    now_unix: u64,
+    max_age_seconds: u64,
+    root: &'a Path,
+}
+
+fn is_lower_hex_sha40(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn require_nonempty_string_field(
+    payload: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("{label} requires non-empty string field: {key}"))
+}
+
+fn require_positive_u64_field(
+    payload: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<u64, String> {
+    payload
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{label} requires positive integer field: {key}"))
+}
+
+fn validate_timestamp(
+    value: u64,
+    label: &str,
+    now_unix: u64,
+    max_age_seconds: u64,
+) -> Result<(), String> {
+    if value > now_unix.saturating_add(300) {
+        return Err(format!("{label} timestamp is too far in the future"));
+    }
+    if now_unix.saturating_sub(value) > max_age_seconds {
+        return Err(format!(
+            "{label} evidence is stale; refresh OS matrix evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn git_head_commit() -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .map_err(|err| format!("run git rev-parse HEAD failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("resolve git head commit failed: {}", stderr.trim()));
+    }
+    let head = String::from_utf8(output.stdout)
+        .map_err(|err| format!("decode git head commit failed: {err}"))?
+        .trim()
+        .to_ascii_lowercase();
+    if !is_lower_hex_sha40(head.as_str()) {
+        return Err(format!(
+            "git head commit is not a lowercase 40-char SHA: {head}"
+        ));
+    }
+    Ok(head)
+}
+
+fn resolve_artifact_path_for_verify(
+    raw: &str,
+    root: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let item = raw.trim();
+    if item.is_empty() {
+        return Err(format!("{label} has invalid source artifact entry"));
+    }
+    let candidate = PathBuf::from(item);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    if !resolved.exists() {
+        return Err(format!("{label} source artifact does not exist: {raw}"));
+    }
+    Ok(fs::canonicalize(resolved).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
+fn validate_measured_child_report_for_verify(
+    report_path: &Path,
+    label: &str,
+    visited_reports: &mut HashSet<PathBuf>,
+    context: &FreshInstallVerifyContext<'_>,
+) -> Result<(), String> {
+    let resolved = fs::canonicalize(report_path).unwrap_or_else(|_| report_path.to_path_buf());
+    if !visited_reports.insert(resolved.clone()) {
+        return Ok(());
+    }
+    if resolved
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("json"))
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
+    let body = fs::read_to_string(resolved.as_path())
+        .map_err(|err| format!("{label} source artifact read failed: {err}"))?;
+    let payload = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "{label} source artifact is not valid JSON: {} ({err})",
+            resolved.display()
+        )
+    })?;
+    let object = payload.as_object().ok_or_else(|| {
+        format!(
+            "{label} source artifact JSON must be an object: {}",
+            resolved.display()
+        )
+    })?;
+
+    let structured_markers = [
+        "evidence_mode",
+        "git_commit",
+        "captured_at_unix",
+        "source_artifacts",
+        "source_artifact",
+    ];
+    if !structured_markers
+        .iter()
+        .any(|marker| object.contains_key(*marker))
+    {
+        return Ok(());
+    }
+
+    if object.get("evidence_mode").and_then(Value::as_str) != Some("measured") {
+        return Err(format!(
+            "{label} child report must set evidence_mode=measured: {}",
+            resolved.display()
+        ));
+    }
+
+    let child_commit = require_nonempty_string_field(object, "git_commit", label)?;
+    if !is_lower_hex_sha40(child_commit.as_str()) {
+        return Err(format!(
+            "{label} child report git_commit must be a 40-char lowercase hex SHA"
+        ));
+    }
+    if child_commit != context.expected_commit {
+        return Err(format!(
+            "{label} child report git_commit does not match expected commit; report={child_commit} expected={} path={}",
+            context.expected_commit,
+            resolved.display(),
+        ));
+    }
+    let child_captured_at = require_positive_u64_field(object, "captured_at_unix", label)?;
+    validate_timestamp(
+        child_captured_at,
+        label,
+        context.now_unix,
+        context.max_age_seconds,
+    )?;
+
+    if let Some(status) = object.get("status").and_then(Value::as_str)
+        && status != "pass"
+    {
+        return Err(format!(
+            "{label} child report status must be pass: {}",
+            resolved.display()
+        ));
+    }
+
+    let child_source_artifacts = object.get("source_artifacts");
+    let child_source_artifact = object.get("source_artifact");
+    if child_source_artifacts.is_none() && child_source_artifact.is_none() {
+        return Err(format!(
+            "{label} child report must declare source_artifacts or source_artifact: {}",
+            resolved.display()
+        ));
+    }
+    if let Some(items) = child_source_artifacts {
+        validate_source_artifact_entries_for_verify(
+            items,
+            format!("{label}.child_sources").as_str(),
+            visited_reports,
+            context,
+            true,
+        )?;
+    }
+    if let Some(item) = child_source_artifact {
+        let item = item
+            .as_str()
+            .ok_or_else(|| format!("{label}.child_source has invalid source artifact entry"))?;
+        let child_path = resolve_artifact_path_for_verify(
+            item,
+            context.root,
+            format!("{label}.child_source").as_str(),
+        )?;
+        validate_measured_child_report_for_verify(
+            child_path.as_path(),
+            format!("{label}.child_source").as_str(),
+            visited_reports,
+            context,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_source_artifact_entries_for_verify(
+    artifacts: &Value,
+    label: &str,
+    visited_reports: &mut HashSet<PathBuf>,
+    context: &FreshInstallVerifyContext<'_>,
+    require_non_empty: bool,
+) -> Result<(), String> {
+    let entries = artifacts
+        .as_array()
+        .ok_or_else(|| format!("{label} requires non-empty source_artifacts list"))?;
+    if require_non_empty && entries.is_empty() {
+        return Err(format!("{label} requires non-empty source_artifacts list"));
+    }
+    for item in entries {
+        let item = item
+            .as_str()
+            .ok_or_else(|| format!("{label} has invalid source artifact entry"))?;
+        let child_path = resolve_artifact_path_for_verify(item, context.root, label)?;
+        validate_measured_child_report_for_verify(
+            child_path.as_path(),
+            label,
+            visited_reports,
+            context,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn execute_ops_rebind_linux_fresh_install_os_matrix_inputs(
@@ -741,4 +999,346 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
         )
     })?;
     Ok(output_path.display().to_string())
+}
+
+pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
+    config: VerifyLinuxFreshInstallOsMatrixReadinessConfig,
+) -> Result<String, String> {
+    let root = repo_root()?;
+    let report_path = require_file(
+        config.report_path.as_path(),
+        "fresh install OS matrix report",
+    )?;
+    let max_age_seconds = if config.max_age_seconds == 0 {
+        604_800
+    } else {
+        config.max_age_seconds
+    };
+    let now_unix = unix_now();
+
+    let required_os_profiles = match config.profile.trim() {
+        "cross_platform" => vec![
+            ("debian13", "linux"),
+            ("ubuntu", "linux"),
+            ("fedora", "linux"),
+            ("mint", "linux"),
+            ("macos", "macos"),
+        ],
+        "linux" => vec![
+            ("debian13", "linux"),
+            ("ubuntu", "linux"),
+            ("fedora", "linux"),
+            ("mint", "linux"),
+        ],
+        other => {
+            return Err(format!(
+                "unsupported fresh install OS matrix profile: {other} (expected cross_platform or linux)"
+            ));
+        }
+    };
+
+    let required_checks = vec![
+        (
+            "clean_install",
+            vec![
+                "host_pristine",
+                "fresh_install_completed",
+                "service_bootstrap_secure",
+                "key_custody_hardened",
+                "no_legacy_fallback_paths",
+            ],
+        ),
+        (
+            "one_hop",
+            vec![
+                "tunnel_established",
+                "encrypted_transport",
+                "egress_via_selected_exit",
+                "dns_fail_closed",
+                "no_underlay_leak",
+            ],
+        ),
+        (
+            "two_hop",
+            vec![
+                "chain_enforced",
+                "encrypted_transport",
+                "entry_relay_forwarding",
+                "final_exit_egress",
+                "no_underlay_leak",
+            ],
+        ),
+        (
+            "role_switch",
+            vec![
+                "switch_execution",
+                "post_switch_reconcile",
+                "policy_still_enforced",
+                "least_privilege_preserved",
+            ],
+        ),
+    ];
+    let required_security_assertions = vec![
+        "no_plaintext_secrets_at_rest",
+        "encrypted_transport_required",
+        "default_deny_enforced",
+        "fail_closed_enforced",
+        "least_privilege_role_switch",
+    ];
+
+    let body = fs::read_to_string(report_path.as_path()).map_err(|err| {
+        format!(
+            "read fresh install OS matrix report failed ({}): {err}",
+            report_path.display()
+        )
+    })?;
+    let payload = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "parse fresh install OS matrix report JSON failed ({}): {err}",
+            report_path.display()
+        )
+    })?;
+    let payload = payload
+        .as_object()
+        .ok_or_else(|| "fresh install OS matrix report must be a JSON object".to_string())?;
+
+    if payload.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err("fresh install OS matrix report must set schema_version=1".to_string());
+    }
+    if payload.get("evidence_mode").and_then(Value::as_str) != Some("measured") {
+        return Err("fresh install OS matrix report must set evidence_mode=measured".to_string());
+    }
+    require_nonempty_string_field(payload, "environment", "fresh_install_os_matrix_report")?;
+    let captured_at_unix = require_positive_u64_field(
+        payload,
+        "captured_at_unix",
+        "fresh_install_os_matrix_report",
+    )?;
+    validate_timestamp(
+        captured_at_unix,
+        "fresh_install_os_matrix_report",
+        now_unix,
+        max_age_seconds,
+    )?;
+
+    let git_commit =
+        require_nonempty_string_field(payload, "git_commit", "fresh_install_os_matrix_report")?;
+    if !is_lower_hex_sha40(git_commit.as_str()) {
+        return Err(
+            "fresh install OS matrix report git_commit must be a 40-char lowercase hex SHA"
+                .to_string(),
+        );
+    }
+    let expected_git_commit_arg = config.expected_git_commit.trim().to_ascii_lowercase();
+    if !expected_git_commit_arg.is_empty() && !is_lower_hex_sha40(expected_git_commit_arg.as_str())
+    {
+        return Err(
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT must be a 40-char lowercase hex SHA when set"
+                .to_string(),
+        );
+    }
+    let expected_commit = if expected_git_commit_arg.is_empty() {
+        git_head_commit()?
+    } else {
+        expected_git_commit_arg
+    };
+    if git_commit != expected_commit {
+        return Err(format!(
+            "fresh install OS matrix report git_commit does not match expected commit; report={git_commit} expected={expected_commit}"
+        ));
+    }
+    let verify_context = FreshInstallVerifyContext {
+        expected_commit: expected_commit.as_str(),
+        now_unix,
+        max_age_seconds,
+        root: &root,
+    };
+
+    let mut visited_reports = HashSet::new();
+    visited_reports.insert(fs::canonicalize(report_path.as_path()).unwrap_or(report_path.clone()));
+    let source_artifacts = payload.get("source_artifacts").ok_or_else(|| {
+        "fresh_install_os_matrix_report requires non-empty source_artifacts list".to_string()
+    })?;
+    validate_source_artifact_entries_for_verify(
+        source_artifacts,
+        "fresh_install_os_matrix_report",
+        &mut visited_reports,
+        &verify_context,
+        true,
+    )?;
+
+    let security_assertions = payload
+        .get("security_assertions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "fresh install OS matrix report requires security_assertions object".to_string()
+        })?;
+    let missing_assertions = required_security_assertions
+        .iter()
+        .filter(|key| !security_assertions.contains_key(**key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_assertions.is_empty() {
+        return Err(format!(
+            "fresh install OS matrix report missing security_assertions: {}",
+            missing_assertions.join(", ")
+        ));
+    }
+    for key in required_security_assertions {
+        if security_assertions.get(key).and_then(Value::as_bool) != Some(true) {
+            return Err(format!(
+                "fresh install OS matrix security_assertion must be true: {key}"
+            ));
+        }
+    }
+
+    let scenarios = payload
+        .get("scenarios")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "fresh install OS matrix report requires scenarios object".to_string())?;
+    let required_os_ids = required_os_profiles
+        .iter()
+        .map(|(id, _)| (*id).to_string())
+        .collect::<HashSet<_>>();
+    let observed_os_ids = scenarios.keys().cloned().collect::<HashSet<_>>();
+    if required_os_ids != observed_os_ids {
+        let mut missing = required_os_ids
+            .difference(&observed_os_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut extra = observed_os_ids
+            .difference(&required_os_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        extra.sort();
+        let mut details = Vec::new();
+        if !missing.is_empty() {
+            details.push(format!("missing={}", missing.join(",")));
+        }
+        if !extra.is_empty() {
+            details.push(format!("extra={}", extra.join(",")));
+        }
+        return Err(format!(
+            "fresh install OS matrix scenarios must match required OS set ({})",
+            details.join("; ")
+        ));
+    }
+
+    for (os_id, expected_profile) in required_os_profiles {
+        let label = format!("fresh_install_os_matrix.scenarios.{os_id}");
+        let scenario = scenarios
+            .get(os_id)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        if scenario.get("status").and_then(Value::as_str) != Some("pass") {
+            return Err(format!("{label}.status must be pass"));
+        }
+        let host_profile = require_nonempty_string_field(scenario, "host_profile", label.as_str())?;
+        if host_profile != expected_profile {
+            return Err(format!("{label}.host_profile must be {expected_profile}"));
+        }
+        require_nonempty_string_field(scenario, "os_version", label.as_str())?;
+        require_nonempty_string_field(scenario, "node_id", label.as_str())?;
+
+        for (section_name, expected_keys) in &required_checks {
+            let section_label = format!("{label}.{section_name}");
+            let section = scenario
+                .get(*section_name)
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{section_label} must be an object"))?;
+            if section.get("status").and_then(Value::as_str) != Some("pass") {
+                return Err(format!("{section_label}.status must be pass"));
+            }
+            let section_time =
+                require_positive_u64_field(section, "captured_at_unix", section_label.as_str())?;
+            validate_timestamp(
+                section_time,
+                section_label.as_str(),
+                now_unix,
+                max_age_seconds,
+            )?;
+            let section_sources = section.get("source_artifacts").ok_or_else(|| {
+                format!("{section_label} requires non-empty source_artifacts list")
+            })?;
+            validate_source_artifact_entries_for_verify(
+                section_sources,
+                section_label.as_str(),
+                &mut visited_reports,
+                &verify_context,
+                true,
+            )?;
+            let checks = section
+                .get("checks")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{section_label}.checks must be an object"))?;
+            let missing_checks = expected_keys
+                .iter()
+                .filter(|key| !checks.contains_key(**key))
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing_checks.is_empty() {
+                return Err(format!(
+                    "{section_label}.checks missing required keys: {}",
+                    missing_checks.join(", ")
+                ));
+            }
+            for key in expected_keys {
+                if checks.get(*key).and_then(Value::as_str) != Some("pass") {
+                    return Err(format!("{section_label}.checks.{key} must be pass"));
+                }
+            }
+        }
+
+        if scenario
+            .get("one_hop")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("hop_count"))
+            .and_then(Value::as_u64)
+            != Some(1)
+        {
+            return Err(format!("{label}.one_hop.hop_count must be 1"));
+        }
+        if scenario
+            .get("two_hop")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("hop_count"))
+            .and_then(Value::as_u64)
+            != Some(2)
+        {
+            return Err(format!("{label}.two_hop.hop_count must be 2"));
+        }
+
+        let transitions = scenario
+            .get("role_switch")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("transitions"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("{label}.role_switch.transitions must contain at least one transition")
+            })?;
+        if transitions.is_empty() {
+            return Err(format!(
+                "{label}.role_switch.transitions must contain at least one transition"
+            ));
+        }
+        for (index, transition) in transitions.iter().enumerate() {
+            let transition_label = format!("{label}.role_switch.transitions[{index}]");
+            let transition = transition
+                .as_object()
+                .ok_or_else(|| format!("{transition_label} must be an object"))?;
+            let from_role =
+                require_nonempty_string_field(transition, "from_role", transition_label.as_str())?;
+            let to_role =
+                require_nonempty_string_field(transition, "to_role", transition_label.as_str())?;
+            if from_role == to_role {
+                return Err(format!("{transition_label} must change role"));
+            }
+            if transition.get("status").and_then(Value::as_str) != Some("pass") {
+                return Err(format!("{transition_label}.status must be pass"));
+            }
+        }
+    }
+
+    Ok("Fresh install OS matrix readiness checks: PASS".to_string())
 }

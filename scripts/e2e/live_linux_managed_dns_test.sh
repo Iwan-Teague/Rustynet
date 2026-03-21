@@ -45,19 +45,9 @@ USAGE
 json_field() {
   local payload="$1"
   local field="$2"
-  python3 - "$payload" "$field" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-value = payload.get(sys.argv[2])
-if value is None:
-    print("")
-elif isinstance(value, bool):
-    print("true" if value else "false")
-else:
-    print(value)
-PY
+  cargo run --quiet -p rustynet-cli -- ops read-json-field \
+    --payload "$payload" \
+    --field "$field"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -90,7 +80,7 @@ exec >> "$LOG_PATH" 2>&1
 live_lab_init "rustynet-managed-dns" "$SSH_IDENTITY_FILE"
 cleanup_all() {
   if [[ -n "${CLIENT_HOST:-}" ]]; then
-    live_lab_run_root "$CLIENT_HOST" "root rm -f /tmp/rn-dns-query.py /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" >/dev/null 2>&1 || true
+    live_lab_run_root "$CLIENT_HOST" "root rm -f /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" >/dev/null 2>&1 || true
   fi
   if [[ -n "${SIGNER_HOST:-}" ]]; then
     live_lab_run_root "$SIGNER_HOST" "root rm -f /tmp/rn_issue_dns_zone.sh /tmp/rn_issue_dns_zone.env /tmp/rn-dns-records.json" >/dev/null 2>&1 || true
@@ -102,7 +92,6 @@ trap 'cleanup_all' EXIT
 ISSUE_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_dns_zone.sh"
 ISSUE_ENV="$LIVE_LAB_WORK_DIR/rn_issue_dns_zone.env"
 RECORDS_JSON="$LIVE_LAB_WORK_DIR/rn-dns-records.json"
-QUERY_SCRIPT="$LIVE_LAB_WORK_DIR/rn-dns-query.py"
 VERIFIER_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone.pub"
 VALID_BUNDLE_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone-valid.bundle"
 STALE_BUNDLE_LOCAL="$LIVE_LAB_WORK_DIR/dns-zone-stale.bundle"
@@ -145,71 +134,6 @@ cat > "$RECORDS_JSON" <<EOF_RECORDS
   }
 ]
 EOF_RECORDS
-
-cat > "$QUERY_SCRIPT" <<'PY'
-#!/usr/bin/env python3
-import json
-import socket
-import struct
-import sys
-
-if len(sys.argv) != 4:
-    raise SystemExit("usage: rn-dns-query.py <server> <port> <qname>")
-
-server = sys.argv[1]
-port = int(sys.argv[2])
-qname = sys.argv[3].strip(".")
-if not qname:
-    raise SystemExit("qname must not be empty")
-
-header = struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
-question = b"".join(
-    bytes([len(label)]) + label.encode("ascii")
-    for label in qname.split(".")
-) + b"\x00" + struct.pack("!HH", 1, 1)
-
-result = {
-    "rcode": -1,
-    "answer_count": 0,
-    "answer_ip": "",
-    "answer_ttl": 0,
-    "error": "",
-}
-
-try:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(3.0)
-    sock.sendto(header + question, (server, port))
-    response, _ = sock.recvfrom(512)
-    sock.close()
-
-    flags = struct.unpack("!H", response[2:4])[0]
-    rcode = flags & 0x000F
-    answer_count = struct.unpack("!H", response[6:8])[0]
-    offset = 12
-    while offset < len(response) and response[offset] != 0:
-        offset += 1 + response[offset]
-    offset += 5
-    answer_ip = ""
-    answer_ttl = 0
-    if answer_count > 0 and offset + 12 <= len(response):
-        offset += 2
-        rr_type, rr_class, ttl, rdlen = struct.unpack("!HHIH", response[offset:offset + 10])
-        offset += 10
-        if rr_type == 1 and rr_class == 1 and rdlen == 4 and offset + 4 <= len(response):
-            answer_ip = ".".join(str(byte) for byte in response[offset:offset + 4])
-            answer_ttl = ttl
-
-    result["rcode"] = rcode
-    result["answer_count"] = answer_count
-    result["answer_ip"] = answer_ip
-    result["answer_ttl"] = answer_ttl
-except Exception as exc:
-    result["error"] = str(exc)
-
-print(json.dumps(result, separators=(",", ":")))
-PY
-chmod 700 "$QUERY_SCRIPT"
 
 cat > "$ISSUE_SCRIPT" <<'ISSUEEOF'
 #!/usr/bin/env bash
@@ -386,10 +310,6 @@ live_lab_log "Verifying signed managed DNS bundles on signer host"
 live_lab_run_root "$SIGNER_HOST" "root rustynet dns zone verify --bundle /run/rustynet/dns-zone-issue/valid.dns-zone --verifier-key /run/rustynet/dns-zone-issue/rn-dns-zone.pub --expected-zone-name ${ZONE_NAME} --expected-subject-node-id ${CLIENT_NODE_ID} >/dev/null"
 live_lab_run_root "$SIGNER_HOST" "root rustynet dns zone verify --bundle /run/rustynet/dns-zone-issue/stale.dns-zone --verifier-key /run/rustynet/dns-zone-issue/rn-dns-zone.pub --expected-zone-name ${ZONE_NAME} --expected-subject-node-id ${CLIENT_NODE_ID} >/dev/null"
 
-live_lab_log "Installing DNS query helper on client"
-live_lab_scp_to "$QUERY_SCRIPT" "$CLIENT_HOST" "/tmp/rn-dns-query.py"
-live_lab_run_root "$CLIENT_HOST" "root chmod 700 /tmp/rn-dns-query.py"
-
 refresh_traversal_bundles() {
   : > "$TRAVERSAL_ENV"
   live_lab_append_env_assignment "$TRAVERSAL_ENV" "NODES_SPEC" "$NODES_SPEC"
@@ -435,34 +355,21 @@ install_dns_bundle() {
   fi
 }
 
-extract_expected_ip() {
-  local inspect_output="$1"
-  python3 - "$MANAGED_FQDN" "$inspect_output" <<'PY'
-import re
-import sys
-
-fqdn = sys.argv[1]
-inspect_output = sys.argv[2]
-pattern = r"fqdn=" + re.escape(fqdn) + r"\s+.*?expected_ip=([^\s]+)"
-match = re.search(pattern, inspect_output)
-if match:
-    print(match.group(1))
-else:
-    print("")
-PY
-}
-
 live_lab_log "Installing valid managed DNS bundle on $CLIENT_HOST"
 install_dns_bundle "$VALID_BUNDLE_LOCAL" "true"
 
 DNS_INSPECT_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect")"
 RESOLVECTL_STATUS_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root resolvectl status ${DNS_INTERFACE} || true")"
-DIRECT_QUERY_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-dns-query.py ${DNS_SERVER} ${DNS_PORT} ${MANAGED_FQDN}")"
-DIRECT_ALIAS_QUERY_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-dns-query.py ${DNS_SERVER} ${DNS_PORT} ${MANAGED_ALIAS_FQDN}")"
-NON_MANAGED_DIRECT_QUERY="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-dns-query.py ${DNS_SERVER} ${DNS_PORT} example.com")"
+DIRECT_QUERY_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root rustynet ops e2e-dns-query --server '${DNS_SERVER}' --port '${DNS_PORT}' --qname '${MANAGED_FQDN}' --timeout-ms 3000")"
+DIRECT_ALIAS_QUERY_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root rustynet ops e2e-dns-query --server '${DNS_SERVER}' --port '${DNS_PORT}' --qname '${MANAGED_ALIAS_FQDN}' --timeout-ms 3000")"
+NON_MANAGED_DIRECT_QUERY="$(live_lab_capture_root "$CLIENT_HOST" "root rustynet ops e2e-dns-query --server '${DNS_SERVER}' --port '${DNS_PORT}' --qname example.com --timeout-ms 3000")"
 RESOLVECTL_QUERY_VALID="$(live_lab_capture_root "$CLIENT_HOST" "root resolvectl flush-caches >/dev/null 2>&1 || true; root resolvectl query --legend=no ${MANAGED_FQDN} || true")"
 
-EXPECTED_IP="$(extract_expected_ip "$DNS_INSPECT_VALID")"
+EXPECTED_IP="$(
+  cargo run --quiet -p rustynet-cli -- ops extract-managed-dns-expected-ip \
+    --fqdn "$MANAGED_FQDN" \
+    --inspect-output "$DNS_INSPECT_VALID"
+)"
 if [[ -z "$EXPECTED_IP" ]]; then
   echo "failed to determine expected IP from dns inspect output" >&2
   exit 1
@@ -488,7 +395,7 @@ live_lab_run_root "$CLIENT_HOST" "root systemctl restart rustynetd-managed-dns.s
 DNS_INSPECT_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect || true")"
 RUSTYNETD_STATE_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root systemctl is-active rustynetd.service || true")"
 RUSTYNETD_JOURNAL_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root journalctl -u rustynetd.service -n 40 --no-pager || true")"
-DIRECT_QUERY_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root python3 /tmp/rn-dns-query.py ${DNS_SERVER} ${DNS_PORT} ${MANAGED_FQDN}")"
+DIRECT_QUERY_STALE="$(live_lab_capture_root "$CLIENT_HOST" "root rustynet ops e2e-dns-query --server '${DNS_SERVER}' --port '${DNS_PORT}' --qname '${MANAGED_FQDN}' --timeout-ms 3000")"
 
 live_lab_log "Stale dns inspect"
 printf '%s\n' "$DNS_INSPECT_STALE"

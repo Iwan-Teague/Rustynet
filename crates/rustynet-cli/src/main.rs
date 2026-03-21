@@ -366,6 +366,24 @@ enum OpsCommand {
     WriteRealWireguardNoLeakUnderLoadReport {
         config: ops_live_lab_orchestrator::WriteRealWireguardNoLeakUnderLoadReportConfig,
     },
+    VerifyNoLeakDataplaneReport {
+        config: ops_live_lab_orchestrator::VerifyNoLeakDataplaneReportConfig,
+    },
+    E2eDnsQuery {
+        config: ops_live_lab_orchestrator::E2eDnsQueryConfig,
+    },
+    E2eHttpProbeServer {
+        config: ops_live_lab_orchestrator::E2eHttpProbeServerConfig,
+    },
+    E2eHttpProbeClient {
+        config: ops_live_lab_orchestrator::E2eHttpProbeClientConfig,
+    },
+    ReadJsonField {
+        config: ops_live_lab_orchestrator::ReadJsonFieldConfig,
+    },
+    ExtractManagedDnsExpectedIp {
+        config: ops_live_lab_orchestrator::ExtractManagedDnsExpectedIpConfig,
+    },
     WriteActiveNetworkSignedStateTamperReport {
         config: ops_live_lab_orchestrator::WriteActiveNetworkSignedStateTamperReportConfig,
     },
@@ -383,6 +401,9 @@ enum OpsCommand {
     },
     GenerateLinuxFreshInstallOsMatrixReport {
         config: ops_fresh_install_os_matrix::GenerateLinuxFreshInstallOsMatrixReportConfig,
+    },
+    VerifyLinuxFreshInstallOsMatrixReadiness {
+        config: ops_fresh_install_os_matrix::VerifyLinuxFreshInstallOsMatrixReadinessConfig,
     },
     SignReleaseArtifact,
     VerifyReleaseArtifact,
@@ -1190,6 +1211,60 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "verify-no-leak-dataplane-report" => Ok(OpsCommand::VerifyNoLeakDataplaneReport {
+            config: ops_live_lab_orchestrator::VerifyNoLeakDataplaneReportConfig {
+                report_path: parser.required_path("--report-path")?,
+            },
+        }),
+        "e2e-dns-query" => Ok(OpsCommand::E2eDnsQuery {
+            config: ops_live_lab_orchestrator::E2eDnsQueryConfig {
+                server: parser.required("--server")?,
+                port: parser
+                    .required("--port")?
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid value for --port: {err}"))?,
+                qname: parser.required("--qname")?,
+                timeout_ms: parser.parse_u64_or_default("--timeout-ms", 1000)?,
+                fail_on_no_response: parser.has_flag("--fail-on-no-response"),
+            },
+        }),
+        "e2e-http-probe-server" => Ok(OpsCommand::E2eHttpProbeServer {
+            config: ops_live_lab_orchestrator::E2eHttpProbeServerConfig {
+                bind_ip: parser.required("--bind-ip")?,
+                port: parser
+                    .required("--port")?
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid value for --port: {err}"))?,
+                response_body: parser
+                    .value("--response-body")
+                    .unwrap_or_else(|| "probe-ok".to_string()),
+            },
+        }),
+        "e2e-http-probe-client" => Ok(OpsCommand::E2eHttpProbeClient {
+            config: ops_live_lab_orchestrator::E2eHttpProbeClientConfig {
+                host: parser.required("--host")?,
+                port: parser
+                    .required("--port")?
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid value for --port: {err}"))?,
+                timeout_ms: parser.parse_u64_or_default("--timeout-ms", 2000)?,
+                expect_marker: parser
+                    .value("--expect-marker")
+                    .unwrap_or_else(|| "probe-ok".to_string()),
+            },
+        }),
+        "read-json-field" => Ok(OpsCommand::ReadJsonField {
+            config: ops_live_lab_orchestrator::ReadJsonFieldConfig {
+                payload: parser.required("--payload")?,
+                field: parser.required("--field")?,
+            },
+        }),
+        "extract-managed-dns-expected-ip" => Ok(OpsCommand::ExtractManagedDnsExpectedIp {
+            config: ops_live_lab_orchestrator::ExtractManagedDnsExpectedIpConfig {
+                fqdn: parser.required("--fqdn")?,
+                inspect_output: parser.required("--inspect-output")?,
+            },
+        }),
         "write-active-network-signed-state-tamper-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -1341,6 +1416,22 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         mint_os_version: parser
                             .value("--mint-os-version")
                             .unwrap_or_else(|| "Linux Mint".to_string()),
+                    },
+            })
+        }
+        "verify-linux-fresh-install-os-matrix-readiness" => {
+            Ok(OpsCommand::VerifyLinuxFreshInstallOsMatrixReadiness {
+                config:
+                    ops_fresh_install_os_matrix::VerifyLinuxFreshInstallOsMatrixReadinessConfig {
+                        report_path: parser.required_path("--report-path")?,
+                        max_age_seconds: parser
+                            .parse_u64_or_default("--max-age-seconds", 604800)?,
+                        profile: parser
+                            .value("--profile")
+                            .unwrap_or_else(|| "cross_platform".to_string()),
+                        expected_git_commit: parser
+                            .value("--expected-git-commit")
+                            .unwrap_or_default(),
                     },
             })
         }
@@ -2895,6 +2986,24 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 config,
             )
         }
+        OpsCommand::VerifyNoLeakDataplaneReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_verify_no_leak_dataplane_report(config)
+        }
+        OpsCommand::E2eDnsQuery { config } => {
+            ops_live_lab_orchestrator::execute_ops_e2e_dns_query(config)
+        }
+        OpsCommand::E2eHttpProbeServer { config } => {
+            ops_live_lab_orchestrator::execute_ops_e2e_http_probe_server(config)
+        }
+        OpsCommand::E2eHttpProbeClient { config } => {
+            ops_live_lab_orchestrator::execute_ops_e2e_http_probe_client(config)
+        }
+        OpsCommand::ReadJsonField { config } => {
+            ops_live_lab_orchestrator::execute_ops_read_json_field(config)
+        }
+        OpsCommand::ExtractManagedDnsExpectedIp { config } => {
+            ops_live_lab_orchestrator::execute_ops_extract_managed_dns_expected_ip(config)
+        }
         OpsCommand::WriteActiveNetworkSignedStateTamperReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_active_network_signed_state_tamper_report(
                 config,
@@ -2918,6 +3027,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::GenerateLinuxFreshInstallOsMatrixReport { config } => {
             ops_fresh_install_os_matrix::execute_ops_generate_linux_fresh_install_os_matrix_report(
+                config,
+            )
+        }
+        OpsCommand::VerifyLinuxFreshInstallOsMatrixReadiness { config } => {
+            ops_fresh_install_os_matrix::execute_ops_verify_linux_fresh_install_os_matrix_readiness(
                 config,
             )
         }
@@ -9240,12 +9354,19 @@ fn help_text() -> String {
         "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-real-wireguard-exitnode-e2e-report --report-path <path> --exit-status <pass|fail> --lan-off-status <pass|fail> --lan-on-status <pass|fail> --dns-up-status <pass|fail> --kill-switch-status <pass|fail> --dns-down-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-real-wireguard-no-leak-under-load-report --report-path <path> --load-pcap <path> --down-pcap <path> --tunnel-up-status <pass|fail> --load-ping-status <pass|fail> --tunnel-down-block-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops verify-no-leak-dataplane-report --report-path <path>",
+        "  ops e2e-dns-query --server <ip> --port <port> --qname <name> [--timeout-ms <ms>] [--fail-on-no-response]",
+        "  ops e2e-http-probe-server --bind-ip <ipv4> --port <port> [--response-body <text>]",
+        "  ops e2e-http-probe-client --host <ip> --port <port> [--timeout-ms <ms>] [--expect-marker <text>]",
+        "  ops read-json-field --payload <json> --field <name>",
+        "  ops extract-managed-dns-expected-ip --fqdn <name> --inspect-output <text>",
         "  ops write-active-network-signed-state-tamper-report --report-path <path> --baseline-status <pass|fail> --tamper-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --recovery-status <pass|fail> --exit-host <host> --client-host <host> --status-after-tamper <text> --netcheck-after-tamper <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
+        "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
         "  ops sign-release-artifact",
         "  ops verify-release-artifact",
         "  ops collect-platform-probe",
@@ -10140,6 +10261,75 @@ mod tests {
                 .contains("WriteRealWireguardNoLeakUnderLoadReport")
         );
 
+        let verify_no_leak_report = parse_command(&[
+            "ops".to_string(),
+            "verify-no-leak-dataplane-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/no_leak_dataplane_report.json".to_string(),
+        ]);
+        assert!(format!("{verify_no_leak_report:?}").contains("VerifyNoLeakDataplaneReport"));
+
+        let e2e_dns_query = parse_command(&[
+            "ops".to_string(),
+            "e2e-dns-query".to_string(),
+            "--server".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "53535".to_string(),
+            "--qname".to_string(),
+            "exit.rustynet".to_string(),
+            "--timeout-ms".to_string(),
+            "1000".to_string(),
+            "--fail-on-no-response".to_string(),
+        ]);
+        assert!(format!("{e2e_dns_query:?}").contains("E2eDnsQuery"));
+
+        let e2e_http_probe_server = parse_command(&[
+            "ops".to_string(),
+            "e2e-http-probe-server".to_string(),
+            "--bind-ip".to_string(),
+            "192.168.18.51".to_string(),
+            "--port".to_string(),
+            "18080".to_string(),
+            "--response-body".to_string(),
+            "probe-ok".to_string(),
+        ]);
+        assert!(format!("{e2e_http_probe_server:?}").contains("E2eHttpProbeServer"));
+
+        let e2e_http_probe_client = parse_command(&[
+            "ops".to_string(),
+            "e2e-http-probe-client".to_string(),
+            "--host".to_string(),
+            "192.168.18.51".to_string(),
+            "--port".to_string(),
+            "18080".to_string(),
+            "--timeout-ms".to_string(),
+            "2000".to_string(),
+            "--expect-marker".to_string(),
+            "probe-ok".to_string(),
+        ]);
+        assert!(format!("{e2e_http_probe_client:?}").contains("E2eHttpProbeClient"));
+
+        let read_json_field = parse_command(&[
+            "ops".to_string(),
+            "read-json-field".to_string(),
+            "--payload".to_string(),
+            "{\"rcode\":0}".to_string(),
+            "--field".to_string(),
+            "rcode".to_string(),
+        ]);
+        assert!(format!("{read_json_field:?}").contains("ReadJsonField"));
+
+        let extract_dns_expected_ip = parse_command(&[
+            "ops".to_string(),
+            "extract-managed-dns-expected-ip".to_string(),
+            "--fqdn".to_string(),
+            "exit.rustynet".to_string(),
+            "--inspect-output".to_string(),
+            "fqdn=exit.rustynet expected_ip=100.64.0.1".to_string(),
+        ]);
+        assert!(format!("{extract_dns_expected_ip:?}").contains("ExtractManagedDnsExpectedIp"));
+
         let write_active_network_signed_state_tamper_report = parse_command(&[
             "ops".to_string(),
             "write-active-network-signed-state-tamper-report".to_string(),
@@ -10323,6 +10513,23 @@ mod tests {
         assert!(
             format!("{generate_fresh_install_report:?}")
                 .contains("GenerateLinuxFreshInstallOsMatrixReport")
+        );
+
+        let verify_fresh_install_report = parse_command(&[
+            "ops".to_string(),
+            "verify-linux-fresh-install-os-matrix-readiness".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/fresh_install_os_matrix_report.json".to_string(),
+            "--max-age-seconds".to_string(),
+            "604800".to_string(),
+            "--profile".to_string(),
+            "linux".to_string(),
+            "--expected-git-commit".to_string(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+        ]);
+        assert!(
+            format!("{verify_fresh_install_report:?}")
+                .contains("VerifyLinuxFreshInstallOsMatrixReadiness")
         );
 
         let sign_release_artifact =

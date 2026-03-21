@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +196,47 @@ pub struct WriteRealWireguardNoLeakUnderLoadReportConfig {
     pub environment: String,
     pub captured_at_utc: String,
     pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyNoLeakDataplaneReportConfig {
+    pub report_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eDnsQueryConfig {
+    pub server: String,
+    pub port: u16,
+    pub qname: String,
+    pub timeout_ms: u64,
+    pub fail_on_no_response: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eHttpProbeServerConfig {
+    pub bind_ip: String,
+    pub port: u16,
+    pub response_body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eHttpProbeClientConfig {
+    pub host: String,
+    pub port: u16,
+    pub timeout_ms: u64,
+    pub expect_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadJsonFieldConfig {
+    pub payload: String,
+    pub field: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractManagedDnsExpectedIpConfig {
+    pub fqdn: String,
+    pub inspect_output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +536,163 @@ fn count_no_leak_cleartext_packets(lines: &[String]) -> u64 {
         .iter()
         .filter(|line| line.contains("IP 172.16.10.2") && line.contains(" > 198.18.0.1"))
         .count() as u64
+}
+
+fn validate_dns_qname(raw: &str) -> Result<String, String> {
+    let qname = raw.trim().trim_end_matches('.').to_string();
+    if qname.is_empty() {
+        return Err("qname must not be empty".to_string());
+    }
+    if qname.len() > 253 {
+        return Err("qname exceeds maximum DNS length".to_string());
+    }
+    for label in qname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(format!("invalid DNS label length in qname: {label:?}"));
+        }
+        if !label.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'
+            )
+        }) {
+            return Err(format!("invalid DNS label in qname: {label:?}"));
+        }
+    }
+    Ok(qname)
+}
+
+fn build_dns_query_packet(qname: &str) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(128);
+    packet.extend_from_slice(&0x1337u16.to_be_bytes());
+    packet.extend_from_slice(&0x0100u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    for label in qname.split('.') {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
+    let mut labels_seen = 0usize;
+    loop {
+        if offset >= packet.len() {
+            return Err("dns response truncated while reading name".to_string());
+        }
+        let len = packet[offset];
+        if len & 0b1100_0000 == 0b1100_0000 {
+            if offset + 1 >= packet.len() {
+                return Err("dns response truncated while reading compression pointer".to_string());
+            }
+            return Ok(offset + 2);
+        }
+        if len == 0 {
+            return Ok(offset + 1);
+        }
+        if len & 0b1100_0000 != 0 {
+            return Err("dns response contains invalid label encoding".to_string());
+        }
+        let label_len = len as usize;
+        if label_len > 63 {
+            return Err("dns response contains oversized label".to_string());
+        }
+        offset += 1;
+        if offset + label_len > packet.len() {
+            return Err("dns response truncated while reading label bytes".to_string());
+        }
+        offset += label_len;
+        labels_seen += 1;
+        if labels_seen > 128 {
+            return Err("dns response name parse exceeded label limit".to_string());
+        }
+    }
+}
+
+fn decode_first_dns_answer(
+    response: &[u8],
+    rcode: i64,
+    answer_count: u64,
+) -> Result<(i64, u64, String, u64), String> {
+    if response.len() < 12 {
+        return Err("dns response header is too short".to_string());
+    }
+    let mut offset = 12usize;
+    offset = skip_dns_name(response, offset)?;
+    if offset + 4 > response.len() {
+        return Err("dns response truncated in question tail".to_string());
+    }
+    offset += 4;
+
+    let mut answer_ip = String::new();
+    let mut answer_ttl = 0u64;
+    if answer_count > 0 {
+        offset = skip_dns_name(response, offset)?;
+        if offset + 10 > response.len() {
+            return Err("dns response truncated in answer header".to_string());
+        }
+        let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
+        let rr_class = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
+        let ttl = u32::from_be_bytes([
+            response[offset + 4],
+            response[offset + 5],
+            response[offset + 6],
+            response[offset + 7],
+        ]);
+        let rdlen = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rdlen > response.len() {
+            return Err("dns response truncated in answer payload".to_string());
+        }
+        if rr_type == 1 && rr_class == 1 && rdlen == 4 {
+            let addr = Ipv4Addr::new(
+                response[offset],
+                response[offset + 1],
+                response[offset + 2],
+                response[offset + 3],
+            );
+            answer_ip = addr.to_string();
+            answer_ttl = ttl as u64;
+        }
+    }
+    Ok((rcode, answer_count, answer_ip, answer_ttl))
+}
+
+fn is_plaintext_no_leak_report(payload: &Map<String, Value>) -> Result<(), String> {
+    if payload.get("status").and_then(Value::as_str) != Some(CHECK_PASS) {
+        return Err("no-leak dataplane report status must be pass".to_string());
+    }
+    let checks = payload
+        .get("checks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "no-leak dataplane report must contain non-empty checks".to_string())?;
+    if checks.is_empty() {
+        return Err("no-leak dataplane report must contain non-empty checks".to_string());
+    }
+    let failed = checks
+        .iter()
+        .filter_map(|(key, value)| {
+            if value.as_str() == Some(CHECK_PASS) {
+                None
+            } else {
+                Some(key.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "no-leak dataplane checks failed: {}",
+            failed.join(", ")
+        ))
+    }
 }
 
 fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
@@ -1818,6 +2016,223 @@ pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
         .and_then(Value::as_str)
         .unwrap_or(CHECK_FAIL)
         .to_string())
+}
+
+pub fn execute_ops_verify_no_leak_dataplane_report(
+    config: VerifyNoLeakDataplaneReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let body = fs::read_to_string(report_path.as_path())
+        .map_err(|err| format!("missing no-leak report: {} ({err})", report_path.display()))?;
+    let payload = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "invalid no-leak report JSON ({}): {err}",
+            report_path.display()
+        )
+    })?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "no-leak dataplane report must be a JSON object".to_string())?;
+    is_plaintext_no_leak_report(object)?;
+    Ok("No-leak dataplane gate: PASS".to_string())
+}
+
+pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, String> {
+    let server = config
+        .server
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|err| format!("invalid --server value {:?}: {err}", config.server))?;
+    let qname = validate_dns_qname(config.qname.as_str())?;
+    let timeout_ms = if config.timeout_ms == 0 {
+        1000
+    } else {
+        config.timeout_ms.min(60_000)
+    };
+    let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        .map_err(|err| format!("bind UDP socket failed: {err}"))?;
+    let timeout = Duration::from_millis(timeout_ms);
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("set UDP read timeout failed: {err}"))?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("set UDP write timeout failed: {err}"))?;
+
+    let packet = build_dns_query_packet(qname.as_str());
+    let server_addr = SocketAddr::new(server, config.port);
+    let mut result = json!({
+        "rcode": -1,
+        "answer_count": 0,
+        "answer_ip": "",
+        "answer_ttl": 0,
+        "error": "",
+    });
+
+    let query_outcome = (|| -> Result<(), String> {
+        socket
+            .send_to(packet.as_slice(), server_addr)
+            .map_err(|err| format!("dns query send failed: {err}"))?;
+        let mut response = [0u8; 512];
+        let (size, _) = socket
+            .recv_from(&mut response)
+            .map_err(|err| format!("dns query receive failed: {err}"))?;
+        if size < 12 {
+            return Err("dns response too short".to_string());
+        }
+        let flags = u16::from_be_bytes([response[2], response[3]]);
+        let rcode = (flags & 0x000F) as i64;
+        let answer_count = u16::from_be_bytes([response[6], response[7]]) as u64;
+        let (rcode, answer_count, answer_ip, answer_ttl) =
+            decode_first_dns_answer(&response[..size], rcode, answer_count)?;
+        result["rcode"] = Value::from(rcode);
+        result["answer_count"] = Value::from(answer_count);
+        result["answer_ip"] = Value::from(answer_ip);
+        result["answer_ttl"] = Value::from(answer_ttl);
+        Ok(())
+    })();
+
+    if let Err(err) = query_outcome {
+        result["error"] = Value::from(err);
+    }
+    let output =
+        serde_json::to_string(&result).map_err(|err| format!("serialize JSON failed: {err}"))?;
+    if config.fail_on_no_response
+        && result
+            .get("error")
+            .and_then(Value::as_str)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    {
+        return Err(result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("dns query failed")
+            .to_string());
+    }
+    Ok(output)
+}
+
+pub fn execute_ops_e2e_http_probe_server(
+    config: E2eHttpProbeServerConfig,
+) -> Result<String, String> {
+    let bind_ip = config
+        .bind_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| format!("invalid --bind-ip value {:?}: {err}", config.bind_ip))?;
+    let response_body = if config.response_body.is_empty() {
+        "probe-ok".to_string()
+    } else {
+        config.response_body
+    };
+    let listener = TcpListener::bind(SocketAddrV4::new(bind_ip, config.port))
+        .map_err(|err| format!("bind HTTP probe server failed: {err}"))?;
+    for incoming in listener.incoming() {
+        let mut stream = match incoming {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        let body = response_body.as_bytes();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            continue;
+        }
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    }
+    Err("HTTP probe server listener terminated unexpectedly".to_string())
+}
+
+pub fn execute_ops_e2e_http_probe_client(
+    config: E2eHttpProbeClientConfig,
+) -> Result<String, String> {
+    let host = config
+        .host
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|err| format!("invalid --host value {:?}: {err}", config.host))?;
+    let timeout_ms = if config.timeout_ms == 0 {
+        2000
+    } else {
+        config.timeout_ms.min(60_000)
+    };
+    let timeout = Duration::from_millis(timeout_ms);
+    let target = SocketAddr::new(host, config.port);
+    let mut stream = TcpStream::connect_timeout(&target, timeout)
+        .map_err(|err| format!("TCP connect failed: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("set TCP read timeout failed: {err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("set TCP write timeout failed: {err}"))?;
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: probe\r\n\r\n")
+        .map_err(|err| format!("TCP probe write failed: {err}"))?;
+    let mut response = vec![0u8; 4096];
+    let read_size = stream
+        .read(response.as_mut_slice())
+        .map_err(|err| format!("TCP probe read failed: {err}"))?;
+    let response_text = String::from_utf8_lossy(&response[..read_size]).to_string();
+    if !response_text.contains(config.expect_marker.as_str()) {
+        return Err("probe marker missing from response".to_string());
+    }
+    Ok(config.expect_marker)
+}
+
+pub fn execute_ops_read_json_field(config: ReadJsonFieldConfig) -> Result<String, String> {
+    let payload = serde_json::from_str::<Value>(config.payload.as_str())
+        .map_err(|err| format!("parse --payload JSON failed: {err}"))?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "--payload must be a JSON object".to_string())?;
+    let value = object.get(config.field.as_str());
+    match value {
+        None => Ok(String::new()),
+        Some(Value::Null) => Ok(String::new()),
+        Some(Value::Bool(flag)) => {
+            if *flag {
+                Ok("true".to_string())
+            } else {
+                Ok("false".to_string())
+            }
+        }
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Number(number)) => Ok(number.to_string()),
+        Some(other) => {
+            serde_json::to_string(other).map_err(|err| format!("serialize field failed: {err}"))
+        }
+    }
+}
+
+pub fn execute_ops_extract_managed_dns_expected_ip(
+    config: ExtractManagedDnsExpectedIpConfig,
+) -> Result<String, String> {
+    let fqdn = config.fqdn.trim().to_string();
+    if fqdn.is_empty() {
+        return Err("--fqdn must be non-empty".to_string());
+    }
+    let fqdn_token = format!("fqdn={fqdn}");
+    for line in config.inspect_output.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if !tokens.contains(&fqdn_token.as_str()) {
+            continue;
+        }
+        for token in tokens {
+            if let Some(value) = token.strip_prefix("expected_ip=") {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    Ok(String::new())
 }
 
 pub fn execute_ops_write_active_network_signed_state_tamper_report(
