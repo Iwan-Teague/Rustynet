@@ -1,19 +1,22 @@
 {
-  "phase": "phase10",
-  "suite": "traversal_probe_security",
-  "evidence_mode": "measured",
-  "environment": "ci",
-  "captured_at_unix": 1773011366,
-  "git_commit": "3e941348a9dffb53ffbd2641df63ba1c4e7bea21",
-  "status": "pass",
+  "captured_at_unix": 1774094198,
   "checks": {
-    "replay_rejected": "pass",
+    "backend_handshake_evidence_hardened": "pass",
     "fail_closed_on_invalid_traversal": "pass",
-    "no_unauthorized_endpoint_mutation": "pass",
     "managed_peer_coverage_required": "pass",
-    "unmanaged_peer_bundle_rejected": "pass",
-    "backend_handshake_evidence_hardened": "pass"
+    "no_unauthorized_endpoint_mutation": "pass",
+    "replay_rejected": "pass",
+    "unmanaged_peer_bundle_rejected": "pass"
   },
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "git_commit": "bb7ad385e3d89271f750e8637f6b79839e5625c2",
+  "log_artifacts": [
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/traversal_probe_security_tests.log"
+  ],
+  "phase": "phase10",
+  "status": "pass",
+  "suite": "traversal_probe_security",
   "validated_by_tests": [
     "daemon::tests::load_traversal_bundle_rejects_tampered_signature_and_replay",
     "daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed",
@@ -24,8 +27,5 @@
     "daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay",
     "rustynet-backend-wireguard::tests::latest_handshake_parser_rejects_oversized_or_malformed_output",
     "rustynet-backend-wireguard::tests::linux_backend_reads_latest_handshake_for_configured_peer"
-  ],
-  "log_artifacts": [
-    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/traversal_probe_security_tests.log"
   ]
 }

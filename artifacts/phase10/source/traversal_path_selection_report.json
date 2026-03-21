@@ -1,25 +1,25 @@
 {
-  "phase": "phase10",
-  "suite": "traversal_path_selection",
-  "evidence_mode": "measured",
-  "environment": "ci",
-  "captured_at_unix": 1773011366,
-  "git_commit": "3e941348a9dffb53ffbd2641df63ba1c4e7bea21",
-  "status": "pass",
+  "captured_at_unix": 1774094198,
   "checks": {
-    "direct_probe_success": "pass",
-    "relay_fallback_success": "pass",
     "direct_failback_success": "pass",
-    "multi_peer_snapshot_success": "pass"
+    "direct_probe_success": "pass",
+    "multi_peer_snapshot_success": "pass",
+    "relay_fallback_success": "pass"
   },
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "git_commit": "bb7ad385e3d89271f750e8637f6b79839e5625c2",
+  "log_artifacts": [
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/traversal_path_selection_tests.log"
+  ],
+  "phase": "phase10",
+  "status": "pass",
+  "suite": "traversal_path_selection",
   "validated_by_tests": [
     "daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_accepts_multi_peer_snapshot",
     "daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence",
     "daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives",
     "phase10::tests::traversal_probe_falls_back_to_relay_when_handshake_does_not_advance",
     "phase10::tests::traversal_probe_promotes_direct_when_handshake_advances"
-  ],
-  "log_artifacts": [
-    "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/traversal_path_selection_tests.log"
   ]
 }

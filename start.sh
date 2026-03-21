@@ -2043,16 +2043,43 @@ lockdown_blind_exit_local_material() {
   return 0
 }
 
-generate_verifier_key_from_signer() {
+ensure_local_trust_material_with_rust() {
   local signing_passphrase_file="$1"
-  run_root rustynet trust export-verifier-key \
-    --signing-key "${TRUST_SIGNER_KEY_PATH}" \
-    --signing-key-passphrase-file "${signing_passphrase_file}" \
-    --output "${TRUST_VERIFIER_KEY_PATH}"
-  run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
-  if is_macos_host; then
-    run_root chown "$(id -u):$(id -g)" "${TRUST_VERIFIER_KEY_PATH}"
+  if ! command -v rustynet >/dev/null 2>&1; then
+    print_err "rustynet CLI is required for local trust material operations."
+    return 1
   fi
+
+  local rust_trust_output=""
+  if is_linux_host; then
+    if ! rust_trust_output="$(run_root env \
+      RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+      RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+      rustynet ops ensure-local-trust-material \
+        --signing-key-passphrase-file "${signing_passphrase_file}" 2>&1)"; then
+      print_err "Rust-backed local trust material ensure failed; setup is fail-closed."
+      [[ -n "${rust_trust_output}" ]] && print_err "${rust_trust_output}"
+      return 1
+    fi
+  elif is_macos_host; then
+    if ! rust_trust_output="$(env \
+      RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
+      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
+      RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
+      rustynet ops ensure-local-trust-material \
+        --signing-key-passphrase-file "${signing_passphrase_file}" 2>&1)"; then
+      print_err "Rust-backed local trust material ensure failed; setup is fail-closed."
+      [[ -n "${rust_trust_output}" ]] && print_err "${rust_trust_output}"
+      return 1
+    fi
+  else
+    print_err "Unsupported host profile for local trust material ensure: ${HOST_PROFILE}"
+    return 1
+  fi
+
+  [[ -n "${rust_trust_output}" ]] && print_info "${rust_trust_output}"
+  return 0
 }
 
 refresh_signed_trust_evidence() {
@@ -2142,16 +2169,9 @@ configure_trust_material() {
     if ! materialize_signing_passphrase_file signing_passphrase_file; then
       return 1
     fi
-    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
-      run_root rustynet trust keygen \
-        --signing-key-output "${TRUST_SIGNER_KEY_PATH}" \
-        --signing-key-passphrase-file "${signing_passphrase_file}" \
-        --verifier-key-output "${TRUST_VERIFIER_KEY_PATH}" \
-        --force
-      run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
-      print_warn "Generated local trust signer key at ${TRUST_SIGNER_KEY_PATH} for blind_exit role."
-    else
-      generate_verifier_key_from_signer "${signing_passphrase_file}"
+    if ! ensure_local_trust_material_with_rust "${signing_passphrase_file}"; then
+      secure_remove_file_with_scope "${signing_passphrase_file}" || return 1
+      return 1
     fi
     secure_remove_file_with_scope "${signing_passphrase_file}"
     refresh_signed_trust_evidence
@@ -2194,16 +2214,9 @@ configure_trust_material() {
     if ! materialize_signing_passphrase_file signing_passphrase_file; then
       return 1
     fi
-    if [[ ! -f "${TRUST_SIGNER_KEY_PATH}" ]]; then
-      run_root rustynet trust keygen \
-        --signing-key-output "${TRUST_SIGNER_KEY_PATH}" \
-        --signing-key-passphrase-file "${signing_passphrase_file}" \
-        --verifier-key-output "${TRUST_VERIFIER_KEY_PATH}" \
-        --force
-      run_root chmod 0644 "${TRUST_VERIFIER_KEY_PATH}"
-      print_warn "Generated local signer key at ${TRUST_SIGNER_KEY_PATH} (lab/dev only)."
-    else
-      generate_verifier_key_from_signer "${signing_passphrase_file}"
+    if ! ensure_local_trust_material_with_rust "${signing_passphrase_file}"; then
+      secure_remove_file_with_scope "${signing_passphrase_file}" || return 1
+      return 1
     fi
     secure_remove_file_with_scope "${signing_passphrase_file}"
     refresh_signed_trust_evidence
@@ -2975,33 +2988,21 @@ force_local_assignment_refresh_now() {
   fi
 
   print_info "Forcing local assignment bundle refresh (signed) to apply role/exit changes immediately."
-  run_root rm -f "${AUTO_TUNNEL_BUNDLE_PATH}" "${AUTO_TUNNEL_WATERMARK_PATH}"
   if ! command -v rustynet >/dev/null 2>&1; then
-    print_warn "rustynet CLI is required to run local assignment refresh service."
+    print_warn "rustynet CLI is required to run forced local assignment refresh."
     return 1
   fi
   local rust_assignment_refresh_output=""
-  if ! rust_assignment_refresh_output="$(run_root rustynet ops start-assignment-refresh-service 2>&1)"; then
-    print_warn "Failed to run rustynetd-assignment-refresh.service."
+  if ! rust_assignment_refresh_output="$(run_root env \
+    RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
+    RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
+    RUSTYNET_SOCKET="${SOCKET_PATH}" \
+    rustynet ops force-local-assignment-refresh-now 2>&1)"; then
+    print_warn "Rust-backed forced local assignment refresh failed."
     [[ -n "${rust_assignment_refresh_output}" ]] && print_warn "${rust_assignment_refresh_output}"
     return 1
   fi
   [[ -n "${rust_assignment_refresh_output}" ]] && print_info "${rust_assignment_refresh_output}"
-  if ! command -v rustynet >/dev/null 2>&1; then
-    print_warn "rustynet CLI is required to restart runtime after forced assignment refresh."
-    return 1
-  fi
-  local rust_restart_output=""
-  if ! rust_restart_output="$(run_root rustynet ops restart-runtime-service 2>&1)"; then
-    print_warn "Failed to restart rustynetd.service after forced assignment refresh."
-    [[ -n "${rust_restart_output}" ]] && print_warn "${rust_restart_output}"
-    return 1
-  fi
-  [[ -n "${rust_restart_output}" ]] && print_info "${rust_restart_output}"
-  if ! wait_for_daemon_socket_ready 20; then
-    print_warn "Daemon socket did not become ready after assignment refresh restart."
-    return 1
-  fi
   return 0
 }
 

@@ -55,10 +55,11 @@ use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
-    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
-    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
-    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
+    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_TRUST_VERIFIER_KEY_PATH,
+    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    verify_signed_assignment_state_artifact, verify_signed_traversal_state_artifact,
+    verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -456,6 +457,9 @@ enum OpsCommand {
         path: PathBuf,
     },
     EnsureSigningPassphraseMaterial,
+    EnsureLocalTrustMaterial {
+        signing_key_passphrase_path: PathBuf,
+    },
     MaterializeSigningPassphrase {
         output_path: PathBuf,
     },
@@ -463,6 +467,7 @@ enum OpsCommand {
         env_path: PathBuf,
         exit_node_id: Option<String>,
     },
+    ForceLocalAssignmentRefreshNow,
     ApplyLanAccessCoupling {
         enable: bool,
         lan_routes: Vec<String>,
@@ -1667,6 +1672,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::EnsureSigningPassphraseMaterial)
         }
+        "ensure-local-trust-material" => Ok(OpsCommand::EnsureLocalTrustMaterial {
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
+        }),
         "materialize-signing-passphrase" => Ok(OpsCommand::MaterializeSigningPassphrase {
             output_path: parser.required_path("--output")?,
         }),
@@ -1683,6 +1691,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 }
             }),
         }),
+        "force-local-assignment-refresh-now" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops force-local-assignment-refresh-now does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::ForceLocalAssignmentRefreshNow)
+        }
         "apply-lan-access-coupling" => {
             let enable = parse_bool_value(
                 "--enable",
@@ -3197,6 +3213,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::EnsureSigningPassphraseMaterial => {
             execute_ops_ensure_signing_passphrase_material()
         }
+        OpsCommand::EnsureLocalTrustMaterial {
+            signing_key_passphrase_path,
+        } => execute_ops_ensure_local_trust_material(signing_key_passphrase_path),
         OpsCommand::MaterializeSigningPassphrase { output_path } => {
             execute_ops_materialize_signing_passphrase(output_path)
         }
@@ -3204,6 +3223,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             env_path,
             exit_node_id,
         } => execute_ops_set_assignment_refresh_exit_node(env_path, exit_node_id),
+        OpsCommand::ForceLocalAssignmentRefreshNow => {
+            execute_ops_force_local_assignment_refresh_now()
+        }
         OpsCommand::ApplyLanAccessCoupling {
             enable,
             lan_routes,
@@ -3611,8 +3633,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
 fn execute_ops_verify_runtime_binary_custody() -> Result<String, String> {
     enforce_pinned_runtime_binary_custody("runtime-binary-custody")?;
     Ok(format!(
-        "runtime binary custody verification passed: {}",
-        PINNED_RUNTIME_RUSTYNET_BIN
+        "runtime binary custody verification passed: {PINNED_RUNTIME_RUSTYNET_BIN}"
     ))
 }
 
@@ -4642,6 +4663,15 @@ fn execute_ops_check_assignment_refresh_availability() -> Result<String, String>
         env_path.display(),
         DEFAULT_ASSIGNMENT_REFRESH_SYSTEMD_SERVICE
     ))
+}
+
+fn execute_ops_force_local_assignment_refresh_now() -> Result<String, String> {
+    require_root_execution()?;
+    if !cfg!(target_os = "linux") {
+        return Err("force-local-assignment-refresh-now is supported on Linux only".to_string());
+    }
+    force_local_assignment_refresh_now_ops()?;
+    Ok("forced local assignment refresh completed".to_string())
 }
 
 fn execute_ops_install_trust_material(
@@ -6230,6 +6260,114 @@ fn execute_ops_ensure_signing_passphrase_material() -> Result<String, String> {
     let config = signing_passphrase_ops_config_from_env()?;
     ensure_signing_passphrase_material_ops(&config)?;
     Ok("signing passphrase material verified".to_string())
+}
+
+fn execute_ops_ensure_local_trust_material(
+    signing_key_passphrase_path: PathBuf,
+) -> Result<String, String> {
+    if !signing_key_passphrase_path.is_absolute() {
+        return Err(format!(
+            "signing key passphrase file path must be absolute: {}",
+            signing_key_passphrase_path.display()
+        ));
+    }
+    ensure_regular_file_no_symlink(
+        signing_key_passphrase_path.as_path(),
+        "signing key passphrase file",
+    )?;
+
+    let config = signing_passphrase_ops_config_from_env()?;
+    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
+        require_root_execution()?;
+    }
+
+    let trust_signer_key_path = config.trust_signer_key_path;
+    let trust_verifier_key_path = env_path_or_default(
+        "RUSTYNET_TRUST_VERIFIER_KEY",
+        DEFAULT_TRUST_VERIFIER_KEY_PATH,
+    )?;
+
+    let verifier_parent = trust_verifier_key_path.parent().ok_or_else(|| {
+        format!(
+            "trust verifier key path has no parent directory: {}",
+            trust_verifier_key_path.display()
+        )
+    })?;
+    let verifier_parent_metadata = fs::symlink_metadata(verifier_parent).map_err(|err| {
+        format!(
+            "inspect trust verifier parent directory failed ({}): {err}",
+            verifier_parent.display()
+        )
+    })?;
+    if verifier_parent_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "trust verifier parent directory must not be a symlink: {}",
+            verifier_parent.display()
+        ));
+    }
+    if !verifier_parent_metadata.file_type().is_dir() {
+        return Err(format!(
+            "trust verifier parent path must be a directory: {}",
+            verifier_parent.display()
+        ));
+    }
+
+    let (signing_key, initialized_signer) = if trust_signer_key_path.exists() {
+        (
+            load_signing_key(
+                trust_signer_key_path.as_path(),
+                signing_key_passphrase_path.as_path(),
+            )?,
+            false,
+        )
+    } else {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing_key = SigningKey::from_bytes(&seed);
+        let persist_result = persist_encrypted_secret_material(
+            trust_signer_key_path.as_path(),
+            &seed,
+            signing_key_passphrase_path.as_path(),
+            "trust signing key",
+            false,
+        );
+        seed.zeroize();
+        persist_result?;
+        (signing_key, true)
+    };
+    let verifier_key_hex = hex_bytes(signing_key.verifying_key().as_bytes());
+    let verifier_payload = format!("{verifier_key_hex}\n");
+
+    let verifier_tmp = create_secure_temp_file(verifier_parent, "trust-verifier.tmp.")?;
+    if let Err(err) =
+        write_private_bytes_to_file(verifier_tmp.as_path(), verifier_payload.as_bytes())
+    {
+        let _ = remove_file_if_present(verifier_tmp.as_path());
+        return Err(err);
+    }
+
+    let (owner, group) = match config.host_profile {
+        SigningPassphraseHostProfile::Linux => (Uid::from_raw(0), Gid::from_raw(0)),
+        SigningPassphraseHostProfile::Macos => (Uid::effective(), Gid::effective()),
+    };
+    if let Err(err) = publish_file_with_owner_mode(
+        verifier_tmp.as_path(),
+        trust_verifier_key_path.as_path(),
+        owner,
+        group,
+        0o644,
+        "trust verifier key",
+    ) {
+        let _ = remove_file_if_present(verifier_tmp.as_path());
+        return Err(err);
+    }
+
+    Ok(format!(
+        "local trust material ensured: signing_key={} verifier_key={} initialized_signer={}",
+        trust_signer_key_path.display(),
+        trust_verifier_key_path.display(),
+        initialized_signer
+    ))
 }
 
 fn execute_ops_materialize_signing_passphrase(output_path: PathBuf) -> Result<String, String> {
@@ -9591,8 +9729,10 @@ fn help_text() -> String {
         "  ops init-membership",
         "  ops secure-remove --path <absolute-path>",
         "  ops ensure-signing-passphrase-material",
+        "  ops ensure-local-trust-material --signing-key-passphrase-file <absolute-path>",
         "  ops materialize-signing-passphrase --output <absolute-path>",
         "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
+        "  ops force-local-assignment-refresh-now",
         "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
         "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
         "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
@@ -10912,6 +11052,14 @@ mod tests {
         ]);
         assert!(format!("{ensure_signing:?}").contains("EnsureSigningPassphraseMaterial"));
 
+        let ensure_local_trust = parse_command(&[
+            "ops".to_string(),
+            "ensure-local-trust-material".to_string(),
+            "--signing-key-passphrase-file".to_string(),
+            "/tmp/signing-passphrase".to_string(),
+        ]);
+        assert!(format!("{ensure_local_trust:?}").contains("EnsureLocalTrustMaterial"));
+
         let materialize_signing = parse_command(&[
             "ops".to_string(),
             "materialize-signing-passphrase".to_string(),
@@ -10929,6 +11077,12 @@ mod tests {
             "exit-40".to_string(),
         ]);
         assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
+
+        let force_assignment_refresh = parse_command(&[
+            "ops".to_string(),
+            "force-local-assignment-refresh-now".to_string(),
+        ]);
+        assert!(format!("{force_assignment_refresh:?}").contains("ForceLocalAssignmentRefreshNow"));
 
         let lan_coupling = parse_command(&[
             "ops".to_string(),
