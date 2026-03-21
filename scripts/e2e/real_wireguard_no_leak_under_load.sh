@@ -12,7 +12,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-for cmd in ip wg nft python3 ping timeout tcpdump; do
+for cmd in ip wg nft ping timeout tcpdump cargo; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
@@ -52,6 +52,40 @@ ns() {
   local namespace="$1"
   shift
   ip netns exec "${namespace}" "$@"
+}
+
+send_udp_probe() {
+  local namespace="$1"
+  local ip="$2"
+  local port="$3"
+  local payload="$4"
+  ns "${namespace}" env RUSTYNET_UDP_PAYLOAD="${payload}" timeout 2 bash -lc "printf '%s' \"\$RUSTYNET_UDP_PAYLOAD\" >/dev/udp/${ip}/${port}"
+}
+
+write_json_report() {
+  local tunnel_up_status="$1"
+  local load_ping_status="$2"
+  local tunnel_down_block_status="$3"
+
+  local environment="${RUSTYNET_NO_LEAK_ENVIRONMENT:-lab-netns}"
+  local captured_at_utc
+  local captured_at_unix
+  local overall
+  captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  captured_at_unix="$(date -u +%s)"
+  overall="$(
+    cargo run --quiet -p rustynet-cli -- ops write-real-wireguard-no-leak-under-load-report \
+      --report-path "${REPORT_PATH}" \
+      --load-pcap "${LOAD_PCAP}" \
+      --down-pcap "${DOWN_PCAP}" \
+      --tunnel-up-status "${tunnel_up_status}" \
+      --load-ping-status "${load_ping_status}" \
+      --tunnel-down-block-status "${tunnel_down_block_status}" \
+      --environment "${environment}" \
+      --captured-at-utc "${captured_at_utc}" \
+      --captured-at-unix "${captured_at_unix}"
+  )"
+  [[ "${overall}" == "pass" ]]
 }
 
 ip netns add "${NS_CLIENT}"
@@ -129,16 +163,11 @@ sleep 1
 if ns "${NS_CLIENT}" timeout 6 ping -i 0.05 -W 1 198.18.0.1 >/dev/null 2>&1; then
   LOAD_PING_STATUS="pass"
 fi
-ns "${NS_CLIENT}" python3 - <<'PY'
-import socket
-import time
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-end = time.time() + 4.0
-while time.time() < end:
-    sock.sendto(b"rustynet-load", ("198.18.0.1", 53))
-    time.sleep(0.02)
-sock.close()
-PY
+load_probe_end=$((SECONDS + 4))
+while (( SECONDS < load_probe_end )); do
+  send_udp_probe "${NS_CLIENT}" "198.18.0.1" "53" "rustynet-load" >/dev/null 2>&1 || true
+  sleep 0.02
+done
 
 sleep 1
 kill "${TCPDUMP_LOAD_PID}" >/dev/null 2>&1 || true
@@ -155,108 +184,14 @@ if ! ns "${NS_CLIENT}" timeout 4 ping -i 0.2 -W 1 198.18.0.1 >/dev/null 2>&1; th
   TUNNEL_DOWN_BLOCK_STATUS="pass"
 fi
 
-ns "${NS_CLIENT}" python3 - <<'PY' >/dev/null 2>&1 || true
-import socket
-for _ in range(8):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.sendto(b"rustynet-down", ("198.18.0.1", 53))
-    finally:
-        sock.close()
-PY
+for _ in {1..8}; do
+  send_udp_probe "${NS_CLIENT}" "198.18.0.1" "53" "rustynet-down" >/dev/null 2>&1 || true
+done
 
 sleep 1
 kill "${TCPDUMP_DOWN_PID}" >/dev/null 2>&1 || true
 wait "${TCPDUMP_DOWN_PID}" >/dev/null 2>&1 || true
 TCPDUMP_DOWN_PID=""
 
-ENVIRONMENT="${RUSTYNET_NO_LEAK_ENVIRONMENT:-lab-netns}"
-python3 - "${LOAD_PCAP}" "${DOWN_PCAP}" "${REPORT_PATH}" "${TUNNEL_UP_STATUS}" "${LOAD_PING_STATUS}" "${TUNNEL_DOWN_BLOCK_STATUS}" "${ENVIRONMENT}" <<'PY'
-import json
-import subprocess
-import sys
-from datetime import datetime, timezone
-
-(
-    load_pcap,
-    down_pcap,
-    report_path,
-    tunnel_up_status,
-    load_ping_status,
-    tunnel_down_block_status,
-    environment,
-) = sys.argv[1:]
-
-
-def tcpdump_lines(path: str):
-    result = subprocess.run(
-        ["tcpdump", "-nn", "-r", path],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode not in (0, 1):
-        raise SystemExit(f"tcpdump decode failed for {path}: {result.stderr.strip()}")
-    return result.stdout.splitlines()
-
-
-def count_tunnel_packets(lines):
-    return sum(
-        1
-        for line in lines
-        if "IP 172.16.10.2." in line and " > 172.16.10.1.51820: UDP" in line
-    )
-
-
-def count_cleartext_packets(lines):
-    return sum(
-        1
-        for line in lines
-        if "IP 172.16.10.2" in line and " > 198.18.0.1" in line
-    )
-
-
-load_lines = tcpdump_lines(load_pcap)
-down_lines = tcpdump_lines(down_pcap)
-
-load_tunnel_packets = count_tunnel_packets(load_lines)
-load_cleartext_packets = count_cleartext_packets(load_lines)
-down_cleartext_packets = count_cleartext_packets(down_lines)
-
-checks = {
-    "tunnel_up_connectivity": tunnel_up_status,
-    "load_ping_success": load_ping_status,
-    "tunnel_transport_observed_under_load": "pass" if load_tunnel_packets > 0 else "fail",
-    "no_underlay_cleartext_during_load": "pass" if load_cleartext_packets == 0 else "fail",
-    "tunnel_down_fail_closed": tunnel_down_block_status,
-    "no_underlay_cleartext_after_tunnel_down": "pass" if down_cleartext_packets == 0 else "fail",
-}
-overall = "pass" if all(value == "pass" for value in checks.values()) else "fail"
-
-captured_at = datetime.now(timezone.utc)
-report = {
-    "phase": "phase10",
-    "mode": "real_netns_no_leak_under_load",
-    "evidence_mode": "measured",
-    "environment": environment,
-    "captured_at": captured_at.isoformat(),
-    "captured_at_unix": int(captured_at.timestamp()),
-    "status": overall,
-    "checks": checks,
-    "metrics": {
-        "load_tunnel_packets": load_tunnel_packets,
-        "load_cleartext_packets": load_cleartext_packets,
-        "down_cleartext_packets": down_cleartext_packets,
-    },
-    "source_artifacts": [load_pcap, down_pcap],
-}
-
-with open(report_path, "w", encoding="utf-8") as fh:
-    json.dump(report, fh, indent=2)
-    fh.write("\n")
-
-if overall != "pass":
-    raise SystemExit("no-leak dataplane gate failed")
-PY
-
+write_json_report "${TUNNEL_UP_STATUS}" "${LOAD_PING_STATUS}" "${TUNNEL_DOWN_BLOCK_STATUS}"
 echo "No-leak dataplane report written to ${REPORT_PATH}"

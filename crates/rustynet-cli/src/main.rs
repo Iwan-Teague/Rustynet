@@ -363,6 +363,9 @@ enum OpsCommand {
     WriteRealWireguardExitnodeE2eReport {
         config: ops_live_lab_orchestrator::WriteRealWireguardExitnodeE2eReportConfig,
     },
+    WriteRealWireguardNoLeakUnderLoadReport {
+        config: ops_live_lab_orchestrator::WriteRealWireguardNoLeakUnderLoadReportConfig,
+    },
     WriteActiveNetworkSignedStateTamperReport {
         config: ops_live_lab_orchestrator::WriteActiveNetworkSignedStateTamperReportConfig,
     },
@@ -1153,6 +1156,32 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     dns_up_status: parser.required("--dns-up-status")?,
                     kill_switch_status: parser.required("--kill-switch-status")?,
                     dns_down_status: parser.required("--dns-down-status")?,
+                    environment: parser
+                        .value("--environment")
+                        .unwrap_or_else(|| "lab-netns".to_string()),
+                    captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                    captured_at_unix,
+                },
+            })
+        }
+        "write-real-wireguard-no-leak-under-load-report" => {
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteRealWireguardNoLeakUnderLoadReport {
+                config: ops_live_lab_orchestrator::WriteRealWireguardNoLeakUnderLoadReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    load_pcap: parser.required_path("--load-pcap")?,
+                    down_pcap: parser.required_path("--down-pcap")?,
+                    tunnel_up_status: parser.required("--tunnel-up-status")?,
+                    load_ping_status: parser.required("--load-ping-status")?,
+                    tunnel_down_block_status: parser.required("--tunnel-down-block-status")?,
                     environment: parser
                         .value("--environment")
                         .unwrap_or_else(|| "lab-netns".to_string()),
@@ -2860,6 +2889,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::WriteRealWireguardExitnodeE2eReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_real_wireguard_exitnode_e2e_report(config)
+        }
+        OpsCommand::WriteRealWireguardNoLeakUnderLoadReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_real_wireguard_no_leak_under_load_report(
+                config,
+            )
         }
         OpsCommand::WriteActiveNetworkSignedStateTamperReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_active_network_signed_state_tamper_report(
@@ -9205,6 +9239,7 @@ fn help_text() -> String {
         "  ops rewrite-assignment-mesh-cidr --assignment-path <path> --mesh-cidr <ipv4-cidr>",
         "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-real-wireguard-exitnode-e2e-report --report-path <path> --exit-status <pass|fail> --lan-off-status <pass|fail> --lan-on-status <pass|fail> --dns-up-status <pass|fail> --kill-switch-status <pass|fail> --dns-down-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops write-real-wireguard-no-leak-under-load-report --report-path <path> --load-pcap <path> --down-pcap <path> --tunnel-up-status <pass|fail> --load-ping-status <pass|fail> --tunnel-down-block-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-active-network-signed-state-tamper-report --report-path <path> --baseline-status <pass|fail> --tamper-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --recovery-status <pass|fail> --exit-host <host> --client-host <host> --status-after-tamper <text> --netcheck-after-tamper <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
@@ -10080,6 +10115,29 @@ mod tests {
         assert!(
             format!("{write_real_wireguard_exitnode_e2e_report:?}")
                 .contains("WriteRealWireguardExitnodeE2eReport")
+        );
+
+        let write_real_wireguard_no_leak_report = parse_command(&[
+            "ops".to_string(),
+            "write-real-wireguard-no-leak-under-load-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/no_leak_dataplane_report.json".to_string(),
+            "--load-pcap".to_string(),
+            "/tmp/load.pcap".to_string(),
+            "--down-pcap".to_string(),
+            "/tmp/down.pcap".to_string(),
+            "--tunnel-up-status".to_string(),
+            "pass".to_string(),
+            "--load-ping-status".to_string(),
+            "pass".to_string(),
+            "--tunnel-down-block-status".to_string(),
+            "pass".to_string(),
+            "--environment".to_string(),
+            "lab-netns".to_string(),
+        ]);
+        assert!(
+            format!("{write_real_wireguard_no_leak_report:?}")
+                .contains("WriteRealWireguardNoLeakUnderLoadReport")
         );
 
         let write_active_network_signed_state_tamper_report = parse_command(&[

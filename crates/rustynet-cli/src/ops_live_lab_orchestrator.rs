@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
@@ -179,6 +180,19 @@ pub struct WriteRealWireguardExitnodeE2eReportConfig {
     pub dns_up_status: String,
     pub kill_switch_status: String,
     pub dns_down_status: String,
+    pub environment: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRealWireguardNoLeakUnderLoadReportConfig {
+    pub report_path: PathBuf,
+    pub load_pcap: PathBuf,
+    pub down_pcap: PathBuf,
+    pub tunnel_up_status: String,
+    pub load_ping_status: String,
+    pub tunnel_down_block_status: String,
     pub environment: String,
     pub captured_at_utc: String,
     pub captured_at_unix: u64,
@@ -431,6 +445,56 @@ fn parse_pass_fail_skip(value: &str, label: &str) -> Result<String, String> {
             "{label} must be pass, fail, or skipped (got: {value:?})"
         ))
     }
+}
+
+fn decode_tcpdump_lines(path: &Path) -> Result<Vec<String>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("stat pcap failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "pcap path must not be a symlink: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "pcap path must be a regular file: {}",
+            path.display()
+        ));
+    }
+    let output = Command::new("tcpdump")
+        .arg("-nn")
+        .arg("-r")
+        .arg(path)
+        .output()
+        .map_err(|err| format!("tcpdump decode failed ({}): {err}", path.display()))?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "tcpdump decode failed ({}): {}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("decode tcpdump output failed ({}): {err}", path.display()))?;
+    Ok(stdout.lines().map(ToString::to_string).collect())
+}
+
+fn count_no_leak_tunnel_packets(lines: &[String]) -> u64 {
+    lines
+        .iter()
+        .filter(|line| {
+            line.contains("IP 172.16.10.2.") && line.contains(" > 172.16.10.1.51820: UDP")
+        })
+        .count() as u64
+}
+
+fn count_no_leak_cleartext_packets(lines: &[String]) -> u64 {
+    lines
+        .iter()
+        .filter(|line| line.contains("IP 172.16.10.2") && line.contains(" > 198.18.0.1"))
+        .count() as u64
 }
 
 fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
@@ -1674,6 +1738,88 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
         .to_string())
 }
 
+pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
+    config: WriteRealWireguardNoLeakUnderLoadReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let load_pcap = resolve_path(config.load_pcap.as_path())?;
+    let down_pcap = resolve_path(config.down_pcap.as_path())?;
+    let tunnel_up_status = parse_pass_fail(config.tunnel_up_status.as_str(), "--tunnel-up-status")?;
+    let load_ping_status = parse_pass_fail(config.load_ping_status.as_str(), "--load-ping-status")?;
+    let tunnel_down_block_status = parse_pass_fail(
+        config.tunnel_down_block_status.as_str(),
+        "--tunnel-down-block-status",
+    )?;
+    let environment = if config.environment.trim().is_empty() {
+        "lab-netns".to_string()
+    } else {
+        config.environment.trim().to_string()
+    };
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let load_lines = decode_tcpdump_lines(load_pcap.as_path())?;
+    let down_lines = decode_tcpdump_lines(down_pcap.as_path())?;
+    let load_tunnel_packets = count_no_leak_tunnel_packets(&load_lines);
+    let load_cleartext_packets = count_no_leak_cleartext_packets(&load_lines);
+    let down_cleartext_packets = count_no_leak_cleartext_packets(&down_lines);
+
+    let checks = json!({
+        "tunnel_up_connectivity": tunnel_up_status,
+        "load_ping_success": load_ping_status,
+        "tunnel_transport_observed_under_load": if load_tunnel_packets > 0 { CHECK_PASS } else { CHECK_FAIL },
+        "no_underlay_cleartext_during_load": if load_cleartext_packets == 0 { CHECK_PASS } else { CHECK_FAIL },
+        "tunnel_down_fail_closed": tunnel_down_block_status,
+        "no_underlay_cleartext_after_tunnel_down": if down_cleartext_packets == 0 { CHECK_PASS } else { CHECK_FAIL },
+    });
+    let status = if checks
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .all(|value| value.as_str() == Some(CHECK_PASS))
+        })
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "real_netns_no_leak_under_load",
+        "evidence_mode": "measured",
+        "environment": environment,
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": status,
+        "checks": checks,
+        "metrics": {
+            "load_tunnel_packets": load_tunnel_packets,
+            "load_cleartext_packets": load_cleartext_packets,
+            "down_cleartext_packets": down_cleartext_packets,
+        },
+        "source_artifacts": [
+            load_pcap.display().to_string(),
+            down_pcap.display().to_string()
+        ],
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
 pub fn execute_ops_write_active_network_signed_state_tamper_report(
     config: WriteActiveNetworkSignedStateTamperReportConfig,
 ) -> Result<String, String> {
@@ -1854,7 +2000,8 @@ mod tests {
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLinuxControlSurfaceReportConfig,
         WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
         WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
-        WriteRoleSwitchMatrixReportConfig, execute_ops_check_local_file_mode,
+        WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
+        count_no_leak_tunnel_packets, execute_ops_check_local_file_mode,
         execute_ops_rewrite_assignment_mesh_cidr, execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
         execute_ops_write_active_network_rogue_path_hijack_report,
@@ -2153,6 +2300,21 @@ mod tests {
         assert!(body.contains("\"mode\": \"real_netns_wireguard\""));
         assert!(body.contains("\"dns_fail_close_when_tunnel_down\": \"fail\""));
         let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn no_leak_packet_counters_detect_expected_patterns() {
+        let load_lines = vec![
+            "IP 172.16.10.2.12345 > 172.16.10.1.51820: UDP, length 64".to_string(),
+            "IP 172.16.10.2.44444 > 198.18.0.1.53: UDP, length 32".to_string(),
+        ];
+        let down_lines = vec![
+            "IP 172.16.10.2.55555 > 198.18.0.1.53: UDP, length 32".to_string(),
+            "IP 172.16.10.2.66666 > 172.16.10.1.51820: UDP, length 64".to_string(),
+        ];
+        assert_eq!(count_no_leak_tunnel_packets(&load_lines), 1);
+        assert_eq!(count_no_leak_cleartext_packets(&load_lines), 1);
+        assert_eq!(count_no_leak_cleartext_packets(&down_lines), 1);
     }
 
     #[test]
