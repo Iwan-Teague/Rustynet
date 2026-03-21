@@ -19,7 +19,7 @@ require_command() {
   fi
 }
 
-require_command python3
+require_command cargo
 require_command git
 
 ./scripts/ci/test_validate_cross_network_remote_exit_reports.sh

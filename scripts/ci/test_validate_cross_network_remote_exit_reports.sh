@@ -15,317 +15,274 @@ printf 'log\n' >"$log_file"
 current_commit="$(git rev-parse HEAD)"
 captured_at_unix="$(date +%s)"
 
-python3 - "$temp_dir" "$source_file" "$log_file" "$current_commit" "$captured_at_unix" <<'PY'
-import json
-import sys
-from pathlib import Path
+generate_pass_report() {
+  local suite="$1"
+  local report_path="$2"
 
-temp_dir = Path(sys.argv[1])
-source_file = Path(sys.argv[2])
-log_file = Path(sys.argv[3])
-git_commit = sys.argv[4]
-captured_at_unix = int(sys.argv[5])
+  local args=(
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    --suite "$suite"
+    --report-path "$report_path"
+    --log-path "$log_file"
+    --status pass
+    --environment ci
+    --implementation-state implemented
+    --source-artifact "$source_file"
+    --client-host client@example
+    --exit-host exit@example
+    --client-network-id net-a
+    --exit-network-id net-b
+    --nat-profile baseline_lan
+    --impairment-profile none
+  )
 
+  case "$suite" in
+    cross_network_direct_remote_exit)
+      args+=(
+        --check direct_remote_exit_success=pass
+        --check remote_exit_no_underlay_leak=pass
+        --check remote_exit_server_ip_bypass_is_narrow=pass
+      )
+      ;;
+    cross_network_relay_remote_exit)
+      args+=(
+        --relay-host relay@example
+        --relay-network-id net-c
+        --check relay_remote_exit_success=pass
+        --check remote_exit_no_underlay_leak=pass
+        --check remote_exit_server_ip_bypass_is_narrow=pass
+      )
+      ;;
+    cross_network_failback_roaming)
+      args+=(
+        --relay-host relay@example
+        --relay-network-id net-c
+        --check relay_to_direct_failback_success=pass
+        --check endpoint_roam_recovery_success=pass
+        --check remote_exit_no_underlay_leak=pass
+      )
+      ;;
+    cross_network_traversal_adversarial)
+      args+=(
+        --probe-host probe@example
+        --check forged_traversal_rejected=pass
+        --check stale_traversal_rejected=pass
+        --check replayed_traversal_rejected=pass
+        --check rogue_endpoint_rejected=pass
+        --check control_surface_exposure_blocked=pass
+      )
+      ;;
+    cross_network_remote_exit_dns)
+      args+=(
+        --check managed_dns_resolution_success=pass
+        --check remote_exit_dns_fail_closed=pass
+        --check remote_exit_no_underlay_leak=pass
+      )
+      ;;
+    cross_network_remote_exit_soak)
+      args+=(
+        --check long_soak_stable=pass
+        --check remote_exit_no_underlay_leak=pass
+        --check remote_exit_server_ip_bypass_is_narrow=pass
+        --check cross_network_topology_heuristic=pass
+        --check direct_remote_exit_ready=pass
+        --check post_soak_bypass_ready=pass
+        --check no_plaintext_passphrase_files=pass
+      )
+      ;;
+    *)
+      echo "unsupported suite in test fixture generator: $suite" >&2
+      exit 1
+      ;;
+  esac
 
-def write_report(name: str, payload: dict) -> None:
-    path = temp_dir / name
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
-common = {
-    "schema_version": 1,
-    "phase": "phase10",
-    "environment": "ci",
-    "evidence_mode": "measured",
-    "captured_at_unix": captured_at_unix,
-    "git_commit": git_commit,
-    "source_artifacts": [str(source_file)],
-    "log_artifacts": [str(log_file)],
+  "${args[@]}" >/dev/null
 }
 
-write_report(
-    "cross_network_direct_remote_exit_report.json",
-    {
-        **common,
-        "suite": "cross_network_direct_remote_exit",
-        "status": "pass",
-        "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "direct_remote_exit_success": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-            "remote_exit_server_ip_bypass_is_narrow": "pass",
-        },
-    },
-)
+generate_pass_report cross_network_direct_remote_exit "$temp_dir/cross_network_direct_remote_exit_report.json"
+generate_pass_report cross_network_relay_remote_exit "$temp_dir/cross_network_relay_remote_exit_report.json"
+generate_pass_report cross_network_failback_roaming "$temp_dir/cross_network_failback_roaming_report.json"
+generate_pass_report cross_network_traversal_adversarial "$temp_dir/cross_network_traversal_adversarial_report.json"
+generate_pass_report cross_network_remote_exit_dns "$temp_dir/cross_network_remote_exit_dns_report.json"
+generate_pass_report cross_network_remote_exit_soak "$temp_dir/cross_network_remote_exit_soak_report.json"
 
-write_report(
-    "cross_network_relay_remote_exit_report.json",
-    {
-        **common,
-        "suite": "cross_network_relay_remote_exit",
-        "status": "pass",
-        "participants": {
-            "client_host": "client@example",
-            "exit_host": "exit@example",
-            "relay_host": "relay@example",
-        },
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "relay_network_id": "net-c",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "relay_remote_exit_success": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-            "remote_exit_server_ip_bypass_is_narrow": "pass",
-        },
-    },
-)
+cat >"$temp_dir/invalid_same_network.json" <<JSON
+{
+  "schema_version": 1,
+  "phase": "phase10",
+  "suite": "cross_network_direct_remote_exit",
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "captured_at_unix": ${captured_at_unix},
+  "git_commit": "${current_commit}",
+  "status": "pass",
+  "participants": {
+    "client_host": "client@example",
+    "exit_host": "exit@example"
+  },
+  "network_context": {
+    "client_network_id": "net-a",
+    "exit_network_id": "net-a",
+    "nat_profile": "baseline_lan",
+    "impairment_profile": "none"
+  },
+  "checks": {
+    "direct_remote_exit_success": "pass",
+    "remote_exit_no_underlay_leak": "pass",
+    "remote_exit_server_ip_bypass_is_narrow": "pass"
+  },
+  "source_artifacts": [
+    "${source_file}"
+  ],
+  "log_artifacts": [
+    "${log_file}"
+  ]
+}
+JSON
 
-write_report(
-    "cross_network_failback_roaming_report.json",
-    {
-        **common,
-        "suite": "cross_network_failback_roaming",
-        "status": "pass",
-        "participants": {
-            "client_host": "client@example",
-            "exit_host": "exit@example",
-            "relay_host": "relay@example",
-        },
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "relay_network_id": "net-c",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "relay_to_direct_failback_success": "pass",
-            "endpoint_roam_recovery_success": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-        },
-    },
-)
+cat >"$temp_dir/invalid_pass_with_failed_check.json" <<JSON
+{
+  "schema_version": 1,
+  "phase": "phase10",
+  "suite": "cross_network_relay_remote_exit",
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "captured_at_unix": ${captured_at_unix},
+  "git_commit": "${current_commit}",
+  "status": "pass",
+  "participants": {
+    "client_host": "client@example",
+    "exit_host": "exit@example",
+    "relay_host": "relay@example"
+  },
+  "network_context": {
+    "client_network_id": "net-a",
+    "exit_network_id": "net-b",
+    "relay_network_id": "net-c",
+    "nat_profile": "baseline_lan",
+    "impairment_profile": "none"
+  },
+  "checks": {
+    "relay_remote_exit_success": "fail",
+    "remote_exit_no_underlay_leak": "pass",
+    "remote_exit_server_ip_bypass_is_narrow": "pass"
+  },
+  "source_artifacts": [
+    "${source_file}"
+  ],
+  "log_artifacts": [
+    "${log_file}"
+  ]
+}
+JSON
 
-write_report(
-    "cross_network_traversal_adversarial_report.json",
-    {
-        **common,
-        "suite": "cross_network_traversal_adversarial",
-        "status": "pass",
-        "participants": {
-            "client_host": "client@example",
-            "exit_host": "exit@example",
-            "probe_host": "probe@example",
-        },
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "forged_traversal_rejected": "pass",
-            "stale_traversal_rejected": "pass",
-            "replayed_traversal_rejected": "pass",
-            "rogue_endpoint_rejected": "pass",
-            "control_surface_exposure_blocked": "pass",
-        },
-    },
-)
-
-write_report(
-    "cross_network_remote_exit_dns_report.json",
-    {
-        **common,
-        "suite": "cross_network_remote_exit_dns",
-        "status": "pass",
-        "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "managed_dns_resolution_success": "pass",
-            "remote_exit_dns_fail_closed": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-        },
-    },
-)
-
-write_report(
-    "cross_network_remote_exit_soak_report.json",
-    {
-        **common,
-        "suite": "cross_network_remote_exit_soak",
-        "status": "pass",
-        "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "long_soak_stable": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-            "remote_exit_server_ip_bypass_is_narrow": "pass",
-            "cross_network_topology_heuristic": "pass",
-            "direct_remote_exit_ready": "pass",
-            "post_soak_bypass_ready": "pass",
-            "no_plaintext_passphrase_files": "pass",
-        },
-    },
-)
-
-write_report(
-    "invalid_same_network.json",
-    {
-        **common,
-        "suite": "cross_network_direct_remote_exit",
-        "status": "pass",
-        "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-a",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "direct_remote_exit_success": "pass",
-            "remote_exit_no_underlay_leak": "pass",
-            "remote_exit_server_ip_bypass_is_narrow": "pass",
-        },
-    },
-)
-
-write_report(
-    "invalid_pass_with_failed_check.json",
-    {
-        **common,
-        "suite": "cross_network_relay_remote_exit",
-        "status": "pass",
-        "participants": {
-            "client_host": "client@example",
-            "exit_host": "exit@example",
-            "relay_host": "relay@example",
-        },
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "relay_network_id": "net-c",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "relay_remote_exit_success": "fail",
-            "remote_exit_no_underlay_leak": "pass",
-            "remote_exit_server_ip_bypass_is_narrow": "pass",
-        },
-    },
-)
-
-write_report(
-    "invalid_fail_without_summary.json",
-    {
-        **common,
-        "suite": "cross_network_traversal_adversarial",
-        "status": "fail",
-        "participants": {
-            "client_host": "client@example",
-            "exit_host": "exit@example",
-            "probe_host": "probe@example",
-        },
-        "network_context": {
-            "client_network_id": "net-a",
-            "exit_network_id": "net-b",
-            "nat_profile": "baseline_lan",
-            "impairment_profile": "none",
-        },
-        "checks": {
-            "forged_traversal_rejected": "fail",
-            "stale_traversal_rejected": "pass",
-            "replayed_traversal_rejected": "pass",
-            "rogue_endpoint_rejected": "pass",
-            "control_surface_exposure_blocked": "pass",
-        },
-    },
-)
-PY
+cat >"$temp_dir/invalid_fail_without_summary.json" <<JSON
+{
+  "schema_version": 1,
+  "phase": "phase10",
+  "suite": "cross_network_traversal_adversarial",
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "captured_at_unix": ${captured_at_unix},
+  "git_commit": "${current_commit}",
+  "status": "fail",
+  "participants": {
+    "client_host": "client@example",
+    "exit_host": "exit@example",
+    "probe_host": "probe@example"
+  },
+  "network_context": {
+    "client_network_id": "net-a",
+    "exit_network_id": "net-b",
+    "nat_profile": "baseline_lan",
+    "impairment_profile": "none"
+  },
+  "checks": {
+    "forged_traversal_rejected": "fail",
+    "stale_traversal_rejected": "pass",
+    "replayed_traversal_rejected": "pass",
+    "rogue_endpoint_rejected": "pass",
+    "control_surface_exposure_blocked": "pass"
+  },
+  "source_artifacts": [
+    "${source_file}"
+  ],
+  "log_artifacts": [
+    "${log_file}"
+  ]
+}
+JSON
 
 symlink_source="$temp_dir/source-link.txt"
 ln -sf "$source_file" "$symlink_source"
 
-python3 - "$temp_dir" "$symlink_source" "$log_file" "$current_commit" "$captured_at_unix" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-temp_dir = Path(sys.argv[1])
-symlink_source = sys.argv[2]
-log_file = sys.argv[3]
-git_commit = sys.argv[4]
-captured_at_unix = int(sys.argv[5])
-
-common = {
-    "schema_version": 1,
-    "phase": "phase10",
-    "suite": "cross_network_direct_remote_exit",
-    "environment": "ci",
-    "evidence_mode": "measured",
-    "captured_at_unix": captured_at_unix,
-    "git_commit": git_commit,
-    "status": "pass",
-    "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-    "network_context": {
-        "client_network_id": "net-a",
-        "exit_network_id": "net-b",
-        "nat_profile": "baseline_lan",
-        "impairment_profile": "none",
-    },
-    "checks": {
-        "direct_remote_exit_success": "pass",
-        "remote_exit_no_underlay_leak": "pass",
-        "remote_exit_server_ip_bypass_is_narrow": "pass",
-    },
-    "log_artifacts": [log_file],
+cat >"$temp_dir/invalid_symlink_artifact.json" <<JSON
+{
+  "schema_version": 1,
+  "phase": "phase10",
+  "suite": "cross_network_direct_remote_exit",
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "captured_at_unix": ${captured_at_unix},
+  "git_commit": "${current_commit}",
+  "status": "pass",
+  "participants": {
+    "client_host": "client@example",
+    "exit_host": "exit@example"
+  },
+  "network_context": {
+    "client_network_id": "net-a",
+    "exit_network_id": "net-b",
+    "nat_profile": "baseline_lan",
+    "impairment_profile": "none"
+  },
+  "checks": {
+    "direct_remote_exit_success": "pass",
+    "remote_exit_no_underlay_leak": "pass",
+    "remote_exit_server_ip_bypass_is_narrow": "pass"
+  },
+  "source_artifacts": [
+    "${symlink_source}"
+  ],
+  "log_artifacts": [
+    "${log_file}"
+  ]
 }
+JSON
 
-(temp_dir / "invalid_symlink_artifact.json").write_text(
-    json.dumps(
-        {
-            **common,
-            "source_artifacts": [symlink_source],
-        },
-        indent=2,
-    )
-    + "\n",
-    encoding="utf-8",
-)
-
-(temp_dir / "invalid_outside_artifact.json").write_text(
-    json.dumps(
-        {
-            **common,
-            "source_artifacts": ["/etc/hosts"],
-        },
-        indent=2,
-    )
-    + "\n",
-    encoding="utf-8",
-)
-PY
+cat >"$temp_dir/invalid_outside_artifact.json" <<JSON
+{
+  "schema_version": 1,
+  "phase": "phase10",
+  "suite": "cross_network_direct_remote_exit",
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "captured_at_unix": ${captured_at_unix},
+  "git_commit": "${current_commit}",
+  "status": "pass",
+  "participants": {
+    "client_host": "client@example",
+    "exit_host": "exit@example"
+  },
+  "network_context": {
+    "client_network_id": "net-a",
+    "exit_network_id": "net-b",
+    "nat_profile": "baseline_lan",
+    "impairment_profile": "none"
+  },
+  "checks": {
+    "direct_remote_exit_success": "pass",
+    "remote_exit_no_underlay_leak": "pass",
+    "remote_exit_server_ip_bypass_is_narrow": "pass"
+  },
+  "source_artifacts": [
+    "/etc/hosts"
+  ],
+  "log_artifacts": [
+    "${log_file}"
+  ]
+}
+JSON
 
 cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --artifact-dir "$temp_dir" \
@@ -368,44 +325,24 @@ if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-r
   exit 1
 fi
 
-python3 - "$temp_dir/valid_fail_status.json" "$source_file" "$log_file" "$current_commit" "$captured_at_unix" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-source_file = sys.argv[2]
-log_file = sys.argv[3]
-git_commit = sys.argv[4]
-captured_at_unix = int(sys.argv[5])
-
-payload = {
-    "schema_version": 1,
-    "phase": "phase10",
-    "suite": "cross_network_direct_remote_exit",
-    "environment": "ci",
-    "evidence_mode": "measured",
-    "captured_at_unix": captured_at_unix,
-    "git_commit": git_commit,
-    "status": "fail",
-    "participants": {"client_host": "client@example", "exit_host": "exit@example"},
-    "network_context": {
-        "client_network_id": "net-a",
-        "exit_network_id": "net-b",
-        "nat_profile": "baseline_lan",
-        "impairment_profile": "none",
-    },
-    "checks": {
-        "direct_remote_exit_success": "fail",
-        "remote_exit_no_underlay_leak": "pass",
-        "remote_exit_server_ip_bypass_is_narrow": "pass",
-    },
-    "failure_summary": "synthetic failure",
-    "source_artifacts": [source_file],
-    "log_artifacts": [log_file],
-}
-path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
+cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report \
+  --suite cross_network_direct_remote_exit \
+  --report-path "$temp_dir/valid_fail_status.json" \
+  --log-path "$log_file" \
+  --status fail \
+  --failure-summary "synthetic failure" \
+  --environment ci \
+  --implementation-state implemented \
+  --source-artifact "$source_file" \
+  --client-host client@example \
+  --exit-host exit@example \
+  --client-network-id net-a \
+  --exit-network-id net-b \
+  --nat-profile baseline_lan \
+  --impairment-profile none \
+  --check direct_remote_exit_success=fail \
+  --check remote_exit_no_underlay_leak=pass \
+  --check remote_exit_server_ip_bypass_is_narrow=pass >/dev/null
 
 if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/valid_fail_status.json" \
