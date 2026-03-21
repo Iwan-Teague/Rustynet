@@ -51,6 +51,14 @@ pub struct VerifyLinuxFreshInstallOsMatrixReadinessConfig {
     pub expected_git_commit: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteFreshInstallOsMatrixReadinessFixturesConfig {
+    pub output_dir: PathBuf,
+    pub head_commit: String,
+    pub stale_commit: String,
+    pub now_unix: u64,
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -116,6 +124,26 @@ fn parse_json_object(path: &Path, label: &str) -> Result<Map<String, Value>, Str
         .as_object()
         .cloned()
         .ok_or_else(|| format!("{label} must be a JSON object"))
+}
+
+fn write_json(path: &Path, payload: &Value, label: &str) -> Result<(), String> {
+    let mut body = serde_json::to_string_pretty(payload)
+        .map_err(|err| format!("serialize {label} failed: {err}"))?;
+    body.push('\n');
+    fs::write(path, body.as_bytes())
+        .map_err(|err| format!("write {label} failed ({}): {err}", path.display()))
+}
+
+fn write_text(path: &Path, body: &str, label: &str) -> Result<(), String> {
+    fs::write(path, body.as_bytes())
+        .map_err(|err| format!("write {label} failed ({}): {err}", path.display()))
+}
+
+fn absolute_display(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn canonicalize_report(
@@ -1341,4 +1369,390 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
     }
 
     Ok("Fresh install OS matrix readiness checks: PASS".to_string())
+}
+
+pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
+    config: WriteFreshInstallOsMatrixReadinessFixturesConfig,
+) -> Result<String, String> {
+    if config.now_unix == 0 {
+        return Err("fixture now_unix must be positive".to_string());
+    }
+    let head_commit = config.head_commit.trim().to_ascii_lowercase();
+    if !is_lower_hex_sha40(head_commit.as_str()) {
+        return Err("fixture head_commit must be a 40-char lowercase hex SHA".to_string());
+    }
+    let stale_commit = config.stale_commit.trim().to_ascii_lowercase();
+    if !is_lower_hex_sha40(stale_commit.as_str()) {
+        return Err("fixture stale_commit must be a 40-char lowercase hex SHA".to_string());
+    }
+
+    let output_dir = resolve_path(config.output_dir.as_path())?;
+    fs::create_dir_all(output_dir.as_path()).map_err(|err| {
+        format!(
+            "create fixture output directory failed ({}): {err}",
+            output_dir.display()
+        )
+    })?;
+
+    let bootstrap_log = output_dir.join("bootstrap_hosts.log");
+    let baseline_log = output_dir.join("validate_baseline_runtime.log");
+    let two_hop_log = output_dir.join("two_hop.log");
+    let lan_toggle_log = output_dir.join("lan_toggle.log");
+    let exit_handoff_log = output_dir.join("exit_handoff.log");
+    let exit_handoff_monitor_log = output_dir.join("exit_handoff_monitor.log");
+    let role_switch_md = output_dir.join("role_switch.md");
+
+    for path in [
+        bootstrap_log.as_path(),
+        baseline_log.as_path(),
+        two_hop_log.as_path(),
+        lan_toggle_log.as_path(),
+        exit_handoff_log.as_path(),
+        exit_handoff_monitor_log.as_path(),
+        role_switch_md.as_path(),
+    ] {
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("fixture");
+        write_text(
+            path,
+            format!("{file_name}\n").as_str(),
+            "fixture text artifact",
+        )?;
+    }
+
+    let role_switch_report_path = output_dir.join("role_switch_matrix_report.json");
+    let two_hop_report_path = output_dir.join("live_linux_two_hop_report.json");
+    let lan_toggle_report_path = output_dir.join("live_linux_lan_toggle_report.json");
+    let exit_handoff_report_path = output_dir.join("live_linux_exit_handoff_report.json");
+    let report_path = output_dir.join("report.json");
+    let stale_two_hop_report_path = output_dir.join("live_linux_two_hop_report_stale.json");
+    let stale_wrapper_report_path = output_dir.join("report_with_stale_child.json");
+
+    let role_switch_hosts = ["debian13", "ubuntu", "fedora", "mint"]
+        .into_iter()
+        .map(|os_id| {
+            (
+                os_id.to_string(),
+                json!({
+                    "transition": {
+                        "from_role": "client",
+                        "to_role": "admin",
+                        "status": "pass",
+                    },
+                    "checks": {
+                        "switch_execution": "pass",
+                        "post_switch_reconcile": "pass",
+                        "policy_still_enforced": "pass",
+                        "least_privilege_preserved": "pass",
+                    },
+                }),
+            )
+        })
+        .collect::<Map<String, Value>>();
+
+    let role_switch_report = json!({
+        "schema_version": 1,
+        "evidence_mode": "measured",
+        "git_commit": head_commit,
+        "captured_at_unix": config.now_unix,
+        "status": "pass",
+        "hosts": role_switch_hosts,
+        "source_artifact": absolute_display(role_switch_md.as_path()),
+    });
+    write_json(
+        role_switch_report_path.as_path(),
+        &role_switch_report,
+        "fixture role-switch report",
+    )?;
+
+    let two_hop_report = json!({
+        "phase": "phase10",
+        "mode": "live_linux_two_hop_report",
+        "evidence_mode": "measured",
+        "captured_at_unix": config.now_unix,
+        "git_commit": head_commit,
+        "status": "pass",
+        "source_artifacts": [absolute_display(two_hop_log.as_path())],
+    });
+    write_json(
+        two_hop_report_path.as_path(),
+        &two_hop_report,
+        "fixture two-hop report",
+    )?;
+
+    let lan_toggle_report = json!({
+        "phase": "phase10",
+        "mode": "live_linux_lan_toggle_report",
+        "evidence_mode": "measured",
+        "captured_at_unix": config.now_unix,
+        "git_commit": head_commit,
+        "status": "pass",
+        "source_artifacts": [absolute_display(lan_toggle_log.as_path())],
+    });
+    write_json(
+        lan_toggle_report_path.as_path(),
+        &lan_toggle_report,
+        "fixture lan-toggle report",
+    )?;
+
+    let exit_handoff_report = json!({
+        "phase": "phase10",
+        "mode": "live_linux_exit_handoff_report",
+        "evidence_mode": "measured",
+        "captured_at_unix": config.now_unix,
+        "git_commit": head_commit,
+        "status": "pass",
+        "source_artifacts": [
+            absolute_display(exit_handoff_log.as_path()),
+            absolute_display(exit_handoff_monitor_log.as_path()),
+        ],
+    });
+    write_json(
+        exit_handoff_report_path.as_path(),
+        &exit_handoff_report,
+        "fixture exit-handoff report",
+    )?;
+
+    let scenario = |os_id: &str| {
+        json!({
+            "status": "pass",
+            "host_profile": "linux",
+            "os_version": os_id,
+            "node_id": format!("{os_id}-node"),
+            "clean_install": {
+                "status": "pass",
+                "captured_at_unix": config.now_unix,
+                "source_artifacts": [
+                    absolute_display(bootstrap_log.as_path()),
+                    absolute_display(baseline_log.as_path()),
+                ],
+                "checks": {
+                    "host_pristine": "pass",
+                    "fresh_install_completed": "pass",
+                    "service_bootstrap_secure": "pass",
+                    "key_custody_hardened": "pass",
+                    "no_legacy_fallback_paths": "pass",
+                },
+            },
+            "one_hop": {
+                "status": "pass",
+                "captured_at_unix": config.now_unix,
+                "hop_count": 1,
+                "source_artifacts": [
+                    absolute_display(baseline_log.as_path()),
+                    absolute_display(exit_handoff_report_path.as_path()),
+                    absolute_display(exit_handoff_log.as_path()),
+                    absolute_display(exit_handoff_monitor_log.as_path()),
+                ],
+                "checks": {
+                    "tunnel_established": "pass",
+                    "encrypted_transport": "pass",
+                    "egress_via_selected_exit": "pass",
+                    "dns_fail_closed": "pass",
+                    "no_underlay_leak": "pass",
+                },
+            },
+            "two_hop": {
+                "status": "pass",
+                "captured_at_unix": config.now_unix,
+                "hop_count": 2,
+                "source_artifacts": [
+                    absolute_display(two_hop_report_path.as_path()),
+                    absolute_display(two_hop_log.as_path()),
+                ],
+                "checks": {
+                    "chain_enforced": "pass",
+                    "encrypted_transport": "pass",
+                    "entry_relay_forwarding": "pass",
+                    "final_exit_egress": "pass",
+                    "no_underlay_leak": "pass",
+                },
+            },
+            "role_switch": {
+                "status": "pass",
+                "captured_at_unix": config.now_unix,
+                "source_artifacts": [
+                    absolute_display(role_switch_report_path.as_path()),
+                    absolute_display(role_switch_md.as_path()),
+                ],
+                "checks": {
+                    "switch_execution": "pass",
+                    "post_switch_reconcile": "pass",
+                    "policy_still_enforced": "pass",
+                    "least_privilege_preserved": "pass",
+                },
+                "transitions": [
+                    {
+                        "from_role": "client",
+                        "to_role": "admin",
+                        "status": "pass",
+                    }
+                ],
+            },
+        })
+    };
+
+    let report = json!({
+        "schema_version": 1,
+        "evidence_mode": "measured",
+        "environment": "fixture",
+        "captured_at_unix": config.now_unix,
+        "git_commit": head_commit,
+        "source_artifacts": [
+            absolute_display(bootstrap_log.as_path()),
+            absolute_display(baseline_log.as_path()),
+            absolute_display(two_hop_report_path.as_path()),
+            absolute_display(role_switch_report_path.as_path()),
+            absolute_display(lan_toggle_report_path.as_path()),
+            absolute_display(exit_handoff_report_path.as_path()),
+            absolute_display(role_switch_md.as_path()),
+            absolute_display(two_hop_log.as_path()),
+            absolute_display(lan_toggle_log.as_path()),
+            absolute_display(exit_handoff_log.as_path()),
+            absolute_display(exit_handoff_monitor_log.as_path()),
+        ],
+        "security_assertions": {
+            "no_plaintext_secrets_at_rest": true,
+            "encrypted_transport_required": true,
+            "default_deny_enforced": true,
+            "fail_closed_enforced": true,
+            "least_privilege_role_switch": true,
+        },
+        "scenarios": {
+            "debian13": scenario("debian13"),
+            "ubuntu": scenario("ubuntu"),
+            "fedora": scenario("fedora"),
+            "mint": scenario("mint"),
+        },
+    });
+    write_json(report_path.as_path(), &report, "fixture readiness report")?;
+
+    let mut stale_two_hop = two_hop_report
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "fixture two-hop report shape invalid".to_string())?;
+    stale_two_hop.insert("git_commit".to_string(), Value::String(stale_commit));
+    write_json(
+        stale_two_hop_report_path.as_path(),
+        &Value::Object(stale_two_hop),
+        "fixture stale two-hop report",
+    )?;
+
+    let mut stale_wrapper = report
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "fixture readiness report shape invalid".to_string())?;
+    stale_wrapper.insert(
+        "source_artifacts".to_string(),
+        Value::Array(vec![
+            Value::String(absolute_display(bootstrap_log.as_path())),
+            Value::String(absolute_display(baseline_log.as_path())),
+            Value::String(absolute_display(stale_two_hop_report_path.as_path())),
+            Value::String(absolute_display(role_switch_report_path.as_path())),
+            Value::String(absolute_display(lan_toggle_report_path.as_path())),
+            Value::String(absolute_display(exit_handoff_report_path.as_path())),
+            Value::String(absolute_display(role_switch_md.as_path())),
+            Value::String(absolute_display(two_hop_log.as_path())),
+            Value::String(absolute_display(lan_toggle_log.as_path())),
+            Value::String(absolute_display(exit_handoff_log.as_path())),
+            Value::String(absolute_display(exit_handoff_monitor_log.as_path())),
+        ]),
+    );
+    let scenarios = stale_wrapper
+        .get_mut("scenarios")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "fixture readiness report scenarios missing".to_string())?;
+    for scenario_payload in scenarios.values_mut() {
+        let two_hop_section = scenario_payload
+            .as_object_mut()
+            .and_then(|entry| entry.get_mut("two_hop"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| "fixture scenario two_hop section missing".to_string())?;
+        two_hop_section.insert(
+            "source_artifacts".to_string(),
+            Value::Array(vec![
+                Value::String(absolute_display(stale_two_hop_report_path.as_path())),
+                Value::String(absolute_display(two_hop_log.as_path())),
+            ]),
+        );
+    }
+    write_json(
+        stale_wrapper_report_path.as_path(),
+        &Value::Object(stale_wrapper),
+        "fixture stale-wrapper report",
+    )?;
+
+    Ok(format!(
+        "fresh install readiness fixtures written: output_dir={} report={} stale_report={}",
+        output_dir.display(),
+        report_path.display(),
+        stale_wrapper_report_path.display()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WriteFreshInstallOsMatrixReadinessFixturesConfig,
+        execute_ops_write_fresh_install_os_matrix_readiness_fixtures, parse_json_object,
+    };
+    use serde_json::Value;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn writes_readiness_fixtures_with_stale_child_commit() {
+        let unique = format!(
+            "ops-fresh-install-fixtures-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        );
+        let output_dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(output_dir.as_path()).expect("create fixture temp dir");
+
+        execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
+            WriteFreshInstallOsMatrixReadinessFixturesConfig {
+                output_dir: output_dir.clone(),
+                head_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                stale_commit: "1111111111111111111111111111111111111111".to_string(),
+                now_unix: 1_773_300_000,
+            },
+        )
+        .expect("write fixtures");
+
+        let stale_child = parse_json_object(
+            output_dir
+                .join("live_linux_two_hop_report_stale.json")
+                .as_path(),
+            "stale child fixture",
+        )
+        .expect("load stale child fixture");
+        assert_eq!(
+            stale_child.get("git_commit").and_then(Value::as_str),
+            Some("1111111111111111111111111111111111111111")
+        );
+
+        let stale_wrapper = parse_json_object(
+            output_dir.join("report_with_stale_child.json").as_path(),
+            "stale wrapper fixture",
+        )
+        .expect("load stale wrapper fixture");
+        let source_artifacts = stale_wrapper
+            .get("source_artifacts")
+            .and_then(Value::as_array)
+            .expect("source_artifacts array");
+        assert!(source_artifacts.iter().any(|entry| {
+            entry
+                .as_str()
+                .map(|value| value.ends_with("/live_linux_two_hop_report_stale.json"))
+                .unwrap_or(false)
+        }));
+
+        fs::remove_dir_all(output_dir.as_path()).expect("cleanup fixture temp dir");
+    }
 }

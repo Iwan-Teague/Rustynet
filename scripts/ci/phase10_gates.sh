@@ -26,7 +26,6 @@ require_cargo_subcommand() {
 require_command cargo
 require_command rustup
 require_command rg
-require_command python3
 require_cargo_subcommand fmt
 require_cargo_subcommand clippy
 require_cargo_subcommand audit

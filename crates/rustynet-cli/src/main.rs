@@ -420,6 +420,9 @@ enum OpsCommand {
     VerifyLinuxFreshInstallOsMatrixReadiness {
         config: ops_fresh_install_os_matrix::VerifyLinuxFreshInstallOsMatrixReadinessConfig,
     },
+    WriteFreshInstallOsMatrixReadinessFixtures {
+        config: ops_fresh_install_os_matrix::WriteFreshInstallOsMatrixReadinessFixturesConfig,
+    },
     WriteUnsignedReleaseProvenance {
         config: ops_phase9::WriteUnsignedReleaseProvenanceConfig,
     },
@@ -1502,6 +1505,21 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         expected_git_commit: parser
                             .value("--expected-git-commit")
                             .unwrap_or_default(),
+                    },
+            })
+        }
+        "write-fresh-install-os-matrix-readiness-fixtures" => {
+            let now_unix_raw = parser.required("--now-unix")?;
+            let now_unix = now_unix_raw
+                .parse::<u64>()
+                .map_err(|err| format!("invalid value for --now-unix: {err}"))?;
+            Ok(OpsCommand::WriteFreshInstallOsMatrixReadinessFixtures {
+                config:
+                    ops_fresh_install_os_matrix::WriteFreshInstallOsMatrixReadinessFixturesConfig {
+                        output_dir: parser.required_path("--output-dir")?,
+                        head_commit: parser.required("--head-commit")?,
+                        stale_commit: parser.required("--stale-commit")?,
+                        now_unix,
                     },
             })
         }
@@ -3123,6 +3141,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VerifyLinuxFreshInstallOsMatrixReadiness { config } => {
             ops_fresh_install_os_matrix::execute_ops_verify_linux_fresh_install_os_matrix_readiness(
+                config,
+            )
+        }
+        OpsCommand::WriteFreshInstallOsMatrixReadinessFixtures { config } => {
+            ops_fresh_install_os_matrix::execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
                 config,
             )
         }
@@ -9466,6 +9489,7 @@ fn help_text() -> String {
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
+        "  ops write-fresh-install-os-matrix-readiness-fixtures --output-dir <path> --head-commit <sha> --stale-commit <sha> --now-unix <unix>",
         "  ops write-unsigned-release-provenance --input <path> --output <path>",
         "  ops sign-release-artifact",
         "  ops verify-release-artifact",
@@ -10680,6 +10704,23 @@ mod tests {
         assert!(
             format!("{verify_fresh_install_report:?}")
                 .contains("VerifyLinuxFreshInstallOsMatrixReadiness")
+        );
+
+        let write_fresh_install_fixtures = parse_command(&[
+            "ops".to_string(),
+            "write-fresh-install-os-matrix-readiness-fixtures".to_string(),
+            "--output-dir".to_string(),
+            "/tmp/rustynet-fresh-install-fixtures".to_string(),
+            "--head-commit".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--stale-commit".to_string(),
+            "1111111111111111111111111111111111111111".to_string(),
+            "--now-unix".to_string(),
+            "1773300000".to_string(),
+        ]);
+        assert!(
+            format!("{write_fresh_install_fixtures:?}")
+                .contains("WriteFreshInstallOsMatrixReadinessFixtures")
         );
 
         let write_unsigned_release_provenance = parse_command(&[
