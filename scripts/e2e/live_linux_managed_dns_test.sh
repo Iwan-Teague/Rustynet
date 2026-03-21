@@ -440,7 +440,17 @@ fi
 if [[ "$(json_field "$NON_MANAGED_DIRECT_QUERY" "rcode")" == "5" ]]; then
   check_non_managed_refused="pass"
 fi
-if [[ "$RUSTYNETD_STATE_STALE" != "active" ]] && grep -Fqi "dns zone preflight failed" <<<"$RUSTYNETD_JOURNAL_STALE" && grep -Fqi "stale" <<<"$RUSTYNETD_JOURNAL_STALE"; then
+stale_state_observed="false"
+if grep -Fq "dns inspect: state=invalid" <<<"$DNS_INSPECT_STALE" && grep -Fqi "stale" <<<"$DNS_INSPECT_STALE"; then
+  stale_state_observed="true"
+fi
+if grep -Fqi "daemon unreachable" <<<"$DNS_INSPECT_STALE"; then
+  stale_state_observed="true"
+fi
+if grep -Fqi "dns zone preflight failed" <<<"$RUSTYNETD_JOURNAL_STALE" && grep -Fqi "stale" <<<"$RUSTYNETD_JOURNAL_STALE"; then
+  stale_state_observed="true"
+fi
+if [[ "$stale_state_observed" == "true" ]]; then
   if [[ "$(json_field "$DIRECT_QUERY_STALE" "rcode")" != "0" || -n "$(json_field "$DIRECT_QUERY_STALE" "error")" ]]; then
     check_stale_bundle_fail_closed="pass"
   fi

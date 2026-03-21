@@ -4965,22 +4965,28 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             DaemonError::InvalidConfig(format!("dns zone watermark preflight failed: {err}"))
         })?;
     if config.dns_zone_bundle_path.exists() {
-        let auto_tunnel = auto_tunnel_preflight.as_ref().ok_or_else(|| {
-            DaemonError::InvalidConfig(
-                "dns zone preflight requires signed assignment context".to_string(),
-            )
-        })?;
-        let _ = load_dns_zone_bundle(DnsZoneLoadContext {
-            path: &config.dns_zone_bundle_path,
-            verifier_key_path: &config.dns_zone_verifier_key_path,
-            max_age_secs: config.dns_zone_max_age_secs.get(),
-            trust_policy: TrustPolicy::default(),
-            previous_watermark: dns_zone_watermark,
-            expected_zone_name: &config.dns_zone_name,
-            local_node_id: &config.node_id,
-            auto_tunnel: &auto_tunnel.bundle,
-        })
-        .map_err(|err| DaemonError::InvalidConfig(format!("dns zone preflight failed: {err}")))?;
+        if let Some(auto_tunnel) = auto_tunnel_preflight.as_ref() {
+            if let Err(err) = load_dns_zone_bundle(DnsZoneLoadContext {
+                path: &config.dns_zone_bundle_path,
+                verifier_key_path: &config.dns_zone_verifier_key_path,
+                max_age_secs: config.dns_zone_max_age_secs.get(),
+                trust_policy: TrustPolicy::default(),
+                previous_watermark: dns_zone_watermark,
+                expected_zone_name: &config.dns_zone_name,
+                local_node_id: &config.node_id,
+                auto_tunnel: &auto_tunnel.bundle,
+            }) {
+                // Managed DNS must fail closed for managed names, but stale/invalid bundles
+                // should not prevent daemon startup or dataplane reconciliation.
+                eprintln!(
+                    "rustynetd startup warning: dns zone preflight skipped invalid managed DNS bundle: {err}"
+                );
+            }
+        } else {
+            eprintln!(
+                "rustynetd startup warning: dns zone bundle present without signed assignment context; managed DNS remains fail-closed"
+            );
+        }
     }
 
     let traversal_watermark =
@@ -8387,6 +8393,12 @@ mod tests {
             format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
         )
         .expect("auto tunnel verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("auto tunnel verifier key permissions should be secure");
+        }
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -8404,6 +8416,12 @@ mod tests {
             body = body.replace("route_count=1", "route_count=2");
         }
         std::fs::write(path, body).expect("auto tunnel file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("auto tunnel bundle permissions should be secure");
+        }
     }
 
     fn write_auto_tunnel_file_exitless(
@@ -8418,6 +8436,12 @@ mod tests {
             format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
         )
         .expect("auto tunnel verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("auto tunnel verifier key permissions should be secure");
+        }
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -8435,6 +8459,12 @@ mod tests {
             ),
         )
         .expect("auto tunnel file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("auto tunnel bundle permissions should be secure");
+        }
     }
 
     fn write_auto_tunnel_file_two_peers(
@@ -8449,6 +8479,12 @@ mod tests {
             format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
         )
         .expect("auto tunnel verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("auto tunnel verifier key permissions should be secure");
+        }
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -8467,6 +8503,67 @@ mod tests {
             ),
         )
         .expect("auto tunnel file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("auto tunnel bundle permissions should be secure");
+        }
+    }
+
+    fn write_dns_zone_file_with_timing(
+        path: &Path,
+        verifier_path: &Path,
+        subject_node_id: &str,
+        record: (&str, &str, &[&str]),
+        nonce: u64,
+        generated_at_unix: u64,
+        ttl_secs: u64,
+        tamper_after_sign: bool,
+    ) {
+        let (target_node_id, expected_ip, aliases) = record;
+        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("dns zone verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("dns zone verifier key permissions should be secure");
+        }
+
+        let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
+            &signing_key,
+            "rustynet",
+            subject_node_id,
+            generated_at_unix,
+            ttl_secs,
+            nonce,
+            &[rustynet_dns_zone::DnsZoneRecordInput {
+                label: "app".to_string(),
+                target_node_id: target_node_id.to_string(),
+                rr_type: rustynet_dns_zone::DnsRecordType::A,
+                target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
+                expected_ip: expected_ip.to_string(),
+                ttl_secs,
+                aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            }],
+        )
+        .expect("dns zone bundle should be built");
+        let mut body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
+        if tamper_after_sign {
+            body = body.replace("record.0.ttl_secs=60", "record.0.ttl_secs=61");
+        }
+        std::fs::write(path, body).expect("dns zone file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("dns zone bundle permissions should be secure");
+        }
     }
 
     fn write_dns_zone_file(
@@ -8477,38 +8574,16 @@ mod tests {
         nonce: u64,
         tamper_after_sign: bool,
     ) {
-        let (target_node_id, expected_ip, aliases) = record;
-        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
-        std::fs::write(
+        write_dns_zone_file_with_timing(
+            path,
             verifier_path,
-            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
-        )
-        .expect("dns zone verifier key should be written");
-
-        let generated = unix_now();
-        let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
-            &signing_key,
-            "rustynet",
             subject_node_id,
-            generated,
-            60,
+            record,
             nonce,
-            &[rustynet_dns_zone::DnsZoneRecordInput {
-                label: "app".to_string(),
-                target_node_id: target_node_id.to_string(),
-                rr_type: rustynet_dns_zone::DnsRecordType::A,
-                target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
-                expected_ip: expected_ip.to_string(),
-                ttl_secs: 60,
-                aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
-            }],
-        )
-        .expect("dns zone bundle should be built");
-        let mut body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
-        if tamper_after_sign {
-            body = body.replace("record.0.ttl_secs=60", "record.0.ttl_secs=61");
-        }
-        std::fs::write(path, body).expect("dns zone file should be written");
+            unix_now(),
+            60,
+            tamper_after_sign,
+        );
     }
 
     fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
@@ -11183,6 +11258,93 @@ mod tests {
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
         let _ = std::fs::remove_file(traversal_bundle_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn preflight_allows_stale_dns_zone_bundle_without_failing_daemon_start() {
+        let test_dir = secure_test_dir("rustynetd-preflight-dns-zone-stale-optional");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        let dns_zone_watermark_path = test_dir.join("dns-zone.watermark");
+        let traversal_bundle_path = test_dir.join("missing.traversal.bundle");
+        let traversal_verifier_path = test_dir.join("missing.traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            41,
+            false,
+        );
+        let stale_generated_at = unix_now().saturating_sub(7_200);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            42,
+            stale_generated_at,
+            300,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            dns_zone_bundle_path: dns_zone_path.clone(),
+            dns_zone_verifier_key_path: dns_zone_verifier_path.clone(),
+            dns_zone_watermark_path: dns_zone_watermark_path.clone(),
+            traversal_bundle_path: traversal_bundle_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+
+        run_preflight_checks(&config)
+            .expect("preflight should pass with stale dns zone bundle and fail-closed DNS state");
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_watermark_path);
         let _ = std::fs::remove_file(traversal_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
     }

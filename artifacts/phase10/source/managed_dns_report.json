@@ -2,9 +2,9 @@
   "phase": "phase10",
   "mode": "live_linux_managed_dns",
   "evidence_mode": "measured",
-  "captured_at": "2026-03-20T20:14:16Z",
-  "captured_at_unix": 1774037656,
-  "git_commit": "b10d2646e069ce22ee76b180a242719f5c0b2aff",
+  "captured_at": "2026-03-21T19:54:06Z",
+  "captured_at_unix": 1774122846,
+  "git_commit": "00bfbd4065104a3c3835229057bb5a56ad9b9a66",
   "status": "pass",
   "zone_name": "rustynet",
   "signer_host": "debian@192.168.64.22",
@@ -25,6 +25,6 @@
     "valid_bundle_restored": "pass"
   },
   "source_artifacts": [
-    "/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260320T200617Z/live_linux_managed_dns.log"
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260321T194523Z/live_linux_managed_dns.log"
   ]
 }

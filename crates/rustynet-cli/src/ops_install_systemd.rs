@@ -996,15 +996,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             ],
         )?;
     }
-    run_command_stream(
-        "systemctl",
-        &[
-            "--no-pager",
-            "--full",
-            "status",
-            "rustynetd-managed-dns.service",
-        ],
-    )?;
+    run_systemctl_status_with_retry("rustynetd-managed-dns.service", 20, 250)?;
     run_command_stream(
         "systemctl",
         &["--no-pager", "--full", "status", "rustynetd.service"],
@@ -2094,6 +2086,67 @@ fn run_command_stream(command: &str, args: &[&str]) -> Result<(), String> {
     ))
 }
 
+fn run_systemctl_status_with_retry(
+    unit: &str,
+    attempts: usize,
+    sleep_ms: u64,
+) -> Result<(), String> {
+    let status_args = ["--no-pager", "--full", "status", unit];
+    let command_text = format_command("systemctl", &status_args);
+    let mut last_state = "unknown".to_string();
+    let mut last_exit = "unknown".to_string();
+    for attempt in 1..=attempts {
+        let output = Command::new("systemctl")
+            .args(status_args)
+            .output()
+            .map_err(|err| format!("execute {command_text} failed: {err}"))?;
+        if !output.stdout.is_empty() {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        if output.status.success() {
+            return Ok(());
+        }
+        last_exit = format!("{}", output.status);
+        last_state = systemctl_unit_active_state(unit)?;
+        if attempt < attempts && systemctl_state_retryable(last_state.as_str()) {
+            sleep(Duration::from_millis(sleep_ms));
+            continue;
+        }
+        return Err(format!(
+            "command failed: {command_text} (exit={last_exit}, active_state={last_state}, attempt={attempt}/{attempts})"
+        ));
+    }
+    Err(format!(
+        "command failed: {command_text} (exit={last_exit}, active_state={last_state})"
+    ))
+}
+
+fn systemctl_unit_active_state(unit: &str) -> Result<String, String> {
+    let output = Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+        .map_err(|err| format!("execute systemctl is-active {unit} failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Ok(stderr);
+    }
+    Ok("unknown".to_string())
+}
+
+fn systemctl_state_retryable(state: &str) -> bool {
+    matches!(
+        state,
+        "activating" | "deactivating" | "reloading" | "inactive" | "unknown"
+    )
+}
+
 fn format_command(command: &str, args: &[&str]) -> String {
     if args.is_empty() {
         return command.to_string();
@@ -2131,7 +2184,7 @@ mod tests {
     use super::{
         assignment_peer_endpoint, bytes_to_hex, parse_dev_interface_token,
         parse_dns_resolver_bind_addr_install, parse_install_bool, read_env_file_values,
-        resolve_selected_exit_node_id,
+        resolve_selected_exit_node_id, systemctl_state_retryable,
     };
 
     #[test]
@@ -2143,6 +2196,16 @@ mod tests {
         assert!(!parse_install_bool("TEST", "0").expect("0 should parse"));
         assert!(!parse_install_bool("TEST", "no").expect("no should parse"));
         assert!(parse_install_bool("TEST", "TRUE").is_err());
+    }
+
+    #[test]
+    fn systemctl_state_retryable_is_strict() {
+        assert!(systemctl_state_retryable("activating"));
+        assert!(systemctl_state_retryable("deactivating"));
+        assert!(systemctl_state_retryable("reloading"));
+        assert!(systemctl_state_retryable("inactive"));
+        assert!(!systemctl_state_retryable("failed"));
+        assert!(!systemctl_state_retryable("active"));
     }
 
     #[test]

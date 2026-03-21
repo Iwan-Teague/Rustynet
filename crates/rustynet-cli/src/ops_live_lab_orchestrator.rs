@@ -2223,12 +2223,36 @@ pub fn execute_ops_extract_managed_dns_expected_ip(
     let fqdn_token = format!("fqdn={fqdn}");
     for line in config.inspect_output.lines() {
         let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if !tokens.contains(&fqdn_token.as_str()) {
-            continue;
+        if tokens.contains(&fqdn_token.as_str()) {
+            for token in &tokens {
+                if let Some(value) = token.strip_prefix("expected_ip=") {
+                    return Ok(value.to_string());
+                }
+            }
         }
-        for token in tokens {
-            if let Some(value) = token.strip_prefix("expected_ip=") {
-                return Ok(value.to_string());
+
+        for (index, token) in tokens.iter().enumerate() {
+            let Some(record_token) = token.strip_prefix("record.") else {
+                continue;
+            };
+            let Some((record_index, token_fqdn)) = record_token.split_once(".fqdn=") else {
+                continue;
+            };
+            if token_fqdn != fqdn {
+                continue;
+            }
+
+            let expected_ip_prefix = format!("record.{record_index}.expected_ip=");
+            for candidate in &tokens {
+                if let Some(value) = candidate.strip_prefix(expected_ip_prefix.as_str()) {
+                    return Ok(value.to_string());
+                }
+            }
+
+            for candidate in tokens.iter().skip(index + 1) {
+                if let Some(value) = candidate.strip_prefix("expected_ip=") {
+                    return Ok(value.to_string());
+                }
             }
         }
     }
@@ -2409,15 +2433,16 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckLocalFileModeConfig, RewriteAssignmentMeshCidrConfig,
-        RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
-        WriteActiveNetworkRoguePathHijackReportConfig,
+        CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
+        RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
+        UpdateRoleSwitchHostResultConfig, WriteActiveNetworkRoguePathHijackReportConfig,
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLinuxControlSurfaceReportConfig,
         WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
         WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
         WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
         count_no_leak_tunnel_packets, execute_ops_check_local_file_mode,
-        execute_ops_rewrite_assignment_mesh_cidr, execute_ops_rewrite_assignment_peer_endpoint_ip,
+        execute_ops_extract_managed_dns_expected_ip, execute_ops_rewrite_assignment_mesh_cidr,
+        execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
         execute_ops_write_active_network_rogue_path_hijack_report,
         execute_ops_write_active_network_signed_state_tamper_report,
@@ -2730,6 +2755,32 @@ mod tests {
         assert_eq!(count_no_leak_tunnel_packets(&load_lines), 1);
         assert_eq!(count_no_leak_cleartext_packets(&load_lines), 1);
         assert_eq!(count_no_leak_cleartext_packets(&down_lines), 1);
+    }
+
+    #[test]
+    fn extract_managed_dns_expected_ip_supports_legacy_tokens() {
+        let output = "dns inspect: state=valid fqdn=exit.rustynet expected_ip=100.64.0.1";
+        let expected =
+            execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
+                fqdn: "exit.rustynet".to_string(),
+                inspect_output: output.to_string(),
+            })
+            .expect("extract expected ip");
+        assert_eq!(expected, "100.64.0.1");
+    }
+
+    #[test]
+    fn extract_managed_dns_expected_ip_supports_record_indexed_tokens() {
+        let output = "dns inspect: state=valid record_count=2 \
+record.0.fqdn=client.rustynet record.0.expected_ip=100.68.223.117 \
+record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
+        let expected =
+            execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
+                fqdn: "exit.rustynet".to_string(),
+                inspect_output: output.to_string(),
+            })
+            .expect("extract expected ip");
+        assert_eq!(expected, "100.109.33.213");
     }
 
     #[test]

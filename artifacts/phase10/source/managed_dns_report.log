@@ -1,45 +1,44 @@
 [managed-dns] Collecting WireGuard public keys
 [managed-dns] Issuing signed managed DNS bundles on debian@192.168.64.22
-signing passphrase materialized at /tmp/rn-dns-zone-passphrase.5QeCdI
-dns zone bundle issued: zone_name=rustynet subject_node_id=client-1 output=/run/rustynet/dns-zone-issue/valid.dns-zone generated_at_unix=1774037615 expires_at_unix=1774037915 record_count=2 verifier_key_output=/run/rustynet/dns-zone-issue/rn-dns-zone.pub
-dns zone bundle issued: zone_name=rustynet subject_node_id=client-1 output=/run/rustynet/dns-zone-issue/stale.dns-zone generated_at_unix=1774030413 expires_at_unix=1774030713 record_count=2 verifier_key_output=/run/rustynet/dns-zone-issue/rn-dns-zone.pub
+signing passphrase materialized at /tmp/rn-dns-zone-passphrase.YbWj5h
+dns zone bundle issued: zone_name=rustynet subject_node_id=client-1 output=/run/rustynet/dns-zone-issue/valid.dns-zone generated_at_unix=1774122805 expires_at_unix=1774123105 record_count=2 verifier_key_output=/run/rustynet/dns-zone-issue/rn-dns-zone.pub
+dns zone bundle issued: zone_name=rustynet subject_node_id=client-1 output=/run/rustynet/dns-zone-issue/stale.dns-zone generated_at_unix=1774115602 expires_at_unix=1774115902 record_count=2 verifier_key_output=/run/rustynet/dns-zone-issue/rn-dns-zone.pub
 [managed-dns] Verifying signed managed DNS bundles on signer host
-[managed-dns] Installing DNS query helper on client
 [managed-dns] Installing valid managed DNS bundle on debian@192.168.64.24
 [managed-dns] Issuing signed traversal bundles on debian@192.168.64.22
-signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.zi3C2u
-traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774037620 expires_at_unix=1774037740 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
-traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774037620 expires_at_unix=1774037740 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.cHoZZ2
+traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774122809 expires_at_unix=1774122929 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774122809 expires_at_unix=1774122929 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
 [managed-dns] Distributing signed traversal bundles
 [managed-dns] Valid dns inspect
-dns inspect: state=valid zone_name=rustynet subject_node_id=client-1 generated_at_unix=1774037615 expires_at_unix=1774037915 record_count=2 record.0.fqdn=client.rustynet target_node_id=client-1 rr_type=A target_addr_kind=mesh_ipv4 expected_ip=100.68.223.117 ttl_secs=300 aliases=none record.1.fqdn=exit.rustynet target_node_id=exit-1 rr_type=A target_addr_kind=mesh_ipv4 expected_ip=100.109.33.213 ttl_secs=300 aliases=gateway.rustynet
+dns inspect: state=valid zone_name=rustynet subject_node_id=client-1 generated_at_unix=1774122805 expires_at_unix=1774123105 record_count=2 record.0.fqdn=client.rustynet target_node_id=client-1 rr_type=A target_addr_kind=mesh_ipv4 expected_ip=100.68.223.117 ttl_secs=300 aliases=none record.1.fqdn=exit.rustynet target_node_id=exit-1 rr_type=A target_addr_kind=mesh_ipv4 expected_ip=100.109.33.213 ttl_secs=300 aliases=gateway.rustynet
 [managed-dns] Valid resolvectl status
-Link 23 (rustynet0)
+Link 19 (rustynet0)
     Current Scopes: DNS
          Protocols: -DefaultRoute +LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
        DNS Servers: 127.0.0.1:53535
         DNS Domain: rustynet
      Default Route: no
 [managed-dns] Valid loopback DNS query
-{"rcode":0,"answer_count":1,"answer_ip":"100.109.33.213","answer_ttl":300,"error":""}
+{"answer_count":1,"answer_ip":"100.109.33.213","answer_ttl":300,"error":"","rcode":0}
 [managed-dns] Valid resolvectl query
 exit.rustynet: 100.109.33.213
 [managed-dns] Installing stale managed DNS bundle on debian@192.168.64.24
 [managed-dns] Issuing signed traversal bundles on debian@192.168.64.22
-signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.rjXUuy
-traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774037634 expires_at_unix=1774037754 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
-traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774037634 expires_at_unix=1774037754 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.LlnZGJ
+traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774122823 expires_at_unix=1774122943 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774122823 expires_at_unix=1774122943 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
 [managed-dns] Distributing signed traversal bundles
 [managed-dns] Stale dns inspect
-error: daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): No such file or directory (os error 2)
+dns inspect: state=invalid error=dns_zone_bundle_is_stale
 [managed-dns] Stale rustynetd state
-activating
+active
 [managed-dns] Stale loopback DNS query
-{"rcode":-1,"answer_count":0,"answer_ip":"","answer_ttl":0,"error":"timed out"}
+{"answer_count":0,"answer_ip":"","answer_ttl":0,"error":"","rcode":2}
 [managed-dns] Restoring valid managed DNS bundle on debian@192.168.64.24
 [managed-dns] Issuing signed traversal bundles on debian@192.168.64.22
-signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.dlS6bP
-traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774037646 expires_at_unix=1774037766 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
-traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774037646 expires_at_unix=1774037766 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+signing passphrase materialized at /tmp/rn-dns-traversal-passphrase.JUr2IK
+traversal bundle issued: source_node_id=client-1 target_node_id=exit-1 output=/run/rustynet/traversal-issue/rn-traversal-client-1-exit-1.bundle generated_at_unix=1774122832 expires_at_unix=1774122952 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
+traversal bundle issued: source_node_id=exit-1 target_node_id=client-1 output=/run/rustynet/traversal-issue/rn-traversal-exit-1-client-1.bundle generated_at_unix=1774122832 expires_at_unix=1774122952 verifier_key_output=/run/rustynet/traversal-issue/rn-traversal.pub
 [managed-dns] Distributing signed traversal bundles
-[managed-dns] Managed DNS report written: /Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260320T200617Z/live_linux_managed_dns_report.json
+[managed-dns] Managed DNS report written: /Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260321T194523Z/live_linux_managed_dns_report.json

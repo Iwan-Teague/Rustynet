@@ -1792,10 +1792,18 @@ stage_preflight() {
 
 stage_prepare_source_archive() {
   local archive_ref=""
+  local tar_version
+  local -a tar_flags=()
   write_remote_scripts
   printf 'source mode: %s\n' "$(describe_source_mode)"
   if [[ "$SOURCE_MODE" == "working-tree" ]]; then
-    COPYFILE_DISABLE=1 tar -C "$ROOT_DIR" \
+    tar_version="$(tar --version 2>/dev/null || true)"
+    tar_version="${tar_version%%$'\n'*}"
+    if [[ "$tar_version" == *"bsdtar"* ]]; then
+      # Prevent host-local metadata leakage into deployment archives on macOS.
+      tar_flags+=(--no-mac-metadata --no-xattrs --no-acls --no-fflags)
+    fi
+    COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -C "$ROOT_DIR" \
       --exclude='.git' \
       --exclude='target' \
       --exclude='.cargo-home' \
