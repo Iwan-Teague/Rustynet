@@ -1,0 +1,1736 @@
+#![forbid(unsafe_code)]
+
+use std::fs;
+use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+
+const CHECK_PASS: &str = "pass";
+const CHECK_FAIL: &str = "fail";
+const CHECK_SKIPPED: &str = "skipped";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckLocalFileModeConfig {
+    pub path: PathBuf,
+    pub policy: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteCrossNetworkForensicsManifestConfig {
+    pub stage: String,
+    pub collected_at_utc: String,
+    pub stage_dir: PathBuf,
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha256FileConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteCrossNetworkPreflightReportConfig {
+    pub nodes_tsv: PathBuf,
+    pub stage_dir: PathBuf,
+    pub output: PathBuf,
+    pub reference_unix: u64,
+    pub max_clock_skew_secs: u64,
+    pub discovery_max_age_secs: u64,
+    pub signed_artifact_max_age_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxRebootRecoveryReportConfig {
+    pub report_path: PathBuf,
+    pub observations_path: PathBuf,
+    pub exit_pre: String,
+    pub exit_post: String,
+    pub client_pre: String,
+    pub client_post: String,
+    pub exit_return: String,
+    pub exit_boot_change: String,
+    pub post_exit_twohop: String,
+    pub client_return: String,
+    pub client_boot_change: String,
+    pub post_client_twohop: String,
+    pub salvage_twohop: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxLabRunSummaryConfig {
+    pub nodes_tsv: PathBuf,
+    pub stages_tsv: PathBuf,
+    pub summary_json: PathBuf,
+    pub summary_md: PathBuf,
+    pub run_id: String,
+    pub network_id: String,
+    pub report_dir: String,
+    pub overall_status: String,
+    pub started_at_local: String,
+    pub started_at_utc: String,
+    pub started_at_unix: u64,
+    pub finished_at_local: String,
+    pub finished_at_utc: String,
+    pub finished_at_unix: u64,
+    pub elapsed_secs: u64,
+    pub elapsed_human: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanIpv4PortRangeConfig {
+    pub network_prefix: String,
+    pub start_host: u8,
+    pub end_host: u8,
+    pub port: u16,
+    pub timeout_ms: u64,
+    pub output_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRoleSwitchHostResultConfig {
+    pub hosts_json_path: PathBuf,
+    pub os_id: String,
+    pub temp_role: String,
+    pub switch_execution: String,
+    pub post_switch_reconcile: String,
+    pub policy_still_enforced: String,
+    pub least_privilege_preserved: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRoleSwitchMatrixReportConfig {
+    pub hosts_json_path: PathBuf,
+    pub report_path: PathBuf,
+    pub source_path: PathBuf,
+    pub git_commit: String,
+    pub captured_at_unix: u64,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxServerIpBypassReportConfig {
+    pub report_path: PathBuf,
+    pub allowed_management_cidrs: String,
+    pub probe_from_client_status: String,
+    pub probe_ip: String,
+    pub probe_port: u16,
+    pub client_internet_route: String,
+    pub client_probe_route: String,
+    pub client_table_51820: String,
+    pub client_endpoints: String,
+    pub probe_self_test: String,
+    pub probe_from_client_output: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxControlSurfaceReportConfig {
+    pub report_path: PathBuf,
+    pub dns_bind_addr: String,
+    pub remote_dns_probe_status: String,
+    pub remote_dns_probe_output: String,
+    pub work_dir: PathBuf,
+    pub host_labels: Vec<String>,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteAssignmentPeerEndpointIpConfig {
+    pub assignment_path: PathBuf,
+    pub endpoint_ip: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxEndpointHijackReportConfig {
+    pub report_path: PathBuf,
+    pub rogue_endpoint_ip: String,
+    pub baseline_status: String,
+    pub baseline_netcheck: String,
+    pub baseline_endpoints: String,
+    pub status_after_hijack: String,
+    pub netcheck_after_hijack: String,
+    pub endpoints_after_hijack: String,
+    pub status_after_recovery: String,
+    pub endpoints_after_recovery: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileModePolicy {
+    OwnerOnly,
+    NoGroupWorldWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedCidr {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+fn parse_file_mode_policy(raw: &str) -> Result<FileModePolicy, String> {
+    match raw.trim() {
+        "owner-only" => Ok(FileModePolicy::OwnerOnly),
+        "no-group-world-write" => Ok(FileModePolicy::NoGroupWorldWrite),
+        other => Err(format!(
+            "invalid --policy {other:?}; expected owner-only or no-group-world-write"
+        )),
+    }
+}
+
+fn resolve_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("resolve current directory failed: {err}"))?;
+    Ok(cwd.join(path))
+}
+
+fn read_tsv_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read tsv failed ({}): {err}", path.display()))?;
+    Ok(body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split('\t')
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>())
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create output directory failed ({}): {err}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn write_json_pretty(path: &Path, payload: &Value) -> Result<(), String> {
+    ensure_parent_dir(path)?;
+    let body = serde_json::to_string_pretty(payload)
+        .map_err(|err| format!("serialize JSON failed: {err}"))?;
+    fs::write(path, format!("{body}\n"))
+        .map_err(|err| format!("write JSON failed ({}): {err}", path.display()))
+}
+
+fn absolute_path_string(path: &Path) -> Result<String, String> {
+    Ok(resolve_path(path)?.display().to_string())
+}
+
+fn is_word_boundary(ch: Option<char>) -> bool {
+    match ch {
+        None => true,
+        Some(value) => !(value.is_ascii_alphanumeric() || value == '_'),
+    }
+}
+
+fn redact_first_keyword_value(line: &str, keyword: &str) -> Option<String> {
+    let lowered = line.to_ascii_lowercase();
+    let keyword_len = keyword.len();
+    let mut search_from = 0usize;
+    while search_from + keyword_len <= lowered.len() {
+        let offset = lowered[search_from..].find(keyword)?;
+        let start = search_from + offset;
+        let end = start + keyword_len;
+        let before = line[..start].chars().next_back();
+        let after = line[end..].chars().next();
+        if !is_word_boundary(before) || !is_word_boundary(after) {
+            search_from = end;
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut sep_index = end;
+        while sep_index < bytes.len() && bytes[sep_index].is_ascii_whitespace() {
+            sep_index += 1;
+        }
+        if sep_index >= bytes.len() || !matches!(bytes[sep_index], b':' | b'=') {
+            search_from = end;
+            continue;
+        }
+        let mut value_start = sep_index + 1;
+        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        if value_start >= bytes.len() {
+            return None;
+        }
+        let mut value_end = value_start;
+        while value_end < bytes.len() && !bytes[value_end].is_ascii_whitespace() {
+            value_end += 1;
+        }
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[..value_start]);
+        out.push_str("<redacted>");
+        out.push_str(&line[value_end..]);
+        return Some(out);
+    }
+    None
+}
+
+fn redact_forensics_line(line: &str) -> String {
+    let upper = line.to_ascii_uppercase();
+    if upper.contains("PRIVATE KEY-----")
+        || (upper.contains("BEGIN ") && upper.contains("PRIVATE KEY"))
+    {
+        return "[REDACTED sensitive key material]".to_string();
+    }
+    let mut out = line.to_string();
+    for keyword in ["passphrase", "password", "secret", "token"] {
+        if let Some(updated) = redact_first_keyword_value(out.as_str(), keyword) {
+            out = updated;
+        }
+    }
+    out
+}
+
+fn redact_forensics_payload(input: &str) -> String {
+    let mut lines = input
+        .lines()
+        .map(redact_forensics_line)
+        .collect::<Vec<String>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut body = lines.join("\n");
+    if input.ends_with('\n') {
+        body.push('\n');
+    }
+    lines.clear();
+    body
+}
+
+fn parse_network_prefix(prefix: &str) -> Result<[u8; 3], String> {
+    let parts = prefix.trim().split('.').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid --network-prefix {prefix:?}; expected a.b.c"
+        ));
+    }
+    let mut octets = [0u8; 3];
+    for (index, part) in parts.iter().enumerate() {
+        octets[index] = part
+            .parse::<u8>()
+            .map_err(|err| format!("invalid --network-prefix {prefix:?}: {err}"))?;
+    }
+    Ok(octets)
+}
+
+fn reboot_reason_for_check(check: &str) -> Option<&'static str> {
+    match check {
+        "exit_reboot_returns" => Some("exit did not return on SSH after reboot"),
+        "exit_boot_id_changes" => Some("exit reboot was not proven by a new boot_id"),
+        "post_exit_reboot_twohop" => Some("two-hop validation failed after exit reboot"),
+        "client_reboot_returns" => Some("client did not return on SSH after reboot"),
+        "client_boot_id_changes" => Some("client reboot was not proven by a new boot_id"),
+        "post_client_reboot_twohop" => Some("two-hop validation failed after client reboot"),
+        "client_failure_salvage_twohop" => {
+            Some("salvage two-hop validation failed after the client reboot outage")
+        }
+        _ => None,
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn parse_pass_fail(value: &str, label: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized == CHECK_PASS || normalized == CHECK_FAIL {
+        Ok(normalized.to_string())
+    } else {
+        Err(format!("{label} must be pass or fail (got: {value:?})"))
+    }
+}
+
+fn parse_pass_fail_skip(value: &str, label: &str) -> Result<String, String> {
+    let normalized = value.trim();
+    if normalized == CHECK_PASS || normalized == CHECK_FAIL || normalized == CHECK_SKIPPED {
+        Ok(normalized.to_string())
+    } else {
+        Err(format!(
+            "{label} must be pass, fail, or skipped (got: {value:?})"
+        ))
+    }
+}
+
+fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(Map::new());
+    }
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read JSON failed ({}): {err}", path.display()))?;
+    if body.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    let parsed: Value = serde_json::from_str(body.as_str())
+        .map_err(|err| format!("parse JSON failed ({}): {err}", path.display()))?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| format!("JSON root must be an object ({})", path.display()))?;
+    Ok(object.clone())
+}
+
+fn parse_cidr(value: &str) -> Result<ParsedCidr, String> {
+    let trimmed = value.trim();
+    let (ip_raw, prefix_raw) = trimmed
+        .split_once('/')
+        .ok_or_else(|| format!("invalid CIDR {trimmed:?}"))?;
+    let ip = ip_raw
+        .parse::<IpAddr>()
+        .map_err(|err| format!("invalid CIDR IP {ip_raw:?}: {err}"))?;
+    let prefix = prefix_raw
+        .parse::<u8>()
+        .map_err(|err| format!("invalid CIDR prefix {prefix_raw:?}: {err}"))?;
+    match ip {
+        IpAddr::V4(ipv4) => {
+            if prefix > 32 {
+                return Err(format!("invalid IPv4 CIDR prefix: {prefix}"));
+            }
+            let mask = if prefix == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            let network = u32::from(ipv4) & mask;
+            Ok(ParsedCidr::V4 { network, prefix })
+        }
+        IpAddr::V6(ipv6) => {
+            if prefix > 128 {
+                return Err(format!("invalid IPv6 CIDR prefix: {prefix}"));
+            }
+            let mask = if prefix == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            let network = u128::from_be_bytes(ipv6.octets()) & mask;
+            Ok(ParsedCidr::V6 { network, prefix })
+        }
+    }
+}
+
+fn cidr_is_host_route(cidr: &ParsedCidr) -> bool {
+    match cidr {
+        ParsedCidr::V4 { prefix, .. } => *prefix == 32,
+        ParsedCidr::V6 { prefix, .. } => *prefix == 128,
+    }
+}
+
+fn is_peer_endpoint_key(key: &str) -> bool {
+    if !key.starts_with("peer.") || !key.ends_with(".endpoint") {
+        return false;
+    }
+    let Some(middle) = key.strip_prefix("peer.") else {
+        return false;
+    };
+    let Some(index) = middle.strip_suffix(".endpoint") else {
+        return false;
+    };
+    !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn split_endpoint_host_port(value: &str) -> Option<(&str, &str)> {
+    let trimmed = value.trim();
+    let (host, port) = trimmed.rsplit_once(':')?;
+    if host.trim().is_empty() || port.trim().is_empty() {
+        return None;
+    }
+    Some((host.trim(), port.trim()))
+}
+
+pub fn execute_ops_check_local_file_mode(
+    config: CheckLocalFileModeConfig,
+) -> Result<String, String> {
+    let path = resolve_path(config.path.as_path())?;
+    let metadata = fs::symlink_metadata(path.as_path())
+        .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("path must not be a symlink: {}", path.display()));
+    }
+    if !metadata.file_type().is_file() && !metadata.file_type().is_socket() {
+        return Err(format!("path must be a regular file: {}", path.display()));
+    }
+    let mode = metadata.mode() & 0o777;
+    let label = if config.label.trim().is_empty() {
+        "file".to_string()
+    } else {
+        config.label.trim().to_string()
+    };
+    match parse_file_mode_policy(config.policy.as_str())? {
+        FileModePolicy::OwnerOnly => {
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "{label} must be owner-only (0400/0600): {} ({mode:03o})",
+                    path.display()
+                ));
+            }
+        }
+        FileModePolicy::NoGroupWorldWrite => {
+            if mode & 0o022 != 0 {
+                return Err(format!(
+                    "{label} must not be group/world writable: {} ({mode:03o})",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(format!("{mode:03o}"))
+}
+
+pub fn execute_ops_redact_forensics_text() -> Result<String, String> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|err| format!("read stdin failed: {err}"))?;
+    Ok(redact_forensics_payload(input.as_str()))
+}
+
+pub fn execute_ops_write_cross_network_forensics_manifest(
+    config: WriteCrossNetworkForensicsManifestConfig,
+) -> Result<String, String> {
+    let stage_dir = resolve_path(config.stage_dir.as_path())?;
+    let output = resolve_path(config.output.as_path())?;
+    if !stage_dir.is_dir() {
+        return Err(format!(
+            "stage-dir must be an existing directory: {}",
+            stage_dir.display()
+        ));
+    }
+
+    let mut node_dirs = fs::read_dir(stage_dir.as_path())
+        .map_err(|err| format!("read stage-dir failed ({}): {err}", stage_dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .collect::<Vec<_>>();
+    node_dirs.sort_by_key(|entry| entry.file_name());
+
+    let mut nodes = Vec::new();
+    for node_dir in node_dirs {
+        let node_path = node_dir.path();
+        let mut files = fs::read_dir(node_path.as_path())
+            .map_err(|err| {
+                format!(
+                    "read node forensics directory failed ({}): {err}",
+                    node_path.display()
+                )
+            })?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+            })
+            .map(|entry| {
+                fs::canonicalize(entry.path()).unwrap_or_else(|_| {
+                    resolve_path(entry.path().as_path()).unwrap_or_else(|_| entry.path())
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        nodes.push(json!({
+            "label": node_dir.file_name().to_string_lossy().to_string(),
+            "files": files.into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        }));
+    }
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "cross_network_failure_forensics",
+        "stage": config.stage,
+        "collected_at_utc": config.collected_at_utc,
+        "bundle_dir": absolute_path_string(stage_dir.as_path())?,
+        "nodes": nodes,
+    });
+    write_json_pretty(output.as_path(), &payload)?;
+    Ok(output.display().to_string())
+}
+
+pub fn execute_ops_sha256_file(config: Sha256FileConfig) -> Result<String, String> {
+    let path = resolve_path(config.path.as_path())?;
+    let bytes = fs::read(path.as_path())
+        .map_err(|err| format!("read file failed ({}): {err}", path.display()))?;
+    let digest = Sha256::digest(bytes.as_slice());
+    Ok(format!("{digest:x}"))
+}
+
+pub fn execute_ops_write_cross_network_preflight_report(
+    config: WriteCrossNetworkPreflightReportConfig,
+) -> Result<String, String> {
+    let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+    let stage_dir = resolve_path(config.stage_dir.as_path())?;
+    let output = resolve_path(config.output.as_path())?;
+    let rows = read_tsv_rows(nodes_tsv.as_path())?;
+
+    let mut nodes = Vec::new();
+    for row in rows {
+        if row.len() != 4 {
+            continue;
+        }
+        let label = row[0].clone();
+        let capability_file = stage_dir.join(format!("capabilities-{label}.txt"));
+        nodes.push(json!({
+            "label": row[0],
+            "target": row[1],
+            "node_id": row[2],
+            "role": row[3],
+            "capability_file": absolute_path_string(capability_file.as_path())?,
+            "capability_file_exists": capability_file.exists(),
+        }));
+    }
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "cross_network_preflight",
+        "reference_unix": config.reference_unix,
+        "max_clock_skew_secs": config.max_clock_skew_secs,
+        "discovery_max_age_secs": config.discovery_max_age_secs,
+        "signed_artifact_max_age_secs": config.signed_artifact_max_age_secs,
+        "nodes": nodes,
+    });
+    write_json_pretty(output.as_path(), &payload)?;
+    Ok(output.display().to_string())
+}
+
+pub fn execute_ops_write_live_linux_reboot_recovery_report(
+    config: WriteLiveLinuxRebootRecoveryReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let observations_path = resolve_path(config.observations_path.as_path())?;
+    let observations = fs::read(observations_path.as_path())
+        .map(|bytes| String::from_utf8_lossy(bytes.as_slice()).to_string())
+        .unwrap_or_default();
+
+    let checks = [
+        ("exit_reboot_returns", config.exit_return),
+        ("exit_boot_id_changes", config.exit_boot_change),
+        ("post_exit_reboot_twohop", config.post_exit_twohop),
+        ("client_reboot_returns", config.client_return),
+        ("client_boot_id_changes", config.client_boot_change),
+        ("post_client_reboot_twohop", config.post_client_twohop),
+        ("client_failure_salvage_twohop", config.salvage_twohop),
+    ];
+
+    let relevant = checks
+        .iter()
+        .filter(|(_, value)| value.as_str() != CHECK_SKIPPED)
+        .collect::<Vec<_>>();
+    let status = if !relevant.is_empty()
+        && relevant
+            .iter()
+            .all(|(_, value)| value.as_str() == CHECK_PASS)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+
+    let mut failure_reasons = checks
+        .iter()
+        .filter_map(|(name, value)| {
+            if value.as_str() == CHECK_FAIL {
+                reboot_reason_for_check(name).map(ToString::to_string)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for line in observations
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        match line {
+            "client_reboot_wait=fail" => {
+                failure_reasons.push("client reboot wait timed out".to_string())
+            }
+            "exit_reboot_wait=fail" => {
+                failure_reasons.push("exit reboot wait timed out".to_string())
+            }
+            "exit_post=" => {
+                failure_reasons.push("exit post-reboot boot_id capture was empty".to_string())
+            }
+            "client_post=" => {
+                failure_reasons.push("client post-reboot boot_id capture was empty".to_string())
+            }
+            _ => {}
+        }
+    }
+
+    let checks_json = checks
+        .iter()
+        .map(|(name, value)| (name.to_string(), Value::String(value.clone())))
+        .collect::<Map<_, _>>();
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_linux_reboot_recovery",
+        "status": status,
+        "checks": Value::Object(checks_json),
+        "boot_ids": {
+            "exit_pre": config.exit_pre,
+            "exit_post": config.exit_post,
+            "client_pre": config.client_pre,
+            "client_post": config.client_post,
+        },
+        "failure_reasons": failure_reasons,
+        "observations": observations.trim(),
+    });
+
+    write_json_pretty(report_path.as_path(), &payload)?;
+    if status != CHECK_PASS {
+        return Err("live_linux_reboot_recovery report status is fail".to_string());
+    }
+    Ok(report_path.display().to_string())
+}
+
+pub fn execute_ops_write_live_linux_lab_run_summary(
+    config: WriteLiveLinuxLabRunSummaryConfig,
+) -> Result<String, String> {
+    let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+    let stages_tsv = resolve_path(config.stages_tsv.as_path())?;
+    let summary_json = resolve_path(config.summary_json.as_path())?;
+    let summary_md = resolve_path(config.summary_md.as_path())?;
+
+    let node_rows = read_tsv_rows(nodes_tsv.as_path())?;
+    let stage_rows = read_tsv_rows(stages_tsv.as_path())?;
+
+    let nodes = node_rows
+        .into_iter()
+        .filter(|row| row.len() == 4)
+        .map(|row| {
+            json!({
+                "label": row[0],
+                "target": row[1],
+                "node_id": row[2],
+                "bootstrap_role": row[3],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let stages = stage_rows
+        .into_iter()
+        .filter(|row| row.len() == 8)
+        .map(|row| {
+            let rc = row[3].parse::<i64>().unwrap_or(1);
+            json!({
+                "stage": row[0],
+                "severity": row[1],
+                "status": row[2],
+                "rc": rc,
+                "log_path": row[4],
+                "message": row[5],
+                "started_at": row[6],
+                "finished_at": row[7],
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = json!({
+        "schema_version": 1,
+        "run_id": config.run_id,
+        "network_id": config.network_id,
+        "report_dir": config.report_dir,
+        "overall_status": config.overall_status,
+        "started_at_local": config.started_at_local,
+        "started_at_utc": config.started_at_utc,
+        "started_at_unix": config.started_at_unix,
+        "finished_at_local": config.finished_at_local,
+        "finished_at_utc": config.finished_at_utc,
+        "finished_at_unix": config.finished_at_unix,
+        "elapsed_secs": config.elapsed_secs,
+        "elapsed_human": config.elapsed_human,
+        "nodes": nodes,
+        "stages": stages,
+    });
+    write_json_pretty(summary_json.as_path(), &payload)?;
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "# Live Linux Lab Orchestrator Summary ({})",
+        payload
+            .get("run_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(String::new());
+    lines.push(format!(
+        "- overall_status: `{}`",
+        payload
+            .get("overall_status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- network_id: `{}`",
+        payload
+            .get("network_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- report_dir: `{}`",
+        payload
+            .get("report_dir")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- started_at_local: `{}`",
+        payload
+            .get("started_at_local")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- started_at_utc: `{}`",
+        payload
+            .get("started_at_utc")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- finished_at_local: `{}`",
+        payload
+            .get("finished_at_local")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- finished_at_utc: `{}`",
+        payload
+            .get("finished_at_utc")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "- elapsed: `{}`",
+        payload
+            .get("elapsed_human")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    ));
+    lines.push(String::new());
+    lines.push("## Nodes".to_string());
+    lines.push(String::new());
+    if let Some(node_array) = payload.get("nodes").and_then(Value::as_array) {
+        for node in node_array {
+            lines.push(format!(
+                "- `{}`: `{}` (`{}`, bootstrap role `{}`)",
+                node.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                node.get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                node.get("node_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                node.get("bootstrap_role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Stages".to_string());
+    lines.push(String::new());
+    if let Some(stage_array) = payload.get("stages").and_then(Value::as_array) {
+        for stage in stage_array {
+            lines.push(format!(
+                "- `{}` [{}] -> `{}` (rc={})",
+                stage
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                stage
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                stage
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                stage.get("rc").and_then(Value::as_i64).unwrap_or(1),
+            ));
+            lines.push(format!(
+                "  log: `{}`",
+                stage
+                    .get("log_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ));
+            lines.push(format!(
+                "  detail: {}",
+                stage
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stage detail unavailable")
+            ));
+        }
+    }
+    ensure_parent_dir(summary_md.as_path())?;
+    fs::write(summary_md.as_path(), lines.join("\n") + "\n").map_err(|err| {
+        format!(
+            "write markdown summary failed ({}): {err}",
+            summary_md.display()
+        )
+    })?;
+
+    Ok(format!(
+        "live lab run summary generated: json={} md={}",
+        summary_json.display(),
+        summary_md.display()
+    ))
+}
+
+pub fn execute_ops_scan_ipv4_port_range(config: ScanIpv4PortRangeConfig) -> Result<String, String> {
+    if config.start_host == 0 {
+        return Err("--start-host must be between 1 and 254".to_string());
+    }
+    if config.end_host == 0 {
+        return Err("--end-host must be between 1 and 254".to_string());
+    }
+    if config.start_host > config.end_host {
+        return Err("--start-host must be <= --end-host".to_string());
+    }
+    let prefix = parse_network_prefix(config.network_prefix.as_str())?;
+    let timeout = Duration::from_millis(config.timeout_ms.max(1));
+    let output_key = if config.output_key.trim().is_empty() {
+        "hosts=".to_string()
+    } else {
+        config.output_key
+    };
+    let mut hits = Vec::new();
+    for host in config.start_host..=config.end_host {
+        let ip = Ipv4Addr::new(prefix[0], prefix[1], prefix[2], host);
+        let addr = SocketAddr::V4(SocketAddrV4::new(ip, config.port));
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            hits.push(ip.to_string());
+        }
+    }
+    Ok(format!("{output_key}{}", hits.join(",")))
+}
+
+pub fn execute_ops_update_role_switch_host_result(
+    config: UpdateRoleSwitchHostResultConfig,
+) -> Result<String, String> {
+    let hosts_json_path = resolve_path(config.hosts_json_path.as_path())?;
+    let os_id = config.os_id.trim();
+    if os_id.is_empty() {
+        return Err("--os-id must be non-empty".to_string());
+    }
+    let temp_role = config.temp_role.trim();
+    if temp_role.is_empty() {
+        return Err("--temp-role must be non-empty".to_string());
+    }
+    let switch_execution = parse_pass_fail(config.switch_execution.as_str(), "switch-execution")?;
+    let post_switch_reconcile = parse_pass_fail(
+        config.post_switch_reconcile.as_str(),
+        "post-switch-reconcile",
+    )?;
+    let policy_still_enforced = parse_pass_fail(
+        config.policy_still_enforced.as_str(),
+        "policy-still-enforced",
+    )?;
+    let least_privilege_preserved = parse_pass_fail(
+        config.least_privilege_preserved.as_str(),
+        "least-privilege-preserved",
+    )?;
+
+    let mut payload = read_json_object_or_empty(hosts_json_path.as_path())?;
+    payload.insert(
+        os_id.to_string(),
+        json!({
+            "transition": {
+                "from_role": "client",
+                "to_role": temp_role,
+                "status": if switch_execution == CHECK_PASS { CHECK_PASS } else { CHECK_FAIL },
+            },
+            "checks": {
+                "switch_execution": switch_execution,
+                "post_switch_reconcile": post_switch_reconcile,
+                "policy_still_enforced": policy_still_enforced,
+                "least_privilege_preserved": least_privilege_preserved,
+            },
+        }),
+    );
+    write_json_pretty(hosts_json_path.as_path(), &Value::Object(payload))?;
+    Ok(hosts_json_path.display().to_string())
+}
+
+pub fn execute_ops_write_role_switch_matrix_report(
+    config: WriteRoleSwitchMatrixReportConfig,
+) -> Result<String, String> {
+    let hosts_json_path = resolve_path(config.hosts_json_path.as_path())?;
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let source_path = resolve_path(config.source_path.as_path())?;
+    let git_commit = config.git_commit.trim().to_ascii_lowercase();
+    if git_commit.is_empty() {
+        return Err("--git-commit must be non-empty".to_string());
+    }
+    let overall_status = config.overall_status.trim();
+    if overall_status != CHECK_PASS && overall_status != CHECK_FAIL {
+        return Err(format!(
+            "--overall-status must be pass or fail (got: {:?})",
+            config.overall_status
+        ));
+    }
+    let hosts = read_json_object_or_empty(hosts_json_path.as_path())?;
+    let report = json!({
+        "schema_version": 1,
+        "evidence_mode": "measured",
+        "git_commit": git_commit,
+        "captured_at_unix": config.captured_at_unix,
+        "status": overall_status,
+        "hosts": Value::Object(hosts),
+        "source_artifact": source_path.display().to_string(),
+    });
+    write_json_pretty(report_path.as_path(), &report)?;
+    Ok(report_path.display().to_string())
+}
+
+pub fn execute_ops_write_live_linux_server_ip_bypass_report(
+    config: WriteLiveLinuxServerIpBypassReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let probe_ip = config
+        .probe_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| format!("invalid probe IP {:?}: {err}", config.probe_ip))?;
+    let probe_from_client_status = parse_pass_fail(
+        config.probe_from_client_status.as_str(),
+        "probe-from-client-status",
+    )?;
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let mut allowed_networks = Vec::new();
+    for part in config
+        .allowed_management_cidrs
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        allowed_networks.push((part.to_string(), parse_cidr(part)?));
+    }
+
+    let internet_route_ok = config.client_internet_route.contains("dev rustynet0");
+    let probe_route_direct = !config.client_probe_route.contains("dev rustynet0")
+        && config
+            .client_probe_route
+            .contains(probe_ip.to_string().as_str());
+    let probe_host_self_reachable = config.probe_self_test.contains("probe-ok");
+
+    let mut unexpected_bypass_routes = Vec::new();
+    for raw_line in config.client_table_51820.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.contains("dev rustynet0") || line.starts_with("default ") {
+            continue;
+        }
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        let parsed = match parse_cidr(first) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if cidr_is_host_route(&parsed) {
+            continue;
+        }
+        let allowed = allowed_networks
+            .iter()
+            .any(|(_, allowed)| *allowed == parsed);
+        if !allowed {
+            unexpected_bypass_routes.push(line.to_string());
+        }
+    }
+
+    let checks = json!({
+        "internet_route_via_rustynet0": if internet_route_ok { CHECK_PASS } else { CHECK_FAIL },
+        "probe_host_self_service_reachable": if probe_host_self_reachable { CHECK_PASS } else { CHECK_FAIL },
+        "probe_endpoint_route_direct_not_tunnelled": if probe_route_direct { CHECK_PASS } else { CHECK_FAIL },
+        "probe_service_blocked_from_client": probe_from_client_status,
+        "no_unexpected_bypass_routes": if unexpected_bypass_routes.is_empty() { CHECK_PASS } else { CHECK_FAIL },
+    });
+
+    let overall = if checks
+        .as_object()
+        .map(|items| items.values().all(|v| v.as_str() == Some(CHECK_PASS)))
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "live_linux_server_ip_bypass",
+        "evidence_mode": "measured",
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": overall,
+        "probe_host_ip": probe_ip.to_string(),
+        "probe_port": config.probe_port,
+        "checks": checks,
+        "evidence": {
+            "client_internet_route": config.client_internet_route,
+            "client_probe_route": config.client_probe_route,
+            "client_table_51820": config.client_table_51820,
+            "client_endpoints": config.client_endpoints,
+            "probe_self_test": config.probe_self_test,
+            "client_probe_output": config.probe_from_client_output,
+            "unexpected_bypass_routes": unexpected_bypass_routes,
+            "allowed_management_cidrs": allowed_networks.into_iter().map(|(raw, _)| raw).collect::<Vec<_>>(),
+        }
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
+pub fn execute_ops_write_live_linux_control_surface_report(
+    config: WriteLiveLinuxControlSurfaceReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let work_dir = resolve_path(config.work_dir.as_path())?;
+    if !work_dir.is_dir() {
+        return Err(format!(
+            "work-dir must be an existing directory: {}",
+            work_dir.display()
+        ));
+    }
+    if config.host_labels.is_empty() {
+        return Err("at least one --host-label is required".to_string());
+    }
+
+    let Some((dns_host, dns_port)) = config.dns_bind_addr.rsplit_once(':') else {
+        return Err(format!(
+            "invalid --dns-bind-addr {:?}; expected host:port",
+            config.dns_bind_addr
+        ));
+    };
+    let dns_port_num = dns_port
+        .parse::<u16>()
+        .map_err(|err| format!("invalid dns bind port {dns_port:?}: {err}"))?;
+    if dns_host.trim().is_empty() {
+        return Err("dns bind host must not be empty".to_string());
+    }
+    let allowed_udp = format!("{}:{}", dns_host.trim(), dns_port_num);
+    let remote_dns_probe_status = parse_pass_fail_skip(
+        config.remote_dns_probe_status.as_str(),
+        "remote-dns-probe-status",
+    )?;
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let mut host_results = Map::new();
+    let mut overall = CHECK_PASS.to_string();
+    for label in &config.host_labels {
+        let daemon_meta = fs::read_to_string(work_dir.join(format!("{label}.daemon_socket.txt")))
+            .map_err(|err| format!("read {label} daemon metadata failed: {err}"))?;
+        let helper_meta = fs::read_to_string(work_dir.join(format!("{label}.helper_socket.txt")))
+            .map_err(|err| format!("read {label} helper metadata failed: {err}"))?;
+        let listeners_raw =
+            fs::read_to_string(work_dir.join(format!("{label}.inet_listeners.txt")))
+                .map_err(|err| format!("read {label} listener capture failed: {err}"))?;
+        let dns_service_state =
+            fs::read_to_string(work_dir.join(format!("{label}.managed_dns_state.txt")))
+                .map_err(|err| format!("read {label} DNS service state failed: {err}"))?;
+
+        let daemon_meta_trimmed = daemon_meta.trim().to_string();
+        let helper_meta_trimmed = helper_meta.trim().to_string();
+        let daemon_parts = daemon_meta_trimmed.split('|').collect::<Vec<_>>();
+        let helper_parts = helper_meta_trimmed.split('|').collect::<Vec<_>>();
+        let daemon_ok = daemon_parts.len() == 4
+            && daemon_parts[0] == "socket"
+            && daemon_parts[1] == "600"
+            && daemon_parts[2] == "root";
+        let helper_ok = helper_parts.len() == 4
+            && helper_parts[0] == "socket"
+            && helper_parts[1] == "660"
+            && helper_parts[2] == "root";
+
+        let mut tcp_listener_ok = true;
+        let mut udp_listener_ok = true;
+        let mut rustynet_listener_lines = Vec::new();
+        for line in listeners_raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if !line.contains("rustynetd") {
+                continue;
+            }
+            rustynet_listener_lines.push(line.to_string());
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            if parts.len() < 5 {
+                tcp_listener_ok = false;
+                udp_listener_ok = false;
+                continue;
+            }
+            let proto = parts[0];
+            let local_addr = parts[4];
+            if proto.starts_with("tcp") {
+                tcp_listener_ok = false;
+            } else if proto.starts_with("udp") {
+                if local_addr != allowed_udp {
+                    udp_listener_ok = false;
+                }
+            } else {
+                udp_listener_ok = false;
+            }
+        }
+
+        if !daemon_ok || !helper_ok || !tcp_listener_ok || !udp_listener_ok {
+            overall = CHECK_FAIL.to_string();
+        }
+
+        host_results.insert(
+            label.to_string(),
+            json!({
+                "checks": {
+                    "daemon_socket_secure": if daemon_ok { CHECK_PASS } else { CHECK_FAIL },
+                    "helper_socket_secure": if helper_ok { CHECK_PASS } else { CHECK_FAIL },
+                    "no_rustynet_tcp_listener": if tcp_listener_ok { CHECK_PASS } else { CHECK_FAIL },
+                    "rustynet_udp_loopback_only": if udp_listener_ok { CHECK_PASS } else { CHECK_FAIL },
+                },
+                "evidence": {
+                    "daemon_socket_meta": daemon_meta_trimmed,
+                    "helper_socket_meta": helper_meta_trimmed,
+                    "managed_dns_service_state": dns_service_state.trim(),
+                    "rustynet_listener_lines": rustynet_listener_lines,
+                }
+            }),
+        );
+    }
+
+    if remote_dns_probe_status == CHECK_FAIL {
+        overall = CHECK_FAIL.to_string();
+    }
+
+    let all_daemon_ok = host_results.values().all(|value| {
+        value
+            .get("checks")
+            .and_then(|checks| checks.get("daemon_socket_secure"))
+            .and_then(Value::as_str)
+            == Some(CHECK_PASS)
+    });
+    let all_helper_ok = host_results.values().all(|value| {
+        value
+            .get("checks")
+            .and_then(|checks| checks.get("helper_socket_secure"))
+            .and_then(Value::as_str)
+            == Some(CHECK_PASS)
+    });
+    let all_no_tcp = host_results.values().all(|value| {
+        value
+            .get("checks")
+            .and_then(|checks| checks.get("no_rustynet_tcp_listener"))
+            .and_then(Value::as_str)
+            == Some(CHECK_PASS)
+    });
+    let all_udp_loopback = host_results.values().all(|value| {
+        value
+            .get("checks")
+            .and_then(|checks| checks.get("rustynet_udp_loopback_only"))
+            .and_then(Value::as_str)
+            == Some(CHECK_PASS)
+    });
+
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "live_linux_control_surface_exposure",
+        "evidence_mode": "measured",
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": overall,
+        "dns_bind_addr": config.dns_bind_addr,
+        "checks": {
+            "all_daemon_sockets_secure": if all_daemon_ok { CHECK_PASS } else { CHECK_FAIL },
+            "all_helper_sockets_secure": if all_helper_ok { CHECK_PASS } else { CHECK_FAIL },
+            "no_rustynet_tcp_listeners": if all_no_tcp { CHECK_PASS } else { CHECK_FAIL },
+            "rustynet_udp_loopback_only": if all_udp_loopback { CHECK_PASS } else { CHECK_FAIL },
+            "remote_underlay_dns_probe_blocked": remote_dns_probe_status,
+        },
+        "hosts": Value::Object(host_results),
+        "evidence": {
+            "remote_underlay_dns_probe_output": config.remote_dns_probe_output,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
+pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
+    config: RewriteAssignmentPeerEndpointIpConfig,
+) -> Result<String, String> {
+    let assignment_path = resolve_path(config.assignment_path.as_path())?;
+    let endpoint_ip = config
+        .endpoint_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| {
+            format!(
+                "invalid endpoint IPv4 address {:?}: {err}",
+                config.endpoint_ip
+            )
+        })?
+        .to_string();
+    let metadata = fs::symlink_metadata(assignment_path.as_path()).map_err(|err| {
+        format!(
+            "stat assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "assignment path must not be a symlink: {}",
+            assignment_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "assignment path must be a regular file: {}",
+            assignment_path.display()
+        ));
+    }
+
+    let body = fs::read_to_string(assignment_path.as_path()).map_err(|err| {
+        format!(
+            "read assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    let mut replaced = 0usize;
+    let mut updated = Vec::new();
+    for line in body.lines() {
+        let mut line_out = line.to_string();
+        if let Some((key, value)) = line.split_once('=') {
+            if is_peer_endpoint_key(key.trim()) {
+                let (_, port) = split_endpoint_host_port(value).ok_or_else(|| {
+                    format!(
+                        "invalid peer endpoint value {:?} in {}",
+                        value.trim(),
+                        assignment_path.display()
+                    )
+                })?;
+                let port_num = port.parse::<u16>().map_err(|err| {
+                    format!(
+                        "invalid endpoint port {:?} in {}: {err}",
+                        port,
+                        assignment_path.display()
+                    )
+                })?;
+                line_out = format!("{}={endpoint_ip}:{port_num}", key.trim());
+                replaced += 1;
+            }
+        }
+        updated.push(line_out);
+    }
+    if replaced == 0 {
+        return Err(format!(
+            "failed to locate peer endpoint fields in assignment bundle ({})",
+            assignment_path.display()
+        ));
+    }
+    fs::write(
+        assignment_path.as_path(),
+        format!("{}\n", updated.join("\n")),
+    )
+    .map_err(|err| {
+        format!(
+            "write assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    Ok(replaced.to_string())
+}
+
+pub fn execute_ops_write_live_linux_endpoint_hijack_report(
+    config: WriteLiveLinuxEndpointHijackReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let rogue_endpoint_ip = config
+        .rogue_endpoint_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| {
+            format!(
+                "invalid rogue endpoint IPv4 address {:?}: {err}",
+                config.rogue_endpoint_ip
+            )
+        })?
+        .to_string();
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let checks = json!({
+        "baseline_runtime_secure": if !config.baseline_status.contains("state=FailClosed") { CHECK_PASS } else { CHECK_FAIL },
+        "hijack_drives_fail_closed": if config.status_after_hijack.contains("state=FailClosed") { CHECK_PASS } else { CHECK_FAIL },
+        "restricted_safe_mode_engaged": if config.status_after_hijack.contains("restricted_safe_mode=true") { CHECK_PASS } else { CHECK_FAIL },
+        "netcheck_reports_fail_closed": if config.netcheck_after_hijack.contains("path_mode=fail_closed") { CHECK_PASS } else { CHECK_FAIL },
+        "rogue_endpoint_not_adopted": if !config.endpoints_after_hijack.contains(rogue_endpoint_ip.as_str()) { CHECK_PASS } else { CHECK_FAIL },
+        "recovery_restores_secure_runtime": if !config.status_after_recovery.contains("state=FailClosed")
+            && config.status_after_recovery.contains("restricted_safe_mode=false")
+        {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        },
+        "recovery_keeps_rogue_endpoint_rejected": if !config.endpoints_after_recovery.contains(rogue_endpoint_ip.as_str()) { CHECK_PASS } else { CHECK_FAIL },
+    });
+    let status = if checks
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .all(|value| value.as_str() == Some(CHECK_PASS))
+        })
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "live_linux_endpoint_hijack",
+        "evidence_mode": "measured",
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": status,
+        "rogue_endpoint_ip": rogue_endpoint_ip,
+        "checks": checks,
+        "evidence": {
+            "baseline_status": config.baseline_status,
+            "baseline_netcheck": config.baseline_netcheck,
+            "baseline_endpoints": config.baseline_endpoints,
+            "status_after_hijack": config.status_after_hijack,
+            "netcheck_after_hijack": config.netcheck_after_hijack,
+            "endpoints_after_hijack": config.endpoints_after_hijack,
+            "status_after_recovery": config.status_after_recovery,
+            "endpoints_after_recovery": config.endpoints_after_recovery,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CheckLocalFileModeConfig, RewriteAssignmentPeerEndpointIpConfig,
+        UpdateRoleSwitchHostResultConfig, WriteLiveLinuxControlSurfaceReportConfig,
+        WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
+        WriteLiveLinuxServerIpBypassReportConfig, WriteRoleSwitchMatrixReportConfig,
+        execute_ops_check_local_file_mode, execute_ops_rewrite_assignment_peer_endpoint_ip,
+        execute_ops_update_role_switch_host_result,
+        execute_ops_write_live_linux_control_surface_report,
+        execute_ops_write_live_linux_endpoint_hijack_report,
+        execute_ops_write_live_linux_reboot_recovery_report,
+        execute_ops_write_live_linux_server_ip_bypass_report,
+        execute_ops_write_role_switch_matrix_report, redact_forensics_payload,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustynet-cli-{name}-{stamp}"))
+    }
+
+    #[test]
+    fn owner_only_mode_check_rejects_group_bits() {
+        let path = temp_path("mode-check");
+        fs::write(path.as_path(), "secret").expect("write temp file");
+        fs::set_permissions(path.as_path(), fs::Permissions::from_mode(0o640)).expect("set perms");
+        let err = execute_ops_check_local_file_mode(CheckLocalFileModeConfig {
+            path: path.clone(),
+            policy: "owner-only".to_string(),
+            label: "file".to_string(),
+        })
+        .expect_err("mode check should fail");
+        assert!(err.contains("owner-only"));
+        let _ = fs::remove_file(path.as_path());
+    }
+
+    #[test]
+    fn redact_forensics_payload_hides_private_key_and_secret_values() {
+        let input = "-----BEGIN PRIVATE KEY-----\npassword=abc123\ntoken: xyz\nsafe=value\n";
+        let output = redact_forensics_payload(input);
+        assert!(output.contains("[REDACTED sensitive key material]"));
+        assert!(output.contains("password=<redacted>"));
+        assert!(output.contains("token: <redacted>"));
+        assert!(output.contains("safe=value"));
+    }
+
+    #[test]
+    fn reboot_recovery_report_fails_when_client_reboot_missing() {
+        let report_path = temp_path("reboot-report");
+        let observations_path = temp_path("reboot-observations");
+        fs::write(observations_path.as_path(), "client_reboot_wait=fail\n").expect("write obs");
+
+        let err = execute_ops_write_live_linux_reboot_recovery_report(
+            WriteLiveLinuxRebootRecoveryReportConfig {
+                report_path: report_path.clone(),
+                observations_path: observations_path.clone(),
+                exit_pre: "a".to_string(),
+                exit_post: "b".to_string(),
+                client_pre: "c".to_string(),
+                client_post: "".to_string(),
+                exit_return: "pass".to_string(),
+                exit_boot_change: "pass".to_string(),
+                post_exit_twohop: "pass".to_string(),
+                client_return: "fail".to_string(),
+                client_boot_change: "fail".to_string(),
+                post_client_twohop: "fail".to_string(),
+                salvage_twohop: "skipped".to_string(),
+            },
+        )
+        .expect_err("report should fail");
+        assert!(err.contains("status is fail"));
+        let body = fs::read_to_string(report_path.as_path()).expect("report present");
+        assert!(body.contains("\"status\": \"fail\""));
+
+        let _ = fs::remove_file(report_path.as_path());
+        let _ = fs::remove_file(observations_path.as_path());
+    }
+
+    #[test]
+    fn role_switch_host_result_writer_sets_expected_checks() {
+        let hosts_path = temp_path("role-switch-hosts");
+        fs::write(hosts_path.as_path(), "{}\n").expect("write hosts");
+        execute_ops_update_role_switch_host_result(UpdateRoleSwitchHostResultConfig {
+            hosts_json_path: hosts_path.clone(),
+            os_id: "debian13".to_string(),
+            temp_role: "admin".to_string(),
+            switch_execution: "pass".to_string(),
+            post_switch_reconcile: "pass".to_string(),
+            policy_still_enforced: "pass".to_string(),
+            least_privilege_preserved: "pass".to_string(),
+        })
+        .expect("update host result");
+
+        let body = fs::read_to_string(hosts_path.as_path()).expect("read hosts");
+        assert!(body.contains("\"debian13\""));
+        assert!(body.contains("\"switch_execution\": \"pass\""));
+        let _ = fs::remove_file(hosts_path.as_path());
+    }
+
+    #[test]
+    fn role_switch_report_writer_emits_measured_report() {
+        let hosts_path = temp_path("role-switch-hosts-report");
+        let report_path = temp_path("role-switch-report");
+        let source_path = temp_path("role-switch-source");
+        fs::write(
+            hosts_path.as_path(),
+            "{ \"ubuntu\": { \"checks\": { \"switch_execution\": \"pass\" } } }\n",
+        )
+        .expect("write hosts");
+        fs::write(source_path.as_path(), "# source\n").expect("write source");
+
+        execute_ops_write_role_switch_matrix_report(WriteRoleSwitchMatrixReportConfig {
+            hosts_json_path: hosts_path.clone(),
+            report_path: report_path.clone(),
+            source_path: source_path.clone(),
+            git_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            captured_at_unix: 1_772_983_200,
+            overall_status: "pass".to_string(),
+        })
+        .expect("write report");
+
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"evidence_mode\": \"measured\""));
+        assert!(body.contains("\"status\": \"pass\""));
+        assert!(body.contains("\"ubuntu\""));
+
+        let _ = fs::remove_file(hosts_path.as_path());
+        let _ = fs::remove_file(report_path.as_path());
+        let _ = fs::remove_file(source_path.as_path());
+    }
+
+    #[test]
+    fn server_ip_bypass_report_marks_pass_with_expected_routes() {
+        let report_path = temp_path("server-ip-bypass-report");
+        let status = execute_ops_write_live_linux_server_ip_bypass_report(
+            WriteLiveLinuxServerIpBypassReportConfig {
+                report_path: report_path.clone(),
+                allowed_management_cidrs: "192.168.1.0/24".to_string(),
+                probe_from_client_status: "pass".to_string(),
+                probe_ip: "192.168.1.10".to_string(),
+                probe_port: 18080,
+                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
+                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_table_51820: "192.168.1.0/24 dev eth0\n10.0.0.0/8 dev rustynet0\n"
+                    .to_string(),
+                client_endpoints: "peer endpoints".to_string(),
+                probe_self_test: "probe-ok".to_string(),
+                probe_from_client_output: "blocked".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "pass");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"status\": \"pass\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn control_surface_report_fails_on_tcp_listener() {
+        let work_dir = temp_path("control-surface-work");
+        fs::create_dir_all(work_dir.as_path()).expect("mkdir");
+        fs::write(
+            work_dir.join("client.daemon_socket.txt"),
+            "socket|600|root|root\n",
+        )
+        .expect("write daemon");
+        fs::write(
+            work_dir.join("client.helper_socket.txt"),
+            "socket|660|root|rustynetd\n",
+        )
+        .expect("write helper");
+        fs::write(
+            work_dir.join("client.inet_listeners.txt"),
+            "tcp LISTEN 0 128 0.0.0.0:9000 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=3))\n",
+        )
+        .expect("write listeners");
+        fs::write(work_dir.join("client.managed_dns_state.txt"), "active\n").expect("write state");
+        let report_path = temp_path("control-surface-report");
+        let status = execute_ops_write_live_linux_control_surface_report(
+            WriteLiveLinuxControlSurfaceReportConfig {
+                report_path: report_path.clone(),
+                dns_bind_addr: "127.0.0.1:53535".to_string(),
+                remote_dns_probe_status: "pass".to_string(),
+                remote_dns_probe_output: "{}".to_string(),
+                work_dir: work_dir.clone(),
+                host_labels: vec!["client".to_string()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"status\": \"fail\""));
+
+        let _ = fs::remove_file(work_dir.join("client.daemon_socket.txt"));
+        let _ = fs::remove_file(work_dir.join("client.helper_socket.txt"));
+        let _ = fs::remove_file(work_dir.join("client.inet_listeners.txt"));
+        let _ = fs::remove_file(work_dir.join("client.managed_dns_state.txt"));
+        let _ = fs::remove_dir(work_dir.as_path());
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn rewrite_assignment_peer_endpoint_ip_updates_peer_entries() {
+        let assignment_path = temp_path("assignment-endpoint-rewrite");
+        fs::write(
+            assignment_path.as_path(),
+            "node_id=client-1\npeer.0.endpoint=192.168.18.49:51820\npeer.1.endpoint=192.168.18.51:51820\npeer.1.node_id=exit-1\n",
+        )
+        .expect("write assignment");
+        let replaced = execute_ops_rewrite_assignment_peer_endpoint_ip(
+            RewriteAssignmentPeerEndpointIpConfig {
+                assignment_path: assignment_path.clone(),
+                endpoint_ip: "203.0.113.10".to_string(),
+            },
+        )
+        .expect("rewrite assignment");
+        assert_eq!(replaced, "2");
+        let body = fs::read_to_string(assignment_path.as_path()).expect("read assignment");
+        assert!(body.contains("peer.0.endpoint=203.0.113.10:51820"));
+        assert!(body.contains("peer.1.endpoint=203.0.113.10:51820"));
+        let _ = fs::remove_file(assignment_path.as_path());
+    }
+
+    #[test]
+    fn endpoint_hijack_report_marks_fail_when_rogue_endpoint_present() {
+        let report_path = temp_path("endpoint-hijack-report");
+        let status = execute_ops_write_live_linux_endpoint_hijack_report(
+            WriteLiveLinuxEndpointHijackReportConfig {
+                report_path: report_path.clone(),
+                rogue_endpoint_ip: "192.168.18.77".to_string(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
+                baseline_netcheck: "path_mode=direct_active".to_string(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                endpoints_after_hijack: "peer-a=192.168.18.77:51820".to_string(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+}

@@ -63,7 +63,7 @@ USAGE
 write_report() {
   local status="$1"
   local args=(
-    python3 "$ROOT_DIR/scripts/e2e/generate_cross_network_remote_exit_report.py"
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
     --suite cross_network_relay_remote_exit
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -92,12 +92,16 @@ write_report() {
     --check "no_plaintext_passphrase_files=${CHECK_NO_PLAINTEXT_PASSPHRASE_FILES}"
   )
   local item
+  set +u
   for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
   done
   for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--log-artifact "$item")
   done
+  set -u
   "${args[@]}"
 }
 
@@ -476,18 +480,8 @@ TRAVEOF
     CHECK_NO_PLAINTEXT_PASSPHRASE_FILES="pass"
   fi
 
-  if python3 - "$CLIENT_ADDR" "$EXIT_ADDR" <<'PY'
-import ipaddress
-import sys
-
-client_ip = ipaddress.ip_address(sys.argv[1])
-exit_ip = ipaddress.ip_address(sys.argv[2])
-prefix = 24 if client_ip.version == 4 else 64
-client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
-exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-raise SystemExit(1 if client_net == exit_net else 0)
-PY
-  then
+  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1
+  if [[ "$topology_result" == "pass" ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   else
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="fail"
@@ -516,18 +510,14 @@ PY
     return 1
   fi
 
-  mapfile -t bypass_results < <(python3 - "$BYPASS_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(checks.get("internet_route_via_rustynet0", "fail"))
-print(checks.get("probe_service_blocked_from_client", "fail"))
-print(checks.get("probe_endpoint_route_direct_not_tunnelled", "fail"))
-print(checks.get("no_unexpected_bypass_routes", "fail"))
-PY
-)
+  mapfile -t bypass_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$BYPASS_REPORT_PATH" \
+      --check internet_route_via_rustynet0 \
+      --check probe_service_blocked_from_client \
+      --check probe_endpoint_route_direct_not_tunnelled \
+      --check no_unexpected_bypass_routes
+  ) || return 1
 
   if [[ "${bypass_results[0]}" == 'pass' && "${bypass_results[1]}" == 'pass' ]]; then
     CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK="pass"
@@ -537,7 +527,11 @@ PY
   fi
 
   if [[ "$CHECK_RELAY_REMOTE_EXIT_SUCCESS" != 'pass' ]]; then
-    FAILURE_SUMMARY="relay remote-exit steady-state checks did not all pass"
+    if [[ "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" != 'pass' ]]; then
+      FAILURE_SUMMARY="client and final-exit underlay addresses share the same local prefix; refusing to claim cross-network relay remote exit on same-subnet topology"
+    else
+      FAILURE_SUMMARY="relay remote-exit steady-state checks did not all pass"
+    fi
     return 1
   fi
   if [[ "$CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK" != 'pass' ]]; then

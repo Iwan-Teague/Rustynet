@@ -906,26 +906,20 @@ cross_network_stages_applicable() {
   client_addr="$(live_lab_target_address "$client_target")"
   exit_addr="$(live_lab_target_address "$exit_target")"
   set +e
-  python3 - "$client_addr" "$exit_addr" <<'PY'
-import ipaddress
-import sys
-
-try:
-    client_ip = ipaddress.ip_address(sys.argv[1])
-    exit_ip = ipaddress.ip_address(sys.argv[2])
-except ValueError:
-    raise SystemExit(2)
-
-if client_ip.version != exit_ip.version:
-    raise SystemExit(1)
-
-prefix = 24 if client_ip.version == 4 else 64
-client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
-exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-raise SystemExit(0 if client_net == exit_net else 1)
-PY
+  local topology_result
+  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$client_addr" --ip-b "$exit_addr" --ipv4-prefix 24 --ipv6-prefix 64 2>/dev/null)"
   same_prefix_rc=$?
   set -e
+  if [[ "$same_prefix_rc" -eq 0 ]]; then
+    topology_result="$(printf '%s' "$topology_result" | tr -d '[:space:]')"
+    if [[ "$topology_result" == "fail" ]]; then
+      same_prefix_rc=0
+    else
+      same_prefix_rc=1
+    fi
+  else
+    same_prefix_rc=2
+  fi
   if [[ "$same_prefix_rc" -eq 0 ]]; then
     CROSS_NETWORK_SKIP_REASON="requires distinct client/exit underlay prefixes (client=${client_addr}, exit=${exit_addr}); use --force-cross-network to override"
     return 1
@@ -976,17 +970,10 @@ ensure_password_file() {
     printf 'path must not be a symlink: %s\n' "$selected_path" >&2
     return 1
   fi
-  if ! python3 - "$selected_path" <<'PY'
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o077:
-    raise SystemExit(f"file must be owner-only (0400/0600): {path} ({mode:03o})")
-PY
+  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+    --path "$selected_path" \
+    --policy owner-only \
+    --label file >/dev/null
   then
     return 1
   fi
@@ -1054,28 +1041,7 @@ stage_requires_forensics_bundle() {
 }
 
 redact_forensics_text() {
-  python3 - <<'PY'
-import re
-import sys
-
-line_redact_patterns = (
-    re.compile(r"BEGIN [A-Z ]*PRIVATE KEY", re.IGNORECASE),
-    re.compile(r"PRIVATE KEY-----", re.IGNORECASE),
-)
-value_redact_patterns = (
-    re.compile(r"(?i)\b(passphrase|password|secret|token)\b(\s*[:=]\s*)(\S+)"),
-)
-
-for raw_line in sys.stdin:
-    line = raw_line.rstrip("\n")
-    if any(pattern.search(line) for pattern in line_redact_patterns):
-        print("[REDACTED sensitive key material]")
-        continue
-    redacted = line
-    for pattern in value_redact_patterns:
-        redacted = pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", redacted)
-    print(redacted)
-PY
+  cargo run --quiet -p rustynet-cli -- ops redact-forensics-text
 }
 
 capture_forensics_user() {
@@ -1146,36 +1112,11 @@ collect_cross_network_failure_forensics() {
   done < "$NODES_TSV"
 
   manifest_path="$stage_dir/manifest.json"
-  python3 - "$stage_name" "$collected_at" "$stage_dir" "$manifest_path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-stage_name = sys.argv[1]
-collected_at = sys.argv[2]
-stage_dir = Path(sys.argv[3]).resolve()
-manifest_path = Path(sys.argv[4]).resolve()
-
-nodes = []
-for node_dir in sorted(path for path in stage_dir.iterdir() if path.is_dir()):
-    files = [str(path.resolve()) for path in sorted(node_dir.glob("*")) if path.is_file()]
-    nodes.append(
-        {
-            "label": node_dir.name,
-            "files": files,
-        }
-    )
-
-payload = {
-    "schema_version": 1,
-    "mode": "cross_network_failure_forensics",
-    "stage": stage_name,
-    "collected_at_utc": collected_at,
-    "bundle_dir": str(stage_dir),
-    "nodes": nodes,
-}
-manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
+  cargo run --quiet -p rustynet-cli -- ops write-cross-network-forensics-manifest \
+    --stage "$stage_name" \
+    --collected-at-utc "$collected_at" \
+    --stage-dir "$stage_dir" \
+    --output "$manifest_path" >/dev/null
 
   printf '%s' "$stage_dir"
 }
@@ -2507,21 +2448,20 @@ stage_run_live_lan_toggle() {
 assert_json_report_status_pass() {
   local report_path="$1"
   local label="$2"
+  local status
   if [[ ! -f "$report_path" ]]; then
     printf '%s report missing: %s\n' "$label" "$report_path" >&2
     return 1
   fi
-  python3 - "$report_path" "$label" <<'PY'
-import json
-import sys
-
-report_path, label = sys.argv[1], sys.argv[2]
-with open(report_path, encoding="utf-8") as fh:
-    payload = json.load(fh)
-status = payload.get("status")
-if status != "pass":
-    raise SystemExit(f"{label} report status is not pass: {status!r}")
-PY
+  status="$(cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+    --report-path "$report_path" \
+    --include-status \
+    --default-value fail)"
+  status="$(printf '%s' "$status" | tr -d '[:space:]')"
+  if [[ "$status" != "pass" ]]; then
+    printf '%s report status is not pass: %s\n' "$label" "$status" >&2
+    return 1
+  fi
 }
 
 assert_log_absent_patterns() {
@@ -2875,22 +2815,14 @@ cross_network_preflight_worker() {
   live_lab_run_root "$target" "root bash '$discovery_script_path' --quiet --output '$discovery_remote_path'"
   live_lab_scp_from "$target" "$discovery_remote_path" "$discovery_local_path"
   live_lab_run_root "$target" "root rustynet ops secure-remove --path '$discovery_remote_path' >/dev/null 2>&1 || root rm -f '$discovery_remote_path'" || true
-  python3 "$ROOT_DIR/scripts/ci/validate_network_discovery_bundle.py" \
+  cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
     --bundle "$discovery_local_path" \
     --max-age-seconds "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" \
     --require-verifier-keys \
     --require-daemon-active \
     --require-socket-present \
     --output "$discovery_validation_path"
-  discovery_hash="$(python3 - "$discovery_local_path" <<'PY'
-import hashlib
-import sys
-
-path = sys.argv[1]
-with open(path, "rb") as handle:
-    print(hashlib.sha256(handle.read()).hexdigest())
-PY
-)"
+  discovery_hash="$(cargo run --quiet -p rustynet-cli -- ops sha256-file --path "$discovery_local_path")"
 
   route_snapshot="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true" || true)"
   endpoint_snapshot="$(live_lab_capture_root "$target" "root wg show rustynet0 endpoints || true" || true)"
@@ -2923,53 +2855,19 @@ stage_run_cross_network_preflight() {
 
   stage_dir="$(parallel_stage_dir cross_network_preflight)"
   report_path="$REPORT_DIR/cross_network_preflight_report.json"
-  python3 - "$NODES_TSV" "$stage_dir" "$report_path" "$CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-nodes_tsv = Path(sys.argv[1])
-stage_dir = Path(sys.argv[2])
-report_path = Path(sys.argv[3])
-reference_unix = int(sys.argv[4])
-max_skew = int(sys.argv[5])
-discovery_max_age = int(sys.argv[6])
-signed_artifact_max_age = int(sys.argv[7])
-
-nodes = []
-for line in nodes_tsv.read_text(encoding="utf-8").splitlines():
-    parts = line.split("\t")
-    if len(parts) != 4:
-        continue
-    label, target, node_id, role = parts
-    capability_file = stage_dir / f"capabilities-{label}.txt"
-    nodes.append(
-        {
-            "label": label,
-            "target": target,
-            "node_id": node_id,
-            "role": role,
-            "capability_file": str(capability_file.resolve()),
-            "capability_file_exists": capability_file.exists(),
-        }
-    )
-
-payload = {
-    "schema_version": 1,
-    "mode": "cross_network_preflight",
-    "reference_unix": reference_unix,
-    "max_clock_skew_secs": max_skew,
-    "discovery_max_age_secs": discovery_max_age,
-    "signed_artifact_max_age_secs": signed_artifact_max_age,
-    "nodes": nodes,
-}
-report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
+  cargo run --quiet -p rustynet-cli -- ops write-cross-network-preflight-report \
+    --nodes-tsv "$NODES_TSV" \
+    --stage-dir "$stage_dir" \
+    --output "$report_path" \
+    --reference-unix "$CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX" \
+    --max-clock-skew-secs "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" \
+    --discovery-max-age-secs "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" \
+    --signed-artifact-max-age-secs "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >/dev/null
 }
 
 stage_run_cross_network_nat_matrix() {
   local output_path="$REPORT_DIR/cross_network_remote_exit_nat_matrix_validation.md"
-  python3 "$ROOT_DIR/scripts/ci/validate_cross_network_nat_matrix.py" \
+  cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
     --artifact-dir "$REPORT_DIR" \
     --required-nat-profiles "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" \
     --expected-git-commit "$(current_run_git_commit)" \
@@ -2978,9 +2876,10 @@ stage_run_cross_network_nat_matrix() {
 }
 
 stage_generate_fresh_install_os_matrix_report() {
-  local commit_short role_report canonical_report canonical_source_dir manifest_json
+  local commit_short role_report canonical_report canonical_source_dir
   local canonical_bootstrap_log canonical_baseline_log canonical_two_hop_report
   local canonical_role_switch_report canonical_lan_toggle_report canonical_exit_handoff_report
+  local required_path
   if ! has_five_node_release_gate_topology; then
     printf 'fresh install OS matrix report generation requires the full five-node topology (entry, aux, and extra targets)\n' >&2
     return 1
@@ -2989,52 +2888,33 @@ stage_generate_fresh_install_os_matrix_report() {
   role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
   canonical_report="$ROOT_DIR/artifacts/phase10/fresh_install_os_matrix_report.json"
   canonical_source_dir="$ROOT_DIR/artifacts/phase10/source/fresh_install_os_matrix"
-  manifest_json="$STATE_DIR/fresh_install_os_matrix_inputs.json"
-  python3 "$ROOT_DIR/scripts/e2e/rebind_linux_fresh_install_os_matrix_inputs.py" \
+  cargo run --quiet -p rustynet-cli -- ops rebind-linux-fresh-install-os-matrix-inputs \
     --dest-dir "$canonical_source_dir" \
     --bootstrap-log "$LOG_DIR/bootstrap_hosts.log" \
     --baseline-log "$LOG_DIR/validate_baseline_runtime.log" \
     --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
     --role-switch-report "$role_report" \
     --lan-toggle-report "$REPORT_DIR/live_linux_lan_toggle_report.json" \
-    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" > "$manifest_json"
-  canonical_bootstrap_log="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["bootstrap_log"])
-PY
-)"
-  canonical_baseline_log="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["baseline_log"])
-PY
-)"
-  canonical_two_hop_report="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["two_hop_report"])
-PY
-)"
-  canonical_role_switch_report="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["role_switch_report"])
-PY
-)"
-  canonical_lan_toggle_report="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["lan_toggle_report"])
-PY
-)"
-  canonical_exit_handoff_report="$(python3 - "$manifest_json" <<'PY'
-import json
-import sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["exit_handoff_report"])
-PY
-)"
-  python3 "$ROOT_DIR/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py" \
+    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" >/dev/null
+  canonical_bootstrap_log="$canonical_source_dir/bootstrap_hosts.log"
+  canonical_baseline_log="$canonical_source_dir/validate_baseline_runtime.log"
+  canonical_two_hop_report="$canonical_source_dir/live_linux_two_hop_report.json"
+  canonical_role_switch_report="$canonical_source_dir/$(basename "$role_report")"
+  canonical_lan_toggle_report="$canonical_source_dir/live_linux_lan_toggle_report.json"
+  canonical_exit_handoff_report="$canonical_source_dir/live_linux_exit_handoff_report.json"
+  for required_path in \
+    "$canonical_bootstrap_log" \
+    "$canonical_baseline_log" \
+    "$canonical_two_hop_report" \
+    "$canonical_role_switch_report" \
+    "$canonical_lan_toggle_report" \
+    "$canonical_exit_handoff_report"; do
+    if [[ ! -f "$required_path" ]]; then
+      printf 'fresh install OS matrix canonicalized input missing: %s\n' "$required_path" >&2
+      return 1
+    fi
+  done
+  cargo run --quiet -p rustynet-cli -- ops generate-linux-fresh-install-os-matrix-report \
     --output "$canonical_report" \
     --environment "linux-live-lab-orchestrator:${NETWORK_ID}" \
     --source-mode "$SOURCE_MODE" \
@@ -3250,19 +3130,13 @@ stage_run_reboot_recovery_report() {
     client_boot_change="fail"
     printf 'client_reboot_wait=fail\n' | tee -a "$observations_file"
     arp -an | rg "$(printf '%s' "$(live_lab_target_address "$client_target")" | sed 's/\./\\./g')" | tee -a "$observations_file" || true
-    python3 - <<'PY' | tee -a "$observations_file"
-import socket
-hits = []
-for i in range(1, 255):
-    host = f'192.168.18.{i}'
-    s = socket.socket()
-    s.settimeout(0.08)
-    rc = s.connect_ex((host, 22))
-    s.close()
-    if rc == 0:
-        hits.append(host)
-print('ssh_port22_hosts=' + ','.join(hits))
-PY
+    cargo run --quiet -p rustynet-cli -- ops scan-ipv4-port-range \
+      --network-prefix 192.168.18 \
+      --start-host 1 \
+      --end-host 254 \
+      --port 22 \
+      --timeout-ms 80 \
+      --output-key 'ssh_port22_hosts=' | tee -a "$observations_file"
   fi
 
   if [[ "$client_return" == "pass" && "$client_boot_change" == "pass" ]]; then
@@ -3332,69 +3206,20 @@ PY
     salvage_twohop="skipped"
   fi
 
-  python3 - "$reboot_report" "$observations_file" "$exit_pre" "$exit_post" "$client_pre" "$client_post" "$exit_return" "$exit_boot_change" "$post_exit_twohop" "$client_return" "$client_boot_change" "$post_client_twohop" "$salvage_twohop" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-(report_path, observations_path, exit_pre, exit_post, client_pre, client_post, exit_return, exit_boot_change, post_exit_twohop,
- client_return, client_boot_change, post_client_twohop, salvage_twohop) = sys.argv[1:]
-observations = Path(observations_path).read_text(encoding='utf-8', errors='ignore')
-checks = {
-    'exit_reboot_returns': exit_return,
-    'exit_boot_id_changes': exit_boot_change,
-    'post_exit_reboot_twohop': post_exit_twohop,
-    'client_reboot_returns': client_return,
-    'client_boot_id_changes': client_boot_change,
-    'post_client_reboot_twohop': post_client_twohop,
-    'client_failure_salvage_twohop': salvage_twohop,
-}
-relevant = [value for value in checks.values() if value != 'skipped']
-status = 'pass' if relevant and all(value == 'pass' for value in relevant) else 'fail'
-failure_reason_map = {
-    'exit_reboot_returns': 'exit did not return on SSH after reboot',
-    'exit_boot_id_changes': 'exit reboot was not proven by a new boot_id',
-    'post_exit_reboot_twohop': 'two-hop validation failed after exit reboot',
-    'client_reboot_returns': 'client did not return on SSH after reboot',
-    'client_boot_id_changes': 'client reboot was not proven by a new boot_id',
-    'post_client_reboot_twohop': 'two-hop validation failed after client reboot',
-    'client_failure_salvage_twohop': 'salvage two-hop validation failed after the client reboot outage',
-}
-failure_reasons = [
-    failure_reason_map[name]
-    for name, value in checks.items()
-    if value == 'fail'
-]
-for observation_line in observations.splitlines():
-    observation_line = observation_line.strip()
-    if not observation_line:
-        continue
-    if observation_line == 'client_reboot_wait=fail':
-        failure_reasons.append('client reboot wait timed out')
-    elif observation_line == 'exit_reboot_wait=fail':
-        failure_reasons.append('exit reboot wait timed out')
-    elif observation_line == 'exit_post=':
-        failure_reasons.append('exit post-reboot boot_id capture was empty')
-    elif observation_line == 'client_post=':
-        failure_reasons.append('client post-reboot boot_id capture was empty')
-report = {
-    'schema_version': 1,
-    'mode': 'live_linux_reboot_recovery',
-    'status': status,
-    'checks': checks,
-    'boot_ids': {
-        'exit_pre': exit_pre,
-        'exit_post': exit_post,
-        'client_pre': client_pre,
-        'client_post': client_post,
-    },
-    'failure_reasons': failure_reasons,
-    'observations': observations.strip(),
-}
-Path(report_path).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-if status != 'pass':
-    raise SystemExit(1)
-PY
+  cargo run --quiet -p rustynet-cli -- ops write-live-linux-reboot-recovery-report \
+    --report-path "$reboot_report" \
+    --observations-path "$observations_file" \
+    --exit-pre "$exit_pre" \
+    --exit-post "$exit_post" \
+    --client-pre "$client_pre" \
+    --client-post "$client_post" \
+    --exit-return "$exit_return" \
+    --exit-boot-change "$exit_boot_change" \
+    --post-exit-twohop "$post_exit_twohop" \
+    --client-return "$client_return" \
+    --client-boot-change "$client_boot_change" \
+    --post-client-twohop "$post_client_twohop" \
+    --salvage-twohop "$salvage_twohop" >/dev/null
 }
 
 write_run_summary() {
@@ -3404,104 +3229,30 @@ write_run_summary() {
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   elapsed_secs=$((finished_at_unix - RUN_STARTED_AT_UNIX))
   elapsed_human="$(format_elapsed_duration "$elapsed_secs")"
-  python3 - "$NODES_TSV" "$STAGE_TSV" "$SUMMARY_JSON" "$SUMMARY_MD" "$RUN_ID" "$NETWORK_ID" "$REPORT_DIR" "$OVERALL_STATUS" "$RUN_STARTED_AT_LOCAL" "$RUN_STARTED_AT_UTC" "$RUN_STARTED_AT_UNIX" "$finished_at_local" "$finished_at_utc" "$finished_at_unix" "$elapsed_secs" "$elapsed_human" <<'PY'
-import csv
-import json
-import sys
-from pathlib import Path
-
-(nodes_tsv, stages_tsv, summary_json, summary_md, run_id, network_id, report_dir, overall_status,
- started_at_local, started_at_utc, started_at_unix, finished_at_local, finished_at_utc, finished_at_unix,
- elapsed_secs, elapsed_human) = sys.argv[1:]
-
-nodes = []
-with open(nodes_tsv, newline='', encoding='utf-8') as fh:
-    reader = csv.reader(fh, delimiter='\t')
-    for row in reader:
-        if not row:
-            continue
-        label, target, node_id, role = row
-        nodes.append({
-            'label': label,
-            'target': target,
-            'node_id': node_id,
-            'bootstrap_role': role,
-        })
-
-stages = []
-with open(stages_tsv, newline='', encoding='utf-8') as fh:
-    reader = csv.reader(fh, delimiter='\t')
-    for row in reader:
-        if not row:
-            continue
-        stage_name, severity, status, rc, log_path, message, started_at, finished_at = row
-        stages.append({
-            'stage': stage_name,
-            'severity': severity,
-            'status': status,
-            'rc': int(rc),
-            'log_path': log_path,
-            'message': message,
-            'started_at': started_at,
-            'finished_at': finished_at,
-        })
-
-summary = {
-    'schema_version': 1,
-    'run_id': run_id,
-    'network_id': network_id,
-    'report_dir': report_dir,
-    'overall_status': overall_status,
-    'started_at_local': started_at_local,
-    'started_at_utc': started_at_utc,
-    'started_at_unix': int(started_at_unix),
-    'finished_at_local': finished_at_local,
-    'finished_at_utc': finished_at_utc,
-    'finished_at_unix': int(finished_at_unix),
-    'elapsed_secs': int(elapsed_secs),
-    'elapsed_human': elapsed_human,
-    'nodes': nodes,
-    'stages': stages,
-}
-Path(summary_json).write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
-
-lines = []
-lines.append(f'# Live Linux Lab Orchestrator Summary ({run_id})')
-lines.append('')
-lines.append(f'- overall_status: `{overall_status}`')
-lines.append(f'- network_id: `{network_id}`')
-lines.append(f'- report_dir: `{report_dir}`')
-lines.append(f'- started_at_local: `{started_at_local}`')
-lines.append(f'- started_at_utc: `{started_at_utc}`')
-lines.append(f'- finished_at_local: `{finished_at_local}`')
-lines.append(f'- finished_at_utc: `{finished_at_utc}`')
-lines.append(f'- elapsed: `{elapsed_human}`')
-lines.append('')
-lines.append('## Nodes')
-lines.append('')
-for node in nodes:
-    lines.append(f"- `{node['label']}`: `{node['target']}` (`{node['node_id']}`, bootstrap role `{node['bootstrap_role']}`)")
-lines.append('')
-lines.append('## Stages')
-lines.append('')
-for stage in stages:
-    lines.append(
-        f"- `{stage['stage']}` [{stage['severity']}] -> `{stage['status']}` (rc={stage['rc']})"
-    )
-    lines.append(f"  log: `{stage['log_path']}`")
-    lines.append(f"  detail: {stage['message']}")
-Path(summary_md).write_text('\n'.join(lines) + '\n', encoding='utf-8')
-PY
+  cargo run --quiet -p rustynet-cli -- ops write-live-linux-lab-run-summary \
+    --nodes-tsv "$NODES_TSV" \
+    --stages-tsv "$STAGE_TSV" \
+    --summary-json "$SUMMARY_JSON" \
+    --summary-md "$SUMMARY_MD" \
+    --run-id "$RUN_ID" \
+    --network-id "$NETWORK_ID" \
+    --report-dir "$REPORT_DIR" \
+    --overall-status "$OVERALL_STATUS" \
+    --started-at-local "$RUN_STARTED_AT_LOCAL" \
+    --started-at-utc "$RUN_STARTED_AT_UTC" \
+    --started-at-unix "$RUN_STARTED_AT_UNIX" \
+    --finished-at-local "$finished_at_local" \
+    --finished-at-utc "$finished_at_utc" \
+    --finished-at-unix "$finished_at_unix" \
+    --elapsed-secs "$elapsed_secs" \
+    --elapsed-human "$elapsed_human" >/dev/null
 }
 
 refresh_failure_digest() {
   if [[ ! -f "$NODES_TSV" || ! -f "$STAGE_TSV" ]]; then
     return 0
   fi
-  if [[ ! -f "$ROOT_DIR/scripts/e2e/generate_live_linux_lab_failure_digest.py" ]]; then
-    return 0
-  fi
-  if ! python3 "$ROOT_DIR/scripts/e2e/generate_live_linux_lab_failure_digest.py" \
+  if ! cargo run --quiet -p rustynet-cli -- ops generate-live-linux-lab-failure-digest \
     --nodes-tsv "$NODES_TSV" \
     --stages-tsv "$STAGE_TSV" \
     --report-dir "$REPORT_DIR" \
@@ -3662,17 +3413,10 @@ ensure_known_hosts_input() {
     printf 'pinned SSH known_hosts file must not be a symlink: %s\n' "$SSH_KNOWN_HOSTS_FILE" >&2
     exit 2
   fi
-  if ! python3 - "$SSH_KNOWN_HOSTS_FILE" <<'PY'
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o022:
-    raise SystemExit(f"pinned SSH known_hosts file must not be group/world writable: {path} ({mode:03o})")
-PY
+  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+    --path "$SSH_KNOWN_HOSTS_FILE" \
+    --policy no-group-world-write \
+    --label 'pinned SSH known_hosts file' >/dev/null
   then
     exit 2
   fi

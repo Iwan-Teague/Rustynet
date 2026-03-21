@@ -46,6 +46,8 @@ CLIENT_ENDPOINTS_FILE=""
 EXIT_NFT_FILE=""
 CLIENT_PLAINTEXT_FILE=""
 EXIT_PLAINTEXT_FILE=""
+SOURCE_ARTIFACTS=()
+LOG_ARTIFACTS=()
 
 usage() {
   cat <<'USAGE'
@@ -62,180 +64,44 @@ USAGE
 
 write_report() {
   local status="$1"
-  export REPORT_STATUS="$status"
-  export REPORT_FAILURE_SUMMARY="$FAILURE_SUMMARY"
-  export REPORT_PATH LOG_PATH CLIENT_HOST EXIT_HOST CLIENT_NODE_ID EXIT_NODE_ID
-  export CLIENT_NETWORK_ID EXIT_NETWORK_ID CLIENT_ADDR EXIT_ADDR
-  export NAT_PROFILE IMPAIRMENT_PROFILE
-  export CHECK_DIRECT_REMOTE_EXIT_SUCCESS CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK
-  export CHECK_REMOTE_EXIT_SERVER_IP_BYPASS_IS_NARROW CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC
-  export CHECK_CLIENT_EXIT_SELECTED CHECK_EXIT_SERVING_ROUTE CHECK_CLIENT_ROUTE_VIA_RUSTYNET
-  export CHECK_EXIT_ENDPOINT_VISIBLE CHECK_EXIT_MASQUERADE_PRESENT CHECK_NO_PLAINTEXT_PASSPHRASE_FILES
-  export BYPASS_REPORT_PATH BYPASS_LOG_PATH
-  export CLIENT_STATUS_FILE EXIT_STATUS_FILE CLIENT_INTERNET_ROUTE_FILE CLIENT_ENDPOINTS_FILE
-  export EXIT_NFT_FILE CLIENT_PLAINTEXT_FILE EXIT_PLAINTEXT_FILE ROOT_DIR
-
-  python3 - <<'PY'
-from __future__ import annotations
-
-import ipaddress
-import json
-import os
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-root_dir = Path(os.environ["ROOT_DIR"]).resolve()
-ci_dir = root_dir / "scripts" / "ci"
-if str(ci_dir) not in sys.path:
-    sys.path.insert(0, str(ci_dir))
-
-from cross_network_remote_exit_schema import validate_report_payload
-
-
-def env_text(name: str) -> str:
-    return os.environ.get(name, "")
-
-
-def read_text_file(path_raw: str) -> str:
-    if not path_raw:
-        return ""
-    path = Path(path_raw)
-    if not path.is_file():
-        return ""
-    return path.read_text(encoding="utf-8")
-
-
-def artifact_list(*items: str) -> list[str]:
-    values: list[str] = []
-    for item in items:
-        if not item:
-            continue
-        path = Path(item).resolve()
-        if path.exists():
-            values.append(str(path))
-    return values
-
-
-def current_git_commit() -> str:
-    expected = env_text("RUSTYNET_EXPECTED_GIT_COMMIT").strip().lower()
-    if expected:
-        return expected
-    return (
-        subprocess.check_output(["git", "rev-parse", "HEAD"], text=True)
-        .strip()
-        .lower()
-    )
-
-
-def same_underlay_prefix(client_raw: str, exit_raw: str) -> bool:
-    if not client_raw or not exit_raw:
-        return False
-    client_ip = ipaddress.ip_address(client_raw)
-    exit_ip = ipaddress.ip_address(exit_raw)
-    if client_ip.version != exit_ip.version:
-        return False
-    prefix = 24 if client_ip.version == 4 else 64
-    client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
-    exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-    return client_net == exit_net
-
-
-report_path = Path(env_text("REPORT_PATH")).resolve()
-report_path.parent.mkdir(parents=True, exist_ok=True)
-captured_at_unix = int(time.time())
-
-bypass_payload = {}
-bypass_report_path = env_text("BYPASS_REPORT_PATH")
-if bypass_report_path and Path(bypass_report_path).is_file():
-    bypass_payload = json.loads(Path(bypass_report_path).read_text(encoding="utf-8"))
-
-bypass_checks = bypass_payload.get("checks", {}) if isinstance(bypass_payload, dict) else {}
-
-topology_same_prefix = same_underlay_prefix(env_text("CLIENT_ADDR"), env_text("EXIT_ADDR"))
-topology_heuristic = "fail" if topology_same_prefix else env_text("CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC")
-
-checks = {
-    "direct_remote_exit_success": env_text("CHECK_DIRECT_REMOTE_EXIT_SUCCESS"),
-    "remote_exit_no_underlay_leak": env_text("CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK"),
-    "remote_exit_server_ip_bypass_is_narrow": env_text("CHECK_REMOTE_EXIT_SERVER_IP_BYPASS_IS_NARROW"),
-    "cross_network_topology_heuristic": topology_heuristic,
-    "client_exit_selected": env_text("CHECK_CLIENT_EXIT_SELECTED"),
-    "exit_serving_route": env_text("CHECK_EXIT_SERVING_ROUTE"),
-    "client_route_via_rustynet0": env_text("CHECK_CLIENT_ROUTE_VIA_RUSTYNET"),
-    "exit_endpoint_visible": env_text("CHECK_EXIT_ENDPOINT_VISIBLE"),
-    "exit_masquerade_present": env_text("CHECK_EXIT_MASQUERADE_PRESENT"),
-    "no_plaintext_passphrase_files": env_text("CHECK_NO_PLAINTEXT_PASSPHRASE_FILES"),
-}
-
-status = env_text("REPORT_STATUS")
-failure_summary = env_text("REPORT_FAILURE_SUMMARY").strip()
-if topology_same_prefix:
-    failure_summary = (
-        "client and exit underlay addresses share the same local prefix; refusing to "
-        "claim cross-network direct remote exit on same-subnet topology"
-    )
-    status = "fail"
-    checks["direct_remote_exit_success"] = "fail"
-
-payload = {
-    "schema_version": 1,
-    "phase": "phase10",
-    "suite": "cross_network_direct_remote_exit",
-    "environment": "live_linux_cross_network_direct_remote_exit",
-    "evidence_mode": "measured",
-    "captured_at_unix": captured_at_unix,
-    "git_commit": current_git_commit(),
-    "status": status,
-    "participants": {
-        "client_host": env_text("CLIENT_HOST"),
-        "exit_host": env_text("EXIT_HOST"),
-    },
-    "network_context": {
-        "client_network_id": env_text("CLIENT_NETWORK_ID"),
-        "exit_network_id": env_text("EXIT_NETWORK_ID"),
-        "nat_profile": env_text("NAT_PROFILE"),
-        "impairment_profile": env_text("IMPAIRMENT_PROFILE"),
-        "client_underlay_ip": env_text("CLIENT_ADDR"),
-        "exit_underlay_ip": env_text("EXIT_ADDR"),
-    },
-    "checks": checks,
-    "source_artifacts": artifact_list(
-        str((root_dir / "scripts" / "e2e" / "live_linux_cross_network_direct_remote_exit_test.sh").resolve()),
-        env_text("BYPASS_REPORT_PATH"),
-    ),
-    "log_artifacts": artifact_list(
-        env_text("LOG_PATH"),
-        env_text("BYPASS_LOG_PATH"),
-    ),
-    "evidence": {
-        "client_node_id": env_text("CLIENT_NODE_ID"),
-        "exit_node_id": env_text("EXIT_NODE_ID"),
-        "same_underlay_prefix_heuristic": topology_same_prefix,
-        "topology_heuristic_basis": "shared /24 for IPv4 or shared /64 for IPv6 is not treated as cross-network proof",
-        "nat_profile": env_text("NAT_PROFILE"),
-        "impairment_profile": env_text("IMPAIRMENT_PROFILE"),
-        "client_status": read_text_file(env_text("CLIENT_STATUS_FILE")),
-        "exit_status": read_text_file(env_text("EXIT_STATUS_FILE")),
-        "client_internet_route": read_text_file(env_text("CLIENT_INTERNET_ROUTE_FILE")),
-        "client_endpoints": read_text_file(env_text("CLIENT_ENDPOINTS_FILE")),
-        "exit_nft_ruleset_excerpt": read_text_file(env_text("EXIT_NFT_FILE")),
-        "client_plaintext_check": read_text_file(env_text("CLIENT_PLAINTEXT_FILE")),
-        "exit_plaintext_check": read_text_file(env_text("EXIT_PLAINTEXT_FILE")),
-        "server_ip_bypass_report": bypass_payload,
-        "server_ip_bypass_checks": bypass_checks,
-    },
-}
-if status == "fail":
-    payload["failure_summary"] = failure_summary or "cross-network direct remote-exit validation failed"
-
-problems = validate_report_payload(report_path, payload)
-if problems:
-    raise SystemExit("\n".join(problems))
-
-report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
+  local args=(
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
+    --suite cross_network_direct_remote_exit
+    --report-path "$REPORT_PATH"
+    --log-path "$LOG_PATH"
+    --status "$status"
+    --failure-summary "$FAILURE_SUMMARY"
+    --implementation-state live_measured_validator
+    --client-host "$CLIENT_HOST"
+    --exit-host "$EXIT_HOST"
+    --client-network-id "$CLIENT_NETWORK_ID"
+    --exit-network-id "$EXIT_NETWORK_ID"
+    --nat-profile "$NAT_PROFILE"
+    --impairment-profile "$IMPAIRMENT_PROFILE"
+    --source-artifact "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh"
+    --check "direct_remote_exit_success=${CHECK_DIRECT_REMOTE_EXIT_SUCCESS}"
+    --check "remote_exit_no_underlay_leak=${CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK}"
+    --check "remote_exit_server_ip_bypass_is_narrow=${CHECK_REMOTE_EXIT_SERVER_IP_BYPASS_IS_NARROW}"
+    --check "cross_network_topology_heuristic=${CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC}"
+    --check "client_exit_selected=${CHECK_CLIENT_EXIT_SELECTED}"
+    --check "exit_serving_route=${CHECK_EXIT_SERVING_ROUTE}"
+    --check "client_route_via_rustynet0=${CHECK_CLIENT_ROUTE_VIA_RUSTYNET}"
+    --check "exit_endpoint_visible=${CHECK_EXIT_ENDPOINT_VISIBLE}"
+    --check "exit_masquerade_present=${CHECK_EXIT_MASQUERADE_PRESENT}"
+    --check "no_plaintext_passphrase_files=${CHECK_NO_PLAINTEXT_PASSPHRASE_FILES}"
+  )
+  local item
+  set +u
+  for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
+    args+=(--source-artifact "$item")
+  done
+  for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
+    args+=(--log-artifact "$item")
+  done
+  set -u
+  "${args[@]}"
 }
 
 cleanup() {
@@ -320,6 +186,8 @@ main() {
   artifact_dir="$(dirname "$REPORT_PATH")"
   BYPASS_REPORT_PATH="$artifact_dir/cross_network_direct_remote_exit_server_ip_bypass_report.json"
   BYPASS_LOG_PATH="$artifact_dir/cross_network_direct_remote_exit_server_ip_bypass.log"
+  SOURCE_ARTIFACTS=("$BYPASS_REPORT_PATH")
+  LOG_ARTIFACTS=("$BYPASS_LOG_PATH")
   CLIENT_STATUS_FILE="$LIVE_LAB_WORK_DIR/client_status.txt"
   EXIT_STATUS_FILE="$LIVE_LAB_WORK_DIR/exit_status.txt"
   CLIENT_INTERNET_ROUTE_FILE="$LIVE_LAB_WORK_DIR/client_internet_route.txt"
@@ -600,18 +468,8 @@ TRAVEOF
     CHECK_NO_PLAINTEXT_PASSPHRASE_FILES="pass"
   fi
 
-  if python3 - "$CLIENT_ADDR" "$EXIT_ADDR" <<'PY'
-import ipaddress
-import sys
-
-client_ip = ipaddress.ip_address(sys.argv[1])
-exit_ip = ipaddress.ip_address(sys.argv[2])
-prefix = 24 if client_ip.version == 4 else 64
-client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
-exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-raise SystemExit(1 if client_net == exit_net else 0)
-PY
-  then
+  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1
+  if [[ "$topology_result" == "pass" ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   else
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="fail"
@@ -640,19 +498,14 @@ PY
     return 1
   fi
 
-  mapfile -t bypass_results < <(python3 - "$BYPASS_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(checks.get("internet_route_via_rustynet0", "fail"))
-print(checks.get("probe_service_blocked_from_client", "fail"))
-print(checks.get("probe_endpoint_route_direct_not_tunnelled", "fail"))
-print(checks.get("no_unexpected_bypass_routes", "fail"))
-print(payload.get("status", "fail"))
-PY
-)
+  mapfile -t bypass_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$BYPASS_REPORT_PATH" \
+      --check internet_route_via_rustynet0 \
+      --check probe_service_blocked_from_client \
+      --check probe_endpoint_route_direct_not_tunnelled \
+      --check no_unexpected_bypass_routes
+  ) || return 1
 
   if [[ "${bypass_results[0]}" == 'pass' && "${bypass_results[1]}" == 'pass' ]]; then
     CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK="pass"
@@ -662,7 +515,11 @@ PY
   fi
 
   if [[ "$CHECK_DIRECT_REMOTE_EXIT_SUCCESS" != 'pass' ]]; then
-    FAILURE_SUMMARY="direct remote-exit steady-state checks did not all pass"
+    if [[ "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" != 'pass' ]]; then
+      FAILURE_SUMMARY="client and exit underlay addresses share the same local prefix; refusing to claim cross-network direct remote exit on same-subnet topology"
+    else
+      FAILURE_SUMMARY="direct remote-exit steady-state checks did not all pass"
+    fi
     return 1
   fi
   if [[ "$CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK" != 'pass' ]]; then

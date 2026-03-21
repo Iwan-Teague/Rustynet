@@ -32,19 +32,10 @@ live_lab_init() {
     echo "ssh identity file must not be a symlink: $LIVE_LAB_SSH_IDENTITY_FILE" >&2
     exit 1
   fi
-  if ! python3 - "$LIVE_LAB_SSH_IDENTITY_FILE" <<'PY'
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o077:
-    raise SystemExit(
-        f"ssh identity file must be owner-only (0400/0600): {path} ({mode:03o})"
-    )
-PY
+  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+    --path "$LIVE_LAB_SSH_IDENTITY_FILE" \
+    --policy owner-only \
+    --label 'ssh identity file' >/dev/null
   then
     exit 1
   fi
@@ -85,17 +76,10 @@ live_lab_require_known_hosts_file() {
     echo "pinned known_hosts file must not be a symlink: $path" >&2
     exit 1
   fi
-  if ! python3 - "$path" <<'PY'
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o022:
-    raise SystemExit(f"pinned known_hosts file must not be group/world writable: {path} ({mode:03o})")
-PY
+  if ! cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+    --path "$path" \
+    --policy no-group-world-write \
+    --label 'pinned known_hosts file' >/dev/null
   then
     exit 1
   fi

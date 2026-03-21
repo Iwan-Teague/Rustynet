@@ -81,14 +81,14 @@ for spec in REPORT_SPECS:
 write_report(REPORT_SPECS[0], "symmetric_nat", "symmetric_partial")
 PY
 
-./scripts/ci/validate_cross_network_nat_matrix.py \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
   --artifact-dir "$temp_dir" \
   --required-nat-profiles baseline_lan \
   --expected-git-commit "$current_commit" \
   --require-pass-status \
   --output "$temp_dir/nat_matrix_baseline.md"
 
-if ./scripts/ci/validate_cross_network_nat_matrix.py \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
   --artifact-dir "$temp_dir" \
   --required-nat-profiles baseline_lan,symmetric_nat \
   --expected-git-commit "$current_commit" \
@@ -150,7 +150,7 @@ for spec in REPORT_SPECS:
     (temp_dir / filename).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 
-./scripts/ci/validate_cross_network_nat_matrix.py \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
   --artifact-dir "$temp_dir" \
   --required-nat-profiles baseline_lan,symmetric_nat \
   --expected-git-commit "$current_commit" \

@@ -79,7 +79,7 @@ validate_positive_integer() {
 write_report() {
   local status="$1"
   local args=(
-    python3 "$ROOT_DIR/scripts/e2e/generate_cross_network_remote_exit_report.py"
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
     --suite cross_network_remote_exit_soak
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -103,12 +103,16 @@ write_report() {
     --check "no_plaintext_passphrase_files=${CHECK_NO_PLAINTEXT_PASSPHRASE_FILES}"
   )
   local item
+  set +u
   for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
   done
   for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--log-artifact "$item")
   done
+  set -u
   "${args[@]}"
 }
 
@@ -234,30 +238,23 @@ main() {
     return 1
   fi
 
-  mapfile -t direct_results < <(python3 - "$DIRECT_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-network_context = payload.get("network_context", {})
-print(payload.get("status", "fail"))
-print(checks.get("direct_remote_exit_success", "fail"))
-print(checks.get("remote_exit_no_underlay_leak", "fail"))
-print(checks.get("remote_exit_server_ip_bypass_is_narrow", "fail"))
-print(checks.get("cross_network_topology_heuristic", "fail"))
-print(network_context.get("client_underlay_ip", ""))
-print(network_context.get("exit_underlay_ip", ""))
-PY
-)
+  mapfile -t direct_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$DIRECT_REPORT_PATH" \
+      --include-status \
+      --check direct_remote_exit_success \
+      --check remote_exit_no_underlay_leak \
+      --check remote_exit_server_ip_bypass_is_narrow \
+      --check cross_network_topology_heuristic
+  ) || return 1
 
   local direct_status="${direct_results[0]:-fail}"
   local direct_success="${direct_results[1]:-fail}"
   local direct_leak_check="${direct_results[2]:-fail}"
   local direct_bypass_check="${direct_results[3]:-fail}"
   local direct_topology_check="${direct_results[4]:-fail}"
-  local direct_client_underlay="${direct_results[5]:-}"
-  local direct_exit_underlay="${direct_results[6]:-}"
+  local direct_client_underlay
+  local direct_exit_underlay
 
   if [[ "$direct_status" == 'pass' && "$direct_success" == 'pass' ]]; then
     CHECK_DIRECT_REMOTE_EXIT_READY="pass"
@@ -271,6 +268,8 @@ PY
   if [[ "$direct_topology_check" == 'pass' ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   fi
+  direct_client_underlay="$(live_lab_target_address "$CLIENT_HOST")"
+  direct_exit_underlay="$(live_lab_target_address "$EXIT_HOST")"
   CLIENT_ADDR="$direct_client_underlay"
   EXIT_ADDR="$direct_exit_underlay"
 
@@ -392,19 +391,15 @@ PY
     return 1
   fi
 
-  mapfile -t bypass_results < <(python3 - "$BYPASS_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(payload.get("status", "fail"))
-print(checks.get("internet_route_via_rustynet0", "fail"))
-print(checks.get("probe_service_blocked_from_client", "fail"))
-print(checks.get("probe_endpoint_route_direct_not_tunnelled", "fail"))
-print(checks.get("no_unexpected_bypass_routes", "fail"))
-PY
-)
+  mapfile -t bypass_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$BYPASS_REPORT_PATH" \
+      --include-status \
+      --check internet_route_via_rustynet0 \
+      --check probe_service_blocked_from_client \
+      --check probe_endpoint_route_direct_not_tunnelled \
+      --check no_unexpected_bypass_routes
+  ) || return 1
 
   local bypass_status_value="${bypass_results[0]:-fail}"
   local bypass_route_tunnelled="${bypass_results[1]:-fail}"
@@ -433,40 +428,20 @@ PY
     CHECK_LONG_SOAK_STABLE="pass"
   fi
 
-  python3 - "$MONITOR_SUMMARY_PATH" \
-    "$samples" \
-    "$failing_samples" \
-    "$max_consecutive_observed" \
-    "$elapsed_secs" \
-    "$SOAK_DURATION_SECS" \
-    "$SOAK_MAX_FAILING_SAMPLES" \
-    "$SOAK_MAX_CONSECUTIVE_FAILURES" \
-    "$CHECK_DIRECT_REMOTE_EXIT_READY" \
-    "$CHECK_POST_SOAK_BYPASS_READY" \
-    "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" \
-    "${first_failure_reason:-none}" \
-    "$CHECK_LONG_SOAK_STABLE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-payload = {
-    "samples": int(sys.argv[2]),
-    "failing_samples": int(sys.argv[3]),
-    "max_consecutive_failures_observed": int(sys.argv[4]),
-    "elapsed_secs": int(sys.argv[5]),
-    "required_soak_duration_secs": int(sys.argv[6]),
-    "allowed_failing_samples": int(sys.argv[7]),
-    "allowed_max_consecutive_failures": int(sys.argv[8]),
-    "direct_remote_exit_ready": sys.argv[9],
-    "post_soak_bypass_ready": sys.argv[10],
-    "no_plaintext_passphrase_files": sys.argv[11],
-    "first_failure_reason": sys.argv[12],
-    "long_soak_stable": sys.argv[13],
-}
-path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-PY
+  cargo run --quiet -p rustynet-cli -- ops write-cross-network-soak-monitor-summary \
+    --path "$MONITOR_SUMMARY_PATH" \
+    --samples "$samples" \
+    --failing-samples "$failing_samples" \
+    --max-consecutive-failures-observed "$max_consecutive_observed" \
+    --elapsed-secs "$elapsed_secs" \
+    --required-soak-duration-secs "$SOAK_DURATION_SECS" \
+    --allowed-failing-samples "$SOAK_MAX_FAILING_SAMPLES" \
+    --allowed-max-consecutive-failures "$SOAK_MAX_CONSECUTIVE_FAILURES" \
+    --direct-remote-exit-ready "$CHECK_DIRECT_REMOTE_EXIT_READY" \
+    --post-soak-bypass-ready "$CHECK_POST_SOAK_BYPASS_READY" \
+    --no-plaintext-passphrase-files "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" \
+    --first-failure-reason "${first_failure_reason:-none}" \
+    --long-soak-stable "$CHECK_LONG_SOAK_STABLE" >/dev/null
 
   if [[ "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" != 'pass' ]]; then
     FAILURE_SUMMARY="soak path topology did not credibly prove a cross-network claim"

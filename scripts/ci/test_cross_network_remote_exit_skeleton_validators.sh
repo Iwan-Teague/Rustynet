@@ -7,10 +7,8 @@ cd "$ROOT_DIR"
 temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
 
-ssh_pass="$temp_dir/ssh.pass"
-sudo_pass="$temp_dir/sudo.pass"
-printf 'secret\n' >"$ssh_pass"
-printf 'secret\n' >"$sudo_pass"
+ssh_identity="$temp_dir/id_test"
+printf 'not-a-real-private-key\n' >"$ssh_identity"
 
 run_expect_fail() {
   local script_path="$1"
@@ -22,8 +20,7 @@ run_expect_fail() {
 }
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --client-node-id "client-1" \
@@ -34,8 +31,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_ex
   --log-path "$temp_dir/cross_network_direct_remote_exit.log"
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --relay-host "relay@example" \
@@ -49,8 +45,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_relay_remote_exi
   --log-path "$temp_dir/cross_network_relay_remote_exit.log"
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --relay-host "relay@example" \
@@ -64,8 +59,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_failback_roaming
   --log-path "$temp_dir/cross_network_failback_roaming.log"
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --probe-host "probe@example" \
@@ -75,8 +69,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_traversal_advers
   --log-path "$temp_dir/cross_network_traversal_adversarial.log"
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --client-node-id "client-1" \
@@ -87,8 +80,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_
   --log-path "$temp_dir/cross_network_remote_exit_dns.log"
 
 run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh" \
-  --ssh-password-file "$ssh_pass" \
-  --sudo-password-file "$sudo_pass" \
+  --ssh-identity-file "$ssh_identity" \
   --client-host "client@example" \
   --exit-host "exit@example" \
   --client-network-id "net-a" \
@@ -96,7 +88,7 @@ run_expect_fail "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak
   --report-path "$temp_dir/cross_network_remote_exit_soak_report.json" \
   --log-path "$temp_dir/cross_network_remote_exit_soak.log"
 
-./scripts/ci/validate_cross_network_remote_exit_reports.py \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --artifact-dir "$temp_dir" \
   --output "$temp_dir/skeleton_validation.md"
 

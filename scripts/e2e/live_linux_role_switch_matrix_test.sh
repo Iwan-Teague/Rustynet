@@ -168,28 +168,14 @@ record_host_result() {
   local post_switch_reconcile="$4"
   local policy_still_enforced="$5"
   local least_privilege_preserved="$6"
-  python3 - "$TMP_JSON" "$os_id" "$temp_role" "$switch_execution" "$post_switch_reconcile" "$policy_still_enforced" "$least_privilege_preserved" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path, os_id, temp_role, switch_execution, post_switch_reconcile, policy_still_enforced, least_privilege_preserved = sys.argv[1:]
-payload = json.loads(Path(path).read_text(encoding='utf-8'))
-payload[os_id] = {
-    'transition': {
-        'from_role': 'client',
-        'to_role': temp_role,
-        'status': 'pass' if switch_execution == 'pass' else 'fail',
-    },
-    'checks': {
-        'switch_execution': switch_execution,
-        'post_switch_reconcile': post_switch_reconcile,
-        'policy_still_enforced': policy_still_enforced,
-        'least_privilege_preserved': least_privilege_preserved,
-    },
-}
-Path(path).write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
-PY
+  cargo run --quiet -p rustynet-cli -- ops update-role-switch-host-result \
+    --hosts-json-path "$TMP_JSON" \
+    --os-id "$os_id" \
+    --temp-role "$temp_role" \
+    --switch-execution "$switch_execution" \
+    --post-switch-reconcile "$post_switch_reconcile" \
+    --policy-still-enforced "$policy_still_enforced" \
+    --least-privilege-preserved "$least_privilege_preserved" >/dev/null
 }
 
 overall_status="pass"
@@ -292,24 +278,13 @@ process_host "$FEDORA_HOST" fedora blind_exit "$FEDORA_NODE_ID"
 process_host "$UBUNTU_HOST" ubuntu admin "$UBUNTU_NODE_ID"
 process_host "$MINT_HOST" mint admin "$MINT_NODE_ID"
 
-python3 - "$TMP_JSON" "$REPORT_PATH" "$SOURCE_PATH" "$git_commit" "$captured_at_unix" "$overall_status" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-hosts_path, report_path, source_path, git_commit, captured_at_unix, overall_status = sys.argv[1:]
-hosts = json.loads(Path(hosts_path).read_text(encoding='utf-8'))
-report = {
-    'schema_version': 1,
-    'evidence_mode': 'measured',
-    'git_commit': git_commit,
-    'captured_at_unix': int(captured_at_unix),
-    'status': overall_status,
-    'hosts': hosts,
-    'source_artifact': source_path,
-}
-Path(report_path).write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-PY
+cargo run --quiet -p rustynet-cli -- ops write-role-switch-matrix-report \
+  --hosts-json-path "$TMP_JSON" \
+  --report-path "$REPORT_PATH" \
+  --source-path "$SOURCE_PATH" \
+  --git-commit "$git_commit" \
+  --captured-at-unix "$captured_at_unix" \
+  --overall-status "$overall_status" >/dev/null
 
 printf 'role_switch_report=%s\n' "$REPORT_PATH"
 printf 'role_switch_source=%s\n' "$SOURCE_PATH"

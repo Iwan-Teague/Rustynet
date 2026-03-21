@@ -125,12 +125,7 @@ PY
 chmod 700 "$SERVER_SCRIPT" "$PROBE_SCRIPT"
 
 if [[ -n "$PROBE_BIND_IP" ]]; then
-  python3 - "$PROBE_BIND_IP" <<'PY'
-import ipaddress
-import sys
-
-ipaddress.IPv4Address(sys.argv[1])
-PY
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$PROBE_BIND_IP" >/dev/null
   PROBE_IP="$PROBE_BIND_IP"
 else
   PROBE_IP="$(live_lab_target_address "$PROBE_HOST")"
@@ -186,97 +181,27 @@ printf '%s\n' "$PROBE_SELF_TEST"
 live_lab_log "Client probe output"
 printf '%s\n' "$PROBE_FROM_CLIENT_OUTPUT"
 
-python3 - "$REPORT_PATH" "$SSH_ALLOW_CIDRS" "$PROBE_FROM_CLIENT_STATUS" "$PROBE_IP" "$PROBE_PORT" "$CLIENT_INTERNET_ROUTE" "$CLIENT_PROBE_ROUTE" "$CLIENT_TABLE_51820" "$CLIENT_ENDPOINTS" "$PROBE_SELF_TEST" "$PROBE_FROM_CLIENT_OUTPUT" <<'PY'
-import ipaddress
-import json
-import sys
-from datetime import datetime, timezone
+captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+captured_at_unix="$(date -u +%s)"
 
-(
-    report_path,
-    allowed_cidrs_raw,
-    probe_from_client_status,
-    probe_ip,
-    probe_port,
-    client_internet_route,
-    client_probe_route,
-    client_table_51820,
-    client_endpoints,
-    probe_self_test,
-    probe_from_client_output,
-) = sys.argv[1:]
+report_status="$(
+  cargo run --quiet -p rustynet-cli -- ops write-live-linux-server-ip-bypass-report \
+    --report-path "$REPORT_PATH" \
+    --allowed-management-cidrs "$SSH_ALLOW_CIDRS" \
+    --probe-from-client-status "$PROBE_FROM_CLIENT_STATUS" \
+    --probe-ip "$PROBE_IP" \
+    --probe-port "$PROBE_PORT" \
+    --client-internet-route "$CLIENT_INTERNET_ROUTE" \
+    --client-probe-route "$CLIENT_PROBE_ROUTE" \
+    --client-table-51820 "$CLIENT_TABLE_51820" \
+    --client-endpoints "$CLIENT_ENDPOINTS" \
+    --probe-self-test "$PROBE_SELF_TEST" \
+    --probe-from-client-output "$PROBE_FROM_CLIENT_OUTPUT" \
+    --captured-at-utc "$captured_at_utc" \
+    --captured-at-unix "$captured_at_unix"
+)"
 
-allowed_networks = []
-for part in [item.strip() for item in allowed_cidrs_raw.split(",") if item.strip()]:
-    allowed_networks.append(ipaddress.ip_network(part, strict=False))
-
-internet_route_ok = "dev rustynet0" in client_internet_route
-probe_route_direct = "dev rustynet0" not in client_probe_route and probe_ip in client_probe_route
-probe_host_self_reachable = "probe-ok" in probe_self_test
-
-unexpected_bypass_routes = []
-for raw_line in client_table_51820.splitlines():
-    line = raw_line.strip()
-    if not line or "dev rustynet0" in line or line.startswith("default "):
-        continue
-    first = line.split()[0]
-    try:
-        network = ipaddress.ip_network(first, strict=False)
-    except ValueError:
-        continue
-    if network.prefixlen == network.max_prefixlen:
-        continue
-    if any(network == allowed for allowed in allowed_networks):
-        continue
-    unexpected_bypass_routes.append(line)
-
-checks = {
-    "internet_route_via_rustynet0": "pass" if internet_route_ok else "fail",
-    "probe_host_self_service_reachable": "pass" if probe_host_self_reachable else "fail",
-    "probe_endpoint_route_direct_not_tunnelled": "pass" if probe_route_direct else "fail",
-    "probe_service_blocked_from_client": probe_from_client_status,
-    "no_unexpected_bypass_routes": "pass" if not unexpected_bypass_routes else "fail",
-}
-
-overall = "pass"
-for value in checks.values():
-    if value != "pass":
-        overall = "fail"
-        break
-
-captured_at = datetime.now(timezone.utc)
-payload = {
-    "phase": "phase10",
-    "mode": "live_linux_server_ip_bypass",
-    "evidence_mode": "measured",
-    "captured_at": captured_at.isoformat(),
-    "captured_at_unix": int(captured_at.timestamp()),
-    "status": overall,
-    "probe_host_ip": probe_ip,
-    "probe_port": int(probe_port),
-    "checks": checks,
-    "evidence": {
-        "client_internet_route": client_internet_route,
-        "client_probe_route": client_probe_route,
-        "client_table_51820": client_table_51820,
-        "client_endpoints": client_endpoints,
-        "probe_self_test": probe_self_test,
-        "client_probe_output": probe_from_client_output,
-        "unexpected_bypass_routes": unexpected_bypass_routes,
-        "allowed_management_cidrs": [str(network) for network in allowed_networks],
-    },
-}
-
-with open(report_path, "w", encoding="utf-8") as fh:
-    json.dump(payload, fh, indent=2)
-    fh.write("\n")
-PY
-
-if [[ "$(python3 - "$REPORT_PATH" <<'PY'
-import json, sys
-print(json.loads(open(sys.argv[1], encoding="utf-8").read())["status"])
-PY
-)" != "pass" ]]; then
+if [[ "$report_status" != "pass" ]]; then
   echo "server-IP bypass test failed; see ${REPORT_PATH}" >&2
   exit 1
 fi

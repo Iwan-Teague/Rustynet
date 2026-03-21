@@ -55,7 +55,7 @@ USAGE
 write_report() {
   local status="$1"
   local args=(
-    python3 "$ROOT_DIR/scripts/e2e/generate_cross_network_remote_exit_report.py"
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
     --suite cross_network_remote_exit_dns
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -78,12 +78,16 @@ write_report() {
     --check "managed_dns_child_ready=${CHECK_MANAGED_DNS_CHILD_READY}"
   )
   local item
+  set +u
   for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
   done
   for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--log-artifact "$item")
   done
+  set -u
   "${args[@]}"
 }
 
@@ -181,18 +185,14 @@ main() {
     return 1
   fi
 
-  mapfile -t direct_results < <(python3 - "$DIRECT_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(payload.get("status", "fail"))
-print(checks.get("direct_remote_exit_success", "fail"))
-print(checks.get("remote_exit_no_underlay_leak", "fail"))
-print(checks.get("cross_network_topology_heuristic", "fail"))
-PY
-)
+  mapfile -t direct_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$DIRECT_REPORT_PATH" \
+      --include-status \
+      --check direct_remote_exit_success \
+      --check remote_exit_no_underlay_leak \
+      --check cross_network_topology_heuristic
+  ) || return 1
 
   if [[ "${direct_results[0]}" == 'pass' && "${direct_results[1]}" == 'pass' ]]; then
     CHECK_DIRECT_REMOTE_EXIT_READY="pass"
@@ -233,24 +233,20 @@ PY
     return 1
   fi
 
-  mapfile -t managed_results < <(python3 - "$MANAGED_DNS_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(payload.get("status", "fail"))
-print(checks.get("dns_inspect_valid", "fail"))
-print(checks.get("managed_dns_service_active", "fail"))
-print(checks.get("resolvectl_split_dns_configured", "fail"))
-print(checks.get("loopback_resolver_answers_managed_name", "fail"))
-print(checks.get("systemd_resolved_answers_managed_name", "fail"))
-print(checks.get("alias_resolves_to_expected_ip", "fail"))
-print(checks.get("non_managed_query_refused", "fail"))
-print(checks.get("stale_bundle_fail_closed", "fail"))
-print(checks.get("valid_bundle_restored", "fail"))
-PY
-)
+  mapfile -t managed_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$MANAGED_DNS_REPORT_PATH" \
+      --include-status \
+      --check dns_inspect_valid \
+      --check managed_dns_service_active \
+      --check resolvectl_split_dns_configured \
+      --check loopback_resolver_answers_managed_name \
+      --check systemd_resolved_answers_managed_name \
+      --check alias_resolves_to_expected_ip \
+      --check non_managed_query_refused \
+      --check stale_bundle_fail_closed \
+      --check valid_bundle_restored
+  ) || return 1
 
   if [[ "${managed_results[0]}" == 'pass' ]]; then
     CHECK_MANAGED_DNS_CHILD_READY="pass"

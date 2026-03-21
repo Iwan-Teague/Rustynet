@@ -26,14 +26,14 @@ require_command git
 ./scripts/ci/test_validate_cross_network_nat_matrix.sh
 ./scripts/ci/test_validate_network_discovery_bundle.sh
 
-./scripts/ci/validate_cross_network_remote_exit_reports.py \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --artifact-dir "$ARTIFACT_DIR" \
   --expected-git-commit "$EXPECTED_COMMIT" \
   --require-pass-status \
   --max-evidence-age-seconds "$MAX_EVIDENCE_AGE_SECONDS" \
   --output "$SCHEMA_OUTPUT"
 
-./scripts/ci/validate_cross_network_nat_matrix.py \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-nat-matrix \
   --artifact-dir "$ARTIFACT_DIR" \
   --required-nat-profiles "$REQUIRED_NAT_PROFILES" \
   --expected-git-commit "$EXPECTED_COMMIT" \

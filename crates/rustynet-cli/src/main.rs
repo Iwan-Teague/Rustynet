@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod env_file;
+mod ops_cross_network_reports;
 mod ops_e2e;
+mod ops_fresh_install_os_matrix;
 mod ops_install_systemd;
+mod ops_live_lab_failure_digest;
+mod ops_live_lab_orchestrator;
+mod ops_network_discovery;
 mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
@@ -282,6 +287,82 @@ enum OpsCommand {
     GeneratePhase10Artifacts,
     VerifyPhase10Provenance,
     VerifyPhase6ParityEvidence,
+    GenerateCrossNetworkRemoteExitReport {
+        config: ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig,
+    },
+    ValidateCrossNetworkRemoteExitReports {
+        config: ops_cross_network_reports::ValidateCrossNetworkRemoteExitReportsConfig,
+    },
+    ValidateCrossNetworkNatMatrix {
+        config: ops_cross_network_reports::ValidateCrossNetworkNatMatrixConfig,
+    },
+    ReadCrossNetworkReportFields {
+        config: ops_cross_network_reports::ReadCrossNetworkReportFieldsConfig,
+    },
+    ClassifyCrossNetworkTopology {
+        config: ops_cross_network_reports::ClassifyCrossNetworkTopologyConfig,
+    },
+    ChooseCrossNetworkRoamAlias {
+        config: ops_cross_network_reports::ChooseCrossNetworkRoamAliasConfig,
+    },
+    ValidateIpv4Address {
+        config: ops_cross_network_reports::ValidateIpv4AddressConfig,
+    },
+    WriteCrossNetworkSoakMonitorSummary {
+        config: ops_cross_network_reports::WriteCrossNetworkSoakMonitorSummaryConfig,
+    },
+    CheckLocalFileMode {
+        config: ops_live_lab_orchestrator::CheckLocalFileModeConfig,
+    },
+    RedactForensicsText,
+    WriteCrossNetworkForensicsManifest {
+        config: ops_live_lab_orchestrator::WriteCrossNetworkForensicsManifestConfig,
+    },
+    Sha256File {
+        config: ops_live_lab_orchestrator::Sha256FileConfig,
+    },
+    WriteCrossNetworkPreflightReport {
+        config: ops_live_lab_orchestrator::WriteCrossNetworkPreflightReportConfig,
+    },
+    WriteLiveLinuxRebootRecoveryReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxRebootRecoveryReportConfig,
+    },
+    WriteLiveLinuxLabRunSummary {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxLabRunSummaryConfig,
+    },
+    ScanIpv4PortRange {
+        config: ops_live_lab_orchestrator::ScanIpv4PortRangeConfig,
+    },
+    UpdateRoleSwitchHostResult {
+        config: ops_live_lab_orchestrator::UpdateRoleSwitchHostResultConfig,
+    },
+    WriteRoleSwitchMatrixReport {
+        config: ops_live_lab_orchestrator::WriteRoleSwitchMatrixReportConfig,
+    },
+    WriteLiveLinuxServerIpBypassReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxServerIpBypassReportConfig,
+    },
+    WriteLiveLinuxControlSurfaceReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxControlSurfaceReportConfig,
+    },
+    RewriteAssignmentPeerEndpointIp {
+        config: ops_live_lab_orchestrator::RewriteAssignmentPeerEndpointIpConfig,
+    },
+    WriteLiveLinuxEndpointHijackReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig,
+    },
+    ValidateNetworkDiscoveryBundle {
+        config: ops_network_discovery::ValidateNetworkDiscoveryBundleConfig,
+    },
+    GenerateLiveLinuxLabFailureDigest {
+        config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig,
+    },
+    RebindLinuxFreshInstallOsMatrixInputs {
+        config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig,
+    },
+    GenerateLinuxFreshInstallOsMatrixReport {
+        config: ops_fresh_install_os_matrix::GenerateLinuxFreshInstallOsMatrixReportConfig,
+    },
     SignReleaseArtifact,
     VerifyReleaseArtifact,
     CollectPlatformProbe,
@@ -544,6 +625,552 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops verify-phase6-parity-evidence does not accept options".to_string());
             }
             Ok(OpsCommand::VerifyPhase6ParityEvidence)
+        }
+        "generate-cross-network-remote-exit-report" => {
+            let source_artifacts = collect_repeated_option_values(&args[1..], "--source-artifact")
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let log_artifacts = collect_repeated_option_values(&args[1..], "--log-artifact")
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let check_overrides = collect_repeated_option_values(&args[1..], "--check");
+            Ok(OpsCommand::GenerateCrossNetworkRemoteExitReport {
+                config: ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig {
+                    suite: parser.required("--suite")?,
+                    report_path: parser.required_path("--report-path")?,
+                    log_path: parser.required_path("--log-path")?,
+                    status: parser.required("--status")?,
+                    failure_summary: parser.value("--failure-summary").unwrap_or_default(),
+                    environment: parser
+                        .value("--environment")
+                        .unwrap_or_else(|| "live_linux_skeleton".to_string()),
+                    implementation_state: parser
+                        .value("--implementation-state")
+                        .unwrap_or_else(|| "not_implemented".to_string()),
+                    source_artifacts,
+                    log_artifacts,
+                    client_host: parser.value("--client-host"),
+                    exit_host: parser.value("--exit-host"),
+                    relay_host: parser.value("--relay-host"),
+                    probe_host: parser.value("--probe-host"),
+                    client_network_id: parser.value("--client-network-id"),
+                    exit_network_id: parser.value("--exit-network-id"),
+                    relay_network_id: parser.value("--relay-network-id"),
+                    nat_profile: parser
+                        .value("--nat-profile")
+                        .unwrap_or_else(|| "baseline_lan".to_string()),
+                    impairment_profile: parser
+                        .value("--impairment-profile")
+                        .unwrap_or_else(|| "none".to_string()),
+                    check_overrides,
+                },
+            })
+        }
+        "validate-cross-network-remote-exit-reports" => {
+            let reports = parser
+                .value("--reports")
+                .map(split_csv)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            Ok(OpsCommand::ValidateCrossNetworkRemoteExitReports {
+                config: ops_cross_network_reports::ValidateCrossNetworkRemoteExitReportsConfig {
+                    reports,
+                    artifact_dir: parser.optional_path("--artifact-dir"),
+                    output: parser.optional_path("--output"),
+                    max_evidence_age_seconds: parser.parse_u64_or_default(
+                        "--max-evidence-age-seconds",
+                        ops_cross_network_reports::default_max_evidence_age_seconds(),
+                    )?,
+                    expected_git_commit: parser.value("--expected-git-commit"),
+                    require_pass_status: parser.has_flag("--require-pass-status"),
+                },
+            })
+        }
+        "validate-cross-network-nat-matrix" => {
+            let reports = parser
+                .value("--reports")
+                .map(split_csv)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let required_nat_profiles = parser
+                .value("--required-nat-profiles")
+                .map(split_csv)
+                .unwrap_or_else(|| split_csv("baseline_lan".to_string()));
+            Ok(OpsCommand::ValidateCrossNetworkNatMatrix {
+                config: ops_cross_network_reports::ValidateCrossNetworkNatMatrixConfig {
+                    reports,
+                    artifact_dir: parser.optional_path("--artifact-dir"),
+                    required_nat_profiles,
+                    max_evidence_age_seconds: parser.parse_u64_or_default(
+                        "--max-evidence-age-seconds",
+                        ops_cross_network_reports::default_max_evidence_age_seconds(),
+                    )?,
+                    expected_git_commit: parser.value("--expected-git-commit"),
+                    require_pass_status: parser.has_flag("--require-pass-status"),
+                    output: parser.optional_path("--output"),
+                },
+            })
+        }
+        "read-cross-network-report-fields" => {
+            let checks = collect_repeated_option_values(&args[1..], "--check");
+            let network_fields = collect_repeated_option_values(&args[1..], "--network-field");
+            Ok(OpsCommand::ReadCrossNetworkReportFields {
+                config: ops_cross_network_reports::ReadCrossNetworkReportFieldsConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    include_status: parser.has_flag("--include-status"),
+                    checks,
+                    network_fields,
+                    default_value: parser
+                        .value("--default-value")
+                        .unwrap_or_else(|| "fail".to_string()),
+                },
+            })
+        }
+        "classify-cross-network-topology" => {
+            let ipv4_prefix = parser
+                .value("--ipv4-prefix")
+                .map(|value| {
+                    value
+                        .parse::<u8>()
+                        .map_err(|err| format!("invalid value for --ipv4-prefix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(24);
+            let ipv6_prefix = parser
+                .value("--ipv6-prefix")
+                .map(|value| {
+                    value
+                        .parse::<u8>()
+                        .map_err(|err| format!("invalid value for --ipv6-prefix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(64);
+            Ok(OpsCommand::ClassifyCrossNetworkTopology {
+                config: ops_cross_network_reports::ClassifyCrossNetworkTopologyConfig {
+                    ip_a: parser.required("--ip-a")?,
+                    ip_b: parser.required("--ip-b")?,
+                    ipv4_prefix,
+                    ipv6_prefix,
+                },
+            })
+        }
+        "choose-cross-network-roam-alias" => {
+            let used_ips = collect_repeated_option_values(&args[1..], "--used-ip");
+            let ipv4_prefix = parser
+                .value("--ipv4-prefix")
+                .map(|value| {
+                    value
+                        .parse::<u8>()
+                        .map_err(|err| format!("invalid value for --ipv4-prefix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(24);
+            let ipv6_prefix = parser
+                .value("--ipv6-prefix")
+                .map(|value| {
+                    value
+                        .parse::<u8>()
+                        .map_err(|err| format!("invalid value for --ipv6-prefix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(64);
+            Ok(OpsCommand::ChooseCrossNetworkRoamAlias {
+                config: ops_cross_network_reports::ChooseCrossNetworkRoamAliasConfig {
+                    exit_ip: parser.required("--exit-ip")?,
+                    used_ips,
+                    ipv4_prefix,
+                    ipv6_prefix,
+                },
+            })
+        }
+        "validate-ipv4-address" => Ok(OpsCommand::ValidateIpv4Address {
+            config: ops_cross_network_reports::ValidateIpv4AddressConfig {
+                ip: parser.required("--ip")?,
+            },
+        }),
+        "write-cross-network-soak-monitor-summary" => {
+            let parse_u64 = |key: &str| -> Result<u64, String> {
+                parser
+                    .required(key)?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid value for {key}: {err}"))
+            };
+            Ok(OpsCommand::WriteCrossNetworkSoakMonitorSummary {
+                config: ops_cross_network_reports::WriteCrossNetworkSoakMonitorSummaryConfig {
+                    path: parser.required_path("--path")?,
+                    samples: parse_u64("--samples")?,
+                    failing_samples: parse_u64("--failing-samples")?,
+                    max_consecutive_failures_observed: parse_u64(
+                        "--max-consecutive-failures-observed",
+                    )?,
+                    elapsed_secs: parse_u64("--elapsed-secs")?,
+                    required_soak_duration_secs: parse_u64("--required-soak-duration-secs")?,
+                    allowed_failing_samples: parse_u64("--allowed-failing-samples")?,
+                    allowed_max_consecutive_failures: parse_u64(
+                        "--allowed-max-consecutive-failures",
+                    )?,
+                    direct_remote_exit_ready: parser.required("--direct-remote-exit-ready")?,
+                    post_soak_bypass_ready: parser.required("--post-soak-bypass-ready")?,
+                    no_plaintext_passphrase_files: parser
+                        .required("--no-plaintext-passphrase-files")?,
+                    first_failure_reason: parser.required("--first-failure-reason")?,
+                    long_soak_stable: parser.required("--long-soak-stable")?,
+                },
+            })
+        }
+        "check-local-file-mode" => Ok(OpsCommand::CheckLocalFileMode {
+            config: ops_live_lab_orchestrator::CheckLocalFileModeConfig {
+                path: parser.required_path("--path")?,
+                policy: parser.required("--policy")?,
+                label: parser
+                    .value("--label")
+                    .unwrap_or_else(|| "file".to_string()),
+            },
+        }),
+        "redact-forensics-text" => {
+            if args.len() != 1 {
+                return Err("ops redact-forensics-text does not accept options".to_string());
+            }
+            Ok(OpsCommand::RedactForensicsText)
+        }
+        "write-cross-network-forensics-manifest" => {
+            Ok(OpsCommand::WriteCrossNetworkForensicsManifest {
+                config: ops_live_lab_orchestrator::WriteCrossNetworkForensicsManifestConfig {
+                    stage: parser.required("--stage")?,
+                    collected_at_utc: parser.required("--collected-at-utc")?,
+                    stage_dir: parser.required_path("--stage-dir")?,
+                    output: parser.required_path("--output")?,
+                },
+            })
+        }
+        "sha256-file" => Ok(OpsCommand::Sha256File {
+            config: ops_live_lab_orchestrator::Sha256FileConfig {
+                path: parser.required_path("--path")?,
+            },
+        }),
+        "write-cross-network-preflight-report" => {
+            let parse_u64 = |key: &str| -> Result<u64, String> {
+                parser
+                    .required(key)?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid value for {key}: {err}"))
+            };
+            Ok(OpsCommand::WriteCrossNetworkPreflightReport {
+                config: ops_live_lab_orchestrator::WriteCrossNetworkPreflightReportConfig {
+                    nodes_tsv: parser.required_path("--nodes-tsv")?,
+                    stage_dir: parser.required_path("--stage-dir")?,
+                    output: parser.required_path("--output")?,
+                    reference_unix: parse_u64("--reference-unix")?,
+                    max_clock_skew_secs: parse_u64("--max-clock-skew-secs")?,
+                    discovery_max_age_secs: parse_u64("--discovery-max-age-secs")?,
+                    signed_artifact_max_age_secs: parse_u64("--signed-artifact-max-age-secs")?,
+                },
+            })
+        }
+        "write-live-linux-reboot-recovery-report" => {
+            Ok(OpsCommand::WriteLiveLinuxRebootRecoveryReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxRebootRecoveryReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    observations_path: parser.required_path("--observations-path")?,
+                    exit_pre: parser.required("--exit-pre")?,
+                    exit_post: parser.required("--exit-post")?,
+                    client_pre: parser.required("--client-pre")?,
+                    client_post: parser.required("--client-post")?,
+                    exit_return: parser.required("--exit-return")?,
+                    exit_boot_change: parser.required("--exit-boot-change")?,
+                    post_exit_twohop: parser.required("--post-exit-twohop")?,
+                    client_return: parser.required("--client-return")?,
+                    client_boot_change: parser.required("--client-boot-change")?,
+                    post_client_twohop: parser.required("--post-client-twohop")?,
+                    salvage_twohop: parser.required("--salvage-twohop")?,
+                },
+            })
+        }
+        "write-live-linux-lab-run-summary" => {
+            let parse_u64 = |key: &str| -> Result<u64, String> {
+                parser
+                    .required(key)?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid value for {key}: {err}"))
+            };
+            Ok(OpsCommand::WriteLiveLinuxLabRunSummary {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxLabRunSummaryConfig {
+                    nodes_tsv: parser.required_path("--nodes-tsv")?,
+                    stages_tsv: parser.required_path("--stages-tsv")?,
+                    summary_json: parser.required_path("--summary-json")?,
+                    summary_md: parser.required_path("--summary-md")?,
+                    run_id: parser.required("--run-id")?,
+                    network_id: parser.required("--network-id")?,
+                    report_dir: parser.required("--report-dir")?,
+                    overall_status: parser.required("--overall-status")?,
+                    started_at_local: parser.required("--started-at-local")?,
+                    started_at_utc: parser.required("--started-at-utc")?,
+                    started_at_unix: parse_u64("--started-at-unix")?,
+                    finished_at_local: parser.required("--finished-at-local")?,
+                    finished_at_utc: parser.required("--finished-at-utc")?,
+                    finished_at_unix: parse_u64("--finished-at-unix")?,
+                    elapsed_secs: parse_u64("--elapsed-secs")?,
+                    elapsed_human: parser.required("--elapsed-human")?,
+                },
+            })
+        }
+        "scan-ipv4-port-range" => {
+            let parse_u8_or_default = |key: &str, default: u8| -> Result<u8, String> {
+                parser
+                    .value(key)
+                    .map(|value| {
+                        value
+                            .parse::<u8>()
+                            .map_err(|err| format!("invalid value for {key}: {err}"))
+                    })
+                    .transpose()?
+                    .map_or(Ok(default), Ok)
+            };
+            let parse_u16_or_default = |key: &str, default: u16| -> Result<u16, String> {
+                parser
+                    .value(key)
+                    .map(|value| {
+                        value
+                            .parse::<u16>()
+                            .map_err(|err| format!("invalid value for {key}: {err}"))
+                    })
+                    .transpose()?
+                    .map_or(Ok(default), Ok)
+            };
+            let parse_u64_or_default = |key: &str, default: u64| -> Result<u64, String> {
+                parser
+                    .value(key)
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|err| format!("invalid value for {key}: {err}"))
+                    })
+                    .transpose()?
+                    .map_or(Ok(default), Ok)
+            };
+            Ok(OpsCommand::ScanIpv4PortRange {
+                config: ops_live_lab_orchestrator::ScanIpv4PortRangeConfig {
+                    network_prefix: parser.required("--network-prefix")?,
+                    start_host: parse_u8_or_default("--start-host", 1)?,
+                    end_host: parse_u8_or_default("--end-host", 254)?,
+                    port: parse_u16_or_default("--port", 22)?,
+                    timeout_ms: parse_u64_or_default("--timeout-ms", 80)?,
+                    output_key: parser
+                        .value("--output-key")
+                        .unwrap_or_else(|| "hosts=".to_string()),
+                },
+            })
+        }
+        "update-role-switch-host-result" => Ok(OpsCommand::UpdateRoleSwitchHostResult {
+            config: ops_live_lab_orchestrator::UpdateRoleSwitchHostResultConfig {
+                hosts_json_path: parser.required_path("--hosts-json-path")?,
+                os_id: parser.required("--os-id")?,
+                temp_role: parser.required("--temp-role")?,
+                switch_execution: parser.required("--switch-execution")?,
+                post_switch_reconcile: parser.required("--post-switch-reconcile")?,
+                policy_still_enforced: parser.required("--policy-still-enforced")?,
+                least_privilege_preserved: parser.required("--least-privilege-preserved")?,
+            },
+        }),
+        "write-role-switch-matrix-report" => {
+            let captured_at_unix = parser
+                .required("--captured-at-unix")?
+                .parse::<u64>()
+                .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))?;
+            Ok(OpsCommand::WriteRoleSwitchMatrixReport {
+                config: ops_live_lab_orchestrator::WriteRoleSwitchMatrixReportConfig {
+                    hosts_json_path: parser.required_path("--hosts-json-path")?,
+                    report_path: parser.required_path("--report-path")?,
+                    source_path: parser.required_path("--source-path")?,
+                    git_commit: parser.required("--git-commit")?,
+                    captured_at_unix,
+                    overall_status: parser.required("--overall-status")?,
+                },
+            })
+        }
+        "write-live-linux-server-ip-bypass-report" => {
+            let probe_port = parser
+                .required("--probe-port")?
+                .parse::<u16>()
+                .map_err(|err| format!("invalid value for --probe-port: {err}"))?;
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteLiveLinuxServerIpBypassReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxServerIpBypassReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    allowed_management_cidrs: parser.required("--allowed-management-cidrs")?,
+                    probe_from_client_status: parser.required("--probe-from-client-status")?,
+                    probe_ip: parser.required("--probe-ip")?,
+                    probe_port,
+                    client_internet_route: parser.required("--client-internet-route")?,
+                    client_probe_route: parser.required("--client-probe-route")?,
+                    client_table_51820: parser.required("--client-table-51820")?,
+                    client_endpoints: parser.required("--client-endpoints")?,
+                    probe_self_test: parser.required("--probe-self-test")?,
+                    probe_from_client_output: parser.required("--probe-from-client-output")?,
+                    captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                    captured_at_unix,
+                },
+            })
+        }
+        "write-live-linux-control-surface-report" => {
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let host_labels = collect_repeated_option_values(&args[1..], "--host-label");
+            Ok(OpsCommand::WriteLiveLinuxControlSurfaceReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxControlSurfaceReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    dns_bind_addr: parser.required("--dns-bind-addr")?,
+                    remote_dns_probe_status: parser.required("--remote-dns-probe-status")?,
+                    remote_dns_probe_output: parser.required("--remote-dns-probe-output")?,
+                    work_dir: parser.required_path("--work-dir")?,
+                    host_labels,
+                    captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                    captured_at_unix,
+                },
+            })
+        }
+        "rewrite-assignment-peer-endpoint-ip" => Ok(OpsCommand::RewriteAssignmentPeerEndpointIp {
+            config: ops_live_lab_orchestrator::RewriteAssignmentPeerEndpointIpConfig {
+                assignment_path: parser.required_path("--assignment-path")?,
+                endpoint_ip: parser.required("--endpoint-ip")?,
+            },
+        }),
+        "write-live-linux-endpoint-hijack-report" => {
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteLiveLinuxEndpointHijackReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    rogue_endpoint_ip: parser.required("--rogue-endpoint-ip")?,
+                    baseline_status: parser.required("--baseline-status")?,
+                    baseline_netcheck: parser.required("--baseline-netcheck")?,
+                    baseline_endpoints: parser.required("--baseline-endpoints")?,
+                    status_after_hijack: parser.required("--status-after-hijack")?,
+                    netcheck_after_hijack: parser.required("--netcheck-after-hijack")?,
+                    endpoints_after_hijack: parser.required("--endpoints-after-hijack")?,
+                    status_after_recovery: parser.required("--status-after-recovery")?,
+                    endpoints_after_recovery: parser.required("--endpoints-after-recovery")?,
+                    captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                    captured_at_unix,
+                },
+            })
+        }
+        "validate-network-discovery-bundle" => {
+            let mut bundles = Vec::new();
+            let mut seen = HashSet::new();
+            for bundle in collect_repeated_option_values(&args[1..], "--bundle") {
+                if seen.insert(bundle.clone()) {
+                    bundles.push(PathBuf::from(bundle));
+                }
+            }
+            if let Some(csv_bundles) = parser.value("--bundles") {
+                for bundle in split_csv(csv_bundles) {
+                    if seen.insert(bundle.clone()) {
+                        bundles.push(PathBuf::from(bundle));
+                    }
+                }
+            }
+            Ok(OpsCommand::ValidateNetworkDiscoveryBundle {
+                config: ops_network_discovery::ValidateNetworkDiscoveryBundleConfig {
+                    bundles,
+                    max_age_seconds: parser.parse_u64_or_default("--max-age-seconds", 900)?,
+                    require_verifier_keys: parser.has_flag("--require-verifier-keys"),
+                    require_daemon_active: parser.has_flag("--require-daemon-active"),
+                    require_socket_present: parser.has_flag("--require-socket-present"),
+                    output: parser.optional_path("--output"),
+                },
+            })
+        }
+        "generate-live-linux-lab-failure-digest" => {
+            Ok(OpsCommand::GenerateLiveLinuxLabFailureDigest {
+                config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig {
+                    nodes_tsv: parser.required_path("--nodes-tsv")?,
+                    stages_tsv: parser.required_path("--stages-tsv")?,
+                    report_dir: parser.required_path("--report-dir")?,
+                    run_id: parser.required("--run-id")?,
+                    network_id: parser.required("--network-id")?,
+                    overall_status: parser.required("--overall-status")?,
+                    output_json: parser.required_path("--output-json")?,
+                    output_md: parser.required_path("--output-md")?,
+                },
+            })
+        }
+        "rebind-linux-fresh-install-os-matrix-inputs" => {
+            Ok(OpsCommand::RebindLinuxFreshInstallOsMatrixInputs {
+                config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig {
+                    dest_dir: parser.required_path("--dest-dir")?,
+                    bootstrap_log: parser.required_path("--bootstrap-log")?,
+                    baseline_log: parser.required_path("--baseline-log")?,
+                    two_hop_report: parser.required_path("--two-hop-report")?,
+                    role_switch_report: parser.required_path("--role-switch-report")?,
+                    lan_toggle_report: parser.required_path("--lan-toggle-report")?,
+                    exit_handoff_report: parser.required_path("--exit-handoff-report")?,
+                },
+            })
+        }
+        "generate-linux-fresh-install-os-matrix-report" => {
+            Ok(OpsCommand::GenerateLinuxFreshInstallOsMatrixReport {
+                config:
+                    ops_fresh_install_os_matrix::GenerateLinuxFreshInstallOsMatrixReportConfig {
+                        output: parser.required_path("--output")?,
+                        environment: parser.required("--environment")?,
+                        source_mode: parser.required("--source-mode")?,
+                        expected_git_commit_file: parser
+                            .required_path("--expected-git-commit-file")?,
+                        git_status_file: parser.required_path("--git-status-file")?,
+                        bootstrap_log: parser.required_path("--bootstrap-log")?,
+                        baseline_log: parser.required_path("--baseline-log")?,
+                        two_hop_report: parser.required_path("--two-hop-report")?,
+                        role_switch_report: parser.required_path("--role-switch-report")?,
+                        lan_toggle_report: parser.required_path("--lan-toggle-report")?,
+                        exit_handoff_report: parser.required_path("--exit-handoff-report")?,
+                        exit_node_id: parser.required("--exit-node-id")?,
+                        client_node_id: parser.required("--client-node-id")?,
+                        ubuntu_node_id: parser.required("--ubuntu-node-id")?,
+                        fedora_node_id: parser.required("--fedora-node-id")?,
+                        mint_node_id: parser.required("--mint-node-id")?,
+                        debian_os_version: parser
+                            .value("--debian-os-version")
+                            .unwrap_or_else(|| "Debian 13".to_string()),
+                        ubuntu_os_version: parser
+                            .value("--ubuntu-os-version")
+                            .unwrap_or_else(|| "Ubuntu".to_string()),
+                        fedora_os_version: parser
+                            .value("--fedora-os-version")
+                            .unwrap_or_else(|| "Fedora".to_string()),
+                        mint_os_version: parser
+                            .value("--mint-os-version")
+                            .unwrap_or_else(|| "Linux Mint".to_string()),
+                    },
+            })
         }
         "sign-release-artifact" => {
             if args.len() != 1 {
@@ -2008,6 +2635,90 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::VerifyPhase10Provenance => ops_phase9::execute_ops_verify_phase10_provenance(),
         OpsCommand::VerifyPhase6ParityEvidence => {
             ops_phase9::execute_ops_verify_phase6_parity_evidence()
+        }
+        OpsCommand::GenerateCrossNetworkRemoteExitReport { config } => {
+            ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(config)
+        }
+        OpsCommand::ValidateCrossNetworkRemoteExitReports { config } => {
+            ops_cross_network_reports::execute_ops_validate_cross_network_remote_exit_reports(
+                config,
+            )
+        }
+        OpsCommand::ValidateCrossNetworkNatMatrix { config } => {
+            ops_cross_network_reports::execute_ops_validate_cross_network_nat_matrix(config)
+        }
+        OpsCommand::ReadCrossNetworkReportFields { config } => {
+            ops_cross_network_reports::execute_ops_read_cross_network_report_fields(config)
+        }
+        OpsCommand::ClassifyCrossNetworkTopology { config } => {
+            ops_cross_network_reports::execute_ops_classify_cross_network_topology(config)
+        }
+        OpsCommand::ChooseCrossNetworkRoamAlias { config } => {
+            ops_cross_network_reports::execute_ops_choose_cross_network_roam_alias(config)
+        }
+        OpsCommand::ValidateIpv4Address { config } => {
+            ops_cross_network_reports::execute_ops_validate_ipv4_address(config)
+        }
+        OpsCommand::WriteCrossNetworkSoakMonitorSummary { config } => {
+            ops_cross_network_reports::execute_ops_write_cross_network_soak_monitor_summary(config)
+        }
+        OpsCommand::CheckLocalFileMode { config } => {
+            ops_live_lab_orchestrator::execute_ops_check_local_file_mode(config)
+        }
+        OpsCommand::RedactForensicsText => {
+            ops_live_lab_orchestrator::execute_ops_redact_forensics_text()
+        }
+        OpsCommand::WriteCrossNetworkForensicsManifest { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_cross_network_forensics_manifest(config)
+        }
+        OpsCommand::Sha256File { config } => {
+            ops_live_lab_orchestrator::execute_ops_sha256_file(config)
+        }
+        OpsCommand::WriteCrossNetworkPreflightReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_cross_network_preflight_report(config)
+        }
+        OpsCommand::WriteLiveLinuxRebootRecoveryReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_reboot_recovery_report(config)
+        }
+        OpsCommand::WriteLiveLinuxLabRunSummary { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_lab_run_summary(config)
+        }
+        OpsCommand::ScanIpv4PortRange { config } => {
+            ops_live_lab_orchestrator::execute_ops_scan_ipv4_port_range(config)
+        }
+        OpsCommand::UpdateRoleSwitchHostResult { config } => {
+            ops_live_lab_orchestrator::execute_ops_update_role_switch_host_result(config)
+        }
+        OpsCommand::WriteRoleSwitchMatrixReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_role_switch_matrix_report(config)
+        }
+        OpsCommand::WriteLiveLinuxServerIpBypassReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_server_ip_bypass_report(config)
+        }
+        OpsCommand::WriteLiveLinuxControlSurfaceReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_control_surface_report(config)
+        }
+        OpsCommand::RewriteAssignmentPeerEndpointIp { config } => {
+            ops_live_lab_orchestrator::execute_ops_rewrite_assignment_peer_endpoint_ip(config)
+        }
+        OpsCommand::WriteLiveLinuxEndpointHijackReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_endpoint_hijack_report(config)
+        }
+        OpsCommand::ValidateNetworkDiscoveryBundle { config } => {
+            ops_network_discovery::execute_ops_validate_network_discovery_bundle(config)
+        }
+        OpsCommand::GenerateLiveLinuxLabFailureDigest { config } => {
+            ops_live_lab_failure_digest::execute_ops_generate_live_linux_lab_failure_digest(config)
+        }
+        OpsCommand::RebindLinuxFreshInstallOsMatrixInputs { config } => {
+            ops_fresh_install_os_matrix::execute_ops_rebind_linux_fresh_install_os_matrix_inputs(
+                config,
+            )
+        }
+        OpsCommand::GenerateLinuxFreshInstallOsMatrixReport { config } => {
+            ops_fresh_install_os_matrix::execute_ops_generate_linux_fresh_install_os_matrix_report(
+                config,
+            )
         }
         OpsCommand::SignReleaseArtifact => ops_phase9::execute_ops_sign_release_artifact(),
         OpsCommand::VerifyReleaseArtifact => ops_phase9::execute_ops_verify_release_artifact(),
@@ -7746,6 +8457,22 @@ fn split_csv(value: String) -> Vec<String> {
         .collect()
 }
 
+fn collect_repeated_option_values(args: &[String], key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        if index + 1 < args.len() && !args[index + 1].starts_with("--") {
+            if args[index] == key {
+                values.push(args[index + 1].clone());
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    values
+}
+
 fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, String> {
     let mut nodes = Vec::new();
     for raw in encoded
@@ -8283,6 +9010,32 @@ fn help_text() -> String {
         "  ops generate-phase10-artifacts",
         "  ops verify-phase10-provenance",
         "  ops verify-phase6-parity-evidence",
+        "  ops generate-cross-network-remote-exit-report --suite <suite> --report-path <path> --log-path <path> --status <pass|fail> [--failure-summary <text>] [--environment <label>] [--implementation-state <label>] [--source-artifact <path>]... [--log-artifact <path>]... [--client-host <host>] [--exit-host <host>] [--relay-host <host>] [--probe-host <host>] [--client-network-id <id>] [--exit-network-id <id>] [--relay-network-id <id>] [--nat-profile <profile>] [--impairment-profile <profile>] [--check <name=pass|fail>]...",
+        "  ops validate-cross-network-remote-exit-reports [--reports <path[,path...]>] [--artifact-dir <path>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
+        "  ops validate-cross-network-nat-matrix [--reports <path[,path...]>] [--artifact-dir <path>] [--required-nat-profiles <profile[,profile...]>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
+        "  ops read-cross-network-report-fields --report-path <path> [--include-status] [--check <name>]... [--network-field <name>]... [--default-value <text>]",
+        "  ops classify-cross-network-topology --ip-a <ip> --ip-b <ip> [--ipv4-prefix <n>] [--ipv6-prefix <n>]",
+        "  ops choose-cross-network-roam-alias --exit-ip <ip> [--used-ip <ip>]... [--ipv4-prefix <n>] [--ipv6-prefix <n>]",
+        "  ops validate-ipv4-address --ip <ipv4>",
+        "  ops write-cross-network-soak-monitor-summary --path <path> --samples <n> --failing-samples <n> --max-consecutive-failures-observed <n> --elapsed-secs <n> --required-soak-duration-secs <n> --allowed-failing-samples <n> --allowed-max-consecutive-failures <n> --direct-remote-exit-ready <pass|fail> --post-soak-bypass-ready <pass|fail> --no-plaintext-passphrase-files <pass|fail> --first-failure-reason <text> --long-soak-stable <pass|fail>",
+        "  ops check-local-file-mode --path <path> --policy <owner-only|no-group-world-write> [--label <text>]",
+        "  ops redact-forensics-text",
+        "  ops write-cross-network-forensics-manifest --stage <name> --collected-at-utc <utc> --stage-dir <path> --output <path>",
+        "  ops sha256-file --path <path>",
+        "  ops write-cross-network-preflight-report --nodes-tsv <path> --stage-dir <path> --output <path> --reference-unix <unix> --max-clock-skew-secs <secs> --discovery-max-age-secs <secs> --signed-artifact-max-age-secs <secs>",
+        "  ops write-live-linux-reboot-recovery-report --report-path <path> --observations-path <path> --exit-pre <id> --exit-post <id> --client-pre <id> --client-post <id> --exit-return <pass|fail|skipped> --exit-boot-change <pass|fail|skipped> --post-exit-twohop <pass|fail|skipped> --client-return <pass|fail|skipped> --client-boot-change <pass|fail|skipped> --post-client-twohop <pass|fail|skipped> --salvage-twohop <pass|fail|skipped>",
+        "  ops write-live-linux-lab-run-summary --nodes-tsv <path> --stages-tsv <path> --summary-json <path> --summary-md <path> --run-id <id> --network-id <id> --report-dir <path> --overall-status <status> --started-at-local <text> --started-at-utc <text> --started-at-unix <unix> --finished-at-local <text> --finished-at-utc <text> --finished-at-unix <unix> --elapsed-secs <secs> --elapsed-human <text>",
+        "  ops scan-ipv4-port-range --network-prefix <a.b.c> [--start-host <n>] [--end-host <n>] [--port <n>] [--timeout-ms <n>] [--output-key <text>]",
+        "  ops update-role-switch-host-result --hosts-json-path <path> --os-id <id> --temp-role <role> --switch-execution <pass|fail> --post-switch-reconcile <pass|fail> --policy-still-enforced <pass|fail> --least-privilege-preserved <pass|fail>",
+        "  ops write-role-switch-matrix-report --hosts-json-path <path> --report-path <path> --source-path <path> --git-commit <sha> --captured-at-unix <unix> --overall-status <pass|fail>",
+        "  ops write-live-linux-server-ip-bypass-report --report-path <path> --allowed-management-cidrs <cidr[,cidr...]> --probe-from-client-status <pass|fail> --probe-ip <ipv4> --probe-port <port> --client-internet-route <text> --client-probe-route <text> --client-table-51820 <text> --client-endpoints <text> --probe-self-test <text> --probe-from-client-output <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops write-live-linux-control-surface-report --report-path <path> --dns-bind-addr <host:port> --remote-dns-probe-status <pass|fail|skipped> --remote-dns-probe-output <text> --work-dir <path> --host-label <label> [--host-label <label>]... [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops rewrite-assignment-peer-endpoint-ip --assignment-path <path> --endpoint-ip <ipv4>",
+        "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
+        "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
+        "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
+        "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops sign-release-artifact",
         "  ops verify-release-artifact",
         "  ops collect-platform-probe",
@@ -8633,6 +9386,567 @@ mod tests {
             "verify-phase6-parity-evidence".to_string(),
         ]);
         assert!(format!("{verify_phase6_parity:?}").contains("VerifyPhase6ParityEvidence"));
+
+        let generate_cross_network_report = parse_command(&[
+            "ops".to_string(),
+            "generate-cross-network-remote-exit-report".to_string(),
+            "--suite".to_string(),
+            "cross_network_direct_remote_exit".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_string(),
+            "--log-path".to_string(),
+            "artifacts/phase10/source/cross_network_direct_remote_exit.log".to_string(),
+            "--status".to_string(),
+            "fail".to_string(),
+            "--source-artifact".to_string(),
+            "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh".to_string(),
+            "--source-artifact".to_string(),
+            "artifacts/phase10/some-extra-source.txt".to_string(),
+            "--check".to_string(),
+            "direct_remote_exit_success=pass".to_string(),
+            "--check".to_string(),
+            "remote_exit_no_underlay_leak=fail".to_string(),
+        ]);
+        assert!(
+            format!("{generate_cross_network_report:?}")
+                .contains("GenerateCrossNetworkRemoteExitReport")
+        );
+
+        let validate_cross_network_reports = parse_command(&[
+            "ops".to_string(),
+            "validate-cross-network-remote-exit-reports".to_string(),
+            "--artifact-dir".to_string(),
+            "artifacts/phase10".to_string(),
+            "--max-evidence-age-seconds".to_string(),
+            "600".to_string(),
+            "--expected-git-commit".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "--require-pass-status".to_string(),
+        ]);
+        assert!(
+            format!("{validate_cross_network_reports:?}")
+                .contains("ValidateCrossNetworkRemoteExitReports")
+        );
+
+        let validate_cross_network_nat_matrix = parse_command(&[
+            "ops".to_string(),
+            "validate-cross-network-nat-matrix".to_string(),
+            "--artifact-dir".to_string(),
+            "artifacts/phase10".to_string(),
+            "--required-nat-profiles".to_string(),
+            "baseline_lan,hard_nat".to_string(),
+            "--max-evidence-age-seconds".to_string(),
+            "600".to_string(),
+            "--expected-git-commit".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "--require-pass-status".to_string(),
+        ]);
+        assert!(
+            format!("{validate_cross_network_nat_matrix:?}")
+                .contains("ValidateCrossNetworkNatMatrix")
+        );
+
+        let read_cross_network_report_fields = parse_command(&[
+            "ops".to_string(),
+            "read-cross-network-report-fields".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_string(),
+            "--include-status".to_string(),
+            "--check".to_string(),
+            "direct_remote_exit_success".to_string(),
+            "--network-field".to_string(),
+            "client_underlay_ip".to_string(),
+            "--default-value".to_string(),
+            "unknown".to_string(),
+        ]);
+        assert!(
+            format!("{read_cross_network_report_fields:?}")
+                .contains("ReadCrossNetworkReportFields")
+        );
+
+        let classify_cross_network_topology = parse_command(&[
+            "ops".to_string(),
+            "classify-cross-network-topology".to_string(),
+            "--ip-a".to_string(),
+            "192.0.2.10".to_string(),
+            "--ip-b".to_string(),
+            "192.0.3.10".to_string(),
+            "--ipv4-prefix".to_string(),
+            "24".to_string(),
+            "--ipv6-prefix".to_string(),
+            "64".to_string(),
+        ]);
+        assert!(
+            format!("{classify_cross_network_topology:?}").contains("ClassifyCrossNetworkTopology")
+        );
+
+        let choose_cross_network_roam_alias = parse_command(&[
+            "ops".to_string(),
+            "choose-cross-network-roam-alias".to_string(),
+            "--exit-ip".to_string(),
+            "192.0.2.10".to_string(),
+            "--used-ip".to_string(),
+            "192.0.2.11".to_string(),
+            "--used-ip".to_string(),
+            "192.0.2.12".to_string(),
+            "--ipv4-prefix".to_string(),
+            "24".to_string(),
+            "--ipv6-prefix".to_string(),
+            "64".to_string(),
+        ]);
+        assert!(
+            format!("{choose_cross_network_roam_alias:?}").contains("ChooseCrossNetworkRoamAlias")
+        );
+
+        let validate_ipv4_address = parse_command(&[
+            "ops".to_string(),
+            "validate-ipv4-address".to_string(),
+            "--ip".to_string(),
+            "203.0.113.10".to_string(),
+        ]);
+        assert!(format!("{validate_ipv4_address:?}").contains("ValidateIpv4Address"));
+
+        let write_cross_network_soak_monitor_summary = parse_command(&[
+            "ops".to_string(),
+            "write-cross-network-soak-monitor-summary".to_string(),
+            "--path".to_string(),
+            "artifacts/phase10/source/cross_network_remote_exit_soak_monitor_summary.json"
+                .to_string(),
+            "--samples".to_string(),
+            "100".to_string(),
+            "--failing-samples".to_string(),
+            "0".to_string(),
+            "--max-consecutive-failures-observed".to_string(),
+            "0".to_string(),
+            "--elapsed-secs".to_string(),
+            "600".to_string(),
+            "--required-soak-duration-secs".to_string(),
+            "600".to_string(),
+            "--allowed-failing-samples".to_string(),
+            "2".to_string(),
+            "--allowed-max-consecutive-failures".to_string(),
+            "1".to_string(),
+            "--direct-remote-exit-ready".to_string(),
+            "pass".to_string(),
+            "--post-soak-bypass-ready".to_string(),
+            "pass".to_string(),
+            "--no-plaintext-passphrase-files".to_string(),
+            "pass".to_string(),
+            "--first-failure-reason".to_string(),
+            "none".to_string(),
+            "--long-soak-stable".to_string(),
+            "pass".to_string(),
+        ]);
+        assert!(
+            format!("{write_cross_network_soak_monitor_summary:?}")
+                .contains("WriteCrossNetworkSoakMonitorSummary")
+        );
+
+        let check_local_file_mode = parse_command(&[
+            "ops".to_string(),
+            "check-local-file-mode".to_string(),
+            "--path".to_string(),
+            "/tmp/known_hosts".to_string(),
+            "--policy".to_string(),
+            "no-group-world-write".to_string(),
+            "--label".to_string(),
+            "pinned SSH known_hosts file".to_string(),
+        ]);
+        assert!(format!("{check_local_file_mode:?}").contains("CheckLocalFileMode"));
+
+        let redact_forensics_text =
+            parse_command(&["ops".to_string(), "redact-forensics-text".to_string()]);
+        assert!(format!("{redact_forensics_text:?}").contains("RedactForensicsText"));
+
+        let write_cross_network_forensics_manifest = parse_command(&[
+            "ops".to_string(),
+            "write-cross-network-forensics-manifest".to_string(),
+            "--stage".to_string(),
+            "cross_network_direct_remote_exit".to_string(),
+            "--collected-at-utc".to_string(),
+            "20260321T100000Z".to_string(),
+            "--stage-dir".to_string(),
+            "artifacts/phase10/forensics".to_string(),
+            "--output".to_string(),
+            "artifacts/phase10/forensics/manifest.json".to_string(),
+        ]);
+        assert!(
+            format!("{write_cross_network_forensics_manifest:?}")
+                .contains("WriteCrossNetworkForensicsManifest")
+        );
+
+        let sha256_file = parse_command(&[
+            "ops".to_string(),
+            "sha256-file".to_string(),
+            "--path".to_string(),
+            "artifacts/phase10/discovery-a.json".to_string(),
+        ]);
+        assert!(format!("{sha256_file:?}").contains("Sha256File"));
+
+        let write_cross_network_preflight_report = parse_command(&[
+            "ops".to_string(),
+            "write-cross-network-preflight-report".to_string(),
+            "--nodes-tsv".to_string(),
+            "artifacts/live_lab/state/nodes.tsv".to_string(),
+            "--stage-dir".to_string(),
+            "artifacts/live_lab/parallel-cross-network-preflight".to_string(),
+            "--output".to_string(),
+            "artifacts/live_lab/cross_network_preflight_report.json".to_string(),
+            "--reference-unix".to_string(),
+            "1772984762".to_string(),
+            "--max-clock-skew-secs".to_string(),
+            "10".to_string(),
+            "--discovery-max-age-secs".to_string(),
+            "900".to_string(),
+            "--signed-artifact-max-age-secs".to_string(),
+            "900".to_string(),
+        ]);
+        assert!(
+            format!("{write_cross_network_preflight_report:?}")
+                .contains("WriteCrossNetworkPreflightReport")
+        );
+
+        let write_live_linux_reboot_recovery_report = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-reboot-recovery-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_string(),
+            "--observations-path".to_string(),
+            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_string(),
+            "--exit-pre".to_string(),
+            "a".to_string(),
+            "--exit-post".to_string(),
+            "b".to_string(),
+            "--client-pre".to_string(),
+            "c".to_string(),
+            "--client-post".to_string(),
+            "d".to_string(),
+            "--exit-return".to_string(),
+            "pass".to_string(),
+            "--exit-boot-change".to_string(),
+            "pass".to_string(),
+            "--post-exit-twohop".to_string(),
+            "pass".to_string(),
+            "--client-return".to_string(),
+            "pass".to_string(),
+            "--client-boot-change".to_string(),
+            "pass".to_string(),
+            "--post-client-twohop".to_string(),
+            "pass".to_string(),
+            "--salvage-twohop".to_string(),
+            "skipped".to_string(),
+        ]);
+        assert!(
+            format!("{write_live_linux_reboot_recovery_report:?}")
+                .contains("WriteLiveLinuxRebootRecoveryReport")
+        );
+
+        let write_live_linux_lab_run_summary = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-lab-run-summary".to_string(),
+            "--nodes-tsv".to_string(),
+            "artifacts/live_lab/state/nodes.tsv".to_string(),
+            "--stages-tsv".to_string(),
+            "artifacts/live_lab/state/stages.tsv".to_string(),
+            "--summary-json".to_string(),
+            "artifacts/live_lab/run_summary.json".to_string(),
+            "--summary-md".to_string(),
+            "artifacts/live_lab/run_summary.md".to_string(),
+            "--run-id".to_string(),
+            "20260321T100000Z".to_string(),
+            "--network-id".to_string(),
+            "lab-net".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab".to_string(),
+            "--overall-status".to_string(),
+            "pass".to_string(),
+            "--started-at-local".to_string(),
+            "2026-03-21 10:00:00 UTC".to_string(),
+            "--started-at-utc".to_string(),
+            "2026-03-21T10:00:00Z".to_string(),
+            "--started-at-unix".to_string(),
+            "1772983200".to_string(),
+            "--finished-at-local".to_string(),
+            "2026-03-21 10:10:00 UTC".to_string(),
+            "--finished-at-utc".to_string(),
+            "2026-03-21T10:10:00Z".to_string(),
+            "--finished-at-unix".to_string(),
+            "1772983800".to_string(),
+            "--elapsed-secs".to_string(),
+            "600".to_string(),
+            "--elapsed-human".to_string(),
+            "10m 0s".to_string(),
+        ]);
+        assert!(
+            format!("{write_live_linux_lab_run_summary:?}").contains("WriteLiveLinuxLabRunSummary")
+        );
+
+        let scan_ipv4_port_range = parse_command(&[
+            "ops".to_string(),
+            "scan-ipv4-port-range".to_string(),
+            "--network-prefix".to_string(),
+            "192.168.18".to_string(),
+            "--start-host".to_string(),
+            "1".to_string(),
+            "--end-host".to_string(),
+            "254".to_string(),
+            "--port".to_string(),
+            "22".to_string(),
+            "--timeout-ms".to_string(),
+            "80".to_string(),
+            "--output-key".to_string(),
+            "ssh_port22_hosts=".to_string(),
+        ]);
+        assert!(format!("{scan_ipv4_port_range:?}").contains("ScanIpv4PortRange"));
+
+        let update_role_switch_host_result = parse_command(&[
+            "ops".to_string(),
+            "update-role-switch-host-result".to_string(),
+            "--hosts-json-path".to_string(),
+            "artifacts/phase10/role_switch_hosts.json".to_string(),
+            "--os-id".to_string(),
+            "debian13".to_string(),
+            "--temp-role".to_string(),
+            "admin".to_string(),
+            "--switch-execution".to_string(),
+            "pass".to_string(),
+            "--post-switch-reconcile".to_string(),
+            "pass".to_string(),
+            "--policy-still-enforced".to_string(),
+            "pass".to_string(),
+            "--least-privilege-preserved".to_string(),
+            "pass".to_string(),
+        ]);
+        assert!(
+            format!("{update_role_switch_host_result:?}").contains("UpdateRoleSwitchHostResult")
+        );
+
+        let write_role_switch_matrix_report = parse_command(&[
+            "ops".to_string(),
+            "write-role-switch-matrix-report".to_string(),
+            "--hosts-json-path".to_string(),
+            "artifacts/phase10/role_switch_hosts.json".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/role_switch_matrix_report.json".to_string(),
+            "--source-path".to_string(),
+            "artifacts/phase10/source/role_switch_matrix.md".to_string(),
+            "--git-commit".to_string(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            "--captured-at-unix".to_string(),
+            "1772983200".to_string(),
+            "--overall-status".to_string(),
+            "pass".to_string(),
+        ]);
+        assert!(
+            format!("{write_role_switch_matrix_report:?}").contains("WriteRoleSwitchMatrixReport")
+        );
+
+        let write_live_linux_server_ip_bypass_report = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-server-ip-bypass-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/live_linux_server_ip_bypass_report.json".to_string(),
+            "--allowed-management-cidrs".to_string(),
+            "192.168.18.0/24".to_string(),
+            "--probe-from-client-status".to_string(),
+            "pass".to_string(),
+            "--probe-ip".to_string(),
+            "192.168.18.51".to_string(),
+            "--probe-port".to_string(),
+            "18080".to_string(),
+            "--client-internet-route".to_string(),
+            "1.1.1.1 dev rustynet0".to_string(),
+            "--client-probe-route".to_string(),
+            "192.168.18.51 dev enp0s3".to_string(),
+            "--client-table-51820".to_string(),
+            "default dev rustynet0".to_string(),
+            "--client-endpoints".to_string(),
+            "peer=192.168.18.51:51820".to_string(),
+            "--probe-self-test".to_string(),
+            "probe-ok".to_string(),
+            "--probe-from-client-output".to_string(),
+            "blocked".to_string(),
+        ]);
+        assert!(
+            format!("{write_live_linux_server_ip_bypass_report:?}")
+                .contains("WriteLiveLinuxServerIpBypassReport")
+        );
+
+        let write_live_linux_control_surface_report = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-control-surface-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/live_linux_control_surface_exposure_report.json".to_string(),
+            "--dns-bind-addr".to_string(),
+            "127.0.0.1:53535".to_string(),
+            "--remote-dns-probe-status".to_string(),
+            "pass".to_string(),
+            "--remote-dns-probe-output".to_string(),
+            "{}".to_string(),
+            "--work-dir".to_string(),
+            "artifacts/phase10/source/control_surface".to_string(),
+            "--host-label".to_string(),
+            "client".to_string(),
+            "--host-label".to_string(),
+            "exit".to_string(),
+        ]);
+        assert!(
+            format!("{write_live_linux_control_surface_report:?}")
+                .contains("WriteLiveLinuxControlSurfaceReport")
+        );
+
+        let rewrite_assignment_peer_endpoint_ip = parse_command(&[
+            "ops".to_string(),
+            "rewrite-assignment-peer-endpoint-ip".to_string(),
+            "--assignment-path".to_string(),
+            "/var/lib/rustynet/rustynetd.assignment".to_string(),
+            "--endpoint-ip".to_string(),
+            "203.0.113.10".to_string(),
+        ]);
+        assert!(
+            format!("{rewrite_assignment_peer_endpoint_ip:?}")
+                .contains("RewriteAssignmentPeerEndpointIp")
+        );
+
+        let write_live_linux_endpoint_hijack_report = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-endpoint-hijack-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/live_linux_endpoint_hijack_report.json".to_string(),
+            "--rogue-endpoint-ip".to_string(),
+            "203.0.113.10".to_string(),
+            "--baseline-status".to_string(),
+            "state=ExitActive restricted_safe_mode=false".to_string(),
+            "--baseline-netcheck".to_string(),
+            "path_mode=direct_active".to_string(),
+            "--baseline-endpoints".to_string(),
+            "peer-a=192.168.18.51:51820".to_string(),
+            "--status-after-hijack".to_string(),
+            "state=FailClosed restricted_safe_mode=true".to_string(),
+            "--netcheck-after-hijack".to_string(),
+            "path_mode=fail_closed".to_string(),
+            "--endpoints-after-hijack".to_string(),
+            "peer-a=192.168.18.51:51820".to_string(),
+            "--status-after-recovery".to_string(),
+            "state=ExitActive restricted_safe_mode=false".to_string(),
+            "--endpoints-after-recovery".to_string(),
+            "peer-a=192.168.18.51:51820".to_string(),
+        ]);
+        assert!(
+            format!("{write_live_linux_endpoint_hijack_report:?}")
+                .contains("WriteLiveLinuxEndpointHijackReport")
+        );
+
+        let validate_network_discovery_bundle = parse_command(&[
+            "ops".to_string(),
+            "validate-network-discovery-bundle".to_string(),
+            "--bundle".to_string(),
+            "artifacts/phase10/discovery-a.json".to_string(),
+            "--bundle".to_string(),
+            "artifacts/phase10/discovery-b.json".to_string(),
+            "--bundles".to_string(),
+            "artifacts/phase10/discovery-c.json,artifacts/phase10/discovery-b.json".to_string(),
+            "--max-age-seconds".to_string(),
+            "600".to_string(),
+            "--require-verifier-keys".to_string(),
+            "--require-daemon-active".to_string(),
+            "--require-socket-present".to_string(),
+            "--output".to_string(),
+            "artifacts/phase10/discovery-validation.md".to_string(),
+        ]);
+        assert!(
+            format!("{validate_network_discovery_bundle:?}")
+                .contains("ValidateNetworkDiscoveryBundle")
+        );
+
+        let generate_live_lab_failure_digest = parse_command(&[
+            "ops".to_string(),
+            "generate-live-linux-lab-failure-digest".to_string(),
+            "--nodes-tsv".to_string(),
+            "artifacts/live_lab/test/state/nodes.tsv".to_string(),
+            "--stages-tsv".to_string(),
+            "artifacts/live_lab/test/state/stages.tsv".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab/test".to_string(),
+            "--run-id".to_string(),
+            "20260321T120000Z".to_string(),
+            "--network-id".to_string(),
+            "rn-live-lab-20260321T120000Z".to_string(),
+            "--overall-status".to_string(),
+            "fail".to_string(),
+            "--output-json".to_string(),
+            "artifacts/live_lab/test/failure_digest.json".to_string(),
+            "--output-md".to_string(),
+            "artifacts/live_lab/test/failure_digest.md".to_string(),
+        ]);
+        assert!(
+            format!("{generate_live_lab_failure_digest:?}")
+                .contains("GenerateLiveLinuxLabFailureDigest")
+        );
+
+        let rebind_fresh_install_inputs = parse_command(&[
+            "ops".to_string(),
+            "rebind-linux-fresh-install-os-matrix-inputs".to_string(),
+            "--dest-dir".to_string(),
+            "artifacts/phase10/source/fresh_install_os_matrix".to_string(),
+            "--bootstrap-log".to_string(),
+            "artifacts/live_lab/test/logs/bootstrap.log".to_string(),
+            "--baseline-log".to_string(),
+            "artifacts/live_lab/test/logs/baseline.log".to_string(),
+            "--two-hop-report".to_string(),
+            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_string(),
+            "--role-switch-report".to_string(),
+            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_string(),
+            "--lan-toggle-report".to_string(),
+            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_string(),
+            "--exit-handoff-report".to_string(),
+            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_string(),
+        ]);
+        assert!(
+            format!("{rebind_fresh_install_inputs:?}")
+                .contains("RebindLinuxFreshInstallOsMatrixInputs")
+        );
+
+        let generate_fresh_install_report = parse_command(&[
+            "ops".to_string(),
+            "generate-linux-fresh-install-os-matrix-report".to_string(),
+            "--output".to_string(),
+            "artifacts/phase10/fresh_install_os_matrix_report.json".to_string(),
+            "--environment".to_string(),
+            "live-linux-lab".to_string(),
+            "--source-mode".to_string(),
+            "local-head".to_string(),
+            "--expected-git-commit-file".to_string(),
+            "artifacts/live_lab/test/state/expected_git_commit.txt".to_string(),
+            "--git-status-file".to_string(),
+            "artifacts/live_lab/test/state/git_status.txt".to_string(),
+            "--bootstrap-log".to_string(),
+            "artifacts/live_lab/test/logs/bootstrap.log".to_string(),
+            "--baseline-log".to_string(),
+            "artifacts/live_lab/test/logs/baseline.log".to_string(),
+            "--two-hop-report".to_string(),
+            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_string(),
+            "--role-switch-report".to_string(),
+            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_string(),
+            "--lan-toggle-report".to_string(),
+            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_string(),
+            "--exit-handoff-report".to_string(),
+            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_string(),
+            "--exit-node-id".to_string(),
+            "exit-1".to_string(),
+            "--client-node-id".to_string(),
+            "client-1".to_string(),
+            "--ubuntu-node-id".to_string(),
+            "ubuntu-1".to_string(),
+            "--fedora-node-id".to_string(),
+            "fedora-1".to_string(),
+            "--mint-node-id".to_string(),
+            "mint-1".to_string(),
+        ]);
+        assert!(
+            format!("{generate_fresh_install_report:?}")
+                .contains("GenerateLinuxFreshInstallOsMatrixReport")
+        );
 
         let sign_release_artifact =
             parse_command(&["ops".to_string(), "sign-release-artifact".to_string()]);

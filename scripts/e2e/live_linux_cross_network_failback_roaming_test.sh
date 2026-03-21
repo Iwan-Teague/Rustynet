@@ -63,7 +63,7 @@ USAGE
 write_report() {
   local status="$1"
   local args=(
-    python3 "$ROOT_DIR/scripts/e2e/generate_cross_network_remote_exit_report.py"
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
     --suite cross_network_failback_roaming
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -85,12 +85,16 @@ write_report() {
     --check "cross_network_topology_heuristic=${CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC}"
   )
   local item
+  set +u
   for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
   done
   for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--log-artifact "$item")
   done
+  set -u
   "${args[@]}"
 }
 
@@ -205,18 +209,8 @@ main() {
   EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
   RELAY_ADDR="$(live_lab_target_address "$RELAY_HOST")"
 
-  if python3 - "$CLIENT_ADDR" "$EXIT_ADDR" <<'PY'
-import ipaddress
-import sys
-
-client_ip = ipaddress.ip_address(sys.argv[1])
-exit_ip = ipaddress.ip_address(sys.argv[2])
-prefix = 24 if client_ip.version == 4 else 64
-client_net = ipaddress.ip_network(f"{client_ip}/{prefix}", strict=False)
-exit_net = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-raise SystemExit(1 if client_net == exit_net else 0)
-PY
-  then
+  topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1
+  if [[ "$topology_result" == "pass" ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   else
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="fail"
@@ -259,47 +253,19 @@ PY
     reconvergence_secs=-1
   fi
 
-  if python3 - "$RELAY_REPORT_PATH" "$reconvergence_secs" "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-reconvergence_secs = int(sys.argv[2])
-topology_ok = sys.argv[3] == "pass"
-relay_ok = payload.get("checks", {}).get("relay_remote_exit_success") == "pass"
-if relay_ok and topology_ok and 0 <= reconvergence_secs <= 30:
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-  then
+  relay_ready_check="$(cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields --report-path "$RELAY_REPORT_PATH" --check relay_remote_exit_success)" || return 1
+  if [[ "$relay_ready_check" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' && "$reconvergence_secs" -ge 0 && "$reconvergence_secs" -le 30 ]]; then
     CHECK_RELAY_TO_DIRECT_FAILBACK_SUCCESS="pass"
   fi
 
   FAILURE_SUMMARY="computing endpoint roam alias and issuing updated signed assignments"
-  mapfile -t roam_values < <(python3 - "$EXIT_ADDR" "$CLIENT_ADDR" "$RELAY_ADDR" <<'PY'
-import ipaddress
-import sys
-
-exit_ip = ipaddress.ip_address(sys.argv[1])
-used = {ipaddress.ip_address(value) for value in sys.argv[1:] if value}
-if exit_ip.version == 4:
-    prefix = 24
-    network = ipaddress.ip_network(f"{exit_ip}/{prefix}", strict=False)
-    candidate = None
-    for raw in range(int(network.broadcast_address) - 1, int(network.network_address), -1):
-        ip = ipaddress.ip_address(raw)
-        if ip not in used:
-            candidate = ip
-            break
-else:
-    prefix = 64
-    candidate = exit_ip + 0x100
-    if candidate in used:
-        candidate = exit_ip + 0x101
-print(str(candidate))
-print(prefix)
-PY
-)
+  mapfile -t roam_values < <(
+    cargo run --quiet -p rustynet-cli -- ops choose-cross-network-roam-alias \
+      --exit-ip "$EXIT_ADDR" \
+      --used-ip "$EXIT_ADDR" \
+      --used-ip "$CLIENT_ADDR" \
+      --used-ip "$RELAY_ADDR"
+  ) || return 1
   ROAM_ALIAS_IP="${roam_values[0]}"
   ROAM_PREFIX="${roam_values[1]}"
   ROAM_INTERFACE="$(live_lab_capture "$EXIT_HOST" "ip -4 route get '$CLIENT_ADDR' 2>/dev/null | awk '{for (i=1; i<=NF; i++) if (\$i == \"dev\") {print \$(i+1); exit}}' || true")"
@@ -451,16 +417,12 @@ ISSUEEOF
     return 1
   fi
 
-  mapfile -t bypass_results < <(python3 - "$BYPASS_REPORT_PATH" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-print(checks.get("internet_route_via_rustynet0", "fail"))
-print(checks.get("probe_service_blocked_from_client", "fail"))
-PY
-)
+  mapfile -t bypass_results < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$BYPASS_REPORT_PATH" \
+      --check internet_route_via_rustynet0 \
+      --check probe_service_blocked_from_client
+  ) || return 1
 
   if [[ "${bypass_results[0]}" == 'pass' && "${bypass_results[1]}" == 'pass' ]]; then
     CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK="pass"

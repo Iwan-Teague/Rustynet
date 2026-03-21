@@ -45,7 +45,7 @@ USAGE
 write_report() {
   local status="$1"
   local args=(
-    python3 "$ROOT_DIR/scripts/e2e/generate_cross_network_remote_exit_report.py"
+    cargo run --quiet -p rustynet-cli -- ops generate-cross-network-remote-exit-report
     --suite cross_network_traversal_adversarial
     --report-path "$REPORT_PATH"
     --log-path "$LOG_PATH"
@@ -67,12 +67,16 @@ write_report() {
     --check "control_surface_exposure_blocked=${CHECK_CONTROL_SURFACE_EXPOSURE_BLOCKED}"
   )
   local item
+  set +u
   for item in "${SOURCE_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
   done
   for item in "${LOG_ARTIFACTS[@]}"; do
+    [[ -n "$item" ]] || continue
     args+=(--log-artifact "$item")
   done
+  set -u
   "${args[@]}"
 }
 
@@ -125,12 +129,7 @@ if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
   exit 2
 fi
 
-python3 - "$ROGUE_ENDPOINT_IP" <<'PY'
-import ipaddress
-import sys
-
-ipaddress.IPv4Address(sys.argv[1])
-PY
+cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$ROGUE_ENDPOINT_IP" >/dev/null
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -182,20 +181,14 @@ main() {
     FAILURE_SUMMARY="endpoint hijack validator failed before emitting evidence"
     return 1
   fi
-  if python3 - "$endpoint_report" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-required = (
-    checks.get("hijack_drives_fail_closed") == "pass"
-    and checks.get("rogue_endpoint_not_adopted") == "pass"
-    and checks.get("recovery_keeps_rogue_endpoint_rejected") == "pass"
-)
-raise SystemExit(0 if required else 1)
-PY
-  then
+  mapfile -t endpoint_checks < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$endpoint_report" \
+      --check hijack_drives_fail_closed \
+      --check rogue_endpoint_not_adopted \
+      --check recovery_keeps_rogue_endpoint_rejected
+  ) || return 1
+  if [[ "${endpoint_checks[0]:-fail}" == "pass" && "${endpoint_checks[1]:-fail}" == "pass" && "${endpoint_checks[2]:-fail}" == "pass" ]]; then
     CHECK_ROGUE_ENDPOINT_REJECTED="pass"
   fi
 
@@ -216,22 +209,16 @@ PY
     FAILURE_SUMMARY="control-surface exposure validator failed before emitting evidence"
     return 1
   fi
-  if python3 - "$control_report" <<'PY'
-import json
-import sys
-
-payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
-checks = payload.get("checks", {})
-required = (
-    checks.get("all_daemon_sockets_secure") == "pass"
-    and checks.get("all_helper_sockets_secure") == "pass"
-    and checks.get("no_rustynet_tcp_listeners") == "pass"
-    and checks.get("rustynet_udp_loopback_only") == "pass"
-    and checks.get("remote_underlay_dns_probe_blocked") == "pass"
-)
-raise SystemExit(0 if required else 1)
-PY
-  then
+  mapfile -t control_checks < <(
+    cargo run --quiet -p rustynet-cli -- ops read-cross-network-report-fields \
+      --report-path "$control_report" \
+      --check all_daemon_sockets_secure \
+      --check all_helper_sockets_secure \
+      --check no_rustynet_tcp_listeners \
+      --check rustynet_udp_loopback_only \
+      --check remote_underlay_dns_probe_blocked
+  ) || return 1
+  if [[ "${control_checks[0]:-fail}" == "pass" && "${control_checks[1]:-fail}" == "pass" && "${control_checks[2]:-fail}" == "pass" && "${control_checks[3]:-fail}" == "pass" && "${control_checks[4]:-fail}" == "pass" ]]; then
     CHECK_CONTROL_SURFACE_EXPOSURE_BLOCKED="pass"
   fi
 

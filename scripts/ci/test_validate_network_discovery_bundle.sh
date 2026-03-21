@@ -108,7 +108,7 @@ secret_like["leaked_private_key"] = "abc"
 write("invalid_secret_like.json", secret_like)
 PY
 
-./scripts/ci/validate_network_discovery_bundle.py \
+cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
   --bundle "$temp_dir/valid.json" \
   --max-age-seconds 900 \
   --require-verifier-keys \
@@ -116,14 +116,14 @@ PY
   --require-socket-present \
   --output "$temp_dir/valid.md"
 
-if ./scripts/ci/validate_network_discovery_bundle.py \
+if cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
   --bundle "$temp_dir/invalid_stale.json" \
   --max-age-seconds 900; then
   echo "expected invalid_stale.json to fail validation" >&2
   exit 1
 fi
 
-if ./scripts/ci/validate_network_discovery_bundle.py \
+if cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
   --bundle "$temp_dir/invalid_missing_verifier_key.json" \
   --max-age-seconds 900 \
   --require-verifier-keys; then
@@ -131,7 +131,7 @@ if ./scripts/ci/validate_network_discovery_bundle.py \
   exit 1
 fi
 
-if ./scripts/ci/validate_network_discovery_bundle.py \
+if cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
   --bundle "$temp_dir/invalid_endpoint.json" \
   --max-age-seconds 900 \
   --require-verifier-keys; then
@@ -139,7 +139,7 @@ if ./scripts/ci/validate_network_discovery_bundle.py \
   exit 1
 fi
 
-if ./scripts/ci/validate_network_discovery_bundle.py \
+if cargo run --quiet -p rustynet-cli -- ops validate-network-discovery-bundle \
   --bundle "$temp_dir/invalid_secret_like.json" \
   --max-age-seconds 900 \
   --require-verifier-keys; then

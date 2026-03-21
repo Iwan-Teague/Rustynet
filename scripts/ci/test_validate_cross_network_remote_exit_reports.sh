@@ -327,41 +327,41 @@ common = {
 )
 PY
 
-python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --artifact-dir "$temp_dir" \
   --output "$temp_dir/valid.md"
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/invalid_same_network.json"; then
   echo "expected invalid_same_network.json to fail validation" >&2
   exit 1
 fi
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/invalid_pass_with_failed_check.json"; then
   echo "expected invalid_pass_with_failed_check.json to fail validation" >&2
   exit 1
 fi
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/invalid_fail_without_summary.json"; then
   echo "expected invalid_fail_without_summary.json to fail validation" >&2
   exit 1
 fi
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/invalid_symlink_artifact.json"; then
   echo "expected invalid_symlink_artifact.json to fail validation" >&2
   exit 1
 fi
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/invalid_outside_artifact.json"; then
   echo "expected invalid_outside_artifact.json to fail validation" >&2
   exit 1
 fi
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/cross_network_direct_remote_exit_report.json" \
   --expected-git-commit "0000000000000000000000000000000000000000"; then
   echo "expected mismatched git commit to fail validation" >&2
@@ -407,7 +407,7 @@ payload = {
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 
-if python3 "$ROOT_DIR/scripts/ci/validate_cross_network_remote_exit_reports.py" \
+if cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports \
   --reports "$temp_dir/valid_fail_status.json" \
   --expected-git-commit "$current_commit" \
   --require-pass-status; then
