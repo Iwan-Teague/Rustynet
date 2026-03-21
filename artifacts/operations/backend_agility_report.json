@@ -2,7 +2,7 @@
   "additional_backend_paths": [
     "rustynet-backend-api"
   ],
-  "captured_at_unix": 1774101228,
+  "captured_at_unix": 1774104279,
   "conformance_passed": true,
   "default_backend": "wireguard",
   "environment": "ci",

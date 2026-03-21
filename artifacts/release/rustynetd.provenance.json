@@ -3,7 +3,7 @@
   "artifact_sha256": "c186d8d0467f303fdf2ccccb99059cf0b85516bbc3731092a1277b6e6b994a6a",
   "artifact_size_bytes": 1935040,
   "command_digest_sha256": "ae26641e6df4bcc8b82a9c851873ea216b9535709f9734fedd964067a172fe47",
-  "generated_at_unix": 1774101224,
+  "generated_at_unix": 1774104276,
   "host_identity": "ci-localhost",
   "phase": "release",
   "release_track": "beta",
@@ -12,7 +12,7 @@
   "sbom_path": "/Users/iwanteague/Desktop/Rustynet/artifacts/release/sbom.cargo-metadata.json",
   "sbom_sha256": "b17fb23721d3316c06f41bf7a2c05f38e3e3112c6d78101cb52aeca102f26a2b",
   "schema_version": 1,
-  "signature_hex": "171b139cf9f6bfbe153f4798de139c7d2496f6b38645301f4acf2758db26cd54872ea2fea52ff972a6572bc29e7ccfa4e27b9c77313ae48abe6df60d2bf8370a",
+  "signature_hex": "8410ac14b90f53c46f8c18a25d1fc94bc55f71aaaa7555be87a7a8a36b3903bbe68783860138308530c42aebca290304ae0e7e462f89179b098ce7dc45b06c0d",
   "signer_key_id": "ed25519:8016842956f60178",
   "verifier_key_hex": "910ddf4d31366ec143fef10d16160eabbbabee48e8c0040d795119ac19d5a307"
 }

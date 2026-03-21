@@ -11,8 +11,8 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 5 tests
 test backend_contract_exposes_handshake_evidence_for_known_peers_only ... ok
-test backend_contract_rejects_double_start_and_resets_on_shutdown ... ok
 test backend_contract_replaces_route_set_deterministically ... ok
+test backend_contract_rejects_double_start_and_resets_on_shutdown ... ok
 test backend_contract_updates_peer_endpoint_without_replacing_peer ... ok
 test backend_contract_requires_running_state_for_mutations ... ok
 
