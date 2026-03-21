@@ -171,6 +171,20 @@ pub struct WriteLiveLinuxEndpointHijackReportConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRealWireguardExitnodeE2eReportConfig {
+    pub report_path: PathBuf,
+    pub exit_status: String,
+    pub lan_off_status: String,
+    pub lan_on_status: String,
+    pub dns_up_status: String,
+    pub kill_switch_status: String,
+    pub dns_down_status: String,
+    pub environment: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteActiveNetworkSignedStateTamperReportConfig {
     pub report_path: PathBuf,
     pub baseline_status: String,
@@ -1594,6 +1608,72 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
         .to_string())
 }
 
+pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
+    config: WriteRealWireguardExitnodeE2eReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let exit_status = parse_pass_fail(config.exit_status.as_str(), "--exit-status")?;
+    let lan_off_status = parse_pass_fail(config.lan_off_status.as_str(), "--lan-off-status")?;
+    let lan_on_status = parse_pass_fail(config.lan_on_status.as_str(), "--lan-on-status")?;
+    let dns_up_status = parse_pass_fail(config.dns_up_status.as_str(), "--dns-up-status")?;
+    let kill_switch_status =
+        parse_pass_fail(config.kill_switch_status.as_str(), "--kill-switch-status")?;
+    let dns_down_status = parse_pass_fail(config.dns_down_status.as_str(), "--dns-down-status")?;
+    let environment = if config.environment.trim().is_empty() {
+        "lab-netns".to_string()
+    } else {
+        config.environment.trim().to_string()
+    };
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let checks = json!({
+        "exit_node_routing": exit_status,
+        "lan_toggle_off_blocks": lan_off_status,
+        "lan_toggle_on_allows": lan_on_status,
+        "dns_reaches_protected_path_when_tunnel_up": dns_up_status,
+        "kill_switch_blocks_egress_when_tunnel_down": kill_switch_status,
+        "dns_fail_close_when_tunnel_down": dns_down_status,
+    });
+    let status = if checks
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .all(|value| value.as_str() == Some(CHECK_PASS))
+        })
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "real_netns_wireguard",
+        "evidence_mode": "measured",
+        "environment": environment,
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": status,
+        "checks": checks,
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
 pub fn execute_ops_write_active_network_signed_state_tamper_report(
     config: WriteActiveNetworkSignedStateTamperReportConfig,
 ) -> Result<String, String> {
@@ -1773,9 +1853,9 @@ mod tests {
         WriteActiveNetworkRoguePathHijackReportConfig,
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLinuxControlSurfaceReportConfig,
         WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
-        WriteLiveLinuxServerIpBypassReportConfig, WriteRoleSwitchMatrixReportConfig,
-        execute_ops_check_local_file_mode, execute_ops_rewrite_assignment_mesh_cidr,
-        execute_ops_rewrite_assignment_peer_endpoint_ip,
+        WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
+        WriteRoleSwitchMatrixReportConfig, execute_ops_check_local_file_mode,
+        execute_ops_rewrite_assignment_mesh_cidr, execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
         execute_ops_write_active_network_rogue_path_hijack_report,
         execute_ops_write_active_network_signed_state_tamper_report,
@@ -1783,6 +1863,7 @@ mod tests {
         execute_ops_write_live_linux_endpoint_hijack_report,
         execute_ops_write_live_linux_reboot_recovery_report,
         execute_ops_write_live_linux_server_ip_bypass_report,
+        execute_ops_write_real_wireguard_exitnode_e2e_report,
         execute_ops_write_role_switch_matrix_report, redact_forensics_payload,
     };
     use std::fs;
@@ -2046,6 +2127,31 @@ mod tests {
         assert_eq!(status, "fail");
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_report_marks_fail_when_dns_down_check_fails() {
+        let report_path = temp_path("real-wireguard-exitnode-report");
+        let status = execute_ops_write_real_wireguard_exitnode_e2e_report(
+            WriteRealWireguardExitnodeE2eReportConfig {
+                report_path: report_path.clone(),
+                exit_status: "pass".to_string(),
+                lan_off_status: "pass".to_string(),
+                lan_on_status: "pass".to_string(),
+                dns_up_status: "pass".to_string(),
+                kill_switch_status: "pass".to_string(),
+                dns_down_status: "fail".to_string(),
+                environment: "lab-netns".to_string(),
+                captured_at_utc: "2026-03-21T12:00:00Z".to_string(),
+                captured_at_unix: 1_772_990_400,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"mode\": \"real_netns_wireguard\""));
+        assert!(body.contains("\"dns_fail_close_when_tunnel_down\": \"fail\""));
         let _ = fs::remove_file(report_path.as_path());
     }
 

@@ -12,7 +12,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-for cmd in ip wg nft python3 ping timeout; do
+for cmd in ip wg nft ping timeout cargo tcpdump; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
@@ -23,25 +23,19 @@ NS_CLIENT="ryn-client-$$"
 NS_EXIT="ryn-exit-$$"
 NS_INET="ryn-inet-$$"
 NS_LAN="ryn-lan-$$"
+DNS_SERVER_IP="198.18.0.1"
+DNS_SERVER_PORT="53"
 
 KEY_DIR="${RUNTIME_DIR}/keys-$$"
-DNS_COUNT_FILE="${RUNTIME_DIR}/dns-count-$$.txt"
-DNS_SERVER_LOG="${RUNTIME_DIR}/dns-server-$$.log"
 mkdir -p "${KEY_DIR}"
-
-DNS_PID=""
 
 cleanup() {
   set +e
-  if [[ -n "${DNS_PID}" ]]; then
-    kill "${DNS_PID}" >/dev/null 2>&1 || true
-    wait "${DNS_PID}" >/dev/null 2>&1 || true
-  fi
   ip netns del "${NS_CLIENT}" >/dev/null 2>&1 || true
   ip netns del "${NS_EXIT}" >/dev/null 2>&1 || true
   ip netns del "${NS_INET}" >/dev/null 2>&1 || true
   ip netns del "${NS_LAN}" >/dev/null 2>&1 || true
-  rm -rf "${KEY_DIR}" "${DNS_COUNT_FILE}" "${DNS_SERVER_LOG}"
+  rm -rf "${KEY_DIR}"
 }
 trap cleanup EXIT
 
@@ -62,6 +56,14 @@ run_expect_failure() {
   return 0
 }
 
+send_udp_probe() {
+  local namespace="$1"
+  local ip="$2"
+  local port="$3"
+  local payload="$4"
+  ns "${namespace}" env RUSTYNET_UDP_PAYLOAD="${payload}" timeout 2 bash -lc "printf '%s' \"\$RUSTYNET_UDP_PAYLOAD\" >/dev/udp/${ip}/${port}"
+}
+
 write_json_report() {
   local exit_status="$1"
   local lan_off_status="$2"
@@ -69,63 +71,27 @@ write_json_report() {
   local dns_up_status="$4"
   local kill_switch_status="$5"
   local dns_down_status="$6"
-  local overall="fail"
-
-  if [[ "${exit_status}" == "pass" \
-     && "${lan_off_status}" == "pass" \
-     && "${lan_on_status}" == "pass" \
-     && "${dns_up_status}" == "pass" \
-     && "${kill_switch_status}" == "pass" \
-     && "${dns_down_status}" == "pass" ]]; then
-    overall="pass"
-  fi
 
   local environment="${RUSTYNET_PHASE10_E2E_ENVIRONMENT:-lab-netns}"
-  python3 - "$REPORT_PATH" "$overall" "$exit_status" "$lan_off_status" "$lan_on_status" "$dns_up_status" "$kill_switch_status" "$dns_down_status" "$environment" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-(
-    report_path,
-    overall,
-    exit_status,
-    lan_off_status,
-    lan_on_status,
-    dns_up_status,
-    kill_switch_status,
-    dns_down_status,
-    environment,
-) = sys.argv[1:]
-
-captured_at = datetime.now(timezone.utc)
-report = {
-    "phase": "phase10",
-    "mode": "real_netns_wireguard",
-    "evidence_mode": "measured",
-    "environment": environment,
-    "captured_at": captured_at.isoformat(),
-    "captured_at_unix": int(captured_at.timestamp()),
-    "status": overall,
-    "checks": {
-        "exit_node_routing": exit_status,
-        "lan_toggle_off_blocks": lan_off_status,
-        "lan_toggle_on_allows": lan_on_status,
-        "dns_reaches_protected_path_when_tunnel_up": dns_up_status,
-        "kill_switch_blocks_egress_when_tunnel_down": kill_switch_status,
-        "dns_fail_close_when_tunnel_down": dns_down_status,
-    },
-}
-
-with open(report_path, "w", encoding="utf-8") as fh:
-    json.dump(report, fh, indent=2)
-    fh.write("\n")
-PY
-
-  if [[ "${overall}" != "pass" ]]; then
-    return 1
-  fi
-  return 0
+  local captured_at_utc
+  local captured_at_unix
+  local overall
+  captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  captured_at_unix="$(date -u +%s)"
+  overall="$(
+    cargo run --quiet -p rustynet-cli -- ops write-real-wireguard-exitnode-e2e-report \
+      --report-path "${REPORT_PATH}" \
+      --exit-status "${exit_status}" \
+      --lan-off-status "${lan_off_status}" \
+      --lan-on-status "${lan_on_status}" \
+      --dns-up-status "${dns_up_status}" \
+      --kill-switch-status "${kill_switch_status}" \
+      --dns-down-status "${dns_down_status}" \
+      --environment "${environment}" \
+      --captured-at-utc "${captured_at_utc}" \
+      --captured-at-unix "${captured_at_unix}"
+  )"
+  [[ "${overall}" == "pass" ]]
 }
 
 # Namespaces and loopback.
@@ -207,25 +173,6 @@ table ip rustynet_e2e_nat {
 }
 NFT
 
-# UDP DNS probe sink in inet namespace.
-echo 0 >"${DNS_COUNT_FILE}"
-ns "${NS_INET}" python3 - "${DNS_COUNT_FILE}" >"${DNS_SERVER_LOG}" 2>&1 <<'PY' &
-import pathlib
-import socket
-import sys
-
-count_file = pathlib.Path(sys.argv[1])
-count = 0
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("198.18.0.1", 53))
-while True:
-    sock.recvfrom(2048)
-    count += 1
-    count_file.write_text(str(count), encoding="utf-8")
-PY
-DNS_PID=$!
-sleep 1
-
 EXIT_STATUS="fail"
 LAN_OFF_STATUS="fail"
 LAN_ON_STATUS="fail"
@@ -233,7 +180,7 @@ DNS_UP_STATUS="fail"
 KILL_SWITCH_STATUS="fail"
 DNS_DOWN_STATUS="fail"
 
-if run_expect_success ns "${NS_CLIENT}" ping -c 1 -W 1 198.18.0.1; then
+if run_expect_success ns "${NS_CLIENT}" ping -c 1 -W 1 "${DNS_SERVER_IP}"; then
   EXIT_STATUS="pass"
 fi
 
@@ -246,27 +193,36 @@ if run_expect_success ns "${NS_CLIENT}" ping -c 1 -W 1 192.168.50.2; then
   LAN_ON_STATUS="pass"
 fi
 
-before_dns="$(cat "${DNS_COUNT_FILE}")"
-if run_expect_success ns "${NS_CLIENT}" python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"dns-probe-up", ("198.18.0.1", 53)); s.close()'; then
-  sleep 1
-  after_dns="$(cat "${DNS_COUNT_FILE}")"
-  if [[ "${after_dns}" -gt "${before_dns}" ]]; then
+ns "${NS_INET}" timeout 4 tcpdump -ni veth_ei_i -c 1 "udp and dst host ${DNS_SERVER_IP} and dst port ${DNS_SERVER_PORT}" >/dev/null 2>&1 &
+dns_up_capture_pid=$!
+sleep 0.2
+if run_expect_success send_udp_probe "${NS_CLIENT}" "${DNS_SERVER_IP}" "${DNS_SERVER_PORT}" "dns-probe-up"; then
+  if wait "${dns_up_capture_pid}"; then
     DNS_UP_STATUS="pass"
   fi
+else
+  wait "${dns_up_capture_pid}" >/dev/null 2>&1 || true
 fi
 
 ns "${NS_CLIENT}" ip link set wg0 down
 ns "${NS_CLIENT}" ip route del default dev wg0 >/dev/null 2>&1 || true
 
-if run_expect_failure ns "${NS_CLIENT}" ping -c 1 -W 1 198.18.0.1; then
+if run_expect_failure ns "${NS_CLIENT}" ping -c 1 -W 1 "${DNS_SERVER_IP}"; then
   KILL_SWITCH_STATUS="pass"
 fi
 
-before_dns_down="$(cat "${DNS_COUNT_FILE}")"
-if run_expect_failure ns "${NS_CLIENT}" python3 -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b"dns-probe-down", ("198.18.0.1", 53)); s.close()'; then
-  sleep 1
-  after_dns_down="$(cat "${DNS_COUNT_FILE}")"
-  if [[ "${after_dns_down}" -eq "${before_dns_down}" ]]; then
+ns "${NS_INET}" timeout 3 tcpdump -ni veth_ei_i -c 1 "udp and dst host ${DNS_SERVER_IP} and dst port ${DNS_SERVER_PORT}" >/dev/null 2>&1 &
+dns_down_capture_pid=$!
+sleep 0.2
+dns_down_send_failed=0
+if ! send_udp_probe "${NS_CLIENT}" "${DNS_SERVER_IP}" "${DNS_SERVER_PORT}" "dns-probe-down"; then
+  dns_down_send_failed=1
+fi
+if wait "${dns_down_capture_pid}"; then
+  :
+else
+  dns_down_capture_rc=$?
+  if [[ "${dns_down_capture_rc}" -eq 124 && "${dns_down_send_failed}" -eq 1 ]]; then
     DNS_DOWN_STATUS="pass"
   fi
 fi
