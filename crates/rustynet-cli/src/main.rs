@@ -281,6 +281,15 @@ enum OpsCommand {
     RefreshAssignment,
     CollectPhase1MeasuredInput,
     RunPhase1Baseline,
+    CheckNoUnsafeRustSources {
+        config: ops_phase1::CheckNoUnsafeRustSourcesConfig,
+    },
+    CheckDependencyExceptions {
+        config: ops_phase1::CheckDependencyExceptionsConfig,
+    },
+    CheckPerfRegression {
+        config: ops_phase1::CheckPerfRegressionConfig,
+    },
     CollectPhase9RawEvidence,
     GeneratePhase9Artifacts,
     VerifyPhase9Readiness,
@@ -632,6 +641,40 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::RunPhase1Baseline)
         }
+        "check-no-unsafe-rust-sources" => Ok(OpsCommand::CheckNoUnsafeRustSources {
+            config: ops_phase1::CheckNoUnsafeRustSourcesConfig {
+                root: parser
+                    .value("--root")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(ops_phase1::DEFAULT_UNSAFE_SCAN_ROOT_PATH)),
+            },
+        }),
+        "check-dependency-exceptions" => Ok(OpsCommand::CheckDependencyExceptions {
+            config: ops_phase1::CheckDependencyExceptionsConfig {
+                path: parser
+                    .value("--path")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(ops_phase1::DEFAULT_DEPENDENCY_EXCEPTIONS_PATH)
+                    }),
+            },
+        }),
+        "check-perf-regression" => Ok(OpsCommand::CheckPerfRegression {
+            config: ops_phase1::CheckPerfRegressionConfig {
+                phase1_report_path: parser
+                    .value("--phase1-report")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE1_REPORT_PATH)
+                    }),
+                phase3_report_path: parser
+                    .value("--phase3-report")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE3_REPORT_PATH)
+                    }),
+            },
+        }),
         "collect-phase9-raw-evidence" => {
             if args.len() != 1 {
                 return Err("ops collect-phase9-raw-evidence does not accept options".to_string());
@@ -2887,6 +2930,15 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_phase1::execute_ops_collect_phase1_measured_input()
         }
         OpsCommand::RunPhase1Baseline => ops_phase1::execute_ops_run_phase1_baseline(),
+        OpsCommand::CheckNoUnsafeRustSources { config } => {
+            ops_phase1::execute_ops_check_no_unsafe_rust_sources(config)
+        }
+        OpsCommand::CheckDependencyExceptions { config } => {
+            ops_phase1::execute_ops_check_dependency_exceptions(config)
+        }
+        OpsCommand::CheckPerfRegression { config } => {
+            ops_phase1::execute_ops_check_perf_regression(config)
+        }
         OpsCommand::CollectPhase9RawEvidence => {
             ops_phase9::execute_ops_collect_phase9_raw_evidence()
         }
@@ -9319,6 +9371,9 @@ fn help_text() -> String {
         "  ops refresh-assignment",
         "  ops collect-phase1-measured-input",
         "  ops run-phase1-baseline",
+        "  ops check-no-unsafe-rust-sources [--root <path>]",
+        "  ops check-dependency-exceptions [--path <path>]",
+        "  ops check-perf-regression [--phase1-report <path>] [--phase3-report <path>]",
         "  ops collect-phase9-raw-evidence",
         "  ops generate-phase9-artifacts",
         "  ops verify-phase9-readiness",
@@ -9697,6 +9752,32 @@ mod tests {
 
         let run_phase1 = parse_command(&["ops".to_string(), "run-phase1-baseline".to_string()]);
         assert!(format!("{run_phase1:?}").contains("RunPhase1Baseline"));
+
+        let check_no_unsafe = parse_command(&[
+            "ops".to_string(),
+            "check-no-unsafe-rust-sources".to_string(),
+            "--root".to_string(),
+            "crates".to_string(),
+        ]);
+        assert!(format!("{check_no_unsafe:?}").contains("CheckNoUnsafeRustSources"));
+
+        let check_dependency_exceptions = parse_command(&[
+            "ops".to_string(),
+            "check-dependency-exceptions".to_string(),
+            "--path".to_string(),
+            "documents/operations/dependency_exceptions.json".to_string(),
+        ]);
+        assert!(format!("{check_dependency_exceptions:?}").contains("CheckDependencyExceptions"));
+
+        let check_perf_regression = parse_command(&[
+            "ops".to_string(),
+            "check-perf-regression".to_string(),
+            "--phase1-report".to_string(),
+            "artifacts/perf/phase1/baseline.json".to_string(),
+            "--phase3-report".to_string(),
+            "artifacts/perf/phase3/mesh_baseline.json".to_string(),
+        ]);
+        assert!(format!("{check_perf_regression:?}").contains("CheckPerfRegression"));
 
         let collect_phase9_raw =
             parse_command(&["ops".to_string(), "collect-phase9-raw-evidence".to_string()]);

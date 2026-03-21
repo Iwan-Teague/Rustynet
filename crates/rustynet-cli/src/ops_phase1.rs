@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -16,6 +16,13 @@ use serde_json::{Map, Value, json};
 const DEFAULT_PHASE1_MEASURED_INPUT_PATH: &str = "artifacts/perf/phase1/measured_input.json";
 const DEFAULT_PHASE1_RUNTIME_REPORT_PATH: &str = "artifacts/perf/phase1/baseline.json";
 const DEFAULT_PHASE1_BACKEND_REPORT_PATH: &str = "artifacts/perf/phase1/backend_contract_perf.json";
+pub const DEFAULT_PHASE1_PERF_REGRESSION_PHASE1_REPORT_PATH: &str =
+    "artifacts/perf/phase1/baseline.json";
+pub const DEFAULT_PHASE1_PERF_REGRESSION_PHASE3_REPORT_PATH: &str =
+    "artifacts/perf/phase3/mesh_baseline.json";
+pub const DEFAULT_DEPENDENCY_EXCEPTIONS_PATH: &str =
+    "documents/operations/dependency_exceptions.json";
+pub const DEFAULT_UNSAFE_SCAN_ROOT_PATH: &str = "crates";
 
 const PHASE1_IDLE_CPU_ALIASES: &[&str] = &["idle_cpu_percent"];
 const PHASE1_IDLE_MEMORY_ALIASES: &[&str] = &["idle_memory_mb", "idle_rss_mb"];
@@ -31,6 +38,22 @@ const PHASE1_BACKEND_THROUGHPUT_ALIASES: &[&str] = &[
     "throughput_overhead_percent",
     "throughput_overhead_vs_wireguard_percent",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckNoUnsafeRustSourcesConfig {
+    pub root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckDependencyExceptionsConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckPerfRegressionConfig {
+    pub phase1_report_path: PathBuf,
+    pub phase3_report_path: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct Phase1MeasuredInput {
@@ -913,6 +936,654 @@ fn phase1_validate_report(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafeScannerState {
+    Normal,
+    LineComment,
+    BlockComment,
+    String,
+    Char,
+    RawString,
+}
+
+fn unsafe_scanner_is_ident_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+fn unsafe_scanner_is_ident_continue(byte: u8) -> bool {
+    unsafe_scanner_is_ident_start(byte) || byte.is_ascii_digit()
+}
+
+fn unsafe_scanner_advance(
+    bytes: &[u8],
+    index: usize,
+    line: &mut usize,
+    column: &mut usize,
+) -> usize {
+    if bytes[index] == b'\n' {
+        *line += 1;
+        *column = 1;
+    } else {
+        *column += 1;
+    }
+    index + 1
+}
+
+fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut findings = Vec::new();
+
+    let mut index = 0usize;
+    let mut line = 1usize;
+    let mut column = 1usize;
+    let mut state = UnsafeScannerState::Normal;
+    let mut block_depth = 0usize;
+    let mut raw_hashes = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        match state {
+            UnsafeScannerState::Normal => {
+                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::LineComment;
+                    continue;
+                }
+
+                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::BlockComment;
+                    block_depth = 1;
+                    continue;
+                }
+
+                if byte == b'"' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::String;
+                    continue;
+                }
+
+                if byte == b'\'' {
+                    if index + 1 < bytes.len() && unsafe_scanner_is_ident_start(bytes[index + 1]) {
+                        let is_char_literal = index + 2 < bytes.len() && bytes[index + 2] == b'\'';
+                        if !is_char_literal {
+                            index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                            while index < bytes.len()
+                                && unsafe_scanner_is_ident_continue(bytes[index])
+                            {
+                                index =
+                                    unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                            }
+                            continue;
+                        }
+                    }
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::Char;
+                    continue;
+                }
+
+                if byte == b'r' {
+                    let mut candidate = index + 1;
+                    let mut hashes = 0usize;
+                    while candidate < bytes.len() && bytes[candidate] == b'#' {
+                        candidate += 1;
+                        hashes += 1;
+                    }
+                    if candidate < bytes.len() && bytes[candidate] == b'"' {
+                        while index <= candidate {
+                            index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        }
+                        state = UnsafeScannerState::RawString;
+                        raw_hashes = hashes;
+                        continue;
+                    }
+                }
+
+                if unsafe_scanner_is_ident_start(byte) {
+                    let token_line = line;
+                    let token_column = column;
+                    let token_start = index;
+                    while index < bytes.len() && unsafe_scanner_is_ident_continue(bytes[index]) {
+                        index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    }
+                    if &bytes[token_start..index] == b"unsafe" {
+                        findings.push((token_line, token_column));
+                    }
+                    continue;
+                }
+
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+            UnsafeScannerState::LineComment => {
+                if byte == b'\n' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::Normal;
+                    continue;
+                }
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+            UnsafeScannerState::BlockComment => {
+                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    block_depth += 1;
+                    continue;
+                }
+                if byte == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    block_depth = block_depth.saturating_sub(1);
+                    if block_depth == 0 {
+                        state = UnsafeScannerState::Normal;
+                    }
+                    continue;
+                }
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+            UnsafeScannerState::String => {
+                if byte == b'\\' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    if index < bytes.len() {
+                        index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    }
+                    continue;
+                }
+                if byte == b'"' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::Normal;
+                    continue;
+                }
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+            UnsafeScannerState::Char => {
+                if byte == b'\\' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    if index < bytes.len() {
+                        index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    }
+                    continue;
+                }
+                if byte == b'\'' {
+                    index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                    state = UnsafeScannerState::Normal;
+                    continue;
+                }
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+            UnsafeScannerState::RawString => {
+                if byte == b'"' {
+                    let suffix_start = index + 1;
+                    let suffix_end = suffix_start + raw_hashes;
+                    if suffix_end <= bytes.len()
+                        && bytes[suffix_start..suffix_end]
+                            .iter()
+                            .all(|candidate| *candidate == b'#')
+                    {
+                        index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        for _ in 0..raw_hashes {
+                            index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        }
+                        state = UnsafeScannerState::Normal;
+                        continue;
+                    }
+                }
+                index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+            }
+        }
+    }
+
+    findings
+}
+
+fn run_unsafe_scanner_self_tests() -> Result<(), String> {
+    let cases = [
+        (
+            "lifetime_only",
+            "fn keep<'a>(value: &'a str) -> &'a str { value }\n",
+            0usize,
+        ),
+        (
+            "lifetime_plus_unsafe_block",
+            "fn keep<'a>(value: &'a str) -> &'a str { value }\nfn bad() { unsafe { let _x = 1; } }\n",
+            1usize,
+        ),
+        (
+            "comments_and_strings",
+            "// unsafe should not match here\nconst NOTE: &str = \"unsafe in string\";\n",
+            0usize,
+        ),
+    ];
+
+    for (name, source, expected_count) in cases {
+        let findings = scan_rust_source_text_for_unsafe(source);
+        if findings.len() != expected_count {
+            return Err(format!(
+                "unsafe scanner self-test failed for {name}: expected {expected_count} findings, got {}",
+                findings.len()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    if !root.exists() {
+        return Err(format!("source root does not exist: {}", root.display()));
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "source root is not a directory: {}",
+            root.display()
+        ));
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let mut entries = fs::read_dir(&dir)
+            .map_err(|err| format!("read directory failed ({}): {err}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("read directory entry failed ({}): {err}", dir.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("inspect path type failed ({}): {err}", path.display()))?;
+
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "unsafe source scan refuses symlink path; remove symlink or scan concrete paths only: {}",
+                    path.display()
+                ));
+            }
+
+            if file_type.is_dir() {
+                if path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value == "target")
+                {
+                    continue;
+                }
+                pending.push(path);
+                continue;
+            }
+
+            if file_type.is_file() && path.extension().is_some_and(|value| value == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+pub fn execute_ops_check_no_unsafe_rust_sources(
+    config: CheckNoUnsafeRustSourcesConfig,
+) -> Result<String, String> {
+    run_unsafe_scanner_self_tests()?;
+
+    let root = phase1_resolve_path(config.root.to_string_lossy().as_ref())?;
+    let rust_sources = collect_rust_source_paths(root.as_path())?;
+    let mut findings = Vec::new();
+
+    for source_path in rust_sources {
+        let source = fs::read_to_string(&source_path)
+            .map_err(|err| format!("read Rust source failed ({}): {err}", source_path.display()))?;
+        for (line, column) in scan_rust_source_text_for_unsafe(source.as_str()) {
+            findings.push(format!(
+                "{}:{line}:{column}: unsafe keyword detected",
+                source_path.display()
+            ));
+        }
+    }
+
+    if !findings.is_empty() {
+        return Err(format!(
+            "unsafe keyword usage is forbidden in repository Rust sources:\n{}",
+            findings.join("\n")
+        ));
+    }
+
+    Ok("Unsafe code checks: PASS".to_string())
+}
+
+fn parse_two_digits(value: &str, field: &str) -> Result<u32, String> {
+    if value.len() != 2 || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("invalid numeric field for {field}: {value}"));
+    }
+    value
+        .parse::<u32>()
+        .map_err(|err| format!("invalid numeric field for {field}: {err}"))
+}
+
+fn parse_four_digits(value: &str, field: &str) -> Result<i32, String> {
+    if value.len() != 4 || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("invalid numeric field for {field}: {value}"));
+    }
+    value
+        .parse::<i32>()
+        .map_err(|err| format!("invalid numeric field for {field}: {err}"))
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    Some(days)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("missing or invalid UTC field: {field}"));
+    }
+
+    let (datetime_part, offset_seconds) = if let Some(stripped) = trimmed.strip_suffix('Z') {
+        (stripped, 0i64)
+    } else {
+        let tz_start = trimmed
+            .char_indices()
+            .rev()
+            .find_map(|(index, ch)| {
+                if index > 10 && (ch == '+' || ch == '-') {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+        let (base, zone) = trimmed.split_at(tz_start);
+        if zone.len() != 6 || &zone[3..4] != ":" {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let sign = if &zone[0..1] == "+" { 1i64 } else { -1i64 };
+        let offset_hour = parse_two_digits(&zone[1..3], field)?;
+        let offset_minute = parse_two_digits(&zone[4..6], field)?;
+        if offset_hour > 23 || offset_minute > 59 {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let total = i64::from(offset_hour) * 3600 + i64::from(offset_minute) * 60;
+        (base, sign * total)
+    };
+
+    let (date_part, time_part) = datetime_part
+        .split_once('T')
+        .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+    let date_fields = date_part.split('-').collect::<Vec<_>>();
+    if date_fields.len() != 3 {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
+    }
+    let year = parse_four_digits(date_fields[0], field)?;
+    let month = parse_two_digits(date_fields[1], field)?;
+    let day = parse_two_digits(date_fields[2], field)?;
+    let max_day = days_in_month(year, month)
+        .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+    if day == 0 || day > max_day {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
+    }
+
+    let (time_core, fraction) = match time_part.split_once('.') {
+        Some((core, frac)) => (core, Some(frac)),
+        None => (time_part, None),
+    };
+    if let Some(frac) = fraction
+        && (frac.is_empty() || !frac.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
+    }
+    let time_fields = time_core.split(':').collect::<Vec<_>>();
+    if time_fields.len() != 3 {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
+    }
+    let hour = parse_two_digits(time_fields[0], field)?;
+    let minute = parse_two_digits(time_fields[1], field)?;
+    let second = parse_two_digits(time_fields[2], field)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("invalid UTC timestamp for {field}: {value}"));
+    }
+
+    let date_seconds = days_from_civil(year, month, day)
+        .checked_mul(86_400)
+        .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+    let time_seconds = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    date_seconds
+        .checked_add(time_seconds)
+        .and_then(|result| result.checked_sub(offset_seconds))
+        .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))
+}
+
+fn require_non_empty_string_field<'a>(
+    payload: &'a Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<&'a str, String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{label} missing non-empty string field: {key}"))
+}
+
+pub fn execute_ops_check_dependency_exceptions(
+    config: CheckDependencyExceptionsConfig,
+) -> Result<String, String> {
+    let path = phase1_resolve_path(config.path.to_string_lossy().as_ref())?;
+    if !path.exists() {
+        return Err(format!(
+            "missing dependency exception file: {}",
+            path.display()
+        ));
+    }
+    let payload = read_json_value(path.as_path(), "dependency exception file")?;
+    let payload_object = payload.as_object().ok_or_else(|| {
+        format!(
+            "dependency exception file must be a JSON object: {}",
+            path.display()
+        )
+    })?;
+    let exceptions = payload_object
+        .get("exceptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let required_fields = BTreeSet::from([
+        "id",
+        "crate",
+        "reason",
+        "owner",
+        "approved_by",
+        "expires_utc",
+    ]);
+    let now_unix = unix_now() as i64;
+
+    for entry in exceptions {
+        let exception = entry
+            .as_object()
+            .ok_or_else(|| "dependency exception entry must be a JSON object".to_string())?;
+        let present = exception
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let missing = required_fields
+            .difference(&present)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "dependency exception missing fields: [{}]",
+                missing.join(", ")
+            ));
+        }
+
+        let exception_id = require_non_empty_string_field(exception, "id", "dependency exception")?;
+        let expires_utc =
+            require_non_empty_string_field(exception, "expires_utc", "dependency exception")?;
+        let expires_unix = parse_utc_to_unix(expires_utc, "dependency exception expires_utc")?;
+        if expires_unix <= now_unix {
+            return Err(format!("dependency exception expired: {exception_id}"));
+        }
+    }
+
+    Ok("Dependency exception policy check: PASS".to_string())
+}
+
+fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, String> {
+    let payload = read_json_value(path, label)?;
+    let payload_object = payload
+        .as_object()
+        .ok_or_else(|| format!("{label} must be a JSON object: {}", path.display()))?;
+    let metrics = payload_object
+        .get("metrics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{label} metrics must be a non-empty array: {}",
+                path.display()
+            )
+        })?;
+    if metrics.is_empty() {
+        return Err(format!(
+            "{label} metrics must be a non-empty array: {}",
+            path.display()
+        ));
+    }
+
+    let mut values = HashMap::new();
+    for metric in metrics {
+        let metric_object = metric
+            .as_object()
+            .ok_or_else(|| format!("{label} metric entry must be object: {}", path.display()))?;
+        let metric_name = metric_object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("{label} metric missing non-empty name: {}", path.display()))?;
+        let metric_value = metric_object
+            .get("value")
+            .and_then(phase1_value_as_number)
+            .ok_or_else(|| {
+                format!(
+                    "{label} metric '{metric_name}' missing numeric value: {}",
+                    path.display()
+                )
+            })?;
+        if !metric_value.is_finite() || metric_value < 0.0 {
+            return Err(format!(
+                "{label} metric '{metric_name}' has invalid numeric value: {}",
+                metric_object.get("value").cloned().unwrap_or(Value::Null)
+            ));
+        }
+        if metric_object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "fail" || status == "not_measurable")
+        {
+            let status = metric_object
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Err(format!(
+                "{label} metric '{metric_name}' has failing status: {status}"
+            ));
+        }
+        values.insert(metric_name.to_string(), metric_value);
+    }
+
+    Ok(values)
+}
+
+fn require_perf_metric(
+    metrics: &HashMap<String, f64>,
+    name: &str,
+    label: &str,
+) -> Result<f64, String> {
+    metrics
+        .get(name)
+        .copied()
+        .ok_or_else(|| format!("{label} missing required metric: {name}"))
+}
+
+pub fn execute_ops_check_perf_regression(
+    config: CheckPerfRegressionConfig,
+) -> Result<String, String> {
+    let phase1_report_path =
+        phase1_resolve_path(config.phase1_report_path.to_string_lossy().as_ref())?;
+    let phase3_report_path =
+        phase1_resolve_path(config.phase3_report_path.to_string_lossy().as_ref())?;
+
+    if !phase1_report_path.is_file() {
+        return Err(format!(
+            "missing phase1 report: {}",
+            phase1_report_path.display()
+        ));
+    }
+    if !phase3_report_path.is_file() {
+        return Err(format!(
+            "missing phase3 report: {}",
+            phase3_report_path.display()
+        ));
+    }
+
+    let phase1_metrics = load_perf_metrics(phase1_report_path.as_path(), "phase1 report")?;
+    let phase3_metrics = load_perf_metrics(phase3_report_path.as_path(), "phase3 report")?;
+    let idle_cpu = require_perf_metric(&phase1_metrics, "idle_cpu_percent", "phase1 report")?;
+    let idle_memory = require_perf_metric(&phase1_metrics, "idle_memory_mb", "phase1 report")?;
+    let route_apply = require_perf_metric(
+        &phase1_metrics,
+        "route_policy_apply_p95_seconds",
+        "phase1 report",
+    )?;
+    let peer_sessions = require_perf_metric(&phase3_metrics, "peer_sessions", "phase3 report")?;
+
+    if idle_cpu > 2.0 {
+        return Err(format!("idle cpu regression detected: {idle_cpu}"));
+    }
+    if idle_memory > 120.0 {
+        return Err(format!("idle memory regression detected: {idle_memory}"));
+    }
+    if route_apply > 2.0 {
+        return Err(format!(
+            "route apply latency regression detected: {route_apply}"
+        ));
+    }
+    if peer_sessions < 6.0 {
+        return Err(format!(
+            "phase3 mesh benchmark too small: peer_sessions={peer_sessions}"
+        ));
+    }
+
+    Ok("Performance regression gate: PASS".to_string())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -989,8 +1660,10 @@ pub fn execute_ops_run_phase1_baseline() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bool_value, phase1_collect_measured_input_from_source, phase1_validate_report,
-        phase1_validate_secure_directory,
+        CheckDependencyExceptionsConfig, CheckPerfRegressionConfig,
+        execute_ops_check_dependency_exceptions, execute_ops_check_perf_regression,
+        parse_bool_value, parse_utc_to_unix, phase1_collect_measured_input_from_source,
+        phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1155,5 +1828,98 @@ mod tests {
                 .expect_err("report validation should fail");
         assert!(err.contains("non-measured metric"));
         let _ = std::fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn unsafe_scanner_ignores_lifetimes_comments_and_strings() {
+        let source = concat!(
+            "fn keep<'a>(value: &'a str) -> &'a str { value }\n",
+            "// unsafe should not match here\n",
+            "const NOTE: &str = \"unsafe in string\";\n"
+        );
+        let findings = scan_rust_source_text_for_unsafe(source);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn unsafe_scanner_detects_keyword_in_code() {
+        let source = "fn bad() {\n  unsafe { let _x = 1; }\n}\n";
+        let findings = scan_rust_source_text_for_unsafe(source);
+        assert_eq!(findings, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn parse_utc_to_unix_accepts_zulu_and_offset_forms() {
+        let zulu = parse_utc_to_unix("1970-01-01T00:00:00Z", "timestamp").expect("parse zulu");
+        let offset =
+            parse_utc_to_unix("1970-01-01T01:00:00+01:00", "timestamp").expect("parse offset");
+        assert_eq!(zulu, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn parse_utc_to_unix_rejects_invalid_timestamp() {
+        let err = parse_utc_to_unix("not-a-timestamp", "timestamp").expect_err("must fail");
+        assert!(err.contains("invalid UTC timestamp"));
+    }
+
+    #[test]
+    fn dependency_exception_checker_rejects_expired_entries() {
+        let path = unique_temp_path("rustynet-dependency-exceptions", ".json");
+        let payload = concat!(
+            "{",
+            "\"exceptions\":[",
+            "{",
+            "\"id\":\"expired-1\",",
+            "\"crate\":\"openssl-sys\",",
+            "\"reason\":\"temporary\",",
+            "\"owner\":\"security\",",
+            "\"approved_by\":\"eng\",",
+            "\"expires_utc\":\"1970-01-01T00:00:00Z\"",
+            "}",
+            "]",
+            "}\n"
+        );
+        std::fs::write(&path, payload).expect("write exceptions file");
+        let result = execute_ops_check_dependency_exceptions(CheckDependencyExceptionsConfig {
+            path: path.clone(),
+        });
+        let err = result.expect_err("expired entry must fail");
+        assert!(err.contains("dependency exception expired"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn perf_regression_checker_passes_for_valid_metrics() {
+        let phase1 = unique_temp_path("rustynet-perf-phase1", ".json");
+        let phase3 = unique_temp_path("rustynet-perf-phase3", ".json");
+        let phase1_payload = concat!(
+            "{",
+            "\"metrics\":[",
+            "{\"name\":\"idle_cpu_percent\",\"value\":1.0,\"status\":\"pass\"},",
+            "{\"name\":\"idle_memory_mb\",\"value\":64.0,\"status\":\"pass\"},",
+            "{\"name\":\"route_policy_apply_p95_seconds\",\"value\":1.5,\"status\":\"pass\"}",
+            "]",
+            "}\n"
+        );
+        let phase3_payload = concat!(
+            "{",
+            "\"metrics\":[",
+            "{\"name\":\"peer_sessions\",\"value\":6.0,\"status\":\"pass\"}",
+            "]",
+            "}\n"
+        );
+        std::fs::write(&phase1, phase1_payload).expect("write phase1 report");
+        std::fs::write(&phase3, phase3_payload).expect("write phase3 report");
+
+        let result = execute_ops_check_perf_regression(CheckPerfRegressionConfig {
+            phase1_report_path: phase1.clone(),
+            phase3_report_path: phase3.clone(),
+        })
+        .expect("perf regression should pass");
+        assert!(result.contains("PASS"));
+
+        let _ = std::fs::remove_file(phase1);
+        let _ = std::fs::remove_file(phase3);
     }
 }
