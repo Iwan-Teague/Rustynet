@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
-
-cargo run --quiet -p rustynet-cli -- ops verify-phase6-platform-readiness
-cargo run --quiet -p rustynet-cli -- ops verify-phase6-parity-evidence
+exec cargo run --quiet -p rustynet-cli --bin check_phase6_platform_parity -- "$@"

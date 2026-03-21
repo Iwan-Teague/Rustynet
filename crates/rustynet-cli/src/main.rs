@@ -648,7 +648,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         return Err("ops subcommand is required".to_string());
     }
     let subcommand = args[0].as_str();
-    let parser = OptionParser::parse(&args[1..])?;
+    let parser = match OptionParser::parse(&args[1..]) {
+        Ok(parser) => parser,
+        Err(err) => {
+            if subcommand == "prepare-advisory-db" {
+                OptionParser::empty()
+            } else {
+                return Err(err);
+            }
+        }
+    };
     match subcommand {
         "verify-runtime-binary-custody" => {
             if args.len() != 1 {
@@ -9628,6 +9637,13 @@ struct OptionParser {
 }
 
 impl OptionParser {
+    fn empty() -> Self {
+        Self {
+            values: HashMap::new(),
+            flags: HashSet::new(),
+        }
+    }
+
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut values = HashMap::new();
         let mut flags = HashSet::new();
@@ -10252,6 +10268,13 @@ mod tests {
 
         let run_phase1 = parse_command(&["ops".to_string(), "run-phase1-baseline".to_string()]);
         assert!(format!("{run_phase1:?}").contains("RunPhase1Baseline"));
+
+        let prepare_advisory_db = parse_command(&[
+            "ops".to_string(),
+            "prepare-advisory-db".to_string(),
+            "/tmp/rustynet-advisory-db".to_string(),
+        ]);
+        assert!(format!("{prepare_advisory_db:?}").contains("PrepareAdvisoryDb"));
 
         let check_no_unsafe = parse_command(&[
             "ops".to_string(),

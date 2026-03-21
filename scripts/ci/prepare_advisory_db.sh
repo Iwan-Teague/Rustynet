@@ -1,7 +1,2 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
-
-exec cargo run --quiet -p rustynet-cli -- ops prepare-advisory-db "$@"
+exec cargo run --quiet -p rustynet-cli --bin prepare_advisory_db -- "$@"

@@ -1,16 +1,2 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
-
-ARTIFACT_DIR="${RUSTYNET_PHASE10_ARTIFACT_DIR:-${RUSTYNET_PHASE10_OUT_DIR:-artifacts/phase10}}"
-MAX_EVIDENCE_AGE_SECONDS="${RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS:-2678400}"
-
-RUSTYNET_PHASE10_ARTIFACT_DIR="$ARTIFACT_DIR" \
-RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS="$MAX_EVIDENCE_AGE_SECONDS" \
-cargo run --quiet -p rustynet-cli -- ops verify-phase10-provenance
-
-RUSTYNET_PHASE10_ARTIFACT_DIR="$ARTIFACT_DIR" \
-RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS="$MAX_EVIDENCE_AGE_SECONDS" \
-cargo run --quiet -p rustynet-cli -- ops verify-phase10-readiness
+exec cargo run --quiet -p rustynet-cli --bin check_phase10_readiness -- "$@"

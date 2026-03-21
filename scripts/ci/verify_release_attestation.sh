@@ -1,7 +1,2 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
-
-cargo run --quiet -p rustynet-cli -- ops verify-release-artifact
+exec cargo run --quiet -p rustynet-cli --bin verify_release_attestation -- "$@"
