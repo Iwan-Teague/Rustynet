@@ -25,7 +25,7 @@ exit (admin), client1 (client), client2 (client), relay (entry)
 
 | Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| Control-Plane Replay And Rollback | exit | Stale or tampered signed artifacts must be rejected without widening runtime state. | Reject artifact and preserve secure state or fail closed. | pass (generator path), fail (release gate path) | `scripts/e2e/generate_linux_fresh_install_os_matrix_report.py` enforces child `git_commit` binding; `scripts/ci/check_fresh_install_os_matrix_readiness.sh` does not recurse into child reports |
+| Control-Plane Replay And Rollback | exit | Stale or tampered signed artifacts must be rejected without widening runtime state. | Reject artifact and preserve secure state or fail closed. | pass (generator path), fail (release gate path) | `rustynet ops generate-linux-fresh-install-os-matrix-report` enforces child `git_commit` binding; `scripts/ci/check_fresh_install_os_matrix_readiness.sh` does not recurse into child reports |
 | Local Control Surface Spoofing | exit, client1, client2, relay | Clients must reject insecure or attacker-owned local control surfaces before connecting. | Reject path based on ownership, symlink, or mode checks. | pass | `cargo test -p rustynet-cli control_socket_validator -- --nocapture` passed (`3/3`) |
 | DNS Integrity And Namespace Abuse | exit | Managed DNS must reject stale, mismatched, or unauthorized name-to-node mappings. | Managed names fail closed and non-managed names are refused. | pass | `cargo test -p rustynetd dns_resolver_servfails_managed_name_when_zone_is_missing -- --nocapture` passed (`1/1`) |
 | Missing-State Fail-Closed Validation | exit, client1, client2, relay | Removing required trust inputs must make the system restrictive, not permissive. | Operation fails closed with explicit error. | pass (selected paths only) | `cargo test -p rustynetd traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback -- --nocapture` passed (`1/1`) |
@@ -60,7 +60,7 @@ exit (admin), client1 (client), client2 (client), relay (entry)
 
 - Attack family: Release Evidence Integrity
 - Evidence:
-  - the report generator explicitly rejects child report commit drift in [generate_linux_fresh_install_os_matrix_report.py](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py#L78)
+- the report generator explicitly rejects child report commit drift in [ops_fresh_install_os_matrix.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_fresh_install_os_matrix.rs)
   - the readiness gate checks only the top-level report `git_commit` in [check_fresh_install_os_matrix_readiness.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/check_fresh_install_os_matrix_readiness.sh#L146) and then only verifies child source artifact existence in [check_fresh_install_os_matrix_readiness.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/check_fresh_install_os_matrix_readiness.sh#L211)
   - the currently rebound child reports are all still bound to the stale commit `4500e386...`:
     - [live_linux_two_hop_report.json](/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/fresh_install_os_matrix/live_linux_two_hop_report.json#L7)
@@ -69,7 +69,7 @@ exit (admin), client1 (client), client2 (client), relay (entry)
   - proof-of-gap: a temporary copy of the top-level report with only `git_commit` rewritten to current `HEAD` passed `check_fresh_install_os_matrix_readiness.sh` under `RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE=linux`, even though all child evidence remained stale
 - Affected files/subsystems:
   - [check_fresh_install_os_matrix_readiness.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/check_fresh_install_os_matrix_readiness.sh#L139)
-  - [generate_linux_fresh_install_os_matrix_report.py](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/generate_linux_fresh_install_os_matrix_report.py#L78)
+- [ops_fresh_install_os_matrix.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_fresh_install_os_matrix.rs)
   - [artifacts/phase10/source/fresh_install_os_matrix](/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/fresh_install_os_matrix)
 - Expected secure behavior:
   - readiness verification should recursively enforce commit binding for all referenced measured child reports, not only the wrapper report

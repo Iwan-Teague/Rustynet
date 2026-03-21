@@ -5,11 +5,11 @@ Define the canonical measured artifact contract for the future cross-network rem
 
 This schema exists before the implementation is complete so the evidence contract can be stable, testable, and fail-closed.
 
-Primary validator:
-- [validate_cross_network_remote_exit_reports.py](/Users/iwanteague/Desktop/Rustynet/scripts/ci/validate_cross_network_remote_exit_reports.py)
+Primary validator command:
+- `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports ...`
 
-Shared schema module:
-- [cross_network_remote_exit_schema.py](/Users/iwanteague/Desktop/Rustynet/scripts/ci/cross_network_remote_exit_schema.py)
+Shared Rust schema/validator implementation:
+- [ops_cross_network_reports.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_cross_network_reports.rs)
 
 Local schema self-test:
 - [test_validate_cross_network_remote_exit_reports.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/test_validate_cross_network_remote_exit_reports.sh)
