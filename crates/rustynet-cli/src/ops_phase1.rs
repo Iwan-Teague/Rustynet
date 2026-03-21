@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,7 @@ pub const DEFAULT_PHASE1_PERF_REGRESSION_PHASE3_REPORT_PATH: &str =
 pub const DEFAULT_DEPENDENCY_EXCEPTIONS_PATH: &str =
     "documents/operations/dependency_exceptions.json";
 pub const DEFAULT_UNSAFE_SCAN_ROOT_PATH: &str = "crates";
+pub const DEFAULT_SECRETS_HYGIENE_SCAN_ROOT_PATH: &str = ".";
 
 const PHASE1_IDLE_CPU_ALIASES: &[&str] = &["idle_cpu_percent"];
 const PHASE1_IDLE_MEMORY_ALIASES: &[&str] = &["idle_memory_mb", "idle_rss_mb"];
@@ -53,6 +54,11 @@ pub struct CheckDependencyExceptionsConfig {
 pub struct CheckPerfRegressionConfig {
     pub phase1_report_path: PathBuf,
     pub phase3_report_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckSecretsHygieneConfig {
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1584,6 +1590,508 @@ pub fn execute_ops_check_perf_regression(
     Ok("Performance regression gate: PASS".to_string())
 }
 
+fn secrets_hygiene_error(summary: &str, details: &[String]) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("[secrets-hygiene] {summary}"));
+    for detail in details.iter().take(20) {
+        lines.push(format!("  - {detail}"));
+    }
+    if details.len() > 20 {
+        lines.push(format!(
+            "  - ... {} additional violation(s)",
+            details.len() - 20
+        ));
+    }
+    lines.join("\n")
+}
+
+fn parse_git_tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("ls-files")
+        .arg("-z")
+        .output()
+        .map_err(|err| format!("invoke git ls-files failed ({}): {err}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files failed for secrets hygiene scan root {} with status {}",
+            root.display(),
+            output.status
+        ));
+    }
+
+    let mut files = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let path_text = std::str::from_utf8(entry)
+            .map_err(|_| "git ls-files emitted non-utf8 path".to_string())?;
+        let relative = PathBuf::from(path_text);
+        if relative.is_absolute() {
+            return Err(format!(
+                "git ls-files returned absolute path, refusing scan: {}",
+                relative.display()
+            ));
+        }
+        if relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(format!(
+                "git ls-files returned parent-traversal path, refusing scan: {}",
+                relative.display()
+            ));
+        }
+        files.push(relative);
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn collect_workspace_files(
+    root: &Path,
+    excluded_roots: &BTreeSet<&str>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        let mut entries = fs::read_dir(&dir)
+            .map_err(|err| format!("read directory failed ({}): {err}", dir.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("read directory entry failed ({}): {err}", dir.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|err| {
+                format!(
+                    "resolve relative workspace path failed ({}): {err}",
+                    path.display()
+                )
+            })?;
+            if relative.components().any(|component| {
+                excluded_roots.contains(component.as_os_str().to_string_lossy().as_ref())
+            }) {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|err| format!("inspect path type failed ({}): {err}", path.display()))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if file_type.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn read_text_lossy(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("read file failed ({}): {err}", path.display()))?;
+    Ok(String::from_utf8_lossy(bytes.as_slice()).to_string())
+}
+
+fn is_secret_value_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-')
+}
+
+fn is_word_char_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn keyword_has_word_boundaries(text: &str, start: usize, length: usize) -> bool {
+    let bytes = text.as_bytes();
+    let end = start + length;
+    let starts_at_boundary = start == 0 || !is_word_char_byte(bytes[start - 1]);
+    let ends_at_boundary = end >= bytes.len() || !is_word_char_byte(bytes[end]);
+    starts_at_boundary && ends_at_boundary
+}
+
+fn is_bearer_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '~' | '-')
+}
+
+fn extract_secret_assignment_excerpt(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let keywords = [
+        "passphrase",
+        "password",
+        "api_key",
+        "api-key",
+        "secret",
+        "token",
+    ];
+    for keyword in keywords {
+        let mut search_start = 0usize;
+        while let Some(index) = lower[search_start..].find(keyword) {
+            let keyword_index = search_start + index;
+            if !keyword_has_word_boundaries(lower.as_str(), keyword_index, keyword.len()) {
+                search_start = keyword_index + keyword.len();
+                if search_start >= lower.len() {
+                    break;
+                }
+                continue;
+            }
+            let delimiter_window_end = (keyword_index + keyword.len() + 24).min(line.len());
+            for delimiter in [':', '='] {
+                if let Some(offset) = line[keyword_index..delimiter_window_end].find(delimiter) {
+                    let delimiter_index = keyword_index + offset;
+                    let mut value = line[delimiter_index + 1..].trim_start();
+                    if value.starts_with('"') || value.starts_with('\'') {
+                        value = &value[1..];
+                    }
+                    let token = value
+                        .chars()
+                        .take_while(|candidate| is_secret_value_char(*candidate))
+                        .collect::<String>();
+                    if token.len() >= 16 {
+                        return Some(line.trim().chars().take(80).collect::<String>());
+                    }
+                }
+            }
+            search_start = keyword_index + keyword.len();
+            if search_start >= lower.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn extract_bearer_excerpt(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let mut search_start = 0usize;
+    while let Some(index) = lower[search_start..].find("bearer ") {
+        let token_start = search_start + index + "bearer ".len();
+        let token = line[token_start..]
+            .chars()
+            .take_while(|candidate| is_bearer_char(*candidate))
+            .collect::<String>();
+        if token.len() >= 20 {
+            return Some(line.trim().chars().take(80).collect::<String>());
+        }
+        search_start = token_start;
+        if search_start >= lower.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn line_contains_forbidden_inline_passphrase_flag(line: &str) -> bool {
+    let passphrase_flag = concat!("--pass", "phrase");
+    let mut search_start = 0usize;
+    while let Some(index) = line[search_start..].find(passphrase_flag) {
+        let flag_start = search_start + index;
+        let suffix = &line[flag_start + passphrase_flag.len()..];
+        if !suffix.starts_with("-file") {
+            return true;
+        }
+        search_start = flag_start + passphrase_flag.len();
+        if search_start >= line.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn parse_mktemp_secret_variable(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let assignment = trimmed.strip_prefix("local ").unwrap_or(trimmed);
+    let (variable, value) = assignment.split_once('=')?;
+    let variable = variable.trim();
+    if variable.is_empty() {
+        return None;
+    }
+    let mut characters = variable.chars();
+    let first = characters.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !characters.all(|character| character == '_' || character.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if value.trim() != "$(mktemp)" {
+        return None;
+    }
+    let lowered = variable.to_ascii_lowercase();
+    if !(lowered.contains("passphrase")
+        || lowered.contains("secret")
+        || lowered.contains("private")
+        || lowered.contains("signing"))
+    {
+        return None;
+    }
+    Some(variable.to_string())
+}
+
+pub fn execute_ops_check_secrets_hygiene(
+    config: CheckSecretsHygieneConfig,
+) -> Result<String, String> {
+    let root = phase1_resolve_path(config.root.to_string_lossy().as_ref())?;
+    if !root.is_dir() {
+        return Err(format!(
+            "secrets hygiene scan root must be a directory: {}",
+            root.display()
+        ));
+    }
+
+    let tracked_files = parse_git_tracked_files(root.as_path())?;
+    let runtime_secret_basenames = BTreeSet::from([
+        "membership.owner.key",
+        "trust-evidence.key",
+        "assignment.signing.secret",
+        "wireguard.passphrase",
+        "wireguard.key",
+    ]);
+
+    let tracked_secret_artifacts = tracked_files
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| runtime_secret_basenames.contains(*name))
+                .map(|_| path.display().to_string())
+        })
+        .collect::<Vec<_>>();
+    if !tracked_secret_artifacts.is_empty() {
+        return Err(secrets_hygiene_error(
+            "tracked plaintext runtime secret artifacts are forbidden",
+            tracked_secret_artifacts.as_slice(),
+        ));
+    }
+
+    let excluded_roots = BTreeSet::from([".git", "target", ".cargo-home", ".ci-home"]);
+    let workspace_files = collect_workspace_files(root.as_path(), &excluded_roots)?;
+    let mut workspace_secret_artifacts = Vec::new();
+    for file in &workspace_files {
+        let relative = file.strip_prefix(root.as_path()).map_err(|err| {
+            format!(
+                "resolve relative workspace path failed ({}): {err}",
+                file.display()
+            )
+        })?;
+        if relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| runtime_secret_basenames.contains(name))
+        {
+            workspace_secret_artifacts.push(relative.display().to_string());
+        }
+    }
+    if !workspace_secret_artifacts.is_empty() {
+        workspace_secret_artifacts.sort();
+        return Err(secrets_hygiene_error(
+            "workspace contains runtime plaintext secret artifacts (must be encrypted-at-rest or removed)",
+            workspace_secret_artifacts.as_slice(),
+        ));
+    }
+
+    let artifact_suffixes = BTreeSet::from([".json", ".log", ".ndjson", ".txt", ".env"]);
+    let artifact_roots = ["artifacts", "tmp", "tmpcfg"]
+        .into_iter()
+        .map(|suffix| root.join(suffix))
+        .collect::<Vec<_>>();
+    let mut artifact_leaks = Vec::new();
+    for artifact_root in artifact_roots {
+        if !artifact_root.exists() {
+            continue;
+        }
+        if !artifact_root.is_dir() {
+            continue;
+        }
+        let artifact_files = collect_workspace_files(artifact_root.as_path(), &BTreeSet::new())?;
+        for file in artifact_files {
+            if file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == ".gitkeep")
+            {
+                continue;
+            }
+            let extension = file
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(".{}", value.to_ascii_lowercase()));
+            if extension
+                .as_deref()
+                .is_none_or(|value| !artifact_suffixes.contains(value))
+            {
+                continue;
+            }
+
+            let text = read_text_lossy(file.as_path())?;
+            let relative = file
+                .strip_prefix(root.as_path())
+                .map_err(|err| {
+                    format!(
+                        "resolve artifact relative path failed ({}): {err}",
+                        file.display()
+                    )
+                })?
+                .display()
+                .to_string();
+            for line in text.lines() {
+                let upper = line.to_ascii_uppercase();
+                if upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY-----") {
+                    artifact_leaks.push(format!(
+                        "{relative} [private-key-block] -> {}",
+                        line.trim().chars().take(80).collect::<String>()
+                    ));
+                    break;
+                }
+                if let Some(excerpt) = extract_secret_assignment_excerpt(line) {
+                    artifact_leaks.push(format!("{relative} [secret-assignment] -> {excerpt}"));
+                    break;
+                }
+                if let Some(excerpt) = extract_bearer_excerpt(line) {
+                    artifact_leaks.push(format!("{relative} [bearer-token] -> {excerpt}"));
+                    break;
+                }
+            }
+        }
+    }
+    if !artifact_leaks.is_empty() {
+        artifact_leaks.sort();
+        return Err(secrets_hygiene_error(
+            "artifact/log leak scan detected possible secrets",
+            artifact_leaks.as_slice(),
+        ));
+    }
+
+    let mut argv_violations = Vec::new();
+    for relative in &tracked_files {
+        let extension = relative.extension().and_then(|value| value.to_str());
+        if !matches!(extension, Some("rs" | "sh" | "service" | "timer")) {
+            continue;
+        }
+        if relative == Path::new("scripts/ci/secrets_hygiene_gates.sh") {
+            continue;
+        }
+        let absolute = root.join(relative);
+        if !absolute.is_file() {
+            continue;
+        }
+        let text = read_text_lossy(absolute.as_path())?;
+        for (line_index, line) in text.lines().enumerate() {
+            let line_number = line_index + 1;
+            if line_contains_forbidden_inline_passphrase_flag(line) {
+                argv_violations.push(format!(
+                    "{}:{line_number} contains forbidden inline secret argv flag ({}{}{}) -> {}",
+                    relative.display(),
+                    concat!("--pass", "phrase"),
+                    "(?!-",
+                    "file)",
+                    line.trim()
+                ));
+            }
+            for flag in [
+                concat!("--pass", "word"),
+                concat!("--secret", "-value"),
+                concat!("--token", "-value"),
+            ] {
+                if line.contains(flag) {
+                    argv_violations.push(format!(
+                        "{}:{line_number} contains forbidden inline secret argv flag ({flag}) -> {}",
+                        relative.display(),
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    if !argv_violations.is_empty() {
+        argv_violations.sort();
+        return Err(secrets_hygiene_error(
+            "inline secret argv flags detected",
+            argv_violations.as_slice(),
+        ));
+    }
+
+    let mut rm_violations = Vec::new();
+    let sensitive_names = [
+        "membership.owner.key",
+        "trust-evidence.key",
+        "assignment.signing.secret",
+        "wireguard.passphrase",
+        "wireguard.key",
+    ];
+    let mut mktemp_violations = Vec::new();
+    for relative in &tracked_files {
+        if relative.extension().and_then(|value| value.to_str()) != Some("sh") {
+            continue;
+        }
+        let absolute = root.join(relative);
+        if !absolute.is_file() {
+            continue;
+        }
+        let text = read_text_lossy(absolute.as_path())?;
+        for (line_index, line) in text.lines().enumerate() {
+            let line_number = line_index + 1;
+            if line.contains("rm -f") && sensitive_names.iter().any(|name| line.contains(name)) {
+                rm_violations.push(format!(
+                    "{}:{line_number} -> {}",
+                    relative.display(),
+                    line.trim()
+                ));
+            }
+            if let Some(variable) = parse_mktemp_secret_variable(line) {
+                let braced = format!("${{{variable}}}");
+                let chmod_plain = format!("chmod 600 \"{braced}\"");
+                let chmod_run_root = format!("run_root chmod 600 \"{braced}\"");
+                let cleanup_plain = format!("secure_remove_file \"{braced}\"");
+                let cleanup_scope = format!("secure_remove_file_with_scope \"{braced}\"");
+
+                if !text.contains(chmod_plain.as_str()) && !text.contains(chmod_run_root.as_str()) {
+                    mktemp_violations.push(format!(
+                        "{}:{line_number} missing chmod 600 for mktemp secret variable {}",
+                        relative.display(),
+                        variable
+                    ));
+                }
+                if !text.contains(cleanup_plain.as_str()) && !text.contains(cleanup_scope.as_str())
+                {
+                    mktemp_violations.push(format!(
+                        "{}:{line_number} missing secure-remove cleanup for mktemp secret variable {}",
+                        relative.display(),
+                        variable
+                    ));
+                }
+            }
+        }
+    }
+
+    if !rm_violations.is_empty() {
+        rm_violations.sort();
+        return Err(secrets_hygiene_error(
+            "shell scripts use rm -f on sensitive key/passphrase artifacts",
+            rm_violations.as_slice(),
+        ));
+    }
+
+    if !mktemp_violations.is_empty() {
+        mktemp_violations.sort();
+        return Err(secrets_hygiene_error(
+            "mktemp secret handling is missing strict tmp-mode or secure cleanup",
+            mktemp_violations.as_slice(),
+        ));
+    }
+
+    Ok("Secrets hygiene gate: PASS".to_string())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1662,7 +2170,9 @@ mod tests {
     use super::{
         CheckDependencyExceptionsConfig, CheckPerfRegressionConfig,
         execute_ops_check_dependency_exceptions, execute_ops_check_perf_regression,
-        parse_bool_value, parse_utc_to_unix, phase1_collect_measured_input_from_source,
+        extract_bearer_excerpt, extract_secret_assignment_excerpt,
+        line_contains_forbidden_inline_passphrase_flag, parse_bool_value,
+        parse_mktemp_secret_variable, parse_utc_to_unix, phase1_collect_measured_input_from_source,
         phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
     };
     use std::os::unix::fs::PermissionsExt;
@@ -1921,5 +2431,49 @@ mod tests {
 
         let _ = std::fs::remove_file(phase1);
         let _ = std::fs::remove_file(phase3);
+    }
+
+    #[test]
+    fn secrets_assignment_excerpt_detects_secret_value_shape() {
+        let line = "token = \"AbCdEfGhIjKlMnOpQrSt\"";
+        let excerpt = extract_secret_assignment_excerpt(line);
+        assert!(excerpt.is_some());
+    }
+
+    #[test]
+    fn secrets_assignment_excerpt_requires_word_boundaries() {
+        let line = "RUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"/etc/rustynet/assignment.signing.secret\"";
+        let excerpt = extract_secret_assignment_excerpt(line);
+        assert!(excerpt.is_none());
+    }
+
+    #[test]
+    fn bearer_excerpt_detects_bearer_token_shape() {
+        let line = "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345";
+        let excerpt = extract_bearer_excerpt(line);
+        assert!(excerpt.is_some());
+    }
+
+    #[test]
+    fn inline_passphrase_flag_detection_allows_file_variant_only() {
+        assert!(line_contains_forbidden_inline_passphrase_flag(
+            format!("rustynet trust keygen {} foo", concat!("--pass", "phrase")).as_str()
+        ));
+        assert!(!line_contains_forbidden_inline_passphrase_flag(
+            format!(
+                "rustynet trust keygen {} /tmp/cred",
+                concat!("--pass", "phrase-file")
+            )
+            .as_str()
+        ));
+    }
+
+    #[test]
+    fn mktemp_secret_variable_parser_matches_expected_form() {
+        assert_eq!(
+            parse_mktemp_secret_variable("local signing_secret_tmp=$(mktemp)"),
+            Some("signing_secret_tmp".to_string())
+        );
+        assert_eq!(parse_mktemp_secret_variable("tmp=$(mktemp)"), None);
     }
 }

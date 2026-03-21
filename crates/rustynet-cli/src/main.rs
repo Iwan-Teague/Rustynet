@@ -290,6 +290,9 @@ enum OpsCommand {
     CheckPerfRegression {
         config: ops_phase1::CheckPerfRegressionConfig,
     },
+    CheckSecretsHygiene {
+        config: ops_phase1::CheckSecretsHygieneConfig,
+    },
     CollectPhase9RawEvidence,
     GeneratePhase9Artifacts,
     VerifyPhase9Readiness,
@@ -297,6 +300,9 @@ enum OpsCommand {
     GeneratePhase10Artifacts,
     VerifyPhase10Readiness,
     VerifyPhase10Provenance,
+    WritePhase10Hp2TraversalReports {
+        config: ops_phase9::WritePhase10Hp2TraversalReportsConfig,
+    },
     VerifyPhase6PlatformReadiness,
     VerifyPhase6ParityEvidence,
     VerifyRequiredTestOutput {
@@ -675,6 +681,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     }),
             },
         }),
+        "check-secrets-hygiene" => Ok(OpsCommand::CheckSecretsHygiene {
+            config: ops_phase1::CheckSecretsHygieneConfig {
+                root: parser
+                    .value("--root")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(ops_phase1::DEFAULT_SECRETS_HYGIENE_SCAN_ROOT_PATH)
+                    }),
+            },
+        }),
         "collect-phase9-raw-evidence" => {
             if args.len() != 1 {
                 return Err("ops collect-phase9-raw-evidence does not accept options".to_string());
@@ -717,6 +733,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::VerifyPhase10Provenance)
         }
+        "write-phase10-hp2-traversal-reports" => Ok(OpsCommand::WritePhase10Hp2TraversalReports {
+            config: ops_phase9::WritePhase10Hp2TraversalReportsConfig {
+                source_dir: parser.required_path("--source-dir")?,
+                environment: parser.required("--environment")?,
+                path_selection_log: parser.required_path("--path-selection-log")?,
+                probe_security_log: parser.required_path("--probe-security-log")?,
+            },
+        }),
         "verify-phase6-platform-readiness" => {
             if args.len() != 1 {
                 return Err(
@@ -2939,6 +2963,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::CheckPerfRegression { config } => {
             ops_phase1::execute_ops_check_perf_regression(config)
         }
+        OpsCommand::CheckSecretsHygiene { config } => {
+            ops_phase1::execute_ops_check_secrets_hygiene(config)
+        }
         OpsCommand::CollectPhase9RawEvidence => {
             ops_phase9::execute_ops_collect_phase9_raw_evidence()
         }
@@ -2950,6 +2977,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VerifyPhase10Readiness => ops_phase9::execute_ops_verify_phase10_readiness(),
         OpsCommand::VerifyPhase10Provenance => ops_phase9::execute_ops_verify_phase10_provenance(),
+        OpsCommand::WritePhase10Hp2TraversalReports { config } => {
+            ops_phase9::execute_ops_write_phase10_hp2_traversal_reports(config)
+        }
         OpsCommand::VerifyPhase6PlatformReadiness => {
             ops_phase9::execute_ops_verify_phase6_platform_readiness()
         }
@@ -9374,6 +9404,7 @@ fn help_text() -> String {
         "  ops check-no-unsafe-rust-sources [--root <path>]",
         "  ops check-dependency-exceptions [--path <path>]",
         "  ops check-perf-regression [--phase1-report <path>] [--phase3-report <path>]",
+        "  ops check-secrets-hygiene [--root <path>]",
         "  ops collect-phase9-raw-evidence",
         "  ops generate-phase9-artifacts",
         "  ops verify-phase9-readiness",
@@ -9381,6 +9412,7 @@ fn help_text() -> String {
         "  ops generate-phase10-artifacts",
         "  ops verify-phase10-readiness",
         "  ops verify-phase10-provenance",
+        "  ops write-phase10-hp2-traversal-reports --source-dir <path> --environment <label> --path-selection-log <path> --probe-security-log <path>",
         "  ops verify-phase6-platform-readiness",
         "  ops verify-phase6-parity-evidence",
         "  ops verify-required-test-output --output <path> --package <name> --test-filter <pattern>",
@@ -9779,6 +9811,14 @@ mod tests {
         ]);
         assert!(format!("{check_perf_regression:?}").contains("CheckPerfRegression"));
 
+        let check_secrets_hygiene = parse_command(&[
+            "ops".to_string(),
+            "check-secrets-hygiene".to_string(),
+            "--root".to_string(),
+            ".".to_string(),
+        ]);
+        assert!(format!("{check_secrets_hygiene:?}").contains("CheckSecretsHygiene"));
+
         let collect_phase9_raw =
             parse_command(&["ops".to_string(), "collect-phase9-raw-evidence".to_string()]);
         assert!(format!("{collect_phase9_raw:?}").contains("CollectPhase9RawEvidence"));
@@ -9806,6 +9846,22 @@ mod tests {
         let verify_phase10_provenance =
             parse_command(&["ops".to_string(), "verify-phase10-provenance".to_string()]);
         assert!(format!("{verify_phase10_provenance:?}").contains("VerifyPhase10Provenance"));
+
+        let write_phase10_hp2_reports = parse_command(&[
+            "ops".to_string(),
+            "write-phase10-hp2-traversal-reports".to_string(),
+            "--source-dir".to_string(),
+            "artifacts/phase10/source".to_string(),
+            "--environment".to_string(),
+            "ci".to_string(),
+            "--path-selection-log".to_string(),
+            "artifacts/phase10/source/traversal_path_selection_tests.log".to_string(),
+            "--probe-security-log".to_string(),
+            "artifacts/phase10/source/traversal_probe_security_tests.log".to_string(),
+        ]);
+        assert!(
+            format!("{write_phase10_hp2_reports:?}").contains("WritePhase10Hp2TraversalReports")
+        );
 
         let verify_phase6_platform_readiness = parse_command(&[
             "ops".to_string(),

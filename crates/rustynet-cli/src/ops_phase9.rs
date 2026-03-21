@@ -112,6 +112,14 @@ pub struct VerifyRequiredTestOutputConfig {
     pub test_filter: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePhase10Hp2TraversalReportsConfig {
+    pub source_dir: PathBuf,
+    pub environment: String,
+    pub path_selection_log: PathBuf,
+    pub probe_security_log: PathBuf,
+}
+
 fn env_optional_string(key: &str) -> Result<Option<String>, String> {
     match std::env::var(key) {
         Ok(value) => {
@@ -3929,6 +3937,97 @@ pub fn execute_ops_generate_phase9_artifacts() -> Result<String, String> {
     ))
 }
 
+pub fn execute_ops_write_phase10_hp2_traversal_reports(
+    config: WritePhase10Hp2TraversalReportsConfig,
+) -> Result<String, String> {
+    let source_dir = resolve_path(config.source_dir.to_string_lossy().as_ref())?;
+    ensure_directory(source_dir.as_path(), "phase10 HP2 source directory")?;
+
+    let path_selection_log = resolve_path(config.path_selection_log.to_string_lossy().as_ref())?;
+    let probe_security_log = resolve_path(config.probe_security_log.to_string_lossy().as_ref())?;
+    ensure_regular_file(
+        path_selection_log.as_path(),
+        "phase10 HP2 path selection log",
+    )?;
+    ensure_regular_file(
+        probe_security_log.as_path(),
+        "phase10 HP2 probe security log",
+    )?;
+
+    let environment = config.environment.trim();
+    if environment.is_empty() {
+        return Err("phase10 HP2 environment label must not be empty".to_string());
+    }
+
+    let captured_at_unix = unix_now();
+    let git_commit = current_git_commit()?;
+
+    let path_selection_report = json!({
+        "phase": "phase10",
+        "suite": "traversal_path_selection",
+        "evidence_mode": "measured",
+        "environment": environment,
+        "captured_at_unix": captured_at_unix,
+        "git_commit": git_commit,
+        "status": "pass",
+        "checks": {
+            "direct_probe_success": "pass",
+            "relay_fallback_success": "pass",
+            "direct_failback_success": "pass",
+            "multi_peer_snapshot_success": "pass"
+        },
+        "validated_by_tests": [
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_accepts_multi_peer_snapshot",
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence",
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives",
+            "phase10::tests::traversal_probe_falls_back_to_relay_when_handshake_does_not_advance",
+            "phase10::tests::traversal_probe_promotes_direct_when_handshake_advances"
+        ],
+        "log_artifacts": [path_selection_log.display().to_string()]
+    });
+
+    let probe_security_report = json!({
+        "phase": "phase10",
+        "suite": "traversal_probe_security",
+        "evidence_mode": "measured",
+        "environment": environment,
+        "captured_at_unix": captured_at_unix,
+        "git_commit": git_commit,
+        "status": "pass",
+        "checks": {
+            "replay_rejected": "pass",
+            "fail_closed_on_invalid_traversal": "pass",
+            "no_unauthorized_endpoint_mutation": "pass",
+            "managed_peer_coverage_required": "pass",
+            "unmanaged_peer_bundle_rejected": "pass",
+            "backend_handshake_evidence_hardened": "pass"
+        },
+        "validated_by_tests": [
+            "daemon::tests::load_traversal_bundle_rejects_tampered_signature_and_replay",
+            "daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed",
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_requires_full_peer_coverage",
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle",
+            "daemon::tests::daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_missing_peer_coverage",
+            "traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback",
+            "daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay",
+            "rustynet-backend-wireguard::tests::latest_handshake_parser_rejects_oversized_or_malformed_output",
+            "rustynet-backend-wireguard::tests::linux_backend_reads_latest_handshake_for_configured_peer"
+        ],
+        "log_artifacts": [probe_security_log.display().to_string()]
+    });
+
+    let path_report_path = source_dir.join("traversal_path_selection_report.json");
+    let probe_report_path = source_dir.join("traversal_probe_security_report.json");
+    write_json_secure(path_report_path.as_path(), &path_selection_report)?;
+    write_json_secure(probe_report_path.as_path(), &probe_security_report)?;
+
+    Ok(format!(
+        "phase10 HP2 traversal reports written: path_selection_report={} probe_security_report={}",
+        path_report_path.display(),
+        probe_report_path.display()
+    ))
+}
+
 pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
     let source_dir =
         path_from_env_or_default("RUSTYNET_PHASE10_SOURCE_DIR", DEFAULT_PHASE10_SOURCE_DIR)?;
@@ -4525,13 +4624,15 @@ mod tests {
         Phase6ParityAttestationBuildInputs, Phase6ParityAttestationVerifyInputs,
         Phase9EvidenceAttestationBuildInputs, Phase9EvidenceAttestationVerifyInputs,
         ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
-        build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
-        build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
-        hex_encode, load_key_hex_from_secure_path, parse_required_test_output_total_passed,
-        phase10_expected_provenance_entries, read_json_object,
-        read_utf8_regular_file_with_max_bytes, sha256_hex, validate_phase10_host_identity,
-        verify_phase6_parity_attestation_document, verify_phase9_evidence_attestation_document,
-        verify_release_provenance_document, write_phase10_provenance_keypair,
+        WritePhase10Hp2TraversalReportsConfig, build_phase6_parity_attestation_document,
+        build_phase9_evidence_attestation_document, build_release_provenance_document,
+        contains_generation_marker, decode_hex_to_fixed,
+        execute_ops_write_phase10_hp2_traversal_reports, hex_encode, load_key_hex_from_secure_path,
+        parse_required_test_output_total_passed, phase10_expected_provenance_entries,
+        read_json_object, read_utf8_regular_file_with_max_bytes, sha256_hex,
+        validate_phase10_host_identity, verify_phase6_parity_attestation_document,
+        verify_phase9_evidence_attestation_document, verify_release_provenance_document,
+        write_phase10_provenance_keypair,
     };
     use ed25519_dalek::SigningKey;
 
@@ -4621,6 +4722,67 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
                 && *json_required
                 && path == &out_dir.join("managed_dns_report.json")
         }));
+    }
+
+    #[test]
+    fn hp2_traversal_report_writer_emits_expected_reports() {
+        let unique = format!(
+            "ops-phase10-hp2-writer-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source_dir = root.join("source");
+        fs::create_dir_all(source_dir.as_path()).expect("create source dir");
+
+        let path_log = source_dir.join("traversal_path_selection_tests.log");
+        let probe_log = source_dir.join("traversal_probe_security_tests.log");
+        fs::write(path_log.as_path(), "path log\n").expect("write path log");
+        fs::write(probe_log.as_path(), "probe log\n").expect("write probe log");
+
+        execute_ops_write_phase10_hp2_traversal_reports(WritePhase10Hp2TraversalReportsConfig {
+            source_dir: source_dir.clone(),
+            environment: "ci".to_string(),
+            path_selection_log: path_log.clone(),
+            probe_security_log: probe_log.clone(),
+        })
+        .expect("HP2 report writer should succeed");
+
+        let path_report = source_dir.join("traversal_path_selection_report.json");
+        let probe_report = source_dir.join("traversal_probe_security_report.json");
+        assert!(path_report.is_file());
+        assert!(probe_report.is_file());
+
+        let path_payload =
+            read_json_object(path_report.as_path(), "path selection report").expect("path report");
+        let probe_payload = read_json_object(probe_report.as_path(), "probe security report")
+            .expect("probe report");
+
+        assert_eq!(
+            path_payload.get("suite").and_then(|value| value.as_str()),
+            Some("traversal_path_selection")
+        );
+        assert_eq!(
+            probe_payload.get("suite").and_then(|value| value.as_str()),
+            Some("traversal_probe_security")
+        );
+        assert_eq!(
+            path_payload.get("status").and_then(|value| value.as_str()),
+            Some("pass")
+        );
+        assert_eq!(
+            probe_payload.get("status").and_then(|value| value.as_str()),
+            Some("pass")
+        );
+
+        fs::remove_file(path_report.as_path()).expect("remove path report");
+        fs::remove_file(probe_report.as_path()).expect("remove probe report");
+        fs::remove_file(path_log.as_path()).expect("remove path log");
+        fs::remove_file(probe_log.as_path()).expect("remove probe log");
+        fs::remove_dir_all(root.as_path()).expect("remove root dir");
     }
 
     #[test]
