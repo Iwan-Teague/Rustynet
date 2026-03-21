@@ -162,7 +162,7 @@ main() {
   local switch_ts first_switch_ts reconvergence_secs
   local local_ts
   local client_status client_route client_endpoints
-  local issue_script issue_env assign_pub_local exit_assignment_local relay_assignment_local client_assignment_local
+  local issue_env assign_pub_local exit_assignment_local relay_assignment_local client_assignment_local
   local exit_refresh_local relay_refresh_local client_refresh_local
   local client_status_after_roam client_route_after_roam client_endpoints_after_roam
   local artifact_dir
@@ -276,7 +276,6 @@ main() {
 
   live_lab_run_root "$EXIT_HOST" "root ip addr show dev '$ROAM_INTERFACE' | grep -Fq '${ROAM_ALIAS_IP}/${ROAM_PREFIX}' || root ip addr add '${ROAM_ALIAS_IP}/${ROAM_PREFIX}' dev '$ROAM_INTERFACE'"
 
-  issue_script="$LIVE_LAB_WORK_DIR/rn_issue_cross_network_roam.sh"
   issue_env="$LIVE_LAB_WORK_DIR/rn_issue_cross_network_roam.env"
   assign_pub_local="$LIVE_LAB_WORK_DIR/assignment.pub"
   exit_assignment_local="$LIVE_LAB_WORK_DIR/assignment-exit"
@@ -292,69 +291,12 @@ main() {
   NODES_SPEC="${EXIT_NODE_ID}|${ROAM_ALIAS_IP}:51820|${EXIT_PUB_HEX};${RELAY_NODE_ID}|${RELAY_ADDR}:51820|${RELAY_PUB_HEX};${CLIENT_NODE_ID}|${CLIENT_ADDR}:51820|${CLIENT_PUB_HEX}"
   ALLOW_SPEC="${CLIENT_NODE_ID}|${RELAY_NODE_ID};${RELAY_NODE_ID}|${CLIENT_NODE_ID};${CLIENT_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${CLIENT_NODE_ID};${RELAY_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${RELAY_NODE_ID}"
 
-  cat > "$issue_script" <<'ISSUEEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: rn_issue_cross_network_roam.sh <env-file>" >&2
-  exit 2
-fi
-
-source "$1"
-
-root() {
-  sudo -n "$@"
-}
-
-PASS_FILE="$(mktemp /tmp/rn-cross-network-roam-passphrase.XXXXXX)"
-cleanup() {
-  if [[ -f "$PASS_FILE" ]]; then
-    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
-root chmod 0600 "$PASS_FILE"
-
-ISSUE_DIR="/run/rustynet/assignment-issue"
-root rm -rf "$ISSUE_DIR"
-root install -d -m 0700 "$ISSUE_DIR"
-
-issue_bundle() {
-  local target_node_id="$1"
-  local output_name="$2"
-  shift 2
-  root rustynet assignment issue \
-    --target-node-id "$target_node_id" \
-    --nodes "$NODES_SPEC" \
-    --allow "$ALLOW_SPEC" \
-    --signing-secret /etc/rustynet/assignment.signing.secret \
-    --signing-secret-passphrase-file "$PASS_FILE" \
-    --output "$ISSUE_DIR/$output_name" \
-    --verifier-key-output "$ISSUE_DIR/rn-assignment.pub" \
-    "$@" \
-    --ttl-secs 300
-}
-
-issue_bundle "$EXIT_NODE_ID" "rn-assignment-$EXIT_NODE_ID.assignment"
-issue_bundle "$RELAY_NODE_ID" "rn-assignment-$RELAY_NODE_ID.assignment" --exit-node-id "$EXIT_NODE_ID"
-issue_bundle "$CLIENT_NODE_ID" "rn-assignment-$CLIENT_NODE_ID.assignment" --exit-node-id "$EXIT_NODE_ID"
-ISSUEEOF
-  chmod 700 "$issue_script"
-
   : > "$issue_env"
-  live_lab_append_env_assignment "$issue_env" "EXIT_NODE_ID" "$EXIT_NODE_ID"
-  live_lab_append_env_assignment "$issue_env" "RELAY_NODE_ID" "$RELAY_NODE_ID"
-  live_lab_append_env_assignment "$issue_env" "CLIENT_NODE_ID" "$CLIENT_NODE_ID"
   live_lab_append_env_assignment "$issue_env" "NODES_SPEC" "$NODES_SPEC"
   live_lab_append_env_assignment "$issue_env" "ALLOW_SPEC" "$ALLOW_SPEC"
+  live_lab_append_env_assignment "$issue_env" "ASSIGNMENTS_SPEC" "${EXIT_NODE_ID}|-;${RELAY_NODE_ID}|${EXIT_NODE_ID};${CLIENT_NODE_ID}|${EXIT_NODE_ID}"
 
-  live_lab_scp_to "$issue_script" "$EXIT_HOST" "/tmp/rn_issue_cross_network_roam.sh"
-  live_lab_scp_to "$issue_env" "$EXIT_HOST" "/tmp/rn_issue_cross_network_roam.env"
-  live_lab_run_root "$EXIT_HOST" "root chmod 700 /tmp/rn_issue_cross_network_roam.sh && root bash /tmp/rn_issue_cross_network_roam.sh /tmp/rn_issue_cross_network_roam.env"
-  live_lab_run_root "$EXIT_HOST" "root rm -f /tmp/rn_issue_cross_network_roam.sh /tmp/rn_issue_cross_network_roam.env"
+  live_lab_issue_assignment_bundles_from_env "$EXIT_HOST" "$issue_env" "/tmp/rn_issue_cross_network_roam.env"
 
   live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment.pub" > "$assign_pub_local"
   live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment-$EXIT_NODE_ID.assignment" > "$exit_assignment_local"

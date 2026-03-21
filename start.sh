@@ -682,17 +682,10 @@ materialize_signing_passphrase_file() {
     print_err "rustynet CLI is required for signing passphrase materialization."
     return 1
   fi
-  local tmp_passphrase
-  tmp_passphrase="$(mktemp)"
-  chmod 600 "${tmp_passphrase}" || {
-    print_err "Failed to set secure mode on temporary signing passphrase file."
-    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
-    return 1
-  }
+  local tmp_passphrase=""
 
-  local rust_ops_status=1
   if is_linux_host; then
-    run_root env \
+    if ! tmp_passphrase="$(run_root env \
       RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
       RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
@@ -700,9 +693,12 @@ materialize_signing_passphrase_file() {
       RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
       RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
-      rustynet ops materialize-signing-passphrase --output "${tmp_passphrase}" >/dev/null 2>&1 || rust_ops_status=$?
+      rustynet ops materialize-signing-passphrase-temp)"; then
+      print_err "Rust-backed signing passphrase materialization failed; setup is fail-closed."
+      return 1
+    fi
   elif is_macos_host; then
-    env \
+    if ! tmp_passphrase="$(env \
       RUSTYNET_HOST_PROFILE="${HOST_PROFILE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
       RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
@@ -710,36 +706,25 @@ materialize_signing_passphrase_file() {
       RUSTYNET_ASSIGNMENT_SIGNING_SECRET="/etc/rustynet/assignment.signing.secret" \
       RUSTYNET_MACOS_PASSPHRASE_KEYCHAIN_SERVICE="${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
       RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" \
-      rustynet ops materialize-signing-passphrase --output "${tmp_passphrase}" >/dev/null 2>&1 || rust_ops_status=$?
+      rustynet ops materialize-signing-passphrase-temp)"; then
+      print_err "Rust-backed signing passphrase materialization failed; setup is fail-closed."
+      return 1
+    fi
   else
-    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
     print_err "Unsupported host profile for signing passphrase materialization: ${HOST_PROFILE}"
     return 1
   fi
 
-  if [[ "${rust_ops_status}" != "0" ]]; then
-    secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
-    print_err "Rust-backed signing passphrase materialization failed; setup is fail-closed."
+  if [[ -z "${tmp_passphrase}" || "${tmp_passphrase}" != /* ]]; then
+    [[ -n "${tmp_passphrase}" ]] && secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || true
+    print_err "Rust-backed signing passphrase materialization returned an invalid temp path."
     return 1
   fi
 
-  if is_linux_host; then
-    run_root chown root:root "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
-      print_err "Failed to set signing passphrase file owner to root:root."
-      return 1
-    }
-    run_root chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
-      print_err "Failed to set signing passphrase file mode to 0600."
-      return 1
-    }
-  else
-    chmod 600 "${tmp_passphrase}" >/dev/null 2>&1 || {
-      secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || return 1
-      print_err "Failed to set signing passphrase file mode to 0600."
-      return 1
-    }
+  if [[ ! -f "${tmp_passphrase}" || -L "${tmp_passphrase}" ]]; then
+    [[ -e "${tmp_passphrase}" || -L "${tmp_passphrase}" ]] && secure_remove_temp_passphrase_or_fail "${tmp_passphrase}" || true
+    print_err "Rust-backed signing passphrase materialization produced an invalid file path."
+    return 1
   fi
 
   printf -v "${__out_var}" '%s' "${tmp_passphrase}"

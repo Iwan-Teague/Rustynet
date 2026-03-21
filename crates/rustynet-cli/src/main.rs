@@ -275,6 +275,8 @@ enum TrustCommand {
     },
 }
 
+mod ops_ci_release_perf;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpsCommand {
     VerifyRuntimeBinaryCustody,
@@ -284,6 +286,23 @@ enum OpsCommand {
     RefreshAssignment,
     CollectPhase1MeasuredInput,
     RunPhase1Baseline,
+    PrepareAdvisoryDb {
+        config: ops_ci_release_perf::PrepareAdvisoryDbConfig,
+    },
+    RunPhase1CiGates,
+    RunPhase9CiGates,
+    RunPhase10CiGates,
+    RunMembershipCiGates,
+    RunSupplyChainIntegrityGates,
+    RunSecurityRegressionGates,
+    RunActiveNetworkSecurityGates,
+    RunPhase10Hp2Gates,
+    GenerateReleaseSbom,
+    CreateReleaseProvenance {
+        config: ops_ci_release_perf::CreateReleaseProvenanceConfig,
+    },
+    RunPhase3Baseline,
+    RunFuzzSmoke,
     CheckNoUnsafeRustSources {
         config: ops_phase1::CheckNoUnsafeRustSourcesConfig,
     },
@@ -463,6 +482,7 @@ enum OpsCommand {
     MaterializeSigningPassphrase {
         output_path: PathBuf,
     },
+    MaterializeSigningPassphraseTemp,
     SetAssignmentRefreshExitNode {
         env_path: PathBuf,
         exit_node_id: Option<String>,
@@ -519,6 +539,12 @@ enum OpsCommand {
         exit_pubkey_hex: String,
         client_pubkey_hex: String,
         artifact_dir: Option<PathBuf>,
+    },
+    E2eIssueAssignmentBundlesFromEnv {
+        config: ops_e2e::E2eIssueAssignmentBundlesFromEnvConfig,
+    },
+    E2eIssueTraversalBundlesFromEnv {
+        config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig,
     },
 }
 
@@ -665,6 +691,101 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops run-phase1-baseline does not accept options".to_string());
             }
             Ok(OpsCommand::RunPhase1Baseline)
+        }
+        "prepare-advisory-db" => {
+            if args.len() != 2 {
+                return Err("usage: ops prepare-advisory-db <advisory_db_path>".to_string());
+            }
+            Ok(OpsCommand::PrepareAdvisoryDb {
+                config: ops_ci_release_perf::PrepareAdvisoryDbConfig {
+                    target_db: PathBuf::from(args[1].as_str()),
+                },
+            })
+        }
+        "run-phase1-ci-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-phase1-ci-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase1CiGates)
+        }
+        "run-phase9-ci-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-phase9-ci-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase9CiGates)
+        }
+        "run-phase10-ci-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-phase10-ci-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase10CiGates)
+        }
+        "run-membership-ci-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-membership-ci-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunMembershipCiGates)
+        }
+        "run-supply-chain-integrity-gates" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops run-supply-chain-integrity-gates does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::RunSupplyChainIntegrityGates)
+        }
+        "run-security-regression-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-security-regression-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunSecurityRegressionGates)
+        }
+        "run-active-network-security-gates" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops run-active-network-security-gates does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::RunActiveNetworkSecurityGates)
+        }
+        "run-phase10-hp2-gates" => {
+            if args.len() != 1 {
+                return Err("ops run-phase10-hp2-gates does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase10Hp2Gates)
+        }
+        "generate-release-sbom" => {
+            if args.len() != 1 {
+                return Err("ops generate-release-sbom does not accept options".to_string());
+            }
+            Ok(OpsCommand::GenerateReleaseSbom)
+        }
+        "create-release-provenance" => {
+            if args.len() != 4 {
+                return Err(
+                    "usage: ops create-release-provenance <artifact-path> <track> <output-json>"
+                        .to_string(),
+                );
+            }
+            Ok(OpsCommand::CreateReleaseProvenance {
+                config: ops_ci_release_perf::CreateReleaseProvenanceConfig {
+                    artifact_path: PathBuf::from(args[1].as_str()),
+                    track: args[2].clone(),
+                    output_json: PathBuf::from(args[3].as_str()),
+                },
+            })
+        }
+        "run-phase3-baseline" => {
+            if args.len() != 1 {
+                return Err("ops run-phase3-baseline does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunPhase3Baseline)
+        }
+        "run-fuzz-smoke" => {
+            if args.len() != 1 {
+                return Err("ops run-fuzz-smoke does not accept options".to_string());
+            }
+            Ok(OpsCommand::RunFuzzSmoke)
         }
         "check-no-unsafe-rust-sources" => Ok(OpsCommand::CheckNoUnsafeRustSources {
             config: ops_phase1::CheckNoUnsafeRustSourcesConfig {
@@ -1678,6 +1799,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "materialize-signing-passphrase" => Ok(OpsCommand::MaterializeSigningPassphrase {
             output_path: parser.required_path("--output")?,
         }),
+        "materialize-signing-passphrase-temp" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops materialize-signing-passphrase-temp does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::MaterializeSigningPassphraseTemp)
+        }
         "set-assignment-refresh-exit-node" => Ok(OpsCommand::SetAssignmentRefreshExitNode {
             env_path: parser.path_or_default(
                 "--env-path",
@@ -1827,6 +1956,24 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             exit_pubkey_hex: parser.required("--exit-pubkey-hex")?,
             client_pubkey_hex: parser.required("--client-pubkey-hex")?,
             artifact_dir: parser.optional_path("--artifact-dir"),
+        }),
+        "e2e-issue-assignment-bundles-from-env" => {
+            Ok(OpsCommand::E2eIssueAssignmentBundlesFromEnv {
+                config: ops_e2e::E2eIssueAssignmentBundlesFromEnvConfig {
+                    env_file: parser.required_path("--env-file")?,
+                    issue_dir: parser
+                        .optional_path("--issue-dir")
+                        .unwrap_or_else(|| PathBuf::from("/run/rustynet/assignment-issue")),
+                },
+            })
+        }
+        "e2e-issue-traversal-bundles-from-env" => Ok(OpsCommand::E2eIssueTraversalBundlesFromEnv {
+            config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig {
+                env_file: parser.required_path("--env-file")?,
+                issue_dir: parser
+                    .optional_path("--issue-dir")
+                    .unwrap_or_else(|| PathBuf::from("/run/rustynet/traversal-issue")),
+            },
         }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
@@ -3006,6 +3153,34 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_phase1::execute_ops_collect_phase1_measured_input()
         }
         OpsCommand::RunPhase1Baseline => ops_phase1::execute_ops_run_phase1_baseline(),
+        OpsCommand::PrepareAdvisoryDb { config } => {
+            ops_ci_release_perf::execute_ops_prepare_advisory_db(config)
+        }
+        OpsCommand::RunPhase1CiGates => ops_ci_release_perf::execute_ops_run_phase1_ci_gates(),
+        OpsCommand::RunPhase9CiGates => ops_ci_release_perf::execute_ops_run_phase9_ci_gates(),
+        OpsCommand::RunPhase10CiGates => ops_ci_release_perf::execute_ops_run_phase10_ci_gates(),
+        OpsCommand::RunMembershipCiGates => {
+            ops_ci_release_perf::execute_ops_run_membership_ci_gates()
+        }
+        OpsCommand::RunSupplyChainIntegrityGates => {
+            ops_ci_release_perf::execute_ops_run_supply_chain_integrity_gates()
+        }
+        OpsCommand::RunSecurityRegressionGates => {
+            ops_ci_release_perf::execute_ops_run_security_regression_gates()
+        }
+        OpsCommand::RunActiveNetworkSecurityGates => {
+            let config = ops_ci_release_perf::active_network_security_config_from_env()?;
+            ops_ci_release_perf::execute_ops_run_active_network_security_gates(config)
+        }
+        OpsCommand::RunPhase10Hp2Gates => {
+            ops_ci_release_perf::execute_ops_run_phase10_hp2_gates()
+        }
+        OpsCommand::GenerateReleaseSbom => ops_ci_release_perf::execute_ops_generate_release_sbom(),
+        OpsCommand::CreateReleaseProvenance { config } => {
+            ops_ci_release_perf::execute_ops_create_release_provenance(config)
+        }
+        OpsCommand::RunPhase3Baseline => ops_ci_release_perf::execute_ops_run_phase3_baseline(),
+        OpsCommand::RunFuzzSmoke => ops_ci_release_perf::execute_ops_run_fuzz_smoke(),
         OpsCommand::CheckNoUnsafeRustSources { config } => {
             ops_phase1::execute_ops_check_no_unsafe_rust_sources(config)
         }
@@ -3219,6 +3394,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::MaterializeSigningPassphrase { output_path } => {
             execute_ops_materialize_signing_passphrase(output_path)
         }
+        OpsCommand::MaterializeSigningPassphraseTemp => {
+            execute_ops_materialize_signing_passphrase_temp()
+        }
         OpsCommand::SetAssignmentRefreshExitNode {
             env_path,
             exit_node_id,
@@ -3302,6 +3480,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             client_pubkey_hex,
             artifact_dir,
         ),
+        OpsCommand::E2eIssueAssignmentBundlesFromEnv { config } => {
+            ops_e2e::execute_ops_e2e_issue_assignment_bundles_from_env(config)
+        }
+        OpsCommand::E2eIssueTraversalBundlesFromEnv { config } => {
+            ops_e2e::execute_ops_e2e_issue_traversal_bundles_from_env(config)
+        }
     }
 }
 
@@ -6384,6 +6568,18 @@ fn execute_ops_materialize_signing_passphrase(output_path: PathBuf) -> Result<St
         "signing passphrase materialized at {}",
         output_path.display()
     ))
+}
+
+fn execute_ops_materialize_signing_passphrase_temp() -> Result<String, String> {
+    let config = signing_passphrase_ops_config_from_env()?;
+    ensure_signing_passphrase_material_ops(&config)?;
+    let temp_output =
+        create_secure_temp_file(std::env::temp_dir().as_path(), "signing-passphrase.")?;
+    if let Err(err) = materialize_signing_passphrase_ops(&config, temp_output.as_path()) {
+        let _ = secure_remove_file(temp_output.as_path());
+        return Err(err);
+    }
+    Ok(temp_output.display().to_string())
 }
 
 fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
@@ -9731,6 +9927,7 @@ fn help_text() -> String {
         "  ops ensure-signing-passphrase-material",
         "  ops ensure-local-trust-material --signing-key-passphrase-file <absolute-path>",
         "  ops materialize-signing-passphrase --output <absolute-path>",
+        "  ops materialize-signing-passphrase-temp",
         "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
         "  ops force-local-assignment-refresh-now",
         "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
@@ -9738,6 +9935,12 @@ fn help_text() -> String {
         "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
         "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
+        "  ops e2e-bootstrap-host --role <role> --node-id <id> --network-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]> [--skip-apt]",
+        "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
+        "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id>",
+        "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
+        "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
+        "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
     ]
     .join("\n")
 }
@@ -11068,6 +11271,14 @@ mod tests {
         ]);
         assert!(format!("{materialize_signing:?}").contains("MaterializeSigningPassphrase"));
 
+        let materialize_signing_temp = parse_command(&[
+            "ops".to_string(),
+            "materialize-signing-passphrase-temp".to_string(),
+        ]);
+        assert!(
+            format!("{materialize_signing_temp:?}").contains("MaterializeSigningPassphraseTemp")
+        );
+
         let set_exit = parse_command(&[
             "ops".to_string(),
             "set-assignment-refresh-exit-node".to_string(),
@@ -11204,6 +11415,26 @@ mod tests {
         ]);
         assert!(format!("{assignments:?}").contains("E2eIssueAssignments"));
         assert!(format!("{assignments:?}").contains("e2e-issue-artifacts.test"));
+
+        let assignments_from_env = parse_command(&[
+            "ops".to_string(),
+            "e2e-issue-assignment-bundles-from-env".to_string(),
+            "--env-file".to_string(),
+            "/tmp/rn-assign.env".to_string(),
+            "--issue-dir".to_string(),
+            "/run/rustynet/assignment-issue".to_string(),
+        ]);
+        assert!(format!("{assignments_from_env:?}").contains("E2eIssueAssignmentBundlesFromEnv"));
+
+        let traversal_from_env = parse_command(&[
+            "ops".to_string(),
+            "e2e-issue-traversal-bundles-from-env".to_string(),
+            "--env-file".to_string(),
+            "/tmp/rn-traversal.env".to_string(),
+            "--issue-dir".to_string(),
+            "/run/rustynet/traversal-issue".to_string(),
+        ]);
+        assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
     }
 
     #[test]

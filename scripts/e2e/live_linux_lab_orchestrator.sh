@@ -1760,183 +1760,6 @@ run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
   --skip-apt
 EOF_BOOTSTRAP
   chmod 700 "$STATE_DIR/rn_bootstrap.sh"
-
-  cat > "$STATE_DIR/rn_issue_assignments.sh" <<'EOF_ASSIGN'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: rn_issue_assignments.sh <env-file>" >&2
-  exit 2
-fi
-
-source "$1"
-
-run_root() {
-  sudo -n "$@"
-}
-
-PASS_FILE="$(mktemp /tmp/rn-assignment-passphrase.XXXXXX)"
-cleanup() {
-  if [[ -f "$PASS_FILE" ]]; then
-    run_root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-run_root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
-run_root chmod 0600 "$PASS_FILE"
-
-ISSUE_DIR="/run/rustynet/assignment-issue"
-run_root rm -rf "$ISSUE_DIR"
-run_root install -d -m 0700 "$ISSUE_DIR"
-
-issue_bundle() {
-  local target_node_id="$1"
-  local exit_node_id="$2"
-  local output_name="rn-assignment-${target_node_id}.assignment"
-  local -a args
-  args=(
-    rustynet assignment issue
-    --target-node-id "$target_node_id"
-    --nodes "$NODES_SPEC"
-    --allow "$ALLOW_SPEC"
-    --signing-secret /etc/rustynet/assignment.signing.secret
-    --signing-secret-passphrase-file "$PASS_FILE"
-    --output "$ISSUE_DIR/$output_name"
-    --verifier-key-output "$ISSUE_DIR/rn-assignment.pub"
-    --ttl-secs 300
-  )
-  if [[ -n "$exit_node_id" && "$exit_node_id" != "-" ]]; then
-    args+=(--exit-node-id "$exit_node_id")
-  fi
-  run_root "${args[@]}"
-}
-
-OLD_IFS="$IFS"
-IFS=';'
-set -- $ASSIGNMENTS_SPEC
-IFS="$OLD_IFS"
-for entry in "$@"; do
-  [[ -n "$entry" ]] || continue
-  target_node_id="${entry%%|*}"
-  exit_node_id="${entry#*|}"
-  issue_bundle "$target_node_id" "$exit_node_id"
-done
-EOF_ASSIGN
-  chmod 700 "$STATE_DIR/rn_issue_assignments.sh"
-
-  cat > "$STATE_DIR/rn_issue_traversal.sh" <<'EOF_TRAV'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: rn_issue_traversal.sh <env-file>" >&2
-  exit 2
-fi
-
-source "$1"
-
-run_root() {
-  sudo -n "$@"
-}
-
-PASS_FILE="$(mktemp /tmp/rn-traversal-passphrase.XXXXXX)"
-cleanup() {
-  if [[ -f "$PASS_FILE" ]]; then
-    run_root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-run_root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
-run_root chmod 0600 "$PASS_FILE"
-
-ISSUE_DIR="/run/rustynet/traversal-issue"
-run_root rm -rf "$ISSUE_DIR"
-run_root install -d -m 0700 "$ISSUE_DIR"
-SNAPSHOT_GENERATED_AT="$(date +%s)"
-SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
-
-declare -a node_ids=()
-declare -A endpoint_by_node=()
-OLD_IFS="$IFS"
-IFS=';'
-set -- $NODES_SPEC
-IFS="$OLD_IFS"
-for entry in "$@"; do
-  [[ -n "$entry" ]] || continue
-  IFS='|' read -r node_id endpoint _rest <<< "$entry"
-  [[ -n "$node_id" && -n "$endpoint" ]] || continue
-  node_ids+=("$node_id")
-  endpoint_by_node["$node_id"]="$endpoint"
-done
-
-if [[ "${#node_ids[@]}" -lt 2 ]]; then
-  echo "traversal issue requires at least two nodes in NODES_SPEC" >&2
-  exit 1
-fi
-
-issue_pair_bundle() {
-  local source_node_id="$1"
-  local target_node_id="$2"
-  local target_endpoint="${endpoint_by_node[$target_node_id]}"
-  local relay_id="relay-${target_node_id}"
-  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
-  if [[ ! "$TRAVERSAL_TTL_SECS" =~ ^[0-9]+$ ]] || (( TRAVERSAL_TTL_SECS <= 0 || TRAVERSAL_TTL_SECS > 120 )); then
-    echo "TRAVERSAL_TTL_SECS must be a positive integer <= 120 (got: ${TRAVERSAL_TTL_SECS})" >&2
-    exit 2
-  fi
-  run_root rustynet traversal issue \
-    --source-node-id "$source_node_id" \
-    --target-node-id "$target_node_id" \
-    --nodes "$NODES_SPEC" \
-    --allow "$ALLOW_SPEC" \
-    --signing-secret /etc/rustynet/assignment.signing.secret \
-    --signing-secret-passphrase-file "$PASS_FILE" \
-    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
-    --generated-at "$SNAPSHOT_GENERATED_AT" \
-    --nonce "$SNAPSHOT_NONCE" \
-    --output "$ISSUE_DIR/$output_name" \
-    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
-    --ttl-secs "$TRAVERSAL_TTL_SECS"
-}
-
-declare -a allow_sources=()
-declare -a allow_targets=()
-OLD_IFS="$IFS"
-IFS=';'
-set -- $ALLOW_SPEC
-IFS="$OLD_IFS"
-for entry in "$@"; do
-  [[ -n "$entry" ]] || continue
-  IFS='|' read -r source_node_id target_node_id <<< "$entry"
-  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
-  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
-    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
-    exit 1
-  fi
-  issue_pair_bundle "$source_node_id" "$target_node_id"
-  allow_sources+=("$source_node_id")
-  allow_targets+=("$target_node_id")
-done
-
-for node_id in "${node_ids[@]}"; do
-  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
-  run_root rm -f "$aggregate_path"
-  run_root sh -c ': > "$1"' sh "$aggregate_path"
-  for idx in "${!allow_sources[@]}"; do
-    source_node_id="${allow_sources[$idx]}"
-    target_node_id="${allow_targets[$idx]}"
-    if [[ "$source_node_id" == "$node_id" ]]; then
-      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
-      run_root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
-      run_root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
-    fi
-  done
-done
-EOF_TRAV
-  chmod 700 "$STATE_DIR/rn_issue_traversal.sh"
 }
 
 prime_remote_access() {
@@ -2141,9 +1964,7 @@ stage_issue_and_distribute_assignments() {
   append_env_assignment "$env_path" "NODES_SPEC" "$NODES_SPEC"
   append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
   append_env_assignment "$env_path" "ASSIGNMENTS_SPEC" "$ASSIGNMENTS_SPEC"
-  live_lab_scp_to "$STATE_DIR/rn_issue_assignments.sh" "$exit_target" "/tmp/rn_issue_assignments.sh" || return 1
-  live_lab_scp_to "$env_path" "$exit_target" "/tmp/rn_issue_assignments.env" || return 1
-  live_lab_run_root "$exit_target" "root chmod 700 /tmp/rn_issue_assignments.sh && root bash /tmp/rn_issue_assignments.sh /tmp/rn_issue_assignments.env && root rm -f /tmp/rn_issue_assignments.sh /tmp/rn_issue_assignments.env" || return 1
+  live_lab_issue_assignment_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_assignments.env" || return 1
 
   verifier_local="$STATE_DIR/assignment.pub"
   live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment.pub" > "$verifier_local" || return 1
@@ -2183,9 +2004,7 @@ stage_issue_and_distribute_traversal() {
   append_env_assignment "$env_path" "NODES_SPEC" "$NODES_SPEC"
   append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
   append_env_assignment "$env_path" "TRAVERSAL_TTL_SECS" "$TRAVERSAL_TTL_SECS"
-  live_lab_scp_to "$STATE_DIR/rn_issue_traversal.sh" "$exit_target" "/tmp/rn_issue_traversal.sh" || return 1
-  live_lab_scp_to "$env_path" "$exit_target" "/tmp/rn_issue_traversal.env" || return 1
-  live_lab_run_root "$exit_target" "root chmod 700 /tmp/rn_issue_traversal.sh && root bash /tmp/rn_issue_traversal.sh /tmp/rn_issue_traversal.env && root rm -f /tmp/rn_issue_traversal.sh /tmp/rn_issue_traversal.env" || return 1
+  live_lab_issue_traversal_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_traversal.env" || return 1
 
   verifier_local="$STATE_DIR/traversal.pub"
   live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$verifier_local" || return 1

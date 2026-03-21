@@ -372,6 +372,30 @@ live_lab_install_assignment_refresh_env() {
   live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
 }
 
+live_lab_issue_assignment_bundles_from_env() {
+  local target="$1"
+  local env_local="$2"
+  local remote_env_path="${3:-/tmp/rn-e2e-assignments.env}"
+  live_lab_scp_to "$env_local" "$target" "$remote_env_path" || return 1
+  if ! live_lab_run_root "$target" "root rustynet ops e2e-issue-assignment-bundles-from-env --env-file '${remote_env_path}'"; then
+    live_lab_run_root "$target" "root rm -f '${remote_env_path}'" >/dev/null 2>&1 || true
+    return 1
+  fi
+  live_lab_run_root "$target" "root rm -f '${remote_env_path}'" || return 1
+}
+
+live_lab_issue_traversal_bundles_from_env() {
+  local target="$1"
+  local env_local="$2"
+  local remote_env_path="${3:-/tmp/rn-e2e-traversal.env}"
+  live_lab_scp_to "$env_local" "$target" "$remote_env_path" || return 1
+  if ! live_lab_run_root "$target" "root rustynet ops e2e-issue-traversal-bundles-from-env --env-file '${remote_env_path}'"; then
+    live_lab_run_root "$target" "root rm -f '${remote_env_path}'" >/dev/null 2>&1 || true
+    return 1
+  fi
+  live_lab_run_root "$target" "root rm -f '${remote_env_path}'" || return 1
+}
+
 live_lab_enforce_host() {
   local target="$1"
   local role="$2"

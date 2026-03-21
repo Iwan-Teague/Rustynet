@@ -2,8 +2,8 @@
      Running unittests src/lib.rs (target/debug/deps/rustynet_backend_api-00b424f7be99857c)
 
 running 2 tests
-test tests::node_id_trims_outer_whitespace ... ok
 test tests::node_id_rejects_empty_or_whitespace_only_values ... ok
+test tests::node_id_trims_outer_whitespace ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
@@ -12,9 +12,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 5 tests
 test backend_contract_exposes_handshake_evidence_for_known_peers_only ... ok
 test backend_contract_rejects_double_start_and_resets_on_shutdown ... ok
-test backend_contract_requires_running_state_for_mutations ... ok
-test backend_contract_updates_peer_endpoint_without_replacing_peer ... ok
 test backend_contract_replaces_route_set_deterministically ... ok
+test backend_contract_updates_peer_endpoint_without_replacing_peer ... ok
+test backend_contract_requires_running_state_for_mutations ... ok
 
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 

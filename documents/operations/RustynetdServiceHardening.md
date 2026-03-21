@@ -23,7 +23,7 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 
 Implementation note (runtime shell removal):
 - Trust/assignment refresh runtime paths are now direct Rust service execution (`ExecStart=/usr/local/bin/rustynet ops ...`) with binary-custody preflight (`ops verify-runtime-binary-custody`).
-- The install helper remains a compatibility wrapper to `rustynet ops install-systemd`.
+- The install helper remains a compatibility wrapper to `rustynet ops install-systemd`, but now pins `/usr/local/bin/rustynet` and runs `ops verify-runtime-binary-custody` before dispatch. Alternate `RUSTYNET_BIN` overrides are rejected fail-closed.
 
 ## Hardening Controls (Daemon)
 - `NoNewPrivileges=true`

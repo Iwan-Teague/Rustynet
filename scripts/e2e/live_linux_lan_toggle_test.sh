@@ -96,7 +96,6 @@ cleanup_all() {
 }
 trap 'cleanup_all' EXIT
 
-ISSUE_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_lan.sh"
 ISSUE_ENV="$LIVE_LAB_WORK_DIR/rn_issue_lan.env"
 ASSIGN_PUB_LOCAL="$LIVE_LAB_WORK_DIR/assignment.pub"
 EXIT_ASSIGNMENT_LOCAL="$LIVE_LAB_WORK_DIR/assignment-exit"
@@ -105,7 +104,6 @@ BLIND_EXIT_ASSIGNMENT_LOCAL="$LIVE_LAB_WORK_DIR/assignment-blind-exit"
 EXIT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-exit.env"
 CLIENT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-client.env"
 BLIND_EXIT_REFRESH_LOCAL="$LIVE_LAB_WORK_DIR/assignment-refresh-blind-exit.env"
-TRAVERSAL_SCRIPT="$LIVE_LAB_WORK_DIR/rn_issue_lan_traversal.sh"
 TRAVERSAL_ENV="$LIVE_LAB_WORK_DIR/rn_issue_lan_traversal.env"
 TRAVERSAL_PUB_LOCAL="$LIVE_LAB_WORK_DIR/traversal.pub"
 EXIT_TRAVERSAL_LOCAL="$LIVE_LAB_WORK_DIR/traversal-exit"
@@ -128,174 +126,13 @@ BLIND_EXIT_ADDR="$(live_lab_target_address "$BLIND_EXIT_HOST")"
 NODES_SPEC="${EXIT_NODE_ID}|${EXIT_ADDR}:51820|${EXIT_PUB_HEX};${CLIENT_NODE_ID}|${CLIENT_ADDR}:51820|${CLIENT_PUB_HEX};${BLIND_EXIT_NODE_ID}|${BLIND_EXIT_ADDR}:51820|${BLIND_EXIT_PUB_HEX}"
 ALLOW_SPEC="${CLIENT_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${CLIENT_NODE_ID};${BLIND_EXIT_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${BLIND_EXIT_NODE_ID}"
 
-cat > "$ISSUE_SCRIPT" <<'ISSUEEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: rn_issue_lan.sh <env-file>" >&2
-  exit 2
-fi
-
-source "$1"
-
-root() {
-  sudo -n "$@"
-}
-
-PASS_FILE="$(mktemp /tmp/rn-lan-passphrase.XXXXXX)"
-cleanup() {
-  if [[ -f "$PASS_FILE" ]]; then
-    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
-root chmod 0600 "$PASS_FILE"
-
-ISSUE_DIR="/run/rustynet/assignment-issue"
-root rm -rf "$ISSUE_DIR"
-root install -d -m 0700 "$ISSUE_DIR"
-
-issue_bundle() {
-  local target_node_id="$1"
-  local output_name="$2"
-  shift 2
-  root rustynet assignment issue \
-    --target-node-id "$target_node_id" \
-    --nodes "$NODES_SPEC" \
-    --allow "$ALLOW_SPEC" \
-    --signing-secret /etc/rustynet/assignment.signing.secret \
-    --signing-secret-passphrase-file "$PASS_FILE" \
-    --output "$ISSUE_DIR/$output_name" \
-    --verifier-key-output "$ISSUE_DIR/rn-assignment.pub" \
-    "$@" \
-    --ttl-secs 300
-}
-
-issue_bundle "$EXIT_NODE_ID" "rn-assignment-$EXIT_NODE_ID.assignment"
-issue_bundle "$CLIENT_NODE_ID" "rn-assignment-$CLIENT_NODE_ID.assignment" --exit-node-id "$EXIT_NODE_ID"
-issue_bundle "$BLIND_EXIT_NODE_ID" "rn-assignment-$BLIND_EXIT_NODE_ID.assignment"
-ISSUEEOF
-chmod 700 "$ISSUE_SCRIPT"
-
-cat > "$TRAVERSAL_SCRIPT" <<'TRAVEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: rn_issue_lan_traversal.sh <env-file>" >&2
-  exit 2
-fi
-
-source "$1"
-
-root() {
-  sudo -n "$@"
-}
-
-PASS_FILE="$(mktemp /tmp/rn-lan-traversal-passphrase.XXXXXX)"
-cleanup() {
-  if [[ -f "$PASS_FILE" ]]; then
-    root rustynet ops secure-remove --path "$PASS_FILE" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
-
-root rustynet ops materialize-signing-passphrase --output "$PASS_FILE"
-root chmod 0600 "$PASS_FILE"
-
-ISSUE_DIR="/run/rustynet/traversal-issue"
-root rm -rf "$ISSUE_DIR"
-root install -d -m 0700 "$ISSUE_DIR"
-SNAPSHOT_GENERATED_AT="$(date +%s)"
-SNAPSHOT_NONCE="$((SNAPSHOT_GENERATED_AT * 1000 + 1))"
-
-declare -a node_ids=()
-declare -A endpoint_by_node=()
-OLD_IFS="$IFS"
-IFS=';'
-set -- $NODES_SPEC
-IFS="$OLD_IFS"
-for entry in "$@"; do
-  [[ -n "$entry" ]] || continue
-  IFS='|' read -r node_id endpoint _rest <<< "$entry"
-  [[ -n "$node_id" && -n "$endpoint" ]] || continue
-  node_ids+=("$node_id")
-  endpoint_by_node["$node_id"]="$endpoint"
-done
-
-issue_pair_bundle() {
-  local source_node_id="$1"
-  local target_node_id="$2"
-  local target_endpoint="${endpoint_by_node[$target_node_id]}"
-  local relay_id="relay-${target_node_id}"
-  local output_name="rn-traversal-${source_node_id}-${target_node_id}.bundle"
-  root rustynet traversal issue \
-    --source-node-id "$source_node_id" \
-    --target-node-id "$target_node_id" \
-    --nodes "$NODES_SPEC" \
-    --allow "$ALLOW_SPEC" \
-    --signing-secret /etc/rustynet/assignment.signing.secret \
-    --signing-secret-passphrase-file "$PASS_FILE" \
-    --candidates "host|${target_endpoint}|900;relay|${target_endpoint}|700|${relay_id}" \
-    --generated-at "$SNAPSHOT_GENERATED_AT" \
-    --nonce "$SNAPSHOT_NONCE" \
-    --output "$ISSUE_DIR/$output_name" \
-    --verifier-key-output "$ISSUE_DIR/rn-traversal.pub" \
-    --ttl-secs 120
-}
-
-declare -a allow_sources=()
-declare -a allow_targets=()
-OLD_IFS="$IFS"
-IFS=';'
-set -- $ALLOW_SPEC
-IFS="$OLD_IFS"
-for entry in "$@"; do
-  [[ -n "$entry" ]] || continue
-  IFS='|' read -r source_node_id target_node_id <<< "$entry"
-  [[ -n "$source_node_id" && -n "$target_node_id" ]] || continue
-  if [[ -z "${endpoint_by_node[$target_node_id]:-}" ]]; then
-    echo "target node ${target_node_id} from ALLOW_SPEC is missing in NODES_SPEC" >&2
-    exit 1
-  fi
-  issue_pair_bundle "$source_node_id" "$target_node_id"
-  allow_sources+=("$source_node_id")
-  allow_targets+=("$target_node_id")
-done
-
-for node_id in "${node_ids[@]}"; do
-  aggregate_path="$ISSUE_DIR/rn-traversal-${node_id}.traversal"
-  root rm -f "$aggregate_path"
-  root sh -c ': > "$1"' sh "$aggregate_path"
-  for idx in "${!allow_sources[@]}"; do
-    source_node_id="${allow_sources[$idx]}"
-    target_node_id="${allow_targets[$idx]}"
-    if [[ "$source_node_id" == "$node_id" ]]; then
-      pair_path="$ISSUE_DIR/rn-traversal-${source_node_id}-${target_node_id}.bundle"
-      root sh -c 'cat "$1" >> "$2"' sh "$pair_path" "$aggregate_path"
-      root sh -c 'printf "\n" >> "$1"' sh "$aggregate_path"
-    fi
-  done
-done
-TRAVEOF
-chmod 700 "$TRAVERSAL_SCRIPT"
-
 : > "$ISSUE_ENV"
-live_lab_append_env_assignment "$ISSUE_ENV" "EXIT_NODE_ID" "$EXIT_NODE_ID"
-live_lab_append_env_assignment "$ISSUE_ENV" "CLIENT_NODE_ID" "$CLIENT_NODE_ID"
-live_lab_append_env_assignment "$ISSUE_ENV" "BLIND_EXIT_NODE_ID" "$BLIND_EXIT_NODE_ID"
 live_lab_append_env_assignment "$ISSUE_ENV" "NODES_SPEC" "$NODES_SPEC"
 live_lab_append_env_assignment "$ISSUE_ENV" "ALLOW_SPEC" "$ALLOW_SPEC"
-live_lab_append_env_assignment "$ISSUE_ENV" "LAN_TEST_CIDR" "$LAN_TEST_CIDR"
+live_lab_append_env_assignment "$ISSUE_ENV" "ASSIGNMENTS_SPEC" "${EXIT_NODE_ID}|-;${CLIENT_NODE_ID}|${EXIT_NODE_ID};${BLIND_EXIT_NODE_ID}|-"
 
 live_lab_log "Issuing signed LAN-toggle assignments on $EXIT_HOST"
-live_lab_scp_to "$ISSUE_SCRIPT" "$EXIT_HOST" "/tmp/rn_issue_lan.sh"
-live_lab_scp_to "$ISSUE_ENV" "$EXIT_HOST" "/tmp/rn_issue_lan.env"
-live_lab_run_root "$EXIT_HOST" "root chmod 700 /tmp/rn_issue_lan.sh && root bash /tmp/rn_issue_lan.sh /tmp/rn_issue_lan.env"
-live_lab_run_root "$EXIT_HOST" "root rm -f /tmp/rn_issue_lan.sh /tmp/rn_issue_lan.env"
+live_lab_issue_assignment_bundles_from_env "$EXIT_HOST" "$ISSUE_ENV" "/tmp/rn_issue_lan.env"
 
 live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment.pub" > "$ASSIGN_PUB_LOCAL"
 live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/assignment-issue/rn-assignment-$EXIT_NODE_ID.assignment" > "$EXIT_ASSIGNMENT_LOCAL"
@@ -320,10 +157,7 @@ live_lab_append_env_assignment "$TRAVERSAL_ENV" "NODES_SPEC" "$NODES_SPEC"
 live_lab_append_env_assignment "$TRAVERSAL_ENV" "ALLOW_SPEC" "$ALLOW_SPEC"
 
 live_lab_log "Issuing signed traversal bundles for LAN-toggle topology"
-live_lab_scp_to "$TRAVERSAL_SCRIPT" "$EXIT_HOST" "/tmp/rn_issue_lan_traversal.sh"
-live_lab_scp_to "$TRAVERSAL_ENV" "$EXIT_HOST" "/tmp/rn_issue_lan_traversal.env"
-live_lab_run_root "$EXIT_HOST" "root chmod 700 /tmp/rn_issue_lan_traversal.sh && root bash /tmp/rn_issue_lan_traversal.sh /tmp/rn_issue_lan_traversal.env"
-live_lab_run_root "$EXIT_HOST" "root rm -f /tmp/rn_issue_lan_traversal.sh /tmp/rn_issue_lan_traversal.env"
+live_lab_issue_traversal_bundles_from_env "$EXIT_HOST" "$TRAVERSAL_ENV" "/tmp/rn_issue_lan_traversal.env"
 
 live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$TRAVERSAL_PUB_LOCAL"
 live_lab_capture_root "$EXIT_HOST" "root cat /run/rustynet/traversal-issue/rn-traversal-$EXIT_NODE_ID.traversal" > "$EXIT_TRAVERSAL_LOCAL"

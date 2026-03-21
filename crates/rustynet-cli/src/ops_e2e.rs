@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -46,6 +46,18 @@ pub enum SshSudoMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eIssueAssignmentBundlesFromEnvConfig {
+    pub env_file: PathBuf,
+    pub issue_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eIssueTraversalBundlesFromEnvConfig {
+    pub env_file: PathBuf,
+    pub issue_dir: PathBuf,
 }
 
 impl SshSudoMode {
@@ -916,6 +928,295 @@ pub fn execute_ops_e2e_issue_assignments(
     Ok(format!(
         "e2e assignment issuance complete: exit_node_id={exit_node_id} client_node_id={client_node_id} artifact_dir={}",
         artifact_dir.display(),
+    ))
+}
+
+struct GenericAssignmentSpec {
+    target_node_id: String,
+    exit_node_id: Option<String>,
+}
+
+struct GenericTraversalNodeSpec {
+    node_id: String,
+    endpoint: String,
+}
+
+struct GenericTraversalAllowSpec {
+    source_node_id: String,
+    target_node_id: String,
+}
+
+pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
+    config: E2eIssueAssignmentBundlesFromEnvConfig,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    let env_values = load_simple_env_file(config.env_file.as_path(), "assignment env file")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "assignment env file")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "assignment env file")?;
+    let assignments_spec =
+        env_required_value(&env_values, "ASSIGNMENTS_SPEC", "assignment env file")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
+
+    let known_node_ids = parse_generic_nodes(nodes_spec.as_str())?
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
+    prepare_clean_issue_dir(config.issue_dir.as_path(), "assignment issue dir")?;
+
+    for assignment in &assignment_specs {
+        if !known_node_ids.contains(assignment.target_node_id.as_str()) {
+            return Err(format!(
+                "assignment target node is missing from NODES_SPEC: {}",
+                assignment.target_node_id
+            ));
+        }
+        if let Some(exit_node_id) = assignment.exit_node_id.as_ref()
+            && !known_node_ids.contains(exit_node_id.as_str())
+        {
+            return Err(format!(
+                "assignment exit node is missing from NODES_SPEC: {exit_node_id}"
+            ));
+        }
+    }
+
+    let cli_path = std::env::current_exe()
+        .map_err(|err| format!("resolve current rustynet CLI path failed: {err}"))?;
+    let verifier_key_output = config.issue_dir.join("rn-assignment.pub");
+    let passphrase_path = materialize_signing_passphrase_temp("rustynet-assignment-passphrase")?;
+    let result = (|| -> Result<(), String> {
+        ensure_regular_file(
+            Path::new("/etc/rustynet/assignment.signing.secret"),
+            "assignment signing secret",
+        )?;
+        for assignment in &assignment_specs {
+            let output_path = config.issue_dir.join(format!(
+                "rn-assignment-{}.assignment",
+                assignment.target_node_id
+            ));
+            let output_text = output_path.display().to_string();
+            let verifier_text = verifier_key_output.display().to_string();
+            let mut args = vec![
+                "assignment",
+                "issue",
+                "--target-node-id",
+                assignment.target_node_id.as_str(),
+                "--nodes",
+                nodes_spec.as_str(),
+                "--allow",
+                allow_spec.as_str(),
+                "--signing-secret",
+                "/etc/rustynet/assignment.signing.secret",
+                "--signing-secret-passphrase-file",
+                passphrase_path.as_str(),
+                "--output",
+                output_text.as_str(),
+                "--verifier-key-output",
+                verifier_text.as_str(),
+            ];
+            if let Some(exit_node_id) = assignment.exit_node_id.as_ref() {
+                args.push("--exit-node-id");
+                args.push(exit_node_id.as_str());
+            }
+            args.push("--ttl-secs");
+            args.push("300");
+            run_status_path(
+                cli_path.as_path(),
+                args.as_slice(),
+                "issuing live-lab assignment bundle failed",
+            )?;
+        }
+        set_unix_mode(verifier_key_output.as_path(), 0o600)?;
+        for assignment in &assignment_specs {
+            let output_path = config.issue_dir.join(format!(
+                "rn-assignment-{}.assignment",
+                assignment.target_node_id
+            ));
+            set_unix_mode(output_path.as_path(), 0o600)?;
+        }
+        Ok(())
+    })();
+    secure_remove_file(Path::new(passphrase_path.as_str()));
+    result?;
+
+    Ok(format!(
+        "e2e assignment bundle issuance complete: env_file={} issue_dir={}",
+        config.env_file.display(),
+        config.issue_dir.display()
+    ))
+}
+
+pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
+    config: E2eIssueTraversalBundlesFromEnvConfig,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    let env_values = load_simple_env_file(config.env_file.as_path(), "traversal env file")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "traversal env file")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env file")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let ttl_secs = env_values
+        .get("TRAVERSAL_TTL_SECS")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env file: {err}"))
+        })
+        .transpose()?
+        .unwrap_or(120);
+    if ttl_secs == 0 || ttl_secs > 120 {
+        return Err(format!(
+            "TRAVERSAL_TTL_SECS must be a positive integer <= 120 (got: {ttl_secs})"
+        ));
+    }
+
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    if nodes.len() < 2 {
+        return Err("traversal issue requires at least two nodes in NODES_SPEC".to_string());
+    }
+    let endpoints_by_node = nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), node.endpoint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
+    for pair in &allow_pairs {
+        if !endpoints_by_node.contains_key(pair.target_node_id.as_str()) {
+            return Err(format!(
+                "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.target_node_id
+            ));
+        }
+        if !endpoints_by_node.contains_key(pair.source_node_id.as_str()) {
+            return Err(format!(
+                "source node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.source_node_id
+            ));
+        }
+    }
+    prepare_clean_issue_dir(config.issue_dir.as_path(), "traversal issue dir")?;
+
+    let cli_path = std::env::current_exe()
+        .map_err(|err| format!("resolve current rustynet CLI path failed: {err}"))?;
+    let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
+    let passphrase_path = materialize_signing_passphrase_temp("rustynet-traversal-passphrase")?;
+    let result = (|| -> Result<(), String> {
+        ensure_regular_file(
+            Path::new("/etc/rustynet/assignment.signing.secret"),
+            "assignment signing secret",
+        )?;
+        let generated_at = unix_now();
+        let nonce = generated_at.saturating_mul(1000).saturating_add(1);
+        for pair in &allow_pairs {
+            let target_endpoint = endpoints_by_node
+                .get(pair.target_node_id.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                        pair.target_node_id
+                    )
+                })?;
+            let candidates = format!(
+                "host|{target_endpoint}|900;relay|{target_endpoint}|700|relay-{}",
+                pair.target_node_id
+            );
+            let output_path = config.issue_dir.join(format!(
+                "rn-traversal-{}-{}.bundle",
+                pair.source_node_id, pair.target_node_id
+            ));
+            let output_text = output_path.display().to_string();
+            let verifier_text = verifier_key_output.display().to_string();
+            let generated_at_text = generated_at.to_string();
+            let nonce_text = nonce.to_string();
+            let ttl_text = ttl_secs.to_string();
+            let args = [
+                "traversal",
+                "issue",
+                "--source-node-id",
+                pair.source_node_id.as_str(),
+                "--target-node-id",
+                pair.target_node_id.as_str(),
+                "--nodes",
+                nodes_spec.as_str(),
+                "--allow",
+                allow_spec.as_str(),
+                "--signing-secret",
+                "/etc/rustynet/assignment.signing.secret",
+                "--signing-secret-passphrase-file",
+                passphrase_path.as_str(),
+                "--candidates",
+                candidates.as_str(),
+                "--generated-at",
+                generated_at_text.as_str(),
+                "--nonce",
+                nonce_text.as_str(),
+                "--output",
+                output_text.as_str(),
+                "--verifier-key-output",
+                verifier_text.as_str(),
+                "--ttl-secs",
+                ttl_text.as_str(),
+            ];
+            run_status_path(
+                cli_path.as_path(),
+                args.as_slice(),
+                "issuing live-lab traversal bundle failed",
+            )?;
+        }
+
+        let mut aggregate_paths = Vec::new();
+        for node in &nodes {
+            let aggregate_path = config
+                .issue_dir
+                .join(format!("rn-traversal-{}.traversal", node.node_id));
+            let mut aggregate = String::new();
+            for pair in &allow_pairs {
+                if pair.source_node_id != node.node_id {
+                    continue;
+                }
+                let pair_path = config.issue_dir.join(format!(
+                    "rn-traversal-{}-{}.bundle",
+                    pair.source_node_id, pair.target_node_id
+                ));
+                let body = fs::read_to_string(pair_path.as_path()).map_err(|err| {
+                    format!(
+                        "read traversal pair bundle failed ({}): {err}",
+                        pair_path.display()
+                    )
+                })?;
+                aggregate.push_str(body.as_str());
+                aggregate.push('\n');
+            }
+            fs::write(aggregate_path.as_path(), aggregate.as_bytes()).map_err(|err| {
+                format!(
+                    "write aggregated traversal bundle failed ({}): {err}",
+                    aggregate_path.display()
+                )
+            })?;
+            aggregate_paths.push(aggregate_path);
+        }
+
+        set_unix_mode(verifier_key_output.as_path(), 0o600)?;
+        for pair in &allow_pairs {
+            let pair_path = config.issue_dir.join(format!(
+                "rn-traversal-{}-{}.bundle",
+                pair.source_node_id, pair.target_node_id
+            ));
+            set_unix_mode(pair_path.as_path(), 0o600)?;
+        }
+        for aggregate_path in &aggregate_paths {
+            set_unix_mode(aggregate_path.as_path(), 0o600)?;
+        }
+        Ok(())
+    })();
+    secure_remove_file(Path::new(passphrase_path.as_str()));
+    result?;
+
+    Ok(format!(
+        "e2e traversal bundle issuance complete: env_file={} issue_dir={}",
+        config.env_file.display(),
+        config.issue_dir.display()
     ))
 }
 
@@ -2331,8 +2632,248 @@ fn ensure_safe_token(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_safe_spec(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    let allowed = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '.' | '_' | ':' | '/' | ',' | '@' | '+' | '=' | '-' | '|' | ';'
+            )
+    };
+    if !value.chars().all(allowed) {
+        return Err(format!("{label} contains unsupported characters: {value}"));
+    }
+    Ok(())
+}
+
 fn ensure_safe_remote_path(path: &str) -> Result<(), String> {
     ensure_safe_token("remote-path", path)
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| format!("{label} missing ({}): {err}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} must not be a symlink: {}", path.display()));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} must be a file: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn validate_env_key_like(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn load_simple_env_file(path: &Path, label: &str) -> Result<BTreeMap<String, String>, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    ensure_regular_file(path, label)?;
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for (index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            return Err(format!(
+                "{label} line {} is missing '=': {trimmed}",
+                index + 1
+            ));
+        };
+        if !validate_env_key_like(key) {
+            return Err(format!("{label} line {} has invalid key: {key}", index + 1));
+        }
+        let value = crate::env_file::parse_env_value(raw_value).map_err(|err| {
+            format!(
+                "{label} line {} has invalid value for {key}: {err}",
+                index + 1
+            )
+        })?;
+        if values.insert(key.to_string(), value).is_some() {
+            return Err(format!("{label} contains duplicate key: {key}"));
+        }
+    }
+    Ok(values)
+}
+
+fn env_required_value(
+    values: &BTreeMap<String, String>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
+    let value = values
+        .get(key)
+        .cloned()
+        .ok_or_else(|| format!("{label} is missing required key {key}"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{label} key {key} must not be empty"));
+    }
+    Ok(value)
+}
+
+fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, String> {
+    let mut nodes = Vec::new();
+    for entry in encoded.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts = trimmed.split('|').collect::<Vec<_>>();
+        if parts.len() < 2 {
+            return Err(format!(
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|..."
+            ));
+        }
+        let node_id = parts[0].trim();
+        let endpoint = parts[1].trim();
+        ensure_safe_token("node-id", node_id)?;
+        ensure_safe_token("endpoint", endpoint)?;
+        nodes.push(GenericTraversalNodeSpec {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+        });
+    }
+    if nodes.is_empty() {
+        return Err("NODES_SPEC must include at least one node".to_string());
+    }
+    Ok(nodes)
+}
+
+fn parse_generic_allow_specs(encoded: &str) -> Result<Vec<GenericTraversalAllowSpec>, String> {
+    let mut pairs = Vec::new();
+    for entry in encoded.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((source_node_id, target_node_id)) = trimmed.split_once('|') else {
+            return Err(format!(
+                "invalid ALLOW_SPEC entry {trimmed:?}; expected source|target"
+            ));
+        };
+        ensure_safe_token("source-node-id", source_node_id)?;
+        ensure_safe_token("target-node-id", target_node_id)?;
+        pairs.push(GenericTraversalAllowSpec {
+            source_node_id: source_node_id.to_string(),
+            target_node_id: target_node_id.to_string(),
+        });
+    }
+    if pairs.is_empty() {
+        return Err("ALLOW_SPEC must include at least one allow pair".to_string());
+    }
+    Ok(pairs)
+}
+
+fn parse_generic_assignment_specs(encoded: &str) -> Result<Vec<GenericAssignmentSpec>, String> {
+    let mut assignments = Vec::new();
+    for entry in encoded.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((target_node_id, raw_exit_node_id)) = trimmed.split_once('|') else {
+            return Err(format!(
+                "invalid ASSIGNMENTS_SPEC entry {trimmed:?}; expected target|exit_or_dash"
+            ));
+        };
+        ensure_safe_token("target-node-id", target_node_id)?;
+        let exit_node_id = match raw_exit_node_id.trim() {
+            "" | "-" => None,
+            value => {
+                ensure_safe_token("exit-node-id", value)?;
+                Some(value.to_string())
+            }
+        };
+        assignments.push(GenericAssignmentSpec {
+            target_node_id: target_node_id.to_string(),
+            exit_node_id,
+        });
+    }
+    if assignments.is_empty() {
+        return Err("ASSIGNMENTS_SPEC must include at least one target".to_string());
+    }
+    Ok(assignments)
+}
+
+fn prepare_clean_issue_dir(path: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} path must be absolute: {}", path.display()));
+    }
+    ensure_safe_remote_path(path.display().to_string().as_str())?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("{label} must not be a symlink: {}", path.display()));
+            }
+            if !metadata.is_dir() {
+                return Err(format!("{label} must be a directory: {}", path.display()));
+            }
+            fs::remove_dir_all(path)
+                .map_err(|err| format!("remove {label} failed ({}): {err}", path.display()))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "inspect {label} failed ({}): {err}",
+                path.display()
+            ));
+        }
+    }
+    fs::create_dir_all(path)
+        .map_err(|err| format!("create {label} failed ({}): {err}", path.display()))?;
+    set_unix_mode(path, 0o700)?;
+    Ok(())
+}
+
+fn materialize_signing_passphrase_temp(prefix: &str) -> Result<String, String> {
+    let output_path = format!("/tmp/{prefix}.{}.{}", std::process::id(), unique_suffix());
+    run_status(
+        "systemd-creds",
+        &[
+            "decrypt",
+            "--name=signing_key_passphrase",
+            "/etc/rustynet/credentials/signing_key_passphrase.cred",
+            output_path.as_str(),
+        ],
+        &[],
+        "decrypting signing passphrase credential failed",
+    )?;
+    set_unix_mode(Path::new(output_path.as_str()), 0o600)?;
+    Ok(output_path)
+}
+
+fn run_status_path(program: &Path, args: &[&str], context: &str) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{context}: failed to spawn {}: {err}", program.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "no stdout/stderr output".to_string(),
+        (true, false) => format!("stderr={stderr}"),
+        (false, true) => format!("stdout={stdout}"),
+        (false, false) => format!("stdout={stdout}; stderr={stderr}"),
+    };
+    Err(format!(
+        "{context}: status={} {}",
+        output.status.code().unwrap_or(-1),
+        detail
+    ))
 }
 
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
