@@ -70,6 +70,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 90;
+const PINNED_RUNTIME_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -275,6 +276,7 @@ enum TrustCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpsCommand {
+    VerifyRuntimeBinaryCustody,
     RefreshTrust,
     RefreshSignedTrust,
     BootstrapTunnelCustody,
@@ -617,6 +619,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     let subcommand = args[0].as_str();
     let parser = OptionParser::parse(&args[1..])?;
     match subcommand {
+        "verify-runtime-binary-custody" => {
+            if args.len() != 1 {
+                return Err("ops verify-runtime-binary-custody does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyRuntimeBinaryCustody)
+        }
         "refresh-trust" => {
             if args.len() != 1 {
                 return Err("ops refresh-trust does not accept options".to_string());
@@ -2973,6 +2981,7 @@ fn execute_trust_verify(
 
 fn execute_ops(command: OpsCommand) -> Result<String, String> {
     match command {
+        OpsCommand::VerifyRuntimeBinaryCustody => execute_ops_verify_runtime_binary_custody(),
         OpsCommand::RefreshTrust => execute_ops_refresh_trust(),
         OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
         OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),
@@ -3276,6 +3285,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
 
 fn execute_ops_refresh_trust() -> Result<String, String> {
     require_root_execution()?;
+    enforce_pinned_runtime_binary_custody("trust-refresh")?;
 
     if !parse_env_bool_with_default("RUSTYNET_TRUST_AUTO_REFRESH", "true")? {
         return Ok("[trust-refresh] auto-refresh disabled; skipping.".to_string());
@@ -3424,6 +3434,7 @@ fn refresh_trust_record_with_inputs(
 
 fn execute_ops_refresh_assignment() -> Result<String, String> {
     require_root_execution()?;
+    enforce_pinned_runtime_binary_custody("assignment-refresh")?;
 
     if !parse_env_bool_with_default("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false")? {
         return Ok("[assignment-refresh] auto-refresh disabled; skipping.".to_string());
@@ -3595,6 +3606,74 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         generated_at_unix,
         expires_at_unix
     ))
+}
+
+fn execute_ops_verify_runtime_binary_custody() -> Result<String, String> {
+    enforce_pinned_runtime_binary_custody("runtime-binary-custody")?;
+    Ok(format!(
+        "runtime binary custody verification passed: {}",
+        PINNED_RUNTIME_RUSTYNET_BIN
+    ))
+}
+
+fn enforce_pinned_runtime_binary_custody(context: &str) -> Result<(), String> {
+    let pinned_path = Path::new(PINNED_RUNTIME_RUSTYNET_BIN);
+    let metadata = fs::symlink_metadata(pinned_path).map_err(|err| {
+        format!(
+            "[{context}] required executable not found: {} ({err})",
+            pinned_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "[{context}] pinned binary must not be a symlink: {}",
+            pinned_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "[{context}] pinned binary must be a regular file: {}",
+            pinned_path.display()
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "[{context}] pinned binary is not executable: {}",
+            pinned_path.display()
+        ));
+    }
+    if metadata.uid() != 0 {
+        return Err(format!(
+            "[{context}] pinned binary must be root-owned: {}",
+            pinned_path.display()
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "[{context}] pinned binary must not be group/world writable: {} ({:03o})",
+            pinned_path.display(),
+            mode
+        ));
+    }
+
+    let current_exe = std::env::current_exe()
+        .map_err(|err| format!("[{context}] resolve current executable failed: {err}"))?;
+    let current_canonical = fs::canonicalize(current_exe.as_path()).unwrap_or(current_exe);
+    let pinned_canonical = fs::canonicalize(pinned_path).map_err(|err| {
+        format!(
+            "[{context}] canonicalize pinned binary failed ({}): {err}",
+            pinned_path.display()
+        )
+    })?;
+    if current_canonical != pinned_canonical {
+        return Err(format!(
+            "[{context}] unexpected executable path: expected {} got {}",
+            pinned_canonical.display(),
+            current_canonical.display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9431,6 +9510,7 @@ fn help_text() -> String {
         "  trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]",
         "  trust verify --evidence <path> --verifier-key <path> --watermark <path> [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
         "  ops refresh-trust",
+        "  ops verify-runtime-binary-custody",
         "  ops refresh-signed-trust",
         "  ops bootstrap-wireguard-custody",
         "  ops refresh-assignment",
@@ -9802,6 +9882,14 @@ mod tests {
     fn parse_supports_ops_commands() {
         let trust = parse_command(&["ops".to_string(), "refresh-trust".to_string()]);
         assert!(format!("{trust:?}").contains("RefreshTrust"));
+
+        let verify_runtime_binary_custody = parse_command(&[
+            "ops".to_string(),
+            "verify-runtime-binary-custody".to_string(),
+        ]);
+        assert!(
+            format!("{verify_runtime_binary_custody:?}").contains("VerifyRuntimeBinaryCustody")
+        );
 
         let signed_trust = parse_command(&["ops".to_string(), "refresh-signed-trust".to_string()]);
         assert!(format!("{signed_trust:?}").contains("RefreshSignedTrust"));

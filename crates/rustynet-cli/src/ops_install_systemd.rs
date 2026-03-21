@@ -37,12 +37,9 @@ const SERVICE_DST: &str = "/etc/systemd/system/rustynetd.service";
 const HELPER_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-privileged-helper.service";
 const TRUST_REFRESH_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-trust-refresh.service";
 const TRUST_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-trust-refresh.timer";
-const TRUST_REFRESH_SCRIPT_DST: &str = "/usr/local/libexec/rustynet/refresh_trust_evidence.sh";
 const ASSIGNMENT_REFRESH_SERVICE_DST: &str =
     "/etc/systemd/system/rustynetd-assignment-refresh.service";
 const ASSIGNMENT_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-assignment-refresh.timer";
-const ASSIGNMENT_REFRESH_SCRIPT_DST: &str =
-    "/usr/local/libexec/rustynet/refresh_assignment_bundle.sh";
 const MANAGED_DNS_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-managed-dns.service";
 
 #[derive(Debug, Clone)]
@@ -51,10 +48,8 @@ struct InstallSources {
     helper_service: PathBuf,
     trust_refresh_service: PathBuf,
     trust_refresh_timer: PathBuf,
-    trust_refresh_script: PathBuf,
     assignment_refresh_service: PathBuf,
     assignment_refresh_timer: PathBuf,
-    assignment_refresh_script: PathBuf,
     managed_dns_service: PathBuf,
 }
 
@@ -96,13 +91,6 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         daemon_uid,
         daemon_gid,
     )?;
-    ensure_directory_with_owner_mode(
-        Path::new("/usr/local/libexec/rustynet"),
-        0o755,
-        Uid::from_raw(0),
-        Gid::from_raw(0),
-    )?;
-
     install_file(
         sources.service.as_path(),
         Path::new(SERVICE_DST),
@@ -136,14 +124,6 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         "rustynetd-trust-refresh.timer",
     )?;
     install_file(
-        sources.trust_refresh_script.as_path(),
-        Path::new(TRUST_REFRESH_SCRIPT_DST),
-        0o755,
-        Uid::from_raw(0),
-        Gid::from_raw(0),
-        "refresh_trust_evidence.sh",
-    )?;
-    install_file(
         sources.assignment_refresh_service.as_path(),
         Path::new(ASSIGNMENT_REFRESH_SERVICE_DST),
         0o644,
@@ -158,14 +138,6 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         Uid::from_raw(0),
         Gid::from_raw(0),
         "rustynetd-assignment-refresh.timer",
-    )?;
-    install_file(
-        sources.assignment_refresh_script.as_path(),
-        Path::new(ASSIGNMENT_REFRESH_SCRIPT_DST),
-        0o755,
-        Uid::from_raw(0),
-        Gid::from_raw(0),
-        "refresh_assignment_bundle.sh",
     )?;
     install_file(
         sources.managed_dns_service.as_path(),
@@ -1092,11 +1064,9 @@ fn install_sources(root: &Path) -> InstallSources {
         helper_service: root.join("scripts/systemd/rustynetd-privileged-helper.service"),
         trust_refresh_service: root.join("scripts/systemd/rustynetd-trust-refresh.service"),
         trust_refresh_timer: root.join("scripts/systemd/rustynetd-trust-refresh.timer"),
-        trust_refresh_script: root.join("scripts/systemd/refresh_trust_evidence.sh"),
         assignment_refresh_service: root
             .join("scripts/systemd/rustynetd-assignment-refresh.service"),
         assignment_refresh_timer: root.join("scripts/systemd/rustynetd-assignment-refresh.timer"),
-        assignment_refresh_script: root.join("scripts/systemd/refresh_assignment_bundle.sh"),
         managed_dns_service: root.join("scripts/systemd/rustynetd-managed-dns.service"),
     }
 }
@@ -1108,10 +1078,8 @@ fn has_install_sources(root: &Path) -> bool {
         sources.helper_service,
         sources.trust_refresh_service,
         sources.trust_refresh_timer,
-        sources.trust_refresh_script,
         sources.assignment_refresh_service,
         sources.assignment_refresh_timer,
-        sources.assignment_refresh_script,
         sources.managed_dns_service,
     ]
     .iter()
@@ -1134,20 +1102,12 @@ fn validate_source_paths(paths: &InstallSources) -> Result<(), String> {
             paths.trust_refresh_timer.as_path(),
         ),
         (
-            "refresh_trust_evidence.sh",
-            paths.trust_refresh_script.as_path(),
-        ),
-        (
             "rustynetd-assignment-refresh.service",
             paths.assignment_refresh_service.as_path(),
         ),
         (
             "rustynetd-assignment-refresh.timer",
             paths.assignment_refresh_timer.as_path(),
-        ),
-        (
-            "refresh_assignment_bundle.sh",
-            paths.assignment_refresh_script.as_path(),
         ),
         (
             "rustynetd-managed-dns.service",

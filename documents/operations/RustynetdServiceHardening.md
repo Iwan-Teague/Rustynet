@@ -16,13 +16,14 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Privileged helper unit: `scripts/systemd/rustynetd-privileged-helper.service`
 - Trust refresh unit: `scripts/systemd/rustynetd-trust-refresh.service`
 - Trust refresh timer: `scripts/systemd/rustynetd-trust-refresh.timer`
-- Trust refresh helper script: `scripts/systemd/refresh_trust_evidence.sh` (installed to `/usr/local/libexec/rustynet/refresh_trust_evidence.sh`)
+- Trust refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-trust`
 - Assignment refresh unit: `scripts/systemd/rustynetd-assignment-refresh.service`
 - Assignment refresh timer: `scripts/systemd/rustynetd-assignment-refresh.timer`
-- Assignment refresh helper script: `scripts/systemd/refresh_assignment_bundle.sh` (installed to `/usr/local/libexec/rustynet/refresh_assignment_bundle.sh`)
+- Assignment refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-assignment`
 
-Implementation note (Phase A/B migration):
-- Trust/assignment refresh helpers and the systemd installer helper are now compatibility wrappers that execute hardened Rust ops commands (`rustynet ops refresh-trust`, `rustynet ops refresh-assignment`, `rustynet ops install-systemd`) so privileged validation/signing/install logic runs in Rust rather than shell.
+Implementation note (runtime shell removal):
+- Trust/assignment refresh runtime paths are now direct Rust service execution (`ExecStart=/usr/local/bin/rustynet ops ...`) with binary-custody preflight (`ops verify-runtime-binary-custody`).
+- The install helper remains a compatibility wrapper to `rustynet ops install-systemd`.
 
 ## Hardening Controls (Daemon)
 - `NoNewPrivileges=true`
