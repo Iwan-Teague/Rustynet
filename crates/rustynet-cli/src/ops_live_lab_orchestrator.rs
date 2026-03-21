@@ -149,6 +149,12 @@ pub struct RewriteAssignmentPeerEndpointIpConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteAssignmentMeshCidrConfig {
+    pub assignment_path: PathBuf,
+    pub mesh_cidr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteLiveLinuxEndpointHijackReportConfig {
     pub report_path: PathBuf,
     pub rogue_endpoint_ip: String,
@@ -160,6 +166,46 @@ pub struct WriteLiveLinuxEndpointHijackReportConfig {
     pub endpoints_after_hijack: String,
     pub status_after_recovery: String,
     pub endpoints_after_recovery: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteActiveNetworkSignedStateTamperReportConfig {
+    pub report_path: PathBuf,
+    pub baseline_status: String,
+    pub tamper_reject_status: String,
+    pub fail_closed_status: String,
+    pub netcheck_fail_closed_status: String,
+    pub recovery_status: String,
+    pub exit_host: String,
+    pub client_host: String,
+    pub status_after_tamper: String,
+    pub netcheck_after_tamper: String,
+    pub status_after_recovery: String,
+    pub captured_at_utc: String,
+    pub captured_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteActiveNetworkRoguePathHijackReportConfig {
+    pub report_path: PathBuf,
+    pub baseline_status: String,
+    pub hijack_reject_status: String,
+    pub fail_closed_status: String,
+    pub netcheck_fail_closed_status: String,
+    pub no_rogue_endpoint_status: String,
+    pub recovery_status: String,
+    pub recovery_endpoint_status: String,
+    pub rogue_endpoint_ip: String,
+    pub exit_host: String,
+    pub client_host: String,
+    pub endpoints_before: String,
+    pub endpoints_after_hijack: String,
+    pub endpoints_after_recovery: String,
+    pub status_after_hijack: String,
+    pub netcheck_after_hijack: String,
+    pub status_after_recovery: String,
     pub captured_at_utc: String,
     pub captured_at_unix: u64,
 }
@@ -426,6 +472,19 @@ fn parse_cidr(value: &str) -> Result<ParsedCidr, String> {
             let network = u128::from_be_bytes(ipv6.octets()) & mask;
             Ok(ParsedCidr::V6 { network, prefix })
         }
+    }
+}
+
+fn canonicalize_ipv4_cidr(raw: &str, label: &str) -> Result<String, String> {
+    let parsed = parse_cidr(raw).map_err(|err| format!("invalid {label}: {err}"))?;
+    match parsed {
+        ParsedCidr::V4 { network, prefix } => {
+            if prefix == 32 {
+                return Err(format!("{label} must not be an IPv4 host route"));
+            }
+            Ok(format!("{}/{}", Ipv4Addr::from(network), prefix))
+        }
+        ParsedCidr::V6 { .. } => Err(format!("{label} must be an IPv4 CIDR")),
     }
 }
 
@@ -1392,6 +1451,67 @@ pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
     Ok(replaced.to_string())
 }
 
+pub fn execute_ops_rewrite_assignment_mesh_cidr(
+    config: RewriteAssignmentMeshCidrConfig,
+) -> Result<String, String> {
+    let assignment_path = resolve_path(config.assignment_path.as_path())?;
+    let mesh_cidr = canonicalize_ipv4_cidr(config.mesh_cidr.as_str(), "mesh CIDR")?;
+    let metadata = fs::symlink_metadata(assignment_path.as_path()).map_err(|err| {
+        format!(
+            "stat assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "assignment path must not be a symlink: {}",
+            assignment_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "assignment path must be a regular file: {}",
+            assignment_path.display()
+        ));
+    }
+
+    let body = fs::read_to_string(assignment_path.as_path()).map_err(|err| {
+        format!(
+            "read assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    let mut rewritten = false;
+    let mut updated = Vec::new();
+    for line in body.lines() {
+        let mut line_out = line.to_string();
+        if let Some((key, _value)) = line.split_once('=')
+            && key.trim() == "mesh_cidr"
+        {
+            line_out = format!("mesh_cidr={mesh_cidr}");
+            rewritten = true;
+        }
+        updated.push(line_out);
+    }
+    if !rewritten {
+        return Err(format!(
+            "failed to locate mesh_cidr field in assignment bundle ({})",
+            assignment_path.display()
+        ));
+    }
+    fs::write(
+        assignment_path.as_path(),
+        format!("{}\n", updated.join("\n")),
+    )
+    .map_err(|err| {
+        format!(
+            "write assignment path failed ({}): {err}",
+            assignment_path.display()
+        )
+    })?;
+    Ok(mesh_cidr)
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -1474,15 +1594,191 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
         .to_string())
 }
 
+pub fn execute_ops_write_active_network_signed_state_tamper_report(
+    config: WriteActiveNetworkSignedStateTamperReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let baseline_status = parse_pass_fail(config.baseline_status.as_str(), "--baseline-status")?;
+    let tamper_reject_status = parse_pass_fail(
+        config.tamper_reject_status.as_str(),
+        "--tamper-reject-status",
+    )?;
+    let fail_closed_status =
+        parse_pass_fail(config.fail_closed_status.as_str(), "--fail-closed-status")?;
+    let netcheck_fail_closed_status = parse_pass_fail(
+        config.netcheck_fail_closed_status.as_str(),
+        "--netcheck-fail-closed-status",
+    )?;
+    let recovery_status = parse_pass_fail(config.recovery_status.as_str(), "--recovery-status")?;
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let checks = json!({
+        "baseline_two_node_e2e": baseline_status,
+        "tampered_signed_assignment_rejected": tamper_reject_status,
+        "fail_closed_engaged": fail_closed_status,
+        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
+        "recovery_restored_secure_runtime": recovery_status,
+    });
+    let status = if checks
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .all(|value| value.as_str() == Some(CHECK_PASS))
+        })
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "active_network_signed_state_tamper",
+        "evidence_mode": "measured",
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": status,
+        "hosts": {
+            "exit_host": config.exit_host,
+            "client_host": config.client_host,
+        },
+        "checks": checks,
+        "evidence": {
+            "status_after_tamper": config.status_after_tamper,
+            "netcheck_after_tamper": config.netcheck_after_tamper,
+            "status_after_recovery": config.status_after_recovery,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
+pub fn execute_ops_write_active_network_rogue_path_hijack_report(
+    config: WriteActiveNetworkRoguePathHijackReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let rogue_endpoint_ip = config
+        .rogue_endpoint_ip
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| {
+            format!(
+                "invalid rogue endpoint IPv4 address {:?}: {err}",
+                config.rogue_endpoint_ip
+            )
+        })?
+        .to_string();
+    let baseline_status = parse_pass_fail(config.baseline_status.as_str(), "--baseline-status")?;
+    let hijack_reject_status = parse_pass_fail(
+        config.hijack_reject_status.as_str(),
+        "--hijack-reject-status",
+    )?;
+    let fail_closed_status =
+        parse_pass_fail(config.fail_closed_status.as_str(), "--fail-closed-status")?;
+    let netcheck_fail_closed_status = parse_pass_fail(
+        config.netcheck_fail_closed_status.as_str(),
+        "--netcheck-fail-closed-status",
+    )?;
+    let no_rogue_endpoint_status = parse_pass_fail(
+        config.no_rogue_endpoint_status.as_str(),
+        "--no-rogue-endpoint-status",
+    )?;
+    let recovery_status = parse_pass_fail(config.recovery_status.as_str(), "--recovery-status")?;
+    let recovery_endpoint_status = parse_pass_fail(
+        config.recovery_endpoint_status.as_str(),
+        "--recovery-endpoint-status",
+    )?;
+    let captured_at_unix = if config.captured_at_unix == 0 {
+        unix_now()
+    } else {
+        config.captured_at_unix
+    };
+    let captured_at = if config.captured_at_utc.trim().is_empty() {
+        format!("{captured_at_unix}")
+    } else {
+        config.captured_at_utc.trim().to_string()
+    };
+
+    let checks = json!({
+        "baseline_two_node_e2e": baseline_status,
+        "forged_endpoint_assignment_rejected": hijack_reject_status,
+        "fail_closed_engaged": fail_closed_status,
+        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
+        "rogue_endpoint_not_adopted": no_rogue_endpoint_status,
+        "recovery_restored_secure_runtime": recovery_status,
+        "recovery_keeps_rogue_endpoint_rejected": recovery_endpoint_status,
+    });
+    let status = if checks
+        .as_object()
+        .map(|items| {
+            items
+                .values()
+                .all(|value| value.as_str() == Some(CHECK_PASS))
+        })
+        .unwrap_or(false)
+    {
+        CHECK_PASS
+    } else {
+        CHECK_FAIL
+    };
+    let payload = json!({
+        "phase": "phase10",
+        "mode": "active_network_rogue_path_hijack",
+        "evidence_mode": "measured",
+        "captured_at": captured_at,
+        "captured_at_unix": captured_at_unix,
+        "status": status,
+        "hosts": {
+            "exit_host": config.exit_host,
+            "client_host": config.client_host,
+        },
+        "rogue_endpoint_ip": rogue_endpoint_ip,
+        "checks": checks,
+        "evidence": {
+            "wg_endpoints_before": config.endpoints_before,
+            "wg_endpoints_after_hijack": config.endpoints_after_hijack,
+            "wg_endpoints_after_recovery": config.endpoints_after_recovery,
+            "status_after_hijack": config.status_after_hijack,
+            "netcheck_after_hijack": config.netcheck_after_hijack,
+            "status_after_recovery": config.status_after_recovery,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    Ok(payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(CHECK_FAIL)
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckLocalFileModeConfig, RewriteAssignmentPeerEndpointIpConfig,
-        UpdateRoleSwitchHostResultConfig, WriteLiveLinuxControlSurfaceReportConfig,
+        CheckLocalFileModeConfig, RewriteAssignmentMeshCidrConfig,
+        RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
+        WriteActiveNetworkRoguePathHijackReportConfig,
+        WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLinuxControlSurfaceReportConfig,
         WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
         WriteLiveLinuxServerIpBypassReportConfig, WriteRoleSwitchMatrixReportConfig,
-        execute_ops_check_local_file_mode, execute_ops_rewrite_assignment_peer_endpoint_ip,
+        execute_ops_check_local_file_mode, execute_ops_rewrite_assignment_mesh_cidr,
+        execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
+        execute_ops_write_active_network_rogue_path_hijack_report,
+        execute_ops_write_active_network_signed_state_tamper_report,
         execute_ops_write_live_linux_control_surface_report,
         execute_ops_write_live_linux_endpoint_hijack_report,
         execute_ops_write_live_linux_reboot_recovery_report,
@@ -1709,6 +2005,25 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_assignment_mesh_cidr_updates_mesh_cidr_field() {
+        let assignment_path = temp_path("assignment-mesh-cidr-rewrite");
+        fs::write(
+            assignment_path.as_path(),
+            "node_id=client-1\nmesh_cidr=100.64.0.0/10\npeer.0.endpoint=192.168.18.49:51820\n",
+        )
+        .expect("write assignment");
+        let rewritten = execute_ops_rewrite_assignment_mesh_cidr(RewriteAssignmentMeshCidrConfig {
+            assignment_path: assignment_path.clone(),
+            mesh_cidr: "100.128.0.0/10".to_string(),
+        })
+        .expect("rewrite mesh cidr");
+        assert_eq!(rewritten, "100.128.0.0/10");
+        let body = fs::read_to_string(assignment_path.as_path()).expect("read assignment");
+        assert!(body.contains("mesh_cidr=100.128.0.0/10"));
+        let _ = fs::remove_file(assignment_path.as_path());
+    }
+
+    #[test]
     fn endpoint_hijack_report_marks_fail_when_rogue_endpoint_present() {
         let report_path = temp_path("endpoint-hijack-report");
         let status = execute_ops_write_live_linux_endpoint_hijack_report(
@@ -1730,6 +2045,68 @@ mod tests {
         .expect("write report");
         assert_eq!(status, "fail");
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn signed_state_tamper_report_marks_pass_when_all_checks_pass() {
+        let report_path = temp_path("signed-state-tamper-report");
+        let status = execute_ops_write_active_network_signed_state_tamper_report(
+            WriteActiveNetworkSignedStateTamperReportConfig {
+                report_path: report_path.clone(),
+                baseline_status: "pass".to_string(),
+                tamper_reject_status: "pass".to_string(),
+                fail_closed_status: "pass".to_string(),
+                netcheck_fail_closed_status: "pass".to_string(),
+                recovery_status: "pass".to_string(),
+                exit_host: "192.168.18.49".to_string(),
+                client_host: "192.168.18.50".to_string(),
+                status_after_tamper: "state=FailClosed".to_string(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "pass");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"mode\": \"active_network_signed_state_tamper\""));
+        assert!(body.contains("\"status\": \"pass\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn rogue_path_hijack_report_marks_fail_when_endpoint_check_fails() {
+        let report_path = temp_path("rogue-path-hijack-report");
+        let status = execute_ops_write_active_network_rogue_path_hijack_report(
+            WriteActiveNetworkRoguePathHijackReportConfig {
+                report_path: report_path.clone(),
+                baseline_status: "pass".to_string(),
+                hijack_reject_status: "pass".to_string(),
+                fail_closed_status: "pass".to_string(),
+                netcheck_fail_closed_status: "pass".to_string(),
+                no_rogue_endpoint_status: "fail".to_string(),
+                recovery_status: "pass".to_string(),
+                recovery_endpoint_status: "pass".to_string(),
+                rogue_endpoint_ip: "203.0.113.10".to_string(),
+                exit_host: "192.168.18.49".to_string(),
+                client_host: "192.168.18.50".to_string(),
+                endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
+                endpoints_after_hijack: "peer-a=203.0.113.10:51820".to_string(),
+                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
+                status_after_hijack: "state=FailClosed".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"mode\": \"active_network_rogue_path_hijack\""));
         assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
         let _ = fs::remove_file(report_path.as_path());
     }

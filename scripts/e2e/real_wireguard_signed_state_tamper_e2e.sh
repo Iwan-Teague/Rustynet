@@ -113,19 +113,12 @@ if [[ -L "${SSH_KNOWN_HOSTS_FILE}" ]]; then
   echo "pinned SSH known_hosts file must not be a symlink: ${SSH_KNOWN_HOSTS_FILE}" >&2
   exit 2
 fi
-python3 - "${SSH_KNOWN_HOSTS_FILE}" <<'PY'
-import os
-import stat
-import sys
+cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  --path "${SSH_KNOWN_HOSTS_FILE}" \
+  --policy no-group-world-write \
+  --label "pinned SSH known_hosts file" >/dev/null
 
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o022:
-    raise SystemExit(f"pinned SSH known_hosts file must not be group/world writable: {path} ({mode:03o})")
-PY
-
-for cmd in ssh ssh-keygen python3 cargo; do
+for cmd in ssh ssh-keygen cargo; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
@@ -183,16 +176,6 @@ remote_exec_root() {
     remote_exec "${target}" sudo -n -- "$@"
   else
     remote_exec "${target}" "$@"
-  fi
-}
-
-remote_python_root() {
-  local target="$1"
-  shift
-  if needs_sudo; then
-    "${SSH_BASE[@]}" "${target}" sudo -n python3 "$@"
-  else
-    "${SSH_BASE[@]}" "${target}" python3 "$@"
   fi
 }
 
@@ -254,31 +237,17 @@ remote_exec_root "${CLIENT_TARGET}" systemctl stop rustynetd-assignment-refresh.
 BACKUP_PATH="/var/lib/rustynet/rustynetd.assignment.securitytest.$(date +%s).bak"
 remote_exec_root "${CLIENT_TARGET}" cp "${ASSIGNMENT_PATH}" "${BACKUP_PATH}"
 
-remote_python_root "${CLIENT_TARGET}" - "${ASSIGNMENT_PATH}" <<'PY'
-import pathlib
-import sys
+CURRENT_MESH_CIDR="$(capture_remote_root "${CLIENT_TARGET}" awk -F= '/^mesh_cidr=/{print $2; exit}' "${ASSIGNMENT_PATH}" || true)"
+CURRENT_MESH_CIDR="$(printf '%s' "${CURRENT_MESH_CIDR}" | tr -d '[:space:]')"
+TAMPERED_MESH_CIDR="100.128.0.0/10"
+if [[ "${CURRENT_MESH_CIDR}" == "100.128.0.0/10" ]]; then
+  TAMPERED_MESH_CIDR="100.64.0.0/10"
+fi
 
-assignment_path = pathlib.Path(sys.argv[1])
-body = assignment_path.read_text(encoding="utf-8")
-lines = body.splitlines()
-
-updated = []
-changed = False
-for line in lines:
-    if not changed and line.startswith("mesh_cidr="):
-        current = line.split("=", 1)[1].strip()
-        if current == "100.64.0.0/10":
-            line = "mesh_cidr=100.65.0.0/10"
-        else:
-            line = "mesh_cidr=100.64.0.0/10"
-        changed = True
-    updated.append(line)
-
-if not changed:
-    raise SystemExit("failed to locate mesh_cidr field in assignment bundle")
-
-assignment_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
-PY
+remote_exec_root "${CLIENT_TARGET}" \
+  rustynet ops rewrite-assignment-mesh-cidr \
+  --assignment-path "${ASSIGNMENT_PATH}" \
+  --mesh-cidr "${TAMPERED_MESH_CIDR}"
 
 remote_exec_root "${CLIENT_TARGET}" rm -f "${ASSIGNMENT_WATERMARK_PATH}"
 remote_exec_root "${CLIENT_TARGET}" systemctl restart rustynetd
@@ -314,65 +283,24 @@ if [[ "${STATUS_AFTER_RECOVERY}" == *"restricted_safe_mode=false"* && "${STATUS_
   RECOVERY_STATUS="pass"
 fi
 
-OVERALL_STATUS="fail"
-if [[ "${BASELINE_STATUS}" == "pass" \
-   && "${TAMPER_REJECT_STATUS}" == "pass" \
-   && "${FAIL_CLOSED_STATUS}" == "pass" \
-   && "${NETCHECK_FAIL_CLOSED_STATUS}" == "pass" \
-   && "${RECOVERY_STATUS}" == "pass" ]]; then
-  OVERALL_STATUS="pass"
-fi
-
-python3 - "${REPORT_PATH}" "${OVERALL_STATUS}" "${BASELINE_STATUS}" "${TAMPER_REJECT_STATUS}" "${FAIL_CLOSED_STATUS}" "${NETCHECK_FAIL_CLOSED_STATUS}" "${RECOVERY_STATUS}" "${EXIT_HOST}" "${CLIENT_HOST}" "${STATUS_AFTER_TAMPER}" "${NETCHECK_AFTER_TAMPER}" "${STATUS_AFTER_RECOVERY}" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-(
-    report_path,
-    overall_status,
-    baseline_status,
-    tamper_reject_status,
-    fail_closed_status,
-    netcheck_fail_closed_status,
-    recovery_status,
-    exit_host,
-    client_host,
-    status_after_tamper,
-    netcheck_after_tamper,
-    status_after_recovery,
-) = sys.argv[1:]
-
-captured_at = datetime.now(timezone.utc)
-payload = {
-    "phase": "phase10",
-    "mode": "active_network_signed_state_tamper",
-    "evidence_mode": "measured",
-    "captured_at": captured_at.isoformat(),
-    "captured_at_unix": int(captured_at.timestamp()),
-    "status": overall_status,
-    "hosts": {
-        "exit_host": exit_host,
-        "client_host": client_host,
-    },
-    "checks": {
-        "baseline_two_node_e2e": baseline_status,
-        "tampered_signed_assignment_rejected": tamper_reject_status,
-        "fail_closed_engaged": fail_closed_status,
-        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
-        "recovery_restored_secure_runtime": recovery_status,
-    },
-    "evidence": {
-        "status_after_tamper": status_after_tamper,
-        "netcheck_after_tamper": netcheck_after_tamper,
-        "status_after_recovery": status_after_recovery,
-    },
-}
-
-with open(report_path, "w", encoding="utf-8") as fh:
-    json.dump(payload, fh, indent=2)
-    fh.write("\n")
-PY
+captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+captured_at_unix="$(date -u +%s)"
+OVERALL_STATUS="$(
+  cargo run --quiet -p rustynet-cli -- ops write-active-network-signed-state-tamper-report \
+    --report-path "${REPORT_PATH}" \
+    --baseline-status "${BASELINE_STATUS}" \
+    --tamper-reject-status "${TAMPER_REJECT_STATUS}" \
+    --fail-closed-status "${FAIL_CLOSED_STATUS}" \
+    --netcheck-fail-closed-status "${NETCHECK_FAIL_CLOSED_STATUS}" \
+    --recovery-status "${RECOVERY_STATUS}" \
+    --exit-host "${EXIT_HOST}" \
+    --client-host "${CLIENT_HOST}" \
+    --status-after-tamper "${STATUS_AFTER_TAMPER}" \
+    --netcheck-after-tamper "${NETCHECK_AFTER_TAMPER}" \
+    --status-after-recovery "${STATUS_AFTER_RECOVERY}" \
+    --captured-at-utc "${captured_at_utc}" \
+    --captured-at-unix "${captured_at_unix}"
+)"
 
 if [[ "${OVERALL_STATUS}" != "pass" ]]; then
   echo "signed-state tamper e2e failed; see ${REPORT_PATH}" >&2

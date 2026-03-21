@@ -18,7 +18,7 @@ require_env() {
   fi
 }
 
-for cmd in python3 cargo ssh; do
+for cmd in cargo ssh; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
@@ -30,12 +30,8 @@ require_env RUSTYNET_ACTIVE_NET_CLIENT_HOST
 require_env RUSTYNET_ACTIVE_NET_SSH_ALLOW_CIDRS
 
 ROGUE_ENDPOINT_IP="${RUSTYNET_ACTIVE_NET_ROGUE_ENDPOINT_IP:-203.0.113.250}"
-python3 - "${ROGUE_ENDPOINT_IP}" <<'PY'
-import ipaddress
-import sys
-
-ipaddress.IPv4Address(sys.argv[1])
-PY
+cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address \
+  --ip "${ROGUE_ENDPOINT_IP}" >/dev/null
 
 SSH_USER="${RUSTYNET_ACTIVE_NET_SSH_USER:-root}"
 SSH_PORT="${RUSTYNET_ACTIVE_NET_SSH_PORT:-22}"

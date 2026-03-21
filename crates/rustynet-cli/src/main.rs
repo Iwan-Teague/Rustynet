@@ -354,8 +354,17 @@ enum OpsCommand {
     RewriteAssignmentPeerEndpointIp {
         config: ops_live_lab_orchestrator::RewriteAssignmentPeerEndpointIpConfig,
     },
+    RewriteAssignmentMeshCidr {
+        config: ops_live_lab_orchestrator::RewriteAssignmentMeshCidrConfig,
+    },
     WriteLiveLinuxEndpointHijackReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig,
+    },
+    WriteActiveNetworkSignedStateTamperReport {
+        config: ops_live_lab_orchestrator::WriteActiveNetworkSignedStateTamperReportConfig,
+    },
+    WriteActiveNetworkRoguePathHijackReport {
+        config: ops_live_lab_orchestrator::WriteActiveNetworkRoguePathHijackReportConfig,
     },
     ValidateNetworkDiscoveryBundle {
         config: ops_network_discovery::ValidateNetworkDiscoveryBundleConfig,
@@ -1089,6 +1098,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 endpoint_ip: parser.required("--endpoint-ip")?,
             },
         }),
+        "rewrite-assignment-mesh-cidr" => Ok(OpsCommand::RewriteAssignmentMeshCidr {
+            config: ops_live_lab_orchestrator::RewriteAssignmentMeshCidrConfig {
+                assignment_path: parser.required_path("--assignment-path")?,
+                mesh_cidr: parser.required("--mesh-cidr")?,
+            },
+        }),
         "write-live-linux-endpoint-hijack-report" => {
             let captured_at_unix = parser
                 .value("--captured-at-unix")
@@ -1111,6 +1126,71 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     endpoints_after_hijack: parser.required("--endpoints-after-hijack")?,
                     status_after_recovery: parser.required("--status-after-recovery")?,
                     endpoints_after_recovery: parser.required("--endpoints-after-recovery")?,
+                    captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                    captured_at_unix,
+                },
+            })
+        }
+        "write-active-network-signed-state-tamper-report" => {
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteActiveNetworkSignedStateTamperReport {
+                config:
+                    ops_live_lab_orchestrator::WriteActiveNetworkSignedStateTamperReportConfig {
+                        report_path: parser.required_path("--report-path")?,
+                        baseline_status: parser.required("--baseline-status")?,
+                        tamper_reject_status: parser.required("--tamper-reject-status")?,
+                        fail_closed_status: parser.required("--fail-closed-status")?,
+                        netcheck_fail_closed_status: parser
+                            .required("--netcheck-fail-closed-status")?,
+                        recovery_status: parser.required("--recovery-status")?,
+                        exit_host: parser.required("--exit-host")?,
+                        client_host: parser.required("--client-host")?,
+                        status_after_tamper: parser.required("--status-after-tamper")?,
+                        netcheck_after_tamper: parser.required("--netcheck-after-tamper")?,
+                        status_after_recovery: parser.required("--status-after-recovery")?,
+                        captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
+                        captured_at_unix,
+                    },
+            })
+        }
+        "write-active-network-rogue-path-hijack-report" => {
+            let captured_at_unix = parser
+                .value("--captured-at-unix")
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid value for --captured-at-unix: {err}"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteActiveNetworkRoguePathHijackReport {
+                config: ops_live_lab_orchestrator::WriteActiveNetworkRoguePathHijackReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    baseline_status: parser.required("--baseline-status")?,
+                    hijack_reject_status: parser.required("--hijack-reject-status")?,
+                    fail_closed_status: parser.required("--fail-closed-status")?,
+                    netcheck_fail_closed_status: parser
+                        .required("--netcheck-fail-closed-status")?,
+                    no_rogue_endpoint_status: parser.required("--no-rogue-endpoint-status")?,
+                    recovery_status: parser.required("--recovery-status")?,
+                    recovery_endpoint_status: parser.required("--recovery-endpoint-status")?,
+                    rogue_endpoint_ip: parser.required("--rogue-endpoint-ip")?,
+                    exit_host: parser.required("--exit-host")?,
+                    client_host: parser.required("--client-host")?,
+                    endpoints_before: parser.required("--endpoints-before")?,
+                    endpoints_after_hijack: parser.required("--endpoints-after-hijack")?,
+                    endpoints_after_recovery: parser.required("--endpoints-after-recovery")?,
+                    status_after_hijack: parser.required("--status-after-hijack")?,
+                    netcheck_after_hijack: parser.required("--netcheck-after-hijack")?,
+                    status_after_recovery: parser.required("--status-after-recovery")?,
                     captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
                     captured_at_unix,
                 },
@@ -2742,8 +2822,21 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::RewriteAssignmentPeerEndpointIp { config } => {
             ops_live_lab_orchestrator::execute_ops_rewrite_assignment_peer_endpoint_ip(config)
         }
+        OpsCommand::RewriteAssignmentMeshCidr { config } => {
+            ops_live_lab_orchestrator::execute_ops_rewrite_assignment_mesh_cidr(config)
+        }
         OpsCommand::WriteLiveLinuxEndpointHijackReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_endpoint_hijack_report(config)
+        }
+        OpsCommand::WriteActiveNetworkSignedStateTamperReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_active_network_signed_state_tamper_report(
+                config,
+            )
+        }
+        OpsCommand::WriteActiveNetworkRoguePathHijackReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_active_network_rogue_path_hijack_report(
+                config,
+            )
         }
         OpsCommand::ValidateNetworkDiscoveryBundle { config } => {
             ops_network_discovery::execute_ops_validate_network_discovery_bundle(config)
@@ -9076,7 +9169,10 @@ fn help_text() -> String {
         "  ops write-live-linux-server-ip-bypass-report --report-path <path> --allowed-management-cidrs <cidr[,cidr...]> --probe-from-client-status <pass|fail> --probe-ip <ipv4> --probe-port <port> --client-internet-route <text> --client-probe-route <text> --client-table-51820 <text> --client-endpoints <text> --probe-self-test <text> --probe-from-client-output <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-live-linux-control-surface-report --report-path <path> --dns-bind-addr <host:port> --remote-dns-probe-status <pass|fail|skipped> --remote-dns-probe-output <text> --work-dir <path> --host-label <label> [--host-label <label>]... [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops rewrite-assignment-peer-endpoint-ip --assignment-path <path> --endpoint-ip <ipv4>",
+        "  ops rewrite-assignment-mesh-cidr --assignment-path <path> --mesh-cidr <ipv4-cidr>",
         "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops write-active-network-signed-state-tamper-report --report-path <path> --baseline-status <pass|fail> --tamper-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --recovery-status <pass|fail> --exit-host <host> --client-host <host> --status-after-tamper <text> --netcheck-after-tamper <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
@@ -9888,6 +9984,16 @@ mod tests {
                 .contains("RewriteAssignmentPeerEndpointIp")
         );
 
+        let rewrite_assignment_mesh_cidr = parse_command(&[
+            "ops".to_string(),
+            "rewrite-assignment-mesh-cidr".to_string(),
+            "--assignment-path".to_string(),
+            "/var/lib/rustynet/rustynetd.assignment".to_string(),
+            "--mesh-cidr".to_string(),
+            "100.65.0.0/10".to_string(),
+        ]);
+        assert!(format!("{rewrite_assignment_mesh_cidr:?}").contains("RewriteAssignmentMeshCidr"));
+
         let write_live_linux_endpoint_hijack_report = parse_command(&[
             "ops".to_string(),
             "write-live-linux-endpoint-hijack-report".to_string(),
@@ -9915,6 +10021,80 @@ mod tests {
         assert!(
             format!("{write_live_linux_endpoint_hijack_report:?}")
                 .contains("WriteLiveLinuxEndpointHijackReport")
+        );
+
+        let write_active_network_signed_state_tamper_report = parse_command(&[
+            "ops".to_string(),
+            "write-active-network-signed-state-tamper-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/signed_state_tamper_e2e_report.json".to_string(),
+            "--baseline-status".to_string(),
+            "pass".to_string(),
+            "--tamper-reject-status".to_string(),
+            "pass".to_string(),
+            "--fail-closed-status".to_string(),
+            "pass".to_string(),
+            "--netcheck-fail-closed-status".to_string(),
+            "pass".to_string(),
+            "--recovery-status".to_string(),
+            "pass".to_string(),
+            "--exit-host".to_string(),
+            "192.168.18.49".to_string(),
+            "--client-host".to_string(),
+            "192.168.18.50".to_string(),
+            "--status-after-tamper".to_string(),
+            "state=FailClosed".to_string(),
+            "--netcheck-after-tamper".to_string(),
+            "path_mode=fail_closed".to_string(),
+            "--status-after-recovery".to_string(),
+            "state=ExitActive".to_string(),
+        ]);
+        assert!(
+            format!("{write_active_network_signed_state_tamper_report:?}")
+                .contains("WriteActiveNetworkSignedStateTamperReport")
+        );
+
+        let write_active_network_rogue_path_hijack_report = parse_command(&[
+            "ops".to_string(),
+            "write-active-network-rogue-path-hijack-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/phase10/rogue_path_hijack_e2e_report.json".to_string(),
+            "--baseline-status".to_string(),
+            "pass".to_string(),
+            "--hijack-reject-status".to_string(),
+            "pass".to_string(),
+            "--fail-closed-status".to_string(),
+            "pass".to_string(),
+            "--netcheck-fail-closed-status".to_string(),
+            "pass".to_string(),
+            "--no-rogue-endpoint-status".to_string(),
+            "pass".to_string(),
+            "--recovery-status".to_string(),
+            "pass".to_string(),
+            "--recovery-endpoint-status".to_string(),
+            "pass".to_string(),
+            "--rogue-endpoint-ip".to_string(),
+            "203.0.113.10".to_string(),
+            "--exit-host".to_string(),
+            "192.168.18.49".to_string(),
+            "--client-host".to_string(),
+            "192.168.18.50".to_string(),
+            "--endpoints-before".to_string(),
+            "peer-a=192.168.18.49:51820".to_string(),
+            "--endpoints-after-hijack".to_string(),
+            "peer-a=192.168.18.49:51820".to_string(),
+            "--endpoints-after-recovery".to_string(),
+            "peer-a=192.168.18.49:51820".to_string(),
+            "--status-after-hijack".to_string(),
+            "state=FailClosed".to_string(),
+            "--netcheck-after-hijack".to_string(),
+            "path_mode=fail_closed".to_string(),
+            "--status-after-recovery".to_string(),
+            "state=ExitActive".to_string(),
+        ]);
+        assert!(
+            format!("{write_active_network_rogue_path_hijack_report:?}")
+                .contains("WriteActiveNetworkRoguePathHijackReport")
         );
 
         let validate_network_discovery_bundle = parse_command(&[

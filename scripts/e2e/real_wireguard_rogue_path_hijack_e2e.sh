@@ -124,26 +124,15 @@ if [[ -L "${SSH_KNOWN_HOSTS_FILE}" ]]; then
   echo "pinned SSH known_hosts file must not be a symlink: ${SSH_KNOWN_HOSTS_FILE}" >&2
   exit 2
 fi
-python3 - "${SSH_KNOWN_HOSTS_FILE}" <<'PY'
-import os
-import stat
-import sys
+cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+  --path "${SSH_KNOWN_HOSTS_FILE}" \
+  --policy no-group-world-write \
+  --label "pinned SSH known_hosts file" >/dev/null
 
-path = sys.argv[1]
-st = os.stat(path, follow_symlinks=False)
-mode = stat.S_IMODE(st.st_mode)
-if mode & 0o022:
-    raise SystemExit(f"pinned SSH known_hosts file must not be group/world writable: {path} ({mode:03o})")
-PY
+cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address \
+  --ip "${ROGUE_ENDPOINT_IP}" >/dev/null
 
-python3 - "${ROGUE_ENDPOINT_IP}" <<'PY'
-import ipaddress
-import sys
-
-ipaddress.IPv4Address(sys.argv[1])
-PY
-
-for cmd in ssh ssh-keygen python3 cargo; do
+for cmd in ssh ssh-keygen cargo; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "missing required command: ${cmd}" >&2
     exit 1
@@ -201,16 +190,6 @@ remote_exec_root() {
     remote_exec "${target}" sudo -n -- "$@"
   else
     remote_exec "${target}" "$@"
-  fi
-}
-
-remote_python_root() {
-  local target="$1"
-  shift
-  if needs_sudo; then
-    "${SSH_BASE[@]}" "${target}" sudo -n python3 "$@"
-  else
-    "${SSH_BASE[@]}" "${target}" python3 "$@"
   fi
 }
 
@@ -279,30 +258,10 @@ WG_ENDPOINTS_BEFORE="$(capture_remote_root "${CLIENT_TARGET}" wg show rustynet0 
 BACKUP_PATH="/var/lib/rustynet/rustynetd.assignment.securitytest.$(date +%s).bak"
 remote_exec_root "${CLIENT_TARGET}" cp "${ASSIGNMENT_PATH}" "${BACKUP_PATH}"
 
-remote_python_root "${CLIENT_TARGET}" - "${ASSIGNMENT_PATH}" "${ROGUE_ENDPOINT_IP}" <<'PY'
-import pathlib
-import re
-import sys
-
-assignment_path = pathlib.Path(sys.argv[1])
-rogue_ip = sys.argv[2]
-pattern = re.compile(r"^(peer\.\d+\.endpoint=)([^:\s]+):(\d+)\s*$")
-
-lines = assignment_path.read_text(encoding="utf-8").splitlines()
-updated = []
-replaced = 0
-for line in lines:
-    match = pattern.match(line)
-    if match:
-        line = f"{match.group(1)}{rogue_ip}:{match.group(3)}"
-        replaced += 1
-    updated.append(line)
-
-if replaced == 0:
-    raise SystemExit("failed to locate peer endpoint fields in assignment bundle")
-
-assignment_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
-PY
+remote_exec_root "${CLIENT_TARGET}" \
+  rustynet ops rewrite-assignment-peer-endpoint-ip \
+  --assignment-path "${ASSIGNMENT_PATH}" \
+  --endpoint-ip "${ROGUE_ENDPOINT_IP}"
 
 remote_exec_root "${CLIENT_TARGET}" rm -f "${ASSIGNMENT_WATERMARK_PATH}"
 remote_exec_root "${CLIENT_TARGET}" systemctl restart rustynetd
@@ -349,79 +308,30 @@ if [[ "${WG_ENDPOINTS_AFTER_RECOVERY}" != *"${ROGUE_ENDPOINT_IP}"* ]]; then
   RECOVERY_ENDPOINT_STATUS="pass"
 fi
 
-OVERALL_STATUS="fail"
-if [[ "${BASELINE_STATUS}" == "pass" \
-   && "${HIJACK_REJECT_STATUS}" == "pass" \
-   && "${FAIL_CLOSED_STATUS}" == "pass" \
-   && "${NETCHECK_FAIL_CLOSED_STATUS}" == "pass" \
-   && "${NO_ROGUE_ENDPOINT_STATUS}" == "pass" \
-   && "${RECOVERY_STATUS}" == "pass" \
-   && "${RECOVERY_ENDPOINT_STATUS}" == "pass" ]]; then
-  OVERALL_STATUS="pass"
-fi
-
-python3 - "${REPORT_PATH}" "${OVERALL_STATUS}" "${BASELINE_STATUS}" "${HIJACK_REJECT_STATUS}" "${FAIL_CLOSED_STATUS}" "${NETCHECK_FAIL_CLOSED_STATUS}" "${NO_ROGUE_ENDPOINT_STATUS}" "${RECOVERY_STATUS}" "${RECOVERY_ENDPOINT_STATUS}" "${ROGUE_ENDPOINT_IP}" "${EXIT_HOST}" "${CLIENT_HOST}" "${WG_ENDPOINTS_BEFORE}" "${WG_ENDPOINTS_AFTER_HIJACK}" "${WG_ENDPOINTS_AFTER_RECOVERY}" "${STATUS_AFTER_HIJACK}" "${NETCHECK_AFTER_HIJACK}" "${STATUS_AFTER_RECOVERY}" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-(
-    report_path,
-    overall_status,
-    baseline_status,
-    hijack_reject_status,
-    fail_closed_status,
-    netcheck_fail_closed_status,
-    no_rogue_endpoint_status,
-    recovery_status,
-    recovery_endpoint_status,
-    rogue_endpoint_ip,
-    exit_host,
-    client_host,
-    endpoints_before,
-    endpoints_after_hijack,
-    endpoints_after_recovery,
-    status_after_hijack,
-    netcheck_after_hijack,
-    status_after_recovery,
-) = sys.argv[1:]
-
-captured_at = datetime.now(timezone.utc)
-payload = {
-    "phase": "phase10",
-    "mode": "active_network_rogue_path_hijack",
-    "evidence_mode": "measured",
-    "captured_at": captured_at.isoformat(),
-    "captured_at_unix": int(captured_at.timestamp()),
-    "status": overall_status,
-    "hosts": {
-        "exit_host": exit_host,
-        "client_host": client_host,
-    },
-    "rogue_endpoint_ip": rogue_endpoint_ip,
-    "checks": {
-        "baseline_two_node_e2e": baseline_status,
-        "forged_endpoint_assignment_rejected": hijack_reject_status,
-        "fail_closed_engaged": fail_closed_status,
-        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
-        "rogue_endpoint_not_adopted": no_rogue_endpoint_status,
-        "recovery_restored_secure_runtime": recovery_status,
-        "recovery_keeps_rogue_endpoint_rejected": recovery_endpoint_status,
-    },
-    "evidence": {
-        "wg_endpoints_before": endpoints_before,
-        "wg_endpoints_after_hijack": endpoints_after_hijack,
-        "wg_endpoints_after_recovery": endpoints_after_recovery,
-        "status_after_hijack": status_after_hijack,
-        "netcheck_after_hijack": netcheck_after_hijack,
-        "status_after_recovery": status_after_recovery,
-    },
-}
-
-with open(report_path, "w", encoding="utf-8") as fh:
-    json.dump(payload, fh, indent=2)
-    fh.write("\n")
-PY
+captured_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+captured_at_unix="$(date -u +%s)"
+OVERALL_STATUS="$(
+  cargo run --quiet -p rustynet-cli -- ops write-active-network-rogue-path-hijack-report \
+    --report-path "${REPORT_PATH}" \
+    --baseline-status "${BASELINE_STATUS}" \
+    --hijack-reject-status "${HIJACK_REJECT_STATUS}" \
+    --fail-closed-status "${FAIL_CLOSED_STATUS}" \
+    --netcheck-fail-closed-status "${NETCHECK_FAIL_CLOSED_STATUS}" \
+    --no-rogue-endpoint-status "${NO_ROGUE_ENDPOINT_STATUS}" \
+    --recovery-status "${RECOVERY_STATUS}" \
+    --recovery-endpoint-status "${RECOVERY_ENDPOINT_STATUS}" \
+    --rogue-endpoint-ip "${ROGUE_ENDPOINT_IP}" \
+    --exit-host "${EXIT_HOST}" \
+    --client-host "${CLIENT_HOST}" \
+    --endpoints-before "${WG_ENDPOINTS_BEFORE}" \
+    --endpoints-after-hijack "${WG_ENDPOINTS_AFTER_HIJACK}" \
+    --endpoints-after-recovery "${WG_ENDPOINTS_AFTER_RECOVERY}" \
+    --status-after-hijack "${STATUS_AFTER_HIJACK}" \
+    --netcheck-after-hijack "${NETCHECK_AFTER_HIJACK}" \
+    --status-after-recovery "${STATUS_AFTER_RECOVERY}" \
+    --captured-at-utc "${captured_at_utc}" \
+    --captured-at-unix "${captured_at_unix}"
+)"
 
 if [[ "${OVERALL_STATUS}" != "pass" ]]; then
   echo "rogue-path hijack e2e failed; see ${REPORT_PATH}" >&2
