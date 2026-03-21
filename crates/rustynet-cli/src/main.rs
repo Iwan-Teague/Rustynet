@@ -283,10 +283,16 @@ enum OpsCommand {
     RunPhase1Baseline,
     CollectPhase9RawEvidence,
     GeneratePhase9Artifacts,
+    VerifyPhase9Readiness,
     VerifyPhase9Evidence,
     GeneratePhase10Artifacts,
+    VerifyPhase10Readiness,
     VerifyPhase10Provenance,
+    VerifyPhase6PlatformReadiness,
     VerifyPhase6ParityEvidence,
+    VerifyRequiredTestOutput {
+        config: ops_phase9::VerifyRequiredTestOutputConfig,
+    },
     GenerateCrossNetworkRemoteExitReport {
         config: ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig,
     },
@@ -602,6 +608,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::GeneratePhase9Artifacts)
         }
+        "verify-phase9-readiness" => {
+            if args.len() != 1 {
+                return Err("ops verify-phase9-readiness does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyPhase9Readiness)
+        }
         "verify-phase9-evidence" => {
             if args.len() != 1 {
                 return Err("ops verify-phase9-evidence does not accept options".to_string());
@@ -614,11 +626,25 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::GeneratePhase10Artifacts)
         }
+        "verify-phase10-readiness" => {
+            if args.len() != 1 {
+                return Err("ops verify-phase10-readiness does not accept options".to_string());
+            }
+            Ok(OpsCommand::VerifyPhase10Readiness)
+        }
         "verify-phase10-provenance" => {
             if args.len() != 1 {
                 return Err("ops verify-phase10-provenance does not accept options".to_string());
             }
             Ok(OpsCommand::VerifyPhase10Provenance)
+        }
+        "verify-phase6-platform-readiness" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops verify-phase6-platform-readiness does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::VerifyPhase6PlatformReadiness)
         }
         "verify-phase6-parity-evidence" => {
             if args.len() != 1 {
@@ -626,6 +652,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::VerifyPhase6ParityEvidence)
         }
+        "verify-required-test-output" => Ok(OpsCommand::VerifyRequiredTestOutput {
+            config: ops_phase9::VerifyRequiredTestOutputConfig {
+                output_path: parser.required_path("--output")?,
+                package: parser.required("--package")?,
+                test_filter: parser.required("--test-filter")?,
+            },
+        }),
         "generate-cross-network-remote-exit-report" => {
             let source_artifacts = collect_repeated_option_values(&args[1..], "--source-artifact")
                 .into_iter()
@@ -2628,13 +2661,21 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_phase9::execute_ops_collect_phase9_raw_evidence()
         }
         OpsCommand::GeneratePhase9Artifacts => ops_phase9::execute_ops_generate_phase9_artifacts(),
+        OpsCommand::VerifyPhase9Readiness => ops_phase9::execute_ops_verify_phase9_readiness(),
         OpsCommand::VerifyPhase9Evidence => ops_phase9::execute_ops_verify_phase9_evidence(),
         OpsCommand::GeneratePhase10Artifacts => {
             ops_phase9::execute_ops_generate_phase10_artifacts()
         }
+        OpsCommand::VerifyPhase10Readiness => ops_phase9::execute_ops_verify_phase10_readiness(),
         OpsCommand::VerifyPhase10Provenance => ops_phase9::execute_ops_verify_phase10_provenance(),
+        OpsCommand::VerifyPhase6PlatformReadiness => {
+            ops_phase9::execute_ops_verify_phase6_platform_readiness()
+        }
         OpsCommand::VerifyPhase6ParityEvidence => {
             ops_phase9::execute_ops_verify_phase6_parity_evidence()
+        }
+        OpsCommand::VerifyRequiredTestOutput { config } => {
+            ops_phase9::execute_ops_verify_required_test_output(config)
         }
         OpsCommand::GenerateCrossNetworkRemoteExitReport { config } => {
             ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(config)
@@ -3582,7 +3623,7 @@ fn phase6_require_bool_field(payload: &Value, key: &str, source: &Path) -> Resul
         .ok_or_else(|| format!("{} requires boolean field: {key}", source.display()))
 }
 
-fn phase6_validate_platform_parity_report(report_path: &Path) -> Result<(), String> {
+pub(crate) fn phase6_validate_platform_parity_report(report_path: &Path) -> Result<(), String> {
     if !report_path.exists() {
         return Err(format!(
             "missing platform parity report: {}",
@@ -9006,10 +9047,14 @@ fn help_text() -> String {
         "  ops run-phase1-baseline",
         "  ops collect-phase9-raw-evidence",
         "  ops generate-phase9-artifacts",
+        "  ops verify-phase9-readiness",
         "  ops verify-phase9-evidence",
         "  ops generate-phase10-artifacts",
+        "  ops verify-phase10-readiness",
         "  ops verify-phase10-provenance",
+        "  ops verify-phase6-platform-readiness",
         "  ops verify-phase6-parity-evidence",
+        "  ops verify-required-test-output --output <path> --package <name> --test-filter <pattern>",
         "  ops generate-cross-network-remote-exit-report --suite <suite> --report-path <path> --log-path <path> --status <pass|fail> [--failure-summary <text>] [--environment <label>] [--implementation-state <label>] [--source-artifact <path>]... [--log-artifact <path>]... [--client-host <host>] [--exit-host <host>] [--relay-host <host>] [--probe-host <host>] [--client-network-id <id>] [--exit-network-id <id>] [--relay-network-id <id>] [--nat-profile <profile>] [--impairment-profile <profile>] [--check <name=pass|fail>]...",
         "  ops validate-cross-network-remote-exit-reports [--reports <path[,path...]>] [--artifact-dir <path>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
         "  ops validate-cross-network-nat-matrix [--reports <path[,path...]>] [--artifact-dir <path>] [--required-nat-profiles <profile[,profile...]>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
@@ -9212,6 +9257,12 @@ mod tests {
             "collect-platform-parity-bundle".to_string(),
         ]);
         assert!(format!("{bundle:?}").contains("CollectPlatformParityBundle"));
+
+        let verify_readiness = parse_command(&[
+            "ops".to_string(),
+            "verify-phase6-platform-readiness".to_string(),
+        ]);
+        assert!(format!("{verify_readiness:?}").contains("VerifyPhase6PlatformReadiness"));
     }
 
     #[test]
@@ -9369,6 +9420,10 @@ mod tests {
             parse_command(&["ops".to_string(), "generate-phase9-artifacts".to_string()]);
         assert!(format!("{generate_phase9:?}").contains("GeneratePhase9Artifacts"));
 
+        let verify_phase9_readiness =
+            parse_command(&["ops".to_string(), "verify-phase9-readiness".to_string()]);
+        assert!(format!("{verify_phase9_readiness:?}").contains("VerifyPhase9Readiness"));
+
         let verify_phase9 =
             parse_command(&["ops".to_string(), "verify-phase9-evidence".to_string()]);
         assert!(format!("{verify_phase9:?}").contains("VerifyPhase9Evidence"));
@@ -9377,15 +9432,40 @@ mod tests {
             parse_command(&["ops".to_string(), "generate-phase10-artifacts".to_string()]);
         assert!(format!("{generate_phase10:?}").contains("GeneratePhase10Artifacts"));
 
+        let verify_phase10_readiness =
+            parse_command(&["ops".to_string(), "verify-phase10-readiness".to_string()]);
+        assert!(format!("{verify_phase10_readiness:?}").contains("VerifyPhase10Readiness"));
+
         let verify_phase10_provenance =
             parse_command(&["ops".to_string(), "verify-phase10-provenance".to_string()]);
         assert!(format!("{verify_phase10_provenance:?}").contains("VerifyPhase10Provenance"));
+
+        let verify_phase6_platform_readiness = parse_command(&[
+            "ops".to_string(),
+            "verify-phase6-platform-readiness".to_string(),
+        ]);
+        assert!(
+            format!("{verify_phase6_platform_readiness:?}")
+                .contains("VerifyPhase6PlatformReadiness")
+        );
 
         let verify_phase6_parity = parse_command(&[
             "ops".to_string(),
             "verify-phase6-parity-evidence".to_string(),
         ]);
         assert!(format!("{verify_phase6_parity:?}").contains("VerifyPhase6ParityEvidence"));
+
+        let verify_required_test_output = parse_command(&[
+            "ops".to_string(),
+            "verify-required-test-output".to_string(),
+            "--output".to_string(),
+            "/tmp/rustynet-required-test.log".to_string(),
+            "--package".to_string(),
+            "rustynetd".to_string(),
+            "--test-filter".to_string(),
+            "daemon::tests::sample".to_string(),
+        ]);
+        assert!(format!("{verify_required_test_output:?}").contains("VerifyRequiredTestOutput"));
 
         let generate_cross_network_report = parse_command(&[
             "ops".to_string(),

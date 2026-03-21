@@ -45,6 +45,7 @@ const DEFAULT_PHASE9_MAX_SOURCE_AGE_SECONDS: i64 = 2_678_400;
 const DEFAULT_PHASE10_MAX_PROVENANCE_AGE_SECONDS: u64 = 2_678_400;
 const MAX_PHASE10_JSON_SOURCE_BYTES: u64 = 1_048_576;
 const MAX_PHASE10_STATE_LOG_SOURCE_BYTES: u64 = 1_048_576;
+const MAX_REQUIRED_TEST_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const PHASE10_PROVENANCE_FILENAME: &str = "phase10_provenance.attestation.json";
 const PHASE10_PROVENANCE_SIGNING_KEY_PATH_ENV: &str =
     "RUSTYNET_PHASE10_PROVENANCE_SIGNING_KEY_PATH";
@@ -103,6 +104,13 @@ const PHASE9_BACKEND_SCAN_TARGETS: &[&str] = &[
     "crates/rustynet-backend-api/src",
     "crates/rustynet-relay/src",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyRequiredTestOutputConfig {
+    pub output_path: PathBuf,
+    pub package: String,
+    pub test_filter: String,
+}
 
 fn env_optional_string(key: &str) -> Result<Option<String>, String> {
     match std::env::var(key) {
@@ -1754,6 +1762,98 @@ fn phase10_validate_checks_all_pass(
     Ok(())
 }
 
+fn phase10_require_named_checks_pass(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+    label: &str,
+    required_checks: &[&str],
+) -> Result<(), String> {
+    let checks = payload
+        .get("checks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{label} source must include non-empty checks object: {}",
+                source_path.display()
+            )
+        })?;
+    for check_name in required_checks {
+        if checks.get(*check_name).and_then(Value::as_str) != Some("pass") {
+            return Err(format!(
+                "{label} source check must pass ({check_name}) in {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn phase10_require_non_empty_environment(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let environment = payload
+        .get("environment")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{label} source must include non-empty environment: {}",
+                source_path.display()
+            )
+        })?;
+    let _ = environment;
+    Ok(())
+}
+
+fn phase10_validate_source_artifacts_entries(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let source_artifacts = payload
+        .get("source_artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{label} source must include non-empty source_artifacts list: {}",
+                source_path.display()
+            )
+        })?;
+    if source_artifacts.is_empty() {
+        return Err(format!(
+            "{label} source must include non-empty source_artifacts list: {}",
+            source_path.display()
+        ));
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("resolve current directory failed: {err}"))?;
+    for entry in source_artifacts {
+        let source = entry
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{label} source has invalid source_artifacts entry: {}",
+                    source_path.display()
+                )
+            })?;
+        let candidate = if Path::new(source).is_absolute() {
+            PathBuf::from(source)
+        } else {
+            cwd.join(source)
+        };
+        if !candidate.exists() {
+            return Err(format!("{label} source artifact does not exist: {source}"));
+        }
+    }
+    Ok(())
+}
+
 fn phase10_validate_perf_budget(
     payload: &Map<String, Value>,
     source_path: &Path,
@@ -1792,6 +1892,69 @@ fn phase10_validate_perf_budget(
                 source_path.display()
             ));
         }
+    }
+    Ok(())
+}
+
+fn phase10_validate_required_perf_metrics(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+) -> Result<(), String> {
+    let required_metric_names = [
+        "idle_cpu_percent",
+        "idle_rss_mb",
+        "reconnect_seconds",
+        "route_apply_p95_seconds",
+        "throughput_overhead_percent",
+    ];
+    let metrics = payload
+        .get("metrics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "perf_budget_report source must include non-empty metrics list: {}",
+                source_path.display()
+            )
+        })?;
+    let mut seen = std::collections::BTreeSet::new();
+    for metric in metrics {
+        let metric_object = metric.as_object().ok_or_else(|| {
+            format!(
+                "perf_budget_report metrics entries must be objects: {}",
+                source_path.display()
+            )
+        })?;
+        let name = metric_object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "perf_budget_report metric is missing name: {}",
+                    source_path.display()
+                )
+            })?;
+        if metric_object.get("status").and_then(Value::as_str) != Some("pass") {
+            return Err(format!(
+                "perf_budget_report metric did not pass ({name}) in {}",
+                source_path.display()
+            ));
+        }
+        if required_metric_names.contains(&name) {
+            seen.insert(name.to_string());
+        }
+    }
+    let missing = required_metric_names
+        .iter()
+        .filter(|name| !seen.contains(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "perf_budget_report missing required metrics: {}",
+            missing.join(", ")
+        ));
     }
     Ok(())
 }
@@ -2628,6 +2791,114 @@ fn phase6_report_captured_at_unix(report_path: &Path) -> Result<u64, String> {
     object_u64_field(&report, "captured_at_unix", "phase6 parity report")
 }
 
+fn phase9_require_measured_evidence_metadata(
+    document: &Map<String, Value>,
+    label: &str,
+    now_unix: i64,
+    max_evidence_age_seconds: i64,
+) -> Result<(), String> {
+    if document.get("gate_passed").is_some() {
+        return Err(format!(
+            "{label} contains deprecated gate_passed toggle; gate pass must be derived, not asserted"
+        ));
+    }
+    if document.get("evidence_mode").and_then(Value::as_str) != Some("measured") {
+        return Err(format!("{label} must set evidence_mode=measured"));
+    }
+
+    let captured_at_unix = object_u64_field(document, "captured_at_unix", label)?;
+    if captured_at_unix == 0 {
+        return Err(format!(
+            "{label} requires positive integer captured_at_unix"
+        ));
+    }
+    let captured_at_i64 = i64::try_from(captured_at_unix)
+        .map_err(|_| format!("{label} captured_at_unix out of range"))?;
+    if captured_at_i64 > now_unix + 300 {
+        return Err(format!("{label} captured_at_unix is too far in the future"));
+    }
+    if now_unix - captured_at_i64 > max_evidence_age_seconds {
+        return Err(format!(
+            "{label} evidence is too old; regenerate with fresh measurements"
+        ));
+    }
+
+    let environment = object_string_field(document, "environment", label)?;
+    if environment.trim().is_empty() {
+        return Err(format!(
+            "{label} requires non-empty string field: environment"
+        ));
+    }
+
+    phase9_validate_source_artifacts_field(document, label)
+}
+
+fn phase9_require_string(
+    document: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
+    object_string_field(document, key, label)
+}
+
+fn phase9_require_bool(
+    document: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<bool, String> {
+    document
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{label} requires boolean field: {key}"))
+}
+
+fn phase9_require_integer(
+    document: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<i64, String> {
+    if let Some(value) = document.get(key).and_then(Value::as_i64) {
+        return Ok(value);
+    }
+    if let Some(value) = document.get(key).and_then(Value::as_u64) {
+        return i64::try_from(value)
+            .map_err(|_| format!("{label} integer field out of range: {key}"));
+    }
+    Err(format!("{label} requires integer field: {key}"))
+}
+
+fn phase9_require_number(
+    document: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<f64, String> {
+    document
+        .get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("{label} requires numeric field: {key}"))
+}
+
+fn phase9_contains_any_case_insensitive(value: &str, tokens: &[&str]) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    tokens.iter().any(|token| lowered.contains(token))
+}
+
+fn parse_required_test_output_total_passed(output: &str) -> u64 {
+    const PREFIX: &str = "test result: ok.";
+    output
+        .lines()
+        .filter_map(|line| {
+            let remainder = line.trim().strip_prefix(PREFIX)?;
+            let mut fields = remainder.split_whitespace();
+            let passed = fields.next()?.parse::<u64>().ok()?;
+            if fields.next() != Some("passed;") {
+                return None;
+            }
+            Some(passed)
+        })
+        .sum()
+}
+
 struct Phase6ParityAttestationBuildInputs<'a> {
     report_path: &'a Path,
     generated_at_unix: u64,
@@ -3160,6 +3431,15 @@ pub fn write_phase6_parity_evidence_attestation(report_path: &Path) -> Result<()
     write_json_secure(attestation_path.as_path(), &attestation_document)
 }
 
+pub fn execute_ops_verify_phase6_platform_readiness() -> Result<String, String> {
+    let report_path = phase6_parity_report_path_from_env_or_default()?;
+    crate::phase6_validate_platform_parity_report(report_path.as_path())?;
+    Ok(format!(
+        "phase6 platform readiness checks passed: {}",
+        report_path.display()
+    ))
+}
+
 pub fn execute_ops_verify_phase6_parity_evidence() -> Result<String, String> {
     let report_path = phase6_parity_report_path_from_env_or_default()?;
     let attestation_path = phase6_parity_attestation_path_from_env_or_default()?;
@@ -3178,6 +3458,413 @@ pub fn execute_ops_verify_phase6_parity_evidence() -> Result<String, String> {
         "phase6 parity evidence verification passed: report={} attestation={}",
         report_path.display(),
         attestation_path.display()
+    ))
+}
+
+pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
+    let out_dir = path_from_env_or_default("RUSTYNET_PHASE9_OUT_DIR", DEFAULT_PHASE9_OUT_DIR)?;
+    let max_evidence_age_seconds = env_u64_with_default(
+        "RUSTYNET_PHASE9_MAX_EVIDENCE_AGE_SECONDS",
+        DEFAULT_PHASE9_MAX_SOURCE_AGE_SECONDS as u64,
+    )?;
+    let max_evidence_age_seconds = i64::try_from(max_evidence_age_seconds)
+        .map_err(|_| "RUSTYNET_PHASE9_MAX_EVIDENCE_AGE_SECONDS is too large".to_string())?;
+    let now_unix =
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+
+    let compatibility_policy_path = out_dir.join("compatibility_policy.json");
+    let compatibility_policy =
+        read_json_object(compatibility_policy_path.as_path(), "compatibility_policy")?;
+    phase9_require_measured_evidence_metadata(
+        &compatibility_policy,
+        "compatibility_policy",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    phase9_require_string(
+        &compatibility_policy,
+        "policy_version",
+        "compatibility_policy",
+    )?;
+    let minimum_supported_client = compatibility_policy
+        .get("minimum_supported_client")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "compatibility policy requires minimum_supported_client and latest_server objects"
+                .to_string()
+        })?;
+    let latest_server = compatibility_policy
+        .get("latest_server")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "compatibility policy requires minimum_supported_client and latest_server objects"
+                .to_string()
+        })?;
+    let minimum_major = phase9_require_integer(
+        minimum_supported_client,
+        "major",
+        "compatibility_policy minimum_supported_client",
+    )?;
+    let minimum_minor = phase9_require_integer(
+        minimum_supported_client,
+        "minor",
+        "compatibility_policy minimum_supported_client",
+    )?;
+    let latest_major =
+        phase9_require_integer(latest_server, "major", "compatibility_policy latest_server")?;
+    let latest_minor =
+        phase9_require_integer(latest_server, "minor", "compatibility_policy latest_server")?;
+    if (minimum_major, minimum_minor) > (latest_major, latest_minor) {
+        return Err(
+            "compatibility policy invalid: minimum client is greater than latest server"
+                .to_string(),
+        );
+    }
+    if phase9_require_number(
+        &compatibility_policy,
+        "deprecation_window_days",
+        "compatibility_policy",
+    )? <= 0.0
+    {
+        return Err("compatibility policy invalid: deprecation window must be > 0".to_string());
+    }
+    let insecure_mode = compatibility_policy
+        .get("insecure_compatibility_mode")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "compatibility policy invalid: insecure_compatibility_mode object is required"
+                .to_string()
+        })?;
+    if phase9_require_bool(
+        insecure_mode,
+        "default_enabled",
+        "compatibility_policy insecure_compatibility_mode",
+    )? {
+        return Err(
+            "compatibility policy invalid: insecure compatibility default must be disabled"
+                .to_string(),
+        );
+    }
+    if !phase9_require_bool(
+        insecure_mode,
+        "risk_acceptance_required",
+        "compatibility_policy insecure_compatibility_mode",
+    )? || !phase9_require_bool(
+        insecure_mode,
+        "auto_expiry_required",
+        "compatibility_policy insecure_compatibility_mode",
+    )? {
+        return Err(
+            "compatibility policy invalid: risk acceptance + auto-expiry are mandatory".to_string(),
+        );
+    }
+
+    let slo_path = out_dir.join("slo_error_budget_report.json");
+    let slo = read_json_object(slo_path.as_path(), "slo_error_budget_report")?;
+    phase9_require_measured_evidence_metadata(
+        &slo,
+        "slo_error_budget_report",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    let window_start = phase9_require_string(&slo, "window_start_utc", "slo_error_budget_report")?;
+    let window_end = phase9_require_string(&slo, "window_end_utc", "slo_error_budget_report")?;
+    let window_start_unix = parse_utc_to_unix(window_start.as_str(), "slo window_start_utc")?;
+    let window_end_unix = parse_utc_to_unix(window_end.as_str(), "slo window_end_utc")?;
+    if window_end_unix <= window_start_unix {
+        return Err("slo gate failed: window_end_utc must be after window_start_utc".to_string());
+    }
+    if phase9_require_number(
+        &slo,
+        "measured_availability_percent",
+        "slo_error_budget_report",
+    )? < phase9_require_number(&slo, "availability_slo_percent", "slo_error_budget_report")?
+    {
+        return Err("slo gate failed: measured availability below target".to_string());
+    }
+    if phase9_require_number(
+        &slo,
+        "measured_error_budget_consumed_percent",
+        "slo_error_budget_report",
+    )? > phase9_require_number(
+        &slo,
+        "max_error_budget_consumed_percent",
+        "slo_error_budget_report",
+    )? {
+        return Err("slo gate failed: error budget over-consumed".to_string());
+    }
+
+    let performance_path = out_dir.join("performance_budget_report.json");
+    let performance = read_json_object(performance_path.as_path(), "performance_budget_report")?;
+    phase9_require_measured_evidence_metadata(
+        &performance,
+        "performance_budget_report",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    if phase9_require_number(
+        &performance,
+        "idle_cpu_percent",
+        "performance_budget_report",
+    )? > 2.0
+    {
+        return Err("performance gate failed: idle CPU above 2%".to_string());
+    }
+    if phase9_require_number(&performance, "idle_memory_mb", "performance_budget_report")? > 120.0 {
+        return Err("performance gate failed: idle memory above 120 MB".to_string());
+    }
+    if phase9_require_number(
+        &performance,
+        "reconnect_seconds",
+        "performance_budget_report",
+    )? > 5.0
+    {
+        return Err("performance gate failed: reconnect above 5 seconds".to_string());
+    }
+    if phase9_require_number(
+        &performance,
+        "route_apply_p95_seconds",
+        "performance_budget_report",
+    )? > 2.0
+    {
+        return Err("performance gate failed: route apply p95 above 2 seconds".to_string());
+    }
+    if phase9_require_number(
+        &performance,
+        "throughput_overhead_percent",
+        "performance_budget_report",
+    )? > 15.0
+    {
+        return Err("performance gate failed: throughput overhead above 15%".to_string());
+    }
+    if phase9_require_number(&performance, "soak_test_hours", "performance_budget_report")? < 24.0 {
+        return Err("performance gate failed: soak test duration under 24 hours".to_string());
+    }
+
+    let incident_path = out_dir.join("incident_drill_report.json");
+    let incident = read_json_object(incident_path.as_path(), "incident_drill_report")?;
+    phase9_require_measured_evidence_metadata(
+        &incident,
+        "incident_drill_report",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    let incident_executed_at =
+        phase9_require_string(&incident, "executed_at_utc", "incident_drill_report")?;
+    let _ = parse_utc_to_unix(incident_executed_at.as_str(), "incident executed_at_utc")?;
+    if !phase9_require_bool(&incident, "postmortem_completed", "incident_drill_report")? {
+        return Err("incident gate failed: postmortem not completed".to_string());
+    }
+    if !phase9_require_bool(&incident, "action_items_closed", "incident_drill_report")? {
+        return Err("incident gate failed: action items not closed".to_string());
+    }
+    if !phase9_require_bool(
+        &incident,
+        "oncall_readiness_confirmed",
+        "incident_drill_report",
+    )? {
+        return Err("incident gate failed: on-call readiness not confirmed".to_string());
+    }
+
+    let dr_path = out_dir.join("dr_failover_report.json");
+    let dr = read_json_object(dr_path.as_path(), "dr_failover_report")?;
+    phase9_require_measured_evidence_metadata(
+        &dr,
+        "dr_failover_report",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    let dr_executed_at = phase9_require_string(&dr, "executed_at_utc", "dr_failover_report")?;
+    let _ = parse_utc_to_unix(dr_executed_at.as_str(), "dr executed_at_utc")?;
+    if phase9_require_integer(&dr, "region_count", "dr_failover_report")? < 2 {
+        return Err("dr gate failed: fewer than two regions validated".to_string());
+    }
+    if phase9_require_number(&dr, "measured_rpo_minutes", "dr_failover_report")?
+        > phase9_require_number(&dr, "rpo_target_minutes", "dr_failover_report")?
+    {
+        return Err("dr gate failed: RPO target not met".to_string());
+    }
+    if phase9_require_number(&dr, "measured_rto_minutes", "dr_failover_report")?
+        > phase9_require_number(&dr, "rto_target_minutes", "dr_failover_report")?
+    {
+        return Err("dr gate failed: RTO target not met".to_string());
+    }
+    if !phase9_require_bool(&dr, "restore_integrity_verified", "dr_failover_report")? {
+        return Err("dr gate failed: restore integrity not verified".to_string());
+    }
+
+    let backend_path = out_dir.join("backend_agility_report.json");
+    let backend = read_json_object(backend_path.as_path(), "backend_agility_report")?;
+    phase9_require_measured_evidence_metadata(
+        &backend,
+        "backend_agility_report",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    let default_backend =
+        phase9_require_string(&backend, "default_backend", "backend_agility_report")?;
+    if !default_backend.eq_ignore_ascii_case("wireguard") {
+        return Err("backend agility gate failed: default backend must be wireguard".to_string());
+    }
+    let additional_backend_paths = backend
+        .get("additional_backend_paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "backend agility gate failed: at least one additional backend path is required"
+                .to_string()
+        })?;
+    if additional_backend_paths.is_empty() {
+        return Err(
+            "backend agility gate failed: at least one additional backend path is required"
+                .to_string(),
+        );
+    }
+    for value in additional_backend_paths {
+        let path = value
+            .as_str()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .ok_or_else(|| {
+                "backend agility gate failed: invalid additional backend path entry".to_string()
+            })?;
+        if phase9_contains_any_case_insensitive(path, &["stub", "fake", "mock", "simulat"]) {
+            return Err(format!(
+                "backend agility gate failed: synthetic backend path not allowed: {path}"
+            ));
+        }
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else if path.contains('/') {
+            Path::new(".").join(path)
+        } else {
+            Path::new("crates").join(path)
+        };
+        if !candidate.exists() {
+            return Err(format!(
+                "backend agility gate failed: backend path does not exist: {path}"
+            ));
+        }
+    }
+    if !phase9_require_bool(&backend, "conformance_passed", "backend_agility_report")? {
+        return Err("backend agility gate failed: conformance not passed".to_string());
+    }
+    if !phase9_require_bool(
+        &backend,
+        "security_review_complete",
+        "backend_agility_report",
+    )? {
+        return Err("backend agility gate failed: security review incomplete".to_string());
+    }
+    if !phase9_require_bool(
+        &backend,
+        "wireguard_is_adapter_boundary",
+        "backend_agility_report",
+    )? {
+        return Err("backend agility gate failed: wireguard boundary not preserved".to_string());
+    }
+    if phase9_require_bool(
+        &backend,
+        "protocol_leakage_detected",
+        "backend_agility_report",
+    )? {
+        return Err("backend agility gate failed: protocol leakage detected".to_string());
+    }
+    let evidence_commands = backend
+        .get("evidence_commands")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "backend agility gate failed: evidence_commands must be a non-empty list".to_string()
+        })?;
+    if evidence_commands.is_empty() {
+        return Err(
+            "backend agility gate failed: evidence_commands must be a non-empty list".to_string(),
+        );
+    }
+    for value in evidence_commands {
+        let command = value
+            .as_str()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .ok_or_else(|| {
+                "backend agility gate failed: invalid command in evidence_commands".to_string()
+            })?;
+        if phase9_contains_any_case_insensitive(command, &["backend-stub", "stub-backend"]) {
+            return Err(
+                "backend agility gate failed: stub backend command is not valid evidence"
+                    .to_string(),
+            );
+        }
+    }
+
+    let crypto_path = out_dir.join("crypto_deprecation_schedule.json");
+    let crypto = read_json_object(crypto_path.as_path(), "crypto_deprecation_schedule")?;
+    phase9_require_measured_evidence_metadata(
+        &crypto,
+        "crypto_deprecation_schedule",
+        now_unix,
+        max_evidence_age_seconds,
+    )?;
+    let entries = crypto
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "crypto schedule gate failed: no deprecation entries present".to_string())?;
+    if entries.is_empty() {
+        return Err("crypto schedule gate failed: no deprecation entries present".to_string());
+    }
+    for entry in entries {
+        let entry_obj = entry
+            .as_object()
+            .ok_or_else(|| "crypto schedule gate failed: invalid entry type".to_string())?;
+        let deprecates_at = phase9_require_string(
+            entry_obj,
+            "deprecates_at_utc",
+            "crypto deprecation schedule entry",
+        )?;
+        let removal_at = phase9_require_string(
+            entry_obj,
+            "removal_at_utc",
+            "crypto deprecation schedule entry",
+        )?;
+        let deprecates_at_unix =
+            parse_utc_to_unix(deprecates_at.as_str(), "crypto deprecates_at_utc")?;
+        let removal_at_unix = parse_utc_to_unix(removal_at.as_str(), "crypto removal_at_utc")?;
+        if removal_at_unix <= deprecates_at_unix {
+            return Err(
+                "crypto schedule gate failed: removal timestamp must be after deprecation timestamp"
+                    .to_string(),
+            );
+        }
+    }
+    if phase9_require_bool(
+        &crypto,
+        "exceptions_default_enabled",
+        "crypto_deprecation_schedule",
+    )? {
+        return Err(
+            "crypto schedule gate failed: insecure exceptions must be disabled by default"
+                .to_string(),
+        );
+    }
+    if !phase9_require_bool(
+        &crypto,
+        "exceptions_require_risk_acceptance",
+        "crypto_deprecation_schedule",
+    )? {
+        return Err(
+            "crypto schedule gate failed: exceptions must require risk acceptance".to_string(),
+        );
+    }
+    if !phase9_require_bool(
+        &crypto,
+        "exceptions_auto_expire",
+        "crypto_deprecation_schedule",
+    )? {
+        return Err("crypto schedule gate failed: exceptions must auto-expire".to_string());
+    }
+
+    Ok(format!(
+        "phase9 readiness checks passed: {}",
+        out_dir.display()
     ))
 }
 
@@ -3544,6 +4231,207 @@ pub fn execute_ops_verify_phase10_provenance() -> Result<String, String> {
     ))
 }
 
+pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
+    let artifact_dir = phase10_artifact_dir_from_env()?;
+    let max_evidence_age_seconds = env_u64_with_default(
+        "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS",
+        DEFAULT_PHASE10_MAX_SOURCE_AGE_SECONDS,
+    )?;
+    let max_evidence_age_seconds = i64::try_from(max_evidence_age_seconds)
+        .map_err(|_| "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS is too large".to_string())?;
+    let now_unix =
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+
+    let netns_path = artifact_dir.join("netns_e2e_report.json");
+    let leak_path = artifact_dir.join("leak_test_report.json");
+    let perf_path = artifact_dir.join("perf_budget_report.json");
+    let failover_path = artifact_dir.join("direct_relay_failover_report.json");
+    let traversal_path_path = artifact_dir.join("traversal_path_selection_report.json");
+    let traversal_security_path = artifact_dir.join("traversal_probe_security_report.json");
+    let managed_dns_path = artifact_dir.join("managed_dns_report.json");
+
+    let netns_payload = read_json_object(netns_path.as_path(), "netns_e2e_report")?;
+    let leak_payload = read_json_object(leak_path.as_path(), "leak_test_report")?;
+    let perf_payload = read_json_object(perf_path.as_path(), "perf_budget_report")?;
+    let failover_payload =
+        read_json_object(failover_path.as_path(), "direct_relay_failover_report")?;
+    let traversal_path_payload = read_json_object(
+        traversal_path_path.as_path(),
+        "traversal_path_selection_report",
+    )?;
+    let traversal_security_payload = read_json_object(
+        traversal_security_path.as_path(),
+        "traversal_probe_security_report",
+    )?;
+    let managed_dns_payload = read_json_object(managed_dns_path.as_path(), "managed_dns_report")?;
+
+    for (payload, source_path, label) in [
+        (&netns_payload, netns_path.as_path(), "netns_e2e_report"),
+        (&leak_payload, leak_path.as_path(), "leak_test_report"),
+        (&perf_payload, perf_path.as_path(), "perf_budget_report"),
+        (
+            &failover_payload,
+            failover_path.as_path(),
+            "direct_relay_failover_report",
+        ),
+        (
+            &traversal_path_payload,
+            traversal_path_path.as_path(),
+            "traversal_path_selection_report",
+        ),
+        (
+            &traversal_security_payload,
+            traversal_security_path.as_path(),
+            "traversal_probe_security_report",
+        ),
+        (
+            &managed_dns_payload,
+            managed_dns_path.as_path(),
+            "managed_dns_report",
+        ),
+    ] {
+        phase10_require_measured_source(payload, source_path, label)?;
+        let captured_at_unix =
+            phase10_require_positive_unix_timestamp(payload, source_path, label)?;
+        phase10_validate_source_freshness(
+            captured_at_unix,
+            source_path,
+            label,
+            now_unix,
+            max_evidence_age_seconds,
+        )?;
+        phase10_require_non_empty_environment(payload, source_path, label)?;
+        phase10_validate_source_artifacts_entries(payload, source_path, label)?;
+    }
+
+    phase10_require_status_pass(&netns_payload, netns_path.as_path(), "netns_e2e_report")?;
+    phase10_validate_checks_all_pass(&netns_payload, netns_path.as_path(), "netns_e2e_report")?;
+
+    phase10_require_status_pass(&leak_payload, leak_path.as_path(), "leak_test_report")?;
+
+    phase10_require_status_pass(
+        &failover_payload,
+        failover_path.as_path(),
+        "direct_relay_failover_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &failover_payload,
+        failover_path.as_path(),
+        "direct_relay_failover_report",
+    )?;
+
+    phase10_require_status_pass(
+        &traversal_path_payload,
+        traversal_path_path.as_path(),
+        "traversal_path_selection_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &traversal_path_payload,
+        traversal_path_path.as_path(),
+        "traversal_path_selection_report",
+    )?;
+    phase10_require_named_checks_pass(
+        &traversal_path_payload,
+        traversal_path_path.as_path(),
+        "traversal_path_selection_report",
+        &[
+            "direct_probe_success",
+            "relay_fallback_success",
+            "direct_failback_success",
+        ],
+    )?;
+
+    phase10_require_status_pass(
+        &traversal_security_payload,
+        traversal_security_path.as_path(),
+        "traversal_probe_security_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &traversal_security_payload,
+        traversal_security_path.as_path(),
+        "traversal_probe_security_report",
+    )?;
+    phase10_require_named_checks_pass(
+        &traversal_security_payload,
+        traversal_security_path.as_path(),
+        "traversal_probe_security_report",
+        &[
+            "replay_rejected",
+            "fail_closed_on_invalid_traversal",
+            "no_unauthorized_endpoint_mutation",
+            "managed_peer_coverage_required",
+            "unmanaged_peer_bundle_rejected",
+        ],
+    )?;
+
+    phase10_require_status_pass(
+        &managed_dns_payload,
+        managed_dns_path.as_path(),
+        "managed_dns_report",
+    )?;
+    phase10_validate_checks_all_pass(
+        &managed_dns_payload,
+        managed_dns_path.as_path(),
+        "managed_dns_report",
+    )?;
+    phase10_require_named_checks_pass(
+        &managed_dns_payload,
+        managed_dns_path.as_path(),
+        "managed_dns_report",
+        &[
+            "zone_issue_verify_passes",
+            "dns_inspect_valid",
+            "managed_dns_service_active",
+            "resolvectl_split_dns_configured",
+            "loopback_resolver_answers_managed_name",
+            "systemd_resolved_answers_managed_name",
+            "alias_resolves_to_expected_ip",
+            "non_managed_query_refused",
+            "stale_bundle_fail_closed",
+            "valid_bundle_restored",
+        ],
+    )?;
+
+    phase10_validate_perf_budget(&perf_payload, perf_path.as_path())?;
+    phase10_validate_required_perf_metrics(&perf_payload, perf_path.as_path())?;
+
+    let state_log_path = artifact_dir.join("state_transition_audit.log");
+    let state_log = read_utf8_regular_file_with_max_bytes(
+        state_log_path.as_path(),
+        "state_transition_audit.log",
+        MAX_PHASE10_STATE_LOG_SOURCE_BYTES,
+    )?;
+    if !contains_generation_marker(state_log.as_str()) {
+        return Err("state_transition_audit.log missing generation entries".to_string());
+    }
+
+    Ok(format!(
+        "phase10 readiness checks passed: {}",
+        artifact_dir.display()
+    ))
+}
+
+pub fn execute_ops_verify_required_test_output(
+    config: VerifyRequiredTestOutputConfig,
+) -> Result<String, String> {
+    let body = read_utf8_regular_file_with_max_bytes(
+        config.output_path.as_path(),
+        "required test output",
+        MAX_REQUIRED_TEST_OUTPUT_BYTES,
+    )?;
+    let total_passed = parse_required_test_output_total_passed(body.as_str());
+    if total_passed < 1 {
+        return Err(format!(
+            "required test did not execute any tests: package={} filter={}",
+            config.package, config.test_filter
+        ));
+    }
+    Ok(format!(
+        "required test output verification passed: package={} filter={} passed_tests={}",
+        config.package, config.test_filter, total_passed
+    ))
+}
+
 pub fn execute_ops_sign_release_artifact() -> Result<String, String> {
     let artifact_path = release_artifact_path_from_env_or_default()?;
     let sbom_path = release_sbom_path_from_env_or_default()?;
@@ -3639,11 +4527,11 @@ mod tests {
         ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
         build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
         build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
-        hex_encode, load_key_hex_from_secure_path, phase10_expected_provenance_entries,
-        read_json_object, read_utf8_regular_file_with_max_bytes, sha256_hex,
-        validate_phase10_host_identity, verify_phase6_parity_attestation_document,
-        verify_phase9_evidence_attestation_document, verify_release_provenance_document,
-        write_phase10_provenance_keypair,
+        hex_encode, load_key_hex_from_secure_path, parse_required_test_output_total_passed,
+        phase10_expected_provenance_entries, read_json_object,
+        read_utf8_regular_file_with_max_bytes, sha256_hex, validate_phase10_host_identity,
+        verify_phase6_parity_attestation_document, verify_phase9_evidence_attestation_document,
+        verify_release_provenance_document, write_phase10_provenance_keypair,
     };
     use ed25519_dalek::SigningKey;
 
@@ -3660,6 +4548,27 @@ mod tests {
             "ts=1 generation=abc action=apply"
         ));
         assert!(!contains_generation_marker("ts=1 action=apply"));
+    }
+
+    #[test]
+    fn required_test_output_parser_sums_passed_counts() {
+        let output = "\
+running 1 test
+test daemon::tests::alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 2 tests
+test daemon::tests::beta ... ok
+test daemon::tests::gamma ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        assert_eq!(parse_required_test_output_total_passed(output), 3);
+    }
+
+    #[test]
+    fn required_test_output_parser_returns_zero_without_matching_summary() {
+        let output = "running 0 tests\n";
+        assert_eq!(parse_required_test_output_total_passed(output), 0);
     }
 
     #[test]

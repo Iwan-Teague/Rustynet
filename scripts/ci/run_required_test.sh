@@ -6,11 +6,6 @@ if [[ "$#" -lt 2 ]]; then
   exit 2
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "missing required command: python3" >&2
-  exit 1
-fi
-
 PACKAGE="$1"
 shift
 TEST_FILTER="$1"
@@ -37,22 +32,7 @@ fi
 
 cat "${TMP_OUTPUT}"
 
-python3 - "${TMP_OUTPUT}" "${PACKAGE}" "${TEST_FILTER}" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-output_path = Path(sys.argv[1])
-package = sys.argv[2]
-test_filter = sys.argv[3]
-body = output_path.read_text(encoding="utf-8", errors="ignore")
-
-total_passed = 0
-for match in re.finditer(r"test result: ok\.\s+([0-9]+)\s+passed;", body):
-    total_passed += int(match.group(1))
-
-if total_passed < 1:
-    raise SystemExit(
-        f"required test did not execute any tests: package={package} filter={test_filter}"
-    )
-PY
+cargo run --quiet -p rustynet-cli -- ops verify-required-test-output \
+  --output "${TMP_OUTPUT}" \
+  --package "${PACKAGE}" \
+  --test-filter "${TEST_FILTER}"
