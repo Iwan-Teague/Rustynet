@@ -1,30 +1,30 @@
 {
-  "phase": "phase10",
-  "mode": "live_linux_managed_dns",
-  "evidence_mode": "measured",
-  "captured_at": "2026-03-21T19:54:06Z",
-  "captured_at_unix": 1774122846,
-  "git_commit": "00bfbd4065104a3c3835229057bb5a56ad9b9a66",
-  "status": "pass",
-  "zone_name": "rustynet",
-  "signer_host": "debian@192.168.64.22",
-  "client_host": "debian@192.168.64.24",
-  "managed_fqdn": "exit.rustynet",
-  "managed_alias_fqdn": "gateway.rustynet",
-  "expected_ip": "100.109.33.213",
+  "captured_at": "2026-03-21T23:42:53Z",
+  "captured_at_unix": 1774136573,
   "checks": {
-    "zone_issue_verify_passes": "pass",
-    "dns_inspect_valid": "pass",
-    "managed_dns_service_active": "pass",
-    "resolvectl_split_dns_configured": "pass",
-    "loopback_resolver_answers_managed_name": "pass",
-    "systemd_resolved_answers_managed_name": "pass",
     "alias_resolves_to_expected_ip": "pass",
+    "dns_inspect_valid": "pass",
+    "loopback_resolver_answers_managed_name": "pass",
+    "managed_dns_service_active": "pass",
     "non_managed_query_refused": "pass",
+    "resolvectl_split_dns_configured": "pass",
     "stale_bundle_fail_closed": "pass",
-    "valid_bundle_restored": "pass"
+    "systemd_resolved_answers_managed_name": "pass",
+    "valid_bundle_restored": "pass",
+    "zone_issue_verify_passes": "pass"
   },
+  "client_host": "debian@192.168.64.24",
+  "evidence_mode": "measured",
+  "expected_ip": "100.109.33.213",
+  "git_commit": "192ff860a2067fc4906e83d347d8bb156c8da580",
+  "managed_alias_fqdn": "gateway.rustynet",
+  "managed_fqdn": "exit.rustynet",
+  "mode": "live_linux_managed_dns",
+  "phase": "phase10",
+  "signer_host": "debian@192.168.64.22",
   "source_artifacts": [
-    "/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260321T194523Z/live_linux_managed_dns.log"
-  ]
+    "/Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260321T232859Z/live_linux_managed_dns.log"
+  ],
+  "status": "pass",
+  "zone_name": "rustynet"
 }

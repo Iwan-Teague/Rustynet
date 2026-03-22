@@ -1,9 +1,2 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-if ! command -v rustynet >/dev/null 2>&1; then
-  echo "rustynet CLI is required in PATH" >&2
-  exit 1
-fi
-
-exec rustynet ops run-debian-two-node-e2e "$@"
+exec cargo run --quiet -p rustynet-cli --bin debian_two_node_clean_install_and_tunnel_test -- "$@"

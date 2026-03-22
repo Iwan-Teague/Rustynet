@@ -1,16 +1,16 @@
 {
+  "dns_hook_ready": false,
   "evidence_mode": "measured",
-  "platform": "macos",
-  "route_hook_ready": true,
-  "dns_hook_ready": true,
-  "firewall_hook_ready": true,
+  "firewall_hook_ready": false,
   "leak_matrix_passed": true,
-  "probe_time_unix": 1772715000,
-  "probe_host": "macos14-lab-node",
+  "platform": "macos",
+  "probe_host": "iwans-MacBook-Air.local",
   "probe_sources": {
-    "route": "route -n get default",
     "dns": "scutil --dns",
     "firewall": "pfctl -s info",
-    "leak_report": "artifacts/phase10/leak_test_report.json"
-  }
+    "leak_report": "artifacts/phase10/leak_test_report.json",
+    "route": "route -n get default"
+  },
+  "probe_time_unix": 1774129431,
+  "route_hook_ready": false
 }

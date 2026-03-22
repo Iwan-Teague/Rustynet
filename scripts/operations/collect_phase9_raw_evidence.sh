@@ -1,7 +1,2 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT_DIR"
-
-exec cargo run --quiet -p rustynet-cli -- ops collect-phase9-raw-evidence
+exec cargo run --quiet -p rustynet-cli --bin collect_phase9_raw_evidence -- "$@"

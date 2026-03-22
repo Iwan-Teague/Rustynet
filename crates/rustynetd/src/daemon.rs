@@ -8511,15 +8511,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct DnsZoneFixtureTiming {
+        generated_at_unix: u64,
+        ttl_secs: u64,
+        tamper_after_sign: bool,
+    }
+
+    impl DnsZoneFixtureTiming {
+        fn fresh(ttl_secs: u64, tamper_after_sign: bool) -> Self {
+            Self {
+                generated_at_unix: unix_now(),
+                ttl_secs,
+                tamper_after_sign,
+            }
+        }
+    }
+
     fn write_dns_zone_file_with_timing(
         path: &Path,
         verifier_path: &Path,
         subject_node_id: &str,
         record: (&str, &str, &[&str]),
         nonce: u64,
-        generated_at_unix: u64,
-        ttl_secs: u64,
-        tamper_after_sign: bool,
+        timing: DnsZoneFixtureTiming,
     ) {
         let (target_node_id, expected_ip, aliases) = record;
         let signing_key = SigningKey::from_bytes(&[31u8; 32]);
@@ -8539,8 +8554,8 @@ mod tests {
             &signing_key,
             "rustynet",
             subject_node_id,
-            generated_at_unix,
-            ttl_secs,
+            timing.generated_at_unix,
+            timing.ttl_secs,
             nonce,
             &[rustynet_dns_zone::DnsZoneRecordInput {
                 label: "app".to_string(),
@@ -8548,13 +8563,13 @@ mod tests {
                 rr_type: rustynet_dns_zone::DnsRecordType::A,
                 target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
                 expected_ip: expected_ip.to_string(),
-                ttl_secs,
+                ttl_secs: timing.ttl_secs,
                 aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
             }],
         )
         .expect("dns zone bundle should be built");
         let mut body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
-        if tamper_after_sign {
+        if timing.tamper_after_sign {
             body = body.replace("record.0.ttl_secs=60", "record.0.ttl_secs=61");
         }
         std::fs::write(path, body).expect("dns zone file should be written");
@@ -8580,9 +8595,7 @@ mod tests {
             subject_node_id,
             record,
             nonce,
-            unix_now(),
-            60,
-            tamper_after_sign,
+            DnsZoneFixtureTiming::fresh(60, tamper_after_sign),
         );
     }
 
@@ -11302,9 +11315,11 @@ mod tests {
             "daemon-local",
             ("node-exit", "100.64.0.2", &[]),
             42,
-            stale_generated_at,
-            300,
-            false,
+            DnsZoneFixtureTiming {
+                generated_at_unix: stale_generated_at,
+                ttl_secs: 300,
+                tamper_after_sign: false,
+            },
         );
 
         let config = DaemonConfig {
