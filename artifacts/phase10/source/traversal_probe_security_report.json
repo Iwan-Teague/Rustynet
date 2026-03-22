@@ -1,5 +1,5 @@
 {
-  "captured_at_unix": 1774094198,
+  "captured_at_unix": 1774180611,
   "checks": {
     "backend_handshake_evidence_hardened": "pass",
     "fail_closed_on_invalid_traversal": "pass",
@@ -10,7 +10,7 @@
   },
   "environment": "ci",
   "evidence_mode": "measured",
-  "git_commit": "bb7ad385e3d89271f750e8637f6b79839e5625c2",
+  "git_commit": "496510f9d79fb1fd85079288ca8253c39fe5e8b0",
   "log_artifacts": [
     "/Users/iwanteague/Desktop/Rustynet/artifacts/phase10/source/traversal_probe_security_tests.log"
   ],
