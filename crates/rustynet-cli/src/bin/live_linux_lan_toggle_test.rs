@@ -3,6 +3,7 @@
 mod live_lab_support;
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
@@ -365,21 +366,9 @@ fn run() -> Result<(), i32> {
         &blind_exit_node_id,
         &ssh_allow_cidrs,
     )?;
-    ctx.wait_for_daemon_socket(&exit_host, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.wait_for_daemon_socket(&client_host, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.wait_for_daemon_socket(&blind_exit_host, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    ensure_daemon_services_ready(&ctx, &exit_host)?;
+    ensure_daemon_services_ready(&ctx, &client_host)?;
+    ensure_daemon_services_ready(&ctx, &blind_exit_host)?;
 
     logger
         .line("Advertising default route on exit")
@@ -445,15 +434,19 @@ fn run() -> Result<(), i32> {
         })?;
 
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let lan_off_ping_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 15);
+    let lan_off_state = wait_for_lan_access_state(&ctx, &client_host, false, 45);
+    let lan_off_ping_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 45);
     let client_status_off = ctx
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
     apply_lan_access(&ctx, &client_host, true, LAN_TEST_CIDR)?;
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let lan_on_ping_status = wait_for_lan_probe_state(&ctx, &client_host, "reachable", 15);
+    let lan_on_state = wait_for_lan_access_state(&ctx, &client_host, true, 60);
+    let lan_on_ping_status = if lan_on_state {
+        wait_for_lan_probe_state(&ctx, &client_host, "reachable", 45)
+    } else {
+        false
+    };
     let client_status_on = ctx
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
@@ -465,17 +458,17 @@ fn run() -> Result<(), i32> {
         .unwrap_or_default();
 
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let lan_off_again_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 15);
+    let lan_off_again_state = wait_for_lan_access_state(&ctx, &client_host, false, 45);
+    let lan_off_again_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 45);
     let client_status_off_final = ctx
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
     let blind_exit_denied_status =
-        if apply_lan_access(&ctx, &blind_exit_host, true, LAN_TEST_CIDR).is_ok() {
-            "fail"
-        } else {
+        if apply_lan_access_expect_denied(&ctx, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
+        } else {
+            "fail"
         };
     let blind_exit_status = ctx
         .capture_root(&blind_exit_host, &["rustynet", "status"])
@@ -516,8 +509,13 @@ fn run() -> Result<(), i32> {
             1
         })?;
 
-    let check_lan_off_blocks = if lan_off_ping_status { "pass" } else { "fail" };
-    let check_lan_on_allows = if lan_on_ping_status
+    let check_lan_off_blocks = if lan_off_state && lan_off_ping_status {
+        "pass"
+    } else {
+        "fail"
+    };
+    let check_lan_on_allows = if lan_on_state
+        && lan_on_ping_status
         && client_status_on.contains("lan_access=on")
         && client_route_on.contains("dev rustynet0")
     {
@@ -525,7 +523,11 @@ fn run() -> Result<(), i32> {
     } else {
         "fail"
     };
-    let check_lan_off_again_blocks = if lan_off_again_status { "pass" } else { "fail" };
+    let check_lan_off_again_blocks = if lan_off_again_state && lan_off_again_status {
+        "pass"
+    } else {
+        "fail"
+    };
     let check_client_status_initial_off = if client_status_off_initial.contains("lan_access=off")
         && client_status_off_initial.contains(&format!("exit_node={exit_node_id}"))
     {
@@ -644,24 +646,16 @@ fn apply_lan_access(
     enable: bool,
     lan_routes: &str,
 ) -> Result<(), i32> {
-    let enable_flag = if enable { "true" } else { "false" };
-    let mut args = vec![
-        "rustynet",
-        "ops",
-        "apply-lan-access-coupling",
-        "--enable",
-        enable_flag,
-        "--env-path",
-        "/etc/rustynet/assignment-refresh.env",
-    ];
-    if !lan_routes.is_empty() {
-        args.push("--lan-routes");
-        args.push(lan_routes);
+    let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        eprintln!(
+            "apply-lan-access-coupling failed on {target}: {}",
+            summarize_command_output(&output)
+        );
+        Err(1)
     }
-    ctx.run_root(target, &args).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
 }
 
 fn wait_for_lan_probe_state(
@@ -679,6 +673,106 @@ fn wait_for_lan_probe_state(
         }
         if desired_state == "blocked" && !reachable {
             return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    false
+}
+
+fn apply_lan_access_expect_denied(
+    ctx: &LiveLabContext,
+    target: &str,
+    enable: bool,
+    lan_routes: &str,
+) -> Result<bool, i32> {
+    let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    let combined = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if combined.contains("LAN access coupling is not permitted for blind_exit role") {
+        Ok(true)
+    } else {
+        eprintln!(
+            "unexpected blind-exit LAN coupling failure on {target}: {}",
+            summarize_command_output(&output)
+        );
+        Err(1)
+    }
+}
+
+fn run_lan_access_command(
+    ctx: &LiveLabContext,
+    target: &str,
+    enable: bool,
+    lan_routes: &str,
+    socket_wait_attempts: u32,
+) -> Result<Output, i32> {
+    ctx.wait_for_daemon_socket(
+        target,
+        "/run/rustynet/rustynetd.sock",
+        socket_wait_attempts,
+        1,
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+
+    let enable_flag = if enable { "true" } else { "false" };
+    let mut args = vec![
+        "rustynet",
+        "ops",
+        "apply-lan-access-coupling",
+        "--enable",
+        enable_flag,
+        "--env-path",
+        "/etc/rustynet/assignment-refresh.env",
+    ];
+    if !lan_routes.is_empty() {
+        args.push("--lan-routes");
+        args.push(lan_routes);
+    }
+    ctx.run_root_allow_failure(target, &args).map_err(|err| {
+        eprintln!("{err}");
+        1
+    })
+}
+
+fn summarize_command_output(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() && !stdout.is_empty() {
+        format!("{stderr} (stdout: {stdout})")
+    } else if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_string()
+    }
+}
+
+fn wait_for_lan_access_state(
+    ctx: &LiveLabContext,
+    target: &str,
+    expected_enabled: bool,
+    attempts: u32,
+) -> bool {
+    let expected = if expected_enabled {
+        "lan_access=on"
+    } else {
+        "lan_access=off"
+    };
+    for _ in 0..attempts {
+        if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"]) {
+            if status.contains(expected) {
+                return true;
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -1030,6 +1124,37 @@ fn enforce_host(
         eprintln!("{err}");
         1
     })
+}
+
+fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+    let _ = ctx.run_root_allow_failure(
+        target,
+        &[
+            "systemctl",
+            "reset-failed",
+            "rustynetd.service",
+            "rustynetd-privileged-helper.service",
+        ],
+    );
+    ctx.run_root(
+        target,
+        &["systemctl", "restart", "rustynetd-privileged-helper.service"],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(target, &["systemctl", "restart", "rustynetd.service"])
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    Ok(())
 }
 
 fn git_commit(root_dir: &Path) -> String {

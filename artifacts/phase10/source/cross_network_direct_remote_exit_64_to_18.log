@@ -1,0 +1,24 @@
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+[cross-network-direct-remote-exit] Collecting WireGuard public keys
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+failed to decode wireguard pubkey for fedora@192.168.18.51
+[cross-network-direct-remote-exit] Issuing signed direct remote-exit assignments on fedora@192.168.18.51
+scp: Connection closed
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+[cross-network-direct-remote-exit] Distributing signed assignments
+scp: Connection closed
+scp: Connection closed
+[cross-network-direct-remote-exit] Issuing signed traversal bundles for direct remote-exit topology
+scp: Connection closed
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+[cross-network-direct-remote-exit] Distributing signed traversal bundles
+scp: Connection closed
+scp: Connection closed
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+[cross-network-direct-remote-exit] Enforcing runtime roles
+ssh: connect to host 192.168.18.51 port 22: Operation timed out
+error: install-systemd enforce pass failed: status=1 stdout=error: assignment bundle missing selected exit node peer entry: fedora-51
