@@ -2,6 +2,7 @@
 
 mod live_lab_support;
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,24 +55,80 @@ fn run() -> Result<(), String> {
     }
 
     logger.line("[managed-dns] collecting WireGuard public keys")?;
-    let signer_pub_hex = ctx.collect_pubkey_hex(&config.signer_host)?;
-    let client_pub_hex = ctx.collect_pubkey_hex(&config.client_host)?;
+    let client_status_before = ctx.capture_root(
+        &config.client_host,
+        &[
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "rustynet",
+            "status",
+        ],
+    )?;
+    let current_exit_node = parse_status_field(&client_status_before, "exit_node")
+        .ok_or_else(|| "unable to parse exit_node from client rustynet status".to_string())?;
+    logger.line(
+        format!(
+            "[managed-dns] client runtime exit selection before bundle refresh: exit_node={current_exit_node}"
+        )
+        .as_str(),
+    )?;
 
-    let signer_addr = target_address(&config.signer_host).to_string();
-    let client_addr = target_address(&config.client_host).to_string();
-    let nodes_spec = format!(
-        "{}|{}:51820|{};{}|{}:51820|{}",
-        config.signer_node_id,
-        signer_addr,
-        signer_pub_hex,
-        config.client_node_id,
-        client_addr,
-        client_pub_hex,
-    );
-    let allow_spec = format!(
-        "{}|{};{}|{}",
-        config.client_node_id, config.signer_node_id, config.signer_node_id, config.client_node_id,
-    );
+    let mut host_by_node = HashMap::new();
+    host_by_node.insert(config.signer_node_id.clone(), config.signer_host.clone());
+    host_by_node.insert(config.client_node_id.clone(), config.client_host.clone());
+    for peer in &config.managed_peers {
+        host_by_node.insert(peer.node_id.clone(), peer.host.clone());
+    }
+
+    let mut required_node_ids = vec![config.signer_node_id.clone(), config.client_node_id.clone()];
+    if current_exit_node != "none"
+        && current_exit_node != config.signer_node_id
+        && current_exit_node != config.client_node_id
+    {
+        if !host_by_node.contains_key(&current_exit_node) {
+            return Err(format!(
+                "client exit_node {} is not mapped to a host; provide --managed-peer {}|<user@host>",
+                current_exit_node, current_exit_node
+            ));
+        }
+        required_node_ids.push(current_exit_node.clone());
+    }
+
+    let mut mesh_peers = Vec::new();
+    for node_id in required_node_ids {
+        let host = host_by_node
+            .get(&node_id)
+            .ok_or_else(|| format!("missing host mapping for traversal node id: {node_id}"))?;
+        mesh_peers.push(ManagedPeerRuntime {
+            node_id,
+            address: target_address(host).to_string(),
+            pubkey_hex: ctx.collect_pubkey_hex(host)?,
+        });
+    }
+
+    let nodes_spec = mesh_peers
+        .iter()
+        .map(|peer| {
+            format!(
+                "{}|{}:51820|{}",
+                peer.node_id, peer.address, peer.pubkey_hex
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let allow_spec = mesh_peers
+        .iter()
+        .flat_map(|source| {
+            mesh_peers.iter().filter_map(move |destination| {
+                if source.node_id == destination.node_id {
+                    None
+                } else {
+                    Some(format!("{}|{}", source.node_id, destination.node_id))
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(";");
     ensure_safe_spec("NODES_SPEC", &nodes_spec)?;
     ensure_safe_spec("ALLOW_SPEC", &allow_spec)?;
 
@@ -253,9 +310,14 @@ fn run() -> Result<(), String> {
     let non_managed_direct_query =
         remote_dns_query_capture(&ctx, &config.client_host, &config, "example.com")?;
     let _ = ctx.run_root_allow_failure(&config.client_host, &["resolvectl", "flush-caches"])?;
+    let managed_fqdn = config.managed_fqdn();
+    let resolvectl_query_cmd = format!(
+        "if command -v timeout >/dev/null 2>&1; then timeout 15 resolvectl query --legend=no {fqdn}; else resolvectl query --legend=no {fqdn}; fi",
+        fqdn = shell_single_quote(managed_fqdn.as_str())
+    );
     let resolvectl_query_valid = ctx.capture_root_allow_failure(
         &config.client_host,
-        &["resolvectl", "query", "--legend=no", &config.managed_fqdn()],
+        &["sh", "-lc", resolvectl_query_cmd.as_str()],
     )?;
 
     let expected_ip =
@@ -559,6 +621,7 @@ struct Config {
     zone_name: String,
     dns_interface: String,
     dns_bind_addr: String,
+    managed_peers: Vec<ManagedPeerSpec>,
 }
 
 impl Config {
@@ -575,6 +638,7 @@ impl Config {
             zone_name: "rustynet".to_string(),
             dns_interface: "rustynet0".to_string(),
             dns_bind_addr: "127.0.0.1:53535".to_string(),
+            managed_peers: Vec::new(),
         };
 
         let mut iter = args.into_iter();
@@ -591,6 +655,10 @@ impl Config {
                 "--zone-name" => config.zone_name = next_value(&mut iter, &arg)?,
                 "--dns-interface" => config.dns_interface = next_value(&mut iter, &arg)?,
                 "--dns-bind-addr" => config.dns_bind_addr = next_value(&mut iter, &arg)?,
+                "--managed-peer" => {
+                    let value = next_value(&mut iter, &arg)?;
+                    config.managed_peers.push(parse_managed_peer_spec(&value)?);
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -643,6 +711,40 @@ fn validate_targets(config: &Config) -> Result<(), String> {
         ("dns-bind-addr", config.dns_bind_addr.as_str()),
     ] {
         ensure_safe_token(label, value)?;
+    }
+    let mut seen_node_ids = HashSet::new();
+    let mut seen_hosts = HashSet::new();
+    for (label, value) in [
+        ("signer-node-id", config.signer_node_id.as_str()),
+        ("client-node-id", config.client_node_id.as_str()),
+    ] {
+        if !seen_node_ids.insert(value.to_string()) {
+            return Err(format!("{label} is duplicated: {value}"));
+        }
+    }
+    for (label, value) in [
+        ("signer-host", config.signer_host.as_str()),
+        ("client-host", config.client_host.as_str()),
+    ] {
+        if !seen_hosts.insert(value.to_string()) {
+            return Err(format!("{label} is duplicated: {value}"));
+        }
+    }
+    for peer in &config.managed_peers {
+        ensure_safe_token("--managed-peer node-id", peer.node_id.as_str())?;
+        ensure_safe_token("--managed-peer host", peer.host.as_str())?;
+        if !seen_node_ids.insert(peer.node_id.clone()) {
+            return Err(format!(
+                "--managed-peer node-id duplicates an existing node id: {}",
+                peer.node_id
+            ));
+        }
+        if !seen_hosts.insert(peer.host.clone()) {
+            return Err(format!(
+                "--managed-peer host duplicates an existing host: {}",
+                peer.host
+            ));
+        }
     }
     let _ = config
         .dns_bind_addr
@@ -1093,6 +1195,37 @@ fn ensure_safe_spec(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ManagedPeerSpec {
+    node_id: String,
+    host: String,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedPeerRuntime {
+    node_id: String,
+    address: String,
+    pubkey_hex: String,
+}
+
+fn parse_managed_peer_spec(value: &str) -> Result<ManagedPeerSpec, String> {
+    let trimmed = value.trim();
+    let (node_id_raw, host_raw) = trimmed.split_once('|').ok_or_else(|| {
+        format!("invalid --managed-peer value (expected <node-id>|<user@host>): {value}")
+    })?;
+    let node_id = node_id_raw.trim();
+    let host = host_raw.trim();
+    if node_id.is_empty() || host.is_empty() {
+        return Err(format!(
+            "invalid --managed-peer value (node-id and host must be non-empty): {value}"
+        ));
+    }
+    Ok(ManagedPeerSpec {
+        node_id: node_id.to_string(),
+        host: host.to_string(),
+    })
+}
+
 fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
     iter.next()
         .ok_or_else(|| format!("{flag} requires a value"))
@@ -1159,8 +1292,100 @@ fn target_address(target: &str) -> &str {
         .unwrap_or(target)
 }
 
+fn parse_status_field(status: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    status.split_whitespace().find_map(|token| {
+        token
+            .strip_prefix(prefix.as_str())
+            .map(|value| value.to_string())
+    })
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: live_linux_managed_dns_test --ssh-identity-file <path> [options]\n\noptions:\n  --signer-host <user@host>\n  --client-host <user@host>\n  --signer-node-id <id>\n  --client-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --log-path <path>\n  --zone-name <name>\n  --dns-interface <name>\n  --dns-bind-addr <ip:port>"
+        "usage: live_linux_managed_dns_test --ssh-identity-file <path> [options]\n\noptions:\n  --signer-host <user@host>\n  --client-host <user@host>\n  --signer-node-id <id>\n  --client-node-id <id>\n  --managed-peer <node-id|user@host>   (repeatable)\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --log-path <path>\n  --zone-name <name>\n  --dns-interface <name>\n  --dns-bind-addr <ip:port>"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Config, ManagedPeerSpec, parse_managed_peer_spec, parse_status_field, validate_targets,
+    };
+    use std::path::PathBuf;
+
+    fn base_config() -> Config {
+        Config {
+            ssh_identity_file: "/tmp/rn-test-key".to_string(),
+            signer_host: "debian@192.168.64.22".to_string(),
+            client_host: "debian@192.168.64.24".to_string(),
+            signer_node_id: "exit-1".to_string(),
+            client_node_id: "client-1".to_string(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            report_path: PathBuf::from("/tmp/managed_dns_report.json"),
+            log_path: PathBuf::from("/tmp/managed_dns_report.log"),
+            zone_name: "rustynet".to_string(),
+            dns_interface: "rustynet0".to_string(),
+            dns_bind_addr: "127.0.0.1:53535".to_string(),
+            managed_peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_managed_peer_spec_accepts_node_id_and_host() {
+        let parsed = parse_managed_peer_spec("client-2|debian@192.168.64.26")
+            .expect("managed peer should parse");
+        assert_eq!(parsed.node_id, "client-2");
+        assert_eq!(parsed.host, "debian@192.168.64.26");
+    }
+
+    #[test]
+    fn parse_managed_peer_spec_rejects_invalid_shape() {
+        let err = parse_managed_peer_spec("client-2:debian@192.168.64.26").expect_err("must fail");
+        assert!(
+            err.contains("expected <node-id>|<user@host>"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_targets_rejects_duplicate_managed_peer_node_id() {
+        let mut config = base_config();
+        config.managed_peers.push(ManagedPeerSpec {
+            node_id: "client-1".to_string(),
+            host: "debian@192.168.64.26".to_string(),
+        });
+        let err = validate_targets(&config).expect_err("duplicate node id must fail");
+        assert!(
+            err.contains("duplicates an existing node id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_targets_rejects_duplicate_managed_peer_host() {
+        let mut config = base_config();
+        config.managed_peers.push(ManagedPeerSpec {
+            node_id: "client-2".to_string(),
+            host: "debian@192.168.64.22".to_string(),
+        });
+        let err = validate_targets(&config).expect_err("duplicate host must fail");
+        assert!(
+            err.contains("duplicates an existing host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_status_field_extracts_exit_node() {
+        let status = "node_id=client-1 node_role=client state=ExitActive exit_node=client-2 dns_zone_state=valid";
+        let exit = parse_status_field(status, "exit_node").expect("exit_node missing");
+        assert_eq!(exit, "client-2");
+    }
+
+    #[test]
+    fn parse_status_field_returns_none_when_missing() {
+        let status = "node_id=client-1 node_role=client state=ExitActive";
+        assert!(parse_status_field(status, "exit_node").is_none());
+    }
 }

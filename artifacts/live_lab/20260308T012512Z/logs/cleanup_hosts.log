@@ -1,17 +1,0 @@
-[stage:cleanup_hosts] START remove prior RustyNet state from targets
-[cleanup] exit debian@192.168.18.49
- 
- 
-[cleanup] client debian@192.168.18.50
-scp: Connection closed
-ssh: connect to host 192.168.18.50 port 22: Host is down
-[cleanup] entry ubuntu@192.168.18.52
- 
- 
-[cleanup] aux fedora@192.168.18.51
- 
- 
-[cleanup] extra mint@192.168.18.53
- 
- 
-[stage:cleanup_hosts] PASS

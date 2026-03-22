@@ -1169,9 +1169,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     client_post: parser.required("--client-post")?,
                     exit_return: parser.required("--exit-return")?,
                     exit_boot_change: parser.required("--exit-boot-change")?,
+                    post_exit_dns_refresh: parser.required("--post-exit-dns-refresh")?,
                     post_exit_twohop: parser.required("--post-exit-twohop")?,
                     client_return: parser.required("--client-return")?,
                     client_boot_change: parser.required("--client-boot-change")?,
+                    post_client_dns_refresh: parser.required("--post-client-dns-refresh")?,
                     post_client_twohop: parser.required("--post-client-twohop")?,
                     salvage_twohop: parser.required("--salvage-twohop")?,
                 },
@@ -9894,7 +9896,7 @@ fn help_text() -> String {
         "  ops write-cross-network-forensics-manifest --stage <name> --collected-at-utc <utc> --stage-dir <path> --output <path>",
         "  ops sha256-file --path <path>",
         "  ops write-cross-network-preflight-report --nodes-tsv <path> --stage-dir <path> --output <path> --reference-unix <unix> --max-clock-skew-secs <secs> --discovery-max-age-secs <secs> --signed-artifact-max-age-secs <secs>",
-        "  ops write-live-linux-reboot-recovery-report --report-path <path> --observations-path <path> --exit-pre <id> --exit-post <id> --client-pre <id> --client-post <id> --exit-return <pass|fail|skipped> --exit-boot-change <pass|fail|skipped> --post-exit-twohop <pass|fail|skipped> --client-return <pass|fail|skipped> --client-boot-change <pass|fail|skipped> --post-client-twohop <pass|fail|skipped> --salvage-twohop <pass|fail|skipped>",
+        "  ops write-live-linux-reboot-recovery-report --report-path <path> --observations-path <path> --exit-pre <id> --exit-post <id> --client-pre <id> --client-post <id> --exit-return <pass|fail|skipped> --exit-boot-change <pass|fail|skipped> --post-exit-dns-refresh <pass|fail|skipped> --post-exit-twohop <pass|fail|skipped> --client-return <pass|fail|skipped> --client-boot-change <pass|fail|skipped> --post-client-dns-refresh <pass|fail|skipped> --post-client-twohop <pass|fail|skipped> --salvage-twohop <pass|fail|skipped>",
         "  ops write-live-linux-lab-run-summary --nodes-tsv <path> --stages-tsv <path> --summary-json <path> --summary-md <path> --run-id <id> --network-id <id> --report-dir <path> --overall-status <status> --started-at-local <text> --started-at-utc <text> --started-at-unix <unix> --finished-at-local <text> --finished-at-utc <text> --finished-at-unix <unix> --elapsed-secs <secs> --elapsed-human <text>",
         "  ops scan-ipv4-port-range --network-prefix <a.b.c> [--start-host <n>] [--end-host <n>] [--port <n>] [--timeout-ms <n>] [--output-key <text>]",
         "  ops update-role-switch-host-result --hosts-json-path <path> --os-id <id> --temp-role <role> --switch-execution <pass|fail> --post-switch-reconcile <pass|fail> --policy-still-enforced <pass|fail> --least-privilege-preserved <pass|fail>",
@@ -10619,11 +10621,15 @@ mod tests {
             "pass".to_string(),
             "--exit-boot-change".to_string(),
             "pass".to_string(),
+            "--post-exit-dns-refresh".to_string(),
+            "pass".to_string(),
             "--post-exit-twohop".to_string(),
             "pass".to_string(),
             "--client-return".to_string(),
             "pass".to_string(),
             "--client-boot-change".to_string(),
+            "pass".to_string(),
+            "--post-client-dns-refresh".to_string(),
             "pass".to_string(),
             "--post-client-twohop".to_string(),
             "pass".to_string(),
@@ -11458,6 +11464,41 @@ mod tests {
             "/run/rustynet/traversal-issue".to_string(),
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
+    }
+
+    #[test]
+    fn parse_reboot_recovery_report_requires_dns_refresh_checks() {
+        let missing_dns_refresh_checks = parse_command(&[
+            "ops".to_string(),
+            "write-live-linux-reboot-recovery-report".to_string(),
+            "--report-path".to_string(),
+            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_string(),
+            "--observations-path".to_string(),
+            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_string(),
+            "--exit-pre".to_string(),
+            "a".to_string(),
+            "--exit-post".to_string(),
+            "b".to_string(),
+            "--client-pre".to_string(),
+            "c".to_string(),
+            "--client-post".to_string(),
+            "d".to_string(),
+            "--exit-return".to_string(),
+            "pass".to_string(),
+            "--exit-boot-change".to_string(),
+            "pass".to_string(),
+            "--post-exit-twohop".to_string(),
+            "pass".to_string(),
+            "--client-return".to_string(),
+            "pass".to_string(),
+            "--client-boot-change".to_string(),
+            "pass".to_string(),
+            "--post-client-twohop".to_string(),
+            "pass".to_string(),
+            "--salvage-twohop".to_string(),
+            "skipped".to_string(),
+        ]);
+        assert_eq!(format!("{missing_dns_refresh_checks:?}"), "Help");
     }
 
     #[test]

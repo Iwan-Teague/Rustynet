@@ -2308,6 +2308,20 @@ assert_log_absent_patterns() {
   done
 }
 
+assert_log_contains_pattern() {
+  local log_path="$1"
+  local label="$2"
+  local pattern="$3"
+  if [[ ! -f "$log_path" ]]; then
+    printf '%s log missing: %s\n' "$label" "$log_path" >&2
+    return 1
+  fi
+  if ! rg -n -- "$pattern" "$log_path" >/dev/null 2>&1; then
+    printf '%s log missing required pattern (%s): %s\n' "$label" "$pattern" "$log_path" >&2
+    return 1
+  fi
+}
+
 assert_no_managed_dns_service_errors() {
   local log_path="$1"
   local label="$2"
@@ -2321,25 +2335,89 @@ assert_no_managed_dns_service_errors() {
 
 stage_run_live_managed_dns() {
   local canonical_report canonical_log stage_report stage_log
+  local label
   canonical_report="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.json"
   canonical_log="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
   stage_report="$REPORT_DIR/live_linux_managed_dns_report.json"
   stage_log="$REPORT_DIR/live_linux_managed_dns.log"
-  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh" \
-    --ssh-identity-file "$SSH_IDENTITY_FILE" \
-    --signer-host "$(node_target_for_label exit)" \
-    --signer-node-id "$(node_id_for_label exit)" \
-    --client-host "$(node_target_for_label client)" \
-    --client-node-id "$(node_id_for_label client)" \
-    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$stage_report" \
-    --log-path "$stage_log" || return 1
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh"
+    --ssh-identity-file "$SSH_IDENTITY_FILE"
+    --signer-host "$(node_target_for_label exit)"
+    --signer-node-id "$(node_id_for_label exit)"
+    --client-host "$(node_target_for_label client)"
+    --client-node-id "$(node_id_for_label client)"
+  )
+  for label in entry aux extra; do
+    if has_label "$label"; then
+      cmd+=(
+        --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+      )
+    fi
+  done
+  cmd+=(
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS"
+    --report-path "$stage_report"
+    --log-path "$stage_log"
+  )
+  "${cmd[@]}" || return 1
   assert_json_report_status_pass "$stage_report" "live managed DNS" || return 1
   assert_no_managed_dns_service_errors "$stage_log" "live managed DNS" || return 1
   mkdir -p "$(dirname "$canonical_report")" || return 1
   cp "$stage_report" "$canonical_report" || return 1
   cp "$stage_log" "$canonical_log" || return 1
+}
+
+run_periodic_managed_dns_refresh() {
+  local checkpoint_label="$1"
+  local refresh_report refresh_log
+  local label
+  refresh_report="$REPORT_DIR/live_linux_managed_dns_refresh_${checkpoint_label}.json"
+  refresh_log="$REPORT_DIR/live_linux_managed_dns_refresh_${checkpoint_label}.log"
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh"
+    --ssh-identity-file "$SSH_IDENTITY_FILE"
+    --signer-host "$(node_target_for_label exit)"
+    --signer-node-id "$(node_id_for_label exit)"
+    --client-host "$(node_target_for_label client)"
+    --client-node-id "$(node_id_for_label client)"
+  )
+  for label in entry aux extra; do
+    if has_label "$label"; then
+      cmd+=(
+        --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+      )
+    fi
+  done
+  cmd+=(
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS"
+    --report-path "$refresh_report"
+    --log-path "$refresh_log"
+  )
+  "${cmd[@]}" || return 1
+  assert_json_report_status_pass "$refresh_report" "managed DNS refresh (${checkpoint_label})" || return 1
+  assert_no_managed_dns_service_errors "$refresh_log" "managed DNS refresh (${checkpoint_label})" || return 1
+}
+
+assert_no_dns_zone_stale_status() {
+  local log_path="$1"
+  local label="$2"
+  assert_log_absent_patterns \
+    "$log_path" \
+    "$label" \
+    'dns_zone_state=invalid' \
+    'dns_zone_bundle_is_stale'
+}
+
+assert_client_dns_zone_valid_in_log() {
+  local log_path="$1"
+  local label="$2"
+  local client_node_id pattern
+  client_node_id="$(node_id_for_label client)"
+  pattern="node_id=${client_node_id} .*dns_zone_state=valid .*dns_zone_error=none"
+  assert_log_contains_pattern "$log_path" "$label" "$pattern"
 }
 
 stage_run_cross_network_direct_remote_exit() {
@@ -2794,6 +2872,7 @@ stage_run_extended_soak() {
   local lan_log="$REPORT_DIR/live_linux_lan_toggle_soak.log"
   local reboot_report="$REPORT_DIR/live_linux_reboot_recovery_report.json"
   local reboot_log="$REPORT_DIR/live_linux_reboot_recovery.log"
+  run_periodic_managed_dns_refresh "soak_pre_two_hop" || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -2810,7 +2889,10 @@ stage_run_extended_soak() {
     --log-path "$two_hop_pre_log" || return 1
   assert_json_report_status_pass "$two_hop_pre_report" "extended soak pre-reboot two-hop" || return 1
   assert_no_managed_dns_service_errors "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
+  assert_no_dns_zone_stale_status "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
+  assert_client_dns_zone_valid_in_log "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
 
+  run_periodic_managed_dns_refresh "soak_pre_exit_handoff" || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -2828,7 +2910,10 @@ stage_run_extended_soak() {
     --monitor-log "$REPORT_DIR/live_linux_exit_handoff_soak_monitor.log" || return 1
   assert_json_report_status_pass "$handoff_report" "extended soak exit handoff" || return 1
   assert_no_managed_dns_service_errors "$handoff_log" "extended soak exit handoff" || return 1
+  assert_no_dns_zone_stale_status "$handoff_log" "extended soak exit handoff" || return 1
+  assert_client_dns_zone_valid_in_log "$handoff_log" "extended soak exit handoff" || return 1
 
+  run_periodic_managed_dns_refresh "soak_pre_lan_toggle" || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -2843,19 +2928,28 @@ stage_run_extended_soak() {
     --log-path "$lan_log" || return 1
   assert_json_report_status_pass "$lan_report" "extended soak lan toggle" || return 1
   assert_no_managed_dns_service_errors "$lan_log" "extended soak lan toggle" || return 1
+  assert_no_dns_zone_stale_status "$lan_log" "extended soak lan toggle" || return 1
+  assert_client_dns_zone_valid_in_log "$lan_log" "extended soak lan toggle" || return 1
 
+  run_periodic_managed_dns_refresh "soak_pre_reboot_recovery" || return 1
   stage_run_reboot_recovery_report || return 1
   assert_json_report_status_pass "$reboot_report" "extended soak reboot recovery" || return 1
   assert_no_managed_dns_service_errors "$reboot_log" "extended soak reboot recovery" || return 1
 
   if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" ]]; then
     assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" "extended soak post-exit-reboot two-hop" || return 1
+    assert_no_dns_zone_stale_status "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" "extended soak post-exit-reboot two-hop" || return 1
+    assert_client_dns_zone_valid_in_log "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" "extended soak post-exit-reboot two-hop" || return 1
   fi
   if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" ]]; then
     assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" "extended soak post-client-reboot two-hop" || return 1
+    assert_no_dns_zone_stale_status "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" "extended soak post-client-reboot two-hop" || return 1
+    assert_client_dns_zone_valid_in_log "$REPORT_DIR/live_linux_two_hop_soak_post_client_reboot.log" "extended soak post-client-reboot two-hop" || return 1
   fi
   if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" ]]; then
     assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" "extended soak salvage two-hop" || return 1
+    assert_no_dns_zone_stale_status "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" "extended soak salvage two-hop" || return 1
+    assert_client_dns_zone_valid_in_log "$REPORT_DIR/live_linux_two_hop_soak_salvage.log" "extended soak salvage two-hop" || return 1
   fi
 }
 
@@ -2863,7 +2957,10 @@ stage_run_reboot_recovery_report() {
   local exit_target client_target entry_target aux_target extra_target
   local exit_pre exit_post client_pre client_post
   local exit_return="pass" exit_boot_change="pass" client_return="pass" client_boot_change="pass"
+  local post_exit_dns_refresh="skipped" post_client_dns_refresh="skipped"
   local post_exit_twohop="skipped" post_client_twohop="skipped" salvage_twohop="skipped"
+  local reboot_wait_attempts=96
+  local reboot_wait_sleep_secs=5
   local observations_file="$STATE_DIR/reboot_observations.txt"
   local reboot_report="$REPORT_DIR/live_linux_reboot_recovery_report.json"
   local reboot_log="$REPORT_DIR/live_linux_reboot_recovery.log"
@@ -2887,7 +2984,7 @@ stage_run_reboot_recovery_report() {
 
   printf '[reboot] exit target %s\n' "$exit_target"
   run_host_reboot "$exit_target"
-  if ssh_wait_for_host "$exit_target" 48 5; then
+  if ssh_wait_for_host "$exit_target" "$reboot_wait_attempts" "$reboot_wait_sleep_secs"; then
     exit_post="$(capture_boot_id "$exit_target")"
     printf 'exit_post=%s\n' "$exit_post" | tee -a "$observations_file"
     if [[ "$exit_post" == "$exit_pre" || -z "$exit_post" ]]; then
@@ -2900,6 +2997,8 @@ stage_run_reboot_recovery_report() {
   fi
 
   if [[ "$exit_return" == "pass" && "$exit_boot_change" == "pass" ]]; then
+    if run_periodic_managed_dns_refresh "soak_post_exit_reboot_pre_two_hop"; then
+      post_exit_dns_refresh="pass"
     if has_label extra; then
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
@@ -2939,13 +3038,18 @@ stage_run_reboot_recovery_report() {
         post_exit_twohop="fail"
       fi
     fi
+    else
+      post_exit_dns_refresh="fail"
+      post_exit_twohop="fail"
+      printf 'post_exit_dns_refresh=fail\n' | tee -a "$observations_file"
+    fi
   else
     post_exit_twohop="fail"
   fi
 
   printf '[reboot] client target %s\n' "$client_target"
   run_host_reboot "$client_target"
-  if ssh_wait_for_host "$client_target" 48 5; then
+  if ssh_wait_for_host "$client_target" "$reboot_wait_attempts" "$reboot_wait_sleep_secs"; then
     client_post="$(capture_boot_id "$client_target")"
     printf 'client_post=%s\n' "$client_post" | tee -a "$observations_file"
     if [[ "$client_post" == "$client_pre" || -z "$client_post" ]]; then
@@ -2966,6 +3070,8 @@ stage_run_reboot_recovery_report() {
   fi
 
   if [[ "$client_return" == "pass" && "$client_boot_change" == "pass" ]]; then
+    if run_periodic_managed_dns_refresh "soak_post_client_reboot_pre_two_hop"; then
+      post_client_dns_refresh="pass"
     if has_label extra; then
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
@@ -3004,6 +3110,11 @@ stage_run_reboot_recovery_report() {
       else
         post_client_twohop="fail"
       fi
+    fi
+    else
+      post_client_dns_refresh="fail"
+      post_client_twohop="fail"
+      printf 'post_client_dns_refresh=fail\n' | tee -a "$observations_file"
     fi
   else
     post_client_twohop="fail"
@@ -3041,9 +3152,11 @@ stage_run_reboot_recovery_report() {
     --client-post "$client_post" \
     --exit-return "$exit_return" \
     --exit-boot-change "$exit_boot_change" \
+    --post-exit-dns-refresh "$post_exit_dns_refresh" \
     --post-exit-twohop "$post_exit_twohop" \
     --client-return "$client_return" \
     --client-boot-change "$client_boot_change" \
+    --post-client-dns-refresh "$post_client_dns_refresh" \
     --post-client-twohop "$post_client_twohop" \
     --salvage-twohop "$salvage_twohop" >/dev/null
 }

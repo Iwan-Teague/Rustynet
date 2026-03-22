@@ -2,7 +2,9 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
+};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,9 +58,11 @@ pub struct WriteLiveLinuxRebootRecoveryReportConfig {
     pub client_post: String,
     pub exit_return: String,
     pub exit_boot_change: String,
+    pub post_exit_dns_refresh: String,
     pub post_exit_twohop: String,
     pub client_return: String,
     pub client_boot_change: String,
+    pub post_client_dns_refresh: String,
     pub post_client_twohop: String,
     pub salvage_twohop: String,
 }
@@ -450,9 +454,15 @@ fn reboot_reason_for_check(check: &str) -> Option<&'static str> {
     match check {
         "exit_reboot_returns" => Some("exit did not return on SSH after reboot"),
         "exit_boot_id_changes" => Some("exit reboot was not proven by a new boot_id"),
+        "post_exit_reboot_managed_dns_refresh" => {
+            Some("managed DNS refresh failed after exit reboot")
+        }
         "post_exit_reboot_twohop" => Some("two-hop validation failed after exit reboot"),
         "client_reboot_returns" => Some("client did not return on SSH after reboot"),
         "client_boot_id_changes" => Some("client reboot was not proven by a new boot_id"),
+        "post_client_reboot_managed_dns_refresh" => {
+            Some("managed DNS refresh failed after client reboot")
+        }
         "post_client_reboot_twohop" => Some("two-hop validation failed after client reboot"),
         "client_failure_salvage_twohop" => {
             Some("salvage two-hop validation failed after the client reboot outage")
@@ -952,18 +962,45 @@ pub fn execute_ops_write_live_linux_reboot_recovery_report(
 ) -> Result<String, String> {
     let report_path = resolve_path(config.report_path.as_path())?;
     let observations_path = resolve_path(config.observations_path.as_path())?;
+    let exit_return = parse_pass_fail_skip(config.exit_return.as_str(), "--exit-return")?;
+    let exit_boot_change =
+        parse_pass_fail_skip(config.exit_boot_change.as_str(), "--exit-boot-change")?;
+    let post_exit_dns_refresh = parse_pass_fail_skip(
+        config.post_exit_dns_refresh.as_str(),
+        "--post-exit-dns-refresh",
+    )?;
+    let post_exit_twohop =
+        parse_pass_fail_skip(config.post_exit_twohop.as_str(), "--post-exit-twohop")?;
+    let client_return = parse_pass_fail_skip(config.client_return.as_str(), "--client-return")?;
+    let client_boot_change =
+        parse_pass_fail_skip(config.client_boot_change.as_str(), "--client-boot-change")?;
+    let post_client_dns_refresh = parse_pass_fail_skip(
+        config.post_client_dns_refresh.as_str(),
+        "--post-client-dns-refresh",
+    )?;
+    let post_client_twohop =
+        parse_pass_fail_skip(config.post_client_twohop.as_str(), "--post-client-twohop")?;
+    let salvage_twohop = parse_pass_fail_skip(config.salvage_twohop.as_str(), "--salvage-twohop")?;
     let observations = fs::read(observations_path.as_path())
         .map(|bytes| String::from_utf8_lossy(bytes.as_slice()).to_string())
         .unwrap_or_default();
 
     let checks = [
-        ("exit_reboot_returns", config.exit_return),
-        ("exit_boot_id_changes", config.exit_boot_change),
-        ("post_exit_reboot_twohop", config.post_exit_twohop),
-        ("client_reboot_returns", config.client_return),
-        ("client_boot_id_changes", config.client_boot_change),
-        ("post_client_reboot_twohop", config.post_client_twohop),
-        ("client_failure_salvage_twohop", config.salvage_twohop),
+        ("exit_reboot_returns", exit_return),
+        ("exit_boot_id_changes", exit_boot_change),
+        (
+            "post_exit_reboot_managed_dns_refresh",
+            post_exit_dns_refresh,
+        ),
+        ("post_exit_reboot_twohop", post_exit_twohop),
+        ("client_reboot_returns", client_return),
+        ("client_boot_id_changes", client_boot_change),
+        (
+            "post_client_reboot_managed_dns_refresh",
+            post_client_dns_refresh,
+        ),
+        ("post_client_reboot_twohop", post_client_twohop),
+        ("client_failure_salvage_twohop", salvage_twohop),
     ];
 
     let relevant = checks
@@ -2049,7 +2086,7 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
     } else {
         config.timeout_ms.min(60_000)
     };
-    let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+    let socket = UdpSocket::bind(dns_query_bind_addr(server))
         .map_err(|err| format!("bind UDP socket failed: {err}"))?;
     let timeout = Duration::from_millis(timeout_ms);
     socket
@@ -2111,6 +2148,19 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
             .to_string());
     }
     Ok(output)
+}
+
+fn dns_query_bind_addr(server: IpAddr) -> SocketAddr {
+    match server {
+        IpAddr::V4(addr) if addr.is_loopback() => {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        }
+        IpAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        IpAddr::V6(addr) if addr.is_loopback() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+        }
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 pub fn execute_ops_e2e_http_probe_server(
@@ -2440,7 +2490,7 @@ mod tests {
         WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
         WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
         WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
-        count_no_leak_tunnel_packets, execute_ops_check_local_file_mode,
+        count_no_leak_tunnel_packets, dns_query_bind_addr, execute_ops_check_local_file_mode,
         execute_ops_extract_managed_dns_expected_ip, execute_ops_rewrite_assignment_mesh_cidr,
         execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
@@ -2454,6 +2504,7 @@ mod tests {
         execute_ops_write_role_switch_matrix_report, redact_forensics_payload,
     };
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2464,6 +2515,36 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("rustynet-cli-{name}-{stamp}"))
+    }
+
+    #[test]
+    fn dns_query_bind_addr_prefers_loopback_for_loopback_server() {
+        let bind = dns_query_bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            bind,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        );
+    }
+
+    #[test]
+    fn dns_query_bind_addr_uses_unspecified_for_non_loopback_server() {
+        let bind = dns_query_bind_addr(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(
+            bind,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        );
+    }
+
+    #[test]
+    fn dns_query_bind_addr_handles_ipv6_variants() {
+        assert_eq!(
+            dns_query_bind_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+        );
+        assert_eq!(
+            dns_query_bind_addr(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        );
     }
 
     #[test]
@@ -2507,9 +2588,11 @@ mod tests {
                 client_post: "".to_string(),
                 exit_return: "pass".to_string(),
                 exit_boot_change: "pass".to_string(),
+                post_exit_dns_refresh: "pass".to_string(),
                 post_exit_twohop: "pass".to_string(),
                 client_return: "fail".to_string(),
                 client_boot_change: "fail".to_string(),
+                post_client_dns_refresh: "skipped".to_string(),
                 post_client_twohop: "fail".to_string(),
                 salvage_twohop: "skipped".to_string(),
             },
@@ -2520,6 +2603,41 @@ mod tests {
         assert!(body.contains("\"status\": \"fail\""));
 
         let _ = fs::remove_file(report_path.as_path());
+        let _ = fs::remove_file(observations_path.as_path());
+    }
+
+    #[test]
+    fn reboot_recovery_report_rejects_unknown_check_value() {
+        let report_path = temp_path("reboot-report-invalid-check");
+        let observations_path = temp_path("reboot-observations-invalid-check");
+        fs::write(observations_path.as_path(), "").expect("write observations");
+
+        let err = execute_ops_write_live_linux_reboot_recovery_report(
+            WriteLiveLinuxRebootRecoveryReportConfig {
+                report_path: report_path.clone(),
+                observations_path: observations_path.clone(),
+                exit_pre: "a".to_string(),
+                exit_post: "b".to_string(),
+                client_pre: "c".to_string(),
+                client_post: "d".to_string(),
+                exit_return: "pass".to_string(),
+                exit_boot_change: "pass".to_string(),
+                post_exit_dns_refresh: "invalid".to_string(),
+                post_exit_twohop: "pass".to_string(),
+                client_return: "pass".to_string(),
+                client_boot_change: "pass".to_string(),
+                post_client_dns_refresh: "pass".to_string(),
+                post_client_twohop: "pass".to_string(),
+                salvage_twohop: "skipped".to_string(),
+            },
+        )
+        .expect_err("invalid check state should fail");
+        assert!(err.contains("--post-exit-dns-refresh"));
+        assert!(
+            !report_path.exists(),
+            "report should not be emitted when check-state parsing fails"
+        );
+
         let _ = fs::remove_file(observations_path.as_path());
     }
 

@@ -7,6 +7,9 @@
 /.ci-home/
 /.cargo-home/
 /.cargo-audit-db/
+/.cargo-audit-db
+/.cargo-audit-db..lock
+/.cargo-audit-db*
 
 # Local desktop noise
 .DS_Store
@@ -14,6 +17,7 @@ __pycache__/
 
 # Local live-lab runs and operator-specific saved profiles
 /artifacts/live_lab/
+/artifacts/live_lab/**
 /profiles/live_lab/*.env
 !/profiles/live_lab/default_four_node.env
 !/profiles/live_lab/default_five_node.env

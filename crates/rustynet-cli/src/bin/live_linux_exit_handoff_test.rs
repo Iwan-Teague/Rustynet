@@ -19,6 +19,14 @@ use live_lab_support::{
     write_file,
 };
 
+const DNS_ZONE_NAME: &str = "rustynet";
+const DNS_MANAGED_LABEL: &str = "exit";
+const DNS_MANAGED_ALIAS: &str = "gateway";
+const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
+const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.json";
+const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
+const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -280,6 +288,9 @@ fn run() -> Result<(), String> {
     let exit_a_traversal_local = workspace.path().join("traversal-exit-a");
     let exit_b_traversal_local = workspace.path().join("traversal-exit-b");
     let client_traversal_local = workspace.path().join("traversal-client");
+    let dns_records_local = workspace.path().join("dns-zone-records.json");
+    let dns_bundle_local = workspace.path().join("dns-zone-valid.bundle");
+    let dns_verifier_local = workspace.path().join("dns-zone.pub");
 
     refresh_traversal_bundles(
         &config.ssh_identity_file,
@@ -295,6 +306,58 @@ fn run() -> Result<(), String> {
         &config.exit_a_node_id,
         &config.exit_b_node_id,
         &config.client_node_id,
+    )?;
+    let dns_records_json = format!(
+        "[\n  {{\"label\":\"{DNS_MANAGED_LABEL}\",\"target_node_id\":\"{}\",\"ttl_secs\":300,\"aliases\":[\"{DNS_MANAGED_ALIAS}\"]}},\n  {{\"label\":\"client\",\"target_node_id\":\"{}\",\"ttl_secs\":300}}\n]\n",
+        config.exit_a_node_id, config.client_node_id
+    );
+    write_file(&dns_records_local, dns_records_json.as_str())?;
+    let dns_passphrase_remote = capture_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        "mktemp /tmp/rn-exit-handoff-dns-passphrase.XXXXXX",
+    )?
+    .trim()
+    .to_string();
+    let materialize_dns_passphrase_cmd = format!(
+        "rustynet ops materialize-signing-passphrase --output {}",
+        shell_quote(dns_passphrase_remote.as_str())
+    );
+    run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        materialize_dns_passphrase_cmd.as_str(),
+    )?;
+    let chmod_dns_passphrase_cmd =
+        format!("chmod 0600 {}", shell_quote(dns_passphrase_remote.as_str()));
+    run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        chmod_dns_passphrase_cmd.as_str(),
+    )?;
+    let mkdir_dns_issue_dir_cmd = format!("install -d -m 0700 {}", shell_quote(DNS_ZONE_ISSUE_DIR));
+    run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        mkdir_dns_issue_dir_cmd.as_str(),
+    )?;
+    logger.line("[exit-handoff] refreshing managed DNS bundle before monitor")?;
+    refresh_dns_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        &config.client_host,
+        &config.client_node_id,
+        &nodes_spec,
+        &allow_spec,
+        dns_passphrase_remote.as_str(),
+        &dns_records_local,
+        &dns_verifier_local,
+        &dns_bundle_local,
     )?;
 
     logger.line("[exit-handoff] enforcing runtime roles")?;
@@ -391,6 +454,20 @@ fn run() -> Result<(), String> {
                 &config.exit_b_node_id,
                 &config.client_node_id,
             )?;
+            logger.line("[exit-handoff] refreshing managed DNS bundle during handoff monitor")?;
+            refresh_dns_bundle(
+                &config.ssh_identity_file,
+                &work_known_hosts,
+                &config.exit_a_host,
+                &config.client_host,
+                &config.client_node_id,
+                &nodes_spec,
+                &allow_spec,
+                dns_passphrase_remote.as_str(),
+                &dns_records_local,
+                &dns_verifier_local,
+                &dns_bundle_local,
+            )?;
             last_traversal_refresh_ts = unix_now();
         }
         let client_status = status(
@@ -449,6 +526,20 @@ fn run() -> Result<(), String> {
                 &config.exit_b_node_id,
                 &config.client_node_id,
             )?;
+            logger.line("[exit-handoff] refreshing managed DNS bundle before exit switch")?;
+            refresh_dns_bundle(
+                &config.ssh_identity_file,
+                &work_known_hosts,
+                &config.exit_a_host,
+                &config.client_host,
+                &config.client_node_id,
+                &nodes_spec,
+                &allow_spec,
+                dns_passphrase_remote.as_str(),
+                &dns_records_local,
+                &dns_verifier_local,
+                &dns_bundle_local,
+            )?;
             last_traversal_refresh_ts = unix_now();
             switch_ts = ts;
             logger.line(
@@ -498,6 +589,29 @@ fn run() -> Result<(), String> {
         &config.client_host,
         "wg show rustynet0 endpoints || true",
     )?;
+    let cleanup_dns_refresh_cmd = format!(
+        "rm -f {} {} {} {}",
+        shell_quote(dns_passphrase_remote.as_str()),
+        shell_quote(DNS_ZONE_RECORDS_REMOTE),
+        shell_quote(DNS_ZONE_VALID_BUNDLE_REMOTE),
+        shell_quote(DNS_ZONE_VERIFIER_REMOTE)
+    );
+    let _ = run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        cleanup_dns_refresh_cmd.as_str(),
+    );
+    let cleanup_dns_issue_dir_cmd = format!(
+        "rmdir {} >/dev/null 2>&1 || true",
+        shell_quote(DNS_ZONE_ISSUE_DIR)
+    );
+    let _ = run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+        cleanup_dns_issue_dir_cmd.as_str(),
+    );
     let exit_a_nft = capture_root(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -826,6 +940,63 @@ fn refresh_traversal_bundles(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn refresh_dns_bundle(
+    identity: &Path,
+    known_hosts: &Path,
+    signer_host: &str,
+    client_host: &str,
+    client_node_id: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+    passphrase_remote: &str,
+    records_local: &Path,
+    verifier_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    scp_to(
+        identity,
+        known_hosts,
+        records_local,
+        signer_host,
+        DNS_ZONE_RECORDS_REMOTE,
+    )?;
+    let issue_cmd = format!(
+        "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-json {} --output {} --verifier-key-output {}",
+        shell_quote(passphrase_remote),
+        shell_quote(client_node_id),
+        shell_quote(nodes_spec),
+        shell_quote(allow_spec),
+        shell_quote(DNS_ZONE_NAME),
+        shell_quote(DNS_ZONE_RECORDS_REMOTE),
+        shell_quote(DNS_ZONE_VALID_BUNDLE_REMOTE),
+        shell_quote(DNS_ZONE_VERIFIER_REMOTE),
+    );
+    run_root(identity, known_hosts, signer_host, issue_cmd.as_str())?;
+    capture_root_file_to_local(
+        identity,
+        known_hosts,
+        signer_host,
+        DNS_ZONE_VERIFIER_REMOTE,
+        verifier_local,
+    )?;
+    capture_root_file_to_local(
+        identity,
+        known_hosts,
+        signer_host,
+        DNS_ZONE_VALID_BUNDLE_REMOTE,
+        bundle_local,
+    )?;
+    install_dns_bundle(
+        identity,
+        known_hosts,
+        client_host,
+        verifier_local,
+        bundle_local,
+    )?;
+    Ok(())
+}
+
 fn install_assignment_bundle(
     identity: &Path,
     known_hosts: &Path,
@@ -852,6 +1023,35 @@ fn install_assignment_bundle(
         known_hosts,
         target,
         "install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
+    )
+}
+
+fn install_dns_bundle(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+    verifier_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    scp_to(
+        identity,
+        known_hosts,
+        verifier_local,
+        target,
+        "/tmp/rn-dns-zone.pub",
+    )?;
+    scp_to(
+        identity,
+        known_hosts,
+        bundle_local,
+        target,
+        "/tmp/rn-dns-zone.bundle",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
     )
 }
 
