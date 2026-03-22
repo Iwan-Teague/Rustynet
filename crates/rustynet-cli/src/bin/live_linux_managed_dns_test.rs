@@ -467,6 +467,27 @@ fn run() -> Result<(), String> {
         ],
     )?;
 
+    let mut distribution_hosts = host_by_node
+        .values()
+        .cloned()
+        .collect::<Vec<String>>();
+    distribution_hosts.sort();
+    distribution_hosts.dedup();
+    for host in distribution_hosts {
+        if host == config.client_host {
+            continue;
+        }
+        logger.line(
+            format!(
+                "[managed-dns] propagating valid managed DNS bundle to {}",
+                host
+            )
+            .as_str(),
+        )?;
+        install_dns_bundle(&ctx, &host, &verifier_local, &valid_bundle_local)?;
+        restart_managed_dns_stack(&ctx, &host)?;
+    }
+
     let check_zone_issue_verify = "pass";
     let mut check_dns_inspect_valid = "fail";
     let mut check_managed_dns_service_active = "fail";
