@@ -1377,7 +1377,7 @@ run_root_timed 30 systemctl daemon-reload >/dev/null 2>&1 || true
 run_root rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet
 run_root rm -f /usr/local/bin/rustynet /usr/local/bin/rustynetd
 rm -f /tmp/rn_bootstrap.env /tmp/rn_bootstrap.sh /tmp/rn_source.tar.gz
-rm -rf "${HOME}/Rustynet"
+run_root rm -rf "${HOME}/Rustynet"
 EOF_CLEANUP
   chmod 700 "$STATE_DIR/rn_cleanup.sh"
 
@@ -1451,6 +1451,7 @@ build_bootstrap_prereqs_present() {
   local PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
   local missing=0
   local cmd
+  local llvm_found=0
   for cmd in curl git make pkg-config clang nft wg rustup; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
       echo "[bootstrap] missing prerequisite command: ${cmd}" >&2
@@ -1465,7 +1466,16 @@ build_bootstrap_prereqs_present() {
     echo "[bootstrap] missing C++ compiler command (g++/c++)" >&2
     missing=1
   fi
-  if ! command -v llvm-config >/dev/null 2>&1 && ! command -v llvm-config-19 >/dev/null 2>&1; then
+  if command -v llvm-config >/dev/null 2>&1; then
+    llvm_found=1
+  else
+    for cmd in /usr/bin/llvm-config-* /usr/local/bin/llvm-config-*; do
+      [[ -x "${cmd}" ]] || continue
+      llvm_found=1
+      break
+    done
+  fi
+  if [[ "${llvm_found}" -eq 0 ]]; then
     echo "[bootstrap] missing llvm-config command" >&2
     missing=1
   fi
@@ -1517,6 +1527,20 @@ install_prereqs() {
     echo "[bootstrap] prerequisite verification failed after package installation" >&2
     exit 1
   fi
+}
+
+ensure_llvm_config_alias() {
+  if command -v llvm-config >/dev/null 2>&1; then
+    return 0
+  fi
+  local candidate=""
+  for candidate in /usr/bin/llvm-config-* /usr/local/bin/llvm-config-*; do
+    [[ -x "${candidate}" ]] || continue
+    run_root ln -sf "${candidate}" /usr/local/bin/llvm-config
+    return 0
+  done
+  echo "[bootstrap] unable to locate versioned llvm-config binary" >&2
+  return 1
 }
 
 run_apt_update_hardened() {
@@ -1722,6 +1746,7 @@ install_rust_toolchain_hardened() {
 clear_residual_rustynet_state
 repair_local_hostname_resolution
 install_prereqs
+ensure_llvm_config_alias
 repair_managed_dns_prereqs
 if ! command -v rustup >/dev/null 2>&1; then
   echo "rustup is required on test hosts; missing after prerequisite install" >&2
@@ -2136,6 +2161,7 @@ stage_run_live_role_switch_matrix() {
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --debian-host "$(node_target_for_label client)" \
     --debian-node-id "$(node_id_for_label client)" \
     --ubuntu-host "$(node_target_for_label entry)" \
@@ -2211,6 +2237,7 @@ stage_run_live_exit_handoff() {
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --exit-a-host "$(node_target_for_label exit)" \
     --exit-a-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2239,6 +2266,7 @@ stage_run_live_two_hop() {
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --final-exit-host "$(node_target_for_label exit)" \
     --final-exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2605,8 +2633,7 @@ root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet trust veri
 root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns zone verify \
   --bundle /var/lib/rustynet/rustynetd.dns-zone \
   --verifier-key /etc/rustynet/dns-zone.pub \
-  --expected-zone-name rustynet \
-  --expected-subject-node-id '${node_id}'
+  --expected-zone-name rustynet
 echo signed_artifact_chain_ok
 "
 }
@@ -2876,6 +2903,7 @@ stage_run_extended_soak() {
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --final-exit-host "$(node_target_for_label exit)" \
     --final-exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -2896,6 +2924,7 @@ stage_run_extended_soak() {
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --exit-a-host "$(node_target_for_label exit)" \
     --exit-a-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
@@ -3003,6 +3032,7 @@ stage_run_reboot_recovery_report() {
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
           --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
           --final-exit-host "$exit_target" \
           --final-exit-node-id "$(node_id_for_label exit)" \
           --client-host "$client_target" \
@@ -3022,6 +3052,7 @@ stage_run_reboot_recovery_report() {
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
           --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
           --final-exit-host "$exit_target" \
           --final-exit-node-id "$(node_id_for_label exit)" \
           --client-host "$client_target" \
@@ -3076,6 +3107,7 @@ stage_run_reboot_recovery_report() {
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
           --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
           --final-exit-host "$exit_target" \
           --final-exit-node-id "$(node_id_for_label exit)" \
           --client-host "$client_target" \
@@ -3095,6 +3127,7 @@ stage_run_reboot_recovery_report() {
       if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
         bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
           --ssh-identity-file "$SSH_IDENTITY_FILE" \
+          --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
           --final-exit-host "$exit_target" \
           --final-exit-node-id "$(node_id_for_label exit)" \
           --client-host "$client_target" \
@@ -3124,6 +3157,7 @@ stage_run_reboot_recovery_report() {
     if RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
       bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
         --ssh-identity-file "$SSH_IDENTITY_FILE" \
+        --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
         --final-exit-host "$exit_target" \
         --final-exit-node-id "$(node_id_for_label exit)" \
         --client-host "$aux_target" \

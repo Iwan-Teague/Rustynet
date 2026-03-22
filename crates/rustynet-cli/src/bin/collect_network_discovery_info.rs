@@ -4,8 +4,10 @@ use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Output};
 
 const RUSTYNET_STATE_DIR: &str = "/var/lib/rustynet";
 const RUSTYNET_CONFIG_DIR: &str = "/etc/rustynet";
@@ -185,10 +187,10 @@ fn run() -> Result<(), i32> {
     let wg_peers_json = collect_wg_peers(&wg_iface, wg_available)?;
 
     log(config.quiet, "Inventorying Rustynet signed artifacts...");
-    let assignment_pub_key_b64 = read_trimmed_file(ASSIGNMENT_PUB_KEY).unwrap_or_default();
-    let traversal_pub_key_b64 = read_trimmed_file(TRAVERSAL_PUB_KEY).unwrap_or_default();
-    let dns_zone_pub_key_b64 = read_trimmed_file(DNS_ZONE_PUB_KEY).unwrap_or_default();
-    let trust_pub_key_b64 = read_trimmed_file(TRUST_PUB_KEY).unwrap_or_default();
+    let assignment_pub_key_b64 = read_verifier_key_b64(ASSIGNMENT_PUB_KEY).unwrap_or_default();
+    let traversal_pub_key_b64 = read_verifier_key_b64(TRAVERSAL_PUB_KEY).unwrap_or_default();
+    let dns_zone_pub_key_b64 = read_verifier_key_b64(DNS_ZONE_PUB_KEY).unwrap_or_default();
+    let trust_pub_key_b64 = read_verifier_key_b64(TRUST_PUB_KEY).unwrap_or_default();
 
     log(config.quiet, "Checking rustynetd service status...");
     let daemon_status = daemon_status(RUSTYNET_RUN_DIR)?;
@@ -475,7 +477,54 @@ fn resolve_node_id(config: &Config, host_name: &str) -> String {
             return value;
         }
     }
+    if let Some(value) = resolve_node_id_from_runtime_status() {
+        if !value.is_empty() {
+            return value;
+        }
+    }
     host_name.to_string()
+}
+
+fn resolve_node_id_from_runtime_status() -> Option<String> {
+    let socket = format!("{RUSTYNET_RUN_DIR}/rustynetd.sock");
+    let direct = Command::new("rustynet")
+        .env("RUSTYNET_DAEMON_SOCKET", socket.as_str())
+        .arg("status")
+        .output()
+        .ok()
+        .and_then(command_output_stdout_if_success);
+    if let Some(status) = direct {
+        if let Some(node_id) = parse_status_field(status.as_str(), "node_id") {
+            return Some(node_id);
+        }
+    }
+
+    Command::new("sudo")
+        .args(["-n", "env"])
+        .arg(format!("RUSTYNET_DAEMON_SOCKET={socket}"))
+        .args(["rustynet", "status"])
+        .output()
+        .ok()
+        .and_then(command_output_stdout_if_success)
+        .and_then(|status| parse_status_field(status.as_str(), "node_id"))
+}
+
+fn command_output_stdout_if_success(output: Output) -> Option<String> {
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn parse_status_field(status_output: &str, field_name: &str) -> Option<String> {
+    let prefix = format!("{field_name}=");
+    status_output
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn detect_wg_interface(wg_available: bool) -> Option<String> {
@@ -753,6 +802,8 @@ fn build_peer_stanza_template(
 }
 
 fn daemon_status(run_dir: &str) -> Result<Value, i32> {
+    let socket_path = Path::new(run_dir).join("rustynetd.sock");
+    let socket_present = path_is_socket(&socket_path);
     if let Ok(active) = run_capture("systemctl", &["is-active", "--quiet", "rustynetd"]) {
         let _ = active;
         let pid = run_capture(
@@ -766,12 +817,11 @@ fn daemon_status(run_dir: &str) -> Result<Value, i32> {
         return Ok(json!({
             "active": "active",
             "pid": pid.trim(),
-            "socket_path": format!("{run_dir}/rustynetd.sock"),
-            "socket_present": Path::new(run_dir).join("rustynetd.sock").is_file(),
+            "socket_path": socket_path.display().to_string(),
+            "socket_present": socket_present,
         }));
     }
-    let socket_path = Path::new(run_dir).join("rustynetd.sock");
-    if socket_path.is_file() {
+    if socket_present {
         return Ok(json!({
             "active": "socket_present",
             "pid": "",
@@ -823,6 +873,101 @@ fn read_trimmed_file(path: impl AsRef<Path>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn read_verifier_key_b64(path: impl AsRef<Path>) -> Option<String> {
+    let value = read_trimmed_file(path)?;
+    normalize_verifier_key_to_b64(value.as_str())
+}
+
+fn normalize_verifier_key_to_b64(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(bytes) = decode_hex_32(trimmed) {
+        return Some(encode_base64(bytes.as_slice()));
+    }
+    Some(trimmed.to_string())
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let mut index = 0usize;
+    while index < 32 {
+        let hi = decode_hex_nibble(value.as_bytes()[index * 2])?;
+        let lo = decode_hex_nibble(value.as_bytes()[index * 2 + 1])?;
+        out[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Some(out)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let b0 = bytes[index];
+        let b1 = if index + 1 < bytes.len() {
+            bytes[index + 1]
+        } else {
+            0
+        };
+        let b2 = if index + 2 < bytes.len() {
+            bytes[index + 2]
+        } else {
+            0
+        };
+
+        let s0 = b0 >> 2;
+        let s1 = ((b0 & 0x03) << 4) | (b1 >> 4);
+        let s2 = ((b1 & 0x0f) << 2) | (b2 >> 6);
+        let s3 = b2 & 0x3f;
+
+        out.push(TABLE[s0 as usize] as char);
+        out.push(TABLE[s1 as usize] as char);
+        if index + 1 < bytes.len() {
+            out.push(TABLE[s2 as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if index + 2 < bytes.len() {
+            out.push(TABLE[s3 as usize] as char);
+        } else {
+            out.push('=');
+        }
+        index += 3;
+    }
+    out
+}
+
+fn path_is_socket(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                metadata.file_type().is_socket()
+            }
+            #[cfg(not(unix))]
+            {
+                metadata.file_type().is_file()
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 fn os_to_string(value: OsString, flag: &str) -> Result<String, String> {
     value
         .into_string()
@@ -842,6 +987,43 @@ fn is_ipv4(value: &str) -> bool {
         return false;
     }
     parts.into_iter().all(|part| part.parse::<u8>().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_hex_32, encode_base64, normalize_verifier_key_to_b64, parse_status_field,
+    };
+
+    #[test]
+    fn normalize_verifier_key_converts_hex_to_base64() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let converted = normalize_verifier_key_to_b64(hex).expect("hex verifier key should parse");
+        assert_eq!(converted, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+    }
+
+    #[test]
+    fn normalize_verifier_key_preserves_base64() {
+        let b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let converted = normalize_verifier_key_to_b64(b64).expect("base64 verifier key should parse");
+        assert_eq!(converted, b64);
+    }
+
+    #[test]
+    fn encode_base64_matches_expected_output() {
+        let decoded = decode_hex_32(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("hex should decode");
+        assert_eq!(encode_base64(decoded.as_slice()), "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+    }
+
+    #[test]
+    fn parse_status_field_reads_node_id() {
+        let status = "node_id=client-1 node_role=client state=ExitActive";
+        let node_id = parse_status_field(status, "node_id").expect("node_id should parse");
+        assert_eq!(node_id, "client-1");
+    }
 }
 
 fn is_172_private(ip: &str) -> bool {
