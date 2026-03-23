@@ -294,26 +294,31 @@ impl StateFetcher {
         if let Ok(url) = std::env::var("RUSTYNET_TRUST_URL") {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
-                    // write to temp file and run verification
+                    // write to temp file and run full verification via load_* helpers so we obtain watermark
                     let tmp = std::env::temp_dir().join("rustynetd.trust.tmp");
                     std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
-                    // Verify using existing function; if verification fails, return Err.
-                    match verify_signed_trust_state_artifact(&tmp, &self.trust_verifier_key_path, &self.trust_watermark_path, DEFAULT_TRUST_MAX_AGE_SECS, DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS) {
-                        Ok(report) => {
-                            // Persist artifact atomically
+
+                    // Load previous watermark (may be missing)
+                    let previous_watermark = match load_trust_watermark(&self.trust_watermark_path) {
+                        Ok(val) => val,
+                        Err(err) => return Err(format!("read previous watermark failed: {err}")),
+                    };
+
+                    // Use the existing loading/verification routine which enforces signature, age, clock skew, and replay checks.
+                    match load_trust_evidence(&tmp, &self.trust_verifier_key_path, TrustPolicy { max_signed_data_age_secs: DEFAULT_TRUST_MAX_AGE_SECS, max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS }, previous_watermark) {
+                        Ok(envelope) => {
+                            // Atomically persist artifact then persist watermark only after full validation success
                             std::fs::rename(&tmp, &self.trust_evidence_path)
                                 .map_err(|e| format!("persist trust evidence failed: {e}"))?;
-                            // The verification functions persist watermark themselves when called via load_* helpers; to be safe, do nothing here.
-                            eprintln!("statefetch: applied trust bundle: nonce={}", report.nonce);
+                            persist_trust_watermark(&self.trust_watermark_path, envelope.watermark)
+                                .map_err(|e| format!("persist trust watermark failed: {e}"))?;
+                            eprintln!("statefetch: applied trust bundle: nonce={}", envelope.watermark.nonce);
                             Ok(FetchDecision::Applied)
                         }
                         Err(err) => Err(format!("trust fetch verification failed: {err}")),
                     }
                 }
-                Err(_network_err) => {
-                    // preserve existing disk-based path: treat as skipped
-                    Ok(FetchDecision::Skipped)
-                }
+                Err(_network_err) => Ok(FetchDecision::Skipped),
             }
         } else {
             Ok(FetchDecision::Skipped)
@@ -4892,9 +4897,27 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
                     CommandEnvelope::Local(parsed) => {
                         let authorized = if parsed.is_mutating() {
-                            match peer_uid(&stream) {
-                                Some(peer_uid) => peer_uid == 0 || peer_uid == socket_owner_uid,
-                                None => false,
+                            match (peer_uid(&stream), {
+                                // attempt to obtain peer gid if available
+                                #[cfg(any(target_os = "linux", target_os = "android"))]
+                                {
+                                    use nix::sys::socket::sockopt::PeerCredentials;
+                                    getsockopt(&stream, PeerCredentials).ok().map(|c| c.gid())
+                                }
+                                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
+                                {
+                                    use nix::sys::socket::sockopt::LocalPeerCred;
+                                    getsockopt(&stream, LocalPeerCred).ok().map(|c| c.gid())
+                                }
+                                #[allow(unreachable_code)]
+                                None => None,
+                            }) {
+                                (Some(peer_uid), Some(peer_gid)) => {
+                                    // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)
+                                    peer_uid == 0 || peer_uid == socket_owner_uid || peer_gid == socket_owner_gid(&config.socket_path).unwrap_or(0)
+                                }
+                                (Some(peer_uid), None) => peer_uid == 0 || peer_uid == socket_owner_uid,
+                                _ => false,
                             }
                         } else {
                             true

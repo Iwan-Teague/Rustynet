@@ -17,7 +17,10 @@ use rand::RngCore;
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey([u8; 32]);
@@ -28,12 +31,15 @@ impl PublicKey {
     }
 }
 
-#[derive(PartialEq, Eq)]
 pub struct SecretKey([u8; 32]);
 
 impl SecretKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub fn ct_eq(&self, other: &SecretKey) -> subtle::Choice {
+        self.as_bytes().ct_eq(other.as_bytes())
     }
 }
 
@@ -811,7 +817,7 @@ pub fn write_encrypted_key_file(
 fn write_atomic_encrypted_key_file(
     path: &Path,
     bytes: &[u8],
-    mode: u32,
+    _mode: u32,
 ) -> Result<(), CryptoError> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -824,7 +830,7 @@ fn write_atomic_encrypted_key_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
+        options.mode(_mode);
     }
 
     let mut file = options.open(&temp).map_err(|_| CryptoError::Io)?;
@@ -1318,5 +1324,21 @@ mod tests {
             verification.err(),
             Some(CryptoError::AttestationVerificationFailed)
         );
+    }
+
+    #[test]
+    fn secret_key_ct_eq_same_local() {
+        let a = super::SecretKey([1u8; 32]);
+        let b = super::SecretKey([1u8; 32]);
+        assert_eq!(a.ct_eq(&b).unwrap_u8(), 1);
+    }
+
+    #[test]
+    fn secret_key_ct_eq_different_local() {
+        let a = super::SecretKey([1u8; 32]);
+        let mut b = [1u8; 32];
+        b[0] = 2;
+        let b = super::SecretKey(b);
+        assert_eq!(a.ct_eq(&b).unwrap_u8(), 0);
     }
 }

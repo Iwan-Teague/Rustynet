@@ -95,6 +95,16 @@ pub struct TokenClaims {
     pub nonce: String,
 }
 
+impl TokenClaims {
+    pub fn ct_eq(&self, other: &TokenClaims) -> bool {
+        use subtle::ConstantTimeEq;
+        self.subject.as_bytes().ct_eq(other.subject.as_bytes()).unwrap_u8() == 1
+            && self.nonce.as_bytes().ct_eq(other.nonce.as_bytes()).unwrap_u8() == 1
+            && self.issued_at_unix == other.issued_at_unix
+            && self.expires_at_unix == other.expires_at_unix
+    }
+}
+
 impl fmt::Debug for TokenClaims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenClaims")
@@ -110,6 +120,19 @@ impl fmt::Debug for TokenClaims {
 pub struct SignedTokenClaims {
     pub claims: TokenClaims,
     pub signature_hex: String,
+}
+
+impl SignedTokenClaims {
+    pub fn ct_eq(&self, other: &SignedTokenClaims) -> bool {
+        use subtle::ConstantTimeEq;
+        self.claims.ct_eq(&other.claims)
+            && self
+                .signature_hex
+                .as_bytes()
+                .ct_eq(other.signature_hex.as_bytes())
+                .unwrap_u8()
+                == 1
+    }
 }
 
 impl fmt::Debug for SignedTokenClaims {
@@ -1165,7 +1188,7 @@ fn ensure_secure_parent_directory(path: &Path) -> Result<(), TrustStateError> {
     Ok(())
 }
 
-fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustStateError> {
+fn atomic_write_secure(path: &Path, body: &[u8], _mode: u32) -> Result<(), TrustStateError> {
     ensure_secure_parent_directory(path)?;
     if path.exists() {
         let metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::PersistFailure)?;
@@ -1214,7 +1237,7 @@ fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustS
 fn validate_secure_file(
     path: &Path,
     label: &str,
-    disallowed_mode_mask: u32,
+    _disallowed_mode_mask: u32,
 ) -> Result<(), TrustStateError> {
     let link_metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::Missing)?;
     if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
@@ -2874,7 +2897,7 @@ mod tests {
         EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
         ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
         SignedDnsZoneBundleRequest, ThrowawayCredentialState, ThrowawayCredentialStore,
-        TokenClaims, TransportPolicyError, TraversalCoordinationRecord, TrustState,
+        TokenClaims, SignedTokenClaims, TransportPolicyError, TraversalCoordinationRecord, TrustState,
         derive_signing_seed, hex_bytes,
         load_trust_state, persist_trust_state,
     };
@@ -2959,6 +2982,50 @@ mod tests {
         assert!(guard.validate_token_and_nonce(&claims, 110).is_ok());
         let replay = guard.validate_token_and_nonce(&claims, 111);
         assert_eq!(replay.err(), Some(AuthError::ReplayDetected));
+    }
+
+    #[test]
+    fn token_claims_ct_eq() {
+        let a = TokenClaims {
+            subject: "alice".to_string(),
+            issued_at_unix: 100,
+            expires_at_unix: 120,
+            nonce: "nonce-1".to_string(),
+        };
+        let b = TokenClaims {
+            subject: "alice".to_string(),
+            issued_at_unix: 100,
+            expires_at_unix: 120,
+            nonce: "nonce-1".to_string(),
+        };
+        assert!(a.ct_eq(&b));
+
+        let mut c = b.clone();
+        c.nonce = "nonce-2".to_string();
+        assert!(!a.ct_eq(&c));
+    }
+
+    #[test]
+    fn signed_token_claims_ct_eq() {
+        let claims = TokenClaims {
+            subject: "alice".to_string(),
+            issued_at_unix: 100,
+            expires_at_unix: 120,
+            nonce: "nonce-1".to_string(),
+        };
+        let a = SignedTokenClaims {
+            claims: claims.clone(),
+            signature_hex: "deadbeef".to_string(),
+        };
+        let b = SignedTokenClaims {
+            claims,
+            signature_hex: "deadbeef".to_string(),
+        };
+        assert!(a.ct_eq(&b));
+
+        let mut c = b.clone();
+        c.signature_hex = "cafebabe".to_string();
+        assert!(!a.ct_eq(&c));
     }
 
     #[test]
