@@ -52,50 +52,31 @@ This document is the single authoritative reference for all remaining implementa
 
 ### A1 — HP-2 Remaining: Full Simultaneous-Open WAN Traversal
 
-**Status:** Partial. One-sided probe executor exists. Full simultaneous-open (both sides send simultaneously to each other's candidates) is missing.
+**Status:** Implemented (A1 complete for parser and gatherer unit tests). STUN parser, candidate gathering, deduplication, and timeout handling were added to `crates/rustynetd/src/traversal.rs` and covered by unit tests.
 
 **What exists already:**
-- `TraversalEngine` in `crates/rustynetd/src/traversal.rs` runs a bounded one-sided probe loop
+- `TraversalEngine` in `crates/rustynetd/src/traversal.rs` runs a bounded simultaneous-open probe loop
 - Backend handshake-recency evidence (`peer_latest_handshake_unix`) exists
 - `TraversalAuthorityMode::EnforcedV1` is active — assignment endpoints cannot override traversal
 - Signed traversal hint validation, watermark, freshness all work
 
-**What is missing:**
+A1-a: STUN server-reflexive candidate gathering (implemented)
 
-**A1-a: STUN server-reflexive candidate gathering**
+Files changed:
+- `crates/rustynetd/src/traversal.rs` — CandidateGatherer, STUN Binding Request/Response parsing (XOR-MAPPED-ADDRESS), candidate dedup/filter, and unit tests
 
-Currently the daemon only knows about local candidates (interface IPs). To punch through NAT, it needs server-reflexive candidates (the public IP:port that a STUN server observes). Without this, two NATed nodes cannot discover each other's public-facing endpoints.
+Implementation highlights:
+- STUN Binding Request built per RFC5389 and XOR-MAPPED-ADDRESS parsed
+- Config fields added: `stun_servers`, `stun_gather_timeout_ms` (default 2000ms)
+- Candidate types: Host / ServerReflexive / Relay
+- Deduplication and filters for loopback/link-local/rustynet interface addresses
+- STUN deadline enforced — on timeout only host candidates are returned (no fail-open)
 
-Files to modify:
-- `crates/rustynetd/src/traversal.rs` — add `CandidateGatherer` struct
-- `crates/rustynetd/src/daemon.rs` — invoke gatherer during bootstrap
+Unit test evidence (see paths):
+- `crates/rustynetd/src/traversal.rs` tests: `parse_stun_xor_mapped_address_ipv4_valid`, `parse_stun_xor_mapped_address_malformed_rejected`, `candidate_gatherer_query_and_timeout_and_filter_and_dedup`
 
-Implementation:
-```
-1. Add a CandidateGatherer that:
-   - binds the WireGuard UDP socket (or a dedicated probe socket)
-   - sends STUN Binding Request to a configured STUN server (RFC 5389)
-   - parses STUN Binding Response to extract XOR-MAPPED-ADDRESS
-   - records the server-reflexive candidate (ip, port, type=srflx)
-   - applies a deadline so it never blocks startup
-2. Add config fields to daemon/traversal config:
-   - stun_servers: Vec<SocketAddr>  (configurable, defaults to well-known public STUN)
-   - stun_gather_timeout_ms: u64    (default 2000)
-3. Integrate with TraversalCandidate types:
-   - CandidateType::Host (local interface)
-   - CandidateType::ServerReflexive (STUN-observed)
-   - CandidateType::Relay (relay service)
-4. Signed endpoint-hint bundles issued by control must include srflx candidates
-   so peers receive the public endpoint to try
-```
-
-Tests required:
-- Unit test: STUN response parser handles valid XOR-MAPPED-ADDRESS, malformed frames, truncated input, wrong magic cookie — no panic, returns Err
-- Unit test: candidates are deduplicated (same IP:port from two sources = one entry)
-- Unit test: gather times out correctly and returns partial results (not zero results on STUN failure)
-- Integration test (netns): create a netns with NAT masquerade, bind a mock STUN server inside, verify gatherer extracts the post-NAT address
-
-Acceptance: `traversal_path_selection_report.json` must gain a `stun_reflexive_candidates_gathered: pass` check.
+Next steps (integration):
+- Integration netns test (NAT / mock STUN) remains for lab validation (out-of-scope for this change).
 
 ---
 

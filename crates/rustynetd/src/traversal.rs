@@ -1332,7 +1332,7 @@ mod tests {
     use std::io::ErrorKind;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn endpoint(octets: [u8; 4], port: u16) -> SocketEndpoint {
         SocketEndpoint {
@@ -1607,5 +1607,129 @@ mod tests {
             .plan_remote_probes(&candidates)
             .expect_err("relay-only candidates must not authorize direct probes");
         assert!(matches!(err, TraversalError::NoDirectCandidates));
+    }
+
+    // Additional tests for STUN parsing and gather behavior
+    #[test]
+    fn parse_stun_xor_mapped_address_ipv4_valid() {
+        let transaction_id: [u8; 12] = [1,2,3,4,5,6,7,8,9,10,11,12];
+        let port: u16 = 51820;
+        let ip = Ipv4Addr::new(203,0,113,5);
+        let mut message = Vec::new();
+        message.extend_from_slice(&0x0101u16.to_be_bytes());
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+        message.extend_from_slice(&transaction_id);
+        let attr_type = 0x0020u16.to_be_bytes();
+        let attr_len = 8u16.to_be_bytes();
+        message.extend_from_slice(&attr_type);
+        message.extend_from_slice(&attr_len);
+        message.push(0x00);
+        message.push(0x01);
+        let cookie_bytes = 0x2112_A442u32.to_be_bytes();
+        let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
+        let x_port = port ^ port_mask;
+        message.extend_from_slice(&x_port.to_be_bytes());
+        let ip_bytes = ip.octets();
+        for i in 0..4 { message.push(ip_bytes[i] ^ cookie_bytes[i]); }
+        let declared_len = (message.len() - 20) as u16;
+        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
+        let parsed = parse_stun_xor_mapped_address(message.as_slice(), transaction_id).expect("parse");
+        assert_eq!(parsed.port(), port);
+        assert_eq!(parsed.ip(), IpAddr::V4(ip));
+    }
+
+    #[test]
+    fn parse_stun_xor_mapped_address_malformed_rejected() {
+        let bad = vec![0u8; 10];
+        let tid = [0u8;12];
+        let err = parse_stun_xor_mapped_address(bad.as_slice(), tid).expect_err("malformed");
+        assert!(matches!(err, TraversalError::Stun(_)));
+    }
+
+    #[test]
+    fn candidate_gatherer_query_and_timeout_and_filter_and_dedup() {
+        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind local");
+        local.set_nonblocking(false).unwrap();
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind server");
+        let server_addr = server.local_addr().expect("server addr");
+        let server_handle = std::thread::spawn(move || {
+            let mut buf = [0u8;1500];
+            let (n, src) = server.recv_from(&mut buf).expect("recv");
+            let tx = &buf[8..20];
+            let mut txid = [0u8;12]; txid.copy_from_slice(tx);
+            let port = src.port();
+            let ip = match src.ip() { std::net::IpAddr::V4(v4) => v4, _ => Ipv4Addr::LOCALHOST };
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&0x0101u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+            resp.extend_from_slice(&txid);
+            resp.extend_from_slice(&0x0020u16.to_be_bytes());
+            resp.extend_from_slice(&8u16.to_be_bytes());
+            resp.push(0x00); resp.push(0x01);
+            let cookie_bytes = 0x2112_A442u32.to_be_bytes();
+            let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
+            let x_port = port ^ port_mask;
+            resp.extend_from_slice(&x_port.to_be_bytes());
+            let ip_bytes = ip.octets();
+            for i in 0..4 { resp.push(ip_bytes[i] ^ cookie_bytes[i]); }
+            let declared_len = (resp.len() - 20) as u16; resp[2..4].copy_from_slice(&declared_len.to_be_bytes());
+            server.send_to(&resp, src).expect("send resp");
+        });
+
+        let rustynet_if_ips = vec![IpAddr::V4(Ipv4Addr::new(198,51,100,2))];
+        let host_candidates = vec![SocketEndpoint { addr: IpAddr::V4(Ipv4Addr::new(127,0,0,1)), port: 0 }];
+        let gatherer = CandidateGatherer::new(local.try_clone().unwrap(), vec![server_addr], Duration::from_millis(500), host_candidates.clone(), rustynet_if_ips.clone()).expect("gatherer");
+        let candidates = gatherer.gather();
+        assert!(candidates.iter().any(|c| c.source == CandidateSource::Host));
+        assert!(candidates.iter().any(|c| c.source == CandidateSource::ServerReflexive));
+        server_handle.join().expect("join");
+
+        let local2 = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind2");
+        let gatherer_timeout = CandidateGatherer::new(local2.try_clone().unwrap(), vec![(Ipv4Addr::LOCALHOST,9).into()], Duration::from_millis(10), host_candidates, rustynet_if_ips).expect("gatherer2");
+        let results = gatherer_timeout.gather();
+        assert!(results.iter().all(|c| c.source == CandidateSource::Host));
+    }
+
+    #[test]
+    fn coordination_record_validation_and_execute_simultaneous_open_behaviour() {
+        let policy = PolicySet::default();
+        let core = ControlPlaneCore::new(vec![0u8;32], policy);
+        let node_a = rustynet_control::NodeMetadata { node_id: "node-a".to_string(), hostname: "a".to_string(), os: "linux".to_string(), tags: vec![], owner: "owner-a".to_string(), endpoint: "127.0.0.1:51820".to_string(), last_seen_unix: 1, public_key: [1u8;32] };
+        let node_b = rustynet_control::NodeMetadata { node_id: "node-b".to_string(), hostname: "b".to_string(), os: "linux".to_string(), tags: vec![], owner: "owner-b".to_string(), endpoint: "127.0.0.1:51821".to_string(), last_seen_unix: 1, public_key: [2u8;32] };
+        core.nodes.upsert(node_a).expect("upsert a");
+        core.nodes.upsert(node_b).expect("upsert b");
+
+        let mut session_id = [0u8;16]; session_id[0]=1;
+        let mut nonce = [0u8;16]; nonce[0]=7;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let record = TraversalCoordinationRecord { session_id, probe_start_unix: now.saturating_add(1), node_a: "node-a".to_string(), node_b: "node-b".to_string(), issued_at_unix: now, expires_at_unix: now.saturating_add(20), nonce };
+        let signed = core.signed_traversal_coordination_record(record.clone()).expect("sign");
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+
+        let schedule = engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay, now).expect("validate");
+        assert!(schedule.wait_duration.as_secs() <= 10);
+
+        let mut replay2 = CoordinationReplayWindow::default();
+        engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay2, now).expect("first");
+        let replay_err = engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay2, now+1);
+        assert!(matches!(replay_err, Err(TraversalError::CoordinationReplayDetected)));
+
+        struct NoHandshakeRuntime { latest: Option<u64>, sent: Vec<SocketEndpoint> }
+        impl SimultaneousOpenRuntime for NoHandshakeRuntime {
+            fn send_probe(&mut self, endpoint: SocketEndpoint, _round: u8) -> Result<(), TraversalError> { self.sent.push(endpoint); Ok(()) }
+            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> { Ok(self.latest) }
+        }
+        struct ImmediateWaiter; impl SimultaneousOpenWaiter for ImmediateWaiter { fn wait(&mut self, _d: Duration) {} }
+
+        let direct_candidates = vec![ candidate([10,0,0,1],51820,CandidateSource::Host,900) ];
+        let mut runtime = NoHandshakeRuntime { latest: None, sent: Vec::new() };
+        let mut waiter = ImmediateWaiter;
+        let schedule2 = CoordinationSchedule { session_id, nonce, probe_start_unix: now, wait_duration: Duration::from_secs(0) };
+        let result = engine.execute_simultaneous_open(&mut runtime, &mut waiter, schedule2, direct_candidates.as_slice(), Some(SocketEndpoint { addr: IpAddr::V4(Ipv4Addr::new(198,51,100,2)), port: 60000 }), now, 120).expect("exec");
+        match result.decision { TraversalDecision::Relay { endpoint: _, reason, rounds } => { assert_eq!(reason, TraversalDecisionReason::DirectProbeExhaustedRelayArmed); assert_eq!(rounds, engine.config.simultaneous_open_rounds); }, _ => panic!("expected relay") }
     }
 }

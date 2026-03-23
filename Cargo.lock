@@ -564,6 +564,7 @@ dependencies = [
  "rustynet-dns-zone",
  "rustynet-policy",
  "sha2",
+ "subtle",
  "zeroize",
 ]
 
