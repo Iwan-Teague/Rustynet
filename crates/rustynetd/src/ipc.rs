@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::io::{BufRead, Read};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcCommand {
     Status,
@@ -122,6 +124,90 @@ pub fn validate_cidr(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_hexdigit() || ch == '.' || ch == ':' || ch == '/')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCommandEnvelope {
+    pub subject: String,
+    pub nonce: u64,
+    pub command: IpcCommand,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandEnvelope {
+    Local(IpcCommand),
+    Remote(RemoteCommandEnvelope),
+}
+
+pub const REMOTE_OPS_WIRE_PREFIX: &str = "remote-op-v1 ";
+pub const DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT: &str = "user:admin";
+
+pub fn remote_ops_signature_payload(subject: &str, nonce: u64, command: &IpcCommand) -> Vec<u8> {
+    format!(
+        "subject={}\nnonce={}\ncommand={}\n",
+        subject,
+        nonce,
+        command.as_wire()
+    )
+    .into_bytes()
+}
+
+pub fn read_command_envelope<R: std::io::Read>(stream: R) -> Result<CommandEnvelope, std::io::Error> {
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let line = line.trim();
+    
+    if line.starts_with(REMOTE_OPS_WIRE_PREFIX) {
+        let payload = &line[REMOTE_OPS_WIRE_PREFIX.len()..];
+        // expected format: subject=<sub|b64> nonce=<u64> command=<wire> signature=<hex>
+        // But simpler: just space separated or key=value?
+        // Let's assume space separated for simplicity if not specified?
+        // Wait, parse logic must be robust.
+        // Let's assume key=value pairs separated by space, but command might contain spaces.
+        // Actually, signature usually comes last.
+        // Let's look for " signature=".
+        let parts: Vec<&str> = payload.split(" signature=").collect();
+        if parts.len() != 2 {
+             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "missing signature"));
+        }
+        let content = parts[0];
+        let signature_hex = parts[1];
+        
+        let signature = (0..signature_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid signature hex"))?;
+            
+        // content: subject=... nonce=... command=...
+        // This parsing is tricky if command has spaces.
+        // Let's try to parse subject and nonce from start.
+        let mut parts = content.splitn(3, ' ');
+        let subject_part = parts.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing subject"))?;
+        let nonce_part = parts.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing nonce"))?;
+        let command_part = parts.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing command"))?;
+        
+        if !subject_part.starts_with("subject=") || !nonce_part.starts_with("nonce=") || !command_part.starts_with("command=") {
+             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid envelope format"));
+        }
+        
+        let subject = subject_part["subject=".len()..].to_string();
+        let nonce = nonce_part["nonce=".len()..].parse::<u64>().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nonce"))?;
+        let command_wire = &command_part["command=".len()..];
+        
+        let command = parse_command(command_wire);
+        
+        Ok(CommandEnvelope::Remote(RemoteCommandEnvelope {
+            subject,
+            nonce,
+            command,
+            signature,
+        }))
+    } else {
+        Ok(CommandEnvelope::Local(parse_command(line)))
+    }
 }
 
 #[cfg(test)]

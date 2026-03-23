@@ -16,7 +16,10 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ipc::{parse_command, validate_cidr, IpcCommand, IpcResponse};
+use crate::ipc::{
+    parse_command, read_command_envelope, validate_cidr, CommandEnvelope, IpcCommand, IpcResponse,
+    RemoteCommandEnvelope,
+};
 #[cfg(target_os = "macos")]
 use crate::key_material::read_passphrase_file;
 use crate::key_material::{
@@ -3700,6 +3703,49 @@ impl DaemonRuntime {
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
         );
+    }
+
+    fn authorize_remote_command(
+        &self,
+        envelope: &RemoteCommandEnvelope,
+        now_unix: u64,
+    ) -> Result<IpcCommand, String> {
+        if envelope.subject != self.remote_ops_expected_subject {
+            return Err(format!("unexpected subject: {}", envelope.subject));
+        }
+
+        // Enforce strict freshness (nonce as timestamp)
+        // Window: 60 seconds
+        let age = now_unix.saturating_sub(envelope.nonce);
+        if age > 60 {
+            return Err(format!("nonce expired (age {age}s)"));
+        }
+        if envelope.nonce > now_unix + 60 {
+            return Err(format!("nonce in future ({nonce} > {now})", nonce = envelope.nonce, now = now_unix));
+        }
+
+        if let Some(verifier) = &self.remote_ops_verifying_key {
+            let payload = crate::ipc::remote_ops_signature_payload(
+                &envelope.subject,
+                envelope.nonce,
+                &envelope.command,
+            );
+            use ed25519_dalek::Verifier;
+            let signature = ed25519_dalek::Signature::from_bytes(
+                &envelope
+                    .signature
+                    .clone()
+                    .try_into()
+                    .map_err(|_| "invalid signature length".to_string())?,
+            );
+            verifier
+                .verify(&payload, &signature)
+                .map_err(|e| format!("signature verification failed: {e}"))?;
+
+            Ok(envelope.command.clone())
+        } else {
+            Err("remote ops not configured".to_string())
+        }
     }
 
     fn handle_command(&mut self, command: IpcCommand) -> IpcResponse {
