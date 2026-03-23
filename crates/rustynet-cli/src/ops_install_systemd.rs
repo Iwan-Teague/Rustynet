@@ -10,8 +10,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crate::env_file::{format_env_assignment, parse_env_value};
-use nix::unistd::{chown, Gid, Group, Uid, User};
-use rand::{rngs::OsRng, RngCore};
+use nix::unistd::{Gid, Group, Uid, User, chown};
+use rand::{RngCore, rngs::OsRng};
 use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
@@ -2363,10 +2363,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order, parse_dev_interface_token,
-        parse_dns_resolver_bind_addr_install, parse_install_bool, read_env_file_values,
-        render_assignment_refresh_env_contents, resolve_selected_exit_node_id,
-        systemctl_state_retryable,
+        assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order,
+        parse_dev_interface_token, parse_dns_resolver_bind_addr_install, parse_install_bool,
+        read_env_file_values, render_assignment_refresh_env_contents,
+        resolve_selected_exit_node_id, systemctl_state_retryable,
     };
 
     #[test]

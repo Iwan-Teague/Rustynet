@@ -18,9 +18,9 @@ use rand::RngCore;
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey([u8; 32]);

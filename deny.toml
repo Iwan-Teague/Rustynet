@@ -5,6 +5,15 @@ version = 2
 multiple-versions = "warn"
 wildcards = "allow"
 
+# Deprecated cryptographic algorithms
+[[bans.deny]]
+name = "sha1"
+wrappers = []
+
+[[bans.deny]]
+name = "md-5"
+wrappers = []
+
 [licenses]
 confidence-threshold = 0.8
 allow = [

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo:*)",
+      "Bash(pip3 show:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(git stash:*)"
+    ]
+  }
+}

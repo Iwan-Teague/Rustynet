@@ -198,13 +198,13 @@ const MAX_REMOTE_OPS_COMMAND_BYTES: usize = 1024;
 // existing disk-based behavior (do not fail). Any signature/freshness/watermark
 // verification failure is treated as a hard error and will be returned.
 
-#[derive(Debug)]
-enum FetchDecision {
+#[derive(Debug, PartialEq, Eq)]
+pub enum FetchDecision {
     Skipped,    // endpoint not configured or network unreachable -> fallback to disk
     Applied,    // fetched and verified; persisted
 }
 
-struct StateFetcher {
+pub struct StateFetcher {
     // The daemon paths are passed in for verifier keys and watermark locations.
     trust_verifier_key_path: PathBuf,
     trust_watermark_path: PathBuf,
@@ -218,10 +218,14 @@ struct StateFetcher {
     dns_zone_verifier_key_path: PathBuf,
     dns_zone_watermark_path: PathBuf,
     dns_zone_bundle_path: PathBuf,
+    dns_zone_max_age_secs: NonZeroU64,
+    dns_zone_name: String,
+    local_node_id: String,
+    auto_tunnel_enforce: bool,
 }
 
 impl StateFetcher {
-    fn new_from_daemon(cfg: &DaemonConfig) -> Self {
+    pub fn new_from_daemon(cfg: &DaemonConfig) -> Self {
         Self {
             trust_verifier_key_path: PathBuf::from(&cfg.trust_verifier_key_path),
             trust_watermark_path: PathBuf::from(&cfg.trust_watermark_path),
@@ -235,6 +239,10 @@ impl StateFetcher {
             dns_zone_verifier_key_path: PathBuf::from(&cfg.dns_zone_verifier_key_path),
             dns_zone_watermark_path: PathBuf::from(&cfg.dns_zone_watermark_path),
             dns_zone_bundle_path: PathBuf::from(&cfg.dns_zone_bundle_path),
+            dns_zone_max_age_secs: cfg.dns_zone_max_age_secs,
+            dns_zone_name: cfg.dns_zone_name.clone(),
+            local_node_id: cfg.node_id.clone(),
+            auto_tunnel_enforce: cfg.auto_tunnel_enforce,
         }
     }
 
@@ -290,7 +298,7 @@ impl StateFetcher {
         }
     }
 
-    fn fetch_trust(&self) -> Result<FetchDecision, String> {
+    pub fn fetch_trust(&self) -> Result<FetchDecision, String> {
         if let Ok(url) = std::env::var("RUSTYNET_TRUST_URL") {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
@@ -325,7 +333,7 @@ impl StateFetcher {
         }
     }
 
-    fn fetch_traversal(&self) -> Result<FetchDecision, String> {
+    pub fn fetch_traversal(&self) -> Result<FetchDecision, String> {
         if let Ok(url) = std::env::var("RUSTYNET_TRAVERSAL_URL") {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
@@ -356,7 +364,7 @@ impl StateFetcher {
         }
     }
 
-    fn fetch_assignment(&self) -> Result<FetchDecision, String> {
+    pub fn fetch_assignment(&self) -> Result<FetchDecision, String> {
         if let Ok(url) = std::env::var("RUSTYNET_ASSIGNMENT_URL") {
             // require assignment paths configured
             let bundle_path = match &self.assignment_bundle_path {
@@ -375,11 +383,19 @@ impl StateFetcher {
                 Ok(body) => {
                     let tmp = std::env::temp_dir().join("rustynetd.assignment.tmp");
                     std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
-                    match verify_signed_assignment_state_artifact(&tmp, verifier_path, watermark_path, self.assignment_bundle_path.as_deref().and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)).unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS), DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS, Some("") ) {
-                        Ok(report) => {
+
+                    let previous_watermark = match load_auto_tunnel_watermark(watermark_path) {
+                        Ok(val) => val,
+                        Err(err) => return Err(format!("read previous assignment watermark failed: {err}")),
+                    };
+
+                    match load_auto_tunnel_bundle(&tmp, verifier_path, self.assignment_bundle_path.as_deref().and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)).unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS), TrustPolicy { max_signed_data_age_secs: self.assignment_bundle_path.as_deref().and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)).unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS), max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS }, previous_watermark) {
+                        Ok(envelope) => {
                             std::fs::rename(&tmp, bundle_path)
                                 .map_err(|e| format!("persist assignment bundle failed: {e}"))?;
-                            eprintln!("statefetch: applied assignment bundle: nonce={}", report.nonce);
+                            persist_auto_tunnel_watermark(watermark_path, envelope.watermark)
+                                .map_err(|e| format!("persist assignment watermark failed: {e}"))?;
+                            eprintln!("statefetch: applied assignment bundle: nonce={}", envelope.watermark.nonce);
                             Ok(FetchDecision::Applied)
                         }
                         Err(err) => Err(format!("assignment fetch verification failed: {err}")),
@@ -392,17 +408,38 @@ impl StateFetcher {
         }
     }
 
-    fn fetch_dns_zone(&self) -> Result<FetchDecision, String> {
+    pub fn fetch_dns_zone(&self) -> Result<FetchDecision, String> {
         if let Ok(url) = std::env::var("RUSTYNET_DNS_ZONE_URL") {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
                     let tmp = std::env::temp_dir().join("rustynetd.dnszone.tmp");
                     std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
-                    match verify_dns_zone_bundle(&tmp, &parse_dns_zone_verifying_key(&std::fs::read_to_string(&self.dns_zone_verifier_key_path).map_err(|e| format!("read dns verifier key failed: {e}"))?).map_err(|e| format!("parse dns verifier key failed: {e}"))?) {
-                        Ok(report) => {
+
+                    // parse verifier key
+                    let verifier_key = std::fs::read_to_string(&self.dns_zone_verifier_key_path)
+                        .map_err(|e| format!("read dns verifier key failed: {e}"))?;
+                    let verifier = parse_dns_zone_verifying_key(&verifier_key)
+                        .map_err(|e| format!("parse dns verifier key failed: {e}"))?;
+
+                    // load previous watermark (may be missing)
+                    let previous = load_dns_zone_watermark(&self.dns_zone_watermark_path).map_err(|e| format!("read previous dns watermark failed: {e}"))?;
+
+                    match load_dns_zone_bundle(DnsZoneLoadContext {
+                        path: &tmp,
+                        verifier_key_path: &self.dns_zone_verifier_key_path,
+                        max_age_secs: self.dns_zone_max_age_secs.get(),
+                        trust_policy: TrustPolicy { max_signed_data_age_secs: self.dns_zone_max_age_secs.get(), max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS },
+                        previous_watermark: previous,
+                        expected_zone_name: &self.dns_zone_name,
+                        local_node_id: &self.local_node_id,
+                        auto_tunnel: &AutoTunnelBundle { node_id: String::new(), mesh_cidr: String::new(), assigned_cidr: String::new(), peers: Vec::new(), routes: Vec::new(), selected_exit_node: None },
+                    }) {
+                        Ok(envelope) => {
                             std::fs::rename(&tmp, &self.dns_zone_bundle_path)
                                 .map_err(|e| format!("persist dns zone bundle failed: {e}"))?;
-                            eprintln!("statefetch: applied dns zone bundle: updated_at={}", report.updated_at_unix);
+                            persist_dns_zone_watermark(&self.dns_zone_watermark_path, envelope.watermark)
+                                .map_err(|e| format!("persist dns zone watermark failed: {e}"))?;
+                            eprintln!("statefetch: applied dns zone bundle: updated_at={}", envelope.watermark.generated_at_unix);
                             Ok(FetchDecision::Applied)
                         }
                         Err(err) => Err(format!("dns zone fetch verification failed: {err}")),
@@ -1720,6 +1757,7 @@ struct DaemonRuntime {
     wg_key_passphrase_path: Option<PathBuf>,
     wg_public_key_path: Option<PathBuf>,
     privileged_helper_client: Option<PrivilegedCommandClient>,
+    state_fetcher: StateFetcher,
     #[cfg(target_os = "linux")]
     egress_interface: String,
     state_path: PathBuf,
@@ -1896,6 +1934,7 @@ impl DaemonRuntime {
             wg_key_passphrase_path: config.wg_key_passphrase_path.clone(),
             wg_public_key_path: config.wg_public_key_path.clone(),
             privileged_helper_client,
+            state_fetcher: StateFetcher::new_from_daemon(config),
             #[cfg(target_os = "linux")]
             egress_interface: config.egress_interface.clone(),
             state_path: config.state_path.clone(),
@@ -2466,6 +2505,29 @@ impl DaemonRuntime {
         force_reprobe: bool,
         reason: SignedStateRefreshReason,
     ) -> Result<(), String> {
+        match self.state_fetcher.fetch_trust() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: trust applied during refresh"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => return Err(format!("remote trust fetch failed: {e}")),
+        }
+        match self.state_fetcher.fetch_traversal() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: traversal applied during refresh"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => return Err(format!("remote traversal fetch failed: {e}")),
+        }
+        if self.auto_tunnel_enforce {
+             match self.state_fetcher.fetch_assignment() {
+                Ok(FetchDecision::Applied) => eprintln!("statefetch: assignment applied during refresh"),
+                Ok(FetchDecision::Skipped) => {}
+                Err(e) => return Err(format!("remote assignment fetch failed: {e}")),
+            }
+        }
+        match self.state_fetcher.fetch_dns_zone() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: dns zone applied during refresh"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => return Err(format!("remote dns zone fetch failed: {e}")),
+        }
+
         let _trust = self
             .load_verified_trust()
             .map_err(|err| format!("signed trust refresh failed: {err}"))?;
@@ -3302,6 +3364,45 @@ impl DaemonRuntime {
                 .controller
                 .force_fail_closed("blind_exit_invariants_failed");
             return;
+        }
+
+        match self.state_fetcher.fetch_trust() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: trust applied before bootstrap"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote trust fetch failed: {e}"));
+                let _ = self.controller.force_fail_closed("remote_trust_fetch_failed");
+                return;
+            }
+        }
+        match self.state_fetcher.fetch_traversal() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: traversal applied before bootstrap"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote traversal fetch failed: {e}"));
+                let _ = self.controller.force_fail_closed("remote_traversal_fetch_failed");
+                return;
+            }
+        }
+        if self.auto_tunnel_enforce {
+            match self.state_fetcher.fetch_assignment() {
+                Ok(FetchDecision::Applied) => eprintln!("statefetch: assignment applied before bootstrap"),
+                Ok(FetchDecision::Skipped) => {}
+                Err(e) => {
+                    self.restrict_permanent(format!("remote assignment fetch failed: {e}"));
+                    let _ = self.controller.force_fail_closed("remote_assignment_fetch_failed");
+                    return;
+                }
+            }
+        }
+        match self.state_fetcher.fetch_dns_zone() {
+            Ok(FetchDecision::Applied) => eprintln!("statefetch: dns zone applied before bootstrap"),
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote dns zone fetch failed: {e}"));
+                let _ = self.controller.force_fail_closed("remote_dns_zone_fetch_failed");
+                return;
+            }
         }
 
         let trust = match self.load_verified_trust() {
@@ -14497,6 +14598,111 @@ mod tests {
         let _ = std::fs::remove_file(assignment_path);
         let _ = std::fs::remove_file(assignment_verifier_path);
         let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_bootstrap_fetcher_verification_error_causes_permanent_restriction() {
+        let test_dir = secure_test_dir("rustynetd-bootstrap-fetch-error");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        std::env::set_var("RUSTYNET_TRUST_URL", &url);
+        
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = "HTTP/1.1 200 OK\r\n\r\nsignature=badhex\n";
+            let _ = stream.write_all(response.as_bytes());
+        });
+        
+        let mut runtime = DaemonRuntime::new(&config).unwrap();
+        runtime.bootstrap();
+        
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Permanent);
+        assert!(runtime.bootstrap_error.as_deref().unwrap().contains("remote trust fetch failed"));
+        
+        std::env::remove_var("RUSTYNET_TRUST_URL");
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_traversal_preexpiry_refresh_calls_fetcher_when_wired() {
+        let test_dir = secure_test_dir("rustynetd-traversal-preexpiry");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(&membership_snapshot_path, &membership_log_path, "daemon-local");
+        write_traversal_file(&traversal_path, &traversal_verifier_path, "daemon-local", "node-exit", 100, false);
+        
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+
+        let mut runtime = DaemonRuntime::new(&config).unwrap();
+        let _ = runtime.refresh_signed_state_with_reason(false, SignedStateRefreshReason::Startup);
+        assert!(runtime.traversal_hints.is_some());
+        
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+        std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url);
+        
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                tx.send(true).unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 500 Error\r\n\r\n"); 
+            }
+        });
+
+        let expires_at = runtime.traversal_hints.as_ref().unwrap().bundles.first().unwrap().bundle.expires_at_unix;
+        let future_now = expires_at - 1; 
+        
+        runtime.maybe_preexpiry_refresh_traversal(future_now);
+        
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok(), "fetcher should have been called");
+        
+        std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
         let _ = std::fs::remove_dir_all(test_dir);
     }
 }

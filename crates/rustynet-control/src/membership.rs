@@ -1658,7 +1658,9 @@ mod tests {
         let state = base_state();
         let replacement = MembershipApprover {
             approver_id: "guardian-3".to_string(),
-            approver_pubkey_hex: hex_encode(SigningKey::from_bytes(&[4; 32]).verifying_key().as_bytes()),
+            approver_pubkey_hex: hex_encode(
+                SigningKey::from_bytes(&[4; 32]).verifying_key().as_bytes(),
+            ),
             role: MembershipApproverRole::Guardian,
             status: MembershipApproverStatus::Active,
             created_at_unix: 150,

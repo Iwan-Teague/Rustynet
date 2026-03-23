@@ -73,7 +73,12 @@ impl AdminAuthorizer {
         if !session.secure_cookie || !session.http_only_cookie || !session.same_site_strict {
             return Err(AdminError::SessionInsecure);
         }
-        if submitted_csrf_token.as_bytes().ct_eq(session.csrf_token.as_bytes()).unwrap_u8() != 1 {
+        if submitted_csrf_token
+            .as_bytes()
+            .ct_eq(session.csrf_token.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
             return Err(AdminError::CsrfInvalid);
         }
 

@@ -75,6 +75,14 @@ impl MembershipDirectory {
             .copied()
             .unwrap_or(MembershipStatus::Unknown)
     }
+
+    /// Returns `true` if at least one node has been registered in this
+    /// directory.  When the directory is unpopulated (empty) the membership
+    /// enforcement gate treats nodes as pre-membership and skips the check so
+    /// that deployments that have not yet adopted governance are not broken.
+    pub fn is_populated(&self) -> bool {
+        !self.nodes.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -566,6 +574,68 @@ mod tests {
         assert_eq!(
             set.evaluate_with_membership(&udp, &membership),
             Decision::Deny
+        );
+    }
+
+    /// M5: A revoked node's traffic must be denied even when a permissive ACL
+    /// rule would otherwise allow it (revocation check runs before rule eval).
+    #[test]
+    fn test_revoked_node_acl_denied_before_rule_evaluation() {
+        // Wildcard allow-all rule — most permissive possible
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "*".to_string(),
+                dst: "node:revoked-node".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let request = ContextualAccessRequest {
+            src: "user:alice".to_string(),
+            dst: "node:revoked-node".to_string(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("revoked-node", MembershipStatus::Revoked);
+
+        // Must deny despite the permissive rule
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "revoked node must be denied even with a permissive allow rule"
+        );
+    }
+
+    /// M5: An active node's traffic proceeds to rule evaluation normally.
+    #[test]
+    fn test_active_node_acl_proceeds_to_rule_evaluation() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "user:alice".to_string(),
+                dst: "node:active-node".to_string(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let request = ContextualAccessRequest {
+            src: "user:alice".to_string(),
+            dst: "node:active-node".to_string(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("active-node", MembershipStatus::Active);
+
+        // Active node — rule evaluation runs and the allow rule fires
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Allow,
+            "active node must proceed to rule evaluation"
         );
     }
 }

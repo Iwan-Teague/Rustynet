@@ -1138,7 +1138,11 @@ fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<()
     );
     ctx.run_root(
         target,
-        &["systemctl", "restart", "rustynetd-privileged-helper.service"],
+        &[
+            "systemctl",
+            "restart",
+            "rustynetd-privileged-helper.service",
+        ],
     )
     .map_err(|err| {
         eprintln!("{err}");

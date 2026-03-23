@@ -6,6 +6,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -21,7 +22,8 @@ use rustynet_backend_api::{
     SocketEndpoint, TunnelBackend,
 };
 use rustynet_policy::{
-    ContextualAccessRequest, ContextualPolicySet, Decision, Protocol, TrafficContext,
+    ContextualAccessRequest, ContextualPolicySet, Decision, MembershipDirectory, MembershipStatus,
+    Protocol, TrafficContext,
 };
 
 const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
@@ -232,12 +234,16 @@ impl Default for ApplyOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ManagedPeer {
     configured: PeerConfig,
     direct_endpoint: SocketEndpoint,
     relay_endpoint: Option<SocketEndpoint>,
     path: PathMode,
+    /// Candidate path mode awaiting stability window confirmation.
+    pending_path_mode: Option<PathMode>,
+    /// When the current pending candidate was first observed.
+    pending_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +306,8 @@ pub enum Phase10Error {
     PeerNotManaged,
     RelayPathUnavailable,
     NotStarted,
+    MembershipRevoked(String),
+    MembershipNotFound(String),
 }
 
 impl fmt::Display for Phase10Error {
@@ -320,6 +328,12 @@ impl fmt::Display for Phase10Error {
                 f.write_str("relay path unavailable for managed peer")
             }
             Phase10Error::NotStarted => f.write_str("phase10 controller not started"),
+            Phase10Error::MembershipRevoked(id) => {
+                write!(f, "peer {id} membership is revoked: provisioning denied")
+            }
+            Phase10Error::MembershipNotFound(id) => {
+                write!(f, "peer {id} not found in membership: provisioning denied")
+            }
         }
     }
 }
@@ -1986,6 +2000,12 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     lan_route_acl: HashMap<(String, String), bool>,
     managed_peers: BTreeMap<NodeId, ManagedPeer>,
     current_routes: Vec<Route>,
+    /// How long a Direct candidate must be continuously observed before committing (ms).
+    pub direct_stability_window_ms: u64,
+    /// How long a Relay candidate must be continuously observed before committing (ms).
+    pub relay_stability_window_ms: u64,
+    /// Membership directory used to gate peer provisioning and ACL evaluation.
+    membership: MembershipDirectory,
 }
 
 impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
@@ -2010,7 +2030,15 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             lan_route_acl: HashMap::new(),
             managed_peers: BTreeMap::new(),
             current_routes: Vec::new(),
+            direct_stability_window_ms: 3_000,
+            relay_stability_window_ms: 5_000,
+            membership: MembershipDirectory::default(),
         }
+    }
+
+    /// Replace the membership directory used for peer provisioning and ACL evaluation.
+    pub fn set_membership(&mut self, membership: MembershipDirectory) {
+        self.membership = membership;
     }
 
     pub fn state(&self) -> DataplaneState {
@@ -2114,6 +2142,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         applied_stages: &mut Vec<StageMarker>,
     ) -> Result<(), Phase10Error> {
         for peer in &peers {
+            check_peer_membership_active(&peer.node_id, &self.membership)?;
             self.backend.configure_peer(peer.clone())?;
             self.managed_peers.insert(
                 peer.node_id.clone(),
@@ -2122,6 +2151,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                     direct_endpoint: peer.endpoint,
                     relay_endpoint: None,
                     path: PathMode::Direct,
+                    pending_path_mode: None,
+                    pending_since: None,
                 },
             );
             applied_stages.push(StageMarker::PeerApplied);
@@ -2308,23 +2339,132 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn mark_direct_failed(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
         self.ensure_started()?;
-        let relay_endpoint = self
-            .managed_peers
+        // Verify relay endpoint is available before entering hysteresis window.
+        self.managed_peers
             .get(node_id)
             .ok_or(Phase10Error::PeerNotManaged)?
             .relay_endpoint
             .ok_or(Phase10Error::RelayPathUnavailable)?;
-        self.reconfigure_managed_peer(node_id, relay_endpoint, PathMode::Relay)
+        self.consider_path_change_for_peer(node_id, PathMode::Relay)
     }
 
     pub fn mark_direct_recovered(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
         self.ensure_started()?;
-        let direct_endpoint = self
+        self.consider_path_change_for_peer(node_id, PathMode::Direct)
+    }
+
+    /// Evaluate a candidate path mode for a peer under hysteresis policy.
+    ///
+    /// The candidate must be observed continuously for the applicable stability
+    /// window before `commit_path_change_for_peer` is invoked.  If the
+    /// candidate matches the currently committed path, any pending candidate is
+    /// cleared (flap reset).  Returns `Ok(())` in all cases — callers should
+    /// not interpret "no immediate switch" as an error.
+    pub fn consider_path_change_for_peer(
+        &mut self,
+        node_id: &NodeId,
+        candidate: PathMode,
+    ) -> Result<(), Phase10Error> {
+        let peer = self
             .managed_peers
-            .get(node_id)
-            .ok_or(Phase10Error::PeerNotManaged)?
-            .direct_endpoint;
-        self.reconfigure_managed_peer(node_id, direct_endpoint, PathMode::Direct)
+            .get_mut(node_id)
+            .ok_or(Phase10Error::PeerNotManaged)?;
+
+        if peer.path == candidate {
+            // Already on the desired path; reset any pending candidate.
+            peer.pending_path_mode = None;
+            peer.pending_since = None;
+            return Ok(());
+        }
+
+        if peer.pending_path_mode != Some(candidate) {
+            // New candidate observed — start stability window.
+            peer.pending_path_mode = Some(candidate);
+            peer.pending_since = Some(Instant::now());
+            return Ok(());
+        }
+
+        // Same candidate as before — check whether the stability window elapsed.
+        let elapsed = peer
+            .pending_since
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let required = match candidate {
+            PathMode::Direct => Duration::from_millis(self.direct_stability_window_ms),
+            PathMode::Relay => Duration::from_millis(self.relay_stability_window_ms),
+        };
+        if elapsed >= required {
+            // Stability window elapsed — commit the path change.
+            let _ = peer; // release mutable borrow before calling commit
+            self.commit_path_change_for_peer(node_id, candidate)?;
+        }
+        Ok(())
+    }
+
+    /// Commit a path change for a peer.  This is the **single hardened apply
+    /// path** for peer endpoint updates.  It updates the backend, refreshes
+    /// routes, asserts the kill-switch, clears hysteresis state, and logs the
+    /// transition.
+    fn commit_path_change_for_peer(
+        &mut self,
+        node_id: &NodeId,
+        path: PathMode,
+    ) -> Result<(), Phase10Error> {
+        let endpoint = {
+            let peer = self
+                .managed_peers
+                .get(node_id)
+                .ok_or(Phase10Error::PeerNotManaged)?;
+            match path {
+                PathMode::Direct => peer.direct_endpoint,
+                PathMode::Relay => peer
+                    .relay_endpoint
+                    .ok_or(Phase10Error::RelayPathUnavailable)?,
+            }
+        };
+        self.reconfigure_managed_peer(node_id, endpoint, path)?;
+        // Clear hysteresis state after successful commit.
+        if let Some(peer) = self.managed_peers.get_mut(node_id) {
+            peer.pending_path_mode = None;
+            peer.pending_since = None;
+        }
+        log::info!(
+            "peer {}: committed path change to {:?}",
+            node_id.as_str(),
+            path
+        );
+        Ok(())
+    }
+
+    /// Apply a peer revocation immediately: remove from backend and dataplane.
+    /// Does not wait for the next generation cycle.
+    pub fn apply_revocation(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
+        self.backend.remove_peer(node_id)?;
+        self.managed_peers.remove(node_id);
+        self.refresh_peer_endpoint_routes()?;
+        log::info!("peer {} revoked and removed from dataplane", node_id.as_str());
+        Ok(())
+    }
+
+    /// Set the stability windows used by `consider_path_change_for_peer`.
+    pub fn set_stability_windows(
+        &mut self,
+        direct_stability_window_ms: u64,
+        relay_stability_window_ms: u64,
+    ) {
+        self.direct_stability_window_ms = direct_stability_window_ms;
+        self.relay_stability_window_ms = relay_stability_window_ms;
+    }
+
+    /// For testing: back-date a peer's `pending_since` by `elapsed` so tests
+    /// can simulate time passing without sleeping.
+    #[cfg(test)]
+    pub fn backdate_pending_since_for_test(&mut self, node_id: &NodeId, elapsed: Duration) {
+        if let Some(peer) = self.managed_peers.get_mut(node_id) {
+            if let Some(since) = peer.pending_since {
+                peer.pending_since = Some(since - elapsed);
+            }
+        }
     }
 
     pub fn configure_traversal_paths(
@@ -2592,6 +2732,33 @@ fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
         (_, None) => false,
         (None, Some(_)) => true,
         (Some(previous), Some(current)) => current > previous,
+    }
+}
+
+/// Gate peer provisioning on membership status (M4).
+///
+/// A node that is not positively confirmed `Active` in the membership
+/// directory is denied provisioning (default-deny).
+///
+/// When the directory is unpopulated (no entries have been registered) the
+/// check is skipped so that deployments that have not yet adopted quorum
+/// membership governance are not broken.
+fn check_peer_membership_active(
+    node_id: &NodeId,
+    membership: &MembershipDirectory,
+) -> Result<(), Phase10Error> {
+    if !membership.is_populated() {
+        // Membership governance not yet active — skip the gate.
+        return Ok(());
+    }
+    match membership.node_status(node_id.as_str()) {
+        MembershipStatus::Active => Ok(()),
+        MembershipStatus::Revoked => {
+            Err(Phase10Error::MembershipRevoked(node_id.as_str().to_string()))
+        }
+        MembershipStatus::Unknown => Err(Phase10Error::MembershipNotFound(
+            node_id.as_str().to_string(),
+        )),
     }
 }
 
@@ -2916,7 +3083,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     #[cfg(target_os = "linux")]
     use std::thread;
-    #[cfg(target_os = "linux")]
     use std::time::Duration;
     #[cfg(target_os = "linux")]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4439,5 +4605,371 @@ mod tests {
             "udp",
             None,
         ));
+    }
+
+    // ── A3: Hysteresis tests ───────────────────────────────────────────────
+
+    fn make_controller_with_peer(
+        direct_stability_ms: u64,
+        relay_stability_ms: u64,
+    ) -> (
+        Phase10Controller<RecordingBackend, DryRunSystem>,
+        NodeId,
+        SocketEndpoint,
+        SocketEndpoint,
+    ) {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        controller.set_stability_windows(direct_stability_ms, relay_stability_ms);
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+        let direct_ep = SocketEndpoint {
+            addr: "198.51.100.55".parse::<IpAddr>().expect("ip"),
+            port: 51820,
+        };
+        let relay_ep = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip"),
+            port: 443,
+        };
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .configure_traversal_paths(&peer_id, Some(direct_ep), Some(relay_ep))
+            .expect("traversal endpoints should configure");
+        (controller, peer_id, direct_ep, relay_ep)
+    }
+
+    #[test]
+    fn test_no_switch_within_stability_window() {
+        // Relay stability window is 5000ms; calls made before 5000ms elapsed
+        // must NOT commit a path change.
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+        assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // First call: sets pending
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        // Path not yet changed
+        assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // Second call (elapsed = 0ms, well within 5000ms window): no commit
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // Backdate by only 4999ms (still within window): no commit
+        ctrl.backdate_pending_since_for_test(&peer_id, Duration::from_millis(4999));
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(
+            ctrl.peer_path(&peer_id),
+            Some(PathMode::Direct),
+            "path must not switch before stability window expires"
+        );
+    }
+
+    #[test]
+    fn test_switches_after_full_stability_window() {
+        let (mut ctrl, peer_id, _direct_ep, relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+
+        // First call sets pending
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // Backdate by 5001ms (beyond relay window): commit should fire
+        ctrl.backdate_pending_since_for_test(&peer_id, Duration::from_millis(5001));
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(
+            ctrl.peer_path(&peer_id),
+            Some(PathMode::Relay),
+            "path must switch after stability window expires"
+        );
+        assert_eq!(
+            ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint,
+            relay_ep,
+            "backend endpoint must reflect relay after commit"
+        );
+    }
+
+    #[test]
+    fn test_flap_resets_stability_window() {
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+
+        // Start Relay candidate window
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        // Backdate to just under the expiry (4800ms)
+        ctrl.backdate_pending_since_for_test(&peer_id, Duration::from_millis(4800));
+
+        // Flap back to Direct — clears Relay candidate because it matches
+        // current path.  Then re-introduce Relay.
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Direct)
+            .expect("consider should not error");
+        // Now introduce Relay again — window must restart from zero
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        // Check that calling again immediately (elapsed ≈ 0) does not commit
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(
+            ctrl.peer_path(&peer_id),
+            Some(PathMode::Direct),
+            "path must not switch: flap reset the stability window"
+        );
+    }
+
+    #[test]
+    fn test_fail_closed_bypasses_hysteresis() {
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+
+        // Set up a pending relay candidate (not yet committed)
+        ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+            .expect("consider should not error");
+        assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // force_fail_closed must apply immediately regardless of hysteresis
+        ctrl.force_fail_closed("test")
+            .expect("fail closed should succeed");
+        assert_eq!(
+            ctrl.state(),
+            DataplaneState::FailClosed,
+            "fail_closed must apply immediately without waiting for stability window"
+        );
+    }
+
+    #[test]
+    fn test_commit_path_change_is_the_only_apply_path() {
+        // Verify that reconfigure_managed_peer (the backend endpoint update) is
+        // only called through commit_path_change_for_peer, never directly from
+        // consider_path_change_for_peer before the window expires.
+        let (mut ctrl, peer_id, direct_ep, _relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+
+        let initial_ep = ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint;
+        assert_eq!(initial_ep, direct_ep);
+
+        // Multiple consider calls within the window must not touch the backend
+        for _ in 0..10 {
+            ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
+                .expect("consider should not error");
+        }
+        let ep_after_considers = ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint;
+        assert_eq!(
+            ep_after_considers, direct_ep,
+            "backend endpoint must not change until stability window elapses"
+        );
+    }
+
+    #[test]
+    fn test_path_change_count_bounded_during_flap() {
+        // Simulate 60s of alternating Direct/Relay at 500ms intervals.
+        // With direct_window=3000ms and relay_window=5000ms, at most a few
+        // committed changes should occur (each requires its full window).
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
+            make_controller_with_peer(3_000, 5_000);
+
+        let mut committed_changes = 0usize;
+        let total_steps = 120usize; // 60s / 500ms
+        let mut last_path = ctrl.peer_path(&peer_id);
+        let mut elapsed_ms: u64 = 0;
+
+        for step in 0..total_steps {
+            let candidate = if step % 2 == 0 {
+                PathMode::Relay
+            } else {
+                PathMode::Direct
+            };
+            elapsed_ms += 500;
+            ctrl.consider_path_change_for_peer(&peer_id, candidate)
+                .expect("consider should not error");
+            // Simulate time passing by backdating pending_since by 500ms each
+            // step (only when a pending exists; this is a rough simulation)
+            ctrl.backdate_pending_since_for_test(&peer_id, Duration::from_millis(500));
+            ctrl.consider_path_change_for_peer(&peer_id, candidate)
+                .expect("consider should not error");
+
+            let new_path = ctrl.peer_path(&peer_id);
+            if new_path != last_path {
+                committed_changes += 1;
+                last_path = new_path;
+            }
+        }
+
+        // With 500ms alternating flaps and a 5000ms relay window and 3000ms
+        // direct window, genuine commits are very rare. Allow a generous bound
+        // of ≤ 4 committed changes in 60s.
+        assert!(
+            committed_changes <= 4,
+            "too many path changes ({committed_changes}) during sustained flap in 60s window"
+        );
+    }
+
+    // ── M4: Membership enforcement tests ──────────────────────────────────
+
+    #[test]
+    fn test_active_member_provisioned() {
+        use rustynet_policy::{MembershipDirectory, MembershipStatus};
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-b", MembershipStatus::Active);
+        controller.set_membership(membership);
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            RuntimeContext {
+                local_node: NodeId::new("node-a").expect("node"),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
+            },
+            vec![sample_peer("node-b")],
+            vec![],
+            ApplyOptions::default(),
+        );
+        assert!(result.is_ok(), "active member must be provisioned: {result:?}");
+        let peer_id = NodeId::new("node-b").expect("node id");
+        assert!(
+            controller.backend.peers.contains_key(&peer_id),
+            "backend must have the provisioned peer"
+        );
+    }
+
+    #[test]
+    fn test_revoked_member_provisioning_denied() {
+        use rustynet_policy::{MembershipDirectory, MembershipStatus};
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-b", MembershipStatus::Revoked);
+        controller.set_membership(membership);
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            RuntimeContext {
+                local_node: NodeId::new("node-a").expect("node"),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
+            },
+            vec![sample_peer("node-b")],
+            vec![],
+            ApplyOptions::default(),
+        );
+        assert!(
+            matches!(result, Err(Phase10Error::MembershipRevoked(_))),
+            "revoked peer must be denied: {result:?}"
+        );
+        let peer_id = NodeId::new("node-b").expect("node id");
+        assert!(
+            !controller.backend.peers.contains_key(&peer_id),
+            "revoked peer must NOT be in backend"
+        );
+    }
+
+    #[test]
+    fn test_unknown_member_provisioning_denied() {
+        use rustynet_policy::{MembershipDirectory, MembershipStatus};
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        // Register some other node so directory is populated (not empty)
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-c", MembershipStatus::Active);
+        controller.set_membership(membership);
+
+        // node-b is not in the directory at all
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            RuntimeContext {
+                local_node: NodeId::new("node-a").expect("node"),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
+            },
+            vec![sample_peer("node-b")],
+            vec![],
+            ApplyOptions::default(),
+        );
+        assert!(
+            matches!(result, Err(Phase10Error::MembershipNotFound(_))),
+            "unknown peer must be denied when directory is populated: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_revocation_removes_peer_and_routes_immediately() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let peer_id = NodeId::new("node-b").expect("node id");
+        assert!(controller.backend.peers.contains_key(&peer_id));
+
+        // Apply revocation — peer must be removed immediately
+        controller
+            .apply_revocation(&peer_id)
+            .expect("revocation should succeed");
+
+        assert!(
+            !controller.backend.peers.contains_key(&peer_id),
+            "revoked peer must be removed from backend immediately"
+        );
+        assert!(
+            !controller.managed_peers.contains_key(&peer_id),
+            "revoked peer must be removed from managed_peers immediately"
+        );
     }
 }

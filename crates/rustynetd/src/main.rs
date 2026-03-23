@@ -6,9 +6,8 @@ use rustynetd::daemon::{
     DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
     DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
-    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_SOCKET_PATH, DEFAULT_STATE_PATH,
-    DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
-    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DEFAULT_SOCKET_PATH,
+    DEFAULT_STATE_PATH, DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
     DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS, DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES,
     DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS, DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
     DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS,
@@ -696,9 +695,9 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 index += 2;
             }
             Some("--remote-ops-token-verifier-key") => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--remote-ops-token-verifier-key requires a value".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--remote-ops-token-verifier-key requires a value".to_string()
+                })?;
                 config.remote_ops_token_verifier_key_path = Some(value.into());
                 index += 2;
             }

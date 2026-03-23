@@ -6,3 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+subtle = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rustynet-control = { path = "../rustynet-control" }

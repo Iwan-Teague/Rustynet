@@ -1,0 +1,44 @@
+#![forbid(unsafe_code)]
+
+//! Relay session tracking and pairing logic.
+
+use std::time::Instant;
+
+use rand::RngCore;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId([u8; 16]);
+
+impl SessionId {
+    pub fn generate() -> Self {
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        Self(id)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl From<[u8; 16]> for SessionId {
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RelaySession {
+    pub session_id: SessionId,
+    pub node_id: String,
+    pub peer_node_id: String,
+    pub allocated_port: u16,
+    pub established_at: Instant,
+    pub last_packet_at: Instant,
+}
+
+impl RelaySession {
+    pub fn is_paired_with(&self, other: &RelaySession) -> bool {
+        self.node_id == other.peer_node_id && self.peer_node_id == other.node_id
+    }
+}

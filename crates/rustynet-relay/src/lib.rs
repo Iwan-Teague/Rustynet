@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub mod rate_limit;
+pub mod session;
+pub mod transport;
+
+pub use rate_limit::RateLimiter;
+pub use session::{RelaySession, SessionId};
+pub use transport::{RejectReason, RelayHello, RelayHelloAck, RelayHelloResponse, RelayTransport};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayNode {
     pub id: String,

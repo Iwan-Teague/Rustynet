@@ -98,8 +98,17 @@ pub struct TokenClaims {
 impl TokenClaims {
     pub fn ct_eq(&self, other: &TokenClaims) -> bool {
         use subtle::ConstantTimeEq;
-        self.subject.as_bytes().ct_eq(other.subject.as_bytes()).unwrap_u8() == 1
-            && self.nonce.as_bytes().ct_eq(other.nonce.as_bytes()).unwrap_u8() == 1
+        self.subject
+            .as_bytes()
+            .ct_eq(other.subject.as_bytes())
+            .unwrap_u8()
+            == 1
+            && self
+                .nonce
+                .as_bytes()
+                .ct_eq(other.nonce.as_bytes())
+                .unwrap_u8()
+                == 1
             && self.issued_at_unix == other.issued_at_unix
             && self.expires_at_unix == other.expires_at_unix
     }
@@ -1462,6 +1471,65 @@ impl fmt::Debug for SignedTraversalCoordinationRecord {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelaySessionToken {
+    pub node_id: String,
+    pub peer_node_id: String,
+    pub relay_id: [u8; 16],
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: [u8; 16],
+    pub signature: [u8; 64],
+}
+
+impl fmt::Debug for RelaySessionToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelaySessionToken")
+            .field("node_id", &self.node_id)
+            .field("peer_node_id", &self.peer_node_id)
+            .field("relay_id", &"REDACTED")
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("nonce", &"REDACTED")
+            .field("signature", &"REDACTED")
+            .finish()
+    }
+}
+
+impl RelaySessionToken {
+    pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
+        let payload = self.canonical_payload();
+        let signature = Signature::from_bytes(&self.signature);
+        verifying_key
+            .verify(payload.as_bytes(), &signature)
+            .map_err(|e| format!("signature verification failed: {e}"))?;
+        Ok(())
+    }
+
+    pub fn canonical_payload(&self) -> String {
+        format!(
+            "version=1\nnode_id={}\npeer_node_id={}\nrelay_id={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\n",
+            self.node_id,
+            self.peer_node_id,
+            hex_bytes(&self.relay_id),
+            self.issued_at_unix,
+            self.expires_at_unix,
+            hex_bytes(&self.nonce),
+        )
+    }
+
+    pub fn is_expired(&self, now_unix: u64, clock_skew_tolerance_secs: u64) -> bool {
+        now_unix
+            > self
+                .expires_at_unix
+                .saturating_add(clock_skew_tolerance_secs)
+    }
+
+    pub fn ttl_secs(&self) -> u64 {
+        self.expires_at_unix.saturating_sub(self.issued_at_unix)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoTunnelRouteKind {
     Mesh,
@@ -2256,11 +2324,7 @@ impl ControlPlaneCore {
                 "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
             ));
         }
-        if record
-            .expires_at_unix
-            .saturating_sub(record.issued_at_unix)
-            > 30
-        {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
             return Err(ControlPlaneError::Traversal(
                 "coordination ttl exceeds max supported value".to_string(),
             ));
@@ -2297,14 +2361,12 @@ impl ControlPlaneCore {
             ));
         }
 
-        let node_a = self
-            .nodes
-            .get(record.node_a.as_str())?
-            .ok_or_else(|| ControlPlaneError::Traversal("coordination node_a does not exist".to_string()))?;
-        let node_b = self
-            .nodes
-            .get(record.node_b.as_str())?
-            .ok_or_else(|| ControlPlaneError::Traversal("coordination node_b does not exist".to_string()))?;
+        let node_a = self.nodes.get(record.node_a.as_str())?.ok_or_else(|| {
+            ControlPlaneError::Traversal("coordination node_a does not exist".to_string())
+        })?;
+        let node_b = self.nodes.get(record.node_b.as_str())?.ok_or_else(|| {
+            ControlPlaneError::Traversal("coordination node_b does not exist".to_string())
+        })?;
         if !self.policy_allows_node_pair(&node_a, &node_b) {
             return Err(ControlPlaneError::Traversal(
                 "coordination denied by policy".to_string(),
@@ -2351,11 +2413,7 @@ impl ControlPlaneCore {
         if record.issued_at_unix >= record.expires_at_unix {
             return false;
         }
-        if record
-            .expires_at_unix
-            .saturating_sub(record.issued_at_unix)
-            > 30
-        {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
             return false;
         }
         if record.probe_start_unix > record.expires_at_unix {
@@ -2376,8 +2434,8 @@ impl ControlPlaneCore {
             return false;
         }
 
-        let expected_payload = match serialize_traversal_coordination_payload(
-            &TraversalCoordinationRecord {
+        let expected_payload =
+            match serialize_traversal_coordination_payload(&TraversalCoordinationRecord {
                 session_id: record.session_id,
                 probe_start_unix: record.probe_start_unix,
                 node_a: record.node_a.clone(),
@@ -2385,11 +2443,10 @@ impl ControlPlaneCore {
                 issued_at_unix: record.issued_at_unix,
                 expires_at_unix: record.expires_at_unix,
                 nonce: record.nonce,
-            },
-        ) {
-            Ok(payload) => payload,
-            Err(_) => return false,
-        };
+            }) {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
         if expected_payload != record.payload {
             return false;
         }
@@ -2812,7 +2869,8 @@ fn serialize_endpoint_hint_payload(
 fn serialize_traversal_coordination_payload(
     record: &TraversalCoordinationRecord,
 ) -> Result<String, ControlPlaneError> {
-    if !is_valid_node_id_text(record.node_a.as_str()) || !is_valid_node_id_text(record.node_b.as_str())
+    if !is_valid_node_id_text(record.node_a.as_str())
+        || !is_valid_node_id_text(record.node_b.as_str())
     {
         return Err(ControlPlaneError::Traversal(
             "coordination node ids must not be empty".to_string(),
@@ -2828,11 +2886,7 @@ fn serialize_traversal_coordination_payload(
             "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
         ));
     }
-    if record
-        .expires_at_unix
-        .saturating_sub(record.issued_at_unix)
-        > 30
-    {
+    if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
         return Err(ControlPlaneError::Traversal(
             "coordination ttl exceeds max supported value".to_string(),
         ));
@@ -2896,10 +2950,9 @@ mod tests {
         EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
         EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
         ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
-        SignedDnsZoneBundleRequest, ThrowawayCredentialState, ThrowawayCredentialStore,
-        TokenClaims, SignedTokenClaims, TransportPolicyError, TraversalCoordinationRecord, TrustState,
-        derive_signing_seed, hex_bytes,
-        load_trust_state, persist_trust_state,
+        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
+        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
+        TrustState, derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -3895,8 +3948,18 @@ mod tests {
         };
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
         for (credential_id, node_id, endpoint, public_key) in [
-            ("coord-cred-a", "coord-node-a", "198.51.100.170:51820", [170; 32]),
-            ("coord-cred-b", "coord-node-b", "198.51.100.171:51820", [171; 32]),
+            (
+                "coord-cred-a",
+                "coord-node-a",
+                "198.51.100.170:51820",
+                [170; 32],
+            ),
+            (
+                "coord-cred-b",
+                "coord-node-b",
+                "198.51.100.171:51820",
+                [171; 32],
+            ),
         ] {
             core.credentials
                 .create(
@@ -3955,8 +4018,18 @@ mod tests {
         };
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
         for (credential_id, node_id, endpoint, public_key) in [
-            ("coord-cred-c", "coord-node-a", "198.51.100.172:51820", [172; 32]),
-            ("coord-cred-d", "coord-node-b", "198.51.100.173:51820", [173; 32]),
+            (
+                "coord-cred-c",
+                "coord-node-a",
+                "198.51.100.172:51820",
+                [172; 32],
+            ),
+            (
+                "coord-cred-d",
+                "coord-node-b",
+                "198.51.100.173:51820",
+                [173; 32],
+            ),
         ] {
             core.credentials
                 .create(

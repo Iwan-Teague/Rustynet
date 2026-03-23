@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod dataplane;
+pub mod fetcher;
 pub mod ipc;
 pub mod key_material;
 pub mod perf;
