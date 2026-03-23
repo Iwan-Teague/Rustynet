@@ -17,8 +17,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{
-    parse_command, read_command_envelope, validate_cidr, CommandEnvelope, IpcCommand, IpcResponse,
-    RemoteCommandEnvelope,
+    parse_command, read_command_envelope, remote_ops_signature_payload, validate_cidr,
+    CommandEnvelope, IpcCommand, IpcResponse, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
+    REMOTE_OPS_WIRE_PREFIX,
 };
 #[cfg(target_os = "macos")]
 use crate::key_material::read_passphrase_file;
@@ -188,12 +189,6 @@ const MAX_DNS_ZONE_REFRESH_JITTER_SECS: u64 = 45;
 const MIN_TRAVERSAL_REFRESH_MARGIN_SECS: u64 = 15;
 const MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS: u64 = 5;
 const MAX_TRAVERSAL_REFRESH_JITTER_SECS: u64 = 30;
-const REMOTE_OPS_WIRE_PREFIX: &str = "remote-op-v1";
-const REMOTE_OPS_SIGNATURE_SCOPE_V1: &str = "daemon_ipc_remote_op";
-const REMOTE_OPS_REQUIRED_FIELD_COUNT: usize = 6;
-const MAX_REMOTE_OPS_SUBJECT_BYTES: usize = 128;
-const MAX_REMOTE_OPS_NONCE_BYTES: usize = 128;
-const MAX_REMOTE_OPS_COMMAND_BYTES: usize = 1024;
 
 // Minimal network-based signed state fetcher (B1 - pull based). This implements a
 // conservative pull path: if a URL environment variable is provided for a state
@@ -734,70 +729,9 @@ impl fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CommandEnvelope {
-    Local(IpcCommand),
-    Remote(RemoteCommandEnvelope),
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteCommandEnvelope {
-    subject: String,
-    issued_at_unix: u64,
-    expires_at_unix: u64,
-    nonce: String,
-    command: String,
-    signature_hex: String,
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RemoteOpsEnvelopeParseError {
-    InvalidPrefix,
-    InvalidEncoding,
-    MissingField(&'static str),
-    DuplicateField(&'static str),
-    UnknownField(String),
-    InvalidFieldLength(&'static str),
-    InvalidTimestamp(&'static str),
-    EmptyCommand,
-    InvalidCommand,
-}
 
-impl fmt::Display for RemoteOpsEnvelopeParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RemoteOpsEnvelopeParseError::InvalidPrefix => {
-                f.write_str("remote ops envelope prefix is invalid")
-            }
-            RemoteOpsEnvelopeParseError::InvalidEncoding => {
-                f.write_str("remote ops envelope uses invalid encoding")
-            }
-            RemoteOpsEnvelopeParseError::MissingField(field) => {
-                write!(f, "remote ops envelope missing required field {field}")
-            }
-            RemoteOpsEnvelopeParseError::DuplicateField(field) => {
-                write!(f, "remote ops envelope has duplicate field {field}")
-            }
-            RemoteOpsEnvelopeParseError::UnknownField(field) => {
-                write!(f, "remote ops envelope has unknown field {field}")
-            }
-            RemoteOpsEnvelopeParseError::InvalidFieldLength(field) => {
-                write!(f, "remote ops envelope field {field} length is invalid")
-            }
-            RemoteOpsEnvelopeParseError::InvalidTimestamp(field) => {
-                write!(f, "remote ops envelope timestamp {field} is invalid")
-            }
-            RemoteOpsEnvelopeParseError::EmptyCommand => {
-                f.write_str("remote ops command must not be empty")
-            }
-            RemoteOpsEnvelopeParseError::InvalidCommand => {
-                f.write_str("remote ops command is invalid")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RemoteOpsEnvelopeParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteOpsAuthError {
@@ -8829,189 +8763,16 @@ fn is_root_managed_shared_runtime_parent(
     false
 }
 
-fn read_command(stream: &UnixStream) -> Result<String, String> {
-    let reader = BufReader::new(stream);
-    let mut limited = reader.take(4097);
-    let mut bytes = Vec::new();
-    limited
-        .read_until(b'\n', &mut bytes)
-        .map_err(|err| format!("read failed: {err}"))?;
-    if bytes.len() > 4096 {
-        return Err("command too long".to_string());
-    }
-    if bytes.contains(&b'\0') {
-        return Err("command contains null byte".to_string());
-    }
-    let line = String::from_utf8(bytes).map_err(|_| "command is not valid utf-8".to_string())?;
-    Ok(line.trim().to_string())
-}
 
 fn read_command_envelope(stream: &UnixStream) -> Result<CommandEnvelope, String> {
-    let wire = read_command(stream)?;
-    if let Some(encoded_fields) = wire.strip_prefix(REMOTE_OPS_WIRE_PREFIX) {
-        let envelope =
-            parse_remote_command_envelope(encoded_fields).map_err(|err| err.to_string())?;
-        return Ok(CommandEnvelope::Remote(envelope));
-    }
-    Ok(CommandEnvelope::Local(parse_command(&wire)))
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let reader = std::io::BufReader::new(stream);
+    crate::ipc::read_command_envelope(reader).map_err(|e| e.to_string())
 }
 
-fn parse_remote_command_envelope(
-    encoded_fields: &str,
-) -> Result<RemoteCommandEnvelope, RemoteOpsEnvelopeParseError> {
-    if !encoded_fields.starts_with('|') {
-        return Err(RemoteOpsEnvelopeParseError::InvalidPrefix);
-    }
-    let raw_segments = encoded_fields
-        .strip_prefix('|')
-        .ok_or(RemoteOpsEnvelopeParseError::InvalidPrefix)?
-        .split('|')
-        .collect::<Vec<_>>();
-    let mut field_values: BTreeMap<&'static str, String> = BTreeMap::new();
-    for segment in raw_segments {
-        let (key, encoded_value) = segment
-            .split_once('=')
-            .ok_or(RemoteOpsEnvelopeParseError::InvalidEncoding)?;
-        let expected_key = match key {
-            "subject" => "subject",
-            "issued_at_unix" => "issued_at_unix",
-            "expires_at_unix" => "expires_at_unix",
-            "nonce" => "nonce",
-            "command" => "command",
-            "signature" => "signature",
-            other => return Err(RemoteOpsEnvelopeParseError::UnknownField(other.to_string())),
-        };
-        if field_values.contains_key(expected_key) {
-            return Err(RemoteOpsEnvelopeParseError::DuplicateField(expected_key));
-        }
-        let decoded = percent_decode_ascii(encoded_value)?;
-        field_values.insert(expected_key, decoded);
-    }
-    if field_values.len() != REMOTE_OPS_REQUIRED_FIELD_COUNT {
-        return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
-    }
-    let subject = field_values
-        .remove("subject")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("subject"))?;
-    if subject.is_empty() || subject.len() > MAX_REMOTE_OPS_SUBJECT_BYTES {
-        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("subject"));
-    }
-    let issued_at_unix = field_values
-        .remove("issued_at_unix")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("issued_at_unix"))?
-        .parse::<u64>()
-        .map_err(|_| RemoteOpsEnvelopeParseError::InvalidTimestamp("issued_at_unix"))?;
-    let expires_at_unix = field_values
-        .remove("expires_at_unix")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("expires_at_unix"))?
-        .parse::<u64>()
-        .map_err(|_| RemoteOpsEnvelopeParseError::InvalidTimestamp("expires_at_unix"))?;
-    let nonce = field_values
-        .remove("nonce")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("nonce"))?;
-    if nonce.is_empty() || nonce.len() > MAX_REMOTE_OPS_NONCE_BYTES {
-        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("nonce"));
-    }
-    let command = field_values
-        .remove("command")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("command"))?;
-    if command.is_empty() {
-        return Err(RemoteOpsEnvelopeParseError::EmptyCommand);
-    }
-    if command.len() > MAX_REMOTE_OPS_COMMAND_BYTES {
-        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("command"));
-    }
-    if command.contains('\0') || command.contains('\n') || command.contains('\r') {
-        return Err(RemoteOpsEnvelopeParseError::InvalidCommand);
-    }
-    if matches!(parse_command(&command), IpcCommand::Unknown(_)) {
-        return Err(RemoteOpsEnvelopeParseError::InvalidCommand);
-    }
-    let signature_hex = field_values
-        .remove("signature")
-        .ok_or(RemoteOpsEnvelopeParseError::MissingField("signature"))?;
-    if signature_hex.len() != 128 {
-        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("signature"));
-    }
 
-    Ok(RemoteCommandEnvelope {
-        subject,
-        issued_at_unix,
-        expires_at_unix,
-        nonce,
-        command,
-        signature_hex,
-    })
-}
-
-fn remote_ops_signature_payload(envelope: &RemoteCommandEnvelope) -> String {
-    format!(
-        "scope={REMOTE_OPS_SIGNATURE_SCOPE_V1}\nsubject={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\ncommand={}\n",
-        envelope.subject,
-        envelope.issued_at_unix,
-        envelope.expires_at_unix,
-        envelope.nonce,
-        envelope.command
-    )
-}
-
-fn decode_remote_ops_hex_to_fixed<const N: usize>(
-    encoded: &str,
-) -> Result<[u8; N], RemoteOpsEnvelopeParseError> {
-    let mut out = [0u8; N];
-    let raw = encoded.as_bytes();
-    if raw.len() != N * 2 {
-        return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
-    }
-    let mut index = 0usize;
-    while index < N {
-        let high = decode_remote_ops_hex_nibble(raw[index * 2])?;
-        let low = decode_remote_ops_hex_nibble(raw[index * 2 + 1])?;
-        out[index] = (high << 4) | low;
-        index = index.saturating_add(1);
-    }
-    Ok(out)
-}
-
-fn decode_remote_ops_hex_nibble(value: u8) -> Result<u8, RemoteOpsEnvelopeParseError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(RemoteOpsEnvelopeParseError::InvalidEncoding),
-    }
-}
-
-fn percent_decode_ascii(value: &str) -> Result<String, RemoteOpsEnvelopeParseError> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
-            }
-            let high = decode_remote_ops_hex_nibble(bytes[index + 1])?;
-            let low = decode_remote_ops_hex_nibble(bytes[index + 2])?;
-            let decoded = (high << 4) | low;
-            out.push(decoded);
-            index += 3;
-            continue;
-        }
-        if !(byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b':' | b'.' | b'-' | b'_' | b'/' | b' ' | b',' | b'=' | b'+' | b'@'
-            ))
-        {
-            return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
-        }
-        out.push(byte);
-        index += 1;
-    }
-    String::from_utf8(out).map_err(|_| RemoteOpsEnvelopeParseError::InvalidEncoding)
-}
 
 fn write_response(mut stream: UnixStream, response: IpcResponse) -> Result<(), String> {
     stream
