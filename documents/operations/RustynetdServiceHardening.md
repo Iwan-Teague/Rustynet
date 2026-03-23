@@ -16,10 +16,10 @@ Define a production-safe service profile for `rustynetd` with least privilege, f
 - Privileged helper unit: `scripts/systemd/rustynetd-privileged-helper.service`
 - Trust refresh unit: `scripts/systemd/rustynetd-trust-refresh.service`
 - Trust refresh timer: `scripts/systemd/rustynetd-trust-refresh.timer`
-- Trust refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-trust`
+- Trust refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-trust`, then triggers daemon signed-state apply via `ExecStartPost=/usr/local/bin/rustynet state refresh`
 - Assignment refresh unit: `scripts/systemd/rustynetd-assignment-refresh.service`
 - Assignment refresh timer: `scripts/systemd/rustynetd-assignment-refresh.timer`
-- Assignment refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-assignment`
+- Assignment refresh service executes Rust directly: `ExecStart=/usr/local/bin/rustynet ops refresh-assignment`, then triggers daemon signed-state apply via `ExecStartPost=/usr/local/bin/rustynet state refresh`
 
 Implementation note (runtime shell removal):
 - Trust/assignment refresh runtime paths are now direct Rust service execution (`ExecStart=/usr/local/bin/rustynet ops ...`) with binary-custody preflight (`ops verify-runtime-binary-custody`).

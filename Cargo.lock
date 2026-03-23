@@ -577,6 +577,7 @@ dependencies = [
  "rand",
  "security-framework",
  "sha2",
+ "subtle",
  "zeroize",
 ]
 

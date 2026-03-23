@@ -991,9 +991,7 @@ fn is_ipv4(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        decode_hex_32, encode_base64, normalize_verifier_key_to_b64, parse_status_field,
-    };
+    use super::{decode_hex_32, encode_base64, normalize_verifier_key_to_b64, parse_status_field};
 
     #[test]
     fn normalize_verifier_key_converts_hex_to_base64() {
@@ -1005,17 +1003,20 @@ mod tests {
     #[test]
     fn normalize_verifier_key_preserves_base64() {
         let b64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        let converted = normalize_verifier_key_to_b64(b64).expect("base64 verifier key should parse");
+        let converted =
+            normalize_verifier_key_to_b64(b64).expect("base64 verifier key should parse");
         assert_eq!(converted, b64);
     }
 
     #[test]
     fn encode_base64_matches_expected_output() {
-        let decoded = decode_hex_32(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .expect("hex should decode");
-        assert_eq!(encode_base64(decoded.as_slice()), "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+        let decoded =
+            decode_hex_32("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("hex should decode");
+        assert_eq!(
+            encode_base64(decoded.as_slice()),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
     }
 
     #[test]

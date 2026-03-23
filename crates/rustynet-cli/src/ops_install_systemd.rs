@@ -9,9 +9,9 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-use crate::env_file::parse_env_value;
-use nix::unistd::{Gid, Group, Uid, User, chown};
-use rand::{RngCore, rngs::OsRng};
+use crate::env_file::{format_env_assignment, parse_env_value};
+use nix::unistd::{chown, Gid, Group, Uid, User};
+use rand::{rngs::OsRng, RngCore};
 use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
@@ -58,6 +58,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     require_linux_host()?;
 
     let existing_env = read_env_file_values(Path::new(ENV_DST))?;
+    let existing_assignment_refresh_env =
+        read_env_file_values(Path::new(ASSIGNMENT_REFRESH_ENV_DST))?;
     let source_root = resolve_source_root()?;
     let sources = install_sources(source_root.as_path());
     validate_source_paths(&sources)?;
@@ -270,6 +272,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         &existing_env,
     )?;
     let node_id = env_string_or_existing_required("RUSTYNET_NODE_ID", &existing_env)?;
+    let assignment_refresh_default_target_node_id = node_id.clone();
     let node_role = env_string_or_existing_default("RUSTYNET_NODE_ROLE", "client", &existing_env)?;
     let backend_mode =
         env_string_or_existing_default("RUSTYNET_BACKEND", "linux-wireguard", &existing_env)?;
@@ -884,7 +887,30 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         Uid::from_raw(0),
         Gid::from_raw(0),
         0o644,
+        Uid::from_raw(0),
+        Gid::from_raw(0),
+        0o755,
     )?;
+    if assignment_auto_refresh_enabled {
+        let rendered_assignment_refresh_env = render_assignment_refresh_env_contents(
+            assignment_refresh_default_target_node_id.as_str(),
+            env_optional_string("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")?,
+            env_optional_string("RUSTYNET_ASSIGNMENT_NODES")?,
+            env_optional_string("RUSTYNET_ASSIGNMENT_ALLOW")?,
+            env_optional_string("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID")?,
+            &existing_assignment_refresh_env,
+        )?;
+        write_atomic_text_file(
+            Path::new(ASSIGNMENT_REFRESH_ENV_DST),
+            rendered_assignment_refresh_env.as_str(),
+            Uid::from_raw(0),
+            Gid::from_raw(0),
+            0o600,
+            Uid::from_raw(0),
+            daemon_gid,
+            0o750,
+        )?;
+    }
 
     ensure_managed_dns_control_plane_ready()?;
     run_command_checked("systemctl", &["daemon-reload"])?;
@@ -946,24 +972,35 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         "systemctl",
         &["restart", "rustynetd-privileged-helper.service"],
     )?;
+
+    run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
+    wait_for_unit_active("rustynetd.service", 40, 250)?;
+
+    run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
+    wait_for_unit_active("rustynetd-managed-dns.service", 40, 250)?;
+
+    if assignment_auto_refresh_enabled {
+        let _ = run_command_checked(
+            "systemctl",
+            &["start", "rustynetd-assignment-refresh.service"],
+        );
+    }
     if trust_auto_refresh_enabled {
-        run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"])?;
+        let _ = run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"]);
+    }
+    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled {
+        run_command_checked("rustynet", &["state", "refresh"])?;
+    }
+
+    if trust_auto_refresh_enabled {
         run_command_checked("systemctl", &["restart", "rustynetd-trust-refresh.timer"])?;
     }
     if assignment_auto_refresh_enabled {
         run_command_checked(
             "systemctl",
-            &["start", "rustynetd-assignment-refresh.service"],
-        )?;
-        run_command_checked(
-            "systemctl",
             &["restart", "rustynetd-assignment-refresh.timer"],
         )?;
     }
-    run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
-    run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
-    wait_for_unit_active("rustynetd.service", 40, 250)?;
-    wait_for_unit_active("rustynetd-managed-dns.service", 40, 250)?;
 
     run_command_stream(
         "systemctl",
@@ -1410,10 +1447,7 @@ fn read_assignment_refresh_exit_node_id(path: &Path) -> Result<Option<String>, S
     if raw.is_empty() {
         return Ok(None);
     }
-    if !raw
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
-    {
+    if !is_valid_assignment_node_id(raw) {
         return Err(format!(
             "invalid RUSTYNET_ASSIGNMENT_EXIT_NODE_ID in {}: {}",
             path.display(),
@@ -1421,6 +1455,121 @@ fn read_assignment_refresh_exit_node_id(path: &Path) -> Result<Option<String>, S
         ));
     }
     Ok(Some(raw.to_string()))
+}
+
+fn render_assignment_refresh_env_contents(
+    fallback_target_node_id: &str,
+    target_node_id_raw: Option<String>,
+    nodes_spec_raw: Option<String>,
+    allow_spec_raw: Option<String>,
+    exit_node_id_raw: Option<String>,
+    existing: &HashMap<String, String>,
+) -> Result<String, String> {
+    let target_node_id = resolve_assignment_refresh_value(
+        "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID",
+        target_node_id_raw,
+        existing,
+        Some(fallback_target_node_id),
+    )?;
+    if !is_valid_assignment_node_id(target_node_id.as_str()) {
+        return Err(format!(
+            "assignment auto-refresh requires a valid RUSTYNET_ASSIGNMENT_TARGET_NODE_ID; unsupported characters in {target_node_id}",
+        ));
+    }
+
+    let nodes_spec = resolve_assignment_refresh_value(
+        "RUSTYNET_ASSIGNMENT_NODES",
+        nodes_spec_raw,
+        existing,
+        None,
+    )?;
+    let allow_spec = resolve_assignment_refresh_value(
+        "RUSTYNET_ASSIGNMENT_ALLOW",
+        allow_spec_raw,
+        existing,
+        None,
+    )?;
+    let exit_node_id = resolve_assignment_refresh_optional_value(
+        "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID",
+        exit_node_id_raw,
+        existing,
+    )?;
+    if let Some(value) = exit_node_id.as_deref()
+        && !is_valid_assignment_node_id(value)
+    {
+        return Err(format!(
+            "assignment auto-refresh requires a valid RUSTYNET_ASSIGNMENT_EXIT_NODE_ID; unsupported characters in {value}",
+        ));
+    }
+
+    let mut rendered = String::new();
+    rendered.push_str(
+        format_env_assignment(
+            "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID",
+            target_node_id.as_str(),
+        )?
+        .as_str(),
+    );
+    rendered.push('\n');
+    rendered.push_str(
+        format_env_assignment("RUSTYNET_ASSIGNMENT_NODES", nodes_spec.as_str())?.as_str(),
+    );
+    rendered.push('\n');
+    rendered.push_str(
+        format_env_assignment("RUSTYNET_ASSIGNMENT_ALLOW", allow_spec.as_str())?.as_str(),
+    );
+    rendered.push('\n');
+    if let Some(value) = exit_node_id {
+        rendered.push_str(
+            format_env_assignment("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", value.as_str())?.as_str(),
+        );
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn resolve_assignment_refresh_value(
+    key: &str,
+    explicit: Option<String>,
+    existing: &HashMap<String, String>,
+    fallback: Option<&str>,
+) -> Result<String, String> {
+    let resolved = explicit
+        .or_else(|| existing.get(key).cloned())
+        .unwrap_or_else(|| fallback.unwrap_or_default().to_string())
+        .trim()
+        .to_string();
+    if resolved.is_empty() {
+        return Err(format!(
+            "assignment auto-refresh requires {key}; set it explicitly or provide it in {}",
+            ASSIGNMENT_REFRESH_ENV_DST
+        ));
+    }
+    validate_env_line(key, resolved.as_str())?;
+    Ok(resolved)
+}
+
+fn resolve_assignment_refresh_optional_value(
+    key: &str,
+    explicit: Option<String>,
+    existing: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = explicit.or_else(|| existing.get(key).cloned()) else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_string();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    validate_env_line(key, normalized.as_str())?;
+    Ok(Some(normalized))
+}
+
+fn is_valid_assignment_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
 }
 
 fn resolve_selected_exit_node_id(
@@ -1965,11 +2114,14 @@ fn write_atomic_text_file(
     owner: Uid,
     group: Gid,
     mode: u32,
+    parent_owner: Uid,
+    parent_group: Gid,
+    parent_mode: u32,
 ) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("target path has no parent: {}", target.display()))?;
-    ensure_directory_with_owner_mode(parent, 0o755, Uid::from_raw(0), Gid::from_raw(0))?;
+    ensure_directory_with_owner_mode(parent, parent_mode, parent_owner, parent_group)?;
 
     let tmp = create_secure_temp_file(parent, "rustynetd.env.tmp.")?;
     {
@@ -2154,6 +2306,35 @@ fn format_command(command: &str, args: &[&str]) -> String {
     format!("{} {}", command, args.join(" "))
 }
 
+#[cfg(test)]
+fn installer_unit_start_order(
+    trust_auto_refresh_enabled: bool,
+    assignment_auto_refresh_enabled: bool,
+) -> Vec<&'static str> {
+    let mut order = Vec::new();
+    order.push("restart rustynetd-privileged-helper.service");
+    order.push("restart rustynetd.service");
+    order.push("wait rustynetd.service active");
+    order.push("restart rustynetd-managed-dns.service");
+    order.push("wait rustynetd-managed-dns.service active");
+    if assignment_auto_refresh_enabled {
+        order.push("start rustynetd-assignment-refresh.service (best-effort post-daemon)");
+    }
+    if trust_auto_refresh_enabled {
+        order.push("start rustynetd-trust-refresh.service (best-effort post-daemon)");
+    }
+    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled {
+        order.push("run rustynet state refresh (strict)");
+    }
+    if trust_auto_refresh_enabled {
+        order.push("restart rustynetd-trust-refresh.timer");
+    }
+    if assignment_auto_refresh_enabled {
+        order.push("restart rustynetd-assignment-refresh.timer");
+    }
+    order
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -2182,9 +2363,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        assignment_peer_endpoint, bytes_to_hex, parse_dev_interface_token,
+        assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order, parse_dev_interface_token,
         parse_dns_resolver_bind_addr_install, parse_install_bool, read_env_file_values,
-        resolve_selected_exit_node_id, systemctl_state_retryable,
+        render_assignment_refresh_env_contents, resolve_selected_exit_node_id,
+        systemctl_state_retryable,
     };
 
     #[test]
@@ -2206,6 +2388,47 @@ mod tests {
         assert!(systemctl_state_retryable("inactive"));
         assert!(!systemctl_state_retryable("failed"));
         assert!(!systemctl_state_retryable("active"));
+    }
+
+    #[test]
+    fn installer_order_runs_single_strict_state_refresh_after_best_effort_priming() {
+        let order = installer_unit_start_order(true, true);
+        let daemon_idx = order
+            .iter()
+            .position(|entry| *entry == "restart rustynetd.service")
+            .expect("daemon restart should be present");
+        let best_effort_assignment_idx = order
+            .iter()
+            .position(|entry| {
+                *entry == "start rustynetd-assignment-refresh.service (best-effort post-daemon)"
+            })
+            .expect("best-effort assignment refresh start should be present");
+        let best_effort_trust_idx = order
+            .iter()
+            .position(|entry| {
+                *entry == "start rustynetd-trust-refresh.service (best-effort post-daemon)"
+            })
+            .expect("best-effort trust refresh start should be present");
+        let strict_state_refresh_idx = order
+            .iter()
+            .position(|entry| *entry == "run rustynet state refresh (strict)")
+            .expect("strict state refresh should be present");
+        assert!(
+            daemon_idx < best_effort_assignment_idx,
+            "daemon restart must precede best-effort assignment refresh start"
+        );
+        assert!(
+            daemon_idx < best_effort_trust_idx,
+            "daemon restart must precede best-effort trust refresh start"
+        );
+        assert!(
+            best_effort_assignment_idx < strict_state_refresh_idx,
+            "best-effort assignment priming must precede strict state refresh"
+        );
+        assert!(
+            best_effort_trust_idx < strict_state_refresh_idx,
+            "best-effort trust priming must precede strict state refresh"
+        );
     }
 
     #[test]
@@ -2344,5 +2567,68 @@ mod tests {
         let endpoint =
             assignment_peer_endpoint(&fields, "final-exit").expect("peer endpoint should resolve");
         assert_eq!(endpoint, "192.168.18.49:51820");
+    }
+
+    #[test]
+    fn render_assignment_refresh_env_defaults_target_node_id_and_quotes_values() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "RUSTYNET_ASSIGNMENT_NODES".to_string(),
+            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_string(),
+        );
+        existing.insert(
+            "RUSTYNET_ASSIGNMENT_ALLOW".to_string(),
+            "client-50|exit-49;exit-49|client-50".to_string(),
+        );
+
+        let rendered =
+            render_assignment_refresh_env_contents("client-50", None, None, None, None, &existing)
+                .expect("assignment refresh env should render");
+
+        assert!(rendered.contains("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-50\""));
+        assert!(rendered.contains(
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def\""
+        ));
+        assert!(
+            rendered.contains("RUSTYNET_ASSIGNMENT_ALLOW=\"client-50|exit-49;exit-49|client-50\"")
+        );
+    }
+
+    #[test]
+    fn render_assignment_refresh_env_requires_nodes_and_allow() {
+        let err = render_assignment_refresh_env_contents(
+            "client-50",
+            None,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+        )
+        .expect_err("missing assignment refresh fields should fail");
+        assert!(err.contains("RUSTYNET_ASSIGNMENT_NODES"));
+    }
+
+    #[test]
+    fn render_assignment_refresh_env_rejects_invalid_exit_node_id() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "RUSTYNET_ASSIGNMENT_NODES".to_string(),
+            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_string(),
+        );
+        existing.insert(
+            "RUSTYNET_ASSIGNMENT_ALLOW".to_string(),
+            "client-50|exit-49;exit-49|client-50".to_string(),
+        );
+
+        let err = render_assignment_refresh_env_contents(
+            "client-50",
+            None,
+            None,
+            None,
+            Some("exit 49".to_string()),
+            &existing,
+        )
+        .expect_err("invalid exit node id should fail");
+        assert!(err.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"));
     }
 }

@@ -67,6 +67,8 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - If stale trust evidence is reported during unattended runtime, verify `rustynetd-trust-refresh.timer` and `rustynetd-trust-refresh.service` journal output before any bypass actions.
 - If DNS leak protection fault is detected, keep fail-closed posture and do not bypass protection.
 - If route/firewall apply failed, enforce rollback and block egress until trusted state recovers.
+- For cross-network-specific containment and recovery workflow, execute:
+  - `documents/operations/CrossNetworkRemoteExitIncidentPlaybook.md`
 
 ## 6) Verification Commands
 - `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock cargo run -p rustynet-cli -- status`
@@ -99,3 +101,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 - No custom crypto/protocol behavior is introduced.
 - Direct/relay path transitions require signed, fresh traversal endpoint data; invalid traversal state must fail closed.
 - Dataplane firewall/NAT ownership is generation-tagged and must only clean up Rustynet-owned tables.
+
+## 9) External Cross-Network Lab Prerequisites
+Before running measured cross-network suites, satisfy:
+- `documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`

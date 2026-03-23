@@ -64,6 +64,9 @@ Every report is rejected if:
 - `relay_to_direct_failback_success`
 - `endpoint_roam_recovery_success`
 - `remote_exit_no_underlay_leak`
+- `failback_reconnect_within_slo`
+- `no_underlay_leak_while_reconnecting`
+- `signed_state_valid_while_reconnecting`
 
 ### 5.4 `cross_network_traversal_adversarial`
 - `forged_traversal_rejected`

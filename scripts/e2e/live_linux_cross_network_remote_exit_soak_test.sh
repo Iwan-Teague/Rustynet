@@ -17,6 +17,8 @@ CLIENT_NODE_ID="client-1"
 EXIT_NODE_ID="exit-1"
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
+CLIENT_UNDERLAY_IP="${RUSTYNET_CLIENT_UNDERLAY_IP:-}"
+EXIT_UNDERLAY_IP="${RUSTYNET_EXIT_UNDERLAY_IP:-}"
 NAT_PROFILE="baseline_lan"
 IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
@@ -58,6 +60,8 @@ options:
   --nat-profile <profile>              Default: baseline_lan
   --impairment-profile <profile>       Default: none
   --ssh-allow-cidrs <cidr[,cidr]>
+  --client-underlay-ip <ipv4>
+  --exit-underlay-ip <ipv4>
   --soak-duration-secs <secs>          Default: 120
   --sample-interval-secs <secs>        Default: 5
   --max-consecutive-failures <count>   Default: 2
@@ -141,6 +145,8 @@ while [[ $# -gt 0 ]]; do
     --exit-node-id) EXIT_NODE_ID="$2"; shift 2 ;;
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
+    --client-underlay-ip) CLIENT_UNDERLAY_IP="$2"; shift 2 ;;
+    --exit-underlay-ip) EXIT_UNDERLAY_IP="$2"; shift 2 ;;
     --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
     --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
@@ -172,6 +178,13 @@ fi
 if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" ]]; then
   echo "--client-network-id and --exit-network-id must differ" >&2
   exit 2
+fi
+
+if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+fi
+if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
 
 validate_positive_integer "soak duration seconds" "$SOAK_DURATION_SECS"
@@ -223,6 +236,8 @@ main() {
       --exit-node-id "$EXIT_NODE_ID" \
       --client-network-id "$CLIENT_NETWORK_ID" \
       --exit-network-id "$EXIT_NETWORK_ID" \
+      --client-underlay-ip "${CLIENT_UNDERLAY_IP:-}" \
+      --exit-underlay-ip "${EXIT_UNDERLAY_IP:-}" \
       --nat-profile "$NAT_PROFILE" \
       --impairment-profile "$IMPAIRMENT_PROFILE" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -268,8 +283,16 @@ main() {
   if [[ "$direct_topology_check" == 'pass' ]]; then
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="pass"
   fi
-  direct_client_underlay="$(live_lab_target_address "$CLIENT_HOST")"
-  direct_exit_underlay="$(live_lab_target_address "$EXIT_HOST")"
+  if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
+    direct_client_underlay="$CLIENT_UNDERLAY_IP"
+  else
+    direct_client_underlay="$(live_lab_target_address "$CLIENT_HOST")"
+  fi
+  if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
+    direct_exit_underlay="$EXIT_UNDERLAY_IP"
+  else
+    direct_exit_underlay="$(live_lab_target_address "$EXIT_HOST")"
+  fi
   CLIENT_ADDR="$direct_client_underlay"
   EXIT_ADDR="$direct_exit_underlay"
 

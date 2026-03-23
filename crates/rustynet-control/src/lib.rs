@@ -1385,6 +1385,60 @@ pub struct SignedEndpointHintBundle {
     pub target_node_id: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct TraversalCoordinationRecord {
+    pub session_id: [u8; 16],
+    pub probe_start_unix: u64,
+    pub node_a: String,
+    pub node_b: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: [u8; 16],
+}
+
+impl fmt::Debug for TraversalCoordinationRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraversalCoordinationRecord")
+            .field("session_id", &"REDACTED")
+            .field("probe_start_unix", &self.probe_start_unix)
+            .field("node_a", &self.node_a)
+            .field("node_b", &self.node_b)
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("nonce", &"REDACTED")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignedTraversalCoordinationRecord {
+    pub payload: String,
+    pub signature_hex: String,
+    pub session_id: [u8; 16],
+    pub probe_start_unix: u64,
+    pub node_a: String,
+    pub node_b: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: [u8; 16],
+}
+
+impl fmt::Debug for SignedTraversalCoordinationRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignedTraversalCoordinationRecord")
+            .field("payload", &"REDACTED")
+            .field("signature_hex", &"REDACTED")
+            .field("session_id", &"REDACTED")
+            .field("probe_start_unix", &self.probe_start_unix)
+            .field("node_a", &self.node_a)
+            .field("node_b", &self.node_b)
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("nonce", &"REDACTED")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoTunnelRouteKind {
     Mesh,
@@ -2160,6 +2214,95 @@ impl ControlPlaneCore {
         })
     }
 
+    pub fn signed_traversal_coordination_record(
+        &self,
+        record: TraversalCoordinationRecord,
+    ) -> Result<SignedTraversalCoordinationRecord, ControlPlaneError> {
+        if record.issued_at_unix == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "coordination issued_at_unix must be greater than zero".to_string(),
+            ));
+        }
+        if record.probe_start_unix == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "coordination probe_start_unix must be greater than zero".to_string(),
+            ));
+        }
+        if record.issued_at_unix >= record.expires_at_unix {
+            return Err(ControlPlaneError::Traversal(
+                "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+            ));
+        }
+        if record
+            .expires_at_unix
+            .saturating_sub(record.issued_at_unix)
+            > 30
+        {
+            return Err(ControlPlaneError::Traversal(
+                "coordination ttl exceeds max supported value".to_string(),
+            ));
+        }
+        if record.probe_start_unix > record.expires_at_unix {
+            return Err(ControlPlaneError::Traversal(
+                "coordination probe_start_unix must not exceed expires_at_unix".to_string(),
+            ));
+        }
+        if record.node_a.trim() == record.node_b.trim() {
+            return Err(ControlPlaneError::Traversal(
+                "coordination requires distinct node_a and node_b".to_string(),
+            ));
+        }
+        if !is_valid_node_id_text(record.node_a.as_str()) {
+            return Err(ControlPlaneError::Traversal(
+                "coordination node_a must not be empty".to_string(),
+            ));
+        }
+        if !is_valid_node_id_text(record.node_b.as_str()) {
+            return Err(ControlPlaneError::Traversal(
+                "coordination node_b must not be empty".to_string(),
+            ));
+        }
+
+        if record.session_id.iter().all(|value| *value == 0) {
+            return Err(ControlPlaneError::Traversal(
+                "coordination session_id must not be all zeros".to_string(),
+            ));
+        }
+        if record.nonce.iter().all(|value| *value == 0) {
+            return Err(ControlPlaneError::Traversal(
+                "coordination nonce must not be all zeros".to_string(),
+            ));
+        }
+
+        let node_a = self
+            .nodes
+            .get(record.node_a.as_str())?
+            .ok_or_else(|| ControlPlaneError::Traversal("coordination node_a does not exist".to_string()))?;
+        let node_b = self
+            .nodes
+            .get(record.node_b.as_str())?
+            .ok_or_else(|| ControlPlaneError::Traversal("coordination node_b does not exist".to_string()))?;
+        if !self.policy_allows_node_pair(&node_a, &node_b) {
+            return Err(ControlPlaneError::Traversal(
+                "coordination denied by policy".to_string(),
+            ));
+        }
+
+        let payload = serialize_traversal_coordination_payload(&record)?;
+        let signature = self.endpoint_hint_signing_key.sign(payload.as_bytes());
+        Ok(SignedTraversalCoordinationRecord {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            session_id: record.session_id,
+            probe_start_unix: record.probe_start_unix,
+            node_a: record.node_a,
+            node_b: record.node_b,
+            issued_at_unix: record.issued_at_unix,
+            expires_at_unix: record.expires_at_unix,
+            nonce: record.nonce,
+        })
+    }
+
     pub fn verify_signed_endpoint_hint_bundle(&self, bundle: &SignedEndpointHintBundle) -> bool {
         if bundle.generated_at_unix >= bundle.expires_at_unix {
             return false;
@@ -2175,6 +2318,70 @@ impl ControlPlaneCore {
         };
         verifying_key
             .verify(bundle.payload.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    pub fn verify_signed_traversal_coordination_record(
+        &self,
+        record: &SignedTraversalCoordinationRecord,
+    ) -> bool {
+        if record.issued_at_unix >= record.expires_at_unix {
+            return false;
+        }
+        if record
+            .expires_at_unix
+            .saturating_sub(record.issued_at_unix)
+            > 30
+        {
+            return false;
+        }
+        if record.probe_start_unix > record.expires_at_unix {
+            return false;
+        }
+        if record.node_a.trim() == record.node_b.trim() {
+            return false;
+        }
+        if !is_valid_node_id_text(record.node_a.as_str())
+            || !is_valid_node_id_text(record.node_b.as_str())
+        {
+            return false;
+        }
+        if record.session_id.iter().all(|value| *value == 0) {
+            return false;
+        }
+        if record.nonce.iter().all(|value| *value == 0) {
+            return false;
+        }
+
+        let expected_payload = match serialize_traversal_coordination_payload(
+            &TraversalCoordinationRecord {
+                session_id: record.session_id,
+                probe_start_unix: record.probe_start_unix,
+                node_a: record.node_a.clone(),
+                node_b: record.node_b.clone(),
+                issued_at_unix: record.issued_at_unix,
+                expires_at_unix: record.expires_at_unix,
+                nonce: record.nonce,
+            },
+        ) {
+            Ok(payload) => payload,
+            Err(_) => return false,
+        };
+        if expected_payload != record.payload {
+            return false;
+        }
+
+        let signature_bytes = match decode_hex_to_fixed::<64>(&record.signature_hex) {
+            Ok(bytes) => bytes,
+            Err(()) => return false,
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+        let verifying_key = match VerifyingKey::from_bytes(&self.endpoint_hint_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verifying_key
+            .verify(record.payload.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -2433,6 +2640,10 @@ fn selectors_for_node(node: &NodeMetadata) -> Vec<String> {
     selectors
 }
 
+fn is_valid_node_id_text(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
 struct AutoTunnelPayloadHeader<'a> {
     node_id: &'a str,
     mesh_cidr: &'a str,
@@ -2575,6 +2786,66 @@ fn serialize_endpoint_hint_payload(
     Ok(payload)
 }
 
+fn serialize_traversal_coordination_payload(
+    record: &TraversalCoordinationRecord,
+) -> Result<String, ControlPlaneError> {
+    if !is_valid_node_id_text(record.node_a.as_str()) || !is_valid_node_id_text(record.node_b.as_str())
+    {
+        return Err(ControlPlaneError::Traversal(
+            "coordination node ids must not be empty".to_string(),
+        ));
+    }
+    if record.node_a.trim() == record.node_b.trim() {
+        return Err(ControlPlaneError::Traversal(
+            "coordination requires distinct nodes".to_string(),
+        ));
+    }
+    if record.issued_at_unix >= record.expires_at_unix {
+        return Err(ControlPlaneError::Traversal(
+            "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+        ));
+    }
+    if record
+        .expires_at_unix
+        .saturating_sub(record.issued_at_unix)
+        > 30
+    {
+        return Err(ControlPlaneError::Traversal(
+            "coordination ttl exceeds max supported value".to_string(),
+        ));
+    }
+    if record.probe_start_unix > record.expires_at_unix {
+        return Err(ControlPlaneError::Traversal(
+            "coordination probe_start_unix must not exceed expires_at_unix".to_string(),
+        ));
+    }
+    if record.session_id.iter().all(|value| *value == 0) {
+        return Err(ControlPlaneError::Traversal(
+            "coordination session_id must not be all zeros".to_string(),
+        ));
+    }
+    if record.nonce.iter().all(|value| *value == 0) {
+        return Err(ControlPlaneError::Traversal(
+            "coordination nonce must not be all zeros".to_string(),
+        ));
+    }
+
+    let mut payload = String::new();
+    payload.push_str("version=1\n");
+    payload.push_str("type=traversal_coordination\n");
+    payload.push_str(&format!(
+        "session_id={}\n",
+        hex_bytes(record.session_id.as_slice())
+    ));
+    payload.push_str(&format!("probe_start_unix={}\n", record.probe_start_unix));
+    payload.push_str(&format!("node_a={}\n", record.node_a.trim()));
+    payload.push_str(&format!("node_b={}\n", record.node_b.trim()));
+    payload.push_str(&format!("issued_at_unix={}\n", record.issued_at_unix));
+    payload.push_str(&format!("expires_at_unix={}\n", record.expires_at_unix));
+    payload.push_str(&format!("nonce={}\n", hex_bytes(record.nonce.as_slice())));
+    Ok(payload)
+}
+
 fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
     let Some((ip_part, prefix_part)) = value.split_once('/') else {
         return false;
@@ -2603,7 +2874,8 @@ mod tests {
         EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
         ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
         SignedDnsZoneBundleRequest, ThrowawayCredentialState, ThrowawayCredentialStore,
-        TokenClaims, TransportPolicyError, TrustState, derive_signing_seed, hex_bytes,
+        TokenClaims, TransportPolicyError, TraversalCoordinationRecord, TrustState,
+        derive_signing_seed, hex_bytes,
         load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
@@ -3542,6 +3814,161 @@ mod tests {
                 .to_string()
                 .contains("relay candidates require relay_id")
         );
+    }
+
+    #[test]
+    fn traversal_coordination_record_is_signed_and_tamper_detected() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("coord-cred-a", "coord-node-a", "198.51.100.170:51820", [170; 32]),
+            ("coord-cred-b", "coord-node-b", "198.51.100.171:51820", [171; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let signed = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [0x11; 16],
+                probe_start_unix: 205,
+                node_a: "coord-node-a".to_string(),
+                node_b: "coord-node-b".to_string(),
+                issued_at_unix: 200,
+                expires_at_unix: 225,
+                nonce: [0x22; 16],
+            })
+            .expect("coordination record should be issued");
+        assert!(core.verify_signed_traversal_coordination_record(&signed));
+
+        let mut tampered_payload = signed.clone();
+        tampered_payload.payload.push_str("node_b=coord-node-c\n");
+        assert!(!core.verify_signed_traversal_coordination_record(&tampered_payload));
+
+        let mut tampered_signature = signed.clone();
+        tampered_signature.signature_hex = "00".repeat(64);
+        assert!(!core.verify_signed_traversal_coordination_record(&tampered_signature));
+    }
+
+    #[test]
+    fn traversal_coordination_record_enforces_validation_rules() {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:coord-node-a".to_string(),
+                dst: "node:coord-node-b".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("coord-cred-c", "coord-node-a", "198.51.100.172:51820", [172; 32]),
+            ("coord-cred-d", "coord-node-b", "198.51.100.173:51820", [173; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+
+        let ttl_error = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [0x33; 16],
+                probe_start_unix: 205,
+                node_a: "coord-node-a".to_string(),
+                node_b: "coord-node-b".to_string(),
+                issued_at_unix: 200,
+                expires_at_unix: 231,
+                nonce: [0x44; 16],
+            })
+            .expect_err("ttl > 30s must be rejected");
+        assert!(ttl_error.to_string().contains("ttl exceeds"));
+
+        let node_error = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [0x33; 16],
+                probe_start_unix: 205,
+                node_a: "coord-node-a".to_string(),
+                node_b: "missing-node".to_string(),
+                issued_at_unix: 200,
+                expires_at_unix: 225,
+                nonce: [0x44; 16],
+            })
+            .expect_err("missing node must be rejected");
+        assert!(node_error.to_string().contains("does not exist"));
+
+        let same_node_error = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [0x33; 16],
+                probe_start_unix: 205,
+                node_a: "coord-node-a".to_string(),
+                node_b: "coord-node-a".to_string(),
+                issued_at_unix: 200,
+                expires_at_unix: 225,
+                nonce: [0x44; 16],
+            })
+            .expect_err("same node ids must be rejected");
+        assert!(same_node_error.to_string().contains("distinct"));
+    }
+
+    #[test]
+    fn traversal_coordination_record_debug_redacts_sensitive_fields() {
+        let record = TraversalCoordinationRecord {
+            session_id: [0x55; 16],
+            probe_start_unix: 210,
+            node_a: "node-a".to_string(),
+            node_b: "node-b".to_string(),
+            issued_at_unix: 200,
+            expires_at_unix: 220,
+            nonce: [0x66; 16],
+        };
+        let rendered = format!("{record:?}");
+        assert!(rendered.contains("REDACTED"));
+        assert!(!rendered.contains("55"));
+        assert!(!rendered.contains("66"));
     }
 
     #[test]

@@ -18,6 +18,10 @@ This script automates the live Linux lab workflow that was previously being run 
 - run explicit hard-fail cross-network remote-exit stages after the current live suite
 - emit structured reports with explicit hard-fail and soft-fail stages
 
+Companion documents:
+- cross-network prerequisites checklist: `documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`
+- cross-network incident response playbook: `documents/operations/CrossNetworkRemoteExitIncidentPlaybook.md`
+
 ## Target topology
 
 Minimum supported topology:
@@ -218,7 +222,7 @@ Current behavior:
   - still fails closed if the measured topology cannot credibly prove a cross-network claim
 - `cross_network_failback_roaming`
   - runs a real validator that first proves the relay path, then measures relay -> direct failback and signed endpoint-roam recovery on the live path
-  - still fails closed if failback timing, endpoint adoption, or post-roam leak resistance cannot be proven
+  - still fails closed if failback reconnect SLO, underlay leak-free reconnecting, signed-state validity while reconnecting, endpoint adoption, or post-roam leak resistance cannot be proven
 - `cross_network_traversal_adversarial`
   - runs a real validator that combines local signed traversal tamper/replay regression tests with live rogue-endpoint denial and control-surface exposure checks
 - `cross_network_remote_exit_dns`

@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ipc::{IpcCommand, IpcResponse, parse_command, validate_cidr};
+use crate::ipc::{parse_command, validate_cidr, IpcCommand, IpcResponse};
 #[cfg(target_os = "macos")]
 use crate::key_material::read_passphrase_file;
 use crate::key_material::{
@@ -34,21 +34,22 @@ use crate::phase10::{
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
 use crate::privileged_helper::{
+    PrivilegedCommandClient, PrivilegedCommandProgram,
     DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH as HELPER_DEFAULT_SOCKET_PATH,
-    DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS, PrivilegedCommandClient,
-    PrivilegedCommandProgram,
+    DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS,
 };
 use crate::resilience::{
-    ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
+    load_session_snapshot, persist_session_snapshot, ResilienceError, SessionStateSnapshot,
 };
 use crate::traversal::{
-    CandidateSource as ProbeCandidateSource,
+    CandidateSource as ProbeCandidateSource, TraversalCandidate as ProbeTraversalCandidate,
+    TraversalEngineConfig,
     DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES as TRAVERSAL_DEFAULT_MAX_CANDIDATES,
     DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS as TRAVERSAL_DEFAULT_MAX_PAIRS,
     DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES as TRAVERSAL_DEFAULT_RELAY_SWITCH_AFTER_FAILURES,
     DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS as TRAVERSAL_DEFAULT_ROUND_SPACING_MS,
     DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS as TRAVERSAL_DEFAULT_SIMULTANEOUS_ROUNDS,
-    TraversalCandidate as ProbeTraversalCandidate, TraversalEngineConfig,
+    DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS as TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nix::sys::socket::getsockopt;
@@ -74,15 +75,18 @@ use rustynet_backend_wireguard::MacosWireguardBackend;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
-use rustynet_control::membership::{
-    MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
-    replay_membership_snapshot_and_log,
+use rustynet_control::{
+    membership::{
+        load_membership_log, load_membership_snapshot, replay_membership_snapshot_and_log,
+        MembershipNodeStatus, MembershipState,
+    },
+    AuthError, AuthSurfaceGuard, TokenClaims,
 };
 use rustynet_dns_zone::{
-    DnsZoneError, DnsZoneWatermark, SignedDnsZoneBundle as DnsZoneBundle,
     canonicalize_dns_zone_name, dns_zone_payload_digest, dns_zone_watermark_ordering,
     parse_dns_zone_verifying_key, parse_signed_dns_zone_bundle_wire,
-    verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
+    verify_signed_dns_zone_bundle as verify_dns_zone_bundle, DnsZoneError, DnsZoneWatermark,
+    SignedDnsZoneBundle as DnsZoneBundle,
 };
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet, Decision,
@@ -122,6 +126,8 @@ pub const DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 =
 pub const DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = TRAVERSAL_DEFAULT_ROUND_SPACING_MS;
 pub const DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 =
     TRAVERSAL_DEFAULT_RELAY_SWITCH_AFTER_FAILURES;
+pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 =
+    TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS;
 pub const DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS: u64 = 30;
 pub const DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
@@ -136,6 +142,7 @@ pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
 pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
+pub const DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT: &str = "user:local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
@@ -170,6 +177,231 @@ const MAX_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 = 8;
 const MAX_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = 5_000;
 const MAX_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 = 16;
 const MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 3_600;
+const MIN_DNS_ZONE_REFRESH_MARGIN_SECS: u64 = 30;
+const MIN_DNS_ZONE_REFRESH_COOLDOWN_SECS: u64 = 10;
+const MAX_DNS_ZONE_REFRESH_JITTER_SECS: u64 = 45;
+const MIN_TRAVERSAL_REFRESH_MARGIN_SECS: u64 = 15;
+const MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS: u64 = 5;
+const MAX_TRAVERSAL_REFRESH_JITTER_SECS: u64 = 30;
+const REMOTE_OPS_WIRE_PREFIX: &str = "remote-op-v1";
+const REMOTE_OPS_SIGNATURE_SCOPE_V1: &str = "daemon_ipc_remote_op";
+const REMOTE_OPS_REQUIRED_FIELD_COUNT: usize = 6;
+const MAX_REMOTE_OPS_SUBJECT_BYTES: usize = 128;
+const MAX_REMOTE_OPS_NONCE_BYTES: usize = 128;
+const MAX_REMOTE_OPS_COMMAND_BYTES: usize = 1024;
+
+// Minimal network-based signed state fetcher (B1 - pull based). This implements a
+// conservative pull path: if a URL environment variable is provided for a state
+// artifact, attempt a minimal HTTP GET, verify the returned artifact using the
+// existing verification functions, and only persist watermark after success.
+// If the endpoint is not configured or the network is unreachable, fall back to
+// existing disk-based behavior (do not fail). Any signature/freshness/watermark
+// verification failure is treated as a hard error and will be returned.
+
+#[derive(Debug)]
+enum FetchDecision {
+    Skipped,    // endpoint not configured or network unreachable -> fallback to disk
+    Applied,    // fetched and verified; persisted
+}
+
+struct StateFetcher {
+    // The daemon paths are passed in for verifier keys and watermark locations.
+    trust_verifier_key_path: PathBuf,
+    trust_watermark_path: PathBuf,
+    trust_evidence_path: PathBuf,
+    traversal_verifier_key_path: PathBuf,
+    traversal_watermark_path: PathBuf,
+    traversal_bundle_path: PathBuf,
+    assignment_verifier_key_path: Option<PathBuf>,
+    assignment_watermark_path: Option<PathBuf>,
+    assignment_bundle_path: Option<PathBuf>,
+    dns_zone_verifier_key_path: PathBuf,
+    dns_zone_watermark_path: PathBuf,
+    dns_zone_bundle_path: PathBuf,
+}
+
+impl StateFetcher {
+    fn new_from_daemon(cfg: &DaemonConfig) -> Self {
+        Self {
+            trust_verifier_key_path: PathBuf::from(&cfg.trust_verifier_key_path),
+            trust_watermark_path: PathBuf::from(&cfg.trust_watermark_path),
+            trust_evidence_path: PathBuf::from(&cfg.trust_evidence_path),
+            traversal_verifier_key_path: PathBuf::from(&cfg.traversal_verifier_key_path),
+            traversal_watermark_path: PathBuf::from(&cfg.traversal_watermark_path),
+            traversal_bundle_path: PathBuf::from(&cfg.traversal_bundle_path),
+            assignment_verifier_key_path: cfg.auto_tunnel_verifier_key_path.clone(),
+            assignment_watermark_path: cfg.auto_tunnel_watermark_path.clone(),
+            assignment_bundle_path: cfg.auto_tunnel_bundle_path.clone(),
+            dns_zone_verifier_key_path: PathBuf::from(&cfg.dns_zone_verifier_key_path),
+            dns_zone_watermark_path: PathBuf::from(&cfg.dns_zone_watermark_path),
+            dns_zone_bundle_path: PathBuf::from(&cfg.dns_zone_bundle_path),
+        }
+    }
+
+    // Minimal HTTP GET using TcpStream. Returns Ok(body_bytes) on success, Err on network error.
+    fn http_get_raw(url: &str) -> Result<Vec<u8>, String> {
+        // Expect form: http://host[:port]/path
+        let url = url.trim();
+        if !url.starts_with("http://") {
+            return Err("only http:// URLs are supported in this minimal fetcher".to_string());
+        }
+        let without_proto = &url[7..];
+        let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
+        let host_port = parts.get(0).ok_or_else(|| "invalid url".to_string())?;
+        let path = format!("/{}", parts.get(1).unwrap_or(&""));
+        let mut host = host_port.to_string();
+        let mut port = 80u16;
+        if host_port.contains(':') {
+            let mut hp = host_port.splitn(2, ':');
+            host = hp.next().unwrap_or("").to_string();
+            if let Some(p) = hp.next() {
+                port = p.parse::<u16>().map_err(|_| "invalid port in url".to_string())?;
+            }
+        }
+        let addr = format!("{}:{}", host, port);
+        let mut stream = match std::net::TcpStream::connect_timeout(
+            &addr
+                .to_socket_addrs()
+                .map_err(|_| "resolve failed".to_string())?
+                .next()
+                .ok_or_else(|| "resolve returned no addresses".to_string())?,
+            Duration::from_secs(3),
+        ) {
+            Ok(s) => s,
+            Err(_) => return Err("network unreachable".to_string()),
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
+        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|_| "write to socket failed".to_string())?;
+        let mut buf = Vec::new();
+        stream
+            .read_to_end(&mut buf)
+            .map_err(|_| "read from socket failed".to_string())?;
+        // Very minimal HTTP response parsing: look for \r\n\r\n and take the rest as body.
+        if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body = buf.split_off(idx + 4);
+            Ok(body)
+        } else {
+            Err("malformed http response".to_string())
+        }
+    }
+
+    fn fetch_trust(&self) -> Result<FetchDecision, String> {
+        if let Ok(url) = std::env::var("RUSTYNET_TRUST_URL") {
+            match Self::http_get_raw(url.as_str()) {
+                Ok(body) => {
+                    // write to temp file and run verification
+                    let tmp = std::env::temp_dir().join("rustynetd.trust.tmp");
+                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    // Verify using existing function; if verification fails, return Err.
+                    match verify_signed_trust_state_artifact(&tmp, &self.trust_verifier_key_path, &self.trust_watermark_path, DEFAULT_TRUST_MAX_AGE_SECS, DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS) {
+                        Ok(report) => {
+                            // Persist artifact atomically
+                            std::fs::rename(&tmp, &self.trust_evidence_path)
+                                .map_err(|e| format!("persist trust evidence failed: {e}"))?;
+                            // The verification functions persist watermark themselves when called via load_* helpers; to be safe, do nothing here.
+                            eprintln!("statefetch: applied trust bundle: nonce={}", report.nonce);
+                            Ok(FetchDecision::Applied)
+                        }
+                        Err(err) => Err(format!("trust fetch verification failed: {err}")),
+                    }
+                }
+                Err(_network_err) => {
+                    // preserve existing disk-based path: treat as skipped
+                    Ok(FetchDecision::Skipped)
+                }
+            }
+        } else {
+            Ok(FetchDecision::Skipped)
+        }
+    }
+
+    fn fetch_traversal(&self) -> Result<FetchDecision, String> {
+        if let Ok(url) = std::env::var("RUSTYNET_TRAVERSAL_URL") {
+            match Self::http_get_raw(url.as_str()) {
+                Ok(body) => {
+                    let tmp = std::env::temp_dir().join("rustynetd.traversal.tmp");
+                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    match verify_signed_traversal_state_artifact(&tmp, &self.traversal_verifier_key_path, &self.traversal_watermark_path, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS, Some("")) {
+                        Ok(report) => {
+                            std::fs::rename(&tmp, &self.traversal_bundle_path)
+                                .map_err(|e| format!("persist traversal bundle failed: {e}"))?;
+                            eprintln!("statefetch: applied traversal bundle: nonce={}", report.nonce);
+                            Ok(FetchDecision::Applied)
+                        }
+                        Err(err) => Err(format!("traversal fetch verification failed: {err}")),
+                    }
+                }
+                Err(_network_err) => Ok(FetchDecision::Skipped),
+            }
+        } else {
+            Ok(FetchDecision::Skipped)
+        }
+    }
+
+    fn fetch_assignment(&self) -> Result<FetchDecision, String> {
+        if let Ok(url) = std::env::var("RUSTYNET_ASSIGNMENT_URL") {
+            // require assignment paths configured
+            let bundle_path = match &self.assignment_bundle_path {
+                Some(p) => p,
+                None => return Ok(FetchDecision::Skipped),
+            };
+            let verifier_path = match &self.assignment_verifier_key_path {
+                Some(p) => p,
+                None => return Ok(FetchDecision::Skipped),
+            };
+            let watermark_path = match &self.assignment_watermark_path {
+                Some(p) => p,
+                None => return Ok(FetchDecision::Skipped),
+            };
+            match Self::http_get_raw(url.as_str()) {
+                Ok(body) => {
+                    let tmp = std::env::temp_dir().join("rustynetd.assignment.tmp");
+                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    match verify_signed_assignment_state_artifact(&tmp, verifier_path, watermark_path, self.assignment_bundle_path.as_deref().and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)).unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS), DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS, Some("") ) {
+                        Ok(report) => {
+                            std::fs::rename(&tmp, bundle_path)
+                                .map_err(|e| format!("persist assignment bundle failed: {e}"))?;
+                            eprintln!("statefetch: applied assignment bundle: nonce={}", report.nonce);
+                            Ok(FetchDecision::Applied)
+                        }
+                        Err(err) => Err(format!("assignment fetch verification failed: {err}")),
+                    }
+                }
+                Err(_network_err) => Ok(FetchDecision::Skipped),
+            }
+        } else {
+            Ok(FetchDecision::Skipped)
+        }
+    }
+
+    fn fetch_dns_zone(&self) -> Result<FetchDecision, String> {
+        if let Ok(url) = std::env::var("RUSTYNET_DNS_ZONE_URL") {
+            match Self::http_get_raw(url.as_str()) {
+                Ok(body) => {
+                    let tmp = std::env::temp_dir().join("rustynetd.dnszone.tmp");
+                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    match verify_dns_zone_bundle(&tmp, &parse_dns_zone_verifying_key(&std::fs::read_to_string(&self.dns_zone_verifier_key_path).map_err(|e| format!("read dns verifier key failed: {e}"))?).map_err(|e| format!("parse dns verifier key failed: {e}"))?) {
+                        Ok(report) => {
+                            std::fs::rename(&tmp, &self.dns_zone_bundle_path)
+                                .map_err(|e| format!("persist dns zone bundle failed: {e}"))?;
+                            eprintln!("statefetch: applied dns zone bundle: updated_at={}", report.updated_at_unix);
+                            Ok(FetchDecision::Applied)
+                        }
+                        Err(err) => Err(format!("dns zone fetch verification failed: {err}")),
+                    }
+                }
+                Err(_network_err) => Ok(FetchDecision::Skipped),
+            }
+        } else {
+            Ok(FetchDecision::Skipped)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DaemonDataplaneMode {
@@ -233,6 +465,7 @@ impl NodeRole {
                 command,
                 IpcCommand::Status
                     | IpcCommand::Netcheck
+                    | IpcCommand::StateRefresh
                     | IpcCommand::ExitNodeSelect(_)
                     | IpcCommand::ExitNodeOff
                     | IpcCommand::LanAccessOn
@@ -241,7 +474,10 @@ impl NodeRole {
             ),
             NodeRole::BlindExit => matches!(
                 command,
-                IpcCommand::Status | IpcCommand::Netcheck | IpcCommand::DnsInspect
+                IpcCommand::Status
+                    | IpcCommand::Netcheck
+                    | IpcCommand::StateRefresh
+                    | IpcCommand::DnsInspect
             ),
         }
     }
@@ -294,6 +530,8 @@ pub struct DaemonConfig {
     pub traversal_probe_relay_switch_after_failures: NonZeroU8,
     pub traversal_probe_handshake_freshness_secs: NonZeroU64,
     pub traversal_probe_reprobe_interval_secs: NonZeroU64,
+    pub traversal_stun_servers: Vec<SocketAddr>,
+    pub traversal_stun_gather_timeout_ms: NonZeroU64,
     pub backend_mode: DaemonBackendMode,
     pub wg_interface: String,
     pub wg_listen_port: u16,
@@ -302,6 +540,8 @@ pub struct DaemonConfig {
     pub wg_key_passphrase_path: Option<PathBuf>,
     pub wg_public_key_path: Option<PathBuf>,
     pub egress_interface: String,
+    pub remote_ops_token_verifier_key_path: Option<PathBuf>,
+    pub remote_ops_expected_subject: String,
     pub auto_port_forward_exit: bool,
     pub auto_port_forward_lease_secs: NonZeroU32,
     pub dataplane_mode: DaemonDataplaneMode,
@@ -375,6 +615,11 @@ impl Default for DaemonConfig {
                 DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
             )
             .expect("default traversal probe reprobe interval must be non-zero"),
+            traversal_stun_servers: Vec::new(),
+            traversal_stun_gather_timeout_ms: NonZeroU64::new(
+                DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
+            )
+            .expect("default traversal stun gather timeout must be non-zero"),
             backend_mode: DaemonBackendMode::default(),
             wg_interface: DEFAULT_WG_INTERFACE.to_string(),
             wg_listen_port: DEFAULT_WG_LISTEN_PORT,
@@ -385,6 +630,8 @@ impl Default for DaemonConfig {
             wg_key_passphrase_path: Some(PathBuf::from(DEFAULT_WG_KEY_PASSPHRASE_PATH)),
             wg_public_key_path: Some(PathBuf::from(DEFAULT_WG_PUBLIC_KEY_PATH)),
             egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
+            remote_ops_token_verifier_key_path: None,
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
             auto_port_forward_exit: DEFAULT_AUTO_PORT_FORWARD_EXIT,
             auto_port_forward_lease_secs: NonZeroU32::new(DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS)
                 .expect("default auto port-forward lease must be non-zero"),
@@ -421,6 +668,104 @@ impl fmt::Display for DaemonError {
 }
 
 impl std::error::Error for DaemonError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandEnvelope {
+    Local(IpcCommand),
+    Remote(RemoteCommandEnvelope),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteCommandEnvelope {
+    subject: String,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: String,
+    command: String,
+    signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteOpsEnvelopeParseError {
+    InvalidPrefix,
+    InvalidEncoding,
+    MissingField(&'static str),
+    DuplicateField(&'static str),
+    UnknownField(String),
+    InvalidFieldLength(&'static str),
+    InvalidTimestamp(&'static str),
+    EmptyCommand,
+    InvalidCommand,
+}
+
+impl fmt::Display for RemoteOpsEnvelopeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoteOpsEnvelopeParseError::InvalidPrefix => {
+                f.write_str("remote ops envelope prefix is invalid")
+            }
+            RemoteOpsEnvelopeParseError::InvalidEncoding => {
+                f.write_str("remote ops envelope uses invalid encoding")
+            }
+            RemoteOpsEnvelopeParseError::MissingField(field) => {
+                write!(f, "remote ops envelope missing required field {field}")
+            }
+            RemoteOpsEnvelopeParseError::DuplicateField(field) => {
+                write!(f, "remote ops envelope has duplicate field {field}")
+            }
+            RemoteOpsEnvelopeParseError::UnknownField(field) => {
+                write!(f, "remote ops envelope has unknown field {field}")
+            }
+            RemoteOpsEnvelopeParseError::InvalidFieldLength(field) => {
+                write!(f, "remote ops envelope field {field} length is invalid")
+            }
+            RemoteOpsEnvelopeParseError::InvalidTimestamp(field) => {
+                write!(f, "remote ops envelope timestamp {field} is invalid")
+            }
+            RemoteOpsEnvelopeParseError::EmptyCommand => {
+                f.write_str("remote ops command must not be empty")
+            }
+            RemoteOpsEnvelopeParseError::InvalidCommand => {
+                f.write_str("remote ops command is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteOpsEnvelopeParseError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteOpsAuthError {
+    KeyLoad(String),
+    SignatureInvalid,
+    SubjectDenied,
+    ReplayDetected,
+    TokenInvalid,
+}
+
+impl fmt::Display for RemoteOpsAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoteOpsAuthError::KeyLoad(message) => {
+                write!(f, "remote ops verifier key load failed: {message}")
+            }
+            RemoteOpsAuthError::SignatureInvalid => {
+                f.write_str("remote ops signature verification failed")
+            }
+            RemoteOpsAuthError::SubjectDenied => {
+                f.write_str("remote ops subject is not authorized")
+            }
+            RemoteOpsAuthError::ReplayDetected => {
+                f.write_str("remote ops replay detected")
+            }
+            RemoteOpsAuthError::TokenInvalid => {
+                f.write_str("remote ops token lifetime is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteOpsAuthError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrustBootstrapError {
@@ -1401,13 +1746,28 @@ struct DaemonRuntime {
     last_applied_assignment: Option<AutoTunnelWatermark>,
     local_route_reconcile_pending: bool,
     max_reconcile_failures: u32,
+    remote_ops_expected_subject: String,
+    remote_ops_guard: Option<AuthSurfaceGuard>,
+    remote_ops_verifying_key: Option<VerifyingKey>,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
     dns_zone: Option<DnsZoneBundleEnvelope>,
     dns_zone_error: Option<String>,
+    dns_zone_stale_rejections: u64,
+    dns_zone_replay_rejections: u64,
+    dns_zone_future_dated_rejections: u64,
+    dns_zone_preexpiry_refresh_events: u64,
+    dns_zone_last_preexpiry_refresh_unix: Option<u64>,
     traversal_hints: Option<TraversalBundleSetEnvelope>,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
+    traversal_stale_rejections: u64,
+    traversal_replay_rejections: u64,
+    traversal_future_dated_rejections: u64,
+    traversal_preexpiry_refresh_events: u64,
+    traversal_last_preexpiry_refresh_unix: Option<u64>,
+    traversal_endpoint_change_events: u64,
+    traversal_last_endpoint_fingerprint: Option<String>,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
     auto_port_forward_lease_secs: u32,
@@ -1452,6 +1812,23 @@ impl TraversalAuthorityMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignedStateRefreshReason {
+    PreExpiry,
+    EndpointChange,
+    Command,
+}
+
+impl SignedStateRefreshReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignedStateRefreshReason::PreExpiry => "preexpiry",
+            SignedStateRefreshReason::EndpointChange => "endpoint_change",
+            SignedStateRefreshReason::Command => "command",
+        }
+    }
+}
+
 impl DaemonRuntime {
     fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
         NodeId::new(config.node_id.clone())
@@ -1484,6 +1861,14 @@ impl DaemonRuntime {
             })
             .transpose()
             .map_err(DaemonError::InvalidConfig)?;
+        let remote_ops_verifying_key = config
+            .remote_ops_token_verifier_key_path
+            .as_ref()
+            .map(|path| load_remote_ops_access_token_verifying_key(path))
+            .transpose()?;
+        let remote_ops_guard = remote_ops_verifying_key
+            .as_ref()
+            .map(|_| AuthSurfaceGuard::default());
         Ok(Self {
             controller,
             policy,
@@ -1529,6 +1914,8 @@ impl DaemonRuntime {
                 relay_switch_after_failures: config
                     .traversal_probe_relay_switch_after_failures
                     .get(),
+                stun_servers: config.traversal_stun_servers.clone(),
+                stun_gather_timeout_ms: config.traversal_stun_gather_timeout_ms.get(),
             },
             traversal_probe_handshake_freshness_secs: config
                 .traversal_probe_handshake_freshness_secs
@@ -1549,13 +1936,28 @@ impl DaemonRuntime {
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
+            remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
+            remote_ops_guard,
+            remote_ops_verifying_key,
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
             dns_zone: None,
             dns_zone_error: None,
+            dns_zone_stale_rejections: 0,
+            dns_zone_replay_rejections: 0,
+            dns_zone_future_dated_rejections: 0,
+            dns_zone_preexpiry_refresh_events: 0,
+            dns_zone_last_preexpiry_refresh_unix: None,
             traversal_hints: None,
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
+            traversal_stale_rejections: 0,
+            traversal_replay_rejections: 0,
+            traversal_future_dated_rejections: 0,
+            traversal_preexpiry_refresh_events: 0,
+            traversal_last_preexpiry_refresh_unix: None,
+            traversal_endpoint_change_events: 0,
+            traversal_last_endpoint_fingerprint: None,
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
             auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
@@ -1575,6 +1977,57 @@ impl DaemonRuntime {
         )?;
         persist_trust_watermark(&self.trust_watermark_path, envelope.watermark)?;
         Ok(envelope.evidence)
+    }
+
+    fn authorize_remote_command(
+        &mut self,
+        envelope: &RemoteCommandEnvelope,
+        now_unix: u64,
+    ) -> Result<IpcCommand, RemoteOpsAuthError> {
+        let verifying_key = self
+            .remote_ops_verifying_key
+            .as_ref()
+            .ok_or_else(|| RemoteOpsAuthError::KeyLoad("missing verifier key".to_string()))?;
+        let command = parse_command(envelope.command.as_str());
+        if matches!(command, IpcCommand::Unknown(_)) {
+            return Err(RemoteOpsAuthError::TokenInvalid);
+        }
+        let payload = remote_ops_signature_payload(envelope);
+        let signature_bytes = decode_remote_ops_hex_to_fixed::<64>(envelope.signature_hex.as_str())
+            .map_err(|_| RemoteOpsAuthError::SignatureInvalid)?;
+        let signature = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify(payload.as_bytes(), &signature)
+            .map_err(|_| RemoteOpsAuthError::SignatureInvalid)?;
+
+        if envelope.subject != self.remote_ops_expected_subject {
+            return Err(RemoteOpsAuthError::SubjectDenied);
+        }
+        let token_claims = TokenClaims {
+            subject: envelope.subject.clone(),
+            issued_at_unix: envelope.issued_at_unix,
+            expires_at_unix: envelope.expires_at_unix,
+            nonce: envelope.nonce.clone(),
+        };
+        let guard = self
+            .remote_ops_guard
+            .as_mut()
+            .ok_or_else(|| RemoteOpsAuthError::KeyLoad("missing auth guard".to_string()))?;
+        match guard.validate_token_and_nonce(&token_claims, now_unix) {
+            Ok(()) => {}
+            Err(AuthError::ReplayDetected) => return Err(RemoteOpsAuthError::ReplayDetected),
+            Err(
+                AuthError::InvalidTokenLifetime
+                | AuthError::TokenExpired
+                | AuthError::TokenNotYetValid
+                | AuthError::TokenSignatureInvalid
+                | AuthError::RateLimited
+                | AuthError::LockedOutUntil(_)
+                | AuthError::Internal,
+            ) => return Err(RemoteOpsAuthError::TokenInvalid),
+        }
+
+        Ok(command)
     }
 
     fn load_verified_membership(&self) -> Result<MembershipState, MembershipBootstrapError> {
@@ -1673,7 +2126,7 @@ impl DaemonRuntime {
         bundle: &AutoTunnelBundle,
         membership_directory: &MembershipDirectory,
     ) -> Result<(), AutoTunnelBootstrapError> {
-        let subject = "user:local";
+        let subject = DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT;
 
         for peer in &bundle.peers {
             let decision = self.policy.evaluate_with_membership(
@@ -1776,9 +2229,85 @@ impl DaemonRuntime {
                 self.dns_zone = Some(envelope);
             }
             Err(err) => {
+                self.record_dns_zone_bootstrap_error(&err);
                 self.dns_zone_error = Some(err.to_string());
             }
         }
+    }
+
+    fn record_dns_zone_bootstrap_error(&mut self, err: &DnsZoneBootstrapError) {
+        match err {
+            DnsZoneBootstrapError::Stale => {
+                self.dns_zone_stale_rejections = self.dns_zone_stale_rejections.saturating_add(1);
+            }
+            DnsZoneBootstrapError::ReplayDetected => {
+                self.dns_zone_replay_rejections = self.dns_zone_replay_rejections.saturating_add(1);
+            }
+            DnsZoneBootstrapError::FutureDated => {
+                self.dns_zone_future_dated_rejections =
+                    self.dns_zone_future_dated_rejections.saturating_add(1);
+            }
+            DnsZoneBootstrapError::Missing
+            | DnsZoneBootstrapError::Io(_)
+            | DnsZoneBootstrapError::InvalidFormat(_)
+            | DnsZoneBootstrapError::KeyInvalid
+            | DnsZoneBootstrapError::SignatureInvalid
+            | DnsZoneBootstrapError::WrongNode
+            | DnsZoneBootstrapError::AssignmentMismatch(_) => {}
+        }
+    }
+
+    fn dns_zone_next_preexpiry_refresh_target(&self, now_unix: u64) -> Option<u64> {
+        let envelope = self.dns_zone.as_ref()?;
+        let expires_at_unix = envelope.bundle.expires_at_unix;
+        if expires_at_unix <= now_unix {
+            return Some(now_unix);
+        }
+        let ttl_window = expires_at_unix.saturating_sub(now_unix);
+        let margin = ttl_window
+            .saturating_div(4)
+            .max(MIN_DNS_ZONE_REFRESH_MARGIN_SECS)
+            .min(MAX_DNS_ZONE_REFRESH_JITTER_SECS);
+        Some(expires_at_unix.saturating_sub(margin))
+    }
+
+    fn dns_zone_refresh_jitter_offset_secs(&self) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(self.local_node_id.as_bytes());
+        hasher.update(self.wg_interface.as_bytes());
+        hasher.update(b"dns-zone-refresh");
+        let digest = hasher.finalize();
+        u64::from(digest[0]) % MAX_DNS_ZONE_REFRESH_JITTER_SECS
+    }
+
+    fn dns_zone_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
+        let Some(target_unix) = self.dns_zone_next_preexpiry_refresh_target(now_unix) else {
+            return false;
+        };
+        let scheduled_unix = target_unix.saturating_sub(self.dns_zone_refresh_jitter_offset_secs());
+        if now_unix < scheduled_unix {
+            return false;
+        }
+        if let Some(last_refresh_unix) = self.dns_zone_last_preexpiry_refresh_unix
+            && now_unix.saturating_sub(last_refresh_unix) < MIN_DNS_ZONE_REFRESH_COOLDOWN_SECS
+        {
+            return false;
+        }
+        true
+    }
+
+    fn maybe_preexpiry_refresh_dns_zone(
+        &mut self,
+        now_unix: u64,
+        auto_tunnel: Option<&AutoTunnelBundleEnvelope>,
+    ) {
+        if !self.dns_zone_preexpiry_refresh_due(now_unix) {
+            return;
+        }
+        self.dns_zone_preexpiry_refresh_events =
+            self.dns_zone_preexpiry_refresh_events.saturating_add(1);
+        self.dns_zone_last_preexpiry_refresh_unix = Some(now_unix);
+        self.refresh_dns_zone_state(auto_tunnel);
     }
 
     fn dns_zone_status_summary(&self) -> (String, String, String) {
@@ -1902,6 +2431,7 @@ impl DaemonRuntime {
                 self.traversal_probe_statuses.clear();
             }
             Err(err) => {
+                self.record_traversal_bootstrap_error(&err);
                 self.traversal_hints = None;
                 self.traversal_hint_error = Some(err.to_string());
                 self.traversal_probe_statuses.clear();
@@ -1915,6 +2445,229 @@ impl DaemonRuntime {
                     .controller
                     .force_fail_closed("traversal_runtime_sync_failed");
             }
+        }
+    }
+
+    fn refresh_signed_state_with_reason(
+        &mut self,
+        force_reprobe: bool,
+        reason: SignedStateRefreshReason,
+    ) -> Result<(), String> {
+        let _trust = self
+            .load_verified_trust()
+            .map_err(|err| format!("signed trust refresh failed: {err}"))?;
+        let membership_state = self
+            .load_verified_membership()
+            .map_err(|err| format!("signed membership refresh failed: {err}"))?;
+        let membership_directory = membership_directory_from_state(&membership_state);
+        let auto_bundle = if self.auto_tunnel_enforce {
+            Some(
+                self.load_verified_auto_tunnel(&membership_directory)
+                    .map_err(|err| format!("signed assignment refresh failed: {err}"))?,
+            )
+        } else {
+            None
+        };
+
+        self.membership_state = Some(membership_state);
+        self.membership_directory = membership_directory;
+        self.refresh_dns_zone_state(auto_bundle.as_ref());
+        self.refresh_traversal_hint_state(force_reprobe);
+
+        if self.traversal_authority_mode().is_enforced()
+            && self.traversal_hints.is_none()
+            && !self.controller.managed_peer_ids().is_empty()
+        {
+            return Err("signed traversal refresh failed: traversal state missing while peers are managed"
+                .to_string());
+        }
+
+        self.restriction_mode = RestrictionMode::None;
+        self.bootstrap_error = None;
+        self.reconcile_failures = 0;
+        self.last_reconcile_error = None;
+        eprintln!(
+            "rustynetd: signed state refresh completed (reason={})",
+            reason.as_str()
+        );
+        Ok(())
+    }
+
+    fn record_traversal_bootstrap_error(&mut self, err: &TraversalBootstrapError) {
+        match err {
+            TraversalBootstrapError::Stale => {
+                self.traversal_stale_rejections = self.traversal_stale_rejections.saturating_add(1);
+            }
+            TraversalBootstrapError::ReplayDetected => {
+                self.traversal_replay_rejections =
+                    self.traversal_replay_rejections.saturating_add(1);
+            }
+            TraversalBootstrapError::FutureDated => {
+                self.traversal_future_dated_rejections =
+                    self.traversal_future_dated_rejections.saturating_add(1);
+            }
+            TraversalBootstrapError::Missing
+            | TraversalBootstrapError::Io(_)
+            | TraversalBootstrapError::InvalidFormat(_)
+            | TraversalBootstrapError::KeyInvalid
+            | TraversalBootstrapError::SignatureInvalid => {}
+        }
+    }
+
+    fn traversal_next_preexpiry_refresh_target(&self, now_unix: u64) -> Option<u64> {
+        let envelope = self.traversal_hints.as_ref()?;
+        let expires_at_unix = envelope
+            .bundles
+            .first()
+            .map(|bundle| bundle.bundle.expires_at_unix)?;
+        if expires_at_unix <= now_unix {
+            return Some(now_unix);
+        }
+        let ttl_window = expires_at_unix.saturating_sub(now_unix);
+        let margin = ttl_window
+            .saturating_div(4)
+            .max(MIN_TRAVERSAL_REFRESH_MARGIN_SECS)
+            .min(MAX_TRAVERSAL_REFRESH_JITTER_SECS);
+        Some(expires_at_unix.saturating_sub(margin))
+    }
+
+    fn traversal_refresh_jitter_offset_secs(&self) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(self.local_node_id.as_bytes());
+        hasher.update(self.wg_interface.as_bytes());
+        let digest = hasher.finalize();
+        u64::from(digest[0]) % MAX_TRAVERSAL_REFRESH_JITTER_SECS
+    }
+
+    fn traversal_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
+        let Some(target_unix) = self.traversal_next_preexpiry_refresh_target(now_unix) else {
+            return false;
+        };
+        let scheduled_unix =
+            target_unix.saturating_sub(self.traversal_refresh_jitter_offset_secs());
+        if now_unix < scheduled_unix {
+            return false;
+        }
+        if let Some(last_refresh_unix) = self.traversal_last_preexpiry_refresh_unix
+            && now_unix.saturating_sub(last_refresh_unix) < MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS
+        {
+            return false;
+        }
+        true
+    }
+
+    fn maybe_preexpiry_refresh_traversal(&mut self, now_unix: u64) {
+        if !self.traversal_preexpiry_refresh_due(now_unix) {
+            return;
+        }
+        self.traversal_preexpiry_refresh_events =
+            self.traversal_preexpiry_refresh_events.saturating_add(1);
+        self.traversal_last_preexpiry_refresh_unix = Some(now_unix);
+        if let Err(err) =
+            self.refresh_signed_state_with_reason(true, SignedStateRefreshReason::PreExpiry)
+        {
+            self.restrict_recoverable(err);
+            let _ = self.controller.force_fail_closed("preexpiry_signed_state_refresh_failed");
+        }
+    }
+
+    fn compute_runtime_endpoint_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.local_node_id.as_bytes());
+        hasher.update(self.wg_interface.as_bytes());
+        #[cfg(target_os = "linux")]
+        {
+            hasher.update(self.egress_interface.as_bytes());
+            match detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str()) {
+                Ok(gateway) => hasher.update(gateway.octets()),
+                Err(err) => hasher.update(format!("gateway-error:{err}").as_bytes()),
+            }
+        }
+        hasher.update(self.wg_listen_port.to_be_bytes());
+        if let Some(envelope) = self.traversal_hints.as_ref() {
+            for bundle in &envelope.bundles {
+                hasher.update(bundle.bundle.source_node_id.as_bytes());
+                hasher.update(bundle.bundle.target_node_id.as_bytes());
+                for candidate in &bundle.bundle.candidates {
+                    hasher.update(candidate.candidate_type.as_str().as_bytes());
+                    hasher.update(candidate.endpoint.ip().to_string().as_bytes());
+                    hasher.update(candidate.endpoint.port().to_be_bytes());
+                    hasher.update(candidate.priority.to_be_bytes());
+                    if let Some(relay_id) = candidate.relay_id.as_deref() {
+                        hasher.update(relay_id.as_bytes());
+                    }
+                }
+            }
+        } else if let Some(err) = self.traversal_hint_error.as_deref() {
+            hasher.update(err.as_bytes());
+        } else {
+            hasher.update(b"no-traversal-hints");
+        }
+        encode_hex(&hasher.finalize())
+    }
+
+    fn maybe_trigger_endpoint_change_refresh(&mut self) {
+        let fingerprint = self.compute_runtime_endpoint_fingerprint();
+        match self.traversal_last_endpoint_fingerprint.as_deref() {
+            Some(previous) if previous == fingerprint.as_str() => {}
+            Some(_) => {
+                self.traversal_endpoint_change_events =
+                    self.traversal_endpoint_change_events.saturating_add(1);
+                self.traversal_last_endpoint_fingerprint = Some(fingerprint);
+                if let Err(err) = self
+                    .refresh_signed_state_with_reason(true, SignedStateRefreshReason::EndpointChange)
+                {
+                    self.restrict_recoverable(err);
+                    let _ = self
+                        .controller
+                        .force_fail_closed("endpoint_change_signed_state_refresh_failed");
+                }
+            }
+            None => {
+                self.traversal_last_endpoint_fingerprint = Some(fingerprint);
+            }
+        }
+    }
+
+    fn traversal_alarm_state(&self, now_unix: u64) -> (&'static str, String) {
+        if let Some(err) = self.traversal_hint_error.as_deref() {
+            return ("error", sanitize_netcheck_value(err));
+        }
+        let Some(envelope) = self.traversal_hints.as_ref() else {
+            return ("missing", "signed_traversal_state_missing".to_string());
+        };
+        let Some(expires_at) = envelope
+            .bundles
+            .first()
+            .map(|bundle| bundle.bundle.expires_at_unix)
+        else {
+            return ("error", "signed_traversal_bundle_set_empty".to_string());
+        };
+        let remaining_secs = expires_at.saturating_sub(now_unix);
+        if remaining_secs == 0 {
+            ("critical", "signed_traversal_state_expired".to_string())
+        } else if remaining_secs <= MIN_TRAVERSAL_REFRESH_MARGIN_SECS {
+            ("warning", "signed_traversal_state_near_expiry".to_string())
+        } else {
+            ("ok", "none".to_string())
+        }
+    }
+
+    fn dns_zone_alarm_state(&self, now_unix: u64) -> (&'static str, String) {
+        if let Some(err) = self.dns_zone_error.as_deref() {
+            return ("error", sanitize_netcheck_value(err));
+        }
+        let Some(envelope) = self.dns_zone.as_ref() else {
+            return ("missing", "signed_dns_zone_state_missing".to_string());
+        };
+        let expires_at = envelope.bundle.expires_at_unix;
+        let remaining_secs = expires_at.saturating_sub(now_unix);
+        if remaining_secs == 0 {
+            ("critical", "signed_dns_zone_state_expired".to_string())
+        } else if remaining_secs <= MIN_DNS_ZONE_REFRESH_MARGIN_SECS {
+            ("warning", "signed_dns_zone_state_near_expiry".to_string())
+        } else {
+            ("ok", "none".to_string())
         }
     }
 
@@ -2041,8 +2794,32 @@ impl DaemonRuntime {
         let max_candidate_priority = max_candidate_priority
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let traversal_preexpiry_refresh_events = self.traversal_preexpiry_refresh_events;
+        let traversal_last_preexpiry_refresh_unix = self
+            .traversal_last_preexpiry_refresh_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let traversal_stale_rejections = self.traversal_stale_rejections;
+        let traversal_replay_rejections = self.traversal_replay_rejections;
+        let traversal_future_dated_rejections = self.traversal_future_dated_rejections;
+        let traversal_endpoint_change_events = self.traversal_endpoint_change_events;
+        let traversal_endpoint_fingerprint = self
+            .traversal_last_endpoint_fingerprint
+            .as_deref()
+            .map(sanitize_netcheck_value)
+            .unwrap_or_else(|| "none".to_string());
+        let (traversal_alarm_state, traversal_alarm_reason) = self.traversal_alarm_state(now);
+        let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(now);
+        let dns_preexpiry_refresh_events = self.dns_zone_preexpiry_refresh_events;
+        let dns_last_preexpiry_refresh_unix = self
+            .dns_zone_last_preexpiry_refresh_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let dns_stale_rejections = self.dns_zone_stale_rejections;
+        let dns_replay_rejections = self.dns_zone_replay_rejections;
+        let dns_future_dated_rejections = self.dns_zone_future_dated_rejections;
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_error={traversal_error}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error}",
         )
     }
 
@@ -2703,6 +3480,8 @@ impl DaemonRuntime {
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
         self.refresh_traversal_hint_state(false);
+        self.maybe_preexpiry_refresh_dns_zone(unix_now(), auto_bundle.as_ref());
+        self.maybe_trigger_endpoint_change_refresh();
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
         );
@@ -2714,7 +3493,10 @@ impl DaemonRuntime {
                 "command denied: current node role does not permit this operation",
             );
         }
-        if self.is_restricted() && command.is_mutating() {
+        if self.is_restricted()
+            && command.is_mutating()
+            && !matches!(command, IpcCommand::StateRefresh)
+        {
             return IpcResponse::err("daemon is in restricted-safe mode");
         }
         let auto_tunnel_route_advertise_allowed = matches!(
@@ -2804,8 +3586,37 @@ impl DaemonRuntime {
                     self.traversal_probe_handshake_freshness_secs.to_string();
                 let traversal_probe_reprobe_interval_secs =
                     self.traversal_probe_reprobe_interval_secs.to_string();
+                let traversal_preexpiry_refresh_events =
+                    self.traversal_preexpiry_refresh_events.to_string();
+                let traversal_last_preexpiry_refresh_unix = self
+                    .traversal_last_preexpiry_refresh_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let traversal_stale_rejections = self.traversal_stale_rejections.to_string();
+                let traversal_replay_rejections = self.traversal_replay_rejections.to_string();
+                let traversal_future_dated_rejections =
+                    self.traversal_future_dated_rejections.to_string();
+                let traversal_endpoint_change_events =
+                    self.traversal_endpoint_change_events.to_string();
+                let traversal_endpoint_fingerprint = self
+                    .traversal_last_endpoint_fingerprint
+                    .as_deref()
+                    .map(sanitize_netcheck_value)
+                    .unwrap_or_else(|| "none".to_string());
+                let (traversal_alarm_state, traversal_alarm_reason) =
+                    self.traversal_alarm_state(unix_now());
+                let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(unix_now());
+                let dns_preexpiry_refresh_events =
+                    self.dns_zone_preexpiry_refresh_events.to_string();
+                let dns_last_preexpiry_refresh_unix = self
+                    .dns_zone_last_preexpiry_refresh_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let dns_stale_rejections = self.dns_zone_stale_rejections.to_string();
+                let dns_replay_rejections = self.dns_zone_replay_rejections.to_string();
+                let dns_future_dated_rejections = self.dns_zone_future_dated_rejections.to_string();
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -2857,6 +3668,22 @@ impl DaemonRuntime {
                     traversal_probe_peer_count,
                     traversal_probe_direct_peers,
                     traversal_probe_relay_peers,
+                    traversal_preexpiry_refresh_events,
+                    traversal_last_preexpiry_refresh_unix,
+                    traversal_stale_rejections,
+                    traversal_replay_rejections,
+                    traversal_future_dated_rejections,
+                    traversal_endpoint_change_events,
+                    traversal_endpoint_fingerprint,
+                    traversal_alarm_state,
+                    traversal_alarm_reason,
+                    dns_alarm_state,
+                    dns_alarm_reason,
+                    dns_preexpiry_refresh_events,
+                    dns_last_preexpiry_refresh_unix,
+                    dns_stale_rejections,
+                    dns_replay_rejections,
+                    dns_future_dated_rejections,
                     if self.auto_port_forward_exit {
                         "true"
                     } else {
@@ -2872,6 +3699,21 @@ impl DaemonRuntime {
             IpcCommand::Netcheck => {
                 self.refresh_traversal_hint_state(true);
                 IpcResponse::ok(self.netcheck_response_line())
+            }
+            IpcCommand::StateRefresh => {
+                match self.refresh_signed_state_with_reason(
+                    true,
+                    SignedStateRefreshReason::Command,
+                ) {
+                    Ok(()) => IpcResponse::ok("signed state refresh completed"),
+                    Err(err) => {
+                        self.restrict_recoverable(err.clone());
+                        let _ = self
+                            .controller
+                            .force_fail_closed("command_signed_state_refresh_failed");
+                        IpcResponse::err(format!("signed state refresh failed: {err}"))
+                    }
+                }
             }
             IpcCommand::ExitNodeSelect(node) => {
                 let node_id = match NodeId::new(node.clone()) {
@@ -3342,6 +4184,10 @@ impl DaemonRuntime {
             .unwrap_or(true);
 
         self.last_reconcile_error = None;
+        let now_unix = unix_now();
+        self.maybe_preexpiry_refresh_traversal(now_unix);
+        self.maybe_preexpiry_refresh_dns_zone(now_unix, auto_bundle.as_ref());
+        self.maybe_trigger_endpoint_change_refresh();
 
         if self.controller.state() == DataplaneState::FailClosed
             || self.restriction_mode == RestrictionMode::Recoverable
@@ -4043,22 +4889,32 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .map_err(|err| DaemonError::Io(format!("socket read-timeout failed: {err}")))?;
-                let command = read_command(&stream).map_err(DaemonError::Io)?;
-                let parsed = parse_command(&command);
+                let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
+                    CommandEnvelope::Local(parsed) => {
+                        let authorized = if parsed.is_mutating() {
+                            match peer_uid(&stream) {
+                                Some(peer_uid) => peer_uid == 0 || peer_uid == socket_owner_uid,
+                                None => false,
+                            }
+                        } else {
+                            true
+                        };
 
-                let authorized = if parsed.is_mutating() {
-                    match peer_uid(&stream) {
-                        Some(peer_uid) => peer_uid == 0 || peer_uid == socket_owner_uid,
-                        None => false,
+                        if authorized {
+                            runtime.handle_command(parsed)
+                        } else {
+                            IpcResponse::err("unauthorized mutation request")
+                        }
                     }
-                } else {
-                    true
-                };
-
-                let response = if authorized {
-                    runtime.handle_command(parsed)
-                } else {
-                    IpcResponse::err("unauthorized mutation request")
+                    CommandEnvelope::Remote(remote_envelope) => {
+                        let now_unix = unix_now();
+                        match runtime.authorize_remote_command(&remote_envelope, now_unix) {
+                            Ok(parsed) => runtime.handle_command(parsed),
+                            Err(err) => {
+                                IpcResponse::err(format!("remote ops authorization failed: {err}"))
+                            }
+                        }
+                    }
                 };
 
                 write_response(stream, response).map_err(DaemonError::Io)?;
@@ -4091,6 +4947,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             runtime.reconcile();
             next_reconcile = now + reconcile_interval;
         }
+        let now_unix = unix_now();
+        runtime.maybe_preexpiry_refresh_traversal(now_unix);
+        runtime.maybe_trigger_endpoint_change_refresh();
 
         if config
             .max_requests
@@ -4453,6 +5312,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "membership watermark path must be absolute".to_string(),
         ));
     }
+    if let Some(path) = config.remote_ops_token_verifier_key_path.as_ref() {
+        if !path.is_absolute() {
+            return Err(DaemonError::InvalidConfig(
+                "remote ops token verifier key path must be absolute".to_string(),
+            ));
+        }
+    }
     if let Some(path) = config.auto_tunnel_bundle_path.as_ref() {
         if !path.is_absolute() {
             return Err(DaemonError::InvalidConfig(
@@ -4612,6 +5478,11 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if config.membership_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
             "membership watermark path must not be empty".to_string(),
+        ));
+    }
+    if config.remote_ops_expected_subject.trim().is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "remote ops expected subject must not be empty".to_string(),
         ));
     }
     if config.traversal_bundle_path.as_os_str().is_empty() {
@@ -4857,6 +5728,9 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
                 "traversal watermark directory create failed: {err}"
             ))
         })?;
+    }
+    if let Some(path) = config.remote_ops_token_verifier_key_path.as_ref() {
+        validate_remote_ops_token_verifier_key_permissions(path)?;
     }
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
@@ -5496,6 +6370,33 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> 
         .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing verifier key".to_string()))?;
     let key_bytes = decode_hex_to_fixed::<32>(key_line)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| TrustBootstrapError::KeyInvalid)
+}
+
+fn load_remote_ops_access_token_verifying_key(path: &Path) -> Result<VerifyingKey, DaemonError> {
+    enforce_text_artifact_size_limit(
+        path,
+        "remote ops token verifier key",
+        MAX_BUNDLE_VERIFIER_KEY_BYTES,
+    )
+    .map_err(DaemonError::InvalidConfig)?;
+    let content = fs::read_to_string(path)
+        .map_err(|err| DaemonError::InvalidConfig(format!("read remote ops verifier key: {err}")))?;
+    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
+        return Err(DaemonError::InvalidConfig(format!(
+            "remote ops token verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
+        )));
+    }
+    let key_line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| {
+            DaemonError::InvalidConfig("missing remote ops token verifier key".to_string())
+        })?;
+    let key_bytes = decode_hex_to_fixed::<32>(key_line)
+        .map_err(|_| DaemonError::InvalidConfig("invalid remote ops verifier key hex".to_string()))?;
+    VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|_| DaemonError::InvalidConfig("remote ops verifier key is invalid".to_string()))
 }
 
 fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBootstrapError> {
@@ -6520,7 +7421,7 @@ fn load_traversal_bundle_set(
     }
     let Some(first_bundle) = bundles.first() else {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "traversal bundle is empty".to_string(),
+            "traversal bundle set is empty".to_string(),
         ));
     };
     for bundle in &bundles[1..] {
@@ -7368,7 +8269,11 @@ fn parse_cidr(value: &str) -> Option<(std::net::IpAddr, u8)> {
         std::net::IpAddr::V4(_) => prefix <= 32,
         std::net::IpAddr::V6(_) => prefix <= 128,
     };
-    if valid { Some((ip, prefix)) } else { None }
+    if valid {
+        Some((ip, prefix))
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7444,6 +8349,16 @@ fn validate_traversal_verifier_key_permissions(path: &Path) -> Result<(), Daemon
 #[cfg(target_os = "linux")]
 fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "trust verifier key", 0o022, true)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_remote_ops_token_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "remote ops token verifier key", 0o022, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_remote_ops_token_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "remote ops token verifier key", 0o022, true)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -7590,6 +8505,173 @@ fn read_command(stream: &UnixStream) -> Result<String, String> {
     Ok(line.trim().to_string())
 }
 
+fn read_command_envelope(stream: &UnixStream) -> Result<CommandEnvelope, String> {
+    let wire = read_command(stream)?;
+    if let Some(encoded_fields) = wire.strip_prefix(REMOTE_OPS_WIRE_PREFIX) {
+        let envelope =
+            parse_remote_command_envelope(encoded_fields).map_err(|err| err.to_string())?;
+        return Ok(CommandEnvelope::Remote(envelope));
+    }
+    Ok(CommandEnvelope::Local(parse_command(&wire)))
+}
+
+fn parse_remote_command_envelope(
+    encoded_fields: &str,
+) -> Result<RemoteCommandEnvelope, RemoteOpsEnvelopeParseError> {
+    if !encoded_fields.starts_with('|') {
+        return Err(RemoteOpsEnvelopeParseError::InvalidPrefix);
+    }
+    let raw_segments = encoded_fields
+        .strip_prefix('|')
+        .ok_or(RemoteOpsEnvelopeParseError::InvalidPrefix)?
+        .split('|')
+        .collect::<Vec<_>>();
+    let mut field_values: BTreeMap<&'static str, String> = BTreeMap::new();
+    for segment in raw_segments {
+        let (key, encoded_value) = segment
+            .split_once('=')
+            .ok_or(RemoteOpsEnvelopeParseError::InvalidEncoding)?;
+        let expected_key = match key {
+            "subject" => "subject",
+            "issued_at_unix" => "issued_at_unix",
+            "expires_at_unix" => "expires_at_unix",
+            "nonce" => "nonce",
+            "command" => "command",
+            "signature" => "signature",
+            other => return Err(RemoteOpsEnvelopeParseError::UnknownField(other.to_string())),
+        };
+        if field_values.contains_key(expected_key) {
+            return Err(RemoteOpsEnvelopeParseError::DuplicateField(expected_key));
+        }
+        let decoded = percent_decode_ascii(encoded_value)?;
+        field_values.insert(expected_key, decoded);
+    }
+    if field_values.len() != REMOTE_OPS_REQUIRED_FIELD_COUNT {
+        return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
+    }
+    let subject = field_values
+        .remove("subject")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("subject"))?;
+    if subject.is_empty() || subject.len() > MAX_REMOTE_OPS_SUBJECT_BYTES {
+        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("subject"));
+    }
+    let issued_at_unix = field_values
+        .remove("issued_at_unix")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("issued_at_unix"))?
+        .parse::<u64>()
+        .map_err(|_| RemoteOpsEnvelopeParseError::InvalidTimestamp("issued_at_unix"))?;
+    let expires_at_unix = field_values
+        .remove("expires_at_unix")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("expires_at_unix"))?
+        .parse::<u64>()
+        .map_err(|_| RemoteOpsEnvelopeParseError::InvalidTimestamp("expires_at_unix"))?;
+    let nonce = field_values
+        .remove("nonce")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("nonce"))?;
+    if nonce.is_empty() || nonce.len() > MAX_REMOTE_OPS_NONCE_BYTES {
+        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("nonce"));
+    }
+    let command = field_values
+        .remove("command")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("command"))?;
+    if command.is_empty() {
+        return Err(RemoteOpsEnvelopeParseError::EmptyCommand);
+    }
+    if command.len() > MAX_REMOTE_OPS_COMMAND_BYTES {
+        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("command"));
+    }
+    if command.contains('\0') || command.contains('\n') || command.contains('\r') {
+        return Err(RemoteOpsEnvelopeParseError::InvalidCommand);
+    }
+    if matches!(parse_command(&command), IpcCommand::Unknown(_)) {
+        return Err(RemoteOpsEnvelopeParseError::InvalidCommand);
+    }
+    let signature_hex = field_values
+        .remove("signature")
+        .ok_or(RemoteOpsEnvelopeParseError::MissingField("signature"))?;
+    if signature_hex.len() != 128 {
+        return Err(RemoteOpsEnvelopeParseError::InvalidFieldLength("signature"));
+    }
+
+    Ok(RemoteCommandEnvelope {
+        subject,
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+        command,
+        signature_hex,
+    })
+}
+
+fn remote_ops_signature_payload(envelope: &RemoteCommandEnvelope) -> String {
+    format!(
+        "scope={REMOTE_OPS_SIGNATURE_SCOPE_V1}\nsubject={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\ncommand={}\n",
+        envelope.subject,
+        envelope.issued_at_unix,
+        envelope.expires_at_unix,
+        envelope.nonce,
+        envelope.command
+    )
+}
+
+fn decode_remote_ops_hex_to_fixed<const N: usize>(
+    encoded: &str,
+) -> Result<[u8; N], RemoteOpsEnvelopeParseError> {
+    let mut out = [0u8; N];
+    let raw = encoded.as_bytes();
+    if raw.len() != N * 2 {
+        return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
+    }
+    let mut index = 0usize;
+    while index < N {
+        let high = decode_remote_ops_hex_nibble(raw[index * 2])?;
+        let low = decode_remote_ops_hex_nibble(raw[index * 2 + 1])?;
+        out[index] = (high << 4) | low;
+        index = index.saturating_add(1);
+    }
+    Ok(out)
+}
+
+fn decode_remote_ops_hex_nibble(value: u8) -> Result<u8, RemoteOpsEnvelopeParseError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(RemoteOpsEnvelopeParseError::InvalidEncoding),
+    }
+}
+
+fn percent_decode_ascii(value: &str) -> Result<String, RemoteOpsEnvelopeParseError> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
+            }
+            let high = decode_remote_ops_hex_nibble(bytes[index + 1])?;
+            let low = decode_remote_ops_hex_nibble(bytes[index + 2])?;
+            let decoded = (high << 4) | low;
+            out.push(decoded);
+            index += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b':' | b'.' | b'-' | b'_' | b'/' | b' ' | b',' | b'=' | b'+' | b'@'
+            ))
+        {
+            return Err(RemoteOpsEnvelopeParseError::InvalidEncoding);
+        }
+        out.push(byte);
+        index += 1;
+    }
+    String::from_utf8(out).map_err(|_| RemoteOpsEnvelopeParseError::InvalidEncoding)
+}
+
 fn write_response(mut stream: UnixStream, response: IpcResponse) -> Result<(), String> {
     stream
         .write_all(format!("{}\n", response.to_wire()).as_bytes())
@@ -7661,36 +8743,36 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
 
     use ed25519_dalek::{Signer, SigningKey};
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::membership::{
-        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        persist_membership_snapshot, MembershipApprover, MembershipApproverRole,
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
-        persist_membership_snapshot,
+        MEMBERSHIP_SCHEMA_VERSION,
     };
 
     use super::{
-        AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
-        DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
-        DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
-        DnsZoneBootstrapError, DnsZoneLoadContext, IpcCommand, IpcResponse,
-        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
-        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
-        MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES, NodeRole,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
-        is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
-        load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
-        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
-        parse_route_interface_token, passphrase_disallowed_mode_mask,
+        build_dns_response, is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle,
+        load_auto_tunnel_watermark, load_dns_zone_bundle, load_traversal_bundle,
+        load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
+        load_trust_watermark, parse_route_interface_token, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, read_command, resolve_egress_interface_value,
         run_daemon, run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
         trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
-        zeroize_optional_bytes,
+        zeroize_optional_bytes, AutoTunnelWatermark, DaemonBackendMode, DaemonConfig,
+        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext, IpcCommand, IpcResponse,
+        NodeRole, TrustEvidenceRecord, TrustPolicy, TrustWatermark,
+        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
+        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
+        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
+        MIN_TRAVERSAL_REFRESH_MARGIN_SECS,
     };
     use crate::phase10::{PathMode, TraversalProbeDecision, TraversalProbeReason};
 
@@ -7750,6 +8832,53 @@ mod tests {
         .expect("signed artifact should be written");
     }
 
+    fn percent_encode_test(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b':' | b'.' | b'-' | b'_' | b'/' | b' ' | b',' | b'=' | b'+' | b'@'
+                )
+            {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+
+    fn render_remote_command_wire(
+        subject: &str,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+        nonce: &str,
+        command: &str,
+        signing_seed: [u8; 32],
+    ) -> String {
+        let signing_key = SigningKey::from_bytes(&signing_seed);
+        let envelope = RemoteCommandEnvelope {
+            subject: subject.to_string(),
+            issued_at_unix,
+            expires_at_unix,
+            nonce: nonce.to_string(),
+            command: command.to_string(),
+            signature_hex: String::new(),
+        };
+        let payload = remote_ops_signature_payload(&envelope);
+        let signature = signing_key.sign(payload.as_bytes());
+        format!(
+            "{REMOTE_OPS_WIRE_PREFIX}|subject={}|issued_at_unix={}|expires_at_unix={}|nonce={}|command={}|signature={}",
+            percent_encode_test(subject),
+            issued_at_unix,
+            expires_at_unix,
+            percent_encode_test(nonce),
+            percent_encode_test(command),
+            hex_encode(&signature.to_bytes())
+        )
+    }
+
     #[test]
     fn passphrase_permission_mask_accepts_systemd_runtime_credential_mode() {
         assert_eq!(
@@ -7791,10 +8920,201 @@ mod tests {
     }
 
     #[test]
+    fn read_command_envelope_parses_remote_wire_command() {
+        let issued_at = unix_now().saturating_sub(1);
+        let expires_at = issued_at.saturating_add(60);
+        let wire = render_remote_command_wire(
+            DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+            issued_at,
+            expires_at,
+            "nonce-remote-1",
+            "status",
+            [44u8; 32],
+        );
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        writer
+            .write_all(format!("{wire}\n").as_bytes())
+            .expect("remote command wire should write");
+        let envelope = read_command_envelope(&reader).expect("remote envelope should parse");
+        match envelope {
+            CommandEnvelope::Remote(remote) => {
+                assert_eq!(remote.subject, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT);
+                assert_eq!(remote.command, "status");
+                assert_eq!(remote.nonce, "nonce-remote-1");
+                assert_eq!(remote.issued_at_unix, issued_at);
+                assert_eq!(remote.expires_at_unix, expires_at);
+            }
+            CommandEnvelope::Local(_) => panic!("expected remote envelope"),
+        }
+    }
+
+    #[test]
+    fn read_command_envelope_rejects_invalid_remote_wire_command() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        writer
+            .write_all(
+                format!(
+                    "{REMOTE_OPS_WIRE_PREFIX}|subject=user:local|issued_at_unix=1|expires_at_unix=2|nonce=abc|command=status\n"
+                )
+                .as_bytes(),
+            )
+            .expect("invalid remote command wire should write");
+        let err = read_command_envelope(&reader)
+            .expect_err("remote envelope missing signature must be rejected");
+        assert!(err.contains("missing required field signature"));
+    }
+
+    #[test]
+    fn authorize_remote_command_rejects_replay_and_invalid_signature() {
+        let test_dir = secure_test_dir("rustynetd-remote-ops-replay");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let remote_ops_verifier_path = test_dir.join("remote_ops_access_token.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(&membership_snapshot_path, &membership_log_path, "daemon-local");
+
+        let remote_signing_key = SigningKey::from_bytes(&[55u8; 32]);
+        std::fs::write(
+            &remote_ops_verifier_path,
+            format!(
+                "{}\n",
+                hex_encode(remote_signing_key.verifying_key().as_bytes())
+            ),
+        )
+        .expect("remote ops verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&remote_ops_verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("remote ops verifier key permissions should be secure");
+        }
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            remote_ops_token_verifier_key_path: Some(remote_ops_verifier_path),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let now = unix_now();
+        let mut envelope = RemoteCommandEnvelope {
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            issued_at_unix: now.saturating_sub(1),
+            expires_at_unix: now.saturating_add(30),
+            nonce: "nonce-replay-1".to_string(),
+            command: "status".to_string(),
+            signature_hex: String::new(),
+        };
+        let payload = remote_ops_signature_payload(&envelope);
+        let signature = remote_signing_key.sign(payload.as_bytes());
+        envelope.signature_hex = hex_encode(&signature.to_bytes());
+
+        let first = runtime.authorize_remote_command(&envelope, now);
+        assert!(first.is_ok(), "first remote command should authorize");
+
+        let replay = runtime
+            .authorize_remote_command(&envelope, now.saturating_add(1))
+            .expect_err("replayed remote command must be rejected");
+        assert_eq!(replay, RemoteOpsAuthError::ReplayDetected);
+
+        let mut tampered = envelope.clone();
+        tampered.command = "netcheck".to_string();
+        let tampered_err = runtime
+            .authorize_remote_command(&tampered, now.saturating_add(2))
+            .expect_err("tampered remote command must fail signature validation");
+        assert_eq!(tampered_err, RemoteOpsAuthError::SignatureInvalid);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn authorize_remote_command_rejects_wrong_subject() {
+        let test_dir = secure_test_dir("rustynetd-remote-ops-subject");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let remote_ops_verifier_path = test_dir.join("remote_ops_access_token.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(&membership_snapshot_path, &membership_log_path, "daemon-local");
+
+        let remote_signing_key = SigningKey::from_bytes(&[56u8; 32]);
+        std::fs::write(
+            &remote_ops_verifier_path,
+            format!(
+                "{}\n",
+                hex_encode(remote_signing_key.verifying_key().as_bytes())
+            ),
+        )
+        .expect("remote ops verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&remote_ops_verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("remote ops verifier key permissions should be secure");
+        }
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            remote_ops_token_verifier_key_path: Some(remote_ops_verifier_path),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let now = unix_now();
+        let mut envelope = RemoteCommandEnvelope {
+            subject: "user:attacker".to_string(),
+            issued_at_unix: now.saturating_sub(1),
+            expires_at_unix: now.saturating_add(30),
+            nonce: "nonce-subject-1".to_string(),
+            command: "status".to_string(),
+            signature_hex: String::new(),
+        };
+        let payload = remote_ops_signature_payload(&envelope);
+        let signature = remote_signing_key.sign(payload.as_bytes());
+        envelope.signature_hex = hex_encode(&signature.to_bytes());
+        let err = runtime
+            .authorize_remote_command(&envelope, now)
+            .expect_err("subject mismatch must be rejected");
+        assert_eq!(err, RemoteOpsAuthError::SubjectDenied);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn node_role_command_matrix_is_fail_closed() {
         let command_matrix = vec![
             (IpcCommand::Status, true, true, true),
             (IpcCommand::Netcheck, true, true, true),
+            (IpcCommand::StateRefresh, true, true, true),
             (
                 IpcCommand::ExitNodeSelect("node-exit".to_string()),
                 true,
@@ -7909,6 +9229,7 @@ mod tests {
         vec![
             IpcCommand::Status,
             IpcCommand::Netcheck,
+            IpcCommand::StateRefresh,
             IpcCommand::DnsInspect,
             IpcCommand::ExitNodeSelect("node-exit".to_string()),
             IpcCommand::ExitNodeOff,
@@ -7949,7 +9270,10 @@ mod tests {
         if !role.allows_command(command) {
             return RoleAuthDecision::DeniedByRole;
         }
-        if mode.restricted_safe() && command.is_mutating() {
+        if mode.restricted_safe()
+            && command.is_mutating()
+            && !matches!(command, IpcCommand::StateRefresh)
+        {
             return RoleAuthDecision::DeniedByRestrictedSafeMode;
         }
         if mode.auto_tunnel_enforced()
@@ -8197,6 +9521,7 @@ mod tests {
                                 IpcCommand::Unknown(_)
                                     | IpcCommand::KeyRotate
                                     | IpcCommand::KeyRevoke
+                                    | IpcCommand::StateRefresh
                             )
                         {
                             assert!(
@@ -8888,10 +10213,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("auto port-forward should be linux-wireguard only");
-        assert!(
-            err.to_string()
-                .contains("supported only with linux-wireguard backend")
-        );
+        assert!(err
+            .to_string()
+            .contains("supported only with linux-wireguard backend"));
     }
 
     #[test]
@@ -8902,10 +10226,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("relative traversal bundle path must be rejected");
-        assert!(
-            err.to_string()
-                .contains("traversal bundle path must be absolute")
-        );
+        assert!(err
+            .to_string()
+            .contains("traversal bundle path must be absolute"));
     }
 
     #[test]
@@ -8917,10 +10240,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("excessive traversal probe max candidates must be rejected");
-        assert!(
-            err.to_string()
-                .contains("traversal probe max candidates must be at most")
-        );
+        assert!(err
+            .to_string()
+            .contains("traversal probe max candidates must be at most"));
     }
 
     #[test]
@@ -8934,10 +10256,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("excessive traversal probe pairs must be rejected");
-        assert!(
-            err.to_string()
-                .contains("traversal probe max pairs must be at most 4")
-        );
+        assert!(err
+            .to_string()
+            .contains("traversal probe max pairs must be at most 4"));
     }
 
     #[test]
@@ -8950,10 +10271,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("traversal handshake freshness above bundle age must be rejected");
-        assert!(
-            err.to_string()
-                .contains("traversal probe handshake freshness must not exceed traversal max age")
-        );
+        assert!(err
+            .to_string()
+            .contains("traversal probe handshake freshness must not exceed traversal max age"));
     }
 
     #[test]
@@ -8967,10 +10287,9 @@ mod tests {
         };
         let err = validate_daemon_config(&config)
             .expect_err("excessive traversal probe reprobe interval must be rejected");
-        assert!(
-            err.to_string()
-                .contains("traversal probe reprobe interval must be at most")
-        );
+        assert!(err
+            .to_string()
+            .contains("traversal probe reprobe interval must be at most"));
     }
 
     #[test]
@@ -9607,11 +10926,9 @@ mod tests {
             route_err,
             super::AutoTunnelBootstrapError::InvalidFormat(_)
         ));
-        assert!(
-            route_err
-                .to_string()
-                .contains("route_count exceeds maximum")
-        );
+        assert!(route_err
+            .to_string()
+            .contains("route_count exceeds maximum"));
 
         let traversal_path = test_dir.join("traversal.bundle");
         let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
@@ -9637,11 +10954,9 @@ mod tests {
             candidate_err,
             super::TraversalBootstrapError::InvalidFormat(_)
         ));
-        assert!(
-            candidate_err
-                .to_string()
-                .contains("candidate_count must be between")
-        );
+        assert!(candidate_err
+            .to_string()
+            .contains("candidate_count must be between"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -9674,11 +10989,9 @@ mod tests {
             assignment_err,
             super::AutoTunnelBootstrapError::InvalidFormat(_)
         ));
-        assert!(
-            assignment_err
-                .to_string()
-                .contains("key depth exceeds maximum")
-        );
+        assert!(assignment_err
+            .to_string()
+            .contains("key depth exceeds maximum"));
 
         let traversal_path = test_dir.join("traversal.bundle");
         let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
@@ -9703,11 +11016,9 @@ mod tests {
             traversal_err,
             super::TraversalBootstrapError::InvalidFormat(_)
         ));
-        assert!(
-            traversal_err
-                .to_string()
-                .contains("key depth exceeds maximum")
-        );
+        assert!(traversal_err
+            .to_string()
+            .contains("key depth exceeds maximum"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -10092,79 +11403,53 @@ mod tests {
         assert!(status.message.contains("traversal_probe_max_candidates=4"));
         assert!(status.message.contains("traversal_probe_max_pairs=4"));
         assert!(status.message.contains("traversal_probe_rounds=2"));
-        assert!(
-            status
-                .message
-                .contains("traversal_probe_round_spacing_ms=40")
-        );
-        assert!(
-            status
-                .message
-                .contains("traversal_probe_relay_switch_after_failures=2")
-        );
-        assert!(
-            status
-                .message
-                .contains("traversal_probe_handshake_freshness_secs=15")
-        );
-        assert!(
-            status
-                .message
-                .contains("traversal_probe_reprobe_interval_secs=60")
-        );
+        assert!(status
+            .message
+            .contains("traversal_probe_round_spacing_ms=40"));
+        assert!(status
+            .message
+            .contains("traversal_probe_relay_switch_after_failures=2"));
+        assert!(status
+            .message
+            .contains("traversal_probe_handshake_freshness_secs=15"));
+        assert!(status
+            .message
+            .contains("traversal_probe_reprobe_interval_secs=60"));
         assert!(status.message.contains("traversal_probe_result=relay"));
-        assert!(
-            status
-                .message
-                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
-        );
-        assert!(
-            !status
-                .message
-                .contains("traversal_probe_next_reprobe_unix=none")
-        );
+        assert!(status
+            .message
+            .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed"));
+        assert!(!status
+            .message
+            .contains("traversal_probe_next_reprobe_unix=none"));
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
         assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_max_candidates=4")
-        );
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_max_candidates=4"));
         assert!(netcheck.message.contains("traversal_probe_max_pairs=4"));
         assert!(netcheck.message.contains("traversal_probe_rounds=2"));
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_round_spacing_ms=40")
-        );
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_relay_switch_after_failures=2")
-        );
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_handshake_freshness_secs=15")
-        );
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_reprobe_interval_secs=60")
-        );
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_round_spacing_ms=40"));
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_relay_switch_after_failures=2"));
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_handshake_freshness_secs=15"));
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_reprobe_interval_secs=60"));
         assert!(netcheck.message.contains("traversal_probe_result=relay"));
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
-        );
-        assert!(
-            !netcheck
-                .message
-                .contains("traversal_probe_next_reprobe_unix=none")
-        );
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed"));
+        assert!(!netcheck
+            .message
+            .contains("traversal_probe_next_reprobe_unix=none"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -10529,11 +11814,9 @@ mod tests {
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
         assert!(netcheck.message.contains("traversal_probe_result=direct"));
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_reason=fresh_handshake_observed")
-        );
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_reason=fresh_handshake_observed"));
         assert_eq!(
             runtime.controller.managed_peer_endpoint(&exit_node),
             Some(SocketEndpoint {
@@ -10545,6 +11828,622 @@ mod tests {
             runtime.controller.peer_path(&exit_node),
             Some(crate::phase10::PathMode::Direct)
         );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_traversal_preexpiry_refresh_emits_metrics_and_alarm() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-preexpiry-refresh");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            false,
+        );
+        let near_expiry_generated = unix_now().saturating_sub(59);
+        let near_expiry_expires = near_expiry_generated.saturating_add(60);
+        let near_expiry_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={near_expiry_generated}\nexpires_at_unix={near_expiry_expires}\nnonce=9\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            near_expiry_payload.as_str(),
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
+                .expect("test traversal reprobe interval should be non-zero"),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let previous_refresh_events = runtime.traversal_preexpiry_refresh_events;
+        runtime.traversal_last_preexpiry_refresh_unix =
+            Some(unix_now().saturating_sub(MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS.saturating_add(1)));
+        runtime.maybe_preexpiry_refresh_traversal(unix_now());
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains(&format!(
+            "traversal_preexpiry_refresh_events={}",
+            previous_refresh_events + 1
+        )));
+        assert!(!status
+            .message
+            .contains("traversal_last_preexpiry_refresh_unix=none"));
+        assert!(status.message.contains("traversal_alarm_state=warning"));
+        assert!(status
+            .message
+            .contains("traversal_alarm_reason=signed_traversal_state_near_expiry"));
+        assert!(status.message.contains("traversal_stale_rejections=0"));
+        assert!(status.message.contains("traversal_replay_rejections=0"));
+        assert!(status
+            .message
+            .contains("traversal_future_dated_rejections=0"));
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("traversal_alarm_state=warning"));
+        assert!(netcheck
+            .message
+            .contains("traversal_alarm_reason=signed_traversal_state_near_expiry"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_dns_preexpiry_refresh_emits_metrics_and_alarm() {
+        let test_dir = secure_test_dir("rustynetd-runtime-dns-preexpiry-refresh");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        let dns_zone_watermark_path = test_dir.join("dns-zone.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let near_expiry_generated_at = unix_now().saturating_sub(59);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &["ssh"]),
+            2,
+            DnsZoneFixtureTiming {
+                generated_at_unix: near_expiry_generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            dns_zone_bundle_path: dns_zone_path.clone(),
+            dns_zone_verifier_key_path: dns_zone_verifier_path.clone(),
+            dns_zone_watermark_path: dns_zone_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let previous_refresh_events = runtime.dns_zone_preexpiry_refresh_events;
+        runtime.dns_zone_last_preexpiry_refresh_unix = Some(unix_now().saturating_sub(60));
+        runtime.maybe_preexpiry_refresh_dns_zone(unix_now(), Some(&assignment));
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains(&format!(
+            "dns_preexpiry_refresh_events={}",
+            previous_refresh_events + 1
+        )));
+        assert!(!status
+            .message
+            .contains("dns_last_preexpiry_refresh_unix=none"));
+        assert!(status.message.contains("dns_alarm_state=warning"));
+        assert!(status
+            .message
+            .contains("dns_alarm_reason=signed_dns_zone_state_near_expiry"));
+        assert!(status.message.contains("dns_stale_rejections=0"));
+        assert!(status.message.contains("dns_replay_rejections=0"));
+        assert!(status.message.contains("dns_future_dated_rejections=0"));
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("dns_alarm_state=warning"));
+        assert!(netcheck
+            .message
+            .contains("dns_alarm_reason=signed_dns_zone_state_near_expiry"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_traversal_rejection_counters_increment_for_stale_replay_and_future_dated() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-rejection-counters");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let stale_generated = unix_now().saturating_sub(DEFAULT_TRAVERSAL_MAX_AGE_SECS + 20);
+        let stale_expires = stale_generated.saturating_add(1);
+        let stale_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={stale_generated}\nexpires_at_unix={stale_expires}\nnonce=41\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            stale_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(true);
+
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            42,
+            false,
+        );
+        runtime.refresh_traversal_hint_state(true);
+
+        let replay_generated = unix_now();
+        let replay_expires = replay_generated.saturating_add(60);
+        let replay_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={replay_generated}\nexpires_at_unix={replay_expires}\nnonce=41\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            replay_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(true);
+
+        let future_generated =
+            unix_now().saturating_add(runtime.trust_policy.max_clock_skew_secs + 20);
+        let future_expires = future_generated.saturating_add(60);
+        let future_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={future_generated}\nexpires_at_unix={future_expires}\nnonce=43\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            future_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(true);
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("traversal_stale_rejections=1"));
+        assert!(status.message.contains("traversal_replay_rejections=1"));
+        assert!(status
+            .message
+            .contains("traversal_future_dated_rejections=1"));
+        assert!(status.message.contains("traversal_alarm_state=error"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_dns_rejection_counters_increment_for_stale_replay_and_future_dated() {
+        let test_dir = secure_test_dir("rustynetd-runtime-dns-rejection-counters");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        let dns_zone_watermark_path = test_dir.join("dns-zone.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            dns_zone_bundle_path: dns_zone_path.clone(),
+            dns_zone_verifier_key_path: dns_zone_verifier_path.clone(),
+            dns_zone_watermark_path: dns_zone_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let stale_generated_at = unix_now().saturating_sub(DEFAULT_DNS_ZONE_MAX_AGE_SECS + 20);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            41,
+            DnsZoneFixtureTiming {
+                generated_at_unix: stale_generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        runtime.refresh_dns_zone_state(Some(&assignment));
+
+        let replay_generated_at = unix_now();
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            42,
+            DnsZoneFixtureTiming {
+                generated_at_unix: replay_generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        runtime.refresh_dns_zone_state(Some(&assignment));
+
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &["ssh"]),
+            42,
+            DnsZoneFixtureTiming {
+                generated_at_unix: replay_generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        runtime.refresh_dns_zone_state(Some(&assignment));
+
+        let future_generated_at =
+            unix_now().saturating_add(runtime.trust_policy.max_clock_skew_secs + 20);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            43,
+            DnsZoneFixtureTiming {
+                generated_at_unix: future_generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        runtime.refresh_dns_zone_state(Some(&assignment));
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("dns_stale_rejections=1"));
+        assert!(status.message.contains("dns_replay_rejections=1"));
+        assert!(status.message.contains("dns_future_dated_rejections=1"));
+        assert!(status.message.contains("dns_alarm_state=error"));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_endpoint_change_refresh_triggers_event_counter() {
+        let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-refresh");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+
+        let updated_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=2\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.1.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.88\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-2\ncandidate.1.priority=20\n",
+            unix_now(),
+            unix_now().saturating_add(60)
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            updated_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime.maybe_trigger_endpoint_change_refresh();
+
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1
+        );
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains(&format!(
+            "traversal_endpoint_change_events={}",
+            baseline_events + 1
+        )));
+        assert!(!status
+            .message
+            .contains("traversal_endpoint_fingerprint=none"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -10625,11 +12524,9 @@ mod tests {
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("restricted_safe_mode=true"));
-        assert!(
-            status
-                .message
-                .contains("bootstrap_error=traversal authority rejected bootstrap apply")
-        );
+        assert!(status
+            .message
+            .contains("bootstrap_error=traversal authority rejected bootstrap apply"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -10720,11 +12617,9 @@ mod tests {
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("restricted_safe_mode=true"));
-        assert!(
-            status
-                .message
-                .contains("bootstrap_error=traversal runtime sync failed")
-        );
+        assert!(status
+            .message
+            .contains("bootstrap_error=traversal runtime sync failed"));
         assert_eq!(
             runtime.controller.state(),
             crate::phase10::DataplaneState::FailClosed
@@ -10856,13 +12751,11 @@ mod tests {
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("restricted_safe_mode=true"));
-        assert!(
-            runtime
-                .bootstrap_error
-                .as_deref()
-                .unwrap_or("none")
-                .contains("missing signed traversal state for managed peers: node-relay")
-        );
+        assert!(runtime
+            .bootstrap_error
+            .as_deref()
+            .unwrap_or("none")
+            .contains("missing signed traversal state for managed peers: node-relay"));
         assert_eq!(
             runtime.controller.state(),
             crate::phase10::DataplaneState::FailClosed
@@ -11061,13 +12954,11 @@ mod tests {
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("restricted_safe_mode=true"));
-        assert!(
-            runtime
-                .bootstrap_error
-                .as_deref()
-                .unwrap_or("none")
-                .contains("missing signed traversal state for managed peer node-relay")
-        );
+        assert!(runtime
+            .bootstrap_error
+            .as_deref()
+            .unwrap_or("none")
+            .contains("missing signed traversal state for managed peer node-relay"));
         assert_eq!(
             runtime.controller.state(),
             crate::phase10::DataplaneState::FailClosed
@@ -11427,21 +13318,17 @@ mod tests {
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
         assert!(netcheck.message.contains("path_mode=relay_active"));
-        assert!(
-            netcheck
-                .message
-                .contains("path_reason=relay_endpoint_programmed")
-        );
+        assert!(netcheck
+            .message
+            .contains("path_reason=relay_endpoint_programmed"));
         assert!(netcheck.message.contains("traversal_status=valid"));
         assert!(netcheck.message.contains("candidate_count=2"));
         assert!(netcheck.message.contains("host_candidates=1"));
         assert!(netcheck.message.contains("relay_candidates=1"));
         assert!(netcheck.message.contains("traversal_probe_result=relay"));
-        assert!(
-            netcheck
-                .message
-                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
-        );
+        assert!(netcheck
+            .message
+            .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed"));
         assert!(runtime.controller.has_armed_relay_path());
 
         let _ = std::fs::remove_file(state_path);
@@ -12292,11 +14179,9 @@ mod tests {
 
         let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
         assert!(!denied.ok);
-        assert!(
-            denied
-                .message
-                .contains("disabled while auto-tunnel is enforced")
-        );
+        assert!(denied
+            .message
+            .contains("disabled while auto-tunnel is enforced"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -12383,11 +14268,9 @@ mod tests {
         let denied =
             runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
         assert!(!denied.ok);
-        assert!(
-            denied
-                .message
-                .contains("disabled while auto-tunnel is enforced")
-        );
+        assert!(denied
+            .message
+            .contains("disabled while auto-tunnel is enforced"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);

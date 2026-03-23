@@ -20,6 +20,9 @@ RELAY_NODE_ID=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
 RELAY_NETWORK_ID=""
+CLIENT_UNDERLAY_IP="${RUSTYNET_CLIENT_UNDERLAY_IP:-}"
+EXIT_UNDERLAY_IP="${RUSTYNET_EXIT_UNDERLAY_IP:-}"
+RELAY_UNDERLAY_IP="${RUSTYNET_RELAY_UNDERLAY_IP:-}"
 NAT_PROFILE="baseline_lan"
 IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
@@ -55,6 +58,9 @@ options:
   --nat-profile <profile>
   --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
+  --client-underlay-ip <ipv4>
+  --exit-underlay-ip <ipv4>
+  --relay-underlay-ip <ipv4>
   --report-path <path>
   --log-path <path>
 USAGE
@@ -130,6 +136,9 @@ while [[ $# -gt 0 ]]; do
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
     --relay-network-id) RELAY_NETWORK_ID="$2"; shift 2 ;;
+    --client-underlay-ip) CLIENT_UNDERLAY_IP="$2"; shift 2 ;;
+    --exit-underlay-ip) EXIT_UNDERLAY_IP="$2"; shift 2 ;;
+    --relay-underlay-ip) RELAY_UNDERLAY_IP="$2"; shift 2 ;;
     --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
     --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
@@ -157,6 +166,16 @@ fi
 if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" || "$CLIENT_NETWORK_ID" == "$RELAY_NETWORK_ID" || "$EXIT_NETWORK_ID" == "$RELAY_NETWORK_ID" ]]; then
   echo "client, exit, and relay network ids must all differ" >&2
   exit 2
+fi
+
+if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+fi
+if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+fi
+if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
 fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
@@ -202,9 +221,21 @@ main() {
   EXIT_PUB_HEX="$(live_lab_collect_pubkey_hex "$EXIT_HOST")"
   RELAY_PUB_HEX="$(live_lab_collect_pubkey_hex "$RELAY_HOST")"
   CLIENT_PUB_HEX="$(live_lab_collect_pubkey_hex "$CLIENT_HOST")"
-  EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
-  RELAY_ADDR="$(live_lab_target_address "$RELAY_HOST")"
-  CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
+  if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
+    EXIT_ADDR="$EXIT_UNDERLAY_IP"
+  else
+    EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
+  fi
+  if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
+    RELAY_ADDR="$RELAY_UNDERLAY_IP"
+  else
+    RELAY_ADDR="$(live_lab_target_address "$RELAY_HOST")"
+  fi
+  if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
+    CLIENT_ADDR="$CLIENT_UNDERLAY_IP"
+  else
+    CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
+  fi
 
   NODES_SPEC="${EXIT_NODE_ID}|${EXIT_ADDR}:51820|${EXIT_PUB_HEX};${RELAY_NODE_ID}|${RELAY_ADDR}:51820|${RELAY_PUB_HEX};${CLIENT_NODE_ID}|${CLIENT_ADDR}:51820|${CLIENT_PUB_HEX}"
   ALLOW_SPEC="${CLIENT_NODE_ID}|${RELAY_NODE_ID};${RELAY_NODE_ID}|${CLIENT_NODE_ID};${CLIENT_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${CLIENT_NODE_ID};${RELAY_NODE_ID}|${EXIT_NODE_ID};${EXIT_NODE_ID}|${RELAY_NODE_ID}"

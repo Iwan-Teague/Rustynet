@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rand::RngCore;
 use rustynet_backend_api::{NodeId, SocketEndpoint};
+use rustynet_control::SignedTraversalCoordinationRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CandidateSource {
@@ -42,6 +46,8 @@ pub struct TraversalEngineConfig {
     pub simultaneous_open_rounds: u8,
     pub round_spacing_ms: u64,
     pub relay_switch_after_failures: u8,
+    pub stun_servers: Vec<SocketAddr>,
+    pub stun_gather_timeout_ms: u64,
 }
 
 pub const DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES: usize = 8;
@@ -49,6 +55,7 @@ pub const DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS: usize = 24;
 pub const DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 = 3;
 pub const DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = 80;
 pub const DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 = 3;
+pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 = 2_000;
 
 impl Default for TraversalEngineConfig {
     fn default() -> Self {
@@ -58,6 +65,8 @@ impl Default for TraversalEngineConfig {
             simultaneous_open_rounds: DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS,
             round_spacing_ms: DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS,
             relay_switch_after_failures: DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
+            stun_servers: Vec::new(),
+            stun_gather_timeout_ms: DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
         }
     }
 }
@@ -80,6 +89,13 @@ pub enum TraversalError {
     },
     NoDirectCandidates,
     InvalidConfig(&'static str),
+    Stun(String),
+    Coordination(String),
+    CoordinationSignatureInvalid,
+    CoordinationReplayDetected,
+    CoordinationExpired,
+    CoordinationFutureRejected,
+    CoordinationNodeMismatch,
 }
 
 impl fmt::Display for TraversalError {
@@ -109,11 +125,643 @@ impl fmt::Display for TraversalError {
             TraversalError::InvalidConfig(message) => {
                 write!(f, "invalid traversal config: {message}")
             }
+            TraversalError::Stun(message) => write!(f, "stun error: {message}"),
+            TraversalError::Coordination(message) => write!(f, "coordination error: {message}"),
+            TraversalError::CoordinationSignatureInvalid => {
+                f.write_str("coordination signature verification failed")
+            }
+            TraversalError::CoordinationReplayDetected => {
+                f.write_str("coordination nonce replay detected")
+            }
+            TraversalError::CoordinationExpired => f.write_str("coordination record is expired"),
+            TraversalError::CoordinationFutureRejected => {
+                f.write_str("coordination probe start exceeds max future skew")
+            }
+            TraversalError::CoordinationNodeMismatch => {
+                f.write_str("coordination record does not include local and remote nodes")
+            }
         }
     }
 }
 
 impl std::error::Error for TraversalError {}
+
+const STUN_BINDING_REQUEST_TYPE: u16 = 0x0001;
+const STUN_BINDING_RESPONSE_TYPE: u16 = 0x0101;
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+pub type CandidateType = CandidateSource;
+
+#[derive(Debug)]
+pub struct CandidateGatherer {
+    local_socket: UdpSocket,
+    stun_servers: Vec<SocketAddr>,
+    timeout: Duration,
+    host_candidates: Vec<SocketEndpoint>,
+    rustynet_interface_addrs: BTreeSet<IpAddr>,
+}
+
+impl CandidateGatherer {
+    pub fn new(
+        local_socket: UdpSocket,
+        stun_servers: Vec<SocketAddr>,
+        timeout: Duration,
+        host_candidates: Vec<SocketEndpoint>,
+        rustynet_interface_addrs: Vec<IpAddr>,
+    ) -> Result<Self, TraversalError> {
+        if timeout.is_zero() {
+            return Err(TraversalError::InvalidConfig(
+                "stun_gather_timeout_ms must be greater than zero",
+            ));
+        }
+        local_socket
+            .set_nonblocking(false)
+            .map_err(|err| TraversalError::Stun(format!("failed to configure stun socket: {err}")))?;
+        Ok(Self {
+            local_socket,
+            stun_servers,
+            timeout,
+            host_candidates,
+            rustynet_interface_addrs: rustynet_interface_addrs.into_iter().collect(),
+        })
+    }
+
+    pub fn gather(&self) -> Vec<TraversalCandidate> {
+        self.gather_with_observed_at(now_unix_secs())
+    }
+
+    fn gather_with_observed_at(&self, observed_at_unix: u64) -> Vec<TraversalCandidate> {
+        let mut candidates = Vec::new();
+        let host_priority = 900;
+        let srflx_priority = 850;
+
+        if let Ok(bound_addr) = self.local_socket.local_addr() {
+            let endpoint = SocketEndpoint {
+                addr: bound_addr.ip(),
+                port: bound_addr.port(),
+            };
+            if is_candidate_endpoint_allowed(endpoint, &self.rustynet_interface_addrs) {
+                candidates.push(TraversalCandidate {
+                    endpoint,
+                    source: CandidateSource::Host,
+                    priority: host_priority,
+                    observed_at_unix,
+                });
+            }
+        }
+
+        for endpoint in &self.host_candidates {
+            if is_candidate_endpoint_allowed(*endpoint, &self.rustynet_interface_addrs) {
+                candidates.push(TraversalCandidate {
+                    endpoint: *endpoint,
+                    source: CandidateSource::Host,
+                    priority: host_priority,
+                    observed_at_unix,
+                });
+            }
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        for server in &self.stun_servers {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(endpoint) = self.query_stun_server(*server, remaining)
+                && is_candidate_endpoint_allowed(endpoint, &self.rustynet_interface_addrs)
+            {
+                candidates.push(TraversalCandidate {
+                    endpoint,
+                    source: CandidateSource::ServerReflexive,
+                    priority: srflx_priority,
+                    observed_at_unix,
+                });
+            }
+        }
+
+        dedup_candidates(candidates)
+    }
+
+    fn query_stun_server(
+        &self,
+        server: SocketAddr,
+        timeout: Duration,
+    ) -> Result<SocketEndpoint, TraversalError> {
+        let mut transaction_id = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(transaction_id.as_mut_slice());
+        let request = build_stun_binding_request(transaction_id);
+        self.local_socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|err| TraversalError::Stun(format!("failed to set stun read timeout: {err}")))?;
+        self.local_socket
+            .set_write_timeout(Some(timeout))
+            .map_err(|err| TraversalError::Stun(format!("failed to set stun write timeout: {err}")))?;
+        self.local_socket
+            .send_to(request.as_slice(), server)
+            .map_err(|err| TraversalError::Stun(format!("failed to send stun request: {err}")))?;
+
+        let mut buffer = [0u8; 1500];
+        let receive_started = Instant::now();
+        loop {
+            match self.local_socket.recv_from(&mut buffer) {
+                Ok((received, _source)) => {
+                    return parse_stun_xor_mapped_address(
+                        buffer[..received].as_ref(),
+                        transaction_id,
+                    )
+                    .map(|addr| SocketEndpoint {
+                        addr: addr.ip(),
+                        port: addr.port(),
+                    });
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(TraversalError::Stun("stun response timed out".to_string()));
+                }
+                Err(err) => {
+                    if receive_started.elapsed() >= timeout {
+                        return Err(TraversalError::Stun("stun response timed out".to_string()));
+                    }
+                    return Err(TraversalError::Stun(format!(
+                        "failed to receive stun response: {err}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn is_candidate_endpoint_allowed(
+    endpoint: SocketEndpoint,
+    rustynet_interface_addrs: &BTreeSet<IpAddr>,
+) -> bool {
+    if endpoint.port == 0 {
+        return false;
+    }
+    let ip = endpoint.addr;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(value) => {
+            if value.is_link_local() || value.is_broadcast() {
+                return false;
+            }
+        }
+        IpAddr::V6(value) => {
+            if value.is_unicast_link_local() {
+                return false;
+            }
+        }
+    }
+    !rustynet_interface_addrs.contains(&ip)
+}
+
+fn dedup_candidates(mut candidates: Vec<TraversalCandidate>) -> Vec<TraversalCandidate> {
+    candidates.sort_by(|left, right| {
+        left.endpoint
+            .addr
+            .cmp(&right.endpoint.addr)
+            .then(left.endpoint.port.cmp(&right.endpoint.port))
+            .then(left.source.cmp(&right.source))
+            .then(right.priority.cmp(&left.priority))
+            .then(right.observed_at_unix.cmp(&left.observed_at_unix))
+    });
+
+    let mut deduped = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let key = (
+            candidate.endpoint.addr,
+            candidate.endpoint.port,
+            candidate.source,
+        );
+        if seen.insert(key) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn build_stun_binding_request(transaction_id: [u8; 12]) -> [u8; 20] {
+    let mut request = [0u8; 20];
+    request[0..2].copy_from_slice(&STUN_BINDING_REQUEST_TYPE.to_be_bytes());
+    request[2..4].copy_from_slice(&0u16.to_be_bytes());
+    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    request[8..20].copy_from_slice(transaction_id.as_slice());
+    request
+}
+
+fn parse_stun_xor_mapped_address(
+    message: &[u8],
+    transaction_id: [u8; 12],
+) -> Result<SocketAddr, TraversalError> {
+    if message.len() < 20 {
+        return Err(TraversalError::Stun(
+            "stun message is shorter than header".to_string(),
+        ));
+    }
+    let message_type = u16::from_be_bytes([message[0], message[1]]);
+    if message_type != STUN_BINDING_RESPONSE_TYPE {
+        return Err(TraversalError::Stun(
+            "stun message is not a binding response".to_string(),
+        ));
+    }
+    let declared_len = usize::from(u16::from_be_bytes([message[2], message[3]]));
+    let expected_len = 20usize.saturating_add(declared_len);
+    if expected_len > message.len() {
+        return Err(TraversalError::Stun(
+            "stun message is truncated".to_string(),
+        ));
+    }
+    let cookie = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+    if cookie != STUN_MAGIC_COOKIE {
+        return Err(TraversalError::Stun("stun magic cookie mismatch".to_string()));
+    }
+    if message[8..20] != transaction_id {
+        return Err(TraversalError::Stun(
+            "stun transaction id mismatch".to_string(),
+        ));
+    }
+
+    let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+    let mut offset = 20usize;
+    while offset.saturating_add(4) <= expected_len {
+        let attr_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
+        let attr_len = usize::from(u16::from_be_bytes([message[offset + 2], message[offset + 3]]));
+        offset = offset.saturating_add(4);
+        let attr_end = offset.saturating_add(attr_len);
+        if attr_end > expected_len {
+            return Err(TraversalError::Stun(
+                "stun attribute exceeds message boundary".to_string(),
+            ));
+        }
+        let value = &message[offset..attr_end];
+        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
+            if attr_len < 8 {
+                return Err(TraversalError::Stun(
+                    "xor-mapped-address attribute too short".to_string(),
+                ));
+            }
+            let family = value[1];
+            let x_port = u16::from_be_bytes([value[2], value[3]]);
+            let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
+            let port = x_port ^ port_mask;
+            let endpoint = match family {
+                0x01 => {
+                    if attr_len < 8 {
+                        return Err(TraversalError::Stun(
+                            "xor-mapped-address ipv4 attribute too short".to_string(),
+                        ));
+                    }
+                    let mut addr = [0u8; 4];
+                    for (index, slot) in addr.iter_mut().enumerate() {
+                        *slot = value[4 + index] ^ cookie_bytes[index];
+                    }
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port)
+                }
+                0x02 => {
+                    if attr_len < 20 {
+                        return Err(TraversalError::Stun(
+                            "xor-mapped-address ipv6 attribute too short".to_string(),
+                        ));
+                    }
+                    let mut addr = [0u8; 16];
+                    for (index, slot) in addr.iter_mut().enumerate() {
+                        let mask = if index < 4 {
+                            cookie_bytes[index]
+                        } else {
+                            transaction_id[index - 4]
+                        };
+                        *slot = value[4 + index] ^ mask;
+                    }
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), port)
+                }
+                _ => {
+                    return Err(TraversalError::Stun(
+                        "xor-mapped-address has unsupported address family".to_string(),
+                    ));
+                }
+            };
+            return Ok(endpoint);
+        }
+        let padded_len = (attr_len + 3) & !3;
+        offset = offset.saturating_add(padded_len);
+    }
+
+    Err(TraversalError::Stun(
+        "stun response does not contain xor-mapped-address".to_string(),
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCoordinationPayload {
+    session_id: [u8; 16],
+    probe_start_unix: u64,
+    node_a: String,
+    node_b: String,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: [u8; 16],
+}
+
+fn verify_coordination_record_signature(
+    record: &SignedTraversalCoordinationRecord,
+    endpoint_hint_verifier_key: &[u8; 32],
+) -> Result<(), TraversalError> {
+    let parsed = parse_coordination_payload(record.payload.as_str())?;
+    if parsed.session_id != record.session_id
+        || parsed.probe_start_unix != record.probe_start_unix
+        || parsed.node_a != record.node_a
+        || parsed.node_b != record.node_b
+        || parsed.issued_at_unix != record.issued_at_unix
+        || parsed.expires_at_unix != record.expires_at_unix
+        || parsed.nonce != record.nonce
+    {
+        return Err(TraversalError::Coordination(
+            "coordination payload/header mismatch".to_string(),
+        ));
+    }
+    let canonical_payload = serialize_coordination_payload(&parsed);
+    if canonical_payload != record.payload {
+        return Err(TraversalError::Coordination(
+            "coordination payload canonicalization mismatch".to_string(),
+        ));
+    }
+
+    let signature_bytes = decode_hex_to_fixed::<64>(record.signature_hex.as_str())
+        .map_err(|_| TraversalError::CoordinationSignatureInvalid)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    let verifying_key = VerifyingKey::from_bytes(endpoint_hint_verifier_key)
+        .map_err(|_| TraversalError::CoordinationSignatureInvalid)?;
+    verifying_key
+        .verify(record.payload.as_bytes(), &signature)
+        .map_err(|_| TraversalError::CoordinationSignatureInvalid)
+}
+
+fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload, TraversalError> {
+    let mut fields = BTreeMap::<String, String>::new();
+    for line in payload.lines() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            TraversalError::Coordination("coordination payload line missing '='".to_string())
+        })?;
+        if key.trim().is_empty() {
+            return Err(TraversalError::Coordination(
+                "coordination payload key is empty".to_string(),
+            ));
+        }
+        if fields.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(TraversalError::Coordination(format!(
+                "coordination payload duplicate key: {key}"
+            )));
+        }
+    }
+    if fields.len() != 9 {
+        return Err(TraversalError::Coordination(
+            "coordination payload has unexpected field count".to_string(),
+        ));
+    }
+
+    let version = fields
+        .get("version")
+        .ok_or_else(|| TraversalError::Coordination("coordination payload missing version".to_string()))?;
+    if version != "1" {
+        return Err(TraversalError::Coordination(
+            "coordination payload version is unsupported".to_string(),
+        ));
+    }
+    let payload_type = fields
+        .get("type")
+        .ok_or_else(|| TraversalError::Coordination("coordination payload missing type".to_string()))?;
+    if payload_type != "traversal_coordination" {
+        return Err(TraversalError::Coordination(
+            "coordination payload type is unsupported".to_string(),
+        ));
+    }
+
+    let session_id = decode_hex_to_fixed::<16>(
+        fields
+            .get("session_id")
+            .ok_or_else(|| {
+                TraversalError::Coordination("coordination payload missing session_id".to_string())
+            })?
+            .as_str(),
+    )
+    .map_err(|_| TraversalError::Coordination("coordination session_id is invalid".to_string()))?;
+    let nonce = decode_hex_to_fixed::<16>(
+        fields
+            .get("nonce")
+            .ok_or_else(|| {
+                TraversalError::Coordination("coordination payload missing nonce".to_string())
+            })?
+            .as_str(),
+    )
+    .map_err(|_| TraversalError::Coordination("coordination nonce is invalid".to_string()))?;
+    let probe_start_unix = parse_u64_field(&fields, "probe_start_unix")?;
+    let issued_at_unix = parse_u64_field(&fields, "issued_at_unix")?;
+    let expires_at_unix = parse_u64_field(&fields, "expires_at_unix")?;
+    let node_a = fields
+        .get("node_a")
+        .ok_or_else(|| TraversalError::Coordination("coordination payload missing node_a".to_string()))?
+        .trim()
+        .to_string();
+    let node_b = fields
+        .get("node_b")
+        .ok_or_else(|| TraversalError::Coordination("coordination payload missing node_b".to_string()))?
+        .trim()
+        .to_string();
+    if node_a.is_empty() || node_b.is_empty() {
+        return Err(TraversalError::Coordination(
+            "coordination payload node ids must not be empty".to_string(),
+        ));
+    }
+    Ok(ParsedCoordinationPayload {
+        session_id,
+        probe_start_unix,
+        node_a,
+        node_b,
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+    })
+}
+
+fn parse_u64_field(
+    fields: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<u64, TraversalError> {
+    fields
+        .get(name)
+        .ok_or_else(|| TraversalError::Coordination(format!("coordination payload missing {name}")))?
+        .parse::<u64>()
+        .map_err(|_| TraversalError::Coordination(format!("coordination payload invalid {name}")))
+}
+
+fn serialize_coordination_payload(payload: &ParsedCoordinationPayload) -> String {
+    let mut out = String::new();
+    out.push_str("version=1\n");
+    out.push_str("type=traversal_coordination\n");
+    out.push_str(&format!("session_id={}\n", encode_hex(payload.session_id.as_slice())));
+    out.push_str(&format!("probe_start_unix={}\n", payload.probe_start_unix));
+    out.push_str(&format!("node_a={}\n", payload.node_a.trim()));
+    out.push_str(&format!("node_b={}\n", payload.node_b.trim()));
+    out.push_str(&format!("issued_at_unix={}\n", payload.issued_at_unix));
+    out.push_str(&format!("expires_at_unix={}\n", payload.expires_at_unix));
+    out.push_str(&format!("nonce={}\n", encode_hex(payload.nonce.as_slice())));
+    out
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
+    let mut bytes = [0u8; N];
+    let trimmed = encoded.trim();
+    if trimmed.len() != N * 2 {
+        return Err(());
+    }
+    let raw = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < N {
+        let hi = decode_hex_nibble(raw[index * 2])?;
+        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
+        bytes[index] = (hi << 4) | lo;
+        index += 1;
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8, ()> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+pub const MAX_COORDINATION_TTL_SECS: u64 = 30;
+pub const MAX_COORDINATION_FUTURE_START_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalDecisionReason {
+    SimultaneousOpenHandshakeObserved,
+    NoDirectCandidatesRelayArmed,
+    DirectProbeExhaustedRelayArmed,
+    DirectProbeExhaustedFailClosed,
+}
+
+impl TraversalDecisionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TraversalDecisionReason::SimultaneousOpenHandshakeObserved => {
+                "simultaneous_open_handshake_observed"
+            }
+            TraversalDecisionReason::NoDirectCandidatesRelayArmed => {
+                "no_direct_candidates_relay_armed"
+            }
+            TraversalDecisionReason::DirectProbeExhaustedRelayArmed => {
+                "direct_probe_exhausted_relay_armed"
+            }
+            TraversalDecisionReason::DirectProbeExhaustedFailClosed => {
+                "direct_probe_exhausted_fail_closed"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalDecision {
+    Direct {
+        endpoint: SocketEndpoint,
+        reason: TraversalDecisionReason,
+    },
+    Relay {
+        endpoint: SocketEndpoint,
+        reason: TraversalDecisionReason,
+        rounds: u8,
+    },
+    FailClosed {
+        reason: TraversalDecisionReason,
+        rounds: u8,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimultaneousOpenResult {
+    pub decision: TraversalDecision,
+    pub attempts: usize,
+    pub latest_handshake_unix: Option<u64>,
+    pub waited_for_start: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinationSchedule {
+    pub session_id: [u8; 16],
+    pub nonce: [u8; 16],
+    pub probe_start_unix: u64,
+    pub wait_duration: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoordinationReplayWindow {
+    seen_nonces: BTreeMap<[u8; 16], u64>,
+}
+
+impl CoordinationReplayWindow {
+    pub fn verify_and_record(
+        &mut self,
+        nonce: [u8; 16],
+        expires_at_unix: u64,
+        now_unix: u64,
+    ) -> Result<(), TraversalError> {
+        self.seen_nonces.retain(|_, expires| *expires >= now_unix);
+        if self.seen_nonces.contains_key(&nonce) {
+            return Err(TraversalError::CoordinationReplayDetected);
+        }
+        self.seen_nonces.insert(nonce, expires_at_unix);
+        Ok(())
+    }
+}
+
+pub trait SimultaneousOpenRuntime {
+    fn send_probe(&mut self, endpoint: SocketEndpoint, round: u8) -> Result<(), TraversalError>;
+    fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError>;
+}
+
+pub trait SimultaneousOpenWaiter {
+    fn wait(&mut self, duration: Duration);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadSleepWaiter;
+
+impl SimultaneousOpenWaiter for ThreadSleepWaiter {
+    fn wait(&mut self, duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatMappingBehavior {
@@ -457,6 +1105,150 @@ impl TraversalEngine {
 
         Ok(RemoteProbePlan { attempts })
     }
+
+    pub fn validate_signed_coordination_record(
+        &self,
+        record: &SignedTraversalCoordinationRecord,
+        local_node_id: &NodeId,
+        remote_node_id: &NodeId,
+        endpoint_hint_verifier_key: &[u8; 32],
+        replay_window: &mut CoordinationReplayWindow,
+        now_unix: u64,
+    ) -> Result<CoordinationSchedule, TraversalError> {
+        if record.issued_at_unix >= record.expires_at_unix {
+            return Err(TraversalError::Coordination(
+                "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+            ));
+        }
+        if record
+            .expires_at_unix
+            .saturating_sub(record.issued_at_unix)
+            > MAX_COORDINATION_TTL_SECS
+        {
+            return Err(TraversalError::Coordination(
+                "coordination ttl exceeds max supported value".to_string(),
+            ));
+        }
+        if now_unix > record.expires_at_unix {
+            return Err(TraversalError::CoordinationExpired);
+        }
+
+        let wait_secs = record.probe_start_unix.saturating_sub(now_unix);
+        if wait_secs > MAX_COORDINATION_FUTURE_START_SECS {
+            return Err(TraversalError::CoordinationFutureRejected);
+        }
+
+        let local = local_node_id.as_str();
+        let remote = remote_node_id.as_str();
+        let direct_match = record.node_a.trim() == local && record.node_b.trim() == remote;
+        let reverse_match = record.node_a.trim() == remote && record.node_b.trim() == local;
+        if !(direct_match || reverse_match) {
+            return Err(TraversalError::CoordinationNodeMismatch);
+        }
+
+        verify_coordination_record_signature(record, endpoint_hint_verifier_key)?;
+        replay_window.verify_and_record(record.nonce, record.expires_at_unix, now_unix)?;
+        Ok(CoordinationSchedule {
+            session_id: record.session_id,
+            nonce: record.nonce,
+            probe_start_unix: record.probe_start_unix,
+            wait_duration: Duration::from_secs(wait_secs),
+        })
+    }
+
+    pub fn execute_simultaneous_open<R: SimultaneousOpenRuntime, W: SimultaneousOpenWaiter>(
+        &self,
+        runtime: &mut R,
+        waiter: &mut W,
+        schedule: CoordinationSchedule,
+        direct_candidates: &[TraversalCandidate],
+        relay_endpoint: Option<SocketEndpoint>,
+        now_unix: u64,
+        handshake_freshness_secs: u64,
+    ) -> Result<SimultaneousOpenResult, TraversalError> {
+        if handshake_freshness_secs == 0 {
+            return Err(TraversalError::InvalidConfig(
+                "handshake freshness window must be greater than zero",
+            ));
+        }
+        waiter.wait(schedule.wait_duration);
+
+        let plan = match self.plan_remote_probes(direct_candidates) {
+            Ok(plan) => plan,
+            Err(TraversalError::NoDirectCandidates) => {
+                if let Some(endpoint) = relay_endpoint {
+                    return Ok(SimultaneousOpenResult {
+                        decision: TraversalDecision::Relay {
+                            endpoint,
+                            reason: TraversalDecisionReason::NoDirectCandidatesRelayArmed,
+                            rounds: 0,
+                        },
+                        attempts: 0,
+                        latest_handshake_unix: runtime.latest_handshake_unix()?,
+                        waited_for_start: schedule.wait_duration,
+                    });
+                }
+                return Ok(SimultaneousOpenResult {
+                    decision: TraversalDecision::FailClosed {
+                        reason: TraversalDecisionReason::DirectProbeExhaustedFailClosed,
+                        rounds: 0,
+                    },
+                    attempts: 0,
+                    latest_handshake_unix: runtime.latest_handshake_unix()?,
+                    waited_for_start: schedule.wait_duration,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+
+        let mut observed_latest = runtime.latest_handshake_unix()?;
+        for attempt in &plan.attempts {
+            runtime.send_probe(attempt.remote.endpoint, attempt.round)?;
+            let latest = runtime.latest_handshake_unix()?;
+            if handshake_advanced(observed_latest, latest)
+                && handshake_is_fresh(latest, now_unix, handshake_freshness_secs)
+            {
+                return Ok(SimultaneousOpenResult {
+                    decision: TraversalDecision::Direct {
+                        endpoint: attempt.remote.endpoint,
+                        reason: TraversalDecisionReason::SimultaneousOpenHandshakeObserved,
+                    },
+                    attempts: attempt.attempt_ordinal,
+                    latest_handshake_unix: latest,
+                    waited_for_start: schedule.wait_duration,
+                });
+            }
+            observed_latest = match (observed_latest, latest) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(value), None) => Some(value),
+                (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+        }
+
+        if let Some(endpoint) = relay_endpoint {
+            return Ok(SimultaneousOpenResult {
+                decision: TraversalDecision::Relay {
+                    endpoint,
+                    reason: TraversalDecisionReason::DirectProbeExhaustedRelayArmed,
+                    rounds: self.config.simultaneous_open_rounds,
+                },
+                attempts: plan.attempts.len(),
+                latest_handshake_unix: observed_latest,
+                waited_for_start: schedule.wait_duration,
+            });
+        }
+
+        Ok(SimultaneousOpenResult {
+            decision: TraversalDecision::FailClosed {
+                reason: TraversalDecisionReason::DirectProbeExhaustedFailClosed,
+                rounds: self.config.simultaneous_open_rounds,
+            },
+            attempts: plan.attempts.len(),
+            latest_handshake_unix: observed_latest,
+            waited_for_start: schedule.wait_duration,
+        })
+    }
 }
 
 fn validate_candidates(
@@ -506,15 +1298,41 @@ fn score_candidate(candidate: TraversalCandidate) -> u64 {
     u64::from(candidate.priority).saturating_add(candidate.source.preference_score())
 }
 
+fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) -> bool {
+    value
+        .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
+        .unwrap_or(false)
+}
+
+fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
+    match (previous, current) {
+        (None, Some(_)) => true,
+        (Some(before), Some(after)) => after > before,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateSource, NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
-        TraversalCandidate, TraversalEngine, TraversalEngineConfig, TraversalError,
-        TraversalSession, direct_udp_viable,
+        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule,
+        NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
+        SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter, TraversalCandidate,
+        TraversalDecision, TraversalDecisionReason, TraversalEngine, TraversalEngineConfig,
+        TraversalError, TraversalSession, build_stun_binding_request, direct_udp_viable,
+        parse_stun_xor_mapped_address,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
-    use std::net::{IpAddr, Ipv4Addr};
+    use rustynet_control::{
+        ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+        EnrollmentRequest, TraversalCoordinationRecord,
+    };
+    use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     fn endpoint(octets: [u8; 4], port: u16) -> SocketEndpoint {
         SocketEndpoint {
@@ -545,6 +1363,7 @@ mod tests {
             simultaneous_open_rounds: 3,
             round_spacing_ms: 100,
             relay_switch_after_failures: 3,
+            ..TraversalEngineConfig::default()
         })
         .expect("engine config should be valid");
 
@@ -736,6 +1555,7 @@ mod tests {
             simultaneous_open_rounds: 2,
             round_spacing_ms: 50,
             relay_switch_after_failures: 3,
+            ..TraversalEngineConfig::default()
         })
         .expect("config should be valid");
         let candidates = vec![

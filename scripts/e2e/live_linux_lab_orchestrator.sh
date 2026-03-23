@@ -61,6 +61,10 @@ CROSS_NETWORK_IMPAIRMENT_PROFILE="${RUSTYNET_CROSS_NETWORK_IMPAIRMENT_PROFILE:-n
 CROSS_NETWORK_MAX_TIME_SKEW_SECS="${RUSTYNET_CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}"
 CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="${RUSTYNET_CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS:-900}"
 CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="${RUSTYNET_CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}"
+CROSS_NETWORK_CLIENT_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_CLIENT_UNDERLAY_IP:-}"
+CROSS_NETWORK_EXIT_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_EXIT_UNDERLAY_IP:-}"
+CROSS_NETWORK_RELAY_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_RELAY_UNDERLAY_IP:-}"
+CROSS_NETWORK_PROBE_UNDERLAY_IP="${RUSTYNET_CROSS_NETWORK_PROBE_UNDERLAY_IP:-}"
 CROSS_NETWORK_NAT_PROFILE_LIST=()
 CROSS_NETWORK_REQUIRED_NAT_PROFILE_LIST=()
 
@@ -131,6 +135,14 @@ options:
                                  Maximum allowed age for discovery bundles generated during preflight (default: ${CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS})
   --cross-network-signed-artifact-max-age-secs <secs>
                                  Maximum allowed age for signed runtime artifacts in preflight (default: ${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS})
+  --cross-network-client-underlay-ip <ipv4>
+                                 Override client underlay endpoint/topology IP for cross-network validators
+  --cross-network-exit-underlay-ip <ipv4>
+                                 Override exit underlay endpoint/topology IP for cross-network validators
+  --cross-network-relay-underlay-ip <ipv4>
+                                 Override relay underlay endpoint/topology IP for cross-network validators
+  --cross-network-probe-underlay-ip <ipv4>
+                                 Override probe underlay endpoint/topology IP for cross-network validators
   --reboot-hard-fail             Deprecated: extended soak is hard-fail by default
   --dry-run                      Validate config and planned stages without touching hosts
   -h, --help                     Show this help
@@ -492,6 +504,10 @@ load_profile_file() {
       CROSS_NETWORK_MAX_TIME_SKEW_SECS) [[ "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" == "${RUSTYNET_CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" ]] && CROSS_NETWORK_MAX_TIME_SKEW_SECS="$value" ;;
       CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS) [[ "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="$value" ;;
       CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS) [[ "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" == "${RUSTYNET_CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" ]] && CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="$value" ;;
+      CROSS_NETWORK_CLIENT_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" ]] && CROSS_NETWORK_CLIENT_UNDERLAY_IP="$value" ;;
+      CROSS_NETWORK_EXIT_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_EXIT_UNDERLAY_IP" ]] && CROSS_NETWORK_EXIT_UNDERLAY_IP="$value" ;;
+      CROSS_NETWORK_RELAY_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_RELAY_UNDERLAY_IP" ]] && CROSS_NETWORK_RELAY_UNDERLAY_IP="$value" ;;
+      CROSS_NETWORK_PROBE_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_PROBE_UNDERLAY_IP" ]] && CROSS_NETWORK_PROBE_UNDERLAY_IP="$value" ;;
       SOURCE_MODE)
         if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
           SOURCE_MODE="$value"
@@ -765,6 +781,32 @@ cross_network_network_id_for_label() {
   printf '%s-%s' "$NETWORK_ID" "$label"
 }
 
+cross_network_override_underlay_ip_for_label() {
+  local label="$1"
+  case "$label" in
+    client) printf '%s' "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" ;;
+    exit) printf '%s' "$CROSS_NETWORK_EXIT_UNDERLAY_IP" ;;
+    relay) printf '%s' "$CROSS_NETWORK_RELAY_UNDERLAY_IP" ;;
+    probe) printf '%s' "$CROSS_NETWORK_PROBE_UNDERLAY_IP" ;;
+    *) printf '' ;;
+  esac
+}
+
+cross_network_underlay_ip_for_label() {
+  local label="$1"
+  local override target
+  override="$(cross_network_override_underlay_ip_for_label "$label")"
+  if [[ -n "$override" ]]; then
+    printf '%s' "$override"
+    return 0
+  fi
+  target="$(node_target_for_label "$label")"
+  if [[ -z "$target" ]]; then
+    return 1
+  fi
+  live_lab_target_address "$target"
+}
+
 cross_network_relay_label() {
   if has_label entry; then
     printf 'entry'
@@ -816,10 +858,10 @@ cross_network_stage_labels_for_impairment() {
   local stage_kind="$1"
   local relay_label probe_label
   case "$stage_kind" in
-    direct|dns|soak)
+    direct|dns|soak|node_switch)
       printf '%s\n' client exit
       ;;
-    relay|failback)
+    relay|failback|controller_switch)
       relay_label="$(cross_network_relay_label)" || return 1
       printf '%s\n' client exit "$relay_label"
       ;;
@@ -903,8 +945,14 @@ cross_network_stages_applicable() {
     CROSS_NETWORK_SKIP_REASON="requires client and exit targets"
     return 1
   fi
-  client_addr="$(live_lab_target_address "$client_target")"
-  exit_addr="$(live_lab_target_address "$exit_target")"
+  client_addr="$(cross_network_underlay_ip_for_label client)" || {
+    CROSS_NETWORK_SKIP_REASON="unable to resolve client underlay address"
+    return 1
+  }
+  exit_addr="$(cross_network_underlay_ip_for_label exit)" || {
+    CROSS_NETWORK_SKIP_REASON="unable to resolve exit underlay address"
+    return 1
+  }
   set +e
   local topology_result
   topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$client_addr" --ip-b "$exit_addr" --ipv4-prefix 24 --ipv6-prefix 64 2>/dev/null)"
@@ -2452,6 +2500,9 @@ stage_run_cross_network_direct_remote_exit() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_direct_remote_exit_report.json}"
   local log_path="${3:-$REPORT_DIR/cross_network_direct_remote_exit.log}"
+  local client_underlay_ip exit_underlay_ip
+  client_underlay_ip="$(cross_network_underlay_ip_for_label client)"
+  exit_underlay_ip="$(cross_network_underlay_ip_for_label exit)"
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh"
@@ -2462,6 +2513,8 @@ stage_run_cross_network_direct_remote_exit() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --client-underlay-ip "$client_underlay_ip" \
+    --exit-underlay-ip "$exit_underlay_ip" \
     --nat-profile "$nat_profile" \
     --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -2475,10 +2528,14 @@ stage_run_cross_network_relay_remote_exit() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_relay_remote_exit_report.json}"
   local log_path="${3:-$REPORT_DIR/cross_network_relay_remote_exit.log}"
-  local relay_label
+  local relay_label relay_underlay_ip
   if ! relay_label="$(cross_network_relay_label)"; then
     printf 'cross-network relay remote-exit validation requires entry or aux target\n' >&2
     return 1
+  fi
+  relay_underlay_ip="$(cross_network_override_underlay_ip_for_label relay)"
+  if [[ -z "$relay_underlay_ip" ]]; then
+    relay_underlay_ip="$(cross_network_underlay_ip_for_label "$relay_label")"
   fi
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
@@ -2493,6 +2550,9 @@ stage_run_cross_network_relay_remote_exit() {
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
     --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --client-underlay-ip "$(cross_network_underlay_ip_for_label client)" \
+    --exit-underlay-ip "$(cross_network_underlay_ip_for_label exit)" \
+    --relay-underlay-ip "$relay_underlay_ip" \
     --nat-profile "$nat_profile" \
     --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -2506,10 +2566,14 @@ stage_run_cross_network_failback_roaming() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_failback_roaming_report.json}"
   local log_path="${3:-$REPORT_DIR/cross_network_failback_roaming.log}"
-  local relay_label
+  local relay_label relay_underlay_ip
   if ! relay_label="$(cross_network_relay_label)"; then
     printf 'cross-network failback and roaming validation requires entry or aux target\n' >&2
     return 1
+  fi
+  relay_underlay_ip="$(cross_network_override_underlay_ip_for_label relay)"
+  if [[ -z "$relay_underlay_ip" ]]; then
+    relay_underlay_ip="$(cross_network_underlay_ip_for_label "$relay_label")"
   fi
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
@@ -2524,6 +2588,9 @@ stage_run_cross_network_failback_roaming() {
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
     --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --client-underlay-ip "$(cross_network_underlay_ip_for_label client)" \
+    --exit-underlay-ip "$(cross_network_underlay_ip_for_label exit)" \
+    --relay-underlay-ip "$relay_underlay_ip" \
     --nat-profile "$nat_profile" \
     --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -2563,6 +2630,9 @@ stage_run_cross_network_remote_exit_dns() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_remote_exit_dns_report.json}"
   local log_path="${3:-$REPORT_DIR/cross_network_remote_exit_dns.log}"
+  local client_underlay_ip exit_underlay_ip
+  client_underlay_ip="$(cross_network_underlay_ip_for_label client)"
+  exit_underlay_ip="$(cross_network_underlay_ip_for_label exit)"
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh"
@@ -2573,6 +2643,8 @@ stage_run_cross_network_remote_exit_dns() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --client-underlay-ip "$client_underlay_ip" \
+    --exit-underlay-ip "$exit_underlay_ip" \
     --nat-profile "$nat_profile" \
     --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -2586,6 +2658,9 @@ stage_run_cross_network_remote_exit_soak() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_remote_exit_soak_report.json}"
   local log_path="${3:-$REPORT_DIR/cross_network_remote_exit_soak.log}"
+  local client_underlay_ip exit_underlay_ip
+  client_underlay_ip="$(cross_network_underlay_ip_for_label client)"
+  exit_underlay_ip="$(cross_network_underlay_ip_for_label exit)"
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
     bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh"
@@ -2596,6 +2671,8 @@ stage_run_cross_network_remote_exit_soak() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-network-id "$(cross_network_network_id_for_label client)" \
     --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --client-underlay-ip "$client_underlay_ip" \
+    --exit-underlay-ip "$exit_underlay_ip" \
     --nat-profile "$nat_profile" \
     --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
@@ -2603,6 +2680,72 @@ stage_run_cross_network_remote_exit_soak() {
     --log-path "$log_path"
   )
   run_cross_network_stage_with_impairment soak "${cmd[@]}"
+}
+
+stage_run_cross_network_controller_switch() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_controller_switch_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_controller_switch.log}"
+  local relay_label relay_underlay_ip
+  if ! relay_label="$(cross_network_relay_label)"; then
+    printf 'cross-network controller-switch validation requires entry or aux target\n' >&2
+    return 1
+  fi
+  relay_underlay_ip="$(cross_network_override_underlay_ip_for_label relay)"
+  if [[ -z "$relay_underlay_ip" ]]; then
+    relay_underlay_ip="$(cross_network_underlay_ip_for_label "$relay_label")"
+  fi
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_controller_switch_test.sh"
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --relay-host "$(node_target_for_label "$relay_label")" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --relay-node-id "$(node_id_for_label "$relay_label")" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --relay-network-id "$(cross_network_network_id_for_label "$relay_label")" \
+    --client-underlay-ip "$(cross_network_underlay_ip_for_label client)" \
+    --exit-underlay-ip "$(cross_network_underlay_ip_for_label exit)" \
+    --relay-underlay-ip "$relay_underlay_ip" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment controller_switch "${cmd[@]}"
+}
+
+stage_run_cross_network_node_network_switch() {
+  local nat_profile="${1:-baseline_lan}"
+  local report_path="${2:-$REPORT_DIR/cross_network_node_network_switch_report.json}"
+  local log_path="${3:-$REPORT_DIR/cross_network_node_network_switch.log}"
+  local client_underlay_ip exit_underlay_ip
+  client_underlay_ip="$(cross_network_underlay_ip_for_label client)"
+  exit_underlay_ip="$(cross_network_underlay_ip_for_label exit)"
+  local -a cmd=(
+    env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
+    bash "$ROOT_DIR/scripts/e2e/live_linux_cross_network_node_network_switch_test.sh"
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --client-host "$(node_target_for_label client)" \
+    --exit-host "$(node_target_for_label exit)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-network-id "$(cross_network_network_id_for_label client)" \
+    --exit-network-id "$(cross_network_network_id_for_label exit)" \
+    --client-underlay-ip "$client_underlay_ip" \
+    --exit-underlay-ip "$exit_underlay_ip" \
+    --nat-profile "$nat_profile" \
+    --impairment-profile "$CROSS_NETWORK_IMPAIRMENT_PROFILE" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+  )
+  run_cross_network_stage_with_impairment node_switch "${cmd[@]}"
 }
 
 cross_network_verify_signed_artifact_chain() {
@@ -3278,6 +3421,10 @@ parse_args() {
       --cross-network-max-time-skew-secs) CROSS_NETWORK_MAX_TIME_SKEW_SECS="$2"; shift 2 ;;
       --cross-network-discovery-max-age-secs) CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS="$2"; shift 2 ;;
       --cross-network-signed-artifact-max-age-secs) CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS="$2"; shift 2 ;;
+      --cross-network-client-underlay-ip) CROSS_NETWORK_CLIENT_UNDERLAY_IP="$2"; shift 2 ;;
+      --cross-network-exit-underlay-ip) CROSS_NETWORK_EXIT_UNDERLAY_IP="$2"; shift 2 ;;
+      --cross-network-relay-underlay-ip) CROSS_NETWORK_RELAY_UNDERLAY_IP="$2"; shift 2 ;;
+      --cross-network-probe-underlay-ip) CROSS_NETWORK_PROBE_UNDERLAY_IP="$2"; shift 2 ;;
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -3436,6 +3583,18 @@ main() {
     printf 'cross-network signed artifact max age seconds must be <= 86400 (got: %s)\n' "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >&2
     exit 2
   fi
+  if [[ -n "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" ]]; then
+    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_CLIENT_UNDERLAY_IP" >/dev/null
+  fi
+  if [[ -n "$CROSS_NETWORK_EXIT_UNDERLAY_IP" ]]; then
+    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_EXIT_UNDERLAY_IP" >/dev/null
+  fi
+  if [[ -n "$CROSS_NETWORK_RELAY_UNDERLAY_IP" ]]; then
+    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_RELAY_UNDERLAY_IP" >/dev/null
+  fi
+  if [[ -n "$CROSS_NETWORK_PROBE_UNDERLAY_IP" ]]; then
+    cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_PROBE_UNDERLAY_IP" >/dev/null
+  fi
   prepare_cross_network_profile_config
   if (( TRAVERSAL_TTL_SECS > 120 )); then
     printf 'traversal TTL seconds must be <= 120 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
@@ -3502,10 +3661,13 @@ main() {
         if cross_network_relay_label >/dev/null 2>&1; then
           record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: not executed"
           record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: not executed"
+          record_stage_skip "cross_network_controller_switch${stage_suffix}" "hard" "dry-run: not executed"
         else
           record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
           record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
+          record_stage_skip "cross_network_controller_switch${stage_suffix}" "hard" "dry-run: skipped because entry or aux target is not configured"
         fi
+        record_stage_skip "cross_network_node_network_switch${stage_suffix}" "hard" "dry-run: not executed"
         if cross_network_probe_label >/dev/null 2>&1; then
           record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" "hard" "dry-run: not executed"
         else
@@ -3524,6 +3686,8 @@ main() {
         record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
         record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
         record_stage_skip "cross_network_failback_roaming${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_controller_switch${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
+        record_stage_skip "cross_network_node_network_switch${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
         record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
         record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
         record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" "hard" "dry-run: skipped because ${CROSS_NETWORK_SKIP_REASON}"
@@ -3620,6 +3784,15 @@ main() {
           break
         fi
 
+        profile_report="$(cross_network_report_path_for_profile "cross_network_node_network_switch_report.json" "$nat_idx" "$nat_profile")"
+        profile_log="$(cross_network_log_path_for_profile "cross_network_node_network_switch.log" "$nat_idx" "$nat_profile")"
+        run_stage hard "cross_network_node_network_switch${stage_suffix}" "run cross-network node underlay-switch validation (nat_profile=${nat_profile})" stage_run_cross_network_node_network_switch "$nat_profile" "$profile_report" "$profile_log"
+        stage_rc=$?
+        if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+          cross_network_stage_rc="$stage_rc"
+          break
+        fi
+
         if cross_network_relay_label >/dev/null 2>&1; then
           profile_report="$(cross_network_report_path_for_profile "cross_network_relay_remote_exit_report.json" "$nat_idx" "$nat_profile")"
           profile_log="$(cross_network_log_path_for_profile "cross_network_relay_remote_exit.log" "$nat_idx" "$nat_profile")"
@@ -3637,11 +3810,19 @@ main() {
             cross_network_stage_rc="$stage_rc"
             break
           fi
+          profile_report="$(cross_network_report_path_for_profile "cross_network_controller_switch_report.json" "$nat_idx" "$nat_profile")"
+          profile_log="$(cross_network_log_path_for_profile "cross_network_controller_switch.log" "$nat_idx" "$nat_profile")"
+          run_stage hard "cross_network_controller_switch${stage_suffix}" "run cross-network controller-switch validation (nat_profile=${nat_profile})" stage_run_cross_network_controller_switch "$nat_profile" "$profile_report" "$profile_log"
+          stage_rc=$?
+          if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
+            cross_network_stage_rc="$stage_rc"
+            break
+          fi
         else
           record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" hard 'requires entry or aux target'
           record_stage_skip "cross_network_failback_roaming${stage_suffix}" hard 'requires entry or aux target'
+          record_stage_skip "cross_network_controller_switch${stage_suffix}" hard 'requires entry or aux target'
         fi
-
         if cross_network_probe_label >/dev/null 2>&1; then
           profile_report="$(cross_network_report_path_for_profile "cross_network_traversal_adversarial_report.json" "$nat_idx" "$nat_profile")"
           profile_log="$(cross_network_log_path_for_profile "cross_network_traversal_adversarial.log" "$nat_idx" "$nat_profile")"
@@ -3691,6 +3872,8 @@ main() {
       record_stage_skip "cross_network_direct_remote_exit${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
       record_stage_skip "cross_network_relay_remote_exit${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
       record_stage_skip "cross_network_failback_roaming${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_controller_switch${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
+      record_stage_skip "cross_network_node_network_switch${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
       record_stage_skip "cross_network_traversal_adversarial${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
       record_stage_skip "cross_network_remote_exit_dns${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"
       record_stage_skip "cross_network_remote_exit_soak${stage_suffix}" hard "$CROSS_NETWORK_SKIP_REASON"

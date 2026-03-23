@@ -73,6 +73,11 @@ fn run() -> Result<(), i32> {
     )?;
     run_bin(&root_dir, "test_validate_cross_network_nat_matrix", &[])?;
     run_bin(&root_dir, "test_validate_network_discovery_bundle", &[])?;
+    run_bin(
+        &root_dir,
+        "test_cross_network_remote_exit_skeleton_validators",
+        &[],
+    )?;
 
     run_ops(
         &root_dir,

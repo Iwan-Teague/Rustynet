@@ -657,7 +657,6 @@ pub fn apply_signed_update(
     }
 
     verify_membership_signatures(state, signed_update, payload.as_bytes())?;
-    replay_cache.observe(&record.update_id, record.epoch_new)?;
 
     let mut next = reduce_membership_state(state, &record.operation)?;
     next.epoch = record.epoch_new;
@@ -666,6 +665,7 @@ pub fn apply_signed_update(
     if computed_new_root != record.new_state_root {
         return Err(MembershipError::NewStateRootMismatch);
     }
+    replay_cache.observe(&record.update_id, record.epoch_new)?;
 
     Ok(next)
 }
@@ -979,6 +979,7 @@ fn reduce_membership_state(
                 return Err(MembershipError::InvalidTransition("node already revoked"));
             }
             node.status = MembershipNodeStatus::Revoked;
+            node.updated_at_unix = unix_now();
         }
         MembershipOperation::RestoreNode { node_id } => {
             let node = next
@@ -990,6 +991,7 @@ fn reduce_membership_state(
                 return Err(MembershipError::InvalidTransition("node already active"));
             }
             node.status = MembershipNodeStatus::Active;
+            node.updated_at_unix = unix_now();
         }
         MembershipOperation::RotateNodeKey {
             node_id,
@@ -1192,7 +1194,7 @@ fn parse_membership_update_payload(
     })
 }
 
-fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipError> {
+fn atomic_write(path: &Path, body: &[u8], _mode: u32) -> Result<(), MembershipError> {
     if let Some(parent) = path.parent() {
         if parent.exists() {
             let metadata =
@@ -1234,7 +1236,7 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipErr
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
+        options.mode(_mode);
     }
     let mut temp = options
         .open(&temp_path)
@@ -1251,6 +1253,7 @@ fn atomic_write(path: &Path, body: &[u8], mode: u32) -> Result<(), MembershipErr
         let _ = fs::remove_file(&temp_path);
         return Err(MembershipError::Io(err.to_string()));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir =
             fs::File::open(parent).map_err(|err| MembershipError::Io(err.to_string()))?;
@@ -1429,7 +1432,8 @@ mod tests {
         MembershipOperation, MembershipReplayCache, MembershipState, MembershipUpdateRecord,
         SignedMembershipUpdate, append_membership_log_entry, apply_signed_update, hex_encode,
         load_membership_log, load_membership_snapshot, persist_membership_snapshot,
-        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
+        preview_next_state, replay_membership_snapshot_and_log, sign_update_record,
+        write_membership_audit_log,
     };
     use ed25519_dalek::SigningKey;
 
@@ -1612,6 +1616,201 @@ mod tests {
 
         let replay = apply_signed_update(&updated, &signed, 131, &mut cache);
         assert!(replay.is_err());
+    }
+
+    #[test]
+    fn duplicate_signer_is_rejected() {
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-duplicate-signer".to_string(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_string(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_string(),
+            policy_context: None,
+        };
+
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let owner_signature = sign_update_record(&record, "owner-1", &owner_key).expect("sign");
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: vec![owner_signature.clone(), owner_signature],
+        };
+
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("duplicate signer should be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn owner_signature_required_for_rotate_approver() {
+        let state = base_state();
+        let replacement = MembershipApprover {
+            approver_id: "guardian-3".to_string(),
+            approver_pubkey_hex: hex_encode(SigningKey::from_bytes(&[4; 32]).verifying_key().as_bytes()),
+            role: MembershipApproverRole::Guardian,
+            status: MembershipApproverStatus::Active,
+            created_at_unix: 150,
+        };
+
+        let mut candidate = state.clone();
+        candidate.approver_set.push(replacement.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-rotate-approver".to_string(),
+            operation: MembershipOperation::RotateApprover(replacement),
+            target: "guardian-3".to_string(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 140,
+            expires_at_unix: 640,
+            reason_code: "rotate".to_string(),
+            policy_context: None,
+        };
+        let guardian_one = SigningKey::from_bytes(&[2; 32]);
+        let guardian_two = SigningKey::from_bytes(&[3; 32]);
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: vec![
+                sign_update_record(&record, "guardian-1", &guardian_one).expect("sign"),
+                sign_update_record(&record, "guardian-2", &guardian_two).expect("sign"),
+            ],
+        };
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("owner signature should be required");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    #[test]
+    fn replay_cache_not_updated_on_failed_update() {
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let base_record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-retry".to_string(),
+            operation: MembershipOperation::AddNode(new_node.clone()),
+            target: "node-b".to_string(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_string(),
+            policy_context: None,
+        };
+
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+
+        let mut bad_record = base_record.clone();
+        bad_record.new_state_root = "deadbeef".to_string();
+        let bad_signed = SignedMembershipUpdate {
+            record: bad_record.clone(),
+            approver_signatures: vec![
+                sign_update_record(&bad_record, "owner-1", &owner_key).expect("sign"),
+                sign_update_record(&bad_record, "guardian-1", &guardian_key).expect("sign"),
+            ],
+        };
+
+        let mut cache = MembershipReplayCache::default();
+        let err = apply_signed_update(&state, &bad_signed, 130, &mut cache)
+            .expect_err("bad root should fail");
+        assert_eq!(err, MembershipError::NewStateRootMismatch);
+
+        let good_signed = SignedMembershipUpdate {
+            record: base_record.clone(),
+            approver_signatures: vec![
+                sign_update_record(&base_record, "owner-1", &owner_key).expect("sign"),
+                sign_update_record(&base_record, "guardian-1", &guardian_key).expect("sign"),
+            ],
+        };
+
+        let applied = apply_signed_update(&state, &good_signed, 131, &mut cache)
+            .expect("valid update should still apply after failed attempt");
+        assert_eq!(applied.epoch, state.epoch + 1);
+    }
+
+    #[test]
+    fn loading_empty_membership_log_is_supported() {
+        let unique = format!(
+            "membership-empty-log-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+        let log = temp_dir.join("membership.log");
+        std::fs::write(&log, format!("version={MEMBERSHIP_SCHEMA_VERSION}\n"))
+            .expect("empty log should be written");
+
+        let entries = load_membership_log(&log).expect("empty log should load");
+        assert!(entries.is_empty());
+
+        let _ = std::fs::remove_file(log);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn revoke_and_restore_update_timestamp() {
+        let state = base_state();
+        let original_updated = state
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "node-a")
+            .expect("node should exist")
+            .updated_at_unix;
+
+        let revoked = preview_next_state(
+            &state,
+            &MembershipOperation::RevokeNode {
+                node_id: "node-a".to_string(),
+            },
+        )
+        .expect("revoke should succeed");
+        let revoked_node = revoked
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "node-a")
+            .expect("node should exist");
+        assert_eq!(revoked_node.status, MembershipNodeStatus::Revoked);
+        assert!(revoked_node.updated_at_unix >= original_updated);
+
+        let restored = preview_next_state(
+            &revoked,
+            &MembershipOperation::RestoreNode {
+                node_id: "node-a".to_string(),
+            },
+        )
+        .expect("restore should succeed");
+        let restored_node = restored
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "node-a")
+            .expect("node should exist");
+        assert_eq!(restored_node.status, MembershipNodeStatus::Active);
+        assert!(restored_node.updated_at_unix >= revoked_node.updated_at_unix);
     }
 
     #[test]

@@ -3,7 +3,7 @@ Description=Rustynet Assignment Bundle Refresh
 Documentation=https://github.com/Iwan-Teague/Rustynet
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsExecutable=/usr/local/bin/rustynet
+ConditionPathExists=/usr/local/bin/rustynet
 
 [Service]
 Type=oneshot
@@ -19,6 +19,7 @@ Environment=RUSTYNET_DAEMON_GROUP=rustynetd
 LoadCredentialEncrypted=signing_key_passphrase:/etc/rustynet/credentials/signing_key_passphrase.cred
 ExecStartPre=/usr/local/bin/rustynet ops verify-runtime-binary-custody
 ExecStart=/usr/local/bin/rustynet ops refresh-assignment
+ExecStartPost=/usr/local/bin/rustynet state refresh
 User=root
 Group=root
 NoNewPrivileges=true

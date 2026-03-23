@@ -3,6 +3,7 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::fmt;
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -72,7 +73,7 @@ impl AdminAuthorizer {
         if !session.secure_cookie || !session.http_only_cookie || !session.same_site_strict {
             return Err(AdminError::SessionInsecure);
         }
-        if submitted_csrf_token != session.csrf_token {
+        if submitted_csrf_token.as_bytes().ct_eq(session.csrf_token.as_bytes()).unwrap_u8() != 1 {
             return Err(AdminError::CsrfInvalid);
         }
 

@@ -4,6 +4,7 @@
 pub enum IpcCommand {
     Status,
     Netcheck,
+    StateRefresh,
     ExitNodeSelect(String),
     ExitNodeOff,
     LanAccessOn,
@@ -23,6 +24,7 @@ impl IpcCommand {
                 | IpcCommand::ExitNodeOff
                 | IpcCommand::LanAccessOn
                 | IpcCommand::LanAccessOff
+                | IpcCommand::StateRefresh
                 | IpcCommand::RouteAdvertise(_)
                 | IpcCommand::KeyRotate
                 | IpcCommand::KeyRevoke
@@ -33,6 +35,7 @@ impl IpcCommand {
         match self {
             IpcCommand::Status => "status".to_string(),
             IpcCommand::Netcheck => "netcheck".to_string(),
+            IpcCommand::StateRefresh => "state refresh".to_string(),
             IpcCommand::ExitNodeSelect(node) => format!("exit-node select {node}"),
             IpcCommand::ExitNodeOff => "exit-node off".to_string(),
             IpcCommand::LanAccessOn => "lan-access on".to_string(),
@@ -92,6 +95,7 @@ pub fn parse_command(raw: &str) -> IpcCommand {
     match tokens.as_slice() {
         [cmd] if cmd == "status" => IpcCommand::Status,
         [cmd] if cmd == "netcheck" => IpcCommand::Netcheck,
+        [cmd, subcmd] if cmd == "state" && subcmd == "refresh" => IpcCommand::StateRefresh,
         [cmd, subcmd, node] if cmd == "exit-node" && subcmd == "select" => {
             IpcCommand::ExitNodeSelect(node.clone())
         }
@@ -143,6 +147,14 @@ mod tests {
         assert_eq!(revoke, IpcCommand::KeyRevoke);
         assert!(revoke.is_mutating());
         assert_eq!(revoke.as_wire(), "key revoke");
+    }
+
+    #[test]
+    fn parse_state_refresh_mutation() {
+        let command = parse_command("state refresh");
+        assert_eq!(command, IpcCommand::StateRefresh);
+        assert!(command.is_mutating());
+        assert_eq!(command.as_wire(), "state refresh");
     }
 
     #[test]

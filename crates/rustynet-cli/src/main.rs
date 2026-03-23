@@ -78,6 +78,7 @@ enum CliCommand {
     Status,
     Login,
     Netcheck,
+    StateRefresh,
     OperatorMenu,
     ExitNodeSelect(String),
     ExitNodeOff,
@@ -600,6 +601,7 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "status" => CliCommand::Status,
         [cmd] if cmd == "login" => CliCommand::Login,
         [cmd] if cmd == "netcheck" => CliCommand::Netcheck,
+        [cmd, subcmd] if cmd == "state" && subcmd == "refresh" => CliCommand::StateRefresh,
         [cmd, subcmd] if cmd == "operator" && subcmd == "menu" => CliCommand::OperatorMenu,
         [cmd, subcmd, node] if cmd == "exit-node" && subcmd == "select" => {
             CliCommand::ExitNodeSelect(node.clone())
@@ -9729,6 +9731,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
     match command {
         CliCommand::Status => IpcCommand::Status,
         CliCommand::Netcheck => IpcCommand::Netcheck,
+        CliCommand::StateRefresh => IpcCommand::StateRefresh,
         CliCommand::ExitNodeSelect(node) => IpcCommand::ExitNodeSelect(node),
         CliCommand::ExitNodeOff => IpcCommand::ExitNodeOff,
         CliCommand::LanAccessOn => IpcCommand::LanAccessOn,
@@ -9827,6 +9830,7 @@ fn help_text() -> String {
         "  status",
         "  login",
         "  netcheck",
+        "  state refresh",
         "  operator menu",
         "  exit-node select <node>",
         "  exit-node off",
@@ -11464,6 +11468,14 @@ mod tests {
             "/run/rustynet/traversal-issue".to_string(),
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
+    }
+
+    #[test]
+    fn parse_supports_state_refresh_command() {
+        let command = parse_command(&["state".to_string(), "refresh".to_string()]);
+        assert_eq!(command, CliCommand::StateRefresh);
+        let ipc = to_ipc_command(command);
+        assert_eq!(ipc, IpcCommand::StateRefresh);
     }
 
     #[test]

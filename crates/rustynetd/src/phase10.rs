@@ -602,7 +602,7 @@ impl LinuxCommandSystem {
                     "daddr",
                     cidr_text.as_str(),
                     "tcp",
-                    "sport",
+                    "dport",
                     "22",
                     "accept",
                 ],
@@ -1559,7 +1559,7 @@ impl MacosCommandSystem {
         if self.fail_closed_ssh_allow {
             for cidr in &self.fail_closed_ssh_allow_cidrs {
                 rules.push_str(&format!(
-                    "pass out quick {} proto tcp from any port 22 to {} keep state\n",
+                    "pass out quick {} proto tcp from any to {} port 22 keep state\n",
                     cidr.pf_family(),
                     cidr
                 ));
@@ -4256,6 +4256,51 @@ mod tests {
                 "table".to_string(),
                 "51820".to_string(),
             ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_closed_management_allow_rule_targets_ssh_destination_port() {
+        let socket_path = phase10_test_socket_path("m");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            true,
+            vec![
+                "192.168.18.0/24"
+                    .parse::<ManagementCidr>()
+                    .expect("management cidr should parse"),
+            ],
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("tcp dport 22 accept")),
+            "management allow rule must target destination SSH port"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("tcp sport 22 accept")),
+            "management allow rule must not use source SSH port"
         );
     }
 

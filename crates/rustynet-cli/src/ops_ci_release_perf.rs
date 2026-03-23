@@ -399,6 +399,12 @@ pub fn execute_ops_run_phase10_ci_gates() -> Result<String, String> {
             max_evidence_age_seconds.as_str(),
         ),
     ];
+    run_script_with_env(
+        &root_dir,
+        "scripts/ci/phase10_cross_network_exit_gates.sh",
+        &[],
+        &shared_env,
+    )?;
     run_self_op(
         &["ops", "verify-phase10-provenance"],
         Some(&root_dir),

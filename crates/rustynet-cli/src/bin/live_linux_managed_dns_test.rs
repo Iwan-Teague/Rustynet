@@ -467,10 +467,7 @@ fn run() -> Result<(), String> {
         ],
     )?;
 
-    let mut distribution_hosts = host_by_node
-        .values()
-        .cloned()
-        .collect::<Vec<String>>();
+    let mut distribution_hosts = host_by_node.values().cloned().collect::<Vec<String>>();
     distribution_hosts.sort();
     distribution_hosts.dedup();
     for host in distribution_hosts {

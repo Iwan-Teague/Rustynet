@@ -86,7 +86,7 @@ Two-hop chain notes:
 
 Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
-- Linux trust refresh service path is Rust-only: `rustynetd-trust-refresh.service` executes `rustynet ops refresh-trust` directly (no shell wrapper in the active path).
+- Linux trust refresh service path is Rust-only: `rustynetd-trust-refresh.service` executes `rustynet ops refresh-trust` directly (no shell wrapper in the active path), then enforces daemon-side signed state revalidation via `rustynet state refresh`.
 - systemd refresh units pin `/usr/local/bin/rustynet` and run `ops verify-runtime-binary-custody` as `ExecStartPre`, enforcing root-owned/non-group-writable binary custody before refresh execution.
 - `start.sh` manual trust refresh path is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup) with fail-closed behavior (no shell fallback).
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
@@ -97,7 +97,7 @@ Linux trust-refresh behavior:
 Linux assignment-refresh behavior:
 - Auto-tunnel enforcement remains fail-closed: stale/invalid signed assignment bundles are rejected.
 - Trust and auto-tunnel watermark parsers are strict: only digest-bound `version=2` watermark files are accepted (legacy `version=1` is rejected fail-closed).
-- Linux assignment refresh service path is Rust-only: `rustynetd-assignment-refresh.service` executes `rustynet ops refresh-assignment` directly (no shell wrapper in the active path).
+- Linux assignment refresh service path is Rust-only: `rustynetd-assignment-refresh.service` executes `rustynet ops refresh-assignment` directly (no shell wrapper in the active path), then enforces daemon-side signed state revalidation via `rustynet state refresh`.
 - Linux service installer path is Rust-backed: `scripts/systemd/install_rustynetd_service.sh` is a thin wrapper to `rustynet ops install-systemd` (with `RUSTYNET_INSTALL_SOURCE_ROOT` pinned by the wrapper).
 - Linux `start.sh` exit-node selection/disable flows now require local signed assignment refresh support; if assignment refresh is unavailable, interactive exit-node mutation fails closed instead of falling back to raw direct CLI mutation.
 - Legacy Linux WireGuard key paths are no longer implicitly migrated in custody bootstrap/install flows; canonical paths must be present, or operators must perform explicit key re-enrollment/rotation.

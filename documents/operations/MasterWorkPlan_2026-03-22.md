@@ -558,6 +558,10 @@ Files to modify:
 - `crates/rustynetd/src/daemon.rs` — implement `handle_state_refresh_command`
 
 Implementation:
+
+[IN_PROGRESS — started 2026-03-23T18:45Z] Evidence: added a minimal StateFetcher implementation (crates/rustynetd/src/daemon.rs) and unit tests (crates/rustynetd/tests/state_fetcher.rs). CLI/IPC wiring already routes `state refresh` to daemon; the fetch-path is currently conservative: network-unreachable or unset endpoints fall back to secure disk-based verification; cryptographic verification failures will surface as errors and prevent apply. Full verification and Debian test-run pending.
+
+
 ```rust
 // In ipc.rs — command is already parsed, handler needs completion:
 IpcCommand::StateRefresh { target: RefreshTarget } => {

@@ -12,6 +12,8 @@ CLIENT_NODE_ID=""
 EXIT_NODE_ID=""
 CLIENT_NETWORK_ID=""
 EXIT_NETWORK_ID=""
+CLIENT_UNDERLAY_IP="${RUSTYNET_CLIENT_UNDERLAY_IP:-}"
+EXIT_UNDERLAY_IP="${RUSTYNET_EXIT_UNDERLAY_IP:-}"
 NAT_PROFILE="baseline_lan"
 IMPAIRMENT_PROFILE="none"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
@@ -44,6 +46,8 @@ options:
   --nat-profile <profile>
   --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
+  --client-underlay-ip <ipv4>
+  --exit-underlay-ip <ipv4>
   --zone-name <name>
   --dns-interface <name>
   --dns-bind-addr <ip:port>
@@ -112,6 +116,8 @@ while [[ $# -gt 0 ]]; do
     --exit-node-id) EXIT_NODE_ID="$2"; shift 2 ;;
     --client-network-id) CLIENT_NETWORK_ID="$2"; shift 2 ;;
     --exit-network-id) EXIT_NETWORK_ID="$2"; shift 2 ;;
+    --client-underlay-ip) CLIENT_UNDERLAY_IP="$2"; shift 2 ;;
+    --exit-underlay-ip) EXIT_UNDERLAY_IP="$2"; shift 2 ;;
     --nat-profile) NAT_PROFILE="$2"; shift 2 ;;
     --impairment-profile) IMPAIRMENT_PROFILE="$2"; shift 2 ;;
     --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
@@ -144,6 +150,13 @@ if [[ "$CLIENT_NETWORK_ID" == "$EXIT_NETWORK_ID" ]]; then
   exit 2
 fi
 
+if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CLIENT_UNDERLAY_IP" >/dev/null
+fi
+if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
+  cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
+fi
+
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
 exec >> "$LOG_PATH" 2>&1
@@ -170,6 +183,8 @@ main() {
       --exit-node-id "$EXIT_NODE_ID" \
       --client-network-id "$CLIENT_NETWORK_ID" \
       --exit-network-id "$EXIT_NETWORK_ID" \
+      --client-underlay-ip "${CLIENT_UNDERLAY_IP:-}" \
+      --exit-underlay-ip "${EXIT_UNDERLAY_IP:-}" \
       --nat-profile "$NAT_PROFILE" \
       --impairment-profile "$IMPAIRMENT_PROFILE" \
       --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \

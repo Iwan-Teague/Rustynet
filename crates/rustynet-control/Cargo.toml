@@ -9,6 +9,7 @@ authors.workspace = true
 rustynet-dns-zone = { path = "../rustynet-dns-zone" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynet-crypto = { path = "../rustynet-crypto" }
+subtle = "2"
 sha2 = "0.10"
 hkdf = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
