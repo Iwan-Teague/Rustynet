@@ -1197,7 +1197,7 @@ fn ensure_secure_parent_directory(path: &Path) -> Result<(), TrustStateError> {
     Ok(())
 }
 
-fn atomic_write_secure(path: &Path, body: &[u8], _mode: u32) -> Result<(), TrustStateError> {
+fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustStateError> {
     ensure_secure_parent_directory(path)?;
     if path.exists() {
         let metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::PersistFailure)?;
@@ -1246,7 +1246,7 @@ fn atomic_write_secure(path: &Path, body: &[u8], _mode: u32) -> Result<(), Trust
 fn validate_secure_file(
     path: &Path,
     label: &str,
-    _disallowed_mode_mask: u32,
+    disallowed_mode_mask: u32,
 ) -> Result<(), TrustStateError> {
     let link_metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::Missing)?;
     if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
@@ -1266,6 +1266,7 @@ fn validate_secure_file(
         }
     }
     let _ = label;
+    let _ = disallowed_mode_mask;
     Ok(())
 }
 
