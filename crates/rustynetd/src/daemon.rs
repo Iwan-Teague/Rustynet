@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -144,6 +144,8 @@ pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
 pub const DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT: &str = "user:local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
+pub const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
+pub const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
 const BLIND_EXIT_DEFAULT_ROUTE_CIDR: &str = "0.0.0.0/0";
@@ -3474,7 +3476,27 @@ impl DaemonRuntime {
                 }
             }
         }
-        match self.state_fetcher.fetch_dns_zone() {
+        let dns_context = if self.auto_tunnel_enforce {
+            if let Some(path) = &self.config.auto_tunnel_bundle_path {
+                if let Some(verifier) = &self.config.auto_tunnel_verifier_key_path {
+                    use rustynet_control::TrustPolicy;
+                    let policy = TrustPolicy {
+                        max_signed_data_age_secs: self.config.auto_tunnel_max_age_secs.get(),
+                        max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
+                    };
+                    load_auto_tunnel_bundle(path, verifier, policy, None)
+                        .map(|(b, _)| b)
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match self.state_fetcher.fetch_dns_zone(dns_context.as_ref()) {
             Ok(FetchDecision::Applied) => eprintln!("statefetch: dns zone applied before bootstrap"),
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
@@ -5132,15 +5154,35 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                                 #[cfg(any(target_os = "linux", target_os = "android"))]
                                 {
                                     use nix::sys::socket::sockopt::PeerCredentials;
-                                    getsockopt(&stream, PeerCredentials).ok().map(|c| c.gid())
+                                    nix::sys::socket::getsockopt(&stream, PeerCredentials)
+                                        .ok()
+                                        .map(|c| c.gid())
                                 }
-                                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
+                                #[cfg(any(
+                                    target_os = "macos",
+                                    target_os = "ios",
+                                    target_os = "tvos",
+                                    target_os = "watchos",
+                                    target_os = "visionos"
+                                ))]
                                 {
                                     use nix::sys::socket::sockopt::LocalPeerCred;
-                                    getsockopt(&stream, LocalPeerCred).ok().map(|c| c.gid())
+                                    nix::sys::socket::getsockopt(&stream, LocalPeerCred)
+                                        .ok()
+                                        .map(|c| c.gid())
                                 }
-                                #[allow(unreachable_code)]
-                                None => None,
+                                #[cfg(not(any(
+                                    target_os = "linux",
+                                    target_os = "android",
+                                    target_os = "macos",
+                                    target_os = "ios",
+                                    target_os = "tvos",
+                                    target_os = "watchos",
+                                    target_os = "visionos"
+                                )))]
+                                {
+                                    None
+                                }
                             }) {
                                 (Some(peer_uid), Some(peer_gid)) => {
                                     // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)

@@ -39,7 +39,7 @@ pub struct TraversalCandidate {
     pub observed_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraversalEngineConfig {
     pub max_candidates: usize,
     pub max_probe_pairs: usize,
