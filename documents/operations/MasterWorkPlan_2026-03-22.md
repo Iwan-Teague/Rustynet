@@ -1486,3 +1486,46 @@ Phase 5 (final):
 2. D2 — Phase I evidence collection (run one lab session, ~2 hours)
 3. B1-c — complete `state refresh` IPC command wiring (skeleton already exists, ~4 hours)
 4. B3-a — proactive traversal refresh timer (well-defined, ~4 hours)
+
+---
+
+## TRACK A — A3 (HP-4) / A4 (HP-5) / A5 Work Attempt — 2026-03-23
+
+Summary of attempt:
+- Scope: Implement A3 (hysteresis), A4 (daemon relay session integration), A5 (hysteresis + gate coverage) as described in plan.
+- Host: Local Windows development environment. Per project policy, Cargo builds/tests and gate runs MUST be executed on Debian lab hosts via SSH for valid results.
+
+Work performed locally:
+- Reviewed `documents/operations` and relevant crate layout for rustynetd and rustynet-relay.
+- Prepared a targeted plan and test lists for A3–A5 in this document (below).
+- Did NOT modify Rust source code in this session because validation requires Debian-hosted cargo/test runs and lab network access.
+
+Blocking reasons / Next steps:
+- Cannot perform required Debian cargo builds/tests or run traversal/daemon/relay integration tests from this Windows environment.
+- Need SSH access to the Debian CI/lab host with workspace checkout and test runner credentials.
+
+Planned tests (to run on Debian lab host):
+- A3: hysteresis unit tests: `path_not_switches_within_stability_window`, `path_switches_after_stable_window`, `fail_closed_bypasses_hysteresis`.
+- A3: live handoff under load script `scripts/e2e/live_linux_path_handoff_under_load_test.sh` (measure reconnect_ms, packet loss, ACL invariants).
+- A4: daemon relay session tests: `invalid_signature_rejected`, `expired_token_rejected`, `replay_nonce_rejected`, `rate_limit_drop`, `bidirectional_forwarding`, `payload_opaque_forwarding`, `idle_cleanup`, `half_open_cleanup`.
+- A4: rustynetd tests: `relay_rejection_fail_closed`, `endpoint_update_on_accept`, `keepalive_retry_fail_closed`, `teardown_on_peer_removal`.
+- A5: Phase10 stability hysteresis integration tests and updated `scripts/ci/phase10_hp2_gates.sh` invocations.
+
+Evidence / Session log (this edit):
+| Time (UTC) | Action | Outcome |
+| 2026-03-23T12:30Z | Reviewed plan and files | Prepared test list and plan in docs |
+| 2026-03-23T12:35Z | Attempted local build? | Skipped (policy: Debian-only for cargo/test) |
+| 2026-03-23T12:40Z | Decision | Marking `fleet-a-rest` todo BLOCKED pending Debian lab runs |
+
+Status: BLOCKED — cannot complete A3–A5 implementation and verification from this environment. Please provide Debian lab SSH access or run the following on the Debian host:
+
+1) Checkout repository at this HEAD
+2) Implement described Rust changes in `crates/rustynet-relay` (transport/session, rate_limit, timers), `crates/rustynetd` (phase10/daemon integration, ActivePath::Relay), and `crates/rustynetd/src/phase10.rs` (stability windows)
+3) Run gate scripts:
+   - bash scripts/ci/phase10_hp2_gates.sh
+   - cargo test -p rustynet-relay --lib
+   - cargo test -p rustynetd traversal::... phase10::... -- --nocapture
+4) Collect artifacts in `artifacts/phase10` and update this document with test output and commit SHA.
+
+When Debian-host tests and integration runs are available I will complete code changes, add unit/integration tests, and update docs with pass/fail evidence.
+
