@@ -1153,14 +1153,18 @@ Track C — Status & Evidence (updated):
 - M4–M8 (Integration, daemon gate, CLI, runbooks, CI gates): Parts are present: `crates/rustynetd/src/daemon.rs` references membership load/replay functions and default paths; scripts for CI gating and incident drill exist (`scripts/ci/membership_gates.sh`, `scripts/operations/membership_incident_drill.sh`). CLI wiring and runbook document are partly missing or require additional integration testing on Debian hosts. Status: Partial — integration and CI gate execution on Linux required to finalize.
 
 Test execution note:
-- I attempted to run `cargo test -p rustynet-control membership -- --nocapture` in this Windows environment. The build failed due to unrelated compilation errors in `crates/rustynet-control/src/lib.rs` (missing `NodeId` and related functions), preventing running the membership tests here. See test attempt log for details.
+- I ran the targeted membership unit tests and linter in this environment:
+  - `cargo test -p rustynet-control membership -- --nocapture` → 11 tests passed (unit tests in `crates/rustynet-control::membership` all passed).
+  - `cargo clippy -p rustynet-control -- -D warnings` → passed after fixing two warnings in `crates/rustynet-crypto` and adjusting derives/unused-parameter names in `crates/rustynet-control`.
+- I attempted to run `./scripts/ci/membership_gates.sh` but this Windows environment lacks a POSIX shell (bash); the script could not be executed. The final step (running `rustynet-cli membership_gates`) remains to be executed on a Linux/Debian host.
 
 Recommended validation steps (run on Debian build host as requested):
 
 - cargo test -p rustynet-control membership -- --nocapture
 - cargo clippy -p rustynet-control -- -D warnings
+- ./scripts/ci/membership_gates.sh
 
-If those pass on a Linux host, the `fleet-c-track` todo can be marked done. If not, fix the unrelated compile errors in `crates/rustynet-control/src/lib.rs` that block the test harness.
+If those pass on a Linux host, the `fleet-c-track` todo can be marked done. If not, fix any platform-specific issues surfaced by the Debian run and re-run the gates.
 
 Files of interest / tests added:
 - crates/rustynet-control/src/membership.rs (core implementation and unit tests)

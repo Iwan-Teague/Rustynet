@@ -331,11 +331,19 @@ impl StateFetcher {
                 Ok(body) => {
                     let tmp = std::env::temp_dir().join("rustynetd.traversal.tmp");
                     std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
-                    match verify_signed_traversal_state_artifact(&tmp, &self.traversal_verifier_key_path, &self.traversal_watermark_path, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS, Some("")) {
-                        Ok(report) => {
+
+                    let previous_watermark = match load_traversal_watermark(&self.traversal_watermark_path) {
+                        Ok(val) => val,
+                        Err(err) => return Err(format!("read previous traversal watermark failed: {err}")),
+                    };
+
+                    match load_traversal_bundle_set(&tmp, &self.traversal_verifier_key_path, DEFAULT_TRAVERSAL_MAX_AGE_SECS, TrustPolicy { max_signed_data_age_secs: DEFAULT_TRAVERSAL_MAX_AGE_SECS, max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS }, previous_watermark) {
+                        Ok(envelope) => {
                             std::fs::rename(&tmp, &self.traversal_bundle_path)
                                 .map_err(|e| format!("persist traversal bundle failed: {e}"))?;
-                            eprintln!("statefetch: applied traversal bundle: nonce={}", report.nonce);
+                            persist_traversal_watermark(&self.traversal_watermark_path, envelope.watermark)
+                                .map_err(|e| format!("persist traversal watermark failed: {e}"))?;
+                            eprintln!("statefetch: applied traversal bundle: nonce={}", envelope.watermark.nonce);
                             Ok(FetchDecision::Applied)
                         }
                         Err(err) => Err(format!("traversal fetch verification failed: {err}")),
@@ -8704,6 +8712,11 @@ fn write_response(mut stream: UnixStream, response: IpcResponse) -> Result<(), S
 fn socket_owner_uid(path: &Path) -> Result<u32, DaemonError> {
     let metadata = fs::metadata(path).map_err(|err| DaemonError::Io(err.to_string()))?;
     Ok(metadata.uid())
+}
+
+fn socket_owner_gid(path: &Path) -> Result<u32, DaemonError> {
+    let metadata = fs::metadata(path).map_err(|err| DaemonError::Io(err.to_string()))?;
+    Ok(metadata.gid())
 }
 
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
