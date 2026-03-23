@@ -1347,7 +1347,16 @@ If boringtun is out of scope, at minimum write comprehensive conformance tests f
 
 ### G1 — HP-3 Relay Transport Constant-Time Auth Prep
 
-**Status:** Flagged as PENDING in `SecurityHardeningBacklog_2026-03-09.md`.
+**Status:** PARTIAL — constant-time comparison applied in rustynet-control for CSRF tokens; further relay/session places remain.
+
+Evidence:
+- Implemented constant-time CSRF comparison in crates/rustynet-control/src/admin.rs (uses subtle::ConstantTimeEq).
+- Added subtle dependency to crates/rustynet-control/Cargo.toml.
+- Commit: 9482d280c37e0561473c64aed3197d1aee44affb
+
+Remaining work:
+- Add subtle to rustynet-relay and replace token comparisons in crates/rustynet-relay/src/transport.rs.
+- Add grep-based CI gate to security_regression_gates to detect raw token equality.
 
 Before implementing HP-3 relay transport (Track A, A2), the auth token comparison in the relay session protocol must use constant-time comparison to avoid timing side-channels.
 
@@ -1397,7 +1406,11 @@ Tasks:
    - sha1: { status: "deprecated", removal_scheduled: "2026-06-01", usage_count: 0 }
    - 3des: { status: "deprecated", removal_scheduled: "2026-06-01", usage_count: 0 }
 
+   Evidence: updated artifacts/operations/crypto_deprecation_schedule.json and artifacts/operations/source/raw in commit 9482d280c37e0561473c64aed3197d1aee44affb.
+
 4. Add CI gate: fail if sha1 or 3des usage count > 0 (counted by cargo audit)
+
+Status: PARTIAL — schedule updated; dependency removal and CI gate still outstanding.
 ```
 
 ---
