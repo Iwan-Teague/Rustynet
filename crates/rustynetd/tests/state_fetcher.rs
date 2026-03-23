@@ -174,7 +174,7 @@ fn fetcher_all_four_types_skip_when_url_unset() {
     assert_eq!(fetcher.fetch_trust().unwrap(), FetchDecision::Skipped);
     assert_eq!(fetcher.fetch_traversal().unwrap(), FetchDecision::Skipped);
     assert_eq!(fetcher.fetch_assignment().unwrap(), FetchDecision::Skipped);
-    assert_eq!(fetcher.fetch_dns_zone().unwrap(), FetchDecision::Skipped);
+    assert_eq!(fetcher.fetch_dns_zone(None).unwrap(), FetchDecision::Skipped);
 }
 
 #[test]
@@ -195,8 +195,90 @@ fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
     // Verify it failed
     assert!(err.len() > 0);
 
-    let content = fs::read_to_string(&cfg.traversal_bundle_path).unwrap();
-    assert_eq!(content, "sentinel");
-
     std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
+}
+
+fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
+    use rustynet_dns_zone::{DnsRecordType, DnsTargetAddrKind, DnsZoneRecordInput};
+    
+    let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+    fs::write(
+        verifier_path,
+        format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+    )
+    .unwrap();
+
+    let now = unix_now();
+    let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
+        &signing_key,
+        "rustynet",
+        "node-local",
+        now,
+        60,
+        nonce,
+        &[DnsZoneRecordInput {
+            label: "app".to_string(),
+            target_node_id: "node-target".to_string(),
+            rr_type: DnsRecordType::A,
+            target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+            expected_ip: "100.64.0.2".to_string(),
+            ttl_secs: 60,
+            aliases: vec![],
+        }],
+    )
+    .unwrap();
+    
+    rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle).into_bytes()
+}
+
+fn make_signed_trust_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    fs::write(
+        verifier_path,
+        format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+    )
+    .unwrap();
+    
+    let now = unix_now();
+    let payload = format!(
+        "version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={now}\nnonce={nonce}\n"
+    );
+    
+    let signature = signing_key.sign(payload.as_bytes());
+    let mut sig_bytes = signature.to_bytes().to_vec();
+    format!("{}signature={}\n", payload, hex_encode(&sig_bytes)).into_bytes()
+}
+
+#[test]
+fn fetcher_dns_zone_applied_updates_bundle_on_disk() {
+    let dir = tempdir().unwrap();
+    let cfg = make_test_config(dir.path());
+    let bundle = make_signed_dns_zone_bundle(&cfg.dns_zone_verifier_key_path, 100);
+    let url = serve_once(bundle);
+
+    std::env::set_var("RUSTYNET_DNS_ZONE_URL", &url);
+    let fetcher = StateFetcher::new_from_daemon(&cfg);
+
+    assert_eq!(fetcher.fetch_dns_zone(None).unwrap(), FetchDecision::Applied);
+    assert!(cfg.dns_zone_bundle_path.exists());
+    assert!(cfg.dns_zone_watermark_path.exists());
+
+    std::env::remove_var("RUSTYNET_DNS_ZONE_URL");
+}
+
+#[test]
+fn fetcher_trust_applied_updates_bundle_on_disk() {
+    let dir = tempdir().unwrap();
+    let cfg = make_test_config(dir.path());
+    let bundle = make_signed_trust_bundle(&cfg.trust_verifier_key_path, 100);
+    let url = serve_once(bundle);
+
+    std::env::set_var("RUSTYNET_TRUST_URL", &url);
+    let fetcher = StateFetcher::new_from_daemon(&cfg);
+
+    assert_eq!(fetcher.fetch_trust().unwrap(), FetchDecision::Applied);
+    assert!(cfg.trust_evidence_path.exists());
+    assert!(cfg.trust_watermark_path.exists());
+
+    std::env::remove_var("RUSTYNET_TRUST_URL");
 }

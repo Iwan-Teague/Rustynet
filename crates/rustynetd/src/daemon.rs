@@ -408,7 +408,7 @@ impl StateFetcher {
         }
     }
 
-    pub fn fetch_dns_zone(&self) -> Result<FetchDecision, String> {
+    pub fn fetch_dns_zone(&self, auto_bundle: Option<&AutoTunnelBundle>) -> Result<FetchDecision, String> {
         if let Ok(url) = std::env::var("RUSTYNET_DNS_ZONE_URL") {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
@@ -424,6 +424,16 @@ impl StateFetcher {
                     // load previous watermark (may be missing)
                     let previous = load_dns_zone_watermark(&self.dns_zone_watermark_path).map_err(|e| format!("read previous dns watermark failed: {e}"))?;
 
+                    let dummy_bundle = AutoTunnelBundle {
+                        node_id: String::new(),
+                        mesh_cidr: String::new(),
+                        assigned_cidr: String::new(),
+                        peers: Vec::new(),
+                        routes: Vec::new(),
+                        selected_exit_node: None,
+                    };
+                    let context_bundle = auto_bundle.unwrap_or(&dummy_bundle);
+
                     match load_dns_zone_bundle(DnsZoneLoadContext {
                         path: &tmp,
                         verifier_key_path: &self.dns_zone_verifier_key_path,
@@ -432,7 +442,7 @@ impl StateFetcher {
                         previous_watermark: previous,
                         expected_zone_name: &self.dns_zone_name,
                         local_node_id: &self.local_node_id,
-                        auto_tunnel: &AutoTunnelBundle { node_id: String::new(), mesh_cidr: String::new(), assigned_cidr: String::new(), peers: Vec::new(), routes: Vec::new(), selected_exit_node: None },
+                        auto_tunnel: context_bundle,
                     }) {
                         Ok(envelope) => {
                             std::fs::rename(&tmp, &self.dns_zone_bundle_path)
@@ -2522,7 +2532,17 @@ impl DaemonRuntime {
                 Err(e) => return Err(format!("remote assignment fetch failed: {e}")),
             }
         }
-        match self.state_fetcher.fetch_dns_zone() {
+        // For dns_zone: load auto_bundle from disk first if enforced, for accurate context.
+        let auto_bundle_for_dns = if self.auto_tunnel_enforce {
+            // Load assignment bundle for context; if this fails, treat as no context.
+            // Use a local load, not the full load_verified_auto_tunnel (which does full policy
+            // enforcement) — we just need the bundle content for DNS zone context.
+            // If load fails here, pass None (dns zone will use empty bundle context).
+            self.try_load_auto_tunnel_bundle_for_dns_context().ok()
+        } else {
+            None
+        };
+        match self.state_fetcher.fetch_dns_zone(auto_bundle_for_dns.as_ref()) {
             Ok(FetchDecision::Applied) => eprintln!("statefetch: dns zone applied during refresh"),
             Ok(FetchDecision::Skipped) => {}
             Err(e) => return Err(format!("remote dns zone fetch failed: {e}")),
@@ -3346,6 +3366,65 @@ impl DaemonRuntime {
     }
 
     fn bootstrap(&mut self) {
+        // Attempt remote pull of all signed state before disk loads.
+        // Skipped = no URL configured or network unreachable: continue to disk load.
+        // Err = bundle received but verification failed: fail permanently closed.
+        match self.state_fetcher.fetch_trust() {
+            Ok(FetchDecision::Applied) => {
+                eprintln!("rustynetd: bootstrap: remote trust bundle applied");
+            }
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote trust fetch verification failed: {e}"));
+                let _ = self
+                    .controller
+                    .force_fail_closed("remote_trust_fetch_verification_failed");
+                return;
+            }
+        }
+        match self.state_fetcher.fetch_traversal() {
+            Ok(FetchDecision::Applied) => {
+                eprintln!("rustynetd: bootstrap: remote traversal bundle applied");
+            }
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote traversal fetch verification failed: {e}"));
+                let _ = self
+                    .controller
+                    .force_fail_closed("remote_traversal_fetch_verification_failed");
+                return;
+            }
+        }
+        if self.auto_tunnel_enforce {
+            match self.state_fetcher.fetch_assignment() {
+                Ok(FetchDecision::Applied) => {
+                    eprintln!("rustynetd: bootstrap: remote assignment bundle applied");
+                }
+                Ok(FetchDecision::Skipped) => {}
+                Err(e) => {
+                    self.restrict_permanent(format!("remote assignment fetch verification failed: {e}"));
+                    let _ = self
+                        .controller
+                        .force_fail_closed("remote_assignment_fetch_verification_failed");
+                    return;
+                }
+            }
+        }
+        match self.state_fetcher.fetch_dns_zone(None) {
+            // Pass None: we haven't loaded auto_bundle yet; auto_tunnel context not yet known.
+            Ok(FetchDecision::Applied) => {
+                eprintln!("rustynetd: bootstrap: remote dns zone bundle applied");
+            }
+            Ok(FetchDecision::Skipped) => {}
+            Err(e) => {
+                self.restrict_permanent(format!("remote dns zone fetch verification failed: {e}"));
+                let _ = self
+                    .controller
+                    .force_fail_closed("remote_dns_zone_fetch_verification_failed");
+                return;
+            }
+        }
+
         match self.restore_state() {
             Ok(()) => {}
             Err(_err) => {
@@ -4201,6 +4280,48 @@ impl DaemonRuntime {
             let _ = self.controller.force_fail_closed("state_persist_failure");
             err.to_string()
         })
+    }
+
+    fn try_load_auto_tunnel_bundle_for_dns_context(&self) -> Result<AutoTunnelBundle, String> {
+        let bundle_path = self.auto_tunnel_bundle_path.as_ref().ok_or("no assignment path")?;
+        if !bundle_path.exists() {
+            return Err("assignment bundle not found".to_string());
+        }
+        let content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
+        
+        // Use the existing private parser logic. Since load_auto_tunnel_bundle is what parses it,
+        // and it returns AutoTunnelEnvelope, we can reuse it if we can construct the arguments.
+        // But load_auto_tunnel_bundle requires verification. We just want to parse it for context.
+        // However, we can use load_auto_tunnel_bundle with a relaxed policy OR just trust the file on disk
+        // since we are about to re-verify everything in fetch_dns_zone anyway?
+        // Actually, the prompt says: "Use a local load, not the full load_verified_auto_tunnel ... we just need the bundle content".
+        // It implies we should duplicate the parsing logic or reuse a parser.
+        // Since AutoTunnelBundle is likely a struct with a parse method (or internal parsing logic), let's check.
+        // I don't see a public parse method for AutoTunnelBundle exposed.
+        // However, I can call load_auto_tunnel_bundle and just ignore the policy error? 
+        // No, that enforces signatures.
+        // Let's assume for now we call load_auto_tunnel_bundle with current watermark.
+        
+        // Wait, I should check if there is a 'parse_auto_tunnel_bundle_content' or similar.
+        // If not, I'll have to rely on `load_auto_tunnel_bundle` being available.
+        // I see `load_auto_tunnel_bundle` call in `fetch_assignment`.
+        
+        let verifier_path = self.auto_tunnel_verifier_key_path.as_ref().ok_or("no verifier path")?;
+        let watermark_path = self.auto_tunnel_watermark_path.as_ref().ok_or("no watermark path")?;
+        
+        let previous_watermark = load_auto_tunnel_watermark(watermark_path).map_err(|e| e.to_string())?;
+        
+        // We use the real load function. This is safe (it verifies signature again). 
+        // If it fails, we return Err, and caller passes None.
+        let envelope = load_auto_tunnel_bundle(
+            bundle_path,
+            verifier_path,
+            self.auto_tunnel_bundle_path.as_deref().and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)).unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS), 
+            TrustPolicy { max_signed_data_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS }, 
+            previous_watermark
+        ).map_err(|e| format!("{:?}", e))?;
+        
+        Ok(envelope.bundle)
     }
 
     fn restore_state(&mut self) -> Result<(), ResilienceError> {

@@ -4,7 +4,8 @@
       "Bash(echo:*)",
       "Bash(pip3 show:*)",
       "Bash(cargo fmt:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(cargo check:*)"
     ]
   }
 }

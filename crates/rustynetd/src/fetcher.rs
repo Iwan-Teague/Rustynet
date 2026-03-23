@@ -74,8 +74,7 @@ impl StateFetcher {
         // Step 1: Perform HTTP GET with mTLS client auth
         // For now, simulate fetch (in production would use reqwest with mTLS)
         let response_bytes = self
-            .simulate_http_get(&format!("{}/{}", self.control_endpoint, bundle_type))
-            .map_err(FetchError::Network)?;
+            .http_get_raw(&format!("{}/{}", self.control_endpoint, bundle_type))?;
 
         // Step 2: Parse response into signed bundle
         let bundle = SignedBundle::parse(&response_bytes)
@@ -97,15 +96,15 @@ impl StateFetcher {
         Ok(bundle)
     }
 
-    fn simulate_http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+    fn http_get_raw(&self, url: &str) -> Result<Vec<u8>, FetchError> {
         // Minimal HTTP/1.1 GET implementation using std::net::TcpStream
         let url = url.trim();
         if !url.starts_with("http://") {
-            return Err("only http:// URLs are supported in this minimal fetcher".to_string());
+            return Err(FetchError::Network("only http:// URLs are supported in this minimal fetcher".to_string()));
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
-        let host_port = parts.get(0).ok_or_else(|| "invalid url".to_string())?;
+        let host_port = parts.get(0).ok_or_else(|| FetchError::Network("invalid url".to_string()))?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
         let mut port = 80u16;
@@ -113,31 +112,31 @@ impl StateFetcher {
             let mut hp = host_port.splitn(2, ':');
             host = hp.next().unwrap_or("").to_string();
             if let Some(p) = hp.next() {
-                port = p.parse::<u16>().map_err(|_| "invalid port in url".to_string())?;
+                port = p.parse::<u16>().map_err(|_| FetchError::Network("invalid port in url".to_string()))?;
             }
         }
         let addr = format!("{}:{}", host, port);
         
-        let socket_addrs = addr.to_socket_addrs().map_err(|e| format!("resolve failed: {e}"))?;
+        let socket_addrs = addr.to_socket_addrs().map_err(|e| FetchError::Network(format!("resolve failed: {e}")))?;
         let mut stream = match socket_addrs.into_iter().next() {
              Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(3))
-                 .map_err(|_| "network unreachable".to_string())?,
-             None => return Err("resolve returned no addresses".to_string()),
+                 .map_err(|_| FetchError::Network("network unreachable".to_string()))?,
+             None => return Err(FetchError::Network("resolve returned no addresses".to_string())),
         };
         
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
         
         let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
-        stream.write_all(request.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        stream.write_all(request.as_bytes()).map_err(|e| FetchError::Network(format!("write failed: {e}")))?;
         
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).map_err(|e| format!("read failed: {e}"))?;
+        stream.read_to_end(&mut buf).map_err(|e| FetchError::Network(format!("read failed: {e}")))?;
         
         if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
              Ok(buf.split_off(idx + 4))
         } else {
-             Err("malformed http response".to_string())
+             Err(FetchError::InvalidResponse("malformed http response".to_string()))
         }
     }
 
@@ -565,5 +564,25 @@ mod tests {
             res => panic!("expected Stale, got {:?}", res),
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_fetch_bundle_network_error_is_network_error() {
+        let (signing_key, verifying_key) = make_test_keypair();
+        let dir = tempfile::tempdir().unwrap();
+        let watermark_path = dir.path().join("watermark");
+        
+        // Use a port that is unlikely to be listening (e.g. 1) or just an invalid address?
+        // 127.0.0.1:9 is good (discard protocol), or just a random high port.
+        // But 127.0.0.1:9 might be blocked or filtered differently.
+        // Use a random port that we don't bind.
+        let url = "http://127.0.0.1:54321"; 
+        
+        let mut fetcher = StateFetcher::new(url.to_string(), watermark_path, verifying_key).unwrap();
+        
+        match fetcher.fetch_trust() {
+            Err(FetchError::Network(_)) => {},
+            res => panic!("expected Network error, got {:?}", res),
+        }
     }
 }
