@@ -853,6 +853,9 @@ Test flow:
 
 ### C1 — M0: Foundations and Schema Lock
 
+[DONE — evidence: scripts/ci/membership_gates.sh, documents/operations/MembershipGovernanceRunbook.md]
+
+
 Files to modify:
 - `crates/rustynet-control/src/membership/schema.rs` (new or extend)
 
