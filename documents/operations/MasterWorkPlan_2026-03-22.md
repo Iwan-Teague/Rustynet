@@ -121,11 +121,16 @@ Tests required:
 - Unit test: after N failed rounds, transitions to relay decision — no additional attempts
 - Integration test (two netns with iptables NAT): verify two nodes establish direct path through simulated NAT using simultaneous-open
 
+**Status (A1-b):** Implemented. Traversal coordination record validation, signature verification, freshness, nonce anti-replay window, wait-for-probe_start behaviour, simultaneous probe executor, and fallback to relay after configured rounds are implemented in `crates/rustynetd/src/traversal.rs`. Unit tests were added.
+
+Unit test evidence (see paths):
+- `crates/rustynetd/src/traversal.rs` tests: `coordination_record_validation_and_execute_simultaneous_open_behaviour`
+
 ---
 
 ### A2 — HP-3: Production Relay Transport Service
 
-**Status:** Not built. `rustynet-relay` is a fleet selector only — it chooses a relay but cannot forward packets.
+**Status:** Design complete; protocol and control-plane token flows implemented in `crates/rustynet-control`. Relay runtime implementation (packet forwarding service) is TODO — left as the next phase.
 
 **What needs to be built:**
 
