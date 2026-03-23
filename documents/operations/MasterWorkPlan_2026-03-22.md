@@ -853,7 +853,7 @@ Test flow:
 
 ### C1 — M0: Foundations and Schema Lock
 
-[DONE — evidence: scripts/ci/membership_gates.sh, documents/operations/MembershipGovernanceRunbook.md]
+[DONE — evidence: scripts/ci/membership_gates.sh, documents/operations/MembershipGovernanceRunbook.md, commit: 53dfb70]
 
 
 Files to modify:
