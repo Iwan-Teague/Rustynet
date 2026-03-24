@@ -526,7 +526,6 @@ pub fn dns_zone_watermark_ordering(
         .generated_at_unix
         .cmp(&previous.generated_at_unix)
         .then_with(|| current.nonce.cmp(&previous.nonce))
-        .then_with(|| current.payload_digest.cmp(&previous.payload_digest))
 }
 
 fn canonicalize_dns_zone_records(
@@ -875,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn watermark_ordering_uses_digest_after_timestamp_and_nonce() {
+    fn watermark_ordering_treats_equal_timestamp_and_nonce_as_equal() {
         let earlier = DnsZoneWatermark {
             version: 1,
             generated_at_unix: 10,
@@ -890,7 +889,7 @@ mod tests {
         };
         assert_eq!(
             dns_zone_watermark_ordering(&later, &earlier),
-            std::cmp::Ordering::Greater
+            std::cmp::Ordering::Equal
         );
     }
 

@@ -464,6 +464,36 @@ pub fn execute_ops_e2e_bootstrap_host(
             "chmod trust verifier key failed",
         )?;
 
+        // Seed trust evidence before install-systemd so rustynetd.service preflight
+        // (`test -f ${RUSTYNET_TRUST_EVIDENCE}`) has a fail-closed artifact to validate.
+        run_status(
+            "rustynet",
+            &[
+                "trust",
+                "issue",
+                "--signing-key",
+                "/etc/rustynet/trust-evidence.key",
+                "--signing-key-passphrase-file",
+                passphrase_path.as_str(),
+                "--output",
+                "/var/lib/rustynet/rustynetd.trust",
+            ],
+            &[],
+            "trust issue failed during e2e bootstrap",
+        )?;
+        run_status(
+            "chown",
+            &["root:root", "/var/lib/rustynet/rustynetd.trust"],
+            &[],
+            "chown trust evidence failed during e2e bootstrap",
+        )?;
+        run_status(
+            "chmod",
+            &["0600", "/var/lib/rustynet/rustynetd.trust"],
+            &[],
+            "chmod trust evidence failed during e2e bootstrap",
+        )?;
+
         run_status(
             "rustynet",
             &[

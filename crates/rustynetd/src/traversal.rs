@@ -1495,21 +1495,20 @@ fn is_routable_address(addr: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule, EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile,
-        PathMode, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
-        TraversalCandidate, TraversalDecision, TraversalDecisionReason, TraversalEngine,
-        TraversalEngineConfig, TraversalError, TraversalSession,
-        direct_udp_viable, parse_stun_xor_mapped_address, schedule_proactive_refresh,
+        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule,
+        EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
+        SimultaneousOpenRuntime, SimultaneousOpenWaiter, TraversalCandidate, TraversalDecision,
+        TraversalDecisionReason, TraversalEngine, TraversalEngineConfig, TraversalError,
+        TraversalSession, direct_udp_viable, parse_stun_xor_mapped_address,
+        schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
-    use rustynet_control::{
-        ControlPlaneCore, NodeMetadata, TraversalCoordinationRecord,
-    };
+    use rustynet_control::{ControlPlaneCore, NodeMetadata, TraversalCoordinationRecord};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
     use std::collections::BTreeMap;
-    
+
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-    
+
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn endpoint(octets: [u8; 4], port: u16) -> SocketEndpoint {
@@ -1906,9 +1905,9 @@ mod tests {
     fn coordination_record_validation_and_execute_simultaneous_open_behaviour() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node-a".to_string(),
-            dst: "node-b".to_string(),
-            protocol: Protocol::Any,
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
@@ -2067,9 +2066,9 @@ mod tests {
     fn test_a4_forged_signature_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node-a".to_string(),
-            dst: "node-b".to_string(),
-            protocol: Protocol::Any,
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
@@ -2145,9 +2144,9 @@ mod tests {
     fn test_a4_replayed_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node-a".to_string(),
-            dst: "node-b".to_string(),
-            protocol: Protocol::Any,
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);

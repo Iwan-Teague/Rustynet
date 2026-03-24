@@ -2436,6 +2436,22 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(())
     }
 
+    fn commit_verified_traversal_path_for_peer(
+        &mut self,
+        node_id: &NodeId,
+        path: PathMode,
+    ) -> Result<(), Phase10Error> {
+        self.ensure_started()?;
+        if self.peer_path(node_id) == Some(path) {
+            if let Some(peer) = self.managed_peers.get_mut(node_id) {
+                peer.pending_path_mode = None;
+                peer.pending_since = None;
+            }
+            return Ok(());
+        }
+        self.commit_path_change_for_peer(node_id, path)
+    }
+
     /// Apply a peer revocation immediately: remove from backend and dataplane.
     /// Does not wait for the next generation cycle.
     pub fn apply_revocation(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
@@ -2574,7 +2590,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             Ok(plan) => plan,
             Err(crate::traversal::TraversalError::NoDirectCandidates) => {
                 if let Some(relay_endpoint) = relay_endpoint {
-                    self.mark_direct_failed(node_id)?;
+                    self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
                     return Ok(TraversalProbeReport {
                         decision: TraversalProbeDecision::Relay,
                         reason: TraversalProbeReason::NoDirectCandidatesRelayArmed,
@@ -2593,12 +2609,13 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         let mut observed_latest = current_handshake;
         for attempt in &plan.attempts {
             self.configure_traversal_paths(node_id, Some(attempt.remote.endpoint), relay_endpoint)?;
-            self.mark_direct_recovered(node_id)?;
+            self.reconfigure_managed_peer(node_id, attempt.remote.endpoint, PathMode::Direct)?;
 
             let latest_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
             if handshake_advanced(observed_latest, latest_handshake)
                 && handshake_is_fresh(latest_handshake, now_unix, handshake_freshness_secs)
             {
+                self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
                 return Ok(TraversalProbeReport {
                     decision: TraversalProbeDecision::Direct,
                     reason: TraversalProbeReason::FreshHandshakeObserved,
@@ -2611,7 +2628,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         if let Some(relay_endpoint) = relay_endpoint {
-            self.mark_direct_failed(node_id)?;
+            self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
             return Ok(TraversalProbeReport {
                 decision: TraversalProbeDecision::Relay,
                 reason: TraversalProbeReason::DirectProbeExhaustedRelayArmed,
@@ -4081,9 +4098,13 @@ mod tests {
         );
         assert!(controller.relay_path_armed(&peer_id));
 
+        controller.set_stability_windows(0, 0);
         controller
             .mark_direct_failed(&peer_id)
-            .expect("failover should work");
+            .expect("failover should arm hysteresis");
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("failover should commit once stability is satisfied");
         assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
         assert_eq!(
             controller
@@ -4097,7 +4118,11 @@ mod tests {
 
         controller
             .mark_direct_recovered(&peer_id)
-            .expect("failback should work");
+            .expect("recovery signal should arm hysteresis");
+        controller.set_stability_windows(0, 0);
+        controller
+            .mark_direct_recovered(&peer_id)
+            .expect("failback should commit once stability is satisfied");
         assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
         assert_eq!(
             controller
@@ -4803,7 +4828,7 @@ mod tests {
         let mut committed_changes = 0usize;
         let total_steps = 120usize; // 60s / 500ms
         let mut last_path = ctrl.peer_path(&peer_id);
-        let mut elapsed_ms: u64 = 0;
+        let mut _elapsed_ms: u64 = 0;
 
         for step in 0..total_steps {
             let candidate = if step % 2 == 0 {
@@ -4811,7 +4836,7 @@ mod tests {
             } else {
                 PathMode::Direct
             };
-            elapsed_ms += 500;
+            _elapsed_ms += 500;
             ctrl.consider_path_change_for_peer(&peer_id, candidate)
                 .expect("consider should not error");
             // Simulate time passing by backdating pending_since by 500ms each

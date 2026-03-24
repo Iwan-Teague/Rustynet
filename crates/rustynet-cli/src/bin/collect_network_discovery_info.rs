@@ -981,6 +981,24 @@ fn parse_u64(text: &str, field: &str) -> Result<u64, i32> {
     })
 }
 
+fn is_172_private(ip: &str) -> bool {
+    let mut parts = ip.split('.');
+    matches!(
+        (
+            parts.next().and_then(|v| v.parse::<u8>().ok()),
+            parts.next().and_then(|v| v.parse::<u8>().ok()),
+        ),
+        (Some(172), Some(second)) if (16..=31).contains(&second)
+    )
+}
+
+fn status_text(status: ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
+
 fn is_ipv4(value: &str) -> bool {
     let parts: Vec<&str> = value.split('.').collect();
     if parts.len() != 4 {
@@ -1025,22 +1043,4 @@ mod tests {
         let node_id = parse_status_field(status, "node_id").expect("node_id should parse");
         assert_eq!(node_id, "client-1");
     }
-}
-
-fn is_172_private(ip: &str) -> bool {
-    let mut parts = ip.split('.');
-    matches!(
-        (
-            parts.next().and_then(|v| v.parse::<u8>().ok()),
-            parts.next().and_then(|v| v.parse::<u8>().ok()),
-        ),
-        (Some(172), Some(second)) if (16..=31).contains(&second)
-    )
-}
-
-fn status_text(status: ExitStatus) -> String {
-    status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "signal".to_string())
 }

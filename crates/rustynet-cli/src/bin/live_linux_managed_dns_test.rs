@@ -87,8 +87,7 @@ fn run() -> Result<(), String> {
     {
         if !host_by_node.contains_key(&current_exit_node) {
             return Err(format!(
-                "client exit_node {} is not mapped to a host; provide --managed-peer {}|<user@host>",
-                current_exit_node, current_exit_node
+                "client exit_node {current_exit_node} is not mapped to a host; provide --managed-peer {current_exit_node}|<user@host>"
             ));
         }
         required_node_ids.push(current_exit_node.clone());
@@ -475,11 +474,7 @@ fn run() -> Result<(), String> {
             continue;
         }
         logger.line(
-            format!(
-                "[managed-dns] propagating valid managed DNS bundle to {}",
-                host
-            )
-            .as_str(),
+            format!("[managed-dns] propagating valid managed DNS bundle to {host}").as_str(),
         )?;
         install_dns_bundle(&ctx, &host, &verifier_local, &valid_bundle_local)?;
         restart_managed_dns_stack(&ctx, &host)?;

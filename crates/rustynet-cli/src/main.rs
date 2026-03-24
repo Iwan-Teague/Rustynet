@@ -9969,7 +9969,6 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use rustynetd::ipc::IpcCommand;
     use super::{
         CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute,
         is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_json,

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 fn unix_now() -> u64 {
@@ -20,7 +20,7 @@ fn unix_now() -> u64 {
 }
 
 fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
@@ -94,12 +94,12 @@ fn serve_once(response_body: Vec<u8>) -> String {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
         let len = response_body.len();
-        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", len);
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n");
         let mut response = header.into_bytes();
         response.extend_from_slice(&response_body);
         stream.write_all(&response).unwrap();
     });
-    format!("http://{}", addr)
+    format!("http://{addr}")
 }
 
 fn make_signed_traversal_bundle(
@@ -193,7 +193,7 @@ fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
 
     let err = fetcher.fetch_traversal().unwrap_err();
     // Verify it failed
-    assert!(err.len() > 0);
+    assert!(!err.is_empty());
 }
 
 fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64, zone_name: &str) -> Vec<u8> {

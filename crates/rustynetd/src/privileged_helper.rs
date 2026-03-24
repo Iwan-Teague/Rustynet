@@ -22,8 +22,10 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
-use nix::unistd::{Gid, Uid, chown};
-use rustynet_local_security::validate_root_managed_shared_runtime_socket;
+use nix::unistd::{Gid, Group, Uid, chown};
+use rustynet_local_security::{
+    validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
+};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
@@ -209,9 +211,28 @@ impl PrivilegedCommandClient {
     }
 }
 
+fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
+    if !path.starts_with("/run/rustynet") {
+        return None;
+    }
+    Group::from_name("rustynetd")
+        .ok()
+        .flatten()
+        .map(|group| group.gid.as_raw())
+}
+
 fn validate_privileged_helper_socket_security(path: &Path) -> Result<(), String> {
     let expected_uid = Uid::effective().as_raw();
     let allowed_owner_uids = [expected_uid, 0];
+    if let Some(service_gid) = rustynetd_service_gid_for_socket(path) {
+        return validate_root_managed_shared_runtime_socket(
+            path,
+            "privileged helper socket",
+            &allowed_owner_uids,
+            &allowed_owner_uids,
+            service_gid,
+        );
+    }
     validate_owner_only_socket(
         path,
         "privileged helper socket",

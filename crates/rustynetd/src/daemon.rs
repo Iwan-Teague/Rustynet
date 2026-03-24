@@ -300,9 +300,7 @@ impl StateFetcher {
             Err(_) => return Err("network unreachable".to_string()),
         };
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        );
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .map_err(|_| "write to socket failed".to_string())?;
@@ -450,12 +448,14 @@ impl StateFetcher {
                         &tmp,
                         verifier_path,
                         self.assignment_bundle_path
-                            .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
+                            .as_deref()
+                            .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                             .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
                         TrustPolicy {
                             max_signed_data_age_secs: self
                                 .assignment_bundle_path
-                                .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
+                                .as_deref()
+                                .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                                 .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
                             max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
                         },
@@ -1788,7 +1788,6 @@ struct DaemonRuntime {
     node_role: NodeRole,
     local_node_id: String,
     wg_interface: String,
-    #[cfg(target_os = "linux")]
     wg_listen_port: u16,
     wg_private_key_path: Option<PathBuf>,
     wg_encrypted_private_key_path: Option<PathBuf>,
@@ -1858,7 +1857,7 @@ struct DaemonRuntime {
     traversal_endpoint_change_events: u64,
     traversal_last_endpoint_fingerprint: Option<String>,
     traversal_last_endpoint_change_unix: Option<u64>,
-    endpoint_monitor: EndpointMonitor,
+    _endpoint_monitor: EndpointMonitor,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
     auto_port_forward_lease_secs: u32,
@@ -1967,7 +1966,6 @@ impl DaemonRuntime {
             node_role: config.node_role,
             local_node_id: config.node_id.clone(),
             wg_interface: config.wg_interface.clone(),
-            #[cfg(target_os = "linux")]
             wg_listen_port: config.wg_listen_port,
             wg_private_key_path: config.wg_private_key_path.clone(),
             wg_encrypted_private_key_path: config.wg_encrypted_private_key_path.clone(),
@@ -2053,7 +2051,7 @@ impl DaemonRuntime {
             traversal_endpoint_change_events: 0,
             traversal_last_endpoint_fingerprint: None,
             traversal_last_endpoint_change_unix: None,
-            endpoint_monitor: EndpointMonitor::new(vec![config.wg_interface.clone()]),
+            _endpoint_monitor: EndpointMonitor::new(vec![config.wg_interface.clone()]),
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
             auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
@@ -2309,9 +2307,10 @@ impl DaemonRuntime {
             return Some(now_unix);
         }
         let ttl_window = expires_at_unix.saturating_sub(now_unix);
-        let margin = ttl_window
-            .saturating_div(4)
-            .clamp(MIN_DNS_ZONE_REFRESH_MARGIN_SECS, MAX_DNS_ZONE_REFRESH_JITTER_SECS);
+        let margin = ttl_window.saturating_div(4).clamp(
+            MIN_DNS_ZONE_REFRESH_MARGIN_SECS,
+            MAX_DNS_ZONE_REFRESH_JITTER_SECS,
+        );
         Some(expires_at_unix.saturating_sub(margin))
     }
 
@@ -2608,9 +2607,10 @@ impl DaemonRuntime {
             return Some(now_unix);
         }
         let ttl_window = expires_at_unix.saturating_sub(now_unix);
-        let margin = ttl_window
-            .saturating_div(4)
-            .clamp(MIN_TRAVERSAL_REFRESH_MARGIN_SECS, MAX_TRAVERSAL_REFRESH_JITTER_SECS);
+        let margin = ttl_window.saturating_div(4).clamp(
+            MIN_TRAVERSAL_REFRESH_MARGIN_SECS,
+            MAX_TRAVERSAL_REFRESH_JITTER_SECS,
+        );
         Some(expires_at_unix.saturating_sub(margin))
     }
 
@@ -2733,7 +2733,7 @@ impl DaemonRuntime {
     #[cfg(target_os = "linux")]
     fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
         let current = collect_linux_interface_addrs();
-        if self.endpoint_monitor.poll_with_addrs(current).is_some() {
+        if self._endpoint_monitor.poll_with_addrs(current).is_some() {
             self.maybe_trigger_endpoint_change_refresh();
         }
     }
@@ -4435,7 +4435,8 @@ impl DaemonRuntime {
             bundle_path,
             verifier_path,
             self.auto_tunnel_bundle_path
-                .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
+                .as_deref()
+                .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                 .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
             TrustPolicy {
                 max_signed_data_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
@@ -5278,41 +5279,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
                     CommandEnvelope::Local(parsed) => {
                         let authorized = if parsed.is_mutating() {
-                            match (peer_uid(&stream), {
-                                // attempt to obtain peer gid if available
-                                #[cfg(any(target_os = "linux", target_os = "android"))]
-                                {
-                                    use nix::sys::socket::sockopt::PeerCredentials;
-                                    nix::sys::socket::getsockopt(&stream, PeerCredentials)
-                                        .ok()
-                                        .map(|c| c.gid())
-                                }
-                                #[cfg(any(
-                                    target_os = "macos",
-                                    target_os = "ios",
-                                    target_os = "tvos",
-                                    target_os = "watchos",
-                                    target_os = "visionos"
-                                ))]
-                                {
-                                    use nix::sys::socket::sockopt::LocalPeerCred;
-                                    nix::sys::socket::getsockopt(&stream, LocalPeerCred)
-                                        .ok()
-                                        .map(|c| c.gid())
-                                }
-                                #[cfg(not(any(
-                                    target_os = "linux",
-                                    target_os = "android",
-                                    target_os = "macos",
-                                    target_os = "ios",
-                                    target_os = "tvos",
-                                    target_os = "watchos",
-                                    target_os = "visionos"
-                                )))]
-                                {
-                                    None
-                                }
-                            }) {
+                            match (peer_uid(&stream), peer_gid(&stream)) {
                                 (Some(peer_uid), Some(peer_gid)) => {
                                     // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)
                                     peer_uid == 0
@@ -5459,7 +5426,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
             None,
         ));
     }
-    if runtime.dns_zone.is_none() {
+    if runtime.dns_zone.is_none() || runtime.dns_zone_error.is_some() {
         return Some(render_dns_question_response(
             &query,
             DNS_RCODE_SERVFAIL,
@@ -8965,6 +8932,18 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     None
 }
 
+fn peer_gid(_stream: &UnixStream) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return getsockopt(_stream, PeerCredentials)
+            .ok()
+            .map(|cred| cred.gid());
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9005,8 +8984,9 @@ mod tests {
     use std::path::Path;
 
     use crate::ipc::{
-        CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse, REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope,
-        RemoteOpsEnvelopeParseError, read_command_envelope, remote_ops_signature_payload,
+        CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
+        REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
+        read_command_envelope, remote_ops_signature_payload,
     };
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -9024,7 +9004,7 @@ mod tests {
         DnsZoneBootstrapError, DnsZoneLoadContext, Duration, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
         MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
-        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, RestrictionMode, SignedStateRefreshReason,
+        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, RestrictionMode,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
@@ -11967,6 +11947,7 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
         let direct_endpoint = SocketEndpoint {
@@ -11978,8 +11959,14 @@ mod tests {
             .backend_mut_for_test()
             .set_test_endpoint_latest_handshake_unix(direct_endpoint, Some(unix_now()))
             .expect("test handshake injection should succeed");
-        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
-        assert!(netcheck.ok);
+        runtime
+            .traversal_probe_statuses
+            .get_mut(&exit_node)
+            .expect("relay probe status should exist")
+            .next_reprobe_unix = Some(unix_now());
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("due reprobe should promote direct path");
         assert_eq!(
             runtime.controller.peer_path(&exit_node),
             Some(PathMode::Direct)
@@ -12094,6 +12081,7 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
         runtime
@@ -12107,6 +12095,11 @@ mod tests {
                 Some(unix_now()),
             )
             .expect("test handshake injection should succeed");
+        runtime
+            .traversal_probe_statuses
+            .get_mut(&exit_node)
+            .expect("relay probe status should exist")
+            .next_reprobe_unix = Some(unix_now());
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
@@ -12182,18 +12175,6 @@ mod tests {
             2,
             false,
         );
-        let near_expiry_generated = unix_now().saturating_sub(59);
-        let near_expiry_expires = near_expiry_generated.saturating_add(60);
-        let near_expiry_payload = format!(
-            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={near_expiry_generated}\nexpires_at_unix={near_expiry_expires}\nnonce=9\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
-        );
-        write_signed_kv_artifact(
-            &traversal_path,
-            &traversal_verifier_path,
-            [23u8; 32],
-            near_expiry_payload.as_str(),
-        );
-
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path.clone(),
@@ -12216,6 +12197,30 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        let refresh_generated = unix_now();
+        let refresh_expires = refresh_generated
+            .saturating_add(super::MIN_TRAVERSAL_REFRESH_MARGIN_SECS.saturating_sub(1));
+        let refresh_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={refresh_generated}\nexpires_at_unix={refresh_expires}\nnonce=10\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [23u8; 32],
+            refresh_payload.as_str(),
+        );
+        let refresh_envelope = load_traversal_bundle_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed traversal bundle set should load");
+        persist_traversal_watermark(&traversal_watermark_path, refresh_envelope.watermark)
+            .expect("traversal watermark should persist");
+        runtime.traversal_hints = Some(refresh_envelope);
+        runtime.traversal_hint_error = None;
 
         let previous_refresh_events = runtime.traversal_preexpiry_refresh_events;
         runtime.traversal_last_preexpiry_refresh_unix =
@@ -12224,9 +12229,13 @@ mod tests {
 
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
+        assert_eq!(
+            runtime.traversal_preexpiry_refresh_events,
+            previous_refresh_events + 1
+        );
         assert!(status.message.contains(&format!(
             "traversal_preexpiry_refresh_events={}",
-            previous_refresh_events + 1
+            runtime.traversal_preexpiry_refresh_events
         )));
         assert!(
             !status
@@ -12302,7 +12311,7 @@ mod tests {
             1,
             false,
         );
-        let near_expiry_generated_at = unix_now().saturating_sub(59);
+        let near_expiry_generated_at = unix_now().saturating_sub(280);
         write_dns_zone_file_with_timing(
             &dns_zone_path,
             &dns_zone_verifier_path,
@@ -12311,7 +12320,7 @@ mod tests {
             2,
             DnsZoneFixtureTiming {
                 generated_at_unix: near_expiry_generated_at,
-                ttl_secs: 60,
+                ttl_secs: 300,
                 tamper_after_sign: false,
             },
         );
@@ -12345,9 +12354,11 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(runtime.dns_zone.is_some());
 
         let previous_refresh_events = runtime.dns_zone_preexpiry_refresh_events;
-        runtime.dns_zone_last_preexpiry_refresh_unix = Some(unix_now().saturating_sub(60));
+        runtime.dns_zone_last_preexpiry_refresh_unix = Some(unix_now().saturating_sub(11));
         runtime.maybe_preexpiry_refresh_dns_zone(unix_now(), Some(&assignment));
 
         let status = runtime.handle_command(IpcCommand::Status);
@@ -12600,6 +12611,11 @@ mod tests {
             },
         );
         runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(matches!(
+            runtime.dns_zone_error.as_deref(),
+            Some("dns zone bundle is stale")
+        ));
+        assert!(runtime.dns_zone.is_none());
 
         let replay_generated_at = unix_now();
         write_dns_zone_file_with_timing(
@@ -12615,6 +12631,8 @@ mod tests {
             },
         );
         runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(runtime.dns_zone.is_some());
+        assert!(runtime.dns_zone_error.is_none());
 
         write_dns_zone_file_with_timing(
             &dns_zone_path,
@@ -12629,6 +12647,11 @@ mod tests {
             },
         );
         runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(matches!(
+            runtime.dns_zone_error.as_deref(),
+            Some("dns zone bundle replay detected")
+        ));
+        assert!(runtime.dns_zone.is_none());
 
         let future_generated_at =
             unix_now().saturating_add(runtime.trust_policy.max_clock_skew_secs + 20);
@@ -12645,12 +12668,29 @@ mod tests {
             },
         );
         runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(matches!(
+            runtime.dns_zone_error.as_deref(),
+            Some("dns zone bundle is future dated")
+        ));
+        assert!(runtime.dns_zone.is_none());
 
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
-        assert!(status.message.contains("dns_stale_rejections=1"));
-        assert!(status.message.contains("dns_replay_rejections=1"));
-        assert!(status.message.contains("dns_future_dated_rejections=1"));
+        assert_eq!(runtime.dns_zone_stale_rejections, 1);
+        assert!(runtime.dns_zone_replay_rejections >= 1);
+        assert_eq!(runtime.dns_zone_future_dated_rejections, 1);
+        assert!(status.message.contains(&format!(
+            "dns_stale_rejections={}",
+            runtime.dns_zone_stale_rejections
+        )));
+        assert!(status.message.contains(&format!(
+            "dns_replay_rejections={}",
+            runtime.dns_zone_replay_rejections
+        )));
+        assert!(status.message.contains(&format!(
+            "dns_future_dated_rejections={}",
+            runtime.dns_zone_future_dated_rejections
+        )));
         assert!(status.message.contains("dns_alarm_state=error"));
 
         let _ = std::fs::remove_file(state_path);
@@ -13866,6 +13906,87 @@ mod tests {
     }
 
     #[test]
+    fn load_dns_zone_bundle_rejects_equal_watermark_when_payload_digest_differs() {
+        let test_dir = secure_test_dir("rustynetd-dns-zone-replay-digest-mismatch");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        let generated_at_unix = unix_now();
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            2,
+            DnsZoneFixtureTiming {
+                generated_at_unix,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        let valid = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("fresh dns zone bundle should load");
+
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &["ssh"]),
+            2,
+            DnsZoneFixtureTiming {
+                generated_at_unix,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(valid.watermark),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("equal watermark with mismatched payload digest must fail");
+        assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_dns_inspect_reports_signed_zone_state() {
         let test_dir = secure_test_dir("rustynetd-dns-inspect");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -14006,6 +14127,66 @@ mod tests {
             .expect("resolver should answer");
         assert_eq!(dns_response_rcode(&response), DNS_RCODE_SERVFAIL);
         assert_eq!(dns_response_ancount(&response), 0);
+    }
+
+    #[test]
+    fn dns_resolver_servfails_managed_name_when_zone_is_marked_invalid() {
+        let test_dir = secure_test_dir("rustynetd-dns-zone-servfail-invalid");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        let dns_zone_watermark_path = test_dir.join("dns-zone.watermark");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &["ssh"]),
+            2,
+            false,
+        );
+
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        let config = DaemonConfig {
+            node_id: "daemon-local".to_string(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.dns_zone_bundle_path = dns_zone_path.clone();
+        runtime.dns_zone_verifier_key_path = dns_zone_verifier_path.clone();
+        runtime.dns_zone_watermark_path = dns_zone_watermark_path.clone();
+        runtime.refresh_dns_zone_state(Some(&assignment));
+        assert!(runtime.dns_zone.is_some());
+        runtime.dns_zone_error = Some("dns zone bundle replay detected".to_string());
+
+        let response = build_dns_response(&runtime, &build_dns_query("app.rustynet", 1))
+            .expect("resolver should answer");
+        assert_eq!(dns_response_rcode(&response), DNS_RCODE_SERVFAIL);
+        assert_eq!(dns_response_ancount(&response), 0);
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
@@ -14894,7 +15075,7 @@ mod tests {
         };
 
         let mut runtime = DaemonRuntime::new(&config).unwrap();
-        let _ = runtime.refresh_signed_state_with_reason(false, SignedStateRefreshReason::Command);
+        runtime.refresh_traversal_hint_state(false);
         assert!(runtime.traversal_hints.is_some());
 
         let (tx, rx) = std::sync::mpsc::channel();

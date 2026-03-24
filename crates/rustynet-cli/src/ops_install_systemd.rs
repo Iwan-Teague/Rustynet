@@ -3,7 +3,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -989,7 +989,13 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         let _ = run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"]);
     }
     if trust_auto_refresh_enabled || assignment_auto_refresh_enabled {
-        run_command_checked("rustynet", &["state", "refresh"])?;
+        wait_for_unix_socket(socket_path.as_path(), 40, 250)?;
+        let socket_value = display_path(socket_path.as_path());
+        run_command_checked_with_env(
+            "rustynet",
+            &["state", "refresh"],
+            &[("RUSTYNET_DAEMON_SOCKET", socket_value.as_str())],
+        )?;
     }
 
     if trust_auto_refresh_enabled {
@@ -2174,6 +2180,74 @@ fn run_command_checked(command: &str, args: &[&str]) -> Result<(), String> {
     run_command_capture(command, args).map(|_| ())
 }
 
+fn run_command_capture_with_env(
+    command: &str,
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut command_builder = Command::new(command);
+    command_builder.args(args);
+    for (key, value) in env_vars {
+        command_builder.env(key, value);
+    }
+    let output = command_builder
+        .output()
+        .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "command failed ({}): {}",
+            format_command(command, args),
+            details
+        ));
+    }
+
+    String::from_utf8(output.stdout).map_err(|err| {
+        format!(
+            "decode output for {} failed: {err}",
+            format_command(command, args)
+        )
+    })
+}
+
+fn run_command_checked_with_env(
+    command: &str,
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> Result<(), String> {
+    run_command_capture_with_env(command, args, env_vars).map(|_| ())
+}
+
+fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(), String> {
+    let mut last_state = "missing".to_string();
+    for attempt in 1..=attempts {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    last_state = "symlink".to_string();
+                } else if metadata.file_type().is_socket() {
+                    return Ok(());
+                } else {
+                    last_state = "not-socket".to_string();
+                }
+            }
+            Err(err) => {
+                last_state = err.to_string();
+            }
+        }
+        if attempt < attempts {
+            sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+    Err(format!(
+        "daemon socket {} failed to become available after {attempts} attempts (last_state={last_state})",
+        path.display()
+    ))
+}
+
 fn wait_for_unit_active(unit: &str, attempts: usize, sleep_ms: u64) -> Result<(), String> {
     let mut last_state = String::new();
     for attempt in 1..=attempts {
@@ -2311,12 +2385,13 @@ fn installer_unit_start_order(
     trust_auto_refresh_enabled: bool,
     assignment_auto_refresh_enabled: bool,
 ) -> Vec<&'static str> {
-    let mut order = Vec::new();
-    order.push("restart rustynetd-privileged-helper.service");
-    order.push("restart rustynetd.service");
-    order.push("wait rustynetd.service active");
-    order.push("restart rustynetd-managed-dns.service");
-    order.push("wait rustynetd-managed-dns.service active");
+    let mut order = vec![
+        "restart rustynetd-privileged-helper.service",
+        "restart rustynetd.service",
+        "wait rustynetd.service active",
+        "restart rustynetd-managed-dns.service",
+        "wait rustynetd-managed-dns.service active",
+    ];
     if assignment_auto_refresh_enabled {
         order.push("start rustynetd-assignment-refresh.service (best-effort post-daemon)");
     }
@@ -2361,13 +2436,29 @@ fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
 
     use super::{
         assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order,
         parse_dev_interface_token, parse_dns_resolver_bind_addr_install, parse_install_bool,
         read_env_file_values, render_assignment_refresh_env_contents,
-        resolve_selected_exit_node_id, systemctl_state_retryable,
+        resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
     };
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let short_prefix = prefix.chars().take(4).collect::<String>();
+        let nonce = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        PathBuf::from("/tmp").join(format!("rn-{short_prefix}-{nonce}"))
+    }
 
     #[test]
     fn parse_install_bool_accepts_expected_variants() {
@@ -2444,6 +2535,41 @@ mod tests {
         let ipv6_loopback = parse_dns_resolver_bind_addr_install("[::1]:53535")
             .expect_err("ipv6 loopback resolver should be rejected");
         assert!(ipv6_loopback.contains("IPv4 loopback"));
+    }
+
+    #[test]
+    fn wait_for_unix_socket_accepts_valid_socket() {
+        let dir = unique_temp_dir("sock");
+        std::fs::create_dir_all(&dir).expect("temp dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("temp dir perms should be strict");
+        let socket_path = dir.join("rustynetd.sock");
+        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+
+        let result = wait_for_unix_socket(&socket_path, 1, 0);
+        assert!(result.is_ok(), "socket path should validate");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_rejects_symlink_path() {
+        let dir = unique_temp_dir("link");
+        std::fs::create_dir_all(&dir).expect("temp dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("temp dir perms should be strict");
+        let socket_path = dir.join("rustynetd.sock");
+        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+        let symlink_path = dir.join("rustynetd.sock.link");
+        symlink(&socket_path, &symlink_path).expect("symlink should be created");
+
+        let err =
+            wait_for_unix_socket(&symlink_path, 1, 0).expect_err("symlink path must be rejected");
+        assert!(err.contains("last_state=symlink"));
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

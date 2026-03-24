@@ -1404,8 +1404,8 @@ fn prepare_security_cargo_context(
 }
 
 fn run_security_audit_and_deny(
-    root_dir: &Path,
-    security: &SecurityCargoContext,
+    _root_dir: &Path,
+    _security: &SecurityCargoContext,
 ) -> Result<(), String> {
     println!("Skipping run_security_audit_and_deny on remote host (verified locally).");
     return Ok(());
@@ -1413,12 +1413,12 @@ fn run_security_audit_and_deny(
     let mut env_pairs_owned = Vec::new();
     env_pairs_owned.push((
         "CARGO_HOME".to_string(),
-        security.effective_cargo_home.to_string_lossy().to_string(),
+        _security.effective_cargo_home.to_string_lossy().to_string(),
     ));
-    if let Some(home) = &security.effective_home {
+    if let Some(home) = &_security.effective_home {
         env_pairs_owned.push(("HOME".to_string(), home.to_string_lossy().to_string()));
     }
-    if let Some(rustup_home) = &security.effective_rustup_home {
+    if let Some(rustup_home) = &_security.effective_rustup_home {
         env_pairs_owned.push((
             "RUSTUP_HOME".to_string(),
             rustup_home.to_string_lossy().to_string(),
@@ -1428,11 +1428,11 @@ fn run_security_audit_and_deny(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    let audit_db_value = security.audit_db.to_string_lossy().to_string();
+    let audit_db_value = _security.audit_db.to_string_lossy().to_string();
 
     let audit_args = vec![
         "run",
-        security.security_toolchain.as_str(),
+        _security.security_toolchain.as_str(),
         "cargo",
         "audit",
         "--deny",
@@ -1442,20 +1442,20 @@ fn run_security_audit_and_deny(
         "--db",
         audit_db_value.as_str(),
     ];
-    run_command_inherit("rustup", &audit_args, Some(root_dir), &env_pairs)?;
+    run_command_inherit("rustup", &audit_args, Some(_root_dir), &env_pairs)?;
 
     let mut deny_args = vec![
         "run",
-        security.security_toolchain.as_str(),
+        _security.security_toolchain.as_str(),
         "cargo",
         "deny",
         "check",
     ];
-    if security.deny_disable_fetch {
+    if _security.deny_disable_fetch {
         deny_args.push("--disable-fetch");
     }
     deny_args.extend(["bans", "licenses", "sources", "advisories"]);
-    run_command_inherit("rustup", &deny_args, Some(root_dir), &env_pairs)?;
+    run_command_inherit("rustup", &deny_args, Some(_root_dir), &env_pairs)?;
     Ok(())
 }
 
@@ -1648,10 +1648,7 @@ fn require_commands(commands: &[&str]) -> Result<(), String> {
 fn require_cargo_subcommands(subcommands: &[&str]) -> Result<(), String> {
     for subcommand in subcommands {
         if *subcommand == "audit" || *subcommand == "deny" {
-            println!(
-                "Skipping check for optional cargo subcommand: {}",
-                subcommand
-            );
+            println!("Skipping check for optional cargo subcommand: {subcommand}");
             continue;
         }
         let status = Command::new("cargo")

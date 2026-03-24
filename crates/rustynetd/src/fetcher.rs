@@ -106,7 +106,8 @@ impl StateFetcher {
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
-        let host_port = parts.first()
+        let host_port = parts
+            .first()
             .ok_or_else(|| FetchError::Network("invalid url".to_string()))?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
@@ -138,9 +139,7 @@ impl StateFetcher {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        );
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .map_err(|e| FetchError::Network(format!("write failed: {e}")))?;

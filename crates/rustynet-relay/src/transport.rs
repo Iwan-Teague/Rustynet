@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use rand::RngCore;
 use rustynet_control::RelaySessionToken;
 use subtle::ConstantTimeEq;
 
@@ -276,6 +275,7 @@ impl NonceStore {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use rand::RngCore;
 
     fn make_test_keypair() -> (SigningKey, VerifyingKey) {
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
