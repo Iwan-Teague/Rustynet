@@ -77,6 +77,10 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         fail_closed_ssh_allow: false,
         fail_closed_ssh_allow_cidrs: vec![],
         max_requests: None,
+        trust_url: None,
+        traversal_url: None,
+        assignment_url: None,
+        dns_zone_url: None,
     }
 }
 
@@ -125,49 +129,40 @@ fn make_signed_traversal_bundle(
 #[test]
 fn fetcher_traversal_applied_updates_bundle_file() {
     let dir = tempdir().unwrap();
-    let cfg = make_test_config(dir.path());
+    let mut cfg = make_test_config(dir.path());
     let bundle = make_signed_traversal_bundle(&cfg.traversal_verifier_key_path, 100, false);
     let url = serve_once(bundle);
 
-    std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url);
+    cfg.traversal_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
     assert_eq!(fetcher.fetch_traversal().unwrap(), FetchDecision::Applied);
     assert!(cfg.traversal_bundle_path.exists());
     assert!(cfg.traversal_watermark_path.exists());
-
-    std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
 }
 
 #[test]
 fn fetcher_traversal_replay_rejected_is_hard_error() {
     let dir = tempdir().unwrap();
-    let cfg = make_test_config(dir.path());
+    let mut cfg = make_test_config(dir.path());
     fs::create_dir_all(cfg.traversal_watermark_path.parent().unwrap()).unwrap();
     fs::write(&cfg.traversal_watermark_path, "nonce=200\n").unwrap();
 
     let bundle = make_signed_traversal_bundle(&cfg.traversal_verifier_key_path, 100, false);
     let url = serve_once(bundle);
 
-    std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url);
+    cfg.traversal_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
     let err = fetcher.fetch_traversal().unwrap_err();
     assert!(err.contains("replay") || err.contains("watermark") || err.contains("nonce"));
     assert!(!cfg.traversal_bundle_path.exists());
-
-    std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
 }
 
 #[test]
 fn fetcher_all_four_types_skip_when_url_unset() {
     let dir = tempdir().unwrap();
     let cfg = make_test_config(dir.path());
-
-    std::env::remove_var("RUSTYNET_TRUST_URL");
-    std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
-    std::env::remove_var("RUSTYNET_ASSIGNMENT_URL");
-    std::env::remove_var("RUSTYNET_DNS_ZONE_URL");
 
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
@@ -183,7 +178,7 @@ fn fetcher_all_four_types_skip_when_url_unset() {
 #[test]
 fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
     let dir = tempdir().unwrap();
-    let cfg = make_test_config(dir.path());
+    let mut cfg = make_test_config(dir.path());
 
     fs::create_dir_all(cfg.traversal_bundle_path.parent().unwrap()).unwrap();
     fs::write(&cfg.traversal_bundle_path, "sentinel").unwrap();
@@ -191,14 +186,12 @@ fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
     let bundle = make_signed_traversal_bundle(&cfg.traversal_verifier_key_path, 300, true);
     let url = serve_once(bundle);
 
-    std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url);
+    cfg.traversal_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
     let err = fetcher.fetch_traversal().unwrap_err();
     // Verify it failed
     assert!(err.len() > 0);
-
-    std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
 }
 
 fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
@@ -248,18 +241,18 @@ fn make_signed_trust_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
     );
 
     let signature = signing_key.sign(payload.as_bytes());
-    let mut sig_bytes = signature.to_bytes().to_vec();
+    let sig_bytes = signature.to_bytes().to_vec();
     format!("{}signature={}\n", payload, hex_encode(&sig_bytes)).into_bytes()
 }
 
 #[test]
 fn fetcher_dns_zone_applied_updates_bundle_on_disk() {
     let dir = tempdir().unwrap();
-    let cfg = make_test_config(dir.path());
+    let mut cfg = make_test_config(dir.path());
     let bundle = make_signed_dns_zone_bundle(&cfg.dns_zone_verifier_key_path, 100);
     let url = serve_once(bundle);
 
-    std::env::set_var("RUSTYNET_DNS_ZONE_URL", &url);
+    cfg.dns_zone_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
     assert_eq!(
@@ -268,23 +261,19 @@ fn fetcher_dns_zone_applied_updates_bundle_on_disk() {
     );
     assert!(cfg.dns_zone_bundle_path.exists());
     assert!(cfg.dns_zone_watermark_path.exists());
-
-    std::env::remove_var("RUSTYNET_DNS_ZONE_URL");
 }
 
 #[test]
 fn fetcher_trust_applied_updates_bundle_on_disk() {
     let dir = tempdir().unwrap();
-    let cfg = make_test_config(dir.path());
+    let mut cfg = make_test_config(dir.path());
     let bundle = make_signed_trust_bundle(&cfg.trust_verifier_key_path, 100);
     let url = serve_once(bundle);
 
-    std::env::set_var("RUSTYNET_TRUST_URL", &url);
+    cfg.trust_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
     assert_eq!(fetcher.fetch_trust().unwrap(), FetchDecision::Applied);
     assert!(cfg.trust_evidence_path.exists());
     assert!(cfg.trust_watermark_path.exists());
-
-    std::env::remove_var("RUSTYNET_TRUST_URL");
 }

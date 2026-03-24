@@ -11,6 +11,10 @@ const REQUIRED_TESTS: &[&str] = &[
     "daemon::tests::load_traversal_bundle_rejects_private_srflx_candidate",
     "daemon::tests::daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed",
     "traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback",
+    // A4: adversarial coordination record hardening
+    "traversal::tests::test_a4_forged_signature_coordination_record_rejected",
+    "traversal::tests::test_a4_replayed_coordination_record_rejected",
+    "traversal::tests::test_a4_candidate_flooding_rejected_no_panic",
 ];
 
 fn main() {
