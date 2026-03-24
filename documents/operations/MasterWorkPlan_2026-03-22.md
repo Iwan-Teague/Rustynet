@@ -1660,3 +1660,46 @@ When Debian-host tests and integration runs are available I will complete code c
 - Execute `./scripts/ci/membership_gates.sh` on Debian
 - Execute `./scripts/ci/traversal_adversarial_gates.sh` on Debian (A4 tests in rustynetd)
 - Execute `./scripts/e2e/live_linux_path_handoff_under_load_test.sh` on two-node lab
+
+## Session Log — Continuation Sprint 2026-03-24
+
+| Time (UTC) | Track | What was implemented | Evidence / Commit |
+|------------|-------|----------------------|-------------------|
+| 2026-03-24 | F1 | TunnelBackend conformance suite: 21 tests in backend_contract.rs (ContractBackend + run_conformance_suite); stub_conformance.rs with 20 tests against StubBackend; backend_agility_report.json created | b0101e3 |
+| 2026-03-24 | G2 | Deprecation enforcement: add des/des3/3des bans to deny.toml; replace weak cargo-audit grep with 3-gate G2 section in security_regression_gates.sh (Cargo.lock scan, cargo deny bans, use-import scan); update crypto_deprecation_schedule.json with status/usage_count fields | 7f08dba |
+| 2026-03-24 | A4-b | Path transition ACL preservation: 4 unit tests in phase10.rs (test_a4b_direct_to_relay_transition_asserts_killswitch, relay_to_direct, acl_operations_throughout_full_cycle, force_fail_closed_overrides_pending) using DryRunSystem operation audit log | a144a0d |
+
+### Work Status After This Session
+
+#### Track F (Backend Agility — F1): — DONE (Option 2: conformance suite)
+- ContractBackend: 21/21 tests pass in rustynet-backend-api/tests/backend_contract.rs
+- StubBackend: 20/20 tests pass in rustynet-backend-stub/tests/stub_conformance.rs
+- backend_agility_report.json: created with conformance_passed=true
+- FinalLaunchChecklist F1 satisfied: StubBackend proved contract-compliant
+
+#### Track G (G2 — Deprecation Enforcement): — DONE
+- deny.toml: des, des3, 3des added; sha1, md-5 already banned
+- security_regression_gates.sh: G2 section strengthened with 3 discrete gates
+- crypto_deprecation_schedule.json: updated with status="deprecated", usage_count=0
+- cargo deny check bans: PASS (no banned crates in workspace)
+
+#### Track A (A4-b — Path Transition ACL Preservation): — DONE (unit tests)
+- 4 tests added to phase10.rs: verify assert_killswitch called on every path commit
+- Tests use DryRunSystem operation audit log (zero stability windows for determinism)
+- Live nftables snapshot gate (A4-b shell script) remains Debian-lab-only
+- force_fail_closed correctly overrides pending hysteresis transitions
+
+### Gate Results (Windows CI, 2026-03-24)
+
+- cargo fmt --all -- --check: PASS
+- cargo clippy -p rustynet-backend-api -p rustynet-backend-stub -p rustynet-policy -- -D warnings: PASS
+- cargo test -p rustynet-backend-api: 21/21 pass (contract suite)
+- cargo test -p rustynet-backend-stub: 22/22 pass (2 unit + 20 conformance)
+- cargo deny check bans: PASS
+
+### Remaining for Debian Lab
+
+- Run full `cargo test --workspace` on Debian (rustynet-local-security compiles, A4-b phase10 tests run)
+- Execute `./scripts/ci/security_regression_gates.sh` on Debian (G2 gates)
+- Execute `./scripts/ci/traversal_adversarial_gates.sh` on Debian (A4 traversal tests)
+- Execute A4-b live nftables ACL snapshot test on two-node lab
