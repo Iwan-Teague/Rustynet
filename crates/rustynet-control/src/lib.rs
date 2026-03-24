@@ -1197,7 +1197,11 @@ fn ensure_secure_parent_directory(path: &Path) -> Result<(), TrustStateError> {
     Ok(())
 }
 
-fn atomic_write_secure(path: &Path, body: &[u8], mode: u32) -> Result<(), TrustStateError> {
+fn atomic_write_secure(
+    path: &Path,
+    body: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
+) -> Result<(), TrustStateError> {
     ensure_secure_parent_directory(path)?;
     if path.exists() {
         let metadata = fs::symlink_metadata(path).map_err(|_| TrustStateError::PersistFailure)?;

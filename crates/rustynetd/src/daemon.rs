@@ -53,9 +53,11 @@ use crate::traversal::{
     DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS as TRAVERSAL_DEFAULT_ROUND_SPACING_MS,
     DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS as TRAVERSAL_DEFAULT_SIMULTANEOUS_ROUNDS,
     DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS as TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS,
-    TraversalCandidate as ProbeTraversalCandidate, TraversalEngineConfig,
+    EndpointMonitor, TraversalCandidate as ProbeTraversalCandidate, TraversalEngineConfig,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+#[cfg(target_os = "linux")]
+use nix::ifaddrs;
 use nix::sys::socket::getsockopt;
 #[cfg(any(
     target_os = "macos",
@@ -1858,6 +1860,7 @@ struct DaemonRuntime {
     traversal_last_preexpiry_refresh_unix: Option<u64>,
     traversal_endpoint_change_events: u64,
     traversal_last_endpoint_fingerprint: Option<String>,
+    endpoint_monitor: EndpointMonitor,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
     auto_port_forward_lease_secs: u32,
@@ -2051,6 +2054,7 @@ impl DaemonRuntime {
             traversal_last_preexpiry_refresh_unix: None,
             traversal_endpoint_change_events: 0,
             traversal_last_endpoint_fingerprint: None,
+            endpoint_monitor: EndpointMonitor::new(vec![config.wg_interface.clone()]),
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
             auto_port_forward_lease_secs: config.auto_port_forward_lease_secs.get(),
@@ -2712,6 +2716,25 @@ impl DaemonRuntime {
                 self.traversal_last_endpoint_fingerprint = Some(fingerprint);
             }
         }
+    }
+
+    /// Poll the EndpointMonitor for NIC address changes; trigger a signed-state
+    /// refresh whenever a routable address is added, removed, or changes on any
+    /// non-WireGuard interface.  This supplements the coarser fingerprint-based
+    /// detection in `maybe_trigger_endpoint_change_refresh`.
+    #[cfg(target_os = "linux")]
+    fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
+        let current = collect_linux_interface_addrs();
+        if self.endpoint_monitor.poll_with_addrs(current).is_some() {
+            self.maybe_trigger_endpoint_change_refresh();
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
+        // EndpointMonitor NIC polling is Linux-only; the fingerprint-based
+        // change detection in maybe_trigger_endpoint_change_refresh() handles
+        // other platforms.
     }
 
     fn traversal_alarm_state(&self, now_unix: u64) -> (&'static str, String) {
@@ -3491,7 +3514,7 @@ impl DaemonRuntime {
                         policy,
                         None,
                     )
-                    .map(|b| b)
+                    .map(|b| b.bundle)
                     .ok()
                 } else {
                     None
@@ -4936,6 +4959,33 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
     ))
 }
 
+/// Collect current routable addresses per interface using `getifaddrs(2)`.
+/// Returns a map of interface-name → Vec<IpAddr> for use with EndpointMonitor.
+/// Loopback and link-local addresses are included as-is; EndpointMonitor
+/// applies its own filtering via the `ignored_prefixes` list.
+#[cfg(target_os = "linux")]
+fn collect_linux_interface_addrs() -> BTreeMap<String, Vec<std::net::IpAddr>> {
+    use std::net::IpAddr;
+    let mut result: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
+    let Ok(iter) = ifaddrs::getifaddrs() else {
+        return result;
+    };
+    for ifaddr in iter {
+        let Some(addr) = ifaddr.address else {
+            continue;
+        };
+        let ip: IpAddr = if let Some(inet) = addr.as_sockaddr_in() {
+            IpAddr::V4(inet.ip())
+        } else if let Some(inet6) = addr.as_sockaddr_in6() {
+            IpAddr::V6(inet6.ip())
+        } else {
+            continue;
+        };
+        result.entry(ifaddr.interface_name).or_default().push(ip);
+    }
+    result
+}
+
 #[cfg(target_os = "linux")]
 fn nat_pmp_map_udp_port(
     gateway: Ipv4Addr,
@@ -5321,6 +5371,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
         let now_unix = unix_now();
         runtime.maybe_preexpiry_refresh_traversal(now_unix);
+        runtime.poll_endpoint_monitor_and_maybe_refresh();
         runtime.maybe_trigger_endpoint_change_refresh();
 
         if config
