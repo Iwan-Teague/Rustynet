@@ -1979,6 +1979,8 @@ impl DaemonRuntime {
                     .get(),
                 stun_servers: config.traversal_stun_servers.clone(),
                 stun_gather_timeout_ms: config.traversal_stun_gather_timeout_ms.get(),
+                pre_expiry_refresh_margin_secs: MIN_TRAVERSAL_REFRESH_MARGIN_SECS,
+                pre_expiry_jitter_max_secs: MAX_TRAVERSAL_REFRESH_JITTER_SECS,
             },
             traversal_probe_handshake_freshness_secs: config
                 .traversal_probe_handshake_freshness_secs
@@ -2042,56 +2044,7 @@ impl DaemonRuntime {
         Ok(envelope.evidence)
     }
 
-    fn authorize_remote_command(
-        &mut self,
-        envelope: &RemoteCommandEnvelope,
-        now_unix: u64,
-    ) -> Result<IpcCommand, RemoteOpsAuthError> {
-        let verifying_key = self
-            .remote_ops_verifying_key
-            .as_ref()
-            .ok_or_else(|| RemoteOpsAuthError::KeyLoad("missing verifier key".to_string()))?;
-        let command = parse_command(envelope.command.as_str());
-        if matches!(command, IpcCommand::Unknown(_)) {
-            return Err(RemoteOpsAuthError::TokenInvalid);
-        }
-        let payload = remote_ops_signature_payload(envelope);
-        let signature_bytes = decode_remote_ops_hex_to_fixed::<64>(envelope.signature_hex.as_str())
-            .map_err(|_| RemoteOpsAuthError::SignatureInvalid)?;
-        let signature = Signature::from_bytes(&signature_bytes);
-        verifying_key
-            .verify(payload.as_bytes(), &signature)
-            .map_err(|_| RemoteOpsAuthError::SignatureInvalid)?;
 
-        if envelope.subject != self.remote_ops_expected_subject {
-            return Err(RemoteOpsAuthError::SubjectDenied);
-        }
-        let token_claims = TokenClaims {
-            subject: envelope.subject.clone(),
-            issued_at_unix: envelope.issued_at_unix,
-            expires_at_unix: envelope.expires_at_unix,
-            nonce: envelope.nonce.clone(),
-        };
-        let guard = self
-            .remote_ops_guard
-            .as_mut()
-            .ok_or_else(|| RemoteOpsAuthError::KeyLoad("missing auth guard".to_string()))?;
-        match guard.validate_token_and_nonce(&token_claims, now_unix) {
-            Ok(()) => {}
-            Err(AuthError::ReplayDetected) => return Err(RemoteOpsAuthError::ReplayDetected),
-            Err(
-                AuthError::InvalidTokenLifetime
-                | AuthError::TokenExpired
-                | AuthError::TokenNotYetValid
-                | AuthError::TokenSignatureInvalid
-                | AuthError::RateLimited
-                | AuthError::LockedOutUntil(_)
-                | AuthError::Internal,
-            ) => return Err(RemoteOpsAuthError::TokenInvalid),
-        }
-
-        Ok(command)
-    }
 
     fn load_verified_membership(&self) -> Result<MembershipState, MembershipBootstrapError> {
         if !self.membership_snapshot_path.exists() {
@@ -8962,12 +8915,8 @@ mod tests {
     use std::path::Path;
 
     use crate::ipc::{
-        CommandEnvelope, IpcCommand, IpcResponse, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
+        CommandEnvelope, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
         REMOTE_OPS_WIRE_PREFIX, remote_ops_signature_payload, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
-    };
-    use super::{
-        DaemonConfig, DaemonRuntime, RestrictionMode, SignedStateRefreshReason,
-        read_command_envelope, MIN_TRAVERSAL_REFRESH_MARGIN_SECS,
     };
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -8993,10 +8942,12 @@ mod tests {
         load_trust_evidence, load_trust_watermark, parse_route_interface_token,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, read_command, resolve_egress_interface_value,
+        prepare_runtime_wireguard_key_material, read_command_envelope, resolve_egress_interface_value,
         run_daemon, run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
         trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
         zeroize_optional_bytes,
+        RestrictionMode, SignedStateRefreshReason, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS,
+        RemoteOpsAuthError, Duration,
     };
     use crate::phase10::{PathMode, TraversalProbeDecision, TraversalProbeReason};
 

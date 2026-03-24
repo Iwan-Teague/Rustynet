@@ -2057,7 +2057,8 @@ mod tests {
     /// rejected.  The daemon must not switch paths based on forged records.
     #[test]
     fn test_a4_forged_signature_coordination_record_rejected() {
-        use rustynet_control::{ControlPlaneCore, PolicySet};
+        use rustynet_control::ControlPlaneCore;
+        use rustynet_policy::PolicySet;
         let policy = PolicySet::default();
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
 
@@ -2100,7 +2101,8 @@ mod tests {
     /// rejected even when the signature is valid.
     #[test]
     fn test_a4_replayed_coordination_record_rejected() {
-        use rustynet_control::{ControlPlaneCore, PolicySet};
+        use rustynet_control::ControlPlaneCore;
+        use rustynet_policy::PolicySet;
         let policy = PolicySet::default();
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
 

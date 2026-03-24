@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use rand::RngCore;
 use rustynet_control::RelaySessionToken;
 use subtle::ConstantTimeEq;
 
