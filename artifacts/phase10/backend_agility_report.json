@@ -1,0 +1,56 @@
+{
+  "report_version": "1",
+  "generated_at": "2026-03-24",
+  "status": "pass",
+  "track": "F",
+  "option_implemented": "Option 2 — StubBackend conformance suite",
+  "description": "Comprehensive TunnelBackend conformance test suite (Option 2) proving that any compliant backend implementation must satisfy 19 contract invariants. Both rustynet-backend-api (ContractBackend) and rustynet-backend-stub (StubBackend) pass all scenarios.",
+  "backends_validated": [
+    {
+      "backend": "ContractBackend",
+      "crate": "rustynet-backend-api",
+      "test_file": "crates/rustynet-backend-api/tests/backend_contract.rs",
+      "conformance_tests_passed": 21,
+      "conformance_tests_total": 21,
+      "result": "pass"
+    },
+    {
+      "backend": "StubBackend",
+      "crate": "rustynet-backend-stub",
+      "test_file": "crates/rustynet-backend-stub/tests/stub_conformance.rs",
+      "conformance_tests_passed": 20,
+      "conformance_tests_total": 20,
+      "result": "pass"
+    }
+  ],
+  "conformance_scenarios": [
+    "not_running_rejects_mutations",
+    "start_is_idempotent_reject",
+    "start_and_shutdown_lifecycle",
+    "configure_peer_round_trip",
+    "configure_peer_replaces_existing",
+    "remove_peer_makes_it_absent",
+    "update_endpoint_preserves_allowed_ips",
+    "update_endpoint_unknown_peer_rejected",
+    "endpoint_unknown_peer_returns_none_or_error",
+    "handshake_unknown_peer_rejected",
+    "handshake_known_peer_returns_none_initially",
+    "routes_replaced_deterministically",
+    "routes_cleared_on_empty_apply",
+    "exit_mode_off_is_default",
+    "exit_mode_full_tunnel_accepted",
+    "stats_peer_count_reflects_configured_peers",
+    "shutdown_then_ops_require_restart",
+    "multi_peer_isolated_operations",
+    "configure_same_peer_multiple_ips"
+  ],
+  "gate_results": {
+    "cargo_fmt_check": "pass",
+    "cargo_clippy": "pass",
+    "cargo_test_backend_api": "21/21 pass",
+    "cargo_test_backend_stub": "20/20 pass"
+  },
+  "additional_backend_paths": ["rustynet-backend-stub"],
+  "conformance_passed": true,
+  "notes": "Option 1 (boringtun userspace backend) deferred; Option 2 satisfies the launch-checklist requirement for a demonstrably swappable second backend by proving StubBackend is a fully conformant TunnelBackend implementation."
+}

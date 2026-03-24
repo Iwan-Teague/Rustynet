@@ -7,3 +7,6 @@ authors.workspace = true
 
 [dependencies]
 rustynet-backend-api = { path = "../rustynet-backend-api" }
+
+[dev-dependencies]
+rustynet-backend-api = { path = "../rustynet-backend-api" }
