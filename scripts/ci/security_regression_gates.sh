@@ -25,13 +25,32 @@ fi
 
 echo "PASS: no raw secret equality detected"
 
-# G2: Fail if sha1 or 3des appear in dependency tree  
-echo "Checking for deprecated cryptographic algorithms..."
-if cargo audit --deny warnings 2>&1 | grep -iE "sha1|3des|triple.des"; then
-  echo "FAIL: deprecated cryptographic algorithm in dependency tree"
+# G2a: Fail if sha1 or 3des appear in Cargo.lock (fast, no network)
+echo "Checking Cargo.lock for deprecated cryptographic algorithm packages..."
+if grep -iE '^name = "(sha1|md-5|des|des3|3des|triple-des)"' Cargo.lock 2>/dev/null; then
+  echo "FAIL: deprecated cryptographic algorithm crate found in Cargo.lock" >&2
+  echo "FAIL: remove the dependency or disable the feature that pulls in sha1/3des/md5" >&2
   exit 1
 fi
-echo "PASS: no deprecated crypto algorithms"
+echo "PASS: no deprecated crypto algorithm crates in Cargo.lock"
+
+# G2b: cargo deny check bans (enforces deny.toml [[bans.deny]] entries)
+echo "Running cargo deny check bans for deprecated crypto algorithms..."
+if ! cargo deny check bans 2>&1; then
+  echo "FAIL: cargo deny check bans failed — check deny.toml for details" >&2
+  exit 1
+fi
+echo "PASS: cargo deny bans check passed"
+
+# G2c: Source scan — reject any use statement importing deprecated crypto crates
+echo "Scanning source for imports of deprecated cryptographic crates..."
+if grep -rn --include="*.rs" -E \
+  '^[[:space:]]*(pub[[:space:]]+)?use[[:space:]]+(sha1|md5|md_5|des|des3|triple_des)(::|;| )' \
+  crates/ 2>/dev/null | grep -v "// EXCEPTION:"; then
+  echo "FAIL: use-import of deprecated crypto crate found in source" >&2
+  exit 1
+fi
+echo "PASS: no imports of deprecated crypto crates in source"
 
 echo "All security regression gates passed."
 exit 0

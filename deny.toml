@@ -5,13 +5,25 @@ version = 2
 multiple-versions = "warn"
 wildcards = "allow"
 
-# Deprecated cryptographic algorithms
+# Deprecated cryptographic algorithms (G2 — removal scheduled 2026-06-01)
 [[bans.deny]]
 name = "sha1"
 wrappers = []
 
 [[bans.deny]]
 name = "md-5"
+wrappers = []
+
+[[bans.deny]]
+name = "des"
+wrappers = []
+
+[[bans.deny]]
+name = "3des"
+wrappers = []
+
+[[bans.deny]]
+name = "des3"
 wrappers = []
 
 [licenses]

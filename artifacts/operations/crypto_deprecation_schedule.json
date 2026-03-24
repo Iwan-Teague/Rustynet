@@ -4,14 +4,20 @@
     {
       "algorithm": "sha1",
       "deprecates_at_utc": "2026-03-01T00:00:00Z",
-      "notes": "deprecated per MasterWorkPlan G2",
-      "removal_at_utc": "2026-06-01T00:00:00Z"
+      "removal_at_utc": "2026-06-01T00:00:00Z",
+      "status": "deprecated",
+      "usage_count": 0,
+      "deny_toml_ban": "sha1",
+      "notes": "deprecated per MasterWorkPlan G2; banned in deny.toml; 0 usages verified 2026-03-24"
     },
     {
       "algorithm": "3des",
       "deprecates_at_utc": "2026-03-01T00:00:00Z",
-      "notes": "deprecated per MasterWorkPlan G2",
-      "removal_at_utc": "2026-06-01T00:00:00Z"
+      "removal_at_utc": "2026-06-01T00:00:00Z",
+      "status": "deprecated",
+      "usage_count": 0,
+      "deny_toml_ban": "des,des3,3des",
+      "notes": "deprecated per MasterWorkPlan G2; banned in deny.toml; 0 usages verified 2026-03-24"
     }
   ],
   "environment": "ci",
@@ -19,8 +25,10 @@
   "exceptions_auto_expire": true,
   "exceptions_default_enabled": false,
   "exceptions_require_risk_acceptance": true,
-  "measured_at_utc": "2026-03-05T11:06:00Z",
+  "measured_at_utc": "2026-03-24T00:00:00Z",
+  "updated_at_utc": "2026-03-24T00:00:00Z",
   "source_artifacts": [
-    "/Users/iwanteague/Desktop/Rustynet/artifacts/operations/raw/crypto_deprecation_schedule.json"
-  ]
+    "artifacts/operations/crypto_deprecation_schedule.json"
+  ],
+  "ci_gate": "scripts/ci/security_regression_gates.sh — G2 section: cargo deny check bans + grep Cargo.lock"
 }
