@@ -1541,8 +1541,7 @@ fn resolve_assignment_refresh_value(
         .to_string();
     if resolved.is_empty() {
         return Err(format!(
-            "assignment auto-refresh requires {key}; set it explicitly or provide it in {}",
-            ASSIGNMENT_REFRESH_ENV_DST
+            "assignment auto-refresh requires {key}; set it explicitly or provide it in {ASSIGNMENT_REFRESH_ENV_DST}"
         ));
     }
     validate_env_line(key, resolved.as_str())?;
@@ -2108,6 +2107,7 @@ fn publish_file_with_owner_mode(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_atomic_text_file(
     target: &Path,
     body: &str,

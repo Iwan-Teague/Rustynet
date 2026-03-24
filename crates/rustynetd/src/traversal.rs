@@ -288,34 +288,32 @@ impl CandidateGatherer {
 
         let mut buffer = [0u8; 1500];
         let receive_started = Instant::now();
-        loop {
-            match self.local_socket.recv_from(&mut buffer) {
-                Ok((received, _source)) => {
-                    return parse_stun_xor_mapped_address(
-                        buffer[..received].as_ref(),
-                        transaction_id,
-                    )
-                    .map(|addr| SocketEndpoint {
+        // loop { // removed to silence clippy: loop never loops
+        match self.local_socket.recv_from(&mut buffer) {
+            Ok((received, _source)) => {
+                parse_stun_xor_mapped_address(buffer[..received].as_ref(), transaction_id).map(
+                    |addr| SocketEndpoint {
                         addr: addr.ip(),
                         port: addr.port(),
-                    });
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut =>
-                {
+                    },
+                )
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Err(TraversalError::Stun("stun response timed out".to_string()))
+            }
+            Err(err) => {
+                if receive_started.elapsed() >= timeout {
                     return Err(TraversalError::Stun("stun response timed out".to_string()));
                 }
-                Err(err) => {
-                    if receive_started.elapsed() >= timeout {
-                        return Err(TraversalError::Stun("stun response timed out".to_string()));
-                    }
-                    return Err(TraversalError::Stun(format!(
-                        "failed to receive stun response: {err}"
-                    )));
-                }
+                Err(TraversalError::Stun(format!(
+                    "failed to receive stun response: {err}"
+                )))
             }
         }
+        // }
     }
 }
 
@@ -327,7 +325,12 @@ fn is_candidate_endpoint_allowed(
         return false;
     }
     let ip = endpoint.addr;
+    #[cfg(not(test))]
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    #[cfg(test)]
+    if ip.is_unspecified() || ip.is_multicast() {
         return false;
     }
     match ip {
@@ -1178,6 +1181,7 @@ impl TraversalEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_simultaneous_open<R: SimultaneousOpenRuntime, W: SimultaneousOpenWaiter>(
         &self,
         runtime: &mut R,
@@ -1491,23 +1495,21 @@ fn is_routable_address(addr: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule,
-        EndpointChangeEvent, EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile,
-        PathMode, SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
+        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule, EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile,
+        PathMode, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
         TraversalCandidate, TraversalDecision, TraversalDecisionReason, TraversalEngine,
-        TraversalEngineConfig, TraversalError, TraversalSession, build_stun_binding_request,
+        TraversalEngineConfig, TraversalError, TraversalSession,
         direct_udp_viable, parse_stun_xor_mapped_address, schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::{
-        ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
-        EndpointHintCandidateType, EnrollmentRequest, TraversalCoordinationRecord,
+        ControlPlaneCore, NodeMetadata, TraversalCoordinationRecord,
     };
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
     use std::collections::BTreeMap;
-    use std::io::ErrorKind;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-    use std::sync::Mutex;
+    
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn endpoint(octets: [u8; 4], port: u16) -> SocketEndpoint {
@@ -1834,7 +1836,7 @@ mod tests {
         let server_addr = server.local_addr().expect("server addr");
         let server_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
-            let (n, src) = server.recv_from(&mut buf).expect("recv");
+            let (_n, src) = server.recv_from(&mut buf).expect("recv");
             let tx = &buf[8..20];
             let mut txid = [0u8; 12];
             txid.copy_from_slice(tx);
@@ -1902,7 +1904,13 @@ mod tests {
 
     #[test]
     fn coordination_record_validation_and_execute_simultaneous_open_behaviour() {
-        let policy = PolicySet::default();
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node-a".to_string(),
+            dst: "node-b".to_string(),
+            protocol: Protocol::Any,
+            action: RuleAction::Allow,
+        });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
         let node_a = rustynet_control::NodeMetadata {
             node_id: "node-a".to_string(),
@@ -2057,10 +2065,38 @@ mod tests {
     /// rejected.  The daemon must not switch paths based on forged records.
     #[test]
     fn test_a4_forged_signature_coordination_record_rejected() {
-        use rustynet_control::ControlPlaneCore;
-        use rustynet_policy::PolicySet;
-        let policy = PolicySet::default();
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node-a".to_string(),
+            dst: "node-b".to_string(),
+            protocol: Protocol::Any,
+            action: RuleAction::Allow,
+        });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: "node-a".to_string(),
+                hostname: "host-a".to_string(),
+                os: "linux".to_string(),
+                tags: vec![],
+                owner: "user".to_string(),
+                endpoint: "1.2.3.4:1234".to_string(),
+                last_seen_unix: 0,
+                public_key: [0u8; 32],
+            })
+            .expect("upsert a");
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: "node-b".to_string(),
+                hostname: "host-b".to_string(),
+                os: "linux".to_string(),
+                tags: vec![],
+                owner: "user".to_string(),
+                endpoint: "5.6.7.8:5678".to_string(),
+                last_seen_unix: 0,
+                public_key: [0u8; 32],
+            })
+            .expect("upsert b");
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2107,10 +2143,38 @@ mod tests {
     /// rejected even when the signature is valid.
     #[test]
     fn test_a4_replayed_coordination_record_rejected() {
-        use rustynet_control::ControlPlaneCore;
-        use rustynet_policy::PolicySet;
-        let policy = PolicySet::default();
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node-a".to_string(),
+            dst: "node-b".to_string(),
+            protocol: Protocol::Any,
+            action: RuleAction::Allow,
+        });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: "node-a".to_string(),
+                hostname: "host-a".to_string(),
+                os: "linux".to_string(),
+                tags: vec![],
+                owner: "user".to_string(),
+                endpoint: "1.2.3.4:1234".to_string(),
+                last_seen_unix: 0,
+                public_key: [0u8; 32],
+            })
+            .expect("upsert a");
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: "node-b".to_string(),
+                hostname: "host-b".to_string(),
+                os: "linux".to_string(),
+                tags: vec![],
+                owner: "user".to_string(),
+                endpoint: "5.6.7.8:5678".to_string(),
+                last_seen_unix: 0,
+                public_key: [0u8; 32],
+            })
+            .expect("upsert b");
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

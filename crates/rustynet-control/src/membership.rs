@@ -1767,6 +1767,14 @@ mod tests {
         std::fs::write(&log, format!("version={MEMBERSHIP_SCHEMA_VERSION}\n"))
             .expect("empty log should be written");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&log).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&log, perms).unwrap();
+        }
+
         let entries = load_membership_log(&log).expect("empty log should load");
         assert!(entries.is_empty());
 

@@ -354,6 +354,11 @@ mod tests {
         // Set expiry in the past
         token.expires_at_unix = now_unix - 200;
 
+        // Re-sign to ensure signature is valid for the expired timestamp
+        let payload = token.canonical_payload();
+        let signature = signing_key.sign(payload.as_bytes());
+        token.signature = signature.to_bytes();
+
         let hello = RelayHello {
             node_id: "node-a".to_string(),
             peer_node_id: "node-b".to_string(),

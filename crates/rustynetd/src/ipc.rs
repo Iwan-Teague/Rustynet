@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 
 #[derive(Debug)]
 pub enum RemoteOpsEnvelopeParseError {
@@ -17,14 +17,14 @@ pub enum RemoteOpsEnvelopeParseError {
 impl std::fmt::Display for RemoteOpsEnvelopeParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "io error: {}", e),
+            Self::Io(e) => write!(f, "io error: {e}"),
             Self::MissingSignature => write!(f, "missing signature"),
-            Self::InvalidSignatureHex(e) => write!(f, "invalid signature hex: {}", e),
+            Self::InvalidSignatureHex(e) => write!(f, "invalid signature hex: {e}"),
             Self::MissingSubject => write!(f, "missing subject"),
             Self::MissingNonce => write!(f, "missing nonce"),
             Self::MissingCommand => write!(f, "missing command"),
             Self::InvalidFormat => write!(f, "invalid format"),
-            Self::InvalidNonce(e) => write!(f, "invalid nonce: {}", e),
+            Self::InvalidNonce(e) => write!(f, "invalid nonce: {e}"),
         }
     }
 }
@@ -207,8 +207,7 @@ pub fn read_command_envelope<R: std::io::Read>(
         .into());
     }
 
-    if line.starts_with(REMOTE_OPS_WIRE_PREFIX) {
-        let payload = &line[REMOTE_OPS_WIRE_PREFIX.len()..];
+    if let Some(payload) = line.strip_prefix(REMOTE_OPS_WIRE_PREFIX) {
         // expected format: subject=<sub|b64> nonce=<u64> command=<wire> signature=<hex>
 
         let parts: Vec<&str> = payload.split(" signature=").collect();

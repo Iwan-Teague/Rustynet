@@ -1,6 +1,8 @@
 use ed25519_dalek::{Signer, SigningKey};
+use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
 use rustynetd::daemon::{
-    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, FetchDecision, NodeRole, StateFetcher,
+    AutoTunnelBundle, DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, FetchDecision,
+    NodeRole, StateFetcher,
 };
 use std::fs;
 use std::io::{Read, Write};
@@ -115,7 +117,7 @@ fn make_signed_traversal_bundle(
     let now = unix_now();
     let expires = now + 300;
     let payload = format!(
-        "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=0\n"
+        "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=node-a\ntarget_node_id=node-b\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=192.168.1.1\ncandidate.0.port=1234\ncandidate.0.family=ipv4\ncandidate.0.relay_id= \ncandidate.0.priority=100\n"
     );
     let signature = signing_key.sign(payload.as_bytes());
     let mut sig_bytes = signature.to_bytes().to_vec();
@@ -194,7 +196,7 @@ fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
     assert!(err.len() > 0);
 }
 
-fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
+fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64, zone_name: &str) -> Vec<u8> {
     use rustynet_dns_zone::{DnsRecordType, DnsTargetAddrKind, DnsZoneRecordInput};
 
     let signing_key = SigningKey::from_bytes(&[31u8; 32]);
@@ -207,7 +209,7 @@ fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
     let now = unix_now();
     let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
         &signing_key,
-        "rustynet",
+        zone_name,
         "node-local",
         now,
         60,
@@ -249,14 +251,32 @@ fn make_signed_trust_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
 fn fetcher_dns_zone_applied_updates_bundle_on_disk() {
     let dir = tempdir().unwrap();
     let mut cfg = make_test_config(dir.path());
-    let bundle = make_signed_dns_zone_bundle(&cfg.dns_zone_verifier_key_path, 100);
+    let bundle =
+        make_signed_dns_zone_bundle(&cfg.dns_zone_verifier_key_path, 100, &cfg.dns_zone_name);
     let url = serve_once(bundle);
 
     cfg.dns_zone_url = Some(url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
+    let dummy_assignment = AutoTunnelBundle {
+        node_id: "node-local".to_string(),
+        mesh_cidr: "100.64.0.0/10".to_string(),
+        assigned_cidr: "100.64.0.1/32".to_string(),
+        peers: vec![PeerConfig {
+            node_id: NodeId::new("node-target").unwrap(),
+            endpoint: SocketEndpoint {
+                addr: "100.64.0.2".parse().unwrap(),
+                port: 51820,
+            },
+            public_key: [0u8; 32],
+            allowed_ips: vec!["100.64.0.2/32".to_string()],
+        }],
+        routes: vec![],
+        selected_exit_node: None,
+    };
+
     assert_eq!(
-        fetcher.fetch_dns_zone(None).unwrap(),
+        fetcher.fetch_dns_zone(Some(&dummy_assignment)).unwrap(),
         FetchDecision::Applied
     );
     assert!(cfg.dns_zone_bundle_path.exists());

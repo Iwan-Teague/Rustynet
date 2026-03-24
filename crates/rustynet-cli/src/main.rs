@@ -9969,16 +9969,19 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
+    use rustynetd::ipc::IpcCommand;
     use super::{
-        contains_ip_rule_lookup_table, detect_tampered_log, execute, is_interface_absent_detail,
-        launchd_xml_escape, load_dns_zone_records_json, load_signing_key,
-        managed_dns_resolver_server_arg, parse_bool_value, parse_bundle_u64_field, parse_command,
-        parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
-        persist_encrypted_secret_material, phase6_validate_platform_parity_report,
-        render_launchd_plist, required_macos_tunnel_keychain_account,
-        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
-        rewrite_env_key_value, validate_control_socket_security,
+        CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute,
+        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_json,
+        load_signing_key, managed_dns_resolver_server_arg, parse_bool_value,
+        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
+        phase6_validate_platform_parity_report, render_launchd_plist,
+        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command,
+        validate_control_socket_security,
     };
+    use rustynetd::ipc::IpcCommand;
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;

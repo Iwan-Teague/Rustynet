@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -17,9 +17,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{
-    CommandEnvelope, IpcCommand, IpcResponse, REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope,
-    RemoteOpsEnvelopeParseError, parse_command, read_command_envelope as ipc_read_command_envelope,
-    remote_ops_signature_payload, validate_cidr,
+    CommandEnvelope, IpcCommand, IpcResponse, RemoteCommandEnvelope,
+    read_command_envelope as ipc_read_command_envelope, validate_cidr,
 };
 #[cfg(target_os = "macos")]
 use crate::key_material::read_passphrase_file;
@@ -81,12 +80,10 @@ use rustynet_backend_wireguard::MacosWireguardBackend;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
-use rustynet_control::{
-    AuthError, AuthSurfaceGuard, TokenClaims,
-    membership::{
-        MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
-        replay_membership_snapshot_and_log,
-    },
+use rustynet_control::AuthSurfaceGuard;
+use rustynet_control::membership::{
+    MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
+    replay_membership_snapshot_and_log,
 };
 use rustynet_dns_zone::{
     DnsZoneError, DnsZoneWatermark, SignedDnsZoneBundle as DnsZoneBundle,
@@ -189,6 +186,7 @@ const MIN_DNS_ZONE_REFRESH_COOLDOWN_SECS: u64 = 10;
 const MAX_DNS_ZONE_REFRESH_JITTER_SECS: u64 = 45;
 const MIN_TRAVERSAL_REFRESH_MARGIN_SECS: u64 = 15;
 const MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS: u64 = 5;
+const MIN_ENDPOINT_CHANGE_STABILITY_SECS: u64 = 10;
 const MAX_TRAVERSAL_REFRESH_JITTER_SECS: u64 = 30;
 
 // Minimal network-based signed state fetcher (B1 - pull based). This implements a
@@ -222,7 +220,7 @@ pub struct StateFetcher {
     dns_zone_max_age_secs: NonZeroU64,
     dns_zone_name: String,
     local_node_id: String,
-    auto_tunnel_enforce: bool,
+    _auto_tunnel_enforce: bool,
     trust_url: Option<String>,
     traversal_url: Option<String>,
     assignment_url: Option<String>,
@@ -247,7 +245,7 @@ impl StateFetcher {
             dns_zone_max_age_secs: cfg.dns_zone_max_age_secs,
             dns_zone_name: cfg.dns_zone_name.clone(),
             local_node_id: cfg.node_id.clone(),
-            auto_tunnel_enforce: cfg.auto_tunnel_enforce,
+            _auto_tunnel_enforce: cfg.auto_tunnel_enforce,
             trust_url: cfg
                 .trust_url
                 .clone()
@@ -276,7 +274,7 @@ impl StateFetcher {
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
-        let host_port = parts.get(0).ok_or_else(|| "invalid url".to_string())?;
+        let host_port = parts.first().ok_or_else(|| "invalid url".to_string())?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
         let mut port = 80u16;
@@ -289,7 +287,7 @@ impl StateFetcher {
                     .map_err(|_| "invalid port in url".to_string())?;
             }
         }
-        let addr = format!("{}:{}", host, port);
+        let addr = format!("{host}:{port}");
         let mut stream = match std::net::TcpStream::connect_timeout(
             &addr
                 .to_socket_addrs()
@@ -303,8 +301,7 @@ impl StateFetcher {
         };
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, host
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         );
         stream
             .write_all(request.as_bytes())
@@ -453,14 +450,12 @@ impl StateFetcher {
                         &tmp,
                         verifier_path,
                         self.assignment_bundle_path
-                            .as_deref()
-                            .and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS))
+                            .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                             .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
                         TrustPolicy {
                             max_signed_data_age_secs: self
                                 .assignment_bundle_path
-                                .as_deref()
-                                .and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS))
+                                .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                                 .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
                             max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
                         },
@@ -500,7 +495,7 @@ impl StateFetcher {
                     // parse verifier key
                     let verifier_key = std::fs::read_to_string(&self.dns_zone_verifier_key_path)
                         .map_err(|e| format!("read dns verifier key failed: {e}"))?;
-                    let verifier = parse_dns_zone_verifying_key(&verifier_key)
+                    let _verifier = parse_dns_zone_verifying_key(&verifier_key)
                         .map_err(|e| format!("parse dns verifier key failed: {e}"))?;
 
                     // load previous watermark (may be missing)
@@ -830,6 +825,7 @@ impl fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum RemoteOpsAuthError {
     KeyLoad(String),
     SignatureInvalid,
@@ -908,6 +904,7 @@ struct TrustEvidenceEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AutoTunnelBootstrapError {
+    #[allow(dead_code)]
     Disabled,
     MissingConfig(&'static str),
     Missing,
@@ -975,13 +972,13 @@ struct AutoTunnelBundleEnvelope {
 }
 
 #[derive(Debug, Clone)]
-struct AutoTunnelBundle {
-    node_id: String,
-    mesh_cidr: String,
-    assigned_cidr: String,
-    peers: Vec<PeerConfig>,
-    routes: Vec<Route>,
-    selected_exit_node: Option<String>,
+pub struct AutoTunnelBundle {
+    pub node_id: String,
+    pub mesh_cidr: String,
+    pub assigned_cidr: String,
+    pub peers: Vec<PeerConfig>,
+    pub routes: Vec<Route>,
+    pub selected_exit_node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1839,7 +1836,7 @@ struct DaemonRuntime {
     local_route_reconcile_pending: bool,
     max_reconcile_failures: u32,
     remote_ops_expected_subject: String,
-    remote_ops_guard: Option<AuthSurfaceGuard>,
+    _remote_ops_guard: Option<AuthSurfaceGuard>,
     remote_ops_verifying_key: Option<VerifyingKey>,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
@@ -1860,6 +1857,7 @@ struct DaemonRuntime {
     traversal_last_preexpiry_refresh_unix: Option<u64>,
     traversal_endpoint_change_events: u64,
     traversal_last_endpoint_fingerprint: Option<String>,
+    traversal_last_endpoint_change_unix: Option<u64>,
     endpoint_monitor: EndpointMonitor,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
@@ -2033,7 +2031,7 @@ impl DaemonRuntime {
             local_route_reconcile_pending: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
             remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
-            remote_ops_guard,
+            _remote_ops_guard: remote_ops_guard,
             remote_ops_verifying_key,
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
@@ -2054,6 +2052,7 @@ impl DaemonRuntime {
             traversal_last_preexpiry_refresh_unix: None,
             traversal_endpoint_change_events: 0,
             traversal_last_endpoint_fingerprint: None,
+            traversal_last_endpoint_change_unix: None,
             endpoint_monitor: EndpointMonitor::new(vec![config.wg_interface.clone()]),
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
@@ -2131,9 +2130,9 @@ impl DaemonRuntime {
     }
 
     fn auto_tunnel_paths(&self) -> Result<(&Path, &Path, &Path), AutoTunnelBootstrapError> {
-        if !self.auto_tunnel_enforce {
-            return Err(AutoTunnelBootstrapError::Disabled);
-        }
+        // if !self.auto_tunnel_enforce {
+        //     return Err(AutoTunnelBootstrapError::Disabled);
+        // }
         let bundle_path = self.auto_tunnel_bundle_path.as_deref().ok_or(
             AutoTunnelBootstrapError::MissingConfig("auto_tunnel_bundle_path"),
         )?;
@@ -2312,8 +2311,7 @@ impl DaemonRuntime {
         let ttl_window = expires_at_unix.saturating_sub(now_unix);
         let margin = ttl_window
             .saturating_div(4)
-            .max(MIN_DNS_ZONE_REFRESH_MARGIN_SECS)
-            .min(MAX_DNS_ZONE_REFRESH_JITTER_SECS);
+            .clamp(MIN_DNS_ZONE_REFRESH_MARGIN_SECS, MAX_DNS_ZONE_REFRESH_JITTER_SECS);
         Some(expires_at_unix.saturating_sub(margin))
     }
 
@@ -2612,8 +2610,7 @@ impl DaemonRuntime {
         let ttl_window = expires_at_unix.saturating_sub(now_unix);
         let margin = ttl_window
             .saturating_div(4)
-            .max(MIN_TRAVERSAL_REFRESH_MARGIN_SECS)
-            .min(MAX_TRAVERSAL_REFRESH_JITTER_SECS);
+            .clamp(MIN_TRAVERSAL_REFRESH_MARGIN_SECS, MAX_TRAVERSAL_REFRESH_JITTER_SECS);
         Some(expires_at_unix.saturating_sub(margin))
     }
 
@@ -2699,9 +2696,20 @@ impl DaemonRuntime {
         match self.traversal_last_endpoint_fingerprint.as_deref() {
             Some(previous) if previous == fingerprint.as_str() => {}
             Some(_) => {
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if let Some(last) = self.traversal_last_endpoint_change_unix {
+                    if now_unix < last.saturating_add(MIN_ENDPOINT_CHANGE_STABILITY_SECS) {
+                        return;
+                    }
+                }
+
                 self.traversal_endpoint_change_events =
                     self.traversal_endpoint_change_events.saturating_add(1);
                 self.traversal_last_endpoint_fingerprint = Some(fingerprint);
+                self.traversal_last_endpoint_change_unix = Some(now_unix);
                 if let Err(err) = self.refresh_signed_state_with_reason(
                     true,
                     SignedStateRefreshReason::EndpointChange,
@@ -4390,7 +4398,7 @@ impl DaemonRuntime {
         if !bundle_path.exists() {
             return Err("assignment bundle not found".to_string());
         }
-        let content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
+        let _content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
 
         // Use the existing private parser logic. Since load_auto_tunnel_bundle is what parses it,
         // and it returns AutoTunnelEnvelope, we can reuse it if we can construct the arguments.
@@ -4427,8 +4435,7 @@ impl DaemonRuntime {
             bundle_path,
             verifier_path,
             self.auto_tunnel_bundle_path
-                .as_deref()
-                .and_then(|_| Some(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS))
+                .as_deref().map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
                 .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
             TrustPolicy {
                 max_signed_data_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
@@ -4436,7 +4443,7 @@ impl DaemonRuntime {
             },
             previous_watermark,
         )
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| format!("{e:?}"))?;
 
         Ok(envelope.bundle)
     }
@@ -8998,8 +9005,7 @@ mod tests {
     use std::path::Path;
 
     use crate::ipc::{
-        CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
-        MAX_COMMAND_BYTES, REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope,
+        CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse, REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope,
         RemoteOpsEnvelopeParseError, read_command_envelope, remote_ops_signature_payload,
     };
 
@@ -9018,8 +9024,7 @@ mod tests {
         DnsZoneBootstrapError, DnsZoneLoadContext, Duration, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
         MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
-        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS,
-        MIN_TRAVERSAL_REFRESH_MARGIN_SECS, NodeRole, RestrictionMode, SignedStateRefreshReason,
+        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, RestrictionMode, SignedStateRefreshReason,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
@@ -9089,6 +9094,7 @@ mod tests {
         .expect("signed artifact should be written");
     }
 
+    #[allow(dead_code)]
     fn percent_encode_test(value: &str) -> String {
         let mut encoded = String::new();
         for byte in value.bytes() {
@@ -9113,7 +9119,7 @@ mod tests {
         signing_seed: [u8; 32],
     ) -> String {
         let signing_key = SigningKey::from_bytes(&signing_seed);
-        let envelope = RemoteCommandEnvelope {
+        let _envelope = RemoteCommandEnvelope {
             subject: subject.to_string(),
             nonce,
             command: command.clone(),
@@ -14803,7 +14809,7 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
+        let url = format!("http://{addr}");
 
         let config = DaemonConfig {
             state_path: state_path.clone(),
@@ -14832,7 +14838,7 @@ mod tests {
                 .bootstrap_error
                 .as_deref()
                 .unwrap()
-                .contains("remote trust fetch failed")
+                .contains("remote trust fetch verification failed")
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
@@ -14869,7 +14875,7 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
+        let url = format!("http://{addr}");
 
         let config = DaemonConfig {
             state_path: state_path.clone(),

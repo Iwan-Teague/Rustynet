@@ -18,8 +18,7 @@ Environment=RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS=180
 Environment=RUSTYNET_DAEMON_GROUP=rustynetd
 LoadCredentialEncrypted=signing_key_passphrase:/etc/rustynet/credentials/signing_key_passphrase.cred
 ExecStartPre=/usr/local/bin/rustynet ops verify-runtime-binary-custody
-ExecStart=/usr/local/bin/rustynet ops refresh-assignment
-ExecStartPost=/usr/local/bin/rustynet state refresh
+ExecStart=/usr/local/bin/rustynet state refresh
 User=root
 Group=root
 NoNewPrivileges=true

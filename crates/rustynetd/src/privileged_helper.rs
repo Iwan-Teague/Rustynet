@@ -211,14 +211,12 @@ impl PrivilegedCommandClient {
 
 fn validate_privileged_helper_socket_security(path: &Path) -> Result<(), String> {
     let expected_uid = Uid::effective().as_raw();
-    let expected_gid = Gid::effective().as_raw();
     let allowed_owner_uids = [expected_uid, 0];
-    validate_root_managed_shared_runtime_socket(
+    validate_owner_only_socket(
         path,
         "privileged helper socket",
         &allowed_owner_uids,
         &allowed_owner_uids,
-        expected_gid,
     )
 }
 
