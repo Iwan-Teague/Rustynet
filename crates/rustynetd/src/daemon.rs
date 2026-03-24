@@ -221,6 +221,10 @@ pub struct StateFetcher {
     dns_zone_name: String,
     local_node_id: String,
     auto_tunnel_enforce: bool,
+    trust_url: Option<String>,
+    traversal_url: Option<String>,
+    assignment_url: Option<String>,
+    dns_zone_url: Option<String>,
 }
 
 impl StateFetcher {
@@ -242,6 +246,22 @@ impl StateFetcher {
             dns_zone_name: cfg.dns_zone_name.clone(),
             local_node_id: cfg.node_id.clone(),
             auto_tunnel_enforce: cfg.auto_tunnel_enforce,
+            trust_url: cfg
+                .trust_url
+                .clone()
+                .or_else(|| std::env::var("RUSTYNET_TRUST_URL").ok()),
+            traversal_url: cfg
+                .traversal_url
+                .clone()
+                .or_else(|| std::env::var("RUSTYNET_TRAVERSAL_URL").ok()),
+            assignment_url: cfg
+                .assignment_url
+                .clone()
+                .or_else(|| std::env::var("RUSTYNET_ASSIGNMENT_URL").ok()),
+            dns_zone_url: cfg
+                .dns_zone_url
+                .clone()
+                .or_else(|| std::env::var("RUSTYNET_DNS_ZONE_URL").ok()),
         }
     }
 
@@ -301,7 +321,7 @@ impl StateFetcher {
     }
 
     pub fn fetch_trust(&self) -> Result<FetchDecision, String> {
-        if let Ok(url) = std::env::var("RUSTYNET_TRUST_URL") {
+        if let Some(url) = &self.trust_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
                     // write to temp file and run full verification via load_* helpers so we obtain watermark
@@ -348,7 +368,7 @@ impl StateFetcher {
     }
 
     pub fn fetch_traversal(&self) -> Result<FetchDecision, String> {
-        if let Ok(url) = std::env::var("RUSTYNET_TRAVERSAL_URL") {
+        if let Some(url) = &self.traversal_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
                     let tmp = std::env::temp_dir().join("rustynetd.traversal.tmp");
@@ -399,7 +419,7 @@ impl StateFetcher {
     }
 
     pub fn fetch_assignment(&self) -> Result<FetchDecision, String> {
-        if let Ok(url) = std::env::var("RUSTYNET_ASSIGNMENT_URL") {
+        if let Some(url) = &self.assignment_url {
             // require assignment paths configured
             let bundle_path = match &self.assignment_bundle_path {
                 Some(p) => p,
@@ -469,7 +489,7 @@ impl StateFetcher {
         &self,
         auto_bundle: Option<&AutoTunnelBundle>,
     ) -> Result<FetchDecision, String> {
-        if let Ok(url) = std::env::var("RUSTYNET_DNS_ZONE_URL") {
+        if let Some(url) = &self.dns_zone_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
                     let tmp = std::env::temp_dir().join("rustynetd.dnszone.tmp");
@@ -682,6 +702,10 @@ pub struct DaemonConfig {
     pub fail_closed_ssh_allow: bool,
     pub fail_closed_ssh_allow_cidrs: Vec<ManagementCidr>,
     pub max_requests: Option<NonZeroUsize>,
+    pub trust_url: Option<String>,
+    pub traversal_url: Option<String>,
+    pub assignment_url: Option<String>,
+    pub dns_zone_url: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -776,6 +800,10 @@ impl Default for DaemonConfig {
             fail_closed_ssh_allow: DEFAULT_FAIL_CLOSED_SSH_ALLOW,
             fail_closed_ssh_allow_cidrs: Vec::new(),
             max_requests: None,
+            trust_url: None,
+            traversal_url: None,
+            assignment_url: None,
+            dns_zone_url: None,
         }
     }
 }
@@ -3463,7 +3491,7 @@ impl DaemonRuntime {
                         policy,
                         None,
                     )
-                    .map(|(b, _)| b)
+                    .map(|b| b)
                     .ok()
                 } else {
                     None
@@ -14722,19 +14750,19 @@ mod tests {
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
 
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path.clone(),
             trust_verifier_key_path: trust_verifier_path.clone(),
             trust_watermark_path: trust_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
+            trust_url: Some(url.clone()),
             ..DaemonConfig::default()
         };
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
-        unsafe { std::env::set_var("RUSTYNET_TRUST_URL", &url) };
 
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -14756,7 +14784,6 @@ mod tests {
                 .contains("remote trust fetch failed")
         );
 
-        unsafe { std::env::remove_var("RUSTYNET_TRUST_URL") };
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
@@ -14789,6 +14816,10 @@ mod tests {
             false,
         );
 
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}", addr);
+
         let config = DaemonConfig {
             state_path: state_path.clone(),
             trust_evidence_path: trust_path.clone(),
@@ -14801,17 +14832,13 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
+            traversal_url: Some(url.clone()),
             ..DaemonConfig::default()
         };
 
         let mut runtime = DaemonRuntime::new(&config).unwrap();
         let _ = runtime.refresh_signed_state_with_reason(false, SignedStateRefreshReason::Command);
         assert!(runtime.traversal_hints.is_some());
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}", addr);
-        unsafe { std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url) };
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -14841,7 +14868,6 @@ mod tests {
             "fetcher should have been called"
         );
 
-        unsafe { std::env::remove_var("RUSTYNET_TRAVERSAL_URL") };
         let _ = std::fs::remove_dir_all(test_dir);
     }
 }

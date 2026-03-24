@@ -1,0 +1,52 @@
+{
+  "captured_at_unix": 1774349315,
+  "checks": {
+    "m0_schema_lock": "pass",
+    "m1_deterministic_reducer": "pass",
+    "m2_quorum_verification": "pass",
+    "m3_persistence_integrity": "pass",
+    "m4_daemon_enforcement_gate": "pass",
+    "m5_policy_coupling_revoked_denied": "pass",
+    "m6_cli_subcommands_present": "pass",
+    "m7_governance_runbook_present": "pass",
+    "m8_ci_gates_script_present": "pass"
+  },
+  "environment": "ci",
+  "evidence_mode": "measured",
+  "git_commit": "10b2f541465bc673ba9639b10f74d1dfe9fcd1e6",
+  "phase": "phase10",
+  "status": "pass",
+  "suite": "membership_governance",
+  "validated_by_tests": [
+    "membership::tests::canonical_state_and_root_are_deterministic",
+    "membership::tests::unknown_schema_version_is_rejected_fail_closed",
+    "membership::tests::signed_update_requires_threshold_and_owner_for_quorum_change",
+    "membership::tests::add_node_update_requires_valid_signatures_and_root_chain",
+    "membership::tests::replay_and_rollback_are_rejected",
+    "membership::tests::duplicate_signer_is_rejected",
+    "membership::tests::owner_signature_required_for_rotate_approver",
+    "membership::tests::replay_cache_not_updated_on_failed_update",
+    "membership::tests::loading_empty_membership_log_is_supported",
+    "membership::tests::snapshot_and_log_roundtrip_integrity",
+    "membership::tests::revoke_and_restore_update_timestamp",
+    "tests::test_revoked_node_acl_denied_before_rule_evaluation",
+    "tests::test_active_node_acl_proceeds_to_rule_evaluation",
+    "tests::membership_aware_contextual_policy_denies_revoked_and_unknown_nodes",
+    "tests::membership_aware_policy_preserves_protocol_filters",
+    "phase10::tests::test_active_member_provisioned",
+    "phase10::tests::test_revoked_member_provisioning_denied",
+    "phase10::tests::test_unknown_member_provisioning_denied",
+    "phase10::tests::test_revocation_removes_peer_and_routes_immediately"
+  ],
+  "evidence_summary": {
+    "m0_schema_lock": "MEMBERSHIP_SCHEMA_VERSION=1, canonical_payload/state_root_hex implemented in crates/rustynet-control/src/membership.rs",
+    "m1_deterministic_reducer": "reduce_membership_state, preview_next_state, apply_signed_update with ordered validation chain (network_id, created/expiry, prev_root, epoch chain, sig verification, legality, epoch advance, root recompute, replay protection via MembershipReplayCache)",
+    "m2_quorum_verification": "verify_membership_signatures enforces active-approver membership, threshold, duplicate signer detection, owner-signature for sensitive ops using ed25519_dalek",
+    "m3_persistence_integrity": "persist_membership_snapshot, load_membership_snapshot, append_membership_log_entry, load_membership_log, replay_membership_snapshot_and_log; atomic write with tmp+fsync+rename and Unix permission checks",
+    "m4_daemon_enforcement_gate": "check_peer_membership_active called in Phase10Controller before every backend.configure_peer(); MembershipRevoked/MembershipNotFound errors fail-closed; empty directory skips gate for bootstrap",
+    "m5_policy_coupling_revoked_denied": "ContextualPolicySet.evaluate_with_membership() denies revoked/unknown nodes before ACL rule evaluation in crates/rustynet-policy/src/lib.rs",
+    "m6_cli_subcommands": "rustynet membership propose/sign-update/apply-update/verify-update/status all implemented in crates/rustynet-cli/src/main.rs",
+    "m7_governance_runbook": "documents/operations/MembershipGovernanceRunbook.md covers add-node, revoke, key-rotation, and incident-drill procedures",
+    "m8_ci_gates_script": "scripts/ci/membership_gates.sh runs cargo clippy, cargo test membership, and membership_gates binary"
+  }
+}
