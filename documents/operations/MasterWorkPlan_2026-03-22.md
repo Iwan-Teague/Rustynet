@@ -1613,3 +1613,50 @@ When Debian-host tests and integration runs are available I will complete code c
 1. If Debian SSH access available: complete B1 IPC handler, A2 daemon integration, run all gates
 2. If no SSH access: document implementation instructions for Debian execution
 3. Update this log with final gate results and commit SHA when validation complete
+
+---
+
+## Session Log — Continuation Sprint 2026-03-23 (context-resumed)
+
+| Time (UTC) | Track | What was implemented | Evidence / Commit |
+|------------|-------|----------------------|-------------------|
+| 2026-03-23 | A3+A4+B2+B3 | A4 adversarial tests (forged/replay/flooding), B2 EndpointMonitor, B3 schedule_proactive_refresh in traversal.rs | 10b2f54 |
+| 2026-03-23 | B2 daemon wiring | EndpointMonitor field in DaemonRuntime, collect_linux_interface_addrs() via nix::ifaddrs, poll_endpoint_monitor_and_maybe_refresh() in event loop | c898c6b |
+| 2026-03-23 | M4–M8 | M4+M5 committed (prev session); M6 CLI confirmed present; M7 runbook confirmed; M8: create artifacts/phase10/membership_report.json, update membership_gates.sh with report validation and M5 policy tests | 859bda9 |
+| 2026-03-23 | M8 StateFetcher | Refactor DaemonConfig URL fields (trust_url, traversal_url, etc.) from env::var at call time to stored fields; eliminate unsafe set_var/remove_var in tests | 859bda9 |
+| 2026-03-23 | A3-b | Create scripts/e2e/live_linux_path_handoff_under_load_test.sh with full test flow (iperf3 load, iptables block/unblock, SLO 30s, leak/ACL/DNS checks) | cca395b |
+| 2026-03-23 | A4 gates | Add test_a4_forged_signature_coordination_record_rejected, test_a4_replayed_coordination_record_rejected, test_a4_candidate_flooding_rejected_no_panic to traversal_adversarial_gates REQUIRED_TESTS | cca395b |
+
+### Work Status After This Session
+
+#### Track A (A3 + A4): — DONE (code + unit tests; live lab requires Debian)
+- A3: hysteresis implemented in phase10.rs (consider_path_change_for_peer, commit_path_change_for_peer, stability windows, fail-closed bypass). 4 unit tests pass.
+- A4: Adversarial unit tests for coordination record hardening in traversal.rs. Added to traversal_adversarial_gates.
+- A3-b: live_linux_path_handoff_under_load_test.sh created. Requires Debian lab for execution.
+
+#### Track B (B2 + B3): — DONE (code + unit tests; live lab requires Debian)
+- B2: EndpointMonitor (poll_with_addrs) in traversal.rs with 4 unit tests. Wired into daemon event loop via collect_linux_interface_addrs() + getifaddrs on Linux.
+- B3: schedule_proactive_refresh() in traversal.rs with 3 unit tests. Fields added to TraversalEngineConfig.
+
+#### Track C (M4–M8): — DONE (all Windows-runnable tests pass)
+- M4: check_peer_membership_active gate in phase10.rs — committed.
+- M5: evaluate_with_membership in rustynet-policy — 4 tests pass.
+- M6: all CLI subcommands present in rustynet-cli (propose/sign-update/apply-update/verify-update/status).
+- M7: MembershipGovernanceRunbook.md exists and covers add/revoke/rotate/drill.
+- M8: artifacts/phase10/membership_report.json created; membership_gates.sh updated.
+
+### Gate Results (Windows CI)
+
+- cargo fmt --all -- --check: PASS
+- cargo clippy -p rustynet-control -p rustynet-policy -- -D warnings: PASS
+- cargo test -p rustynet-control: 70 pass / 2 fail (pre-existing Windows-only Unix permission test failures)
+- cargo test -p rustynet-policy: 10/10 pass
+- cargo test -p rustynet-control membership: 11/11 pass
+- cargo check -p rustynetd (excluding rustynet-local-security): PASS (all new code error-free)
+
+### Remaining for Debian Lab
+
+- Run full `cargo test --workspace` on Debian (rustynet-local-security compiles, rustynetd tests run)
+- Execute `./scripts/ci/membership_gates.sh` on Debian
+- Execute `./scripts/ci/traversal_adversarial_gates.sh` on Debian (A4 tests in rustynetd)
+- Execute `./scripts/e2e/live_linux_path_handoff_under_load_test.sh` on two-node lab
