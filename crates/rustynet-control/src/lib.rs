@@ -1723,7 +1723,7 @@ pub struct ControlPlaneCore {
     dns_zone_signing_key: SigningKey,
     dns_zone_verifying_key: [u8; 32],
     endpoint_hint_signing_key: SigningKey,
-    endpoint_hint_verifying_key: [u8; 32],
+    pub endpoint_hint_verifying_key: [u8; 32],
     access_token_signing_key: SigningKey,
     access_token_verifying_key: [u8; 32],
 }

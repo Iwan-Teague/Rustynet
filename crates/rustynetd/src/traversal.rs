@@ -1042,8 +1042,8 @@ impl TraversalEngine {
         local_candidates: &[TraversalCandidate],
         remote_candidates: &[TraversalCandidate],
     ) -> Result<ProbePlan, TraversalError> {
-        validate_candidates("local", local_candidates, self.config)?;
-        validate_candidates("remote", remote_candidates, self.config)?;
+        validate_candidates("local", local_candidates, self.config.clone())?;
+        validate_candidates("remote", remote_candidates, self.config.clone())?;
 
         let local_direct = local_candidates
             .iter()
@@ -1094,7 +1094,7 @@ impl TraversalEngine {
         &self,
         remote_candidates: &[TraversalCandidate],
     ) -> Result<RemoteProbePlan, TraversalError> {
-        validate_candidates("remote", remote_candidates, self.config)?;
+        validate_candidates("remote", remote_candidates, self.config.clone())?;
 
         let mut direct_candidates = remote_candidates
             .iter()
@@ -1700,13 +1700,13 @@ mod tests {
         assert_eq!(session.path, PathMode::Relay);
         assert!(
             session
-                .on_direct_probe_timeout(101, fallback_config)
+                .on_direct_probe_timeout(101, fallback_config.clone())
                 .is_none()
         );
         assert_eq!(session.path, PathMode::Relay);
         assert!(
             session
-                .on_direct_probe_timeout(102, fallback_config)
+                .on_direct_probe_timeout(102, fallback_config.clone())
                 .is_some()
         );
         assert_eq!(session.path, PathMode::Relay);
@@ -1715,7 +1715,7 @@ mod tests {
         let direct_endpoint = endpoint([203, 0, 113, 21], 51820);
         session.on_direct_probe_success(direct_endpoint, 103);
         assert_eq!(session.path, PathMode::Direct);
-        session.on_direct_probe_timeout(104, fallback_config);
+        session.on_direct_probe_timeout(104, fallback_config.clone());
         let failback = session
             .on_direct_probe_timeout(105, fallback_config)
             .expect("relay failback should trigger after configured direct probe failures");
@@ -2079,7 +2079,13 @@ mod tests {
             .signed_traversal_coordination_record(record)
             .expect("sign");
         // Corrupt the signature bytes.
-        signed.signature[0] ^= 0xff;
+        let mut corrupted = signed.signature_hex.clone();
+        if corrupted.starts_with('0') {
+            corrupted.replace_range(0..1, "1");
+        } else {
+            corrupted.replace_range(0..1, "0");
+        }
+        signed.signature_hex = corrupted;
 
         let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
         let mut replay = CoordinationReplayWindow::default();

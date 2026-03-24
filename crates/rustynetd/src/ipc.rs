@@ -200,7 +200,11 @@ pub fn read_command_envelope<R: std::io::Read>(
         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty command").into());
     }
     if line.contains('\0') {
-         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "command contains null byte").into());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command contains null byte",
+        )
+        .into());
     }
 
     if line.starts_with(REMOTE_OPS_WIRE_PREFIX) {

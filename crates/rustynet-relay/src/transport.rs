@@ -115,12 +115,12 @@ impl RelayTransport {
         }
 
         // Security check 5: Verify peer_node_id matches token
-        if !hello
+        let is_match: bool = hello
             .peer_node_id
             .as_bytes()
             .ct_eq(hello.session_token.peer_node_id.as_bytes())
-            .into()
-        {
+            .into();
+        if !is_match {
             eprintln!("Relay hello rejected: peer_node_id mismatch");
             return RelayHelloResponse::Rejected(RejectReason::PeerMismatch);
         }

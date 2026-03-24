@@ -2044,8 +2044,6 @@ impl DaemonRuntime {
         Ok(envelope.evidence)
     }
 
-
-
     fn load_verified_membership(&self) -> Result<MembershipState, MembershipBootstrapError> {
         if !self.membership_snapshot_path.exists() {
             return Err(MembershipBootstrapError::MissingSnapshot);
@@ -3029,7 +3027,7 @@ impl DaemonRuntime {
                     &direct_candidates,
                     relay_endpoint,
                     now_unix,
-                    self.traversal_probe_config,
+                    self.traversal_probe_config.clone(),
                     self.traversal_probe_handshake_freshness_secs,
                 )
                 .map_err(|err| {
@@ -3458,9 +3456,15 @@ impl DaemonRuntime {
                         max_signed_data_age_secs: self.auto_tunnel_max_age_secs,
                         max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
                     };
-                    load_auto_tunnel_bundle(path, verifier, self.auto_tunnel_max_age_secs, &policy, None)
-                        .map(|(b, _)| b)
-                        .ok()
+                    load_auto_tunnel_bundle(
+                        path,
+                        verifier,
+                        self.auto_tunnel_max_age_secs,
+                        policy,
+                        None,
+                    )
+                    .map(|(b, _)| b)
+                    .ok()
                 } else {
                     None
                 }
@@ -8909,15 +8913,15 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
 
     use crate::ipc::{
-        CommandEnvelope, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
-        REMOTE_OPS_WIRE_PREFIX, remote_ops_signature_payload, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
-        read_command_envelope, IpcCommand, IpcResponse, MAX_COMMAND_BYTES,
+        CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
+        MAX_COMMAND_BYTES, REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope,
+        RemoteOpsEnvelopeParseError, read_command_envelope, remote_ops_signature_payload,
     };
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -8932,23 +8936,21 @@ mod tests {
         AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
         DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
         DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
-        DnsZoneBootstrapError, DnsZoneLoadContext,
-        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
-        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
-        MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
-        MIN_TRAVERSAL_REFRESH_MARGIN_SECS, NodeRole, TrustEvidenceRecord, TrustPolicy,
-        TrustWatermark, build_dns_response, is_root_managed_shared_runtime_parent,
-        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
-        load_traversal_bundle, load_traversal_bundle_set, load_traversal_watermark,
-        load_trust_evidence, load_trust_watermark, parse_route_interface_token,
-        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
-        persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, resolve_egress_interface_value,
-        run_daemon, run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
+        DnsZoneBootstrapError, DnsZoneLoadContext, Duration, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
+        MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
+        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS,
+        MIN_TRAVERSAL_REFRESH_MARGIN_SECS, NodeRole, RestrictionMode, SignedStateRefreshReason,
+        TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
+        is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
+        load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
+        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
+        parse_route_interface_token, passphrase_disallowed_mode_mask,
+        persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
+        prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
+        run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
         trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
         zeroize_optional_bytes,
-        RestrictionMode, SignedStateRefreshReason, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS,
-        Duration,
     };
     use crate::phase10::{PathMode, TraversalProbeDecision, TraversalProbeReason};
 
@@ -9105,10 +9107,8 @@ mod tests {
         let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
         writer
             .write_all(
-                format!(
-                    "{REMOTE_OPS_WIRE_PREFIX}subject=user:local nonce=123 command=status\n"
-                )
-                .as_bytes(),
+                format!("{REMOTE_OPS_WIRE_PREFIX}subject=user:local nonce=123 command=status\n")
+                    .as_bytes(),
             )
             .expect("invalid remote command wire should write");
         let err = read_command_envelope(&reader)
@@ -9158,9 +9158,10 @@ mod tests {
         let now = unix_now();
         let nonce = now;
         let command = IpcCommand::Status;
-        let payload = remote_ops_signature_payload(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, nonce, &command);
+        let payload =
+            remote_ops_signature_payload(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, nonce, &command);
         let signature = remote_signing_key.sign(&payload);
-        
+
         let envelope = RemoteCommandEnvelope {
             subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
             nonce,
@@ -9173,7 +9174,11 @@ mod tests {
 
         // Replay/Expired check: nonce too old
         let expired_nonce = now.saturating_sub(61);
-        let expired_payload = remote_ops_signature_payload(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, expired_nonce, &command);
+        let expired_payload = remote_ops_signature_payload(
+            DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+            expired_nonce,
+            &command,
+        );
         let expired_signature = remote_signing_key.sign(&expired_payload);
         let expired_envelope = RemoteCommandEnvelope {
             subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
@@ -9181,7 +9186,7 @@ mod tests {
             command: command.clone(),
             signature: expired_signature.to_bytes().to_vec(),
         };
-        
+
         let replay = runtime
             .authorize_remote_command(&expired_envelope, now)
             .expect_err("expired remote command must be rejected");
@@ -9255,12 +9260,12 @@ mod tests {
         let now = unix_now();
         let nonce = now;
         let command = IpcCommand::Status;
-        
+
         // Signed by correct key but WRONG subject
         let wrong_subject = "user:attacker";
         let payload = remote_ops_signature_payload(wrong_subject, nonce, &command);
         let signature = remote_signing_key.sign(&payload);
-        
+
         let envelope = RemoteCommandEnvelope {
             subject: wrong_subject.to_string(),
             nonce,
@@ -14729,7 +14734,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
-        std::env::set_var("RUSTYNET_TRUST_URL", &url);
+        unsafe { std::env::set_var("RUSTYNET_TRUST_URL", &url) };
 
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -14751,7 +14756,7 @@ mod tests {
                 .contains("remote trust fetch failed")
         );
 
-        std::env::remove_var("RUSTYNET_TRUST_URL");
+        unsafe { std::env::remove_var("RUSTYNET_TRUST_URL") };
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
@@ -14800,13 +14805,13 @@ mod tests {
         };
 
         let mut runtime = DaemonRuntime::new(&config).unwrap();
-        let _ = runtime.refresh_signed_state_with_reason(false, SignedStateRefreshReason::Startup);
+        let _ = runtime.refresh_signed_state_with_reason(false, SignedStateRefreshReason::Command);
         assert!(runtime.traversal_hints.is_some());
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
-        std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url);
+        unsafe { std::env::set_var("RUSTYNET_TRAVERSAL_URL", &url) };
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -14836,7 +14841,7 @@ mod tests {
             "fetcher should have been called"
         );
 
-        std::env::remove_var("RUSTYNET_TRAVERSAL_URL");
+        unsafe { std::env::remove_var("RUSTYNET_TRAVERSAL_URL") };
         let _ = std::fs::remove_dir_all(test_dir);
     }
 }

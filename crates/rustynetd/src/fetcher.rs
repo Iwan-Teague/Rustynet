@@ -384,7 +384,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::time::Duration;
 
     fn make_test_keypair() -> (SigningKey, VerifyingKey) {
