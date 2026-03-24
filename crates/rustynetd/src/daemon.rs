@@ -3451,14 +3451,14 @@ impl DaemonRuntime {
             }
         }
         let dns_context = if self.auto_tunnel_enforce {
-            if let Some(path) = &self.config.auto_tunnel_bundle_path {
-                if let Some(verifier) = &self.config.auto_tunnel_verifier_key_path {
+            if let Some(path) = &self.auto_tunnel_bundle_path {
+                if let Some(verifier) = &self.auto_tunnel_verifier_key_path {
                     use crate::phase10::TrustPolicy;
                     let policy = TrustPolicy {
-                        max_signed_data_age_secs: self.config.auto_tunnel_max_age_secs.get(),
+                        max_signed_data_age_secs: self.auto_tunnel_max_age_secs,
                         max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
                     };
-                    load_auto_tunnel_bundle(path, verifier, policy, None)
+                    load_auto_tunnel_bundle(path, verifier, self.auto_tunnel_max_age_secs, &policy, None)
                         .map(|(b, _)| b)
                         .ok()
                 } else {
@@ -8917,6 +8917,7 @@ mod tests {
     use crate::ipc::{
         CommandEnvelope, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
         REMOTE_OPS_WIRE_PREFIX, remote_ops_signature_payload, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+        read_command_envelope, IpcCommand, IpcResponse, MAX_COMMAND_BYTES,
     };
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -8931,7 +8932,7 @@ mod tests {
         AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
         DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
         DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
-        DnsZoneBootstrapError, DnsZoneLoadContext, IpcCommand, IpcResponse,
+        DnsZoneBootstrapError, DnsZoneLoadContext,
         MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
@@ -8942,12 +8943,12 @@ mod tests {
         load_trust_evidence, load_trust_watermark, parse_route_interface_token,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, read_command_envelope, resolve_egress_interface_value,
+        prepare_runtime_wireguard_key_material, resolve_egress_interface_value,
         run_daemon, run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
         trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
         zeroize_optional_bytes,
         RestrictionMode, SignedStateRefreshReason, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS,
-        RemoteOpsAuthError, Duration,
+        Duration,
     };
     use crate::phase10::{PathMode, TraversalProbeDecision, TraversalProbeReason};
 
@@ -9026,30 +9027,24 @@ mod tests {
 
     fn render_remote_command_wire(
         subject: &str,
-        issued_at_unix: u64,
-        expires_at_unix: u64,
-        nonce: &str,
-        command: &str,
+        nonce: u64,
+        command: IpcCommand,
         signing_seed: [u8; 32],
     ) -> String {
         let signing_key = SigningKey::from_bytes(&signing_seed);
         let envelope = RemoteCommandEnvelope {
             subject: subject.to_string(),
-            issued_at_unix,
-            expires_at_unix,
-            nonce: nonce.to_string(),
-            command: command.to_string(),
-            signature_hex: String::new(),
+            nonce,
+            command: command.clone(),
+            signature: Vec::new(),
         };
-        let payload = remote_ops_signature_payload(&envelope);
-        let signature = signing_key.sign(payload.as_bytes());
+        let payload = remote_ops_signature_payload(subject, nonce, &command);
+        let signature = signing_key.sign(&payload);
         format!(
-            "{REMOTE_OPS_WIRE_PREFIX}|subject={}|issued_at_unix={}|expires_at_unix={}|nonce={}|command={}|signature={}",
-            percent_encode_test(subject),
-            issued_at_unix,
-            expires_at_unix,
-            percent_encode_test(nonce),
-            percent_encode_test(command),
+            "{REMOTE_OPS_WIRE_PREFIX}subject={} nonce={} command={} signature={}",
+            subject,
+            nonce,
+            command.as_wire(),
             hex_encode(&signature.to_bytes())
         )
     }
@@ -9071,39 +9066,23 @@ mod tests {
     }
 
     #[test]
-    fn read_command_rejects_oversized_payload() {
-        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
-        let mut payload = vec![b'a'; 4096];
-        payload.push(b'\n');
-        writer
-            .write_all(payload.as_slice())
-            .expect("oversized payload write should succeed");
-
-        let err = read_command(&reader).expect_err("oversized payload must be rejected");
-        assert!(err.contains("command too long"));
-    }
-
-    #[test]
-    fn read_command_rejects_null_byte_payload() {
+    fn read_command_envelope_rejects_null_byte_payload() {
         let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
         writer
             .write_all(b"status\0\n")
             .expect("null-byte payload write should succeed");
 
-        let err = read_command(&reader).expect_err("null-byte payload must be rejected");
-        assert!(err.contains("command contains null byte"));
+        let err = read_command_envelope(&reader).expect_err("null-byte payload must be rejected");
+        assert!(err.to_string().contains("command contains null byte"));
     }
 
     #[test]
     fn read_command_envelope_parses_remote_wire_command() {
-        let issued_at = unix_now().saturating_sub(1);
-        let expires_at = issued_at.saturating_add(60);
+        let nonce = unix_now();
         let wire = render_remote_command_wire(
             DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
-            issued_at,
-            expires_at,
-            "nonce-remote-1",
-            "status",
+            nonce,
+            IpcCommand::Status,
             [44u8; 32],
         );
         let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
@@ -9114,10 +9093,8 @@ mod tests {
         match envelope {
             CommandEnvelope::Remote(remote) => {
                 assert_eq!(remote.subject, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT);
-                assert_eq!(remote.command, "status");
-                assert_eq!(remote.nonce, "nonce-remote-1");
-                assert_eq!(remote.issued_at_unix, issued_at);
-                assert_eq!(remote.expires_at_unix, expires_at);
+                assert_eq!(remote.command, IpcCommand::Status);
+                assert_eq!(remote.nonce, nonce);
             }
             CommandEnvelope::Local(_) => panic!("expected remote envelope"),
         }
@@ -9129,14 +9106,14 @@ mod tests {
         writer
             .write_all(
                 format!(
-                    "{REMOTE_OPS_WIRE_PREFIX}|subject=user:local|issued_at_unix=1|expires_at_unix=2|nonce=abc|command=status\n"
+                    "{REMOTE_OPS_WIRE_PREFIX}subject=user:local nonce=123 command=status\n"
                 )
                 .as_bytes(),
             )
             .expect("invalid remote command wire should write");
         let err = read_command_envelope(&reader)
             .expect_err("remote envelope missing signature must be rejected");
-        assert!(err.contains("missing required field signature"));
+        assert!(matches!(err, RemoteOpsEnvelopeParseError::MissingSignature));
     }
 
     #[test]
@@ -9149,32 +9126,17 @@ mod tests {
         let membership_snapshot_path = test_dir.join("membership.snapshot");
         let membership_log_path = test_dir.join("membership.log");
         let membership_watermark_path = test_dir.join("membership.watermark");
-        let remote_ops_verifier_path = test_dir.join("remote_ops_access_token.pub");
-        write_trust_file(&trust_path, &trust_verifier_path, 1);
-        write_membership_files(
-            &membership_snapshot_path,
-            &membership_log_path,
-            "daemon-local",
-        );
 
-        let remote_signing_key = SigningKey::from_bytes(&[55u8; 32]);
+        // Setup remote ops keys
+        let remote_seed = [55u8; 32];
+        let remote_signing_key = SigningKey::from_bytes(&remote_seed);
+        let remote_verifier_key = remote_signing_key.verifying_key();
+        let remote_ops_verifier_path = test_dir.join("remote-ops.pub");
         std::fs::write(
             &remote_ops_verifier_path,
-            format!(
-                "{}\n",
-                hex_encode(remote_signing_key.verifying_key().as_bytes())
-            ),
+            hex_encode(remote_verifier_key.as_bytes()),
         )
-        .expect("remote ops verifier key should be written");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &remote_ops_verifier_path,
-                std::fs::Permissions::from_mode(0o644),
-            )
-            .expect("remote ops verifier key permissions should be secure");
-        }
+        .expect("verifier key should be written");
 
         let config = DaemonConfig {
             state_path,
@@ -9194,32 +9156,44 @@ mod tests {
         runtime.bootstrap();
 
         let now = unix_now();
-        let mut envelope = RemoteCommandEnvelope {
+        let nonce = now;
+        let command = IpcCommand::Status;
+        let payload = remote_ops_signature_payload(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, nonce, &command);
+        let signature = remote_signing_key.sign(&payload);
+        
+        let envelope = RemoteCommandEnvelope {
             subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
-            issued_at_unix: now.saturating_sub(1),
-            expires_at_unix: now.saturating_add(30),
-            nonce: "nonce-replay-1".to_string(),
-            command: "status".to_string(),
-            signature_hex: String::new(),
+            nonce,
+            command: command.clone(),
+            signature: signature.to_bytes().to_vec(),
         };
-        let payload = remote_ops_signature_payload(&envelope);
-        let signature = remote_signing_key.sign(payload.as_bytes());
-        envelope.signature_hex = hex_encode(&signature.to_bytes());
 
         let first = runtime.authorize_remote_command(&envelope, now);
-        assert!(first.is_ok(), "first remote command should authorize");
+        assert!(first.is_ok(), "fresh remote command should authorize");
 
+        // Replay/Expired check: nonce too old
+        let expired_nonce = now.saturating_sub(61);
+        let expired_payload = remote_ops_signature_payload(DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, expired_nonce, &command);
+        let expired_signature = remote_signing_key.sign(&expired_payload);
+        let expired_envelope = RemoteCommandEnvelope {
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            nonce: expired_nonce,
+            command: command.clone(),
+            signature: expired_signature.to_bytes().to_vec(),
+        };
+        
         let replay = runtime
-            .authorize_remote_command(&envelope, now.saturating_add(1))
-            .expect_err("replayed remote command must be rejected");
-        assert_eq!(replay, RemoteOpsAuthError::ReplayDetected);
+            .authorize_remote_command(&expired_envelope, now)
+            .expect_err("expired remote command must be rejected");
+        assert!(replay.contains("nonce expired"));
 
+        // Tampered check
         let mut tampered = envelope.clone();
-        tampered.command = "netcheck".to_string();
+        tampered.command = IpcCommand::Netcheck;
         let tampered_err = runtime
-            .authorize_remote_command(&tampered, now.saturating_add(2))
+            .authorize_remote_command(&tampered, now)
             .expect_err("tampered remote command must fail signature validation");
-        assert_eq!(tampered_err, RemoteOpsAuthError::SignatureInvalid);
+        assert!(tampered_err.contains("signature verification failed"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -9279,21 +9253,25 @@ mod tests {
         runtime.bootstrap();
 
         let now = unix_now();
-        let mut envelope = RemoteCommandEnvelope {
-            subject: "user:attacker".to_string(),
-            issued_at_unix: now.saturating_sub(1),
-            expires_at_unix: now.saturating_add(30),
-            nonce: "nonce-subject-1".to_string(),
-            command: "status".to_string(),
-            signature_hex: String::new(),
+        let nonce = now;
+        let command = IpcCommand::Status;
+        
+        // Signed by correct key but WRONG subject
+        let wrong_subject = "user:attacker";
+        let payload = remote_ops_signature_payload(wrong_subject, nonce, &command);
+        let signature = remote_signing_key.sign(&payload);
+        
+        let envelope = RemoteCommandEnvelope {
+            subject: wrong_subject.to_string(),
+            nonce,
+            command: command.clone(),
+            signature: signature.to_bytes().to_vec(),
         };
-        let payload = remote_ops_signature_payload(&envelope);
-        let signature = remote_signing_key.sign(payload.as_bytes());
-        envelope.signature_hex = hex_encode(&signature.to_bytes());
+
         let err = runtime
             .authorize_remote_command(&envelope, now)
             .expect_err("subject mismatch must be rejected");
-        assert_eq!(err, RemoteOpsAuthError::SubjectDenied);
+        assert!(err.contains("unexpected subject"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }

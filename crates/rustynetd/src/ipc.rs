@@ -177,6 +177,7 @@ pub enum CommandEnvelope {
 
 pub const REMOTE_OPS_WIRE_PREFIX: &str = "remote-op-v1 ";
 pub const DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT: &str = "user:admin";
+pub const MAX_COMMAND_BYTES: u64 = 4096;
 
 pub fn remote_ops_signature_payload(subject: &str, nonce: u64, command: &IpcCommand) -> Vec<u8> {
     format!(
@@ -191,10 +192,16 @@ pub fn remote_ops_signature_payload(subject: &str, nonce: u64, command: &IpcComm
 pub fn read_command_envelope<R: std::io::Read>(
     stream: R,
 ) -> Result<CommandEnvelope, RemoteOpsEnvelopeParseError> {
-    let mut reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(stream.take(MAX_COMMAND_BYTES));
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let line = line.trim();
+    if line.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty command").into());
+    }
+    if line.contains('\0') {
+         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "command contains null byte").into());
+    }
 
     if line.starts_with(REMOTE_OPS_WIRE_PREFIX) {
         let payload = &line[REMOTE_OPS_WIRE_PREFIX.len()..];
