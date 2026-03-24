@@ -2442,7 +2442,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.backend.remove_peer(node_id)?;
         self.managed_peers.remove(node_id);
         self.refresh_peer_endpoint_routes()?;
-        log::info!("peer {} revoked and removed from dataplane", node_id.as_str());
+        log::info!(
+            "peer {} revoked and removed from dataplane",
+            node_id.as_str()
+        );
         Ok(())
     }
 
@@ -2753,9 +2756,9 @@ fn check_peer_membership_active(
     }
     match membership.node_status(node_id.as_str()) {
         MembershipStatus::Active => Ok(()),
-        MembershipStatus::Revoked => {
-            Err(Phase10Error::MembershipRevoked(node_id.as_str().to_string()))
-        }
+        MembershipStatus::Revoked => Err(Phase10Error::MembershipRevoked(
+            node_id.as_str().to_string(),
+        )),
         MembershipStatus::Unknown => Err(Phase10Error::MembershipNotFound(
             node_id.as_str().to_string(),
         )),
@@ -4658,8 +4661,7 @@ mod tests {
     fn test_no_switch_within_stability_window() {
         // Relay stability window is 5000ms; calls made before 5000ms elapsed
         // must NOT commit a path change.
-        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) = make_controller_with_peer(3_000, 5_000);
         assert_eq!(ctrl.peer_path(&peer_id), Some(PathMode::Direct));
 
         // First call: sets pending
@@ -4686,8 +4688,7 @@ mod tests {
 
     #[test]
     fn test_switches_after_full_stability_window() {
-        let (mut ctrl, peer_id, _direct_ep, relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, _direct_ep, relay_ep) = make_controller_with_peer(3_000, 5_000);
 
         // First call sets pending
         ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
@@ -4704,7 +4705,11 @@ mod tests {
             "path must switch after stability window expires"
         );
         assert_eq!(
-            ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint,
+            ctrl.backend
+                .peers
+                .get(&peer_id)
+                .expect("peer present")
+                .endpoint,
             relay_ep,
             "backend endpoint must reflect relay after commit"
         );
@@ -4712,8 +4717,7 @@ mod tests {
 
     #[test]
     fn test_flap_resets_stability_window() {
-        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) = make_controller_with_peer(3_000, 5_000);
 
         // Start Relay candidate window
         ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
@@ -4740,8 +4744,7 @@ mod tests {
 
     #[test]
     fn test_fail_closed_bypasses_hysteresis() {
-        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) = make_controller_with_peer(3_000, 5_000);
 
         // Set up a pending relay candidate (not yet committed)
         ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
@@ -4763,10 +4766,14 @@ mod tests {
         // Verify that reconfigure_managed_peer (the backend endpoint update) is
         // only called through commit_path_change_for_peer, never directly from
         // consider_path_change_for_peer before the window expires.
-        let (mut ctrl, peer_id, direct_ep, _relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, direct_ep, _relay_ep) = make_controller_with_peer(3_000, 5_000);
 
-        let initial_ep = ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint;
+        let initial_ep = ctrl
+            .backend
+            .peers
+            .get(&peer_id)
+            .expect("peer present")
+            .endpoint;
         assert_eq!(initial_ep, direct_ep);
 
         // Multiple consider calls within the window must not touch the backend
@@ -4774,7 +4781,12 @@ mod tests {
             ctrl.consider_path_change_for_peer(&peer_id, PathMode::Relay)
                 .expect("consider should not error");
         }
-        let ep_after_considers = ctrl.backend.peers.get(&peer_id).expect("peer present").endpoint;
+        let ep_after_considers = ctrl
+            .backend
+            .peers
+            .get(&peer_id)
+            .expect("peer present")
+            .endpoint;
         assert_eq!(
             ep_after_considers, direct_ep,
             "backend endpoint must not change until stability window elapses"
@@ -4786,8 +4798,7 @@ mod tests {
         // Simulate 60s of alternating Direct/Relay at 500ms intervals.
         // With direct_window=3000ms and relay_window=5000ms, at most a few
         // committed changes should occur (each requires its full window).
-        let (mut ctrl, peer_id, _direct_ep, _relay_ep) =
-            make_controller_with_peer(3_000, 5_000);
+        let (mut ctrl, peer_id, _direct_ep, _relay_ep) = make_controller_with_peer(3_000, 5_000);
 
         let mut committed_changes = 0usize;
         let total_steps = 120usize; // 60s / 500ms
@@ -4853,7 +4864,10 @@ mod tests {
             vec![],
             ApplyOptions::default(),
         );
-        assert!(result.is_ok(), "active member must be provisioned: {result:?}");
+        assert!(
+            result.is_ok(),
+            "active member must be provisioned: {result:?}"
+        );
         let peer_id = NodeId::new("node-b").expect("node id");
         assert!(
             controller.backend.peers.contains_key(&peer_id),

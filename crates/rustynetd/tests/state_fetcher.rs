@@ -174,7 +174,10 @@ fn fetcher_all_four_types_skip_when_url_unset() {
     assert_eq!(fetcher.fetch_trust().unwrap(), FetchDecision::Skipped);
     assert_eq!(fetcher.fetch_traversal().unwrap(), FetchDecision::Skipped);
     assert_eq!(fetcher.fetch_assignment().unwrap(), FetchDecision::Skipped);
-    assert_eq!(fetcher.fetch_dns_zone(None).unwrap(), FetchDecision::Skipped);
+    assert_eq!(
+        fetcher.fetch_dns_zone(None).unwrap(),
+        FetchDecision::Skipped
+    );
 }
 
 #[test]
@@ -200,7 +203,7 @@ fn fetcher_verification_error_does_not_overwrite_existing_bundle() {
 
 fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
     use rustynet_dns_zone::{DnsRecordType, DnsTargetAddrKind, DnsZoneRecordInput};
-    
+
     let signing_key = SigningKey::from_bytes(&[31u8; 32]);
     fs::write(
         verifier_path,
@@ -227,7 +230,7 @@ fn make_signed_dns_zone_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
         }],
     )
     .unwrap();
-    
+
     rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle).into_bytes()
 }
 
@@ -238,12 +241,12 @@ fn make_signed_trust_bundle(verifier_path: &PathBuf, nonce: u64) -> Vec<u8> {
         format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
     )
     .unwrap();
-    
+
     let now = unix_now();
     let payload = format!(
         "version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={now}\nnonce={nonce}\n"
     );
-    
+
     let signature = signing_key.sign(payload.as_bytes());
     let mut sig_bytes = signature.to_bytes().to_vec();
     format!("{}signature={}\n", payload, hex_encode(&sig_bytes)).into_bytes()
@@ -259,7 +262,10 @@ fn fetcher_dns_zone_applied_updates_bundle_on_disk() {
     std::env::set_var("RUSTYNET_DNS_ZONE_URL", &url);
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
-    assert_eq!(fetcher.fetch_dns_zone(None).unwrap(), FetchDecision::Applied);
+    assert_eq!(
+        fetcher.fetch_dns_zone(None).unwrap(),
+        FetchDecision::Applied
+    );
     assert!(cfg.dns_zone_bundle_path.exists());
     assert!(cfg.dns_zone_watermark_path.exists());
 

@@ -48,6 +48,10 @@ pub struct TraversalEngineConfig {
     pub relay_switch_after_failures: u8,
     pub stun_servers: Vec<SocketAddr>,
     pub stun_gather_timeout_ms: u64,
+    /// How many seconds before expiry to fire a proactive refresh (B3-a).
+    pub pre_expiry_refresh_margin_secs: u64,
+    /// Maximum jitter added to the proactive refresh window (B3-a).
+    pub pre_expiry_jitter_max_secs: u64,
 }
 
 pub const DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES: usize = 8;
@@ -56,6 +60,10 @@ pub const DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 = 3;
 pub const DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = 80;
 pub const DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 = 3;
 pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 = 2_000;
+/// Default: refresh traversal hints 60 s before expiry (B3-a).
+pub const DEFAULT_PRE_EXPIRY_REFRESH_MARGIN_SECS: u64 = 60;
+/// Default: up to 15 s of random jitter on the proactive refresh timer (B3-a).
+pub const DEFAULT_PRE_EXPIRY_JITTER_MAX_SECS: u64 = 15;
 
 impl Default for TraversalEngineConfig {
     fn default() -> Self {
@@ -67,6 +75,8 @@ impl Default for TraversalEngineConfig {
             relay_switch_after_failures: DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
             stun_servers: Vec::new(),
             stun_gather_timeout_ms: DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
+            pre_expiry_refresh_margin_secs: DEFAULT_PRE_EXPIRY_REFRESH_MARGIN_SECS,
+            pre_expiry_jitter_max_secs: DEFAULT_PRE_EXPIRY_JITTER_MAX_SECS,
         }
     }
 }
@@ -182,9 +192,9 @@ impl CandidateGatherer {
                 "stun_gather_timeout_ms must be greater than zero",
             ));
         }
-        local_socket
-            .set_nonblocking(false)
-            .map_err(|err| TraversalError::Stun(format!("failed to configure stun socket: {err}")))?;
+        local_socket.set_nonblocking(false).map_err(|err| {
+            TraversalError::Stun(format!("failed to configure stun socket: {err}"))
+        })?;
         Ok(Self {
             local_socket,
             stun_servers,
@@ -264,10 +274,14 @@ impl CandidateGatherer {
         let request = build_stun_binding_request(transaction_id);
         self.local_socket
             .set_read_timeout(Some(timeout))
-            .map_err(|err| TraversalError::Stun(format!("failed to set stun read timeout: {err}")))?;
+            .map_err(|err| {
+                TraversalError::Stun(format!("failed to set stun read timeout: {err}"))
+            })?;
         self.local_socket
             .set_write_timeout(Some(timeout))
-            .map_err(|err| TraversalError::Stun(format!("failed to set stun write timeout: {err}")))?;
+            .map_err(|err| {
+                TraversalError::Stun(format!("failed to set stun write timeout: {err}"))
+            })?;
         self.local_socket
             .send_to(request.as_slice(), server)
             .map_err(|err| TraversalError::Stun(format!("failed to send stun request: {err}")))?;
@@ -390,7 +404,9 @@ fn parse_stun_xor_mapped_address(
     }
     let cookie = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
     if cookie != STUN_MAGIC_COOKIE {
-        return Err(TraversalError::Stun("stun magic cookie mismatch".to_string()));
+        return Err(TraversalError::Stun(
+            "stun magic cookie mismatch".to_string(),
+        ));
     }
     if message[8..20] != transaction_id {
         return Err(TraversalError::Stun(
@@ -402,7 +418,10 @@ fn parse_stun_xor_mapped_address(
     let mut offset = 20usize;
     while offset.saturating_add(4) <= expected_len {
         let attr_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
-        let attr_len = usize::from(u16::from_be_bytes([message[offset + 2], message[offset + 3]]));
+        let attr_len = usize::from(u16::from_be_bytes([
+            message[offset + 2],
+            message[offset + 3],
+        ]));
         offset = offset.saturating_add(4);
         let attr_end = offset.saturating_add(attr_len);
         if attr_end > expected_len {
@@ -536,17 +555,17 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
         ));
     }
 
-    let version = fields
-        .get("version")
-        .ok_or_else(|| TraversalError::Coordination("coordination payload missing version".to_string()))?;
+    let version = fields.get("version").ok_or_else(|| {
+        TraversalError::Coordination("coordination payload missing version".to_string())
+    })?;
     if version != "1" {
         return Err(TraversalError::Coordination(
             "coordination payload version is unsupported".to_string(),
         ));
     }
-    let payload_type = fields
-        .get("type")
-        .ok_or_else(|| TraversalError::Coordination("coordination payload missing type".to_string()))?;
+    let payload_type = fields.get("type").ok_or_else(|| {
+        TraversalError::Coordination("coordination payload missing type".to_string())
+    })?;
     if payload_type != "traversal_coordination" {
         return Err(TraversalError::Coordination(
             "coordination payload type is unsupported".to_string(),
@@ -576,12 +595,16 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
     let expires_at_unix = parse_u64_field(&fields, "expires_at_unix")?;
     let node_a = fields
         .get("node_a")
-        .ok_or_else(|| TraversalError::Coordination("coordination payload missing node_a".to_string()))?
+        .ok_or_else(|| {
+            TraversalError::Coordination("coordination payload missing node_a".to_string())
+        })?
         .trim()
         .to_string();
     let node_b = fields
         .get("node_b")
-        .ok_or_else(|| TraversalError::Coordination("coordination payload missing node_b".to_string()))?
+        .ok_or_else(|| {
+            TraversalError::Coordination("coordination payload missing node_b".to_string())
+        })?
         .trim()
         .to_string();
     if node_a.is_empty() || node_b.is_empty() {
@@ -600,13 +623,12 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
     })
 }
 
-fn parse_u64_field(
-    fields: &BTreeMap<String, String>,
-    name: &str,
-) -> Result<u64, TraversalError> {
+fn parse_u64_field(fields: &BTreeMap<String, String>, name: &str) -> Result<u64, TraversalError> {
     fields
         .get(name)
-        .ok_or_else(|| TraversalError::Coordination(format!("coordination payload missing {name}")))?
+        .ok_or_else(|| {
+            TraversalError::Coordination(format!("coordination payload missing {name}"))
+        })?
         .parse::<u64>()
         .map_err(|_| TraversalError::Coordination(format!("coordination payload invalid {name}")))
 }
@@ -615,7 +637,10 @@ fn serialize_coordination_payload(payload: &ParsedCoordinationPayload) -> String
     let mut out = String::new();
     out.push_str("version=1\n");
     out.push_str("type=traversal_coordination\n");
-    out.push_str(&format!("session_id={}\n", encode_hex(payload.session_id.as_slice())));
+    out.push_str(&format!(
+        "session_id={}\n",
+        encode_hex(payload.session_id.as_slice())
+    ));
     out.push_str(&format!("probe_start_unix={}\n", payload.probe_start_unix));
     out.push_str(&format!("node_a={}\n", payload.node_a.trim()));
     out.push_str(&format!("node_b={}\n", payload.node_b.trim()));
@@ -977,7 +1002,7 @@ impl TraversalSession {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraversalEngine {
     pub config: TraversalEngineConfig,
 }
@@ -1120,10 +1145,7 @@ impl TraversalEngine {
                 "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
             ));
         }
-        if record
-            .expires_at_unix
-            .saturating_sub(record.issued_at_unix)
-            > MAX_COORDINATION_TTL_SECS
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > MAX_COORDINATION_TTL_SECS
         {
             return Err(TraversalError::Coordination(
                 "coordination ttl exceeds max supported value".to_string(),
@@ -1312,20 +1334,174 @@ fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
     }
 }
 
+// ─── B3-a: Proactive traversal refresh scheduling ────────────────────────────
+
+/// Compute the `Instant` at which a proactive traversal refresh should fire.
+///
+/// The refresh is scheduled at `expires_at − margin + random_jitter`, where
+/// `jitter ∈ [0, jitter_max_secs)`.  If that instant is already in the past
+/// (or within 5 s of now) the function returns `Instant::now() + 5 s` so
+/// the caller fires promptly without a negative-duration panic.
+///
+/// # Arguments
+/// * `expires_at` – the expiry timestamp of the current traversal bundle.
+/// * `margin_secs` – how many seconds before expiry to begin the refresh.
+/// * `jitter_max_secs` – upper bound (exclusive) on random jitter seconds.
+pub fn schedule_proactive_refresh(
+    expires_at: SystemTime,
+    margin_secs: u64,
+    jitter_max_secs: u64,
+) -> Instant {
+    let jitter_secs = if jitter_max_secs > 0 {
+        let mut buf = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        u64::from_le_bytes(buf) % jitter_max_secs
+    } else {
+        0
+    };
+
+    let margin = Duration::from_secs(margin_secs);
+    let jitter = Duration::from_secs(jitter_secs);
+
+    match expires_at.duration_since(SystemTime::now()) {
+        Ok(remaining) if remaining > margin => {
+            // Schedule `remaining − margin + jitter` from now (before expiry).
+            Instant::now() + (remaining - margin) + jitter
+        }
+        _ => {
+            // Already past the margin window — fire very soon.
+            Instant::now() + Duration::from_secs(5)
+        }
+    }
+}
+
+// ─── B2-a: Endpoint mobility monitoring ──────────────────────────────────────
+
+/// An address change detected on an underlay (non-tunnel) interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointChangeEvent {
+    /// The interface whose routable addresses changed.
+    pub interface: String,
+    /// Previous routable addresses (empty if the interface just appeared).
+    pub old_addrs: Vec<IpAddr>,
+    /// Current routable addresses (empty if the interface disappeared).
+    pub new_addrs: Vec<IpAddr>,
+}
+
+/// Poll-based endpoint change detector.
+///
+/// Tracks routable (non-loopback, non-link-local) addresses per underlay
+/// interface.  Interfaces whose names start with a prefix listed in
+/// `ignored_prefixes` are excluded — set this to `["rustynet"]` to prevent
+/// the WireGuard tunnel address from triggering spurious events.
+pub struct EndpointMonitor {
+    last_seen_addrs: BTreeMap<String, Vec<IpAddr>>,
+    ignored_prefixes: Vec<String>,
+}
+
+impl EndpointMonitor {
+    /// Create a new monitor.
+    pub fn new(ignored_prefixes: Vec<String>) -> Self {
+        Self {
+            last_seen_addrs: BTreeMap::new(),
+            ignored_prefixes,
+        }
+    }
+
+    /// Core change-detection logic given the *current* address snapshot.
+    ///
+    /// This method is intentionally `pub` so that tests can inject address
+    /// maps directly without requiring OS calls.  Addresses that are
+    /// loopback, link-local, or unspecified are filtered out.  Returns the
+    /// first change found (one event per call) or `None` if nothing changed.
+    pub fn poll_with_addrs(
+        &mut self,
+        current: BTreeMap<String, Vec<IpAddr>>,
+    ) -> Option<EndpointChangeEvent> {
+        // Apply interface prefix filter and drop non-routable addresses.
+        let current_filtered: BTreeMap<String, Vec<IpAddr>> = current
+            .into_iter()
+            .filter(|(iface, _)| {
+                !self
+                    .ignored_prefixes
+                    .iter()
+                    .any(|pfx| iface.starts_with(pfx.as_str()))
+            })
+            .map(|(iface, addrs)| {
+                let routable: Vec<IpAddr> = addrs
+                    .into_iter()
+                    .filter(|a| is_routable_address(*a))
+                    .collect();
+                (iface, routable)
+            })
+            .filter(|(_, addrs)| !addrs.is_empty())
+            .collect();
+
+        // Detect added or changed interfaces.
+        for (iface, new_addrs) in &current_filtered {
+            let old_addrs = self.last_seen_addrs.get(iface).cloned().unwrap_or_default();
+            if &old_addrs != new_addrs {
+                let event = EndpointChangeEvent {
+                    interface: iface.clone(),
+                    old_addrs,
+                    new_addrs: new_addrs.clone(),
+                };
+                self.last_seen_addrs = current_filtered;
+                return Some(event);
+            }
+        }
+
+        // Detect removed interfaces.
+        let removed: Vec<String> = self
+            .last_seen_addrs
+            .keys()
+            .filter(|k| !current_filtered.contains_key(*k))
+            .cloned()
+            .collect();
+        if let Some(iface) = removed.into_iter().next() {
+            let old_addrs = self.last_seen_addrs.remove(&iface).unwrap_or_default();
+            let event = EndpointChangeEvent {
+                interface: iface,
+                old_addrs,
+                new_addrs: Vec::new(),
+            };
+            self.last_seen_addrs = current_filtered;
+            return Some(event);
+        }
+
+        self.last_seen_addrs = current_filtered;
+        None
+    }
+}
+
+/// Returns `true` for addresses that are globally routable: not loopback,
+/// not link-local, and not unspecified.
+fn is_routable_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                // Reject link-local (fe80::/10).
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule,
-        NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
-        SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter, TraversalCandidate,
-        TraversalDecision, TraversalDecisionReason, TraversalEngine, TraversalEngineConfig,
-        TraversalError, TraversalSession, build_stun_binding_request, direct_udp_viable,
-        parse_stun_xor_mapped_address,
+        EndpointChangeEvent, EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile,
+        PathMode, SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
+        TraversalCandidate, TraversalDecision, TraversalDecisionReason, TraversalEngine,
+        TraversalEngineConfig, TraversalError, TraversalSession, build_stun_binding_request,
+        direct_udp_viable, parse_stun_xor_mapped_address, schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::{
-        ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
-        EnrollmentRequest, TraversalCoordinationRecord,
+        ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
+        EndpointHintCandidateType, EnrollmentRequest, TraversalCoordinationRecord,
     };
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
     use std::collections::BTreeMap;
@@ -1612,9 +1788,9 @@ mod tests {
     // Additional tests for STUN parsing and gather behavior
     #[test]
     fn parse_stun_xor_mapped_address_ipv4_valid() {
-        let transaction_id: [u8; 12] = [1,2,3,4,5,6,7,8,9,10,11,12];
+        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let port: u16 = 51820;
-        let ip = Ipv4Addr::new(203,0,113,5);
+        let ip = Ipv4Addr::new(203, 0, 113, 5);
         let mut message = Vec::new();
         message.extend_from_slice(&0x0101u16.to_be_bytes());
         message.extend_from_slice(&0u16.to_be_bytes());
@@ -1631,10 +1807,13 @@ mod tests {
         let x_port = port ^ port_mask;
         message.extend_from_slice(&x_port.to_be_bytes());
         let ip_bytes = ip.octets();
-        for i in 0..4 { message.push(ip_bytes[i] ^ cookie_bytes[i]); }
+        for i in 0..4 {
+            message.push(ip_bytes[i] ^ cookie_bytes[i]);
+        }
         let declared_len = (message.len() - 20) as u16;
         message[2..4].copy_from_slice(&declared_len.to_be_bytes());
-        let parsed = parse_stun_xor_mapped_address(message.as_slice(), transaction_id).expect("parse");
+        let parsed =
+            parse_stun_xor_mapped_address(message.as_slice(), transaction_id).expect("parse");
         assert_eq!(parsed.port(), port);
         assert_eq!(parsed.ip(), IpAddr::V4(ip));
     }
@@ -1642,24 +1821,28 @@ mod tests {
     #[test]
     fn parse_stun_xor_mapped_address_malformed_rejected() {
         let bad = vec![0u8; 10];
-        let tid = [0u8;12];
+        let tid = [0u8; 12];
         let err = parse_stun_xor_mapped_address(bad.as_slice(), tid).expect_err("malformed");
         assert!(matches!(err, TraversalError::Stun(_)));
     }
 
     #[test]
     fn candidate_gatherer_query_and_timeout_and_filter_and_dedup() {
-        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind local");
+        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind local");
         local.set_nonblocking(false).unwrap();
-        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind server");
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind server");
         let server_addr = server.local_addr().expect("server addr");
         let server_handle = std::thread::spawn(move || {
-            let mut buf = [0u8;1500];
+            let mut buf = [0u8; 1500];
             let (n, src) = server.recv_from(&mut buf).expect("recv");
             let tx = &buf[8..20];
-            let mut txid = [0u8;12]; txid.copy_from_slice(tx);
+            let mut txid = [0u8; 12];
+            txid.copy_from_slice(tx);
             let port = src.port();
-            let ip = match src.ip() { std::net::IpAddr::V4(v4) => v4, _ => Ipv4Addr::LOCALHOST };
+            let ip = match src.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                _ => Ipv4Addr::LOCALHOST,
+            };
             let mut resp = Vec::new();
             resp.extend_from_slice(&0x0101u16.to_be_bytes());
             resp.extend_from_slice(&0u16.to_be_bytes());
@@ -1667,27 +1850,52 @@ mod tests {
             resp.extend_from_slice(&txid);
             resp.extend_from_slice(&0x0020u16.to_be_bytes());
             resp.extend_from_slice(&8u16.to_be_bytes());
-            resp.push(0x00); resp.push(0x01);
+            resp.push(0x00);
+            resp.push(0x01);
             let cookie_bytes = 0x2112_A442u32.to_be_bytes();
             let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
             let x_port = port ^ port_mask;
             resp.extend_from_slice(&x_port.to_be_bytes());
             let ip_bytes = ip.octets();
-            for i in 0..4 { resp.push(ip_bytes[i] ^ cookie_bytes[i]); }
-            let declared_len = (resp.len() - 20) as u16; resp[2..4].copy_from_slice(&declared_len.to_be_bytes());
+            for i in 0..4 {
+                resp.push(ip_bytes[i] ^ cookie_bytes[i]);
+            }
+            let declared_len = (resp.len() - 20) as u16;
+            resp[2..4].copy_from_slice(&declared_len.to_be_bytes());
             server.send_to(&resp, src).expect("send resp");
         });
 
-        let rustynet_if_ips = vec![IpAddr::V4(Ipv4Addr::new(198,51,100,2))];
-        let host_candidates = vec![SocketEndpoint { addr: IpAddr::V4(Ipv4Addr::new(127,0,0,1)), port: 0 }];
-        let gatherer = CandidateGatherer::new(local.try_clone().unwrap(), vec![server_addr], Duration::from_millis(500), host_candidates.clone(), rustynet_if_ips.clone()).expect("gatherer");
+        let rustynet_if_ips = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))];
+        let host_candidates = vec![SocketEndpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            port: 0,
+        }];
+        let gatherer = CandidateGatherer::new(
+            local.try_clone().unwrap(),
+            vec![server_addr],
+            Duration::from_millis(500),
+            host_candidates.clone(),
+            rustynet_if_ips.clone(),
+        )
+        .expect("gatherer");
         let candidates = gatherer.gather();
         assert!(candidates.iter().any(|c| c.source == CandidateSource::Host));
-        assert!(candidates.iter().any(|c| c.source == CandidateSource::ServerReflexive));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.source == CandidateSource::ServerReflexive)
+        );
         server_handle.join().expect("join");
 
-        let local2 = UdpSocket::bind((Ipv4Addr::LOCALHOST,0)).expect("bind2");
-        let gatherer_timeout = CandidateGatherer::new(local2.try_clone().unwrap(), vec![(Ipv4Addr::LOCALHOST,9).into()], Duration::from_millis(10), host_candidates, rustynet_if_ips).expect("gatherer2");
+        let local2 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind2");
+        let gatherer_timeout = CandidateGatherer::new(
+            local2.try_clone().unwrap(),
+            vec![(Ipv4Addr::LOCALHOST, 9).into()],
+            Duration::from_millis(10),
+            host_candidates,
+            rustynet_if_ips,
+        )
+        .expect("gatherer2");
         let results = gatherer_timeout.gather();
         assert!(results.iter().all(|c| c.source == CandidateSource::Host));
     }
@@ -1695,41 +1903,444 @@ mod tests {
     #[test]
     fn coordination_record_validation_and_execute_simultaneous_open_behaviour() {
         let policy = PolicySet::default();
-        let core = ControlPlaneCore::new(vec![0u8;32], policy);
-        let node_a = rustynet_control::NodeMetadata { node_id: "node-a".to_string(), hostname: "a".to_string(), os: "linux".to_string(), tags: vec![], owner: "owner-a".to_string(), endpoint: "127.0.0.1:51820".to_string(), last_seen_unix: 1, public_key: [1u8;32] };
-        let node_b = rustynet_control::NodeMetadata { node_id: "node-b".to_string(), hostname: "b".to_string(), os: "linux".to_string(), tags: vec![], owner: "owner-b".to_string(), endpoint: "127.0.0.1:51821".to_string(), last_seen_unix: 1, public_key: [2u8;32] };
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        let node_a = rustynet_control::NodeMetadata {
+            node_id: "node-a".to_string(),
+            hostname: "a".to_string(),
+            os: "linux".to_string(),
+            tags: vec![],
+            owner: "owner-a".to_string(),
+            endpoint: "127.0.0.1:51820".to_string(),
+            last_seen_unix: 1,
+            public_key: [1u8; 32],
+        };
+        let node_b = rustynet_control::NodeMetadata {
+            node_id: "node-b".to_string(),
+            hostname: "b".to_string(),
+            os: "linux".to_string(),
+            tags: vec![],
+            owner: "owner-b".to_string(),
+            endpoint: "127.0.0.1:51821".to_string(),
+            last_seen_unix: 1,
+            public_key: [2u8; 32],
+        };
         core.nodes.upsert(node_a).expect("upsert a");
         core.nodes.upsert(node_b).expect("upsert b");
 
-        let mut session_id = [0u8;16]; session_id[0]=1;
-        let mut nonce = [0u8;16]; nonce[0]=7;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let record = TraversalCoordinationRecord { session_id, probe_start_unix: now.saturating_add(1), node_a: "node-a".to_string(), node_b: "node-b".to_string(), issued_at_unix: now, expires_at_unix: now.saturating_add(20), nonce };
-        let signed = core.signed_traversal_coordination_record(record.clone()).expect("sign");
+        let mut session_id = [0u8; 16];
+        session_id[0] = 1;
+        let mut nonce = [0u8; 16];
+        nonce[0] = 7;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = TraversalCoordinationRecord {
+            session_id,
+            probe_start_unix: now.saturating_add(1),
+            node_a: "node-a".to_string(),
+            node_b: "node-b".to_string(),
+            issued_at_unix: now,
+            expires_at_unix: now.saturating_add(20),
+            nonce,
+        };
+        let signed = core
+            .signed_traversal_coordination_record(record.clone())
+            .expect("sign");
 
         let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
         let mut replay = CoordinationReplayWindow::default();
 
-        let schedule = engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay, now).expect("validate");
+        let schedule = engine
+            .validate_signed_coordination_record(
+                &signed,
+                &NodeId::new("node-a").unwrap(),
+                &NodeId::new("node-b").unwrap(),
+                &core.endpoint_hint_verifying_key,
+                &mut replay,
+                now,
+            )
+            .expect("validate");
         assert!(schedule.wait_duration.as_secs() <= 10);
 
         let mut replay2 = CoordinationReplayWindow::default();
-        engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay2, now).expect("first");
-        let replay_err = engine.validate_signed_coordination_record(&signed, &NodeId::new("node-a").unwrap(), &NodeId::new("node-b").unwrap(), &core.endpoint_hint_verifying_key, &mut replay2, now+1);
-        assert!(matches!(replay_err, Err(TraversalError::CoordinationReplayDetected)));
+        engine
+            .validate_signed_coordination_record(
+                &signed,
+                &NodeId::new("node-a").unwrap(),
+                &NodeId::new("node-b").unwrap(),
+                &core.endpoint_hint_verifying_key,
+                &mut replay2,
+                now,
+            )
+            .expect("first");
+        let replay_err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-b").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay2,
+            now + 1,
+        );
+        assert!(matches!(
+            replay_err,
+            Err(TraversalError::CoordinationReplayDetected)
+        ));
 
-        struct NoHandshakeRuntime { latest: Option<u64>, sent: Vec<SocketEndpoint> }
-        impl SimultaneousOpenRuntime for NoHandshakeRuntime {
-            fn send_probe(&mut self, endpoint: SocketEndpoint, _round: u8) -> Result<(), TraversalError> { self.sent.push(endpoint); Ok(()) }
-            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> { Ok(self.latest) }
+        struct NoHandshakeRuntime {
+            latest: Option<u64>,
+            sent: Vec<SocketEndpoint>,
         }
-        struct ImmediateWaiter; impl SimultaneousOpenWaiter for ImmediateWaiter { fn wait(&mut self, _d: Duration) {} }
+        impl SimultaneousOpenRuntime for NoHandshakeRuntime {
+            fn send_probe(
+                &mut self,
+                endpoint: SocketEndpoint,
+                _round: u8,
+            ) -> Result<(), TraversalError> {
+                self.sent.push(endpoint);
+                Ok(())
+            }
+            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
+                Ok(self.latest)
+            }
+        }
+        struct ImmediateWaiter;
+        impl SimultaneousOpenWaiter for ImmediateWaiter {
+            fn wait(&mut self, _d: Duration) {}
+        }
 
-        let direct_candidates = vec![ candidate([10,0,0,1],51820,CandidateSource::Host,900) ];
-        let mut runtime = NoHandshakeRuntime { latest: None, sent: Vec::new() };
+        let direct_candidates = vec![candidate([10, 0, 0, 1], 51820, CandidateSource::Host, 900)];
+        let mut runtime = NoHandshakeRuntime {
+            latest: None,
+            sent: Vec::new(),
+        };
         let mut waiter = ImmediateWaiter;
-        let schedule2 = CoordinationSchedule { session_id, nonce, probe_start_unix: now, wait_duration: Duration::from_secs(0) };
-        let result = engine.execute_simultaneous_open(&mut runtime, &mut waiter, schedule2, direct_candidates.as_slice(), Some(SocketEndpoint { addr: IpAddr::V4(Ipv4Addr::new(198,51,100,2)), port: 60000 }), now, 120).expect("exec");
-        match result.decision { TraversalDecision::Relay { endpoint: _, reason, rounds } => { assert_eq!(reason, TraversalDecisionReason::DirectProbeExhaustedRelayArmed); assert_eq!(rounds, engine.config.simultaneous_open_rounds); }, _ => panic!("expected relay") }
+        let schedule2 = CoordinationSchedule {
+            session_id,
+            nonce,
+            probe_start_unix: now,
+            wait_duration: Duration::from_secs(0),
+        };
+        let result = engine
+            .execute_simultaneous_open(
+                &mut runtime,
+                &mut waiter,
+                schedule2,
+                direct_candidates.as_slice(),
+                Some(SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+                    port: 60000,
+                }),
+                now,
+                120,
+            )
+            .expect("exec");
+        match result.decision {
+            TraversalDecision::Relay {
+                endpoint: _,
+                reason,
+                rounds,
+            } => {
+                assert_eq!(
+                    reason,
+                    TraversalDecisionReason::DirectProbeExhaustedRelayArmed
+                );
+                assert_eq!(rounds, engine.config.simultaneous_open_rounds);
+            }
+            _ => panic!("expected relay"),
+        }
+    }
+
+    // ── A4: Adversarial traversal hardening tests ─────────────────────────
+
+    /// A4: A coordination record with an invalid (forged) signature must be
+    /// rejected.  The daemon must not switch paths based on forged records.
+    #[test]
+    fn test_a4_forged_signature_coordination_record_rejected() {
+        use rustynet_control::{ControlPlaneCore, PolicySet};
+        let policy = PolicySet::default();
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = TraversalCoordinationRecord {
+            session_id: [1u8; 16],
+            probe_start_unix: now + 2,
+            node_a: "node-a".to_string(),
+            node_b: "node-b".to_string(),
+            issued_at_unix: now,
+            expires_at_unix: now + 20,
+            nonce: [9u8; 16],
+        };
+        let mut signed = core
+            .signed_traversal_coordination_record(record)
+            .expect("sign");
+        // Corrupt the signature bytes.
+        signed.signature[0] ^= 0xff;
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+        let err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-b").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay,
+            now,
+        );
+        assert!(
+            matches!(err, Err(TraversalError::CoordinationSignatureInvalid)),
+            "forged signature must be rejected: {err:?}"
+        );
+    }
+
+    /// A4: A replayed coordination record (nonce already seen) must be
+    /// rejected even when the signature is valid.
+    #[test]
+    fn test_a4_replayed_coordination_record_rejected() {
+        use rustynet_control::{ControlPlaneCore, PolicySet};
+        let policy = PolicySet::default();
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = TraversalCoordinationRecord {
+            session_id: [2u8; 16],
+            probe_start_unix: now + 1,
+            node_a: "node-a".to_string(),
+            node_b: "node-b".to_string(),
+            issued_at_unix: now,
+            expires_at_unix: now + 20,
+            nonce: [0xab; 16],
+        };
+        let signed = core
+            .signed_traversal_coordination_record(record)
+            .expect("sign");
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+
+        // First use: valid.
+        engine
+            .validate_signed_coordination_record(
+                &signed,
+                &NodeId::new("node-a").unwrap(),
+                &NodeId::new("node-b").unwrap(),
+                &core.endpoint_hint_verifying_key,
+                &mut replay,
+                now,
+            )
+            .expect("first use should succeed");
+
+        // Second use with the same nonce: replay must be detected.
+        let err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-b").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay,
+            now + 1,
+        );
+        assert!(
+            matches!(err, Err(TraversalError::CoordinationReplayDetected)),
+            "replayed nonce must be rejected: {err:?}"
+        );
+    }
+
+    /// A4: Candidate count exceeding `max_candidates` must be rejected; the
+    /// engine must never panic or allocate unboundedly on a flooded input.
+    #[test]
+    fn test_a4_candidate_flooding_rejected_no_panic() {
+        let engine = TraversalEngine::new(TraversalEngineConfig {
+            max_candidates: 4,
+            ..TraversalEngineConfig::default()
+        })
+        .expect("engine");
+
+        // Build MAX_CANDIDATES + 2 candidates (a flood).
+        let flooded: Vec<TraversalCandidate> = (0u16..6)
+            .map(|i| candidate([10, 0, 0, i as u8 + 1], 51820, CandidateSource::Host, 900))
+            .collect();
+        let remote = vec![candidate([10, 0, 1, 1], 51820, CandidateSource::Host, 900)];
+
+        let err = engine.plan_direct_probes(flooded.as_slice(), remote.as_slice());
+        assert!(
+            matches!(
+                err,
+                Err(TraversalError::CandidateCountExceeded { side: "local", .. })
+            ),
+            "flooded candidates must be rejected: {err:?}"
+        );
+    }
+
+    // ── B3-a: Proactive refresh scheduling tests ──────────────────────────
+
+    /// B3-a: The proactive refresh instant must be *before* `expires_at`.
+    #[test]
+    fn test_b3a_schedule_proactive_refresh_fires_before_expiry() {
+        let expires_at = SystemTime::now() + Duration::from_secs(300);
+        let instant = schedule_proactive_refresh(expires_at, 60, 0);
+        // The instant must be strictly before the expiry time (converted to
+        // SystemTime for comparison).
+        let remaining = expires_at
+            .duration_since(SystemTime::now())
+            .expect("expiry should be in the future");
+        let scheduled_from_now = instant.duration_since(Instant::now());
+        // scheduled_from_now should be < remaining (fires before expiry)
+        assert!(
+            scheduled_from_now < remaining,
+            "refresh must fire before expiry: scheduled={scheduled_from_now:?} remaining={remaining:?}"
+        );
+    }
+
+    /// B3-a: Jitter must be within `[0, jitter_max_secs)`.
+    #[test]
+    fn test_b3a_schedule_proactive_refresh_jitter_bounded() {
+        let expires_at = SystemTime::now() + Duration::from_secs(300);
+        let margin_secs = 60u64;
+        let jitter_max = 15u64;
+
+        // Run many times and verify jitter never exceeds the bound.
+        for _ in 0..200 {
+            let instant = schedule_proactive_refresh(expires_at, margin_secs, jitter_max);
+            let scheduled_from_now = instant.duration_since(Instant::now());
+            // Maximum: remaining - margin + (jitter_max - 1)
+            // = 300 - 60 + 14 = 254 s
+            // Minimum: remaining - margin + 0 = 240 s
+            assert!(
+                scheduled_from_now <= Duration::from_secs(300 - margin_secs + jitter_max),
+                "jitter exceeded bound: {scheduled_from_now:?}"
+            );
+            assert!(
+                scheduled_from_now >= Duration::from_secs(300u64.saturating_sub(margin_secs + 1)),
+                "scheduled too early: {scheduled_from_now:?}"
+            );
+        }
+    }
+
+    /// B3-a: When `expires_at` is already past the margin (or in the past),
+    /// the function must return a near-future instant (~5 s), never panic.
+    #[test]
+    fn test_b3a_schedule_proactive_refresh_past_expiry_fires_soon() {
+        // expiry = now + 30s, margin = 60s → already past margin window
+        let expires_at = SystemTime::now() + Duration::from_secs(30);
+        let instant = schedule_proactive_refresh(expires_at, 60, 0);
+        let scheduled_from_now = instant.duration_since(Instant::now());
+        assert!(
+            scheduled_from_now <= Duration::from_secs(10),
+            "past-margin expiry should fire soon: {scheduled_from_now:?}"
+        );
+    }
+
+    // ── B2-a: EndpointMonitor unit tests ──────────────────────────────────
+
+    fn addr_map(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<IpAddr>> {
+        entries
+            .iter()
+            .map(|(iface, addrs)| {
+                (
+                    iface.to_string(),
+                    addrs.iter().map(|a| a.parse().unwrap()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// B2-a: An address appearing on an interface emits a change event with
+    /// the correct old/new address sets.
+    #[test]
+    fn test_b2a_interface_address_added_emits_event() {
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+
+        // Baseline: no addresses seen yet → no event.
+        let initial = addr_map(&[("eth0", &["192.0.2.1"])]);
+        let event = monitor.poll_with_addrs(initial);
+        assert!(
+            event.is_some(),
+            "first poll with new address should emit event"
+        );
+        let ev = event.unwrap();
+        assert_eq!(ev.interface, "eth0");
+        assert!(ev.old_addrs.is_empty());
+        assert_eq!(ev.new_addrs, vec!["192.0.2.1".parse::<IpAddr>().unwrap()]);
+
+        // Same address, second poll → no event.
+        let same = addr_map(&[("eth0", &["192.0.2.1"])]);
+        assert!(monitor.poll_with_addrs(same).is_none());
+
+        // Address changes → event with old and new.
+        let changed = addr_map(&[("eth0", &["192.0.2.2"])]);
+        let ev2 = monitor
+            .poll_with_addrs(changed)
+            .expect("changed address must emit event");
+        assert_eq!(ev2.old_addrs, vec!["192.0.2.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ev2.new_addrs, vec!["192.0.2.2".parse::<IpAddr>().unwrap()]);
+    }
+
+    /// B2-a: When an interface loses all its addresses, the monitor emits an
+    /// event with an empty `new_addrs` (interface went down).
+    #[test]
+    fn test_b2a_interface_down_emits_event() {
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+
+        // Establish baseline.
+        monitor.poll_with_addrs(addr_map(&[("eth0", &["198.51.100.5"])]));
+
+        // Interface disappears (no routable addrs → filtered out).
+        let gone = BTreeMap::new();
+        let ev = monitor
+            .poll_with_addrs(gone)
+            .expect("interface removal must emit event");
+        assert_eq!(ev.interface, "eth0");
+        assert_eq!(
+            ev.old_addrs,
+            vec!["198.51.100.5".parse::<IpAddr>().unwrap()]
+        );
+        assert!(ev.new_addrs.is_empty());
+    }
+
+    /// B2-a: Address changes on the WireGuard tunnel interface (`rustynet0`)
+    /// must be silently ignored — they are not underlay mobility events.
+    #[test]
+    fn test_b2a_rustynet_interface_changes_ignored() {
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+
+        // Only the tunnel interface changes.
+        let tunnel_only = addr_map(&[("rustynet0", &["10.100.0.1"])]);
+        assert!(
+            monitor.poll_with_addrs(tunnel_only).is_none(),
+            "rustynet0 address change must not emit an event"
+        );
+    }
+
+    /// B2-a: Loopback and link-local addresses must not trigger events.
+    #[test]
+    fn test_b2a_loopback_and_link_local_ignored() {
+        let mut monitor = EndpointMonitor::new(vec![]);
+
+        // Loopback addresses are not routable.
+        let lo = addr_map(&[("lo", &["127.0.0.1", "::1"])]);
+        assert!(
+            monitor.poll_with_addrs(lo).is_none(),
+            "loopback addresses must be ignored"
+        );
+
+        // Link-local IPv4.
+        let link_local = addr_map(&[("eth0", &["169.254.1.2"])]);
+        assert!(
+            monitor.poll_with_addrs(link_local).is_none(),
+            "link-local IPv4 must be ignored"
+        );
+
+        // Link-local IPv6 (fe80::1).
+        let link_local6 = addr_map(&[("eth0", &["fe80::1"])]);
+        assert!(
+            monitor.poll_with_addrs(link_local6).is_none(),
+            "link-local IPv6 must be ignored"
+        );
     }
 }

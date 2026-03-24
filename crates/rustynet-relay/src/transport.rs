@@ -10,7 +10,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
-use rand::RngCore;
 use rustynet_control::RelaySessionToken;
 use subtle::ConstantTimeEq;
 
@@ -634,7 +633,6 @@ mod tests {
 
     #[test]
     fn test_idle_session_cleanup() {
-        use std::thread;
         use std::time::Duration;
 
         let (signing_key, verifying_key) = make_test_keypair();

@@ -12,8 +12,6 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rustynet_control::RelaySessionToken;
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub enum FetchError {
@@ -45,7 +43,11 @@ pub struct StateFetcher {
 }
 
 impl StateFetcher {
-    pub fn new(control_endpoint: String, watermark_path: impl AsRef<Path>, verifying_key: VerifyingKey) -> Result<Self, String> {
+    pub fn new(
+        control_endpoint: String,
+        watermark_path: impl AsRef<Path>,
+        verifying_key: VerifyingKey,
+    ) -> Result<Self, String> {
         let watermark_store = WatermarkStore::new(watermark_path)?;
         Ok(Self {
             control_endpoint,
@@ -73,12 +75,12 @@ impl StateFetcher {
     fn fetch_bundle(&mut self, bundle_type: &str) -> Result<SignedBundle, FetchError> {
         // Step 1: Perform HTTP GET with mTLS client auth
         // For now, simulate fetch (in production would use reqwest with mTLS)
-        let response_bytes = self
-            .http_get_raw(&format!("{}/{}", self.control_endpoint, bundle_type))?;
+        let response_bytes =
+            self.http_get_raw(&format!("{}/{}", self.control_endpoint, bundle_type))?;
 
         // Step 2: Parse response into signed bundle
-        let bundle = SignedBundle::parse(&response_bytes)
-            .map_err(|e| FetchError::InvalidResponse(e))?;
+        let bundle =
+            SignedBundle::parse(&response_bytes).map_err(|e| FetchError::InvalidResponse(e))?;
 
         // Step 3: Verify signature (fail → SignatureInvalid, watermark NOT advanced)
         self.verify_signature(&bundle)
@@ -100,11 +102,15 @@ impl StateFetcher {
         // Minimal HTTP/1.1 GET implementation using std::net::TcpStream
         let url = url.trim();
         if !url.starts_with("http://") {
-            return Err(FetchError::Network("only http:// URLs are supported in this minimal fetcher".to_string()));
+            return Err(FetchError::Network(
+                "only http:// URLs are supported in this minimal fetcher".to_string(),
+            ));
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
-        let host_port = parts.get(0).ok_or_else(|| FetchError::Network("invalid url".to_string()))?;
+        let host_port = parts
+            .get(0)
+            .ok_or_else(|| FetchError::Network("invalid url".to_string()))?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
         let mut port = 80u16;
@@ -112,31 +118,48 @@ impl StateFetcher {
             let mut hp = host_port.splitn(2, ':');
             host = hp.next().unwrap_or("").to_string();
             if let Some(p) = hp.next() {
-                port = p.parse::<u16>().map_err(|_| FetchError::Network("invalid port in url".to_string()))?;
+                port = p
+                    .parse::<u16>()
+                    .map_err(|_| FetchError::Network("invalid port in url".to_string()))?;
             }
         }
         let addr = format!("{}:{}", host, port);
-        
-        let socket_addrs = addr.to_socket_addrs().map_err(|e| FetchError::Network(format!("resolve failed: {e}")))?;
+
+        let socket_addrs = addr
+            .to_socket_addrs()
+            .map_err(|e| FetchError::Network(format!("resolve failed: {e}")))?;
         let mut stream = match socket_addrs.into_iter().next() {
-             Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(3))
-                 .map_err(|_| FetchError::Network("network unreachable".to_string()))?,
-             None => return Err(FetchError::Network("resolve returned no addresses".to_string())),
+            Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(3))
+                .map_err(|_| FetchError::Network("network unreachable".to_string()))?,
+            None => {
+                return Err(FetchError::Network(
+                    "resolve returned no addresses".to_string(),
+                ));
+            }
         };
-        
+
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        
-        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
-        stream.write_all(request.as_bytes()).map_err(|e| FetchError::Network(format!("write failed: {e}")))?;
-        
+
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            path, host
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| FetchError::Network(format!("write failed: {e}")))?;
+
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).map_err(|e| FetchError::Network(format!("read failed: {e}")))?;
-        
+        stream
+            .read_to_end(&mut buf)
+            .map_err(|e| FetchError::Network(format!("read failed: {e}")))?;
+
         if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-             Ok(buf.split_off(idx + 4))
+            Ok(buf.split_off(idx + 4))
         } else {
-             Err(FetchError::InvalidResponse("malformed http response".to_string()))
+            Err(FetchError::InvalidResponse(
+                "malformed http response".to_string(),
+            ))
         }
     }
 
@@ -175,41 +198,42 @@ pub struct SignedBundle {
 
 impl SignedBundle {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let text = std::str::from_utf8(bytes).map_err(|_| "bundle is not valid utf8".to_string())?;
-        
+        let text =
+            std::str::from_utf8(bytes).map_err(|_| "bundle is not valid utf8".to_string())?;
+
         let sig_marker = "signature=";
         let mut signature_bytes = [0u8; 64];
         let mut found_sig = false;
-        
+
         let mut issued_at_unix = 0;
         let mut expires_at_unix = 0;
         let mut watermark = 0;
-        
+
         for line in text.lines() {
-             if let Some(rest) = line.strip_prefix(sig_marker) {
-                 let hex_str = rest.trim();
-                 let decoded = hex_decode(hex_str)?;
-                 if decoded.len() != 64 {
-                     return Err("invalid signature length".to_string());
-                 }
-                 signature_bytes.copy_from_slice(&decoded);
-                 found_sig = true;
-             } else if let Some(rest) = line.strip_prefix("generated_at_unix=") {
-                 issued_at_unix = rest.trim().parse().unwrap_or(0);
-             } else if let Some(rest) = line.strip_prefix("expires_at_unix=") {
-                 expires_at_unix = rest.trim().parse().unwrap_or(0);
-             } else if let Some(rest) = line.strip_prefix("nonce=") {
-                 watermark = rest.trim().parse().unwrap_or(0);
-             }
+            if let Some(rest) = line.strip_prefix(sig_marker) {
+                let hex_str = rest.trim();
+                let decoded = hex_decode(hex_str)?;
+                if decoded.len() != 64 {
+                    return Err("invalid signature length".to_string());
+                }
+                signature_bytes.copy_from_slice(&decoded);
+                found_sig = true;
+            } else if let Some(rest) = line.strip_prefix("generated_at_unix=") {
+                issued_at_unix = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("expires_at_unix=") {
+                expires_at_unix = rest.trim().parse().unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("nonce=") {
+                watermark = rest.trim().parse().unwrap_or(0);
+            }
         }
-        
+
         if !found_sig {
             return Err("missing signature".to_string());
         }
-        
+
         let sig_idx = text.rfind(sig_marker).ok_or("signature marker missing")?;
         let payload = text[..sig_idx].to_string();
-        
+
         Ok(Self {
             payload,
             signature: signature_bytes,
@@ -259,8 +283,8 @@ impl WatermarkStore {
     }
 
     fn load_from_disk(path: &Path) -> Result<std::collections::HashMap<String, u64>, String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("failed to read watermark store: {e}"))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("failed to read watermark store: {e}"))?;
 
         let mut watermarks = std::collections::HashMap::new();
         for line in content.lines() {
@@ -467,7 +491,7 @@ mod tests {
     fn test_fetch_bundle_signature_invalid() {
         let (signing_key, verifying_key) = make_test_keypair();
         let wrong_key = SigningKey::from_bytes(&[2u8; 32]);
-        
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
@@ -476,21 +500,32 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let expires = now + 300;
-            let payload = format!("version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=100\n", now, expires);
+            let payload = format!(
+                "version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=100\n",
+                now, expires
+            );
             let signature = wrong_key.sign(payload.as_bytes());
-            let body = format!("{}signature={}\n", payload, hex_encode(&signature.to_bytes()));
+            let body = format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            );
             let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
             stream.write_all(response.as_bytes()).unwrap();
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let mut fetcher = StateFetcher::new(url, dir.path().join("watermark"), verifying_key).unwrap();
-        
+        let mut fetcher =
+            StateFetcher::new(url, dir.path().join("watermark"), verifying_key).unwrap();
+
         match fetcher.fetch_trust() {
-            Err(FetchError::SignatureInvalid(_)) => {},
+            Err(FetchError::SignatureInvalid(_)) => {}
             res => panic!("expected SignatureInvalid, got {:?}", res),
         }
         handle.join().unwrap();
@@ -499,7 +534,7 @@ mod tests {
     #[test]
     fn test_fetch_bundle_watermark_replay() {
         let (signing_key, verifying_key) = make_test_keypair();
-        
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
@@ -508,12 +543,22 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let expires = now + 300;
-            let payload = format!("version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=400\n", now, expires);
+            let payload = format!(
+                "version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=400\n",
+                now, expires
+            );
             let signature = signing_key.sign(payload.as_bytes());
-            let body = format!("{}signature={}\n", payload, hex_encode(&signature.to_bytes()));
+            let body = format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            );
             let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
             stream.write_all(response.as_bytes()).unwrap();
         });
@@ -524,11 +569,11 @@ mod tests {
             let mut store = WatermarkStore::new(&watermark_path).unwrap();
             store.advance("trust", 500).unwrap();
         }
-        
+
         let mut fetcher = StateFetcher::new(url, watermark_path, verifying_key).unwrap();
-        
+
         match fetcher.fetch_trust() {
-            Err(FetchError::WatermarkRejected(_)) => {},
+            Err(FetchError::WatermarkRejected(_)) => {}
             res => panic!("expected WatermarkRejected, got {:?}", res),
         }
         handle.join().unwrap();
@@ -537,7 +582,7 @@ mod tests {
     #[test]
     fn test_fetch_bundle_stale() {
         let (signing_key, verifying_key) = make_test_keypair();
-        
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{}", addr);
@@ -546,21 +591,33 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let expires = now - 100; 
-            let payload = format!("version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=600\n", now - 200, expires);
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let expires = now - 100;
+            let payload = format!(
+                "version=1\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=600\n",
+                now - 200,
+                expires
+            );
             let signature = signing_key.sign(payload.as_bytes());
-            let body = format!("{}signature={}\n", payload, hex_encode(&signature.to_bytes()));
+            let body = format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            );
             let response = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
             stream.write_all(response.as_bytes()).unwrap();
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let mut fetcher = StateFetcher::new(url, dir.path().join("watermark"), verifying_key).unwrap();
-        
+        let mut fetcher =
+            StateFetcher::new(url, dir.path().join("watermark"), verifying_key).unwrap();
+
         match fetcher.fetch_trust() {
-            Err(FetchError::Stale(_)) => {},
+            Err(FetchError::Stale(_)) => {}
             res => panic!("expected Stale, got {:?}", res),
         }
         handle.join().unwrap();
@@ -571,17 +628,18 @@ mod tests {
         let (signing_key, verifying_key) = make_test_keypair();
         let dir = tempfile::tempdir().unwrap();
         let watermark_path = dir.path().join("watermark");
-        
+
         // Use a port that is unlikely to be listening (e.g. 1) or just an invalid address?
         // 127.0.0.1:9 is good (discard protocol), or just a random high port.
         // But 127.0.0.1:9 might be blocked or filtered differently.
         // Use a random port that we don't bind.
-        let url = "http://127.0.0.1:54321"; 
-        
-        let mut fetcher = StateFetcher::new(url.to_string(), watermark_path, verifying_key).unwrap();
-        
+        let url = "http://127.0.0.1:54321";
+
+        let mut fetcher =
+            StateFetcher::new(url.to_string(), watermark_path, verifying_key).unwrap();
+
         match fetcher.fetch_trust() {
-            Err(FetchError::Network(_)) => {},
+            Err(FetchError::Network(_)) => {}
             res => panic!("expected Network error, got {:?}", res),
         }
     }
