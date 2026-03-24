@@ -4986,4 +4986,229 @@ mod tests {
             "revoked peer must be removed from managed_peers immediately"
         );
     }
+
+    // ── A4-b: Path Transition ACL Preservation ─────────────────────────────
+    //
+    // These tests verify that the kill-switch is re-asserted on every
+    // direct↔relay path transition.  The invariant: `assert_killswitch` must
+    // appear in `DryRunSystem::operations` after each committed path change —
+    // the ACL rule set must never be in a more-permissive state after a
+    // transition than it was before.
+
+    /// Helper: build a Phase10Controller in DataplaneApplied state with one
+    /// managed peer (node-b) that has both direct and relay endpoints
+    /// configured.  Stability windows are set to 0 so the second consecutive
+    /// call to `consider_path_change_for_peer` always commits immediately.
+    fn make_a4b_controller_with_both_endpoints() -> (
+        Phase10Controller<RecordingBackend, DryRunSystem>,
+        NodeId,
+        SocketEndpoint,
+        SocketEndpoint,
+    ) {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        // Zero-length stability windows allow the second call to commit.
+        controller.set_stability_windows(0, 0);
+
+        let peer_id = NodeId::new("node-b").expect("node id");
+        let direct_endpoint = SocketEndpoint {
+            addr: "198.51.100.55".parse::<IpAddr>().expect("ip"),
+            port: 51820,
+        };
+        let relay_endpoint = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip"),
+            port: 443,
+        };
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    local_node: NodeId::new("node-a").expect("node"),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    local_cidr: "100.64.0.1/32".to_string(),
+                },
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .configure_traversal_paths(&peer_id, Some(direct_endpoint), Some(relay_endpoint))
+            .expect("traversal endpoints should configure");
+
+        (controller, peer_id, direct_endpoint, relay_endpoint)
+    }
+
+    #[test]
+    fn test_a4b_direct_to_relay_transition_asserts_killswitch() {
+        let (mut controller, peer_id, _direct_ep, _relay_ep) =
+            make_a4b_controller_with_both_endpoints();
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+
+        // Snapshot operations before transition.
+        let ops_before = controller.system.operations.len();
+
+        // Two consecutive calls commit the path change (stability window = 0 ms).
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("first signal starts pending");
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("second signal commits relay path");
+
+        assert_eq!(
+            controller.peer_path(&peer_id),
+            Some(PathMode::Relay),
+            "path must be Relay after committed failover"
+        );
+
+        // ACL invariant: assert_killswitch must appear after the transition.
+        let new_ops = &controller.system.operations[ops_before..];
+        assert!(
+            new_ops.contains(&"assert_killswitch".to_string()),
+            "assert_killswitch must be called during direct→relay transition; ops={new_ops:?}"
+        );
+
+        // DataplaneState must remain applied (never FailClosed) during transition.
+        assert_ne!(
+            controller.state(),
+            DataplaneState::FailClosed,
+            "ACL transition must not push state to FailClosed"
+        );
+    }
+
+    #[test]
+    fn test_a4b_relay_to_direct_transition_asserts_killswitch() {
+        let (mut controller, peer_id, _direct_ep, _relay_ep) =
+            make_a4b_controller_with_both_endpoints();
+
+        // First move to relay.
+        controller.mark_direct_failed(&peer_id).expect("pending");
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("commit relay");
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
+
+        let ops_before = controller.system.operations.len();
+
+        // Now recover back to direct.
+        controller
+            .mark_direct_recovered(&peer_id)
+            .expect("pending recovery");
+        controller
+            .mark_direct_recovered(&peer_id)
+            .expect("commit direct");
+
+        assert_eq!(
+            controller.peer_path(&peer_id),
+            Some(PathMode::Direct),
+            "path must be Direct after committed recovery"
+        );
+
+        // ACL invariant: assert_killswitch must be called on relay→direct too.
+        let new_ops = &controller.system.operations[ops_before..];
+        assert!(
+            new_ops.contains(&"assert_killswitch".to_string()),
+            "assert_killswitch must be called during relay→direct transition; ops={new_ops:?}"
+        );
+
+        assert_ne!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    #[test]
+    fn test_a4b_acl_operations_are_present_throughout_full_path_cycle() {
+        let (mut controller, peer_id, _direct_ep, _relay_ep) =
+            make_a4b_controller_with_both_endpoints();
+
+        // The initial apply must include apply_firewall_killswitch.
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"apply_firewall_killswitch".to_string()),
+            "apply_firewall_killswitch must be called during initial generation apply"
+        );
+
+        // Direct → Relay.
+        controller.mark_direct_failed(&peer_id).expect("pending");
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("commit relay");
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"assert_killswitch".to_string()),
+            "assert_killswitch must appear after first path transition"
+        );
+
+        // Relay → Direct.
+        let ks_count_after_first = controller
+            .system
+            .operations
+            .iter()
+            .filter(|op| *op == "assert_killswitch")
+            .count();
+        controller.mark_direct_recovered(&peer_id).expect("pending");
+        controller
+            .mark_direct_recovered(&peer_id)
+            .expect("commit direct");
+        let ks_count_after_second = controller
+            .system
+            .operations
+            .iter()
+            .filter(|op| *op == "assert_killswitch")
+            .count();
+
+        assert!(
+            ks_count_after_second > ks_count_after_first,
+            "assert_killswitch call count must increase on relay→direct transition"
+        );
+        assert_ne!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    #[test]
+    fn test_a4b_force_fail_closed_overrides_pending_path_transition() {
+        // Even when a path transition is in pending (hysteresis) state,
+        // force_fail_closed must immediately move the system to FailClosed.
+        // This ensures ACL rules can never be left in a partially-transitioned
+        // state — the daemon's emergency shutdown path always wins.
+        let (mut controller, peer_id, _direct_ep, _relay_ep) =
+            make_a4b_controller_with_both_endpoints();
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
+        assert_ne!(controller.state(), DataplaneState::FailClosed);
+
+        // Start a relay transition (but don't commit — one call only).
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("first signal starts pending");
+
+        // Peer must still be Direct (stability window not yet elapsed).
+        assert_eq!(
+            controller.peer_path(&peer_id),
+            Some(PathMode::Direct),
+            "peer must remain Direct while transition is pending"
+        );
+
+        // force_fail_closed must override the pending transition immediately.
+        controller
+            .force_fail_closed("test_a4b_override")
+            .expect("force_fail_closed must succeed");
+
+        assert_eq!(
+            controller.state(),
+            DataplaneState::FailClosed,
+            "state must be FailClosed after force_fail_closed regardless of pending transition"
+        );
+    }
 }
