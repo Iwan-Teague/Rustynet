@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::process::Command;
 
+use base64::prelude::*;
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
     RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
@@ -18,7 +19,7 @@ pub struct WireguardBackend {
     running: bool,
     context: Option<RuntimeContext>,
     peers: BTreeMap<NodeId, PeerConfig>,
-    peer_latest_handshakes_by_endpoint: BTreeMap<String, Option<u64>>,
+    peer_latest_handshakes_by_node: BTreeMap<NodeId, u64>,
     routes: Vec<Route>,
     exit_mode: ExitMode,
     stats: TunnelStats,
@@ -30,7 +31,7 @@ impl Default for WireguardBackend {
             running: false,
             context: None,
             peers: BTreeMap::new(),
-            peer_latest_handshakes_by_endpoint: BTreeMap::new(),
+            peer_latest_handshakes_by_node: BTreeMap::new(),
             routes: Vec::new(),
             exit_mode: ExitMode::Off,
             stats: TunnelStats::default(),
@@ -53,17 +54,100 @@ impl WireguardBackend {
         self.stats.peer_count = self.peers.len();
     }
 
+    fn fetch_latest_handshakes(&mut self) -> Result<(), BackendError> {
+        let interface_name = match &self.context {
+            Some(ctx) => &ctx.interface_name,
+            None => {
+                return Err(BackendError::not_running(
+                    "wireguard backend context missing",
+                ));
+            }
+        };
+
+        // On non-Linux/macOS or if wg command fails, we might just warn and continue?
+        // But for now, let's try to run it.
+        // If "wg" is not found, backend error.
+        let output = Command::new("wg")
+            .arg("show")
+            .arg(interface_name)
+            .arg("latest-handshakes")
+            .output()
+            .map_err(|err| BackendError::internal(format!("wg show failed: {err}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BackendError::internal(format!(
+                "wg show failed with status {}: {stderr}",
+                output.status
+            )));
+        }
+
+        let stdout = output.stdout;
+        if stdout.len() > WG_LATEST_HANDSHAKES_MAX_BYTES {
+            return Err(BackendError::internal(format!(
+                "wg latest-handshakes output exceeded {WG_LATEST_HANDSHAKES_MAX_BYTES} bytes"
+            )));
+        }
+
+        let output_str = String::from_utf8(stdout)
+            .map_err(|err| BackendError::internal(format!("wg show output not utf8: {err}")))?;
+
+        // Clear or just update? If we clear, we lose history if command fails partially?
+        // But we want LATEST state.
+        // We update the map.
+        // But first, we need a map from PublicKey -> NodeId.
+        let mut pubkey_to_node_id = BTreeMap::new();
+        for (node_id, peer) in &self.peers {
+            pubkey_to_node_id.insert(peer.public_key.clone(), node_id.clone());
+        }
+
+        for line in output_str.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue; // Skip malformed lines
+            }
+            let pubkey_str = parts[0];
+            let timestamp_str = parts[1];
+
+            let timestamp = timestamp_str.parse::<u64>().map_err(|err| {
+                BackendError::internal(format!(
+                    "wg latest-handshakes timestamp parse failed: {err}"
+                ))
+            })?;
+
+            if timestamp == 0 {
+                continue; // No handshake yet
+            }
+
+            // Parse base64 pubkey
+            let pubkey_vec = BASE64_STANDARD.decode(pubkey_str).map_err(|err| {
+                BackendError::internal(format!("wg pubkey base64 decode failed: {err}"))
+            })?;
+
+            let pubkey: [u8; 32] = pubkey_vec.try_into().map_err(|vec: Vec<u8>| {
+                BackendError::internal(format!("wg pubkey wrong length: {}", vec.len()))
+            })?;
+
+            if let Some(node_id) = pubkey_to_node_id.get(&pubkey) {
+                self.peer_latest_handshakes_by_node
+                    .insert(node_id.clone(), timestamp);
+            }
+        }
+
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn set_peer_latest_handshake_unix_for_test(
         &mut self,
         node_id: &NodeId,
         latest_handshake_unix: Option<u64>,
     ) {
-        if let Some(peer) = self.peers.get(node_id) {
-            self.peer_latest_handshakes_by_endpoint.insert(
-                format!("{}:{}", peer.endpoint.addr, peer.endpoint.port),
-                latest_handshake_unix,
-            );
+        if let Some(timestamp) = latest_handshake_unix {
+            self.peer_latest_handshakes_by_node
+                .insert(node_id.clone(), timestamp);
+        } else {
+            self.peer_latest_handshakes_by_node.remove(node_id);
         }
     }
 
@@ -73,10 +157,23 @@ impl WireguardBackend {
         endpoint: SocketEndpoint,
         latest_handshake_unix: Option<u64>,
     ) {
-        self.peer_latest_handshakes_by_endpoint.insert(
-            format!("{}:{}", endpoint.addr, endpoint.port),
-            latest_handshake_unix,
-        );
+        // Reverse lookup: Find peer with this endpoint
+        let mut target_node_id = None;
+        for (node_id, peer) in &self.peers {
+            if peer.endpoint == endpoint {
+                target_node_id = Some(node_id.clone());
+                break;
+            }
+        }
+
+        if let Some(node_id) = target_node_id {
+            if let Some(timestamp) = latest_handshake_unix {
+                self.peer_latest_handshakes_by_node
+                    .insert(node_id, timestamp);
+            } else {
+                self.peer_latest_handshakes_by_node.remove(&node_id);
+            }
+        }
     }
 }
 
@@ -109,9 +206,6 @@ impl TunnelBackend for WireguardBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
-        self.peer_latest_handshakes_by_endpoint
-            .entry(format!("{}:{}", peer.endpoint.addr, peer.endpoint.port))
-            .or_insert(None);
         self.peers.insert(peer.node_id.clone(), peer);
         self.refresh_stats();
         Ok(())
@@ -126,9 +220,6 @@ impl TunnelBackend for WireguardBackend {
         let Some(peer) = self.peers.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
-        self.peer_latest_handshakes_by_endpoint
-            .entry(format!("{}:{}", endpoint.addr, endpoint.port))
-            .or_insert(None);
         peer.endpoint = endpoint;
         Ok(())
     }
@@ -149,20 +240,32 @@ impl TunnelBackend for WireguardBackend {
         if !self.peers.contains_key(node_id) {
             return Err(BackendError::invalid_input("peer is not configured"));
         }
-        let peer = self
-            .peers
-            .get(node_id)
-            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
-        Ok(self
-            .peer_latest_handshakes_by_endpoint
-            .get(&format!("{}:{}", peer.endpoint.addr, peer.endpoint.port))
-            .copied()
-            .flatten())
+
+        // Try to fetch fresh data. If it fails, log and use cached?
+        // Or fail?
+        // Since this is critical for traversal, we should probably fail or at least try.
+        // However, if we are on a platform without wg (e.g. windows test env), we might want to skip.
+        // But the requirement says "Implement backend methods".
+        // Let's call it. If it fails, we return error.
+        if let Err(e) = self.fetch_latest_handshakes() {
+            // If we can't fetch, maybe we just return cached data?
+            // But if fetch failed, we might not have updated cache.
+            // Let's allow failure if cache exists?
+            // No, strict error handling.
+            // Exception: if command not found, maybe we are in a mode where we can't check.
+            // But Phase10 checks this loop.
+            // If this fails, Phase10 loop fails.
+            // Let's return the error.
+            return Err(e);
+        }
+
+        Ok(self.peer_latest_handshakes_by_node.get(node_id).copied())
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
         self.peers.remove(node_id);
+        self.peer_latest_handshakes_by_node.remove(node_id);
         self.refresh_stats();
         Ok(())
     }
@@ -189,7 +292,7 @@ impl TunnelBackend for WireguardBackend {
         self.running = false;
         self.context = None;
         self.peers.clear();
-        self.peer_latest_handshakes_by_endpoint.clear();
+        self.peer_latest_handshakes_by_node.clear();
         self.routes.clear();
         self.exit_mode = ExitMode::Off;
         self.stats = TunnelStats::default();

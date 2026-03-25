@@ -231,13 +231,14 @@ Exit criteria:
   - fail-closed when neither condition is met.
 
 Status (2026-03-08):
-- partially implemented
-- `TraversalEngine` now builds bounded one-sided remote probe plans from verified direct candidates,
-- `Phase10Controller` now executes the probe loop using backend handshake-recency evidence and records direct-vs-relay outcomes,
-- `rustynetd` now surfaces probe result/reason/attempt count in `status` and `netcheck`,
-- traversal probe fanout, round pacing, relay-switch threshold, handshake-freshness windows, and relay reprobe cadence are now explicit daemon policy instead of implicit runtime defaults,
-- `rustynetd` now periodically reprobes relay-backed peers on reconcile and uses live backend handshake evidence to avoid stale cached direct-path downgrades before failback,
-- remaining gap: this is still a one-sided proof model over signed remote candidates, not full simultaneous-open WAN traversal.
+- implemented
+- `TraversalEngine` now builds full simultaneous-open probe plans using local candidates (Host + STUN) and remote candidates.
+- `Phase10Controller` integrates local candidate gathering (Linux-native + STUN) and passes them to the executor.
+- `rustynet netcheck` reports both local host and STUN candidates.
+- `execute_simultaneous_open` now iterates over prioritized candidate pairs, enabling true ICE-like connectivity checks.
+- `rustynetd` now surfaces probe result/reason/attempt count in `status` and `netcheck`.
+- traversal probe fanout, round pacing, relay-switch threshold, handshake-freshness windows, and relay reprobe cadence are now explicit daemon policy instead of implicit runtime defaults.
+- `rustynetd` now periodically reprobes relay-backed peers on reconcile and uses live backend handshake evidence to avoid stale cached direct-path downgrades before failback.
 
 ---
 
@@ -260,6 +261,14 @@ Exit criteria:
   - stale/forged/replayed traversal cannot mutate endpoint,
   - successful decision mutates endpoint once and records reason,
   - failed decision transitions controller to fail-closed.
+
+Status (2026-03-08):
+- implemented (verification blocked by Windows environment)
+- `apply_traversal_authority_to_peers` now consults `traversal_probe_statuses` for proven endpoints.
+- `static_traversal_endpoint` (renamed from authoritative) now prefers Relay as a safe default.
+- `sync_traversal_runtime_state` drops failed probe statuses to force re-evaluation/fallback, preventing stale success.
+- `reconcile` fails closed if traversal authority is missing or invalid.
+- probe failures are logged but do not block other peers (resilient sync).
 
 ---
 

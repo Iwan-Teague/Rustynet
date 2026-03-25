@@ -14,7 +14,7 @@ Core rule:
 You are Agent 1 for the Rustynet repository.
 
 Repository root:
-/Users/iwanteague/Desktop/Rustynet
+/Users/iwanteague/Desktop/Rusty/Rustynet
 
 Mission:
 Complete the remaining HP-2 traversal core work with security as the top priority. Your job is to finish the remaining WAN traversal and direct-path controller work without introducing alternate authority paths, fallback endpoint mutation, or weaker trust checks.
@@ -96,7 +96,7 @@ Definition of done:
 You are Agent 2 for the Rustynet repository.
 
 Repository root:
-/Users/iwanteague/Desktop/Rustynet
+/Users/iwanteague/Desktop/Rusty/Rustynet
 
 Mission:
 Complete the HP-3 relay core with security as the top priority. Your job is to build a production-grade ciphertext-only relay path with constant-time auth, replay protection, bounded resource use, and no plaintext visibility.
@@ -177,7 +177,7 @@ Definition of done:
 You are Agent 3 for the Rustynet repository.
 
 Repository root:
-/Users/iwanteague/Desktop/Rustynet
+/Users/iwanteague/Desktop/Rusty/Rustynet
 
 Mission:
 Finish the remaining security-relevant shell-to-Rust and cross-platform runtime hardening work. Your job is to remove the remaining privileged and secret-bearing shell paths, keep Linux baseline behavior intact, and avoid introducing a second active implementation path.
@@ -255,7 +255,7 @@ Definition of done:
 You are Agent 4 for the Rustynet repository.
 
 Repository root:
-/Users/iwanteague/Desktop/Rustynet
+/Users/iwanteague/Desktop/Rusty/Rustynet
 
 Mission:
 Start the serialization hardening stream without overlapping later artifact-family migrations. Your job is limited to Phase A and Phase B only: typed-schema hardening on privileged or trust-adjacent JSON paths and privileged helper IPC migration prep or implementation.

@@ -76,14 +76,19 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Open scope`
 - This blueprint remains active because the gap table is not yet fully closed.
-- The main open areas are richer HP2 traversal behavior, relay-session and relay-transport artifacts, backend probe surfaces, and traversal or phase10 gate coverage.
+- **Updated 2026-03-25**: Relay crate row updated. Production relay transport now implemented with constant-time auth, replay protection, and 31 tests.
+- **Updated 2026-03-25**: HP-4 relay client module added to daemon (`rustynetd/src/relay_client.rs`) with 8 tests.
+- Remaining open areas: signed traversal-hint bundle, backend probe surfaces, HP-4 wiring into daemon reconcile loop, traversal/phase10 gate coverage.
 
 `Do first`
-- Close gaps in the order already defined here: trust and authorization chain first, then runtime path enforcement, then backend surfaces, then relay transport, then gate coverage.
+- Wire `RelayClient` into daemon reconcile loop to complete HP-4.
+- Add relay endpoint refresh on token expiry.
 - Keep the gap table current as you go so the file remains code-accurate.
 
 `Completion proof`
 - Every touched row in the gap table is either updated to current code reality or remains open with a precise reason.
+- Relay crate row updated 2026-03-25 with implementation evidence.
+- HP-4 relay client module added 2026-03-25 with session establishment and wire protocol.
 - The corresponding tests and gates named by the touched sections pass.
 
 `Do not do`
@@ -134,8 +139,8 @@ Primary references in this repository:
 | CLI netcheck | Returns structured runtime diagnostics (`path_mode`, `path_reason`, `traversal_authority`, artifact freshness/candidate/error fields, and probe result/reason/attempt count) (`crates/rustynetd/src/daemon.rs`) | Still lacks full multi-peer HP-2 telemetry and relay-transport health evidence |
 | Backend API | `TunnelBackend` now supports controlled endpoint rotation plus per-peer handshake-recency evidence via `update_peer_endpoint`, `current_peer_endpoint`, and `peer_latest_handshake_unix` (`crates/rustynet-backend-api/src/lib.rs`) | Still needs richer endpoint-set/probe surfaces for full HP-2/HP-3 |
 | WireGuard backend | Can configure peers, rotate endpoints, and read bounded handshake-recency evidence via strict `wg` argv calls (`crates/rustynet-backend-wireguard/src/lib.rs`) | Still needs transport-level probe traffic generation beyond endpoint rotation + handshake observation |
-| Control signing model | Signed peer-map and signed assignment bundle are implemented (`crates/rustynet-control/src/lib.rs`) | Missing signed traversal-hint bundle and relay-session token artifacts |
-| Relay crate | Fleet selection primitives only (`crates/rustynet-relay/src/lib.rs`) | Missing production relay transport service with authenticated sessions and abuse controls |
+| Control signing model | Signed peer-map, signed assignment bundle, and **RelaySessionToken** (ed25519 signed with ct_eq) are implemented (`crates/rustynet-control/src/lib.rs`). **11 RelaySessionToken tests** cover signing, verification, expiry, ct_eq, and debug redaction. | **UPDATED 2026-03-25**: relay-session token complete. Still needs signed traversal-hint bundle. |
+| Relay crate | **UPDATED 2026-03-25**: Production relay transport implemented with authenticated sessions (`RelayTransport`), constant-time auth, replay protection, rate limiting, per-node session caps, idle/half-open cleanup, and ciphertext-only forwarding (31 tests pass) (`crates/rustynet-relay/src/transport.rs`) | **HP-4 relay client module added** (`crates/rustynetd/src/relay_client.rs`, 8 tests). Remaining: wire into daemon reconcile loop. |
 | Phase10 gates | Current artifacts: netns/leak/perf/failover/state-audit (`scripts/ci/check_phase10_readiness.sh`) | Must add traversal security artifact checks (tamper/replay/failback integrity) |
 
 ## 4) Required Trust and Key Artifacts

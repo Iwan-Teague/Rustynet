@@ -14,9 +14,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
+use std::sync::mpsc;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::stun_client::StunClient;
 use crate::ipc::{
     CommandEnvelope, IpcCommand, IpcResponse, RemoteCommandEnvelope,
     read_command_envelope as ipc_read_command_envelope, validate_cidr,
@@ -54,6 +56,7 @@ use crate::traversal::{
     DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS as TRAVERSAL_DEFAULT_SIMULTANEOUS_ROUNDS,
     DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS as TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS,
     EndpointMonitor, TraversalCandidate as ProbeTraversalCandidate, TraversalEngineConfig,
+    VerifiedTraversalIndex, VerifiedTraversalRecord,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(target_os = "linux")]
@@ -130,6 +133,7 @@ pub const DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = TRAVERSAL_DEFAULT_ROUN
 pub const DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 =
     TRAVERSAL_DEFAULT_RELAY_SWITCH_AFTER_FAILURES;
 pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 = TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS;
+pub const DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS: u64 = 30;
 pub const DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
@@ -1888,6 +1892,9 @@ struct DaemonRuntime {
     traversal_probe_config: TraversalEngineConfig,
     traversal_probe_handshake_freshness_secs: u64,
     traversal_probe_reprobe_interval_secs: u64,
+    local_host_candidates: BTreeMap<String, Vec<IpAddr>>,
+    local_stun_candidates: Vec<SocketAddr>,
+    stun_result_rx: Option<mpsc::Receiver<Vec<IpAddr>>>,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -1914,6 +1921,7 @@ struct DaemonRuntime {
     dns_zone_preexpiry_refresh_events: u64,
     dns_zone_last_preexpiry_refresh_unix: Option<u64>,
     traversal_hints: Option<TraversalBundleSetEnvelope>,
+    verified_traversal_index: VerifiedTraversalIndex,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
     traversal_stale_rejections: u64,
@@ -2079,6 +2087,29 @@ impl DaemonRuntime {
             traversal_probe_reprobe_interval_secs: config
                 .traversal_probe_reprobe_interval_secs
                 .get(),
+            local_host_candidates: BTreeMap::new(),
+            local_stun_candidates: Vec::new(),
+            stun_result_rx: {
+                let (tx, rx) = mpsc::channel();
+                let servers = config.traversal_stun_servers.clone();
+                let timeout = Duration::from_millis(config.traversal_stun_gather_timeout_ms.get());
+                thread::spawn(move || {
+                    if servers.is_empty() {
+                        return;
+                    }
+                    let client = StunClient::new(servers, timeout);
+                    // Initial jitter
+                    sleep(Duration::from_millis(500));
+                    loop {
+                        let ips = client.gather_public_ips();
+                        if !ips.is_empty() {
+                            let _ = tx.send(ips);
+                        }
+                        sleep(Duration::from_secs(DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS));
+                    }
+                });
+                Some(rx)
+            },
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -2105,6 +2136,7 @@ impl DaemonRuntime {
             dns_zone_preexpiry_refresh_events: 0,
             dns_zone_last_preexpiry_refresh_unix: None,
             traversal_hints: None,
+            verified_traversal_index: VerifiedTraversalIndex::new(),
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
             traversal_stale_rejections: 0,
@@ -2503,6 +2535,55 @@ impl DaemonRuntime {
         None
     }
 
+    fn update_verified_traversal_index(&mut self, envelope: &TraversalBundleSetEnvelope) {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        self.verified_traversal_index = VerifiedTraversalIndex::new();
+
+        for bundle_envelope in &envelope.bundles {
+            let bundle = &bundle_envelope.bundle;
+
+            let mut candidates = Vec::new();
+            for cand in &bundle.candidates {
+                let endpoint = SocketEndpoint {
+                    addr: cand.endpoint.ip(),
+                    port: cand.endpoint.port(),
+                };
+                let source = match cand.candidate_type {
+                    TraversalCandidateType::Host => ProbeCandidateSource::Host,
+                    TraversalCandidateType::ServerReflexive => {
+                        ProbeCandidateSource::ServerReflexive
+                    }
+                    TraversalCandidateType::Relay => ProbeCandidateSource::Relay,
+                };
+
+                candidates.push(ProbeTraversalCandidate {
+                    endpoint,
+                    source,
+                    priority: cand.priority,
+                    observed_at_unix: bundle.generated_at_unix,
+                });
+            }
+
+            let record = VerifiedTraversalRecord {
+                candidates,
+                generated_at_unix: bundle.generated_at_unix,
+                expires_at_unix: bundle.expires_at_unix,
+                nonce: bundle.nonce,
+                verified_at_unix: now_unix,
+            };
+
+            self.verified_traversal_index.insert(
+                bundle.source_node_id.clone(),
+                bundle.target_node_id.clone(),
+                record,
+            );
+        }
+    }
+
     fn refresh_traversal_hint_state(&mut self, force_reprobe: bool) {
         let previous_watermark = match load_traversal_watermark(&self.traversal_watermark_path) {
             Ok(value) => value,
@@ -2529,17 +2610,20 @@ impl DaemonRuntime {
                     self.traversal_probe_statuses.clear();
                     return;
                 }
+                self.update_verified_traversal_index(&envelope);
                 self.traversal_hints = Some(envelope);
                 self.traversal_hint_error = None;
             }
             Err(TraversalBootstrapError::Missing) => {
                 self.traversal_hints = None;
+                self.verified_traversal_index = VerifiedTraversalIndex::new();
                 self.traversal_hint_error = None;
                 self.traversal_probe_statuses.clear();
             }
             Err(err) => {
                 self.record_traversal_bootstrap_error(&err);
                 self.traversal_hints = None;
+                self.verified_traversal_index = VerifiedTraversalIndex::new();
                 self.traversal_hint_error = Some(err.to_string());
                 self.traversal_probe_statuses.clear();
             }
@@ -2797,6 +2881,7 @@ impl DaemonRuntime {
     #[cfg(target_os = "linux")]
     fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
         let current = collect_linux_interface_addrs();
+        self.local_host_candidates = current.clone();
         if self._endpoint_monitor.poll_with_addrs(current).is_some() {
             self.maybe_trigger_endpoint_change_refresh();
         }
@@ -2848,6 +2933,21 @@ impl DaemonRuntime {
             ("warning", "signed_dns_zone_state_near_expiry".to_string())
         } else {
             ("ok", "none".to_string())
+        }
+    }
+
+    fn poll_stun_results(&mut self) {
+        if let Some(rx) = self.stun_result_rx.as_mut() {
+            while let Ok(ips) = rx.try_recv() {
+                self.local_stun_candidates = ips
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, self.wg_listen_port))
+                    .collect();
+                eprintln!(
+                    "rustynetd: stun candidates updated: {:?}",
+                    self.local_stun_candidates
+                );
+            }
         }
     }
 
@@ -2998,8 +3098,26 @@ impl DaemonRuntime {
         let dns_stale_rejections = self.dns_zone_stale_rejections;
         let dns_replay_rejections = self.dns_zone_replay_rejections;
         let dns_future_dated_rejections = self.dns_zone_future_dated_rejections;
+        let stun_candidates = if self.local_stun_candidates.is_empty() {
+            "none".to_string()
+        } else {
+            self.local_stun_candidates
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let local_host_candidates = if self.local_host_candidates.is_empty() {
+            "none".to_string()
+        } else {
+            self.local_host_candidates
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} local_host_candidates={local_host_candidates}",
         )
     }
 
@@ -3022,6 +3140,39 @@ impl DaemonRuntime {
             DataplaneState::ControlTrusted => ("control_trusted", "control_trusted"),
             DataplaneState::Init => ("initializing", "init"),
         }
+    }
+
+    fn all_local_candidates(&self) -> Vec<ProbeTraversalCandidate> {
+        let mut candidates = Vec::new();
+        // Host candidates
+        for (iface, addrs) in &self.local_host_candidates {
+            if iface == "lo" || iface.starts_with("rustynet") {
+                continue;
+            }
+            for ip in addrs {
+                 if ip.is_loopback() { continue; }
+                 
+                 candidates.push(ProbeTraversalCandidate {
+                     endpoint: SocketEndpoint {
+                         addr: *ip,
+                         port: self.wg_listen_port,
+                     },
+                     source: ProbeCandidateSource::Host,
+                     priority: 300,
+                     observed_at_unix: unix_now(),
+                 });
+            }
+        }
+        // STUN candidates
+        for endpoint in &self.local_stun_candidates {
+             candidates.push(ProbeTraversalCandidate {
+                 endpoint: SocketEndpoint::from(*endpoint),
+                 source: ProbeCandidateSource::ServerReflexive,
+                 priority: 200,
+                 observed_at_unix: unix_now(),
+             });
+        }
+        candidates
     }
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
@@ -3073,6 +3224,7 @@ impl DaemonRuntime {
         }
 
         let now_unix = unix_now();
+        let local_candidates = self.all_local_candidates();
         let previous_statuses = self.traversal_probe_statuses.clone();
         let mut statuses = BTreeMap::new();
         for remote_node_id in managed_peer_ids {
@@ -3147,6 +3299,7 @@ impl DaemonRuntime {
                 .controller
                 .evaluate_traversal_probes(
                     &remote_node_id,
+                    &local_candidates,
                     &direct_candidates,
                     relay_endpoint,
                     now_unix,
@@ -3291,18 +3444,22 @@ impl DaemonRuntime {
                     peer.node_id.as_str()
                 )
             })?;
-            peer.endpoint = self.authoritative_traversal_endpoint(bundle, &peer.node_id)?;
+            if let Some(status) = self.traversal_probe_statuses.get(&peer.node_id) {
+                peer.endpoint = status.selected_endpoint;
+            } else {
+                peer.endpoint = self.static_traversal_endpoint(bundle, &peer.node_id)?;
+            }
         }
         Ok(peers)
     }
 
-    fn authoritative_traversal_endpoint(
+    fn static_traversal_endpoint(
         &self,
         bundle: &TraversalBundleEnvelope,
         remote_node_id: &NodeId,
     ) -> Result<SocketEndpoint, String> {
         let endpoints = select_runtime_traversal_endpoints(&bundle.bundle.candidates);
-        endpoints.0.or(endpoints.1).ok_or_else(|| {
+        endpoints.1.or(endpoints.0).ok_or_else(|| {
             format!(
                 "traversal authority bundle for peer {} contains no usable runtime endpoints",
                 remote_node_id.as_str()
@@ -3727,6 +3884,7 @@ impl DaemonRuntime {
             trust,
             RuntimeContext {
                 local_node,
+                interface_name: self.wg_interface.clone(),
                 mesh_cidr,
                 local_cidr,
             },
@@ -4720,6 +4878,7 @@ impl DaemonRuntime {
                 trust,
                 RuntimeContext {
                     local_node,
+                    interface_name: self.wg_interface.clone(),
                     mesh_cidr,
                     local_cidr,
                 },
@@ -5418,6 +5577,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             next_reconcile = now + reconcile_interval;
         }
         let now_unix = unix_now();
+        runtime.poll_stun_results();
         runtime.maybe_preexpiry_refresh_traversal(now_unix);
         runtime.poll_endpoint_monitor_and_maybe_refresh();
         runtime.maybe_trigger_endpoint_change_refresh();

@@ -82,6 +82,49 @@ impl Default for TraversalEngineConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTraversalRecord {
+    pub candidates: Vec<TraversalCandidate>,
+    pub generated_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: u64,
+    pub verified_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedTraversalIndex {
+    index: BTreeMap<(String, String), VerifiedTraversalRecord>,
+}
+
+impl VerifiedTraversalIndex {
+    pub fn new() -> Self {
+        Self {
+            index: BTreeMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, source: String, target: String, record: VerifiedTraversalRecord) {
+        self.index.insert((source, target), record);
+    }
+
+    pub fn get(&self, source: &str, target: &str) -> Option<&VerifiedTraversalRecord> {
+        self.index.get(&(source.to_string(), target.to_string()))
+    }
+
+    pub fn prune_expired(&mut self, now_unix: u64) {
+        self.index
+            .retain(|_, record| record.expires_at_unix > now_unix);
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraversalError {
     CandidateCountExceeded {
         side: &'static str,
@@ -1187,7 +1230,8 @@ impl TraversalEngine {
         runtime: &mut R,
         waiter: &mut W,
         schedule: CoordinationSchedule,
-        direct_candidates: &[TraversalCandidate],
+        local_candidates: &[TraversalCandidate],
+        remote_candidates: &[TraversalCandidate],
         relay_endpoint: Option<SocketEndpoint>,
         now_unix: u64,
         handshake_freshness_secs: u64,
@@ -1199,7 +1243,7 @@ impl TraversalEngine {
         }
         waiter.wait(schedule.wait_duration);
 
-        let plan = match self.plan_remote_probes(direct_candidates) {
+        let plan = match self.plan_direct_probes(local_candidates, remote_candidates) {
             Ok(plan) => plan,
             Err(TraversalError::NoDirectCandidates) => {
                 if let Some(endpoint) = relay_endpoint {
@@ -1228,18 +1272,18 @@ impl TraversalEngine {
         };
 
         let mut observed_latest = runtime.latest_handshake_unix()?;
-        for attempt in &plan.attempts {
-            runtime.send_probe(attempt.remote.endpoint, attempt.round)?;
+        for (index, pair) in plan.pairs.iter().enumerate() {
+            runtime.send_probe(pair.remote.endpoint, pair.round)?;
             let latest = runtime.latest_handshake_unix()?;
             if handshake_advanced(observed_latest, latest)
                 && handshake_is_fresh(latest, now_unix, handshake_freshness_secs)
             {
                 return Ok(SimultaneousOpenResult {
                     decision: TraversalDecision::Direct {
-                        endpoint: attempt.remote.endpoint,
+                        endpoint: pair.remote.endpoint,
                         reason: TraversalDecisionReason::SimultaneousOpenHandshakeObserved,
                     },
-                    attempts: attempt.attempt_ordinal,
+                    attempts: index + 1,
                     latest_handshake_unix: latest,
                     waited_for_start: schedule.wait_duration,
                 });
@@ -1259,7 +1303,7 @@ impl TraversalEngine {
                     reason: TraversalDecisionReason::DirectProbeExhaustedRelayArmed,
                     rounds: self.config.simultaneous_open_rounds,
                 },
-                attempts: plan.attempts.len(),
+                attempts: plan.pairs.len(),
                 latest_handshake_unix: observed_latest,
                 waited_for_start: schedule.wait_duration,
             });
@@ -1270,7 +1314,7 @@ impl TraversalEngine {
                 reason: TraversalDecisionReason::DirectProbeExhaustedFailClosed,
                 rounds: self.config.simultaneous_open_rounds,
             },
-            attempts: plan.attempts.len(),
+            attempts: plan.pairs.len(),
             latest_handshake_unix: observed_latest,
             waited_for_start: schedule.wait_duration,
         })
@@ -2016,6 +2060,7 @@ mod tests {
             fn wait(&mut self, _d: Duration) {}
         }
 
+        let local_candidates = vec![candidate([10, 0, 0, 10], 51820, CandidateSource::Host, 900)];
         let direct_candidates = vec![candidate([10, 0, 0, 1], 51820, CandidateSource::Host, 900)];
         let mut runtime = NoHandshakeRuntime {
             latest: None,
@@ -2033,6 +2078,7 @@ mod tests {
                 &mut runtime,
                 &mut waiter,
                 schedule2,
+                local_candidates.as_slice(),
                 direct_candidates.as_slice(),
                 Some(SocketEndpoint {
                     addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
@@ -2413,5 +2459,32 @@ mod tests {
             monitor.poll_with_addrs(link_local6).is_none(),
             "link-local IPv6 must be ignored"
         );
+    }
+
+    /// HP2-01: Verified traversal index lifecycle.
+    #[test]
+    fn test_verified_traversal_index_lifecycle() {
+        let mut index = super::VerifiedTraversalIndex::new();
+        assert!(index.is_empty());
+
+        let record = super::VerifiedTraversalRecord {
+            candidates: vec![],
+            generated_at_unix: 100,
+            expires_at_unix: 200,
+            nonce: 1,
+            verified_at_unix: 150,
+        };
+
+        index.insert("node-a".to_string(), "node-b".to_string(), record.clone());
+        assert_eq!(index.len(), 1);
+
+        let retrieved = index.get("node-a", "node-b").expect("should exist");
+        assert_eq!(retrieved.nonce, 1);
+
+        index.prune_expired(199);
+        assert_eq!(index.len(), 1);
+
+        index.prune_expired(200);
+        assert_eq!(index.len(), 0);
     }
 }

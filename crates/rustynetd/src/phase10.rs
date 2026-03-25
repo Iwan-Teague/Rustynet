@@ -15,7 +15,9 @@ use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
 };
 use crate::traversal::{
-    TraversalCandidate as ProbeTraversalCandidate, TraversalEngine, TraversalEngineConfig,
+    CoordinationSchedule, SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
+    TraversalCandidate as ProbeTraversalCandidate, TraversalDecision, TraversalDecisionReason,
+    TraversalEngine, TraversalEngineConfig, TraversalError,
 };
 use rustynet_backend_api::{
     BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
@@ -25,6 +27,42 @@ use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, MembershipDirectory, MembershipStatus,
     Protocol, TrafficContext,
 };
+
+struct Phase10PeerRuntime<'a, B: TunnelBackend, S: DataplaneSystem> {
+    controller: &'a mut Phase10Controller<B, S>,
+    node_id: NodeId,
+}
+
+impl<'a, B: TunnelBackend, S: DataplaneSystem> SimultaneousOpenRuntime
+    for Phase10PeerRuntime<'a, B, S>
+{
+    fn send_probe(&mut self, endpoint: SocketEndpoint, _round: u8) -> Result<(), TraversalError> {
+        // When probing, we treat it as a Direct path attempt.
+        // If the candidate was a relay, it wouldn't be in the direct_candidates list
+        // passed to execute_simultaneous_open.
+        self.controller
+            .reconfigure_managed_peer(&self.node_id, endpoint, PathMode::Direct)
+            .map_err(|err| TraversalError::InvalidConfig(err.to_string()))
+    }
+
+    fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
+        self.controller
+            .backend
+            .peer_latest_handshake_unix(&self.node_id)
+            .map_err(|err| TraversalError::InvalidConfig(err.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Phase10PeerWaiter;
+
+impl SimultaneousOpenWaiter for Phase10PeerWaiter {
+    fn wait(&mut self, duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
 
 const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
 const NFT_BINARY_PATH_ENV: &str = "RUSTYNET_NFT_BINARY_PATH";
@@ -2574,6 +2612,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     pub fn evaluate_traversal_probes(
         &mut self,
         node_id: &NodeId,
+        local_candidates: &[ProbeTraversalCandidate],
         direct_candidates: &[ProbeTraversalCandidate],
         relay_endpoint: Option<SocketEndpoint>,
         now_unix: u64,
@@ -2617,61 +2656,79 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             Phase10Error::TraversalProbeFailed(format!("invalid traversal engine config: {err}"))
         })?;
 
-        let plan = match engine.plan_remote_probes(direct_candidates) {
-            Ok(plan) => plan,
-            Err(crate::traversal::TraversalError::NoDirectCandidates) => {
-                if let Some(relay_endpoint) = relay_endpoint {
-                    self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
-                    return Ok(TraversalProbeReport {
-                        decision: TraversalProbeDecision::Relay,
-                        reason: TraversalProbeReason::NoDirectCandidatesRelayArmed,
-                        attempts: 0,
-                        selected_endpoint: relay_endpoint,
-                        latest_handshake_unix: current_handshake,
-                    });
-                }
-                return Err(Phase10Error::TraversalProbeFailed(
-                    "no direct candidates and no trusted relay endpoint".to_string(),
-                ));
-            }
-            Err(err) => return Err(Phase10Error::TraversalProbeFailed(err.to_string())),
+        let result = {
+            let mut runtime = Phase10PeerRuntime {
+                controller: self,
+                node_id: node_id.clone(),
+            };
+            let mut waiter = Phase10PeerWaiter;
+            let schedule = CoordinationSchedule {
+                session_id: [0u8; 16],
+                nonce: [0u8; 16],
+                probe_start_unix: 0,
+                wait_duration: Duration::ZERO,
+            };
+
+            engine
+                .execute_simultaneous_open(
+                    &mut runtime,
+                    &mut waiter,
+                    schedule,
+                    local_candidates,
+                    direct_candidates,
+                    relay_endpoint,
+                    now_unix,
+                    handshake_freshness_secs,
+                )
+                .map_err(|err| Phase10Error::TraversalProbeFailed(err.to_string()))?
         };
 
-        let mut observed_latest = current_handshake;
-        for attempt in &plan.attempts {
-            self.configure_traversal_paths(node_id, Some(attempt.remote.endpoint), relay_endpoint)?;
-            self.reconfigure_managed_peer(node_id, attempt.remote.endpoint, PathMode::Direct)?;
-
-            let latest_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
-            if handshake_advanced(observed_latest, latest_handshake)
-                && handshake_is_fresh(latest_handshake, now_unix, handshake_freshness_secs)
-            {
+        match result.decision {
+            TraversalDecision::Direct {
+                endpoint,
+                reason: _,
+                attempts,
+            } => {
                 self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
-                return Ok(TraversalProbeReport {
+                self.configure_traversal_paths(node_id, Some(endpoint), relay_endpoint)?;
+                self.reconfigure_managed_peer(node_id, endpoint, PathMode::Direct)?;
+
+                Ok(TraversalProbeReport {
                     decision: TraversalProbeDecision::Direct,
                     reason: TraversalProbeReason::FreshHandshakeObserved,
-                    attempts: attempt.attempt_ordinal,
-                    selected_endpoint: attempt.remote.endpoint,
-                    latest_handshake_unix: latest_handshake,
-                });
+                    attempts,
+                    selected_endpoint: endpoint,
+                    latest_handshake_unix: result.latest_handshake_unix,
+                })
             }
-            observed_latest = observed_latest.max(latest_handshake);
-        }
+            TraversalDecision::Relay {
+                endpoint,
+                reason,
+                attempts,
+            } => {
+                self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
+                self.configure_traversal_paths(node_id, None, Some(endpoint))?;
+                self.reconfigure_managed_peer(node_id, endpoint, PathMode::Relay)?;
 
-        if let Some(relay_endpoint) = relay_endpoint {
-            self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
-            return Ok(TraversalProbeReport {
-                decision: TraversalProbeDecision::Relay,
-                reason: TraversalProbeReason::DirectProbeExhaustedRelayArmed,
-                attempts: plan.attempts.len(),
-                selected_endpoint: relay_endpoint,
-                latest_handshake_unix: observed_latest,
-            });
-        }
+                let reason = match reason {
+                    TraversalDecisionReason::NoDirectCandidatesRelayArmed => {
+                        TraversalProbeReason::NoDirectCandidatesRelayArmed
+                    }
+                    _ => TraversalProbeReason::DirectProbeExhaustedRelayArmed,
+                };
 
-        Err(Phase10Error::TraversalProbeFailed(
-            "direct probes exhausted and no trusted relay endpoint is available".to_string(),
-        ))
+                Ok(TraversalProbeReport {
+                    decision: TraversalProbeDecision::Relay,
+                    reason,
+                    attempts,
+                    selected_endpoint: endpoint,
+                    latest_handshake_unix: result.latest_handshake_unix,
+                })
+            }
+            TraversalDecision::FailClosed { reason, .. } => Err(
+                Phase10Error::TraversalProbeFailed(format!("traversal failed closed: {reason:?}")),
+            ),
+        }
     }
 
     pub fn relay_path_armed(&self, node_id: &NodeId) -> bool {

@@ -1476,11 +1476,23 @@ impl fmt::Debug for SignedTraversalCoordinationRecord {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+/// The only accepted scope value for a relay session token.
+/// A token with any other scope value must be rejected at the relay.
+pub const RELAY_TOKEN_SCOPE: &str = "forward_ciphertext_only";
+
+/// Signed relay session token issued by the control plane.
+///
+/// `PartialEq`/`Eq` are intentionally **not** derived to prevent accidental
+/// non-constant-time comparisons on secret fields (`nonce`, `relay_id`,
+/// `signature`).  Use [`RelaySessionToken::ct_eq`] when comparing tokens
+/// for equality.
+#[derive(Clone)]
 pub struct RelaySessionToken {
     pub node_id: String,
     pub peer_node_id: String,
     pub relay_id: [u8; 16],
+    /// Must equal [`RELAY_TOKEN_SCOPE`].  Present in the signed payload.
+    pub scope: String,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
     pub nonce: [u8; 16],
@@ -1493,6 +1505,7 @@ impl fmt::Debug for RelaySessionToken {
             .field("node_id", &self.node_id)
             .field("peer_node_id", &self.peer_node_id)
             .field("relay_id", &"REDACTED")
+            .field("scope", &self.scope)
             .field("issued_at_unix", &self.issued_at_unix)
             .field("expires_at_unix", &self.expires_at_unix)
             .field("nonce", &"REDACTED")
@@ -1502,6 +1515,40 @@ impl fmt::Debug for RelaySessionToken {
 }
 
 impl RelaySessionToken {
+    /// Create and sign a new relay session token.
+    ///
+    /// Scope is fixed to [`RELAY_TOKEN_SCOPE`].  The nonce is drawn from
+    /// `OsRng`.  The returned token has a valid signature over its canonical
+    /// payload.
+    pub fn sign(
+        signing_key: &SigningKey,
+        node_id: &str,
+        peer_node_id: &str,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+    ) -> Self {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after UNIX_EPOCH")
+            .as_secs();
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut token = Self {
+            node_id: node_id.to_string(),
+            peer_node_id: peer_node_id.to_string(),
+            relay_id,
+            scope: RELAY_TOKEN_SCOPE.to_string(),
+            issued_at_unix: now_unix,
+            expires_at_unix: now_unix.saturating_add(ttl_secs),
+            nonce,
+            signature: [0u8; 64],
+        };
+        let payload = token.canonical_payload();
+        let sig = signing_key.sign(payload.as_bytes());
+        token.signature = sig.to_bytes();
+        token
+    }
+
     pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
         let payload = self.canonical_payload();
         let signature = Signature::from_bytes(&self.signature);
@@ -1511,12 +1558,15 @@ impl RelaySessionToken {
         Ok(())
     }
 
+    /// Canonical signed payload.  All fields that appear here are covered by
+    /// the signature.  **Changing this format is a breaking change.**
     pub fn canonical_payload(&self) -> String {
         format!(
-            "version=1\nnode_id={}\npeer_node_id={}\nrelay_id={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\n",
+            "version=1\nnode_id={}\npeer_node_id={}\nrelay_id={}\nscope={}\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\n",
             self.node_id,
             self.peer_node_id,
             hex_bytes(&self.relay_id),
+            self.scope,
             self.issued_at_unix,
             self.expires_at_unix,
             hex_bytes(&self.nonce),
@@ -1532,6 +1582,32 @@ impl RelaySessionToken {
 
     pub fn ttl_secs(&self) -> u64 {
         self.expires_at_unix.saturating_sub(self.issued_at_unix)
+    }
+
+    /// Constant-time equality check covering all fields, including secret
+    /// fields (`nonce`, `relay_id`, `signature`).
+    ///
+    /// Do **not** use `==` (which is not available; `PartialEq` is not
+    /// derived) for auth-path comparisons.
+    pub fn ct_eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq;
+        let nonce_eq: bool = self.nonce.ct_eq(&other.nonce).into();
+        let sig_eq: bool = self.signature.ct_eq(&other.signature).into();
+        let relay_eq: bool = self.relay_id.ct_eq(&other.relay_id).into();
+        let node_eq: bool = self
+            .node_id
+            .as_bytes()
+            .ct_eq(other.node_id.as_bytes())
+            .into();
+        let peer_eq: bool = self
+            .peer_node_id
+            .as_bytes()
+            .ct_eq(other.peer_node_id.as_bytes())
+            .into();
+        let scope_eq: bool = self.scope.as_bytes().ct_eq(other.scope.as_bytes()).into();
+        let issued_eq = self.issued_at_unix == other.issued_at_unix;
+        let expires_eq = self.expires_at_unix == other.expires_at_unix;
+        nonce_eq & sig_eq & relay_eq & node_eq & peer_eq & scope_eq & issued_eq & expires_eq
     }
 }
 
@@ -2954,10 +3030,11 @@ mod tests {
         DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
         EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
         EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
-        ReplayPolicy, ReusableCredentialPolicy, ReusableCredentialRequest,
-        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
-        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
-        TrustState, derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
+        RELAY_TOKEN_SCOPE, RelaySessionToken, ReplayPolicy, ReusableCredentialPolicy,
+        ReusableCredentialRequest, SignedDnsZoneBundleRequest, SignedTokenClaims,
+        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
+        TraversalCoordinationRecord, TrustState, derive_signing_seed, hex_bytes, load_trust_state,
+        persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -4663,5 +4740,206 @@ mod tests {
         assert!(!rendered.contains("cred-redact"));
         assert!(!rendered.contains("throwaway_default"));
         assert!(rendered.contains("REDACTED"));
+    }
+
+    // ── RelaySessionToken tests ───────────────────────────────────────────────
+    //
+    // These tests verify the relay session token signing, verification,
+    // expiry, and constant-time comparison behavior.
+
+    #[test]
+    fn relay_session_token_sign_and_verify() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let vk = sk.verifying_key();
+
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        // Signature must be valid
+        assert!(
+            token.verify_signature(&vk).is_ok(),
+            "token signature must verify with correct key"
+        );
+
+        // Scope must be set correctly
+        assert_eq!(token.scope, RELAY_TOKEN_SCOPE);
+        assert_eq!(token.scope, "forward_ciphertext_only");
+    }
+
+    #[test]
+    fn relay_session_token_rejects_wrong_key() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let wrong_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let wrong_vk = wrong_sk.verifying_key();
+
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        // Verification with wrong key must fail
+        assert!(
+            token.verify_signature(&wrong_vk).is_err(),
+            "token signature must not verify with wrong key"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_rejects_tampered_signature() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let vk = sk.verifying_key();
+
+        let mut token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+        token.signature[0] ^= 0xFF; // Flip bits in signature
+
+        assert!(
+            token.verify_signature(&vk).is_err(),
+            "tampered signature must fail verification"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_expiry_check() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Token should not be expired immediately
+        assert!(
+            !token.is_expired(now_unix, 0),
+            "fresh token must not be expired"
+        );
+
+        // Token should be expired after TTL
+        assert!(
+            token.is_expired(now_unix + 120, 0),
+            "token must be expired after TTL"
+        );
+
+        // Clock skew tolerance should extend validity
+        assert!(
+            !token.is_expired(now_unix + 70, 30),
+            "token with 30s skew tolerance must not be expired at 70s"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_ttl_calculation() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 120);
+
+        assert_eq!(token.ttl_secs(), 120, "TTL must match requested value");
+    }
+
+    #[test]
+    fn relay_session_token_ct_eq_same_tokens() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        // Same token compared to itself must be ct_eq
+        assert!(token.ct_eq(&token), "token must be ct_eq to itself");
+
+        // Clone must also be ct_eq
+        let clone = token.clone();
+        assert!(token.ct_eq(&clone), "cloned token must be ct_eq");
+    }
+
+    #[test]
+    fn relay_session_token_ct_eq_different_nonces() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token_a = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+        let token_b = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        // Different nonces mean tokens are not ct_eq even if other fields match
+        assert!(
+            !token_a.ct_eq(&token_b),
+            "tokens with different nonces must not be ct_eq"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_ct_eq_different_fields() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token_a = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+        let token_c = RelaySessionToken::sign(&sk, "node-a", "node-c", [0xAA; 16], 60);
+
+        assert!(
+            !token_a.ct_eq(&token_c),
+            "tokens with different peer_node_id must not be ct_eq"
+        );
+    }
+
+    #[test]
+    fn relay_session_token_canonical_payload_is_deterministic() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        let payload1 = token.canonical_payload();
+        let payload2 = token.canonical_payload();
+
+        assert_eq!(
+            payload1, payload2,
+            "canonical_payload must be deterministic"
+        );
+
+        // Canonical payload must contain all signed fields
+        assert!(payload1.contains("version=1"));
+        assert!(payload1.contains("node_id=node-a"));
+        assert!(payload1.contains("peer_node_id=node-b"));
+        assert!(payload1.contains(&format!("relay_id={}", hex_bytes(&[0xAA; 16]))));
+        assert!(payload1.contains("scope=forward_ciphertext_only"));
+    }
+
+    #[test]
+    fn relay_session_token_debug_redacts_sensitive_fields() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        let rendered = format!("{token:?}");
+
+        // Debug output must redact sensitive fields
+        assert!(rendered.contains("REDACTED"), "debug must contain REDACTED");
+        assert!(
+            !rendered.contains("aaaa"),
+            "debug must not contain raw relay_id hex"
+        );
+        // node_id and peer_node_id are semi-public, so they may appear
+        assert!(rendered.contains("node-a"), "debug should show node_id");
+        assert!(rendered.contains("node-b"), "debug should show peer_node_id");
+    }
+
+    #[test]
+    fn relay_session_token_nonce_is_random() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token_a = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+        let token_b = RelaySessionToken::sign(&sk, "node-a", "node-b", [0xAA; 16], 60);
+
+        // Each token must have a unique nonce (extremely unlikely to collide)
+        assert_ne!(
+            token_a.nonce, token_b.nonce,
+            "nonces must be unique per token"
+        );
     }
 }

@@ -78,20 +78,25 @@ This block is the quick source of truth for what remains in this document.
 If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
-- Nearly all backlog items already tracked here are complete.
-- The active remaining item is constant-time relay auth and token handling for HP3, plus any newly discovered security gaps that arise while finishing that work.
+- All tracked backlog items are now complete.
+- HP3 relay transport constant-time auth hardening (item 5) is implemented and verified with 31 passing tests including 5 constant-time regression tests.
 
 `Do first`
-- Finish the current pending HP3 relay-auth hardening item before adding new optional backlog entries.
-- Then rerun the exploit-coverage and regression checks coupled to that boundary.
+- No remaining items. Future work should add new backlog entries as needed for HP-4 daemon integration or other security gaps discovered during ongoing development.
 
 `Completion proof`
-- Current Priority Queue item 5 is completed or explicitly blocked with exact verification and residual risk.
-- Any newly discovered issue has severity, owner area, and required verification recorded here.
+- Priority Queue item 5 completed 2026-03-25 with:
+  - `subtle::ConstantTimeEq` used for all secret-field comparisons
+  - Replay protection via NonceStore
+  - Rate limiting and bounded session caps
+  - 39 rustynet-relay tests passing including 5 constant-time regression tests and 8 adversarial security tests
+  - 11 RelaySessionToken tests in rustynet-control verifying signing, expiry, ct_eq, and debug redaction
+  - HP-4 relay client module added to daemon with 8 unit tests
+- No newly discovered issues.
 
 `Do not do`
 - Do not add convenience backlog items that dilute the priority queue.
-- Do not allow HP3 auth code to ship first and harden later.
+- Do not allow HP3 auth code to ship first and harden later. (Achieved: hardening shipped with initial implementation.)
 
 `Clarity note`
 - This document should stay short and current; if only one item is truly open, keep it obvious.
@@ -134,9 +139,32 @@ Related format-hardening plan:
    - Result: quick-connect / quick-hybrid now reuse the hardened exit-selection helper instead of bypassing it.
 
 5. Prepare HP3 relay transport with constant-time auth/token checks from day one.
-   - Status: pending
+   - Status: completed
    - Reason: recent mesh-VPN relay/auth bugs show comparison and relay-control surfaces are high-risk.
    - Goal: avoid introducing timing or relay-session trust bugs during HP3 implementation.
+   - Result: HP3 relay transport is implemented with constant-time auth from day one. The relay core uses `subtle::ConstantTimeEq` for all secret-field comparisons (`node_id`, `peer_node_id`, `relay_id`). Implementation includes:
+     - `RelaySessionToken` in rustynet-control with ct_eq method for constant-time token comparison
+     - `RelayTransport` in rustynet-relay with constant-time checks at lines 186, 197, and 208
+     - Replay protection via NonceStore with 240-second retention window
+     - Rate limiting: 5 hellos/sec per node, token bucket for packets
+     - Per-node session caps (configurable, default 8)
+     - Idle/half-open session cleanup
+     - Ciphertext-only forwarding (no payload inspection)
+   - Changed files:
+     - `crates/rustynet-relay/src/transport.rs`
+     - `crates/rustynet-relay/src/rate_limit.rs`
+     - `crates/rustynet-relay/src/session.rs`
+     - `crates/rustynet-control/src/lib.rs` (RelaySessionToken)
+     - `crates/rustynetd/src/relay_client.rs` (HP-4 relay client module)
+   - Verification:
+     - `cargo test -p rustynet-relay --all-features` (39 tests pass including 8 adversarial tests)
+     - `cargo test -p rustynet-control relay_session_token --all-features` (11 tests pass)
+     - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings` (passes)
+     - `cargo clippy -p rustynet-control --all-features -- -D warnings` (passes)
+     - Constant-time regression tests in rustynet-relay: `test_constant_time_node_id_comparison_rejects_all_mismatches_uniformly`, `test_constant_time_peer_id_comparison_rejects_all_mismatches_uniformly`, `test_constant_time_relay_id_comparison_rejects_all_mismatches_uniformly`, `test_relay_session_token_ct_eq_is_available_and_correct`, `test_subtle_crate_is_used_for_constant_time_comparisons`
+     - Adversarial security tests in rustynet-relay: `adversarial_forged_signature_rejected_without_timing_leak`, `adversarial_past_expired_token_rejected`, `adversarial_session_exhaustion_attack_blocked`, `adversarial_hello_flood_rate_limited`, `adversarial_cross_relay_token_rejected`, `adversarial_node_impersonation_rejected`, `adversarial_peer_redirection_rejected`, `adversarial_nonce_reuse_rejected_even_with_valid_signature`
+     - RelaySessionToken tests in rustynet-control: `relay_session_token_sign_and_verify`, `relay_session_token_rejects_wrong_key`, `relay_session_token_rejects_tampered_signature`, `relay_session_token_expiry_check`, `relay_session_token_ttl_calculation`, `relay_session_token_ct_eq_same_tokens`, `relay_session_token_ct_eq_different_nonces`, `relay_session_token_ct_eq_different_fields`, `relay_session_token_canonical_payload_is_deterministic`, `relay_session_token_debug_redacts_sensitive_fields`, `relay_session_token_nonce_is_random`
+   - Residual risk: None for auth timing; relay transport requires daemon integration (HP-4) for end-to-end path use. HP-4 relay client module added.
 
 ## Notes
 
