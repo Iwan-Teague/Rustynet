@@ -246,21 +246,35 @@ Acceptance:
 - Live handoff under load with no policy bypass and no leak.
 
 ### HP-4 Implementation Status (2026-03-25)
-- **Status: Relay client module implemented**
-- `rustynetd` now includes `relay_client` module:
-  - `RelayClient` struct for managing client-side relay sessions
-  - `RelayClientSession` for tracking individual peer sessions
-  - Session establishment with signed `RelaySessionToken`
-  - Wire protocol serialization for `RelayHello` and `RelayHelloAck`
-  - Idle session cleanup
-  - 8 unit tests
-- Integration points ready:
-  - `RelayClient::establish_session()` returns `SocketEndpoint` for `Phase10Controller::configure_traversal_paths()`
-  - Session keepalive and cleanup hooks
+- **Status: partial**
+- `rustynetd` now wires `RelayClient` into the enforced traversal reconcile path instead of leaving relay candidates as raw controller endpoints.
+- Runtime behavior now implemented:
+  - daemon runtime can load a relay-session signer from `RUSTYNET_ASSIGNMENT_SIGNING_SECRET` plus `RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE`,
+  - `rustynet-control` exposes `derive_endpoint_hint_signing_key(...)` so relay-session tokens reuse the endpoint-hint signing domain instead of introducing a second signer,
+  - signed traversal state still remains the only endpoint-mutation authority: `verified traversal state -> deterministic controller decision -> backend apply`,
+  - when relay-session custody is configured, relay decisions resolve through `RelayClient::establish_session(...)` before the controller arms or applies a relay endpoint,
+  - relay-session expiry refresh updates the active relay endpoint without reopening assignment-endpoint fallback,
+  - relay sessions are closed on direct recovery and cleaned up on idle timeout,
+  - configured relay-session establishment failures now surface as traversal runtime sync failures and force the daemon back to fail-closed in enforced mode.
+- Test and verification evidence:
+  - `cargo test -p rustynet-control derive_endpoint_hint_signing_key_matches_control_plane_verifier -- --nocapture`
+  - `cargo test -p rustynetd relay_client::tests -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_relay_client_ -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives -- --exact --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --exact --nocapture`
+  - `cargo test -p rustynet-backend-wireguard in_memory_backend_promotes_cached_endpoint_handshake_on_endpoint_update -- --nocapture`
+- Files changed for this slice:
+  - `crates/rustynet-control/src/lib.rs`
+  - `crates/rustynetd/src/relay_client.rs`
+  - `crates/rustynetd/src/daemon.rs`
+  - `crates/rustynetd/src/phase10.rs`
+  - `crates/rustynet-backend-wireguard/src/lib.rs`
+  - `crates/rustynetd/tests/state_fetcher.rs`
+  - `crates/rustynet-backend-wireguard/tests/conformance.rs`
 - **Remaining for full HP-4**:
-  - Wire `RelayClient` into daemon reconcile loop
-  - Add relay endpoint refresh on token expiry
-  - Live integration tests (requires Unix environment)
+  - fix the retained-relay periodic direct-recovery regression still reproduced by `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay -- --exact --nocapture`,
+  - collect live WAN/NAT evidence for direct success, authenticated relay fallback, and secure failback,
+  - re-run current phase gate scripts after the remaining periodic reprobe regression is resolved.
 
 ## Phase HP-5: Hardening and Gates
 Deliverables:
@@ -340,4 +354,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

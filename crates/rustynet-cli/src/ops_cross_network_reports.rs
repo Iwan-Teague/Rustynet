@@ -13,6 +13,7 @@ const CHECK_PASS: &str = "pass";
 const CHECK_FAIL: &str = "fail";
 const DEFAULT_MAX_EVIDENCE_AGE_SECONDS: u64 = 2_678_400;
 const DEFAULT_ARTIFACT_DIR: &str = "artifacts/phase10";
+const DEFAULT_REQUIRED_NAT_PROFILES: &str = "baseline_lan";
 const SCHEMA_VERSION: i64 = 1;
 const PHASE_NAME: &str = "phase10";
 const EVIDENCE_MODE: &str = "measured";
@@ -718,6 +719,78 @@ fn parse_csv_unique(raw: &str) -> Vec<String> {
     out
 }
 
+fn normalize_required_nat_profiles(required_nat_profiles: &[String]) -> Vec<String> {
+    if required_nat_profiles.is_empty() {
+        return parse_csv_unique(DEFAULT_REQUIRED_NAT_PROFILES);
+    }
+    let joined = required_nat_profiles.join(",");
+    let parsed = parse_csv_unique(&joined);
+    if parsed.is_empty() {
+        parse_csv_unique(DEFAULT_REQUIRED_NAT_PROFILES)
+    } else {
+        parsed
+    }
+}
+
+fn validate_report_paths(
+    report_paths: &[PathBuf],
+    max_evidence_age_seconds: u64,
+    expected_git_commit: Option<&str>,
+    require_pass_status: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    for path in report_paths {
+        if !path.is_file() {
+            errors.push(format!("{}: missing report file", path.display()));
+            continue;
+        }
+        let payload = match parse_report_payload(path) {
+            Ok(payload) => payload,
+            Err(err) => {
+                errors.push(err);
+                continue;
+            }
+        };
+        errors.extend(validate_report_payload(
+            path,
+            &payload,
+            Some(max_evidence_age_seconds),
+            None,
+        ));
+        if let Some(expected) = expected_git_commit {
+            let got = payload
+                .as_object()
+                .and_then(|value| value.get("git_commit"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if got != expected {
+                errors.push(format!(
+                    "{}: git_commit {:?} does not match expected {:?}",
+                    path.display(),
+                    got,
+                    expected
+                ));
+            }
+        }
+        if require_pass_status {
+            let status = payload
+                .as_object()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if status != CHECK_PASS {
+                errors.push(format!(
+                    "{}: status must be 'pass' for gate usage",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
 fn collect_matrix_paths(
     reports: &[PathBuf],
     artifact_dir: Option<PathBuf>,
@@ -752,6 +825,43 @@ fn collect_matrix_paths(
     }
     out.sort();
     Ok(out)
+}
+
+pub fn default_required_nat_profiles() -> Vec<String> {
+    parse_csv_unique(DEFAULT_REQUIRED_NAT_PROFILES)
+}
+
+pub fn validate_cross_network_remote_exit_readiness(
+    artifact_dir: &Path,
+    max_evidence_age_seconds: u64,
+    expected_git_commit: Option<&str>,
+    required_nat_profiles: &[String],
+) -> Result<(), String> {
+    let report_paths = collect_report_paths(&[], Some(artifact_dir.to_path_buf()))?;
+    let mut errors = validate_report_paths(
+        &report_paths,
+        max_evidence_age_seconds,
+        expected_git_commit,
+        true,
+    );
+
+    let matrix_paths = collect_matrix_paths(&[], Some(artifact_dir.to_path_buf()))?;
+    let (records, matrix_errors) = discover_matrix_records(
+        &matrix_paths,
+        max_evidence_age_seconds,
+        expected_git_commit,
+        true,
+    );
+    errors.extend(matrix_errors);
+
+    let normalized_profiles = normalize_required_nat_profiles(required_nat_profiles);
+    errors.extend(validate_matrix(&records, &normalized_profiles));
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 fn discover_matrix_records(
@@ -1126,55 +1236,12 @@ pub fn execute_ops_validate_cross_network_remote_exit_reports(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let mut errors = Vec::new();
-
-    for path in &report_paths {
-        if !path.is_file() {
-            errors.push(format!("{}: missing report file", path.display()));
-            continue;
-        }
-        let payload = match parse_report_payload(path) {
-            Ok(payload) => payload,
-            Err(err) => {
-                errors.push(err);
-                continue;
-            }
-        };
-        errors.extend(validate_report_payload(
-            path,
-            &payload,
-            Some(config.max_evidence_age_seconds),
-            None,
-        ));
-        if let Some(expected) = expected_git_commit.as_deref() {
-            let got = payload
-                .as_object()
-                .and_then(|value| value.get("git_commit"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if got != expected {
-                errors.push(format!(
-                    "{}: git_commit {:?} does not match expected {:?}",
-                    path.display(),
-                    got,
-                    expected
-                ));
-            }
-        }
-        if config.require_pass_status {
-            let status = payload
-                .as_object()
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if status != CHECK_PASS {
-                errors.push(format!(
-                    "{}: status must be 'pass' for gate usage",
-                    path.display()
-                ));
-            }
-        }
-    }
+    let errors = validate_report_paths(
+        &report_paths,
+        config.max_evidence_age_seconds,
+        expected_git_commit.as_deref(),
+        config.require_pass_status,
+    );
 
     if let Some(output) = config.output {
         let output_path = resolve_path(&output)?;
@@ -1195,12 +1262,7 @@ pub fn execute_ops_validate_cross_network_nat_matrix(
     config: ValidateCrossNetworkNatMatrixConfig,
 ) -> Result<String, String> {
     let report_paths = collect_matrix_paths(&config.reports, config.artifact_dir)?;
-    let required_nat_profiles = if config.required_nat_profiles.is_empty() {
-        parse_csv_unique("baseline_lan")
-    } else {
-        let joined = config.required_nat_profiles.join(",");
-        parse_csv_unique(&joined)
-    };
+    let required_nat_profiles = normalize_required_nat_profiles(&config.required_nat_profiles);
     let expected_git_commit = config
         .expected_git_commit
         .as_deref()
@@ -1494,4 +1556,189 @@ pub fn execute_ops_write_cross_network_soak_monitor_summary(
     )
     .map_err(|err| format!("write monitor summary failed ({}): {err}", path.display()))?;
     Ok(path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_GIT_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn create() -> Result<Self, String> {
+            let path = std::env::temp_dir().join(format!(
+                "rustynet-cross-network-tests-{}-{}-{}",
+                std::process::id(),
+                unix_now(),
+                TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path)
+                .map_err(|err| format!("create temp dir failed ({}): {err}", path.display()))?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            self.path.as_path()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn report_payload_for_test(
+        spec: &CrossNetworkReportSpec,
+        artifact_dir: &Path,
+        status: &str,
+    ) -> Result<Value, String> {
+        let source_path = artifact_dir.join(format!("{}_source.txt", spec.suite));
+        let log_path = artifact_dir.join(format!("{}_log.txt", spec.suite));
+        fs::write(&source_path, "measured source\n")
+            .map_err(|err| format!("write source artifact failed: {err}"))?;
+        fs::write(&log_path, "measured log\n")
+            .map_err(|err| format!("write log artifact failed: {err}"))?;
+
+        let mut participants = Map::new();
+        for field in spec.required_participants {
+            participants.insert(
+                (*field).to_string(),
+                Value::String(format!("{field}-value")),
+            );
+        }
+
+        let mut network_context = Map::new();
+        network_context.insert(
+            "client_network_id".to_string(),
+            Value::String("net-client".to_string()),
+        );
+        network_context.insert(
+            "exit_network_id".to_string(),
+            Value::String("net-exit".to_string()),
+        );
+        network_context.insert(
+            "nat_profile".to_string(),
+            Value::String("baseline_lan".to_string()),
+        );
+        network_context.insert(
+            "impairment_profile".to_string(),
+            Value::String("none".to_string()),
+        );
+        if spec.required_network_fields.contains(&"relay_network_id") {
+            network_context.insert(
+                "relay_network_id".to_string(),
+                Value::String("net-relay".to_string()),
+            );
+        }
+
+        let mut checks = Map::new();
+        for check in spec.required_checks {
+            checks.insert((*check).to_string(), Value::String(CHECK_PASS.to_string()));
+        }
+
+        let mut payload = json!({
+            "schema_version": SCHEMA_VERSION,
+            "phase": PHASE_NAME,
+            "suite": spec.suite,
+            "environment": "unit_test",
+            "evidence_mode": EVIDENCE_MODE,
+            "captured_at_unix": unix_now(),
+            "git_commit": TEST_GIT_COMMIT,
+            "status": status,
+            "participants": Value::Object(participants),
+            "network_context": Value::Object(network_context),
+            "checks": Value::Object(checks),
+            "source_artifacts": [source_path.display().to_string()],
+            "log_artifacts": [log_path.display().to_string()],
+            "implementation_state": "live_measured_validator",
+        });
+        if status == CHECK_FAIL {
+            payload.as_object_mut().expect("payload object").insert(
+                "failure_summary".to_string(),
+                Value::String("simulated failure".to_string()),
+            );
+        }
+        Ok(payload)
+    }
+
+    fn write_valid_report(artifact_dir: &Path, suite: &str) -> Result<PathBuf, String> {
+        let spec = report_spec_by_suite(suite).ok_or_else(|| format!("unknown suite {suite}"))?;
+        let report_path = artifact_dir.join(spec.filename);
+        let payload = report_payload_for_test(spec, artifact_dir, CHECK_PASS)?;
+        let rendered = serde_json::to_string_pretty(&payload)
+            .map_err(|err| format!("serialize test report failed: {err}"))?;
+        fs::write(&report_path, format!("{rendered}\n")).map_err(|err| {
+            format!(
+                "write test report failed ({}): {err}",
+                report_path.display()
+            )
+        })?;
+        Ok(report_path)
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_pass_status_with_failed_required_check() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_direct_remote_exit").expect("direct spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        payload["checks"]["direct_remote_exit_success"] = Value::String(CHECK_FAIL.to_string());
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.iter().any(|entry| entry.contains(
+                "status=pass requires all required checks to pass; failing checks: direct_remote_exit_success"
+            )),
+            "expected pass-with-failing-check error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_cross_network_remote_exit_readiness_rejects_missing_canonical_reports() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let err = validate_cross_network_remote_exit_readiness(
+            temp_dir.path(),
+            60,
+            Some(TEST_GIT_COMMIT),
+            &default_required_nat_profiles(),
+        )
+        .expect_err("missing canonical reports must fail");
+
+        assert!(
+            err.contains("cross_network_direct_remote_exit_report.json: missing report file"),
+            "expected missing canonical direct report error, got: {err}"
+        );
+        assert!(
+            err.contains(
+                "missing matrix evidence: suite=cross_network_direct_remote_exit nat_profile=baseline_lan"
+            ),
+            "expected missing matrix coverage error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        for spec in REPORT_SPECS {
+            write_valid_report(temp_dir.path(), spec.suite).expect("write valid report");
+        }
+
+        validate_cross_network_remote_exit_readiness(
+            temp_dir.path(),
+            60,
+            Some(TEST_GIT_COMMIT),
+            &default_required_nat_profiles(),
+        )
+        .expect("complete canonical reports should validate");
+    }
 }

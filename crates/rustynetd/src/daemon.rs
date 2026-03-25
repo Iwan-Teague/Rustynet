@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,7 +18,6 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::stun_client::StunClient;
 use crate::ipc::{
     CommandEnvelope, IpcCommand, IpcResponse, RemoteCommandEnvelope,
     read_command_envelope as ipc_read_command_envelope, validate_cidr,
@@ -48,6 +47,7 @@ use crate::relay_client::{RelayClient, RelayClientConfig};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
+use crate::stun_client::StunClient;
 use crate::traversal::{
     CandidateSource as ProbeCandidateSource,
     DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES as TRAVERSAL_DEFAULT_MAX_CANDIDATES,
@@ -85,11 +85,11 @@ use rustynet_backend_wireguard::MacosWireguardBackend;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
+use rustynet_control::derive_endpoint_hint_signing_key;
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
 };
-use rustynet_control::derive_endpoint_hint_signing_key;
 use rustynet_dns_zone::{
     DnsZoneError, DnsZoneWatermark, SignedDnsZoneBundle as DnsZoneBundle,
     canonicalize_dns_zone_name, dns_zone_payload_digest, dns_zone_watermark_ordering,
@@ -1797,7 +1797,9 @@ impl TunnelBackend for DaemonBackend {
         node_id: &NodeId,
     ) -> Result<Option<u64>, BackendError> {
         match self {
-            DaemonBackend::InMemory(backend) => backend.peer_latest_handshake_unix(node_id),
+            DaemonBackend::InMemory(backend) => {
+                backend.cached_peer_latest_handshake_unix_for_test(node_id)
+            }
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.peer_latest_handshake_unix(node_id),
             #[cfg(target_os = "macos")]
@@ -2030,9 +2032,7 @@ impl SignedStateRefreshReason {
 fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, DaemonError> {
     match (
         config.relay_session_signing_secret_path.as_ref(),
-        config
-            .relay_session_signing_secret_passphrase_path
-            .as_ref(),
+        config.relay_session_signing_secret_passphrase_path.as_ref(),
     ) {
         (None, None) => Ok(None),
         (Some(_), None) => Err(DaemonError::InvalidConfig(format!(
@@ -2048,17 +2048,18 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
             let signing_key = derive_endpoint_hint_signing_key(signing_secret);
             let mut relay_client = RelayClient::new(
-                config.node_id.clone(),
+                NodeId::new(config.node_id.clone())
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
                 Arc::new(signing_key),
                 RelayClientConfig::default(),
             );
-            let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-                .map_err(|err| {
+            let socket =
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).map_err(|err| {
                     DaemonError::Io(format!("bind relay client socket failed: {err}"))
                 })?;
-            relay_client.bind(socket).map_err(|err| {
-                DaemonError::Io(format!("initialize relay client failed: {err}"))
-            })?;
+            relay_client
+                .bind(socket)
+                .map_err(|err| DaemonError::Io(format!("initialize relay client failed: {err}")))?;
             Ok(Some(relay_client))
         }
     }
@@ -2172,7 +2173,10 @@ impl DaemonRuntime {
                     if servers.is_empty() {
                         return;
                     }
-                    let client = StunClient::new(servers, timeout);
+                    let client = StunClient::new(
+                        servers.into_iter().map(|addr| addr.to_string()).collect(),
+                        timeout,
+                    );
                     // Initial jitter
                     sleep(Duration::from_millis(500));
                     loop {
@@ -2180,7 +2184,9 @@ impl DaemonRuntime {
                         if !ips.is_empty() {
                             let _ = tx.send(ips);
                         }
-                        sleep(Duration::from_secs(DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS));
+                        sleep(Duration::from_secs(
+                            DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS,
+                        ));
                     }
                 });
                 Some(rx)
@@ -3187,7 +3193,14 @@ impl DaemonRuntime {
         } else {
             self.local_host_candidates
                 .iter()
-                .map(|addr| addr.to_string())
+                .map(|(iface, addrs)| {
+                    let ips = addrs
+                        .iter()
+                        .map(|addr| addr.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{iface}={ips}")
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -3225,36 +3238,40 @@ impl DaemonRuntime {
                 continue;
             }
             for ip in addrs {
-                 if ip.is_loopback() { continue; }
-                 
-                 candidates.push(ProbeTraversalCandidate {
-                     endpoint: SocketEndpoint {
-                         addr: *ip,
-                         port: self.wg_listen_port,
-                     },
-                     source: ProbeCandidateSource::Host,
-                     priority: 300,
-                     observed_at_unix: unix_now(),
-                 });
+                if ip.is_loopback() {
+                    continue;
+                }
+
+                candidates.push(ProbeTraversalCandidate {
+                    endpoint: SocketEndpoint {
+                        addr: *ip,
+                        port: self.wg_listen_port,
+                    },
+                    source: ProbeCandidateSource::Host,
+                    priority: 300,
+                    observed_at_unix: unix_now(),
+                });
             }
         }
         // STUN candidates
         for endpoint in &self.local_stun_candidates {
-             candidates.push(ProbeTraversalCandidate {
-                 endpoint: SocketEndpoint::from(*endpoint),
-                 source: ProbeCandidateSource::ServerReflexive,
-                 priority: 200,
-                 observed_at_unix: unix_now(),
-             });
+            candidates.push(ProbeTraversalCandidate {
+                endpoint: SocketEndpoint {
+                    addr: endpoint.ip(),
+                    port: endpoint.port(),
+                },
+                source: ProbeCandidateSource::ServerReflexive,
+                priority: 200,
+                observed_at_unix: unix_now(),
+            });
         }
         candidates
     }
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         if let Some(relay_client) = self.relay_client.as_mut() {
-            relay_client.cleanup_idle_sessions(Duration::from_secs(
-                self.relay_session_idle_timeout_secs,
-            ));
+            relay_client
+                .cleanup_idle_sessions(Duration::from_secs(self.relay_session_idle_timeout_secs));
         }
         if !matches!(
             self.controller.state(),
@@ -3528,7 +3545,8 @@ impl DaemonRuntime {
         bundle: &TraversalBundleEnvelope,
         now_unix: u64,
     ) -> Result<Option<SocketEndpoint>, String> {
-        let Some(relay_candidate) = select_runtime_relay_candidate(&bundle.bundle.candidates)? else {
+        let Some(relay_candidate) = select_runtime_relay_candidate(&bundle.bundle.candidates)?
+        else {
             return Ok(None);
         };
         let Some(relay_client) = self.relay_client.as_mut() else {
@@ -6362,14 +6380,18 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         }
     }
     if config.relay_session_signing_secret_path.is_some()
-        && config.relay_session_signing_secret_passphrase_path.is_none()
+        && config
+            .relay_session_signing_secret_passphrase_path
+            .is_none()
     {
         return Err(DaemonError::InvalidConfig(format!(
             "{} is required when {} is set",
             ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV, ASSIGNMENT_SIGNING_SECRET_ENV
         )));
     }
-    if config.relay_session_signing_secret_passphrase_path.is_some()
+    if config
+        .relay_session_signing_secret_passphrase_path
+        .is_some()
         && config.relay_session_signing_secret_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(format!(
@@ -6377,11 +6399,9 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             ASSIGNMENT_SIGNING_SECRET_ENV, ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV
         )));
     }
-    if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get()
-    {
+    if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get() {
         return Err(DaemonError::InvalidConfig(
-            "relay session refresh margin must be less than relay session token ttl"
-                .to_string(),
+            "relay session refresh margin must be less than relay session token ttl".to_string(),
         ));
     }
     if config.auto_tunnel_enforce
@@ -9550,9 +9570,7 @@ mod tests {
         trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
         zeroize_optional_bytes,
     };
-    use crate::phase10::{
-        DataplaneState, PathMode, TraversalProbeDecision, TraversalProbeReason,
-    };
+    use crate::phase10::{DataplaneState, PathMode, TraversalProbeDecision, TraversalProbeReason};
 
     fn hex_encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -10842,15 +10860,31 @@ mod tests {
             },
         );
         relay_client
-            .bind(UdpSocket::bind("127.0.0.1:0").expect("test relay socket should bind"))
+            .bind(UdpSocket::bind("0.0.0.0:0").expect("test relay socket should bind"))
             .expect("test relay client should bind");
         relay_client
     }
 
-    fn spawn_mock_relay_server(
-        allocated_ports: &[u16],
-    ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("mock relay socket should bind");
+    fn discover_test_relay_ip() -> std::net::IpAddr {
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("probe socket should bind");
+        socket
+            .connect("8.8.8.8:80")
+            .expect("probe socket should determine local interface");
+        let ip = socket
+            .local_addr()
+            .expect("probe local addr should be available")
+            .ip();
+        assert!(
+            !ip.is_loopback() && !ip.is_unspecified(),
+            "test relay ip must be routable and non-special"
+        );
+        ip
+    }
+
+    fn spawn_mock_relay_server(allocated_ports: &[u16]) -> (SocketAddr, thread::JoinHandle<()>) {
+        let relay_ip = discover_test_relay_ip();
+        let socket =
+            UdpSocket::bind(SocketAddr::new(relay_ip, 0)).expect("mock relay socket should bind");
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("mock relay timeout should be set");
@@ -10864,9 +10898,10 @@ mod tests {
                 let (_len, from_addr) = socket
                     .recv_from(&mut buf)
                     .expect("mock relay should receive hello");
+                let session_id = [(index as u8).saturating_add(1); 16];
                 let mut ack = Vec::with_capacity(11);
                 ack.push(0x02);
-                ack.extend_from_slice(&(10_000u64 + index as u64).to_be_bytes());
+                ack.extend_from_slice(&session_id);
                 ack.extend_from_slice(&allocated_port.to_be_bytes());
                 socket
                     .send_to(&ack, from_addr)
@@ -10877,7 +10912,9 @@ mod tests {
     }
 
     fn spawn_silent_relay_server() -> (SocketAddr, thread::JoinHandle<()>) {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("silent relay socket should bind");
+        let relay_ip = discover_test_relay_ip();
+        let socket =
+            UdpSocket::bind(SocketAddr::new(relay_ip, 0)).expect("silent relay socket should bind");
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("silent relay timeout should be set");
@@ -10959,6 +10996,17 @@ mod tests {
         };
         let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         (runtime, test_dir)
+    }
+
+    fn seed_local_probe_candidate(runtime: &mut DaemonRuntime) {
+        runtime.local_host_candidates.insert(
+            "eth-test".to_string(),
+            vec![
+                "192.0.2.10"
+                    .parse()
+                    .expect("probe candidate ip should parse"),
+            ],
+        );
     }
 
     fn write_traversal_file_set(
@@ -11178,6 +11226,40 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("traversal bundle path must be absolute")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relative_relay_session_signing_paths() {
+        let config = DaemonConfig {
+            relay_session_signing_secret_path: Some(std::path::PathBuf::from("relative.secret")),
+            relay_session_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/relay.passphrase",
+            )),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relative relay signing secret path must be rejected");
+        assert!(
+            err.to_string()
+                .contains("relay session signing secret path must be absolute")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relay_session_refresh_margin_not_less_than_ttl() {
+        let config = DaemonConfig {
+            relay_session_token_ttl_secs: NonZeroU64::new(30)
+                .expect("relay token ttl should be non-zero"),
+            relay_session_refresh_margin_secs: NonZeroU64::new(30)
+                .expect("relay refresh margin should be non-zero"),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relay refresh margin >= ttl must be rejected");
+        assert!(
+            err.to_string()
+                .contains("relay session refresh margin must be less than relay session token ttl")
         );
     }
 
@@ -12359,6 +12441,8 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        seed_local_probe_candidate(&mut runtime);
+        runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
         assert_eq!(
@@ -12492,7 +12576,11 @@ mod tests {
         };
         assert_eq!(
             runtime.controller.peer_path(&exit_node),
-            Some(PathMode::Relay)
+            Some(PathMode::Relay),
+            "controller_state={:?} traversal_hint_error={:?} bootstrap_error={:?}",
+            runtime.controller.state(),
+            runtime.traversal_hint_error,
+            runtime.bootstrap_error
         );
         assert_eq!(
             runtime.controller.managed_peer_endpoint(&exit_node),
@@ -12579,8 +12667,14 @@ mod tests {
             runtime.controller.managed_peer_endpoint(&exit_node),
             Some(expected_endpoint)
         );
-        assert_eq!(refreshed_status.evaluated_at_unix, initial_status.evaluated_at_unix);
-        assert_eq!(refreshed_status.next_reprobe_unix, initial_status.next_reprobe_unix);
+        assert_eq!(
+            refreshed_status.evaluated_at_unix,
+            initial_status.evaluated_at_unix
+        );
+        assert_eq!(
+            refreshed_status.next_reprobe_unix,
+            initial_status.next_reprobe_unix
+        );
 
         relay_handle
             .join()
@@ -12736,6 +12830,17 @@ mod tests {
             .get_mut(&exit_node)
             .expect("relay status should still exist")
             .next_reprobe_unix = Some(unix_now());
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(
+                SocketEndpoint {
+                    addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+                    port: 51820,
+                },
+                Some(unix_now()),
+            )
+            .expect("fresh direct handshake should be visible for due reprobe");
 
         runtime
             .sync_traversal_runtime_state(false)
@@ -12834,6 +12939,7 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        seed_local_probe_candidate(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
@@ -12968,6 +13074,7 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
+        seed_local_probe_candidate(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");

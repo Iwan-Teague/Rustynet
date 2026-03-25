@@ -45,8 +45,8 @@ use rustynet_crypto::{
     KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
 };
 use rustynet_dns_zone::{
-    canonicalize_dns_zone_name, parse_dns_zone_verifying_key, parse_signed_dns_zone_bundle_wire,
-    verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
+    canonicalize_dns_relative_name, canonicalize_dns_zone_name, parse_dns_zone_verifying_key,
+    parse_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle as verify_dns_zone_bundle,
 };
 use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
@@ -72,6 +72,14 @@ use zeroize::{Zeroize, Zeroizing};
 const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 90;
 const PINNED_RUNTIME_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
+const DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_LINES: usize = 16_384;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES: usize = 4_096;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES: usize = 128;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES: usize = 1_536;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH: usize = 5;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT: usize = 1_024;
+const DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -2297,7 +2305,7 @@ fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, S
             zone_name: parser
                 .value("--zone-name")
                 .unwrap_or_else(|| "rustynet".to_string()),
-            records_path: parser.required_path("--records-json")?,
+            records_path: parser.required_path("--records-manifest")?,
             generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
             ttl_secs: parser.parse_u64_or_default("--ttl-secs", 300)?,
             nonce: parser.parse_u64_or_default("--nonce", generate_assignment_nonce())?,
@@ -2541,8 +2549,8 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
         ttl_secs,
         nonce,
     } = command;
-    ensure_regular_file_no_symlink(&records_path, "dns zone records json")?;
-    let records = load_dns_zone_records_json(&records_path)?;
+    ensure_regular_file_no_symlink(&records_path, "dns zone records manifest")?;
+    let records = load_dns_zone_records_manifest(&records_path)?;
     let signing_secret =
         load_assignment_signing_secret(&signing_secret_path, &signing_secret_passphrase_path)?;
 
@@ -9494,57 +9502,146 @@ fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpe
     Ok(candidates)
 }
 
-fn load_dns_zone_records_json(path: &Path) -> Result<Vec<DnsZoneRecordSpec>, String> {
+fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>, String> {
     let contents = fs::read_to_string(path)
-        .map_err(|err| format!("read dns zone records json failed: {err}"))?;
-    let value: Value = serde_json::from_str(&contents)
-        .map_err(|err| format!("parse dns zone records json failed: {err}"))?;
-    let Value::Array(entries) = value else {
-        return Err("dns zone records json must be an array".to_string());
-    };
-    if entries.is_empty() {
-        return Err("dns zone records json must contain at least one record".to_string());
+        .map_err(|err| format!("read dns zone records manifest failed: {err}"))?;
+    if contents.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "dns zone records manifest exceeds maximum size ({} bytes)",
+            DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES
+        ));
     }
 
-    let mut records = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.into_iter().enumerate() {
-        let Value::Object(mut object) = entry else {
-            return Err(format!("dns zone record {index} must be a JSON object"));
-        };
-        let label = match object.remove("label") {
-            Some(Value::String(value)) => value,
-            _ => return Err(format!("dns zone record {index} missing string label")),
-        };
-        let target_node_id = match object.remove("target_node_id") {
-            Some(Value::String(value)) => value,
-            _ => {
-                return Err(format!(
-                    "dns zone record {index} missing string target_node_id"
-                ));
-            }
-        };
-        let ttl_secs = match object.remove("ttl_secs") {
-            Some(Value::Number(value)) => value.as_u64().ok_or_else(|| {
-                format!("dns zone record {index} ttl_secs must be an unsigned integer")
-            })?,
-            _ => return Err(format!("dns zone record {index} missing integer ttl_secs")),
-        };
-        let aliases = match object.remove("aliases") {
-            Some(Value::Array(values)) => values
-                .into_iter()
-                .map(|value| match value {
-                    Value::String(alias) => Ok(alias),
-                    _ => Err(format!("dns zone record {index} aliases must be strings")),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            None => Vec::new(),
-            _ => return Err(format!("dns zone record {index} aliases must be an array")),
-        };
-        if !object.is_empty() {
+    let mut fields = std::collections::BTreeMap::<String, String>::new();
+    let mut line_count = 0usize;
+    for raw_line in contents.lines() {
+        line_count = line_count.saturating_add(1);
+        if line_count > DNS_ZONE_RECORDS_MANIFEST_MAX_LINES {
             return Err(format!(
-                "dns zone record {index} contains unsupported fields"
+                "dns zone records manifest exceeds maximum line count ({})",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_LINES
             ));
         }
+        if raw_line.is_empty() {
+            return Err("dns zone records manifest must not contain blank lines".to_string());
+        }
+        if raw_line.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES {
+            return Err(format!(
+                "dns zone records manifest line exceeds maximum size ({} bytes)",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES
+            ));
+        }
+        let (raw_key, raw_value) = raw_line
+            .split_once('=')
+            .ok_or_else(|| "invalid dns zone records manifest line".to_string())?;
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() {
+            return Err("dns zone records manifest key must not be empty".to_string());
+        }
+        if key != raw_key || value != raw_value {
+            return Err(format!(
+                "dns zone records manifest field must not contain leading or trailing whitespace: {key}"
+            ));
+        }
+        if key.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES {
+            return Err(format!(
+                "dns zone records manifest key exceeds maximum size ({} bytes)",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES
+            ));
+        }
+        if value.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES {
+            return Err(format!(
+                "dns zone records manifest value exceeds maximum size ({} bytes)",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES
+            ));
+        }
+        if key.split('.').count() > DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH {
+            return Err(format!(
+                "dns zone records manifest key depth exceeds maximum depth ({})",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH
+            ));
+        }
+        if !is_allowed_dns_zone_records_manifest_key(key) {
+            return Err(format!(
+                "unsupported dns zone records manifest field: {key}"
+            ));
+        }
+        if fields.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!("duplicate dns zone records manifest field: {key}"));
+        }
+    }
+
+    if fields.is_empty() {
+        return Err("dns zone records manifest is empty".to_string());
+    }
+    if fields.get("version").map(String::as_str) != Some("1") {
+        return Err("unsupported dns zone records manifest version".to_string());
+    }
+
+    let record_count = parse_dns_zone_records_manifest_usize_field(&fields, "record_count")?;
+    if record_count == 0 || record_count > DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT {
+        return Err(format!(
+            "dns zone records manifest record_count must be in range 1..={}",
+            DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT
+        ));
+    }
+
+    let mut expected_field_count = 2usize;
+    let mut records = Vec::with_capacity(record_count);
+    for index in 0..record_count {
+        let label = canonicalize_dns_relative_name(required_dns_zone_records_manifest_field(
+            &fields, index, "label",
+        )?)
+        .map_err(|err| format!("dns zone record {index} label is invalid: {err}"))?;
+        let target_node_id =
+            required_dns_zone_records_manifest_field(&fields, index, "target_node_id")?
+                .trim()
+                .to_string();
+        if target_node_id.is_empty() {
+            return Err(format!(
+                "dns zone record {index} target_node_id must not be empty"
+            ));
+        }
+        let ttl_secs =
+            parse_dns_zone_records_manifest_indexed_u64_field(&fields, index, "ttl_secs")?;
+        if ttl_secs == 0 || ttl_secs > 300 {
+            return Err(format!(
+                "dns zone record {index} ttl_secs must be in range 1..=300"
+            ));
+        }
+        let alias_count =
+            parse_dns_zone_records_manifest_indexed_usize_field(&fields, index, "alias_count")?;
+        if alias_count > DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT {
+            return Err(format!(
+                "dns zone record {index} alias_count exceeds maximum ({})",
+                DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT
+            ));
+        }
+        expected_field_count = expected_field_count
+            .checked_add(4)
+            .and_then(|value| value.checked_add(alias_count))
+            .ok_or_else(|| "dns zone records manifest field count overflow".to_string())?;
+
+        let mut aliases = Vec::with_capacity(alias_count);
+        let mut seen_aliases = HashSet::new();
+        for alias_index in 0..alias_count {
+            let alias = canonicalize_dns_relative_name(required_dns_zone_records_manifest_alias(
+                &fields,
+                index,
+                alias_index,
+            )?)
+            .map_err(|err| {
+                format!("dns zone record {index} alias {alias_index} is invalid: {err}")
+            })?;
+            if !seen_aliases.insert(alias.clone()) {
+                return Err(format!(
+                    "dns zone record {index} contains duplicate aliases"
+                ));
+            }
+            aliases.push(alias);
+        }
+
         records.push(DnsZoneRecordSpec {
             label,
             target_node_id,
@@ -9553,7 +9650,95 @@ fn load_dns_zone_records_json(path: &Path) -> Result<Vec<DnsZoneRecordSpec>, Str
         });
     }
 
+    if fields.len() != expected_field_count {
+        return Err(format!(
+            "dns zone records manifest field count mismatch: expected {expected_field_count}, found {}",
+            fields.len()
+        ));
+    }
+
     Ok(records)
+}
+
+fn required_dns_zone_records_manifest_field<'a>(
+    fields: &'a std::collections::BTreeMap<String, String>,
+    index: usize,
+    field: &str,
+) -> Result<&'a str, String> {
+    let key = format!("record.{index}.{field}");
+    fields
+        .get(&key)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing {key}"))
+}
+
+fn required_dns_zone_records_manifest_alias<'a>(
+    fields: &'a std::collections::BTreeMap<String, String>,
+    record_index: usize,
+    alias_index: usize,
+) -> Result<&'a str, String> {
+    let key = format!("record.{record_index}.alias.{alias_index}");
+    fields
+        .get(&key)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing {key}"))
+}
+
+fn parse_dns_zone_records_manifest_usize_field(
+    fields: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<usize, String> {
+    fields
+        .get(key)
+        .ok_or_else(|| format!("missing {key}"))?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {key}"))
+}
+
+fn parse_dns_zone_records_manifest_indexed_usize_field(
+    fields: &std::collections::BTreeMap<String, String>,
+    index: usize,
+    field: &str,
+) -> Result<usize, String> {
+    required_dns_zone_records_manifest_field(fields, index, field)?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid record.{index}.{field}"))
+}
+
+fn parse_dns_zone_records_manifest_indexed_u64_field(
+    fields: &std::collections::BTreeMap<String, String>,
+    index: usize,
+    field: &str,
+) -> Result<u64, String> {
+    required_dns_zone_records_manifest_field(fields, index, field)?
+        .parse::<u64>()
+        .map_err(|_| format!("invalid record.{index}.{field}"))
+}
+
+fn is_allowed_dns_zone_records_manifest_key(key: &str) -> bool {
+    matches!(key, "version" | "record_count")
+        || dns_zone_records_manifest_indexed_key(key).is_some()
+}
+
+fn dns_zone_records_manifest_indexed_key(key: &str) -> Option<()> {
+    let mut parts = key.split('.');
+    if parts.next()? != "record" {
+        return None;
+    }
+    parts.next()?.parse::<usize>().ok()?;
+    match parts.next()? {
+        "label" | "target_node_id" | "ttl_secs" | "alias_count" if parts.next().is_none() => {
+            Some(())
+        }
+        "alias" => {
+            parts.next()?.parse::<usize>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(())
+        }
+        _ => None,
+    }
 }
 
 fn validate_assignment_issue_config(
@@ -9857,7 +10042,7 @@ fn help_text() -> String {
         "  exit-node off",
         "  lan-access on|off",
         "  dns inspect",
-        "  dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-json <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
+        "  dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-manifest <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
         "  dns zone verify --bundle <path> --verifier-key <path> [--expected-zone-name <name>] [--expected-subject-node-id <id>]",
         "  traversal issue --signing-secret <path> --signing-secret-passphrase-file <path> --source-node-id <id> --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --candidates <type|endpoint|priority[|relay_id];...> --output <path> [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]",
         "  traversal verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-source-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
@@ -9992,7 +10177,7 @@ fn help_text() -> String {
 mod tests {
     use super::{
         CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute,
-        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_json,
+        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
         load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
         parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
@@ -10045,8 +10230,8 @@ mod tests {
             "node-a|192.0.2.1:51820|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             "--allow".to_string(),
             "node-a|node-a".to_string(),
-            "--records-json".to_string(),
-            "/tmp/dns-records.json".to_string(),
+            "--records-manifest".to_string(),
+            "/tmp/dns-records.manifest".to_string(),
             "--output".to_string(),
             "/tmp/dns-zone.bundle".to_string(),
         ]);
@@ -10113,21 +10298,87 @@ mod tests {
     }
 
     #[test]
-    fn dns_zone_records_json_rejects_unknown_fields() {
+    fn dns_zone_records_manifest_rejects_unknown_fields() {
         let base = std::env::temp_dir().join(format!(
-            "rustynet-dns-zone-records-{}-{}",
+            "rustynet-dns-zone-records-manifest-{}-{}",
             std::process::id(),
             super::generate_assignment_nonce()
         ));
         fs::create_dir_all(&base).expect("temp dir should exist");
-        let path = base.join("records.json");
+        let path = base.join("records.manifest");
         fs::write(
             &path,
-            r#"[{"label":"app","target_node_id":"node-a","ttl_secs":60,"aliases":["ssh"],"unexpected":true}]"#,
+            "version=1\nrecord_count=1\nrecord.0.label=app\nrecord.0.target_node_id=node-a\nrecord.0.ttl_secs=60\nrecord.0.alias_count=1\nrecord.0.alias.0=ssh\nrecord.0.unexpected=true\n",
         )
-        .expect("records json should be written");
-        let err = load_dns_zone_records_json(&path).expect_err("unknown fields must fail");
-        assert!(err.contains("unsupported fields"));
+        .expect("records manifest should be written");
+        let err = load_dns_zone_records_manifest(&path).expect_err("unknown fields must fail");
+        assert!(err.contains("unsupported dns zone records manifest field"));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dns_zone_records_manifest_rejects_sparse_alias_indices() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-dns-zone-records-manifest-sparse-{}-{}",
+            std::process::id(),
+            super::generate_assignment_nonce()
+        ));
+        fs::create_dir_all(&base).expect("temp dir should exist");
+        let path = base.join("records.manifest");
+        fs::write(
+            &path,
+            "version=1\nrecord_count=1\nrecord.0.label=app\nrecord.0.target_node_id=node-a\nrecord.0.ttl_secs=60\nrecord.0.alias_count=1\nrecord.0.alias.1=ssh\n",
+        )
+        .expect("records manifest should be written");
+        let err =
+            load_dns_zone_records_manifest(&path).expect_err("sparse alias indices must fail");
+        assert!(err.contains("missing record.0.alias.0"));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dns_zone_records_manifest_rejects_duplicate_aliases() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-dns-zone-records-manifest-duplicate-{}-{}",
+            std::process::id(),
+            super::generate_assignment_nonce()
+        ));
+        fs::create_dir_all(&base).expect("temp dir should exist");
+        let path = base.join("records.manifest");
+        fs::write(
+            &path,
+            "version=1\nrecord_count=1\nrecord.0.label=app\nrecord.0.target_node_id=node-a\nrecord.0.ttl_secs=60\nrecord.0.alias_count=2\nrecord.0.alias.0=ssh\nrecord.0.alias.1=ssh\n",
+        )
+        .expect("records manifest should be written");
+        let err = load_dns_zone_records_manifest(&path).expect_err("duplicate aliases must fail");
+        assert!(err.contains("duplicate aliases"));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dns_zone_records_manifest_loads_valid_manifest() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-dns-zone-records-manifest-valid-{}-{}",
+            std::process::id(),
+            super::generate_assignment_nonce()
+        ));
+        fs::create_dir_all(&base).expect("temp dir should exist");
+        let path = base.join("records.manifest");
+        fs::write(
+            &path,
+            "version=1\nrecord_count=1\nrecord.0.label=App\nrecord.0.target_node_id=node-a\nrecord.0.ttl_secs=60\nrecord.0.alias_count=2\nrecord.0.alias.0=SSH\nrecord.0.alias.1=gateway\n",
+        )
+        .expect("records manifest should be written");
+        let records = load_dns_zone_records_manifest(&path).expect("valid manifest should load");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].label, "app");
+        assert_eq!(
+            records[0].aliases,
+            vec!["ssh".to_string(), "gateway".to_string()]
+        );
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(base);
     }

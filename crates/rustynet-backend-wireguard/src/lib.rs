@@ -20,6 +20,7 @@ pub struct WireguardBackend {
     context: Option<RuntimeContext>,
     peers: BTreeMap<NodeId, PeerConfig>,
     peer_latest_handshakes_by_node: BTreeMap<NodeId, u64>,
+    peer_latest_handshakes_by_endpoint: BTreeMap<String, u64>,
     routes: Vec<Route>,
     exit_mode: ExitMode,
     stats: TunnelStats,
@@ -32,6 +33,7 @@ impl Default for WireguardBackend {
             context: None,
             peers: BTreeMap::new(),
             peer_latest_handshakes_by_node: BTreeMap::new(),
+            peer_latest_handshakes_by_endpoint: BTreeMap::new(),
             routes: Vec::new(),
             exit_mode: ExitMode::Off,
             stats: TunnelStats::default(),
@@ -40,6 +42,10 @@ impl Default for WireguardBackend {
 }
 
 impl WireguardBackend {
+    fn endpoint_cache_key(endpoint: SocketEndpoint) -> String {
+        format!("{}:{}", endpoint.addr, endpoint.port)
+    }
+
     fn ensure_running(&self) -> Result<(), BackendError> {
         if self.running {
             return Ok(());
@@ -149,6 +155,28 @@ impl WireguardBackend {
         } else {
             self.peer_latest_handshakes_by_node.remove(node_id);
         }
+        if let Some(peer) = self.peers.get(node_id) {
+            let endpoint_key = Self::endpoint_cache_key(peer.endpoint);
+            if let Some(timestamp) = latest_handshake_unix {
+                self.peer_latest_handshakes_by_endpoint
+                    .insert(endpoint_key, timestamp);
+            } else {
+                self.peer_latest_handshakes_by_endpoint
+                    .remove(&endpoint_key);
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn cached_peer_latest_handshake_unix_for_test(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<Option<u64>, BackendError> {
+        self.ensure_running()?;
+        if !self.peers.contains_key(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        Ok(self.peer_latest_handshakes_by_node.get(node_id).copied())
     }
 
     #[doc(hidden)]
@@ -173,6 +201,14 @@ impl WireguardBackend {
             } else {
                 self.peer_latest_handshakes_by_node.remove(&node_id);
             }
+        }
+        let endpoint_key = Self::endpoint_cache_key(endpoint);
+        if let Some(timestamp) = latest_handshake_unix {
+            self.peer_latest_handshakes_by_endpoint
+                .insert(endpoint_key, timestamp);
+        } else {
+            self.peer_latest_handshakes_by_endpoint
+                .remove(&endpoint_key);
         }
     }
 }
@@ -206,6 +242,15 @@ impl TunnelBackend for WireguardBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
+        let endpoint_key = Self::endpoint_cache_key(peer.endpoint);
+        if let Some(timestamp) = self
+            .peer_latest_handshakes_by_endpoint
+            .get(&endpoint_key)
+            .copied()
+        {
+            self.peer_latest_handshakes_by_node
+                .insert(peer.node_id.clone(), timestamp);
+        }
         self.peers.insert(peer.node_id.clone(), peer);
         self.refresh_stats();
         Ok(())
@@ -221,6 +266,15 @@ impl TunnelBackend for WireguardBackend {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
         peer.endpoint = endpoint;
+        let endpoint_key = Self::endpoint_cache_key(endpoint);
+        if let Some(timestamp) = self
+            .peer_latest_handshakes_by_endpoint
+            .get(&endpoint_key)
+            .copied()
+        {
+            self.peer_latest_handshakes_by_node
+                .insert(node_id.clone(), timestamp);
+        }
         Ok(())
     }
 
@@ -264,7 +318,11 @@ impl TunnelBackend for WireguardBackend {
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
-        self.peers.remove(node_id);
+        if let Some(peer) = self.peers.remove(node_id) {
+            let endpoint_key = Self::endpoint_cache_key(peer.endpoint);
+            self.peer_latest_handshakes_by_endpoint
+                .remove(&endpoint_key);
+        }
         self.peer_latest_handshakes_by_node.remove(node_id);
         self.refresh_stats();
         Ok(())
@@ -293,6 +351,7 @@ impl TunnelBackend for WireguardBackend {
         self.context = None;
         self.peers.clear();
         self.peer_latest_handshakes_by_node.clear();
+        self.peer_latest_handshakes_by_endpoint.clear();
         self.routes.clear();
         self.exit_mode = ExitMode::Off;
         self.stats = TunnelStats::default();
@@ -1634,6 +1693,7 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
+            interface_name: "rustynet0".to_string(),
             mesh_cidr: "100.64.0.1/32".to_string(),
             local_cidr: "100.64.0.1/32".to_string(),
         }
@@ -1679,6 +1739,41 @@ mod tests {
         assert_eq!(stats.peer_count, 1);
 
         backend.shutdown().expect("shutdown should succeed");
+    }
+
+    #[test]
+    fn in_memory_backend_promotes_cached_endpoint_handshake_on_endpoint_update() {
+        let mut backend = WireguardBackend::default();
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        let peer = sample_peer("peer-a");
+        let peer_id = peer.node_id.clone();
+        backend
+            .configure_peer(peer)
+            .expect("peer config should succeed");
+
+        let direct_endpoint = SocketEndpoint {
+            addr: "198.51.100.55".parse().expect("valid ip"),
+            port: 51820,
+        };
+        backend.set_endpoint_latest_handshake_unix_for_test(direct_endpoint, Some(4_242));
+        assert_eq!(
+            backend
+                .cached_peer_latest_handshake_unix_for_test(&peer_id)
+                .expect("cached handshake query should succeed"),
+            None
+        );
+
+        backend
+            .update_peer_endpoint(&peer_id, direct_endpoint)
+            .expect("endpoint update should succeed");
+        assert_eq!(
+            backend
+                .cached_peer_latest_handshake_unix_for_test(&peer_id)
+                .expect("cached handshake query should succeed"),
+            Some(4_242)
+        );
     }
 
     #[test]

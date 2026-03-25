@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use rustynet_backend_api::{NodeId, SocketEndpoint};
@@ -90,8 +90,7 @@ impl RelayClientSession {
 
     /// Returns true when the session token must be refreshed to avoid expiry.
     pub fn token_refresh_due(&self, now_unix: u64, refresh_margin_secs: u64) -> bool {
-        self.token_expires_at_unix
-            <= now_unix.saturating_add(refresh_margin_secs)
+        self.token_expires_at_unix <= now_unix.saturating_add(refresh_margin_secs)
     }
 }
 
@@ -215,23 +214,28 @@ impl RelayClient {
         // Create signed session token
         let token = RelaySessionToken::sign(
             &self.signing_key,
-            &self.node_id,
-            peer_node_id,
+            self.node_id.as_str(),
+            peer_node_id.as_str(),
             relay_id,
             ttl_secs,
         );
+        let token_expires_at_unix = token.expires_at_unix;
 
         // Build hello message
         let hello = RelayHello {
-            node_id: self.node_id.clone(),
-            peer_node_id: peer_node_id.clone(),
+            node_id: self.node_id.as_str().to_string(),
+            peer_node_id: peer_node_id.as_str().to_string(),
             session_token: token,
         };
 
         // Send hello to relay
-        let socket = self.socket.as_ref().ok_or(RelayClientError::Io(
-            io::Error::new(io::ErrorKind::NotConnected, "relay socket not bound"),
-        ))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or(RelayClientError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "relay socket not bound",
+            )))?;
 
         let hello_bytes = serialize_relay_hello(&hello);
         socket.send_to(&hello_bytes, relay_addr)?;
@@ -265,7 +269,7 @@ impl RelayClient {
                                 established_at: now,
                                 last_activity: now,
                                 relay_id,
-                                token_expires_at_unix: token.expires_at_unix,
+                                token_expires_at_unix,
                             };
                             let endpoint = session.effective_endpoint();
                             self.sessions.insert(peer_node_id.clone(), session);
@@ -290,7 +294,9 @@ impl RelayClient {
 
     /// Returns the relay endpoint for a peer, if a session exists.
     pub fn relay_endpoint_for_peer(&self, peer_node_id: &NodeId) -> Option<SocketEndpoint> {
-        self.sessions.get(peer_node_id).map(|s| s.effective_endpoint())
+        self.sessions
+            .get(peer_node_id)
+            .map(|s| s.effective_endpoint())
     }
 
     /// Closes the session for a peer.
@@ -408,19 +414,16 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
 
     match data[0] {
         RELAY_HELLO_ACK_MSG_TYPE => {
-            if data.len() < 11 {
+            if data.len() < 19 {
                 return Err("ack message too short".to_string());
             }
-            // Session ID (8 bytes)
-            let session_id_bytes: [u8; 8] = data[1..9]
-                .try_into()
-                .map_err(|_| "invalid session id")?;
-            let session_id = SessionId(u64::from_be_bytes(session_id_bytes));
+            // Session ID (16 bytes)
+            let session_id_bytes: [u8; 16] =
+                data[1..17].try_into().map_err(|_| "invalid session id")?;
+            let session_id = SessionId::from(session_id_bytes);
 
             // Allocated port (2 bytes)
-            let port_bytes: [u8; 2] = data[9..11]
-                .try_into()
-                .map_err(|_| "invalid port")?;
+            let port_bytes: [u8; 2] = data[17..19].try_into().map_err(|_| "invalid port")?;
             let allocated_port = u16::from_be_bytes(port_bytes);
 
             Ok(RelayHelloAck {
@@ -443,6 +446,11 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_node_id(value: &str) -> NodeId {
+        NodeId::new(value.to_string()).expect("test node id should parse")
+    }
 
     #[test]
     fn relay_client_config_has_reasonable_defaults() {
@@ -455,14 +463,14 @@ mod tests {
     #[test]
     fn relay_client_session_effective_endpoint() {
         let now_unix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let session = RelayClientSession {
-            session_id: SessionId(12345),
+            session_id: SessionId::from([0x11; 16]),
             relay_addr: "192.168.1.1:4500".parse().unwrap(),
             allocated_port: 5000,
-            peer_node_id: "peer-a".to_string(),
+            peer_node_id: test_node_id("peer-a"),
             established_at: Instant::now(),
             last_activity: Instant::now(),
             relay_id: [0xAA; 16],
@@ -470,21 +478,24 @@ mod tests {
         };
 
         let endpoint = session.effective_endpoint();
-        assert_eq!(endpoint.addr, "192.168.1.1".parse().unwrap());
+        assert_eq!(
+            endpoint.addr,
+            "192.168.1.1".parse::<std::net::IpAddr>().unwrap()
+        );
         assert_eq!(endpoint.port, 5000);
     }
 
     #[test]
     fn relay_client_session_idle_detection() {
         let now_unix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let mut session = RelayClientSession {
-            session_id: SessionId(12345),
+            session_id: SessionId::from([0x22; 16]),
             relay_addr: "192.168.1.1:4500".parse().unwrap(),
             allocated_port: 5000,
-            peer_node_id: "peer-a".to_string(),
+            peer_node_id: test_node_id("peer-a"),
             established_at: Instant::now(),
             last_activity: Instant::now(),
             relay_id: [0xAA; 16],
@@ -517,12 +528,13 @@ mod tests {
 
     #[test]
     fn parse_relay_hello_ack_valid() {
+        let session_id = [0x55; 16];
         let mut data = vec![RELAY_HELLO_ACK_MSG_TYPE];
-        data.extend_from_slice(&12345u64.to_be_bytes()); // session_id
+        data.extend_from_slice(&session_id);
         data.extend_from_slice(&5000u16.to_be_bytes()); // allocated_port
 
         let ack = parse_relay_hello_ack(&data).expect("should parse valid ack");
-        assert_eq!(ack.session_id.0, 12345);
+        assert_eq!(*ack.session_id.as_bytes(), session_id);
         assert_eq!(ack.allocated_port, 5000);
     }
 
@@ -539,34 +551,34 @@ mod tests {
     fn relay_client_new_creates_empty_session_map() {
         let signing_key = Arc::new(SigningKey::from_bytes(&[1u8; 32]));
         let client = RelayClient::new(
-            "node-a".to_string(),
+            test_node_id("node-a"),
             signing_key,
             RelayClientConfig::default(),
         );
 
         assert_eq!(client.active_session_count(), 0);
-        assert!(!client.has_session(&"peer-b".to_string()));
+        assert!(!client.has_session(&test_node_id("peer-b")));
     }
 
     #[test]
     fn relay_client_cleanup_removes_idle_sessions() {
         let now_unix = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let signing_key = Arc::new(SigningKey::from_bytes(&[1u8; 32]));
         let mut client = RelayClient::new(
-            "node-a".to_string(),
+            test_node_id("node-a"),
             signing_key,
             RelayClientConfig::default(),
         );
 
         // Manually insert a session
-        let peer_id = "peer-b".to_string();
+        let peer_id = test_node_id("peer-b");
         client.sessions.insert(
             peer_id.clone(),
             RelayClientSession {
-                session_id: SessionId(1),
+                session_id: SessionId::from([0x33; 16]),
                 relay_addr: "192.168.1.1:4500".parse().unwrap(),
                 allocated_port: 5000,
                 peer_node_id: peer_id.clone(),
@@ -584,12 +596,15 @@ mod tests {
 
     #[test]
     fn relay_client_session_token_refresh_due_tracks_expiry_margin() {
-        let now_unix = unix_now();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let session = RelayClientSession {
-            session_id: SessionId(7),
+            session_id: SessionId::from([0x44; 16]),
             relay_addr: "192.168.1.1:4500".parse().unwrap(),
             allocated_port: 5001,
-            peer_node_id: "peer-b".to_string(),
+            peer_node_id: test_node_id("peer-b"),
             established_at: Instant::now(),
             last_activity: Instant::now(),
             relay_id: [0xBB; 16],

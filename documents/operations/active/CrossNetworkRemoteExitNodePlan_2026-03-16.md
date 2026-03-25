@@ -1,5 +1,5 @@
 # Rustynet Cross-Network Remote Exit Node Plan (2026-03-16)
-**Last Updated:** 2026-03-22T18:43:41Z
+**Last Updated:** 2026-03-25T18:00:31Z
 
 ## AI Implementation Prompt
 
@@ -83,6 +83,7 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 - Finish honest, measured cross-network remote-exit capability from candidate acquisition through live gates.
 - Remaining code-heavy work is HP-2 real WAN simultaneous-open behavior, HP-3 production relay transport, remote-exit dataplane integration, and the final cross-network gate/report path.
 - The six required cross-network evidence reports and the phase10 cross-network hard-pass gate are still part of the remaining proof burden.
+- Phase 10 readiness no longer gets to ignore the six canonical cross-network reports in code, but the measured artifacts are still missing and the current `rustynetd` runtime compile break blocks end-to-end verification of that gate slice.
 
 `Do first`
 - Reconcile any stale optimism in this document with current code and evidence.
@@ -2801,6 +2802,21 @@ let trust_state = match TrustState::load()? {
 | 2026-03-22T18:43 | Added comprehensive Rust testing requirements (Section 8A) | AI + Security Review |
 | 2026-03-22T18:43 | Added property-based testing, fuzzing, CI/CD gates | AI + Security Review |
 | 2026-03-22T18:43 | Document now 2,299 lines (5.4x larger than original) | AI + Security Review |
+| 2026-03-25T18:00 | Wired `ops verify-phase10-readiness` to fail closed on missing/invalid cross-network reports and NAT-matrix coverage; verification remains blocked by Agent 1 runtime compile failures and missing live artifacts | Agent 2 |
+
+## Session Update — 2026-03-25T18:00:31Z
+
+Status: partial
+
+- Changed files: `crates/rustynet-cli/src/ops_cross_network_reports.rs`, `crates/rustynet-cli/src/ops_phase9.rs`
+- What landed: Phase 10 readiness now reuses the cross-network schema validator and NAT-matrix validator, so canonical remote-exit evidence is required before readiness can pass.
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/ops_cross_network_reports.rs crates/rustynet-cli/src/ops_phase9.rs` `pass`
+  - `cargo fmt --all -- --check` `blocked` by unrelated formatting diffs in Agent 1-owned and other out-of-scope files
+  - `cargo test -p rustynet-cli validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports -- --nocapture` `blocked` by unrelated compile failures in `crates/rustynetd/src/daemon.rs`, `crates/rustynetd/src/dataplane.rs`, `crates/rustynetd/src/phase10.rs`, and `crates/rustynetd/src/relay_client.rs`
+- Artifacts: none generated; `artifacts/phase10/` still lacks the six canonical `cross_network_*` reports required by Section 9.2.
+- Residual risk: live proof for direct remote exit, relay remote exit, failback/roaming, adversarial traversal rejection, managed DNS, and soak behavior is still absent.
+- Blocker / prerequisite: Agent 1 must clear the current runtime compile break before the readiness command, the dedicated cross-network gate, and any live-lab cross-network run can be re-validated end to end.
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.
@@ -2837,4 +2853,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

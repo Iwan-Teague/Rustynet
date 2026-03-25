@@ -2,8 +2,9 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -26,15 +27,20 @@ use nix::unistd::{Gid, Group, Uid, chown};
 use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
 };
-use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
 
+const HELPER_FRAME_MAGIC: [u8; 4] = *b"RNHF";
+const HELPER_FRAME_VERSION: u8 = 1;
+const HELPER_FRAME_TYPE_REQUEST: u8 = 1;
+const HELPER_FRAME_TYPE_RESPONSE: u8 = 2;
+const HELPER_FRAME_HEADER_BYTES: usize = 10;
 const MAX_MESSAGE_BYTES: usize = 16_384;
 const MAX_OUTPUT_BYTES: usize = 65_536;
 const MAX_ARGS: usize = 128;
 const MAX_ARG_BYTES: usize = 256;
+const MAX_PROGRAM_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegedCommandProgram {
@@ -175,33 +181,8 @@ impl PrivilegedCommandClient {
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
         };
-        let mut payload = serde_json::to_vec(&request)
-            .map_err(|err| format!("privileged helper request encode failed: {err}"))?;
-        payload.push(b'\n');
-        if payload.len() > MAX_MESSAGE_BYTES {
-            return Err("privileged helper request exceeds maximum size".to_string());
-        }
-        stream
-            .write_all(&payload)
-            .map_err(|err| format!("privileged helper request write failed: {err}"))?;
-        stream
-            .flush()
-            .map_err(|err| format!("privileged helper request flush failed: {err}"))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_bytes = Vec::new();
-        let read = reader
-            .read_until(b'\n', &mut response_bytes)
-            .map_err(|err| format!("privileged helper response read failed: {err}"))?;
-        if read == 0 {
-            return Err("privileged helper closed connection without a response".to_string());
-        }
-        if response_bytes.len() > MAX_MESSAGE_BYTES {
-            return Err("privileged helper response exceeds maximum size".to_string());
-        }
-
-        let response = serde_json::from_slice::<HelperResponse>(&response_bytes)
-            .map_err(|err| format!("privileged helper response decode failed: {err}"))?;
+        write_request_frame(&mut stream, &request)?;
+        let response = read_response_frame(&mut stream)?;
         if !response.ok {
             return Err(response
                 .error
@@ -375,13 +356,13 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HelperRequest {
     program: String,
     args: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HelperResponse {
     ok: bool,
     status: Option<i32>,
@@ -413,34 +394,309 @@ impl HelperResponse {
 }
 
 fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, String> {
-    let mut reader = BufReader::new(stream);
-    let mut request_bytes = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut request_bytes)
-        .map_err(|err| format!("read request failed: {err}"))?;
-    if read == 0 {
-        return Err("empty request".to_string());
-    }
-    if request_bytes.len() > MAX_MESSAGE_BYTES {
-        return Err("request exceeds maximum size".to_string());
-    }
-    serde_json::from_slice::<HelperRequest>(&request_bytes)
-        .map_err(|err| format!("request decode failed: {err}"))
+    let request_bytes = read_frame(stream, HELPER_FRAME_TYPE_REQUEST)?;
+    decode_helper_request(&request_bytes).map_err(|err| format!("request decode failed: {err}"))
 }
 
 fn write_response(stream: &mut UnixStream, response: HelperResponse) -> Result<(), String> {
-    let mut response_bytes =
-        serde_json::to_vec(&response).map_err(|err| format!("encode response failed: {err}"))?;
-    response_bytes.push(b'\n');
-    if response_bytes.len() > MAX_MESSAGE_BYTES {
-        return Err("response exceeds maximum size".to_string());
+    let response_bytes = encode_helper_response(&response)
+        .map_err(|err| format!("encode response failed: {err}"))?;
+    write_frame(stream, HELPER_FRAME_TYPE_RESPONSE, &response_bytes)
+}
+
+fn write_request_frame(stream: &mut UnixStream, request: &HelperRequest) -> Result<(), String> {
+    let request_bytes = encode_helper_request(request)
+        .map_err(|err| format!("privileged helper request encode failed: {err}"))?;
+    write_frame(stream, HELPER_FRAME_TYPE_REQUEST, &request_bytes)
+        .map_err(|err| format!("privileged helper request write failed: {err}"))
+}
+
+fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String> {
+    let response_bytes = read_frame(stream, HELPER_FRAME_TYPE_RESPONSE)
+        .map_err(|err| format!("privileged helper response read failed: {err}"))?;
+    decode_helper_response(&response_bytes)
+        .map_err(|err| format!("privileged helper response decode failed: {err}"))
+}
+
+fn write_frame(stream: &mut UnixStream, message_type: u8, payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("frame payload must not be empty".to_string());
     }
+    if payload.len() > MAX_MESSAGE_BYTES {
+        return Err("frame payload exceeds maximum size".to_string());
+    }
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| "frame payload length overflow".to_string())?;
+    let mut header = [0u8; HELPER_FRAME_HEADER_BYTES];
+    header[..4].copy_from_slice(&HELPER_FRAME_MAGIC);
+    header[4] = HELPER_FRAME_VERSION;
+    header[5] = message_type;
+    header[6..10].copy_from_slice(&payload_len.to_be_bytes());
     stream
-        .write_all(&response_bytes)
-        .map_err(|err| format!("write response failed: {err}"))?;
+        .write_all(&header)
+        .map_err(|err| format!("write frame header failed: {err}"))?;
+    stream
+        .write_all(payload)
+        .map_err(|err| format!("write frame payload failed: {err}"))?;
     stream
         .flush()
-        .map_err(|err| format!("flush response failed: {err}"))
+        .map_err(|err| format!("flush frame failed: {err}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|err| format!("shutdown frame writer failed: {err}"))
+}
+
+fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<u8>, String> {
+    let mut header = [0u8; HELPER_FRAME_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|err| map_read_exact_error(err, "frame header"))?;
+    if header[..4] != HELPER_FRAME_MAGIC {
+        return Err("invalid frame magic".to_string());
+    }
+    if header[4] != HELPER_FRAME_VERSION {
+        return Err(format!(
+            "unsupported frame version {}; expected {}",
+            header[4], HELPER_FRAME_VERSION
+        ));
+    }
+    if header[5] != expected_message_type {
+        return Err(format!(
+            "unexpected frame type {}; expected {}",
+            header[5], expected_message_type
+        ));
+    }
+    let payload_len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    if payload_len == 0 {
+        return Err("frame payload must not be empty".to_string());
+    }
+    if payload_len > MAX_MESSAGE_BYTES {
+        return Err("frame payload exceeds maximum size".to_string());
+    }
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|err| map_read_exact_error(err, "frame payload"))?;
+    let mut trailing = [0u8; 1];
+    match stream.read(&mut trailing) {
+        Ok(0) => Ok(payload),
+        Ok(_) => Err("trailing bytes after frame payload".to_string()),
+        Err(err) => Err(format!("read frame trailer failed: {err}")),
+    }
+}
+
+fn map_read_exact_error(err: std::io::Error, label: &str) -> String {
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        return format!("truncated {label}");
+    }
+    format!("read {label} failed: {err}")
+}
+
+fn encode_helper_request(request: &HelperRequest) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::new();
+    encode_string_field(
+        &mut payload,
+        request.program.as_str(),
+        "program",
+        MAX_PROGRAM_BYTES,
+    )?;
+    let arg_count = u16::try_from(request.args.len())
+        .map_err(|_| "argument count exceeds protocol limit".to_string())?;
+    payload.extend_from_slice(&arg_count.to_be_bytes());
+    for arg in &request.args {
+        encode_string_field(&mut payload, arg.as_str(), "arg", MAX_ARG_BYTES)?;
+    }
+    Ok(payload)
+}
+
+fn decode_helper_request(payload: &[u8]) -> Result<HelperRequest, String> {
+    let mut cursor = 0usize;
+    let program = decode_string_field(payload, &mut cursor, "program", MAX_PROGRAM_BYTES)?;
+    let arg_count = decode_u16(payload, &mut cursor, "arg_count")? as usize;
+    if arg_count > MAX_ARGS {
+        return Err(format!("argument count exceeds maximum ({MAX_ARGS})"));
+    }
+    let mut args = Vec::with_capacity(arg_count);
+    for _ in 0..arg_count {
+        args.push(decode_string_field(
+            payload,
+            &mut cursor,
+            "arg",
+            MAX_ARG_BYTES,
+        )?);
+    }
+    ensure_payload_consumed(payload, cursor)?;
+    Ok(HelperRequest { program, args })
+}
+
+fn encode_helper_response(response: &HelperResponse) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::new();
+    payload.push(u8::from(response.ok));
+    encode_optional_i32(&mut payload, response.status);
+    encode_optional_string_field(&mut payload, response.stdout.as_deref(), "stdout")?;
+    encode_optional_string_field(&mut payload, response.stderr.as_deref(), "stderr")?;
+    encode_optional_string_field(&mut payload, response.error.as_deref(), "error")?;
+    Ok(payload)
+}
+
+fn decode_helper_response(payload: &[u8]) -> Result<HelperResponse, String> {
+    let mut cursor = 0usize;
+    let ok = decode_bool(payload, &mut cursor, "ok")?;
+    let status = decode_optional_i32(payload, &mut cursor, "status")?;
+    let stdout = decode_optional_string_field(payload, &mut cursor, "stdout", MAX_OUTPUT_BYTES)?;
+    let stderr = decode_optional_string_field(payload, &mut cursor, "stderr", MAX_OUTPUT_BYTES)?;
+    let error = decode_optional_string_field(payload, &mut cursor, "error", MAX_OUTPUT_BYTES)?;
+    ensure_payload_consumed(payload, cursor)?;
+    Ok(HelperResponse {
+        ok,
+        status,
+        stdout,
+        stderr,
+        error,
+    })
+}
+
+fn encode_optional_i32(payload: &mut Vec<u8>, value: Option<i32>) {
+    match value {
+        Some(value) => {
+            payload.push(1);
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        None => payload.push(0),
+    }
+}
+
+fn decode_optional_i32(
+    payload: &[u8],
+    cursor: &mut usize,
+    label: &str,
+) -> Result<Option<i32>, String> {
+    match decode_bool_flag(payload, cursor, label)? {
+        false => Ok(None),
+        true => Ok(Some(decode_i32(payload, cursor, label)?)),
+    }
+}
+
+fn encode_optional_string_field(
+    payload: &mut Vec<u8>,
+    value: Option<&str>,
+    label: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) => {
+            payload.push(1);
+            encode_string_field(payload, value, label, MAX_MESSAGE_BYTES)?;
+        }
+        None => payload.push(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_string_field(
+    payload: &[u8],
+    cursor: &mut usize,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, String> {
+    match decode_bool_flag(payload, cursor, label)? {
+        false => Ok(None),
+        true => Ok(Some(decode_string_field(
+            payload, cursor, label, max_bytes,
+        )?)),
+    }
+}
+
+fn encode_string_field(
+    payload: &mut Vec<u8>,
+    value: &str,
+    label: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    if bytes.len() > max_bytes {
+        return Err(format!("{label} exceeds maximum size ({max_bytes} bytes)"));
+    }
+    let value_len =
+        u16::try_from(bytes.len()).map_err(|_| format!("{label} length exceeds protocol limit"))?;
+    payload.extend_from_slice(&value_len.to_be_bytes());
+    payload.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn decode_string_field(
+    payload: &[u8],
+    cursor: &mut usize,
+    label: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let len = decode_u16(payload, cursor, label)? as usize;
+    if len > max_bytes {
+        return Err(format!("{label} exceeds maximum size ({max_bytes} bytes)"));
+    }
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| format!("{label} length overflow"))?;
+    let value_bytes = payload
+        .get(*cursor..end)
+        .ok_or_else(|| format!("truncated {label}"))?;
+    *cursor = end;
+    std::str::from_utf8(value_bytes)
+        .map_err(|err| format!("{label} is not valid utf-8: {err}"))
+        .map(str::to_string)
+}
+
+fn decode_bool(payload: &[u8], cursor: &mut usize, label: &str) -> Result<bool, String> {
+    match decode_u8(payload, cursor, label)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(format!("invalid {label} flag {value}")),
+    }
+}
+
+fn decode_bool_flag(payload: &[u8], cursor: &mut usize, label: &str) -> Result<bool, String> {
+    decode_bool(payload, cursor, label)
+}
+
+fn decode_u8(payload: &[u8], cursor: &mut usize, label: &str) -> Result<u8, String> {
+    let byte = *payload
+        .get(*cursor)
+        .ok_or_else(|| format!("truncated {label}"))?;
+    *cursor += 1;
+    Ok(byte)
+}
+
+fn decode_u16(payload: &[u8], cursor: &mut usize, label: &str) -> Result<u16, String> {
+    let bytes = decode_fixed::<2>(payload, cursor, label)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn decode_i32(payload: &[u8], cursor: &mut usize, label: &str) -> Result<i32, String> {
+    let bytes = decode_fixed::<4>(payload, cursor, label)?;
+    Ok(i32::from_be_bytes(bytes))
+}
+
+fn decode_fixed<const N: usize>(
+    payload: &[u8],
+    cursor: &mut usize,
+    label: &str,
+) -> Result<[u8; N], String> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| format!("{label} length overflow"))?;
+    let bytes = payload
+        .get(*cursor..end)
+        .ok_or_else(|| format!("truncated {label}"))?;
+    *cursor = end;
+    bytes
+        .try_into()
+        .map_err(|_| format!("invalid fixed-width payload for {label}"))
+}
+
+fn ensure_payload_consumed(payload: &[u8], cursor: usize) -> Result<(), String> {
+    if cursor != payload.len() {
+        return Err("trailing bytes after helper payload".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1242,6 +1498,7 @@ impl fmt::Display for PrivilegedCommandProgram {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::net::Shutdown;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
@@ -1249,11 +1506,31 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        HelperRequest, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
-        handle_request, is_nft_token, is_safe_token, read_request, run_privileged_subprocess,
-        validate_privileged_helper_socket_security, validate_privileged_program_binary,
-        validate_request,
+        HELPER_FRAME_MAGIC, HELPER_FRAME_TYPE_REQUEST, HELPER_FRAME_VERSION, HelperRequest,
+        HelperResponse, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
+        encode_helper_request, handle_request, is_nft_token, is_safe_token, read_request,
+        read_response_frame, run_privileged_subprocess, validate_privileged_helper_socket_security,
+        validate_privileged_program_binary, validate_request, write_request_frame, write_response,
     };
+
+    fn helper_request_frame_bytes(payload: &[u8], version: u8) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(10 + payload.len());
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(version);
+        frame.push(HELPER_FRAME_TYPE_REQUEST);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn write_frame_and_close(stream: &mut UnixStream, frame: &[u8]) {
+        stream
+            .write_all(frame)
+            .expect("frame should be written successfully");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("frame writer should shut down cleanly");
+    }
 
     #[test]
     fn privileged_program_parser_rejects_unknown() {
@@ -1404,18 +1681,147 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .expect("read timeout should be set");
 
-        let mut payload = vec![b'a'; MAX_MESSAGE_BYTES];
-        payload.push(b'\n');
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(HELPER_FRAME_VERSION);
+        frame.push(HELPER_FRAME_TYPE_REQUEST);
+        frame.extend_from_slice(&((MAX_MESSAGE_BYTES + 1) as u32).to_be_bytes());
         let writer = std::thread::spawn(move || {
-            client_stream
-                .write_all(&payload)
-                .expect("oversized payload should be written");
+            write_frame_and_close(&mut client_stream, &frame);
         });
 
         let err = read_request(&mut server_stream)
             .expect_err("oversized privileged helper request must be rejected");
         writer.join().expect("writer thread should complete");
-        assert!(err.contains("request exceeds maximum size"));
+        assert!(err.contains("frame payload exceeds maximum size"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_invalid_magic() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let payload = encode_helper_request(&HelperRequest {
+            program: "ip".to_string(),
+            args: vec!["--version".to_string()],
+        })
+        .expect("request payload should encode");
+        let mut frame = helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION);
+        frame[..4].copy_from_slice(b"BAD!");
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream).expect_err("invalid magic must fail");
+        assert!(err.contains("invalid frame magic"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_unknown_version() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let payload = encode_helper_request(&HelperRequest {
+            program: "ip".to_string(),
+            args: vec!["--version".to_string()],
+        })
+        .expect("request payload should encode");
+        let frame = helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION + 1);
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream).expect_err("unknown version must fail");
+        assert!(err.contains("unsupported frame version"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_truncated_payload() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(HELPER_FRAME_VERSION);
+        frame.push(HELPER_FRAME_TYPE_REQUEST);
+        frame.extend_from_slice(&10u32.to_be_bytes());
+        frame.extend_from_slice(b"short");
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream).expect_err("truncated payload must fail");
+        assert!(err.contains("truncated frame payload"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_trailing_payload_bytes() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let mut payload = encode_helper_request(&HelperRequest {
+            program: "ip".to_string(),
+            args: vec!["--version".to_string()],
+        })
+        .expect("request payload should encode");
+        payload.push(0xff);
+        let frame = helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION);
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream).expect_err("trailing bytes must fail");
+        assert!(err.contains("trailing bytes after helper payload"));
+    }
+
+    #[test]
+    fn helper_frame_round_trips_request_and_response() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("server read timeout should be set");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("server write timeout should be set");
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client read timeout should be set");
+        client_stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .expect("client write timeout should be set");
+
+        let server = std::thread::spawn(move || {
+            let request = read_request(&mut server_stream).expect("request should decode");
+            assert_eq!(request.program, "ip");
+            assert_eq!(request.args, vec!["--version".to_string()]);
+            write_response(
+                &mut server_stream,
+                HelperResponse::success(0, "ok".to_string(), String::new()),
+            )
+            .expect("response should encode");
+        });
+
+        write_request_frame(
+            &mut client_stream,
+            &HelperRequest {
+                program: "ip".to_string(),
+                args: vec!["--version".to_string()],
+            },
+        )
+        .expect("request should encode");
+        let response = read_response_frame(&mut client_stream).expect("response should decode");
+        assert!(response.ok);
+        assert_eq!(response.status, Some(0));
+        assert_eq!(response.stdout.as_deref(), Some("ok"));
+        assert_eq!(response.stderr.as_deref(), Some(""));
+        assert_eq!(response.error, None);
+
+        server.join().expect("server thread should join cleanly");
     }
 
     #[test]
@@ -1477,17 +1883,37 @@ mod tests {
 
     #[test]
     fn fuzzgate_malformed_inputs_never_panic() {
-        let malformed_payloads: &[&[u8]] = &[
-            b"",
-            b"\n",
-            b"{\n",
-            b"{\"program\":1}\n",
-            b"{\"program\":\"ip\",\"args\":\"not-an-array\"}\n",
-            b"{\"program\":\"ip\",\"args\":[\"link\",null]}\n",
-            b"{\"program\":\"ip\",\"args\":[\"link\",\"set\",\"up\",\"dev\",\"$(id)\"]}\n",
-            b"{\"program\":\"not-real\",\"args\":[\"--version\"]}\n",
-            b"{\"program\":\"ip\",\"args\":[]}\n",
-        ];
+        let mut malformed_payloads = Vec::new();
+        malformed_payloads.push(Vec::new());
+        malformed_payloads.push(vec![0u8; 3]);
+        malformed_payloads.push(helper_request_frame_bytes(
+            b"\x00",
+            HELPER_FRAME_VERSION + 1,
+        ));
+        malformed_payloads.push(helper_request_frame_bytes(b"\x00", HELPER_FRAME_VERSION));
+        malformed_payloads.push({
+            let mut frame = helper_request_frame_bytes(b"\x00", HELPER_FRAME_VERSION);
+            frame[..4].copy_from_slice(b"BAD!");
+            frame
+        });
+        malformed_payloads.push({
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+            frame.push(HELPER_FRAME_VERSION);
+            frame.push(HELPER_FRAME_TYPE_REQUEST);
+            frame.extend_from_slice(&10u32.to_be_bytes());
+            frame.extend_from_slice(b"tiny");
+            frame
+        });
+        malformed_payloads.push({
+            let mut payload = encode_helper_request(&HelperRequest {
+                program: "ip".to_string(),
+                args: vec!["link".to_string()],
+            })
+            .expect("request payload should encode");
+            payload.push(0x01);
+            helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION)
+        });
 
         for payload in malformed_payloads {
             let (mut server_stream, mut client_stream) =
@@ -1496,9 +1922,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .expect("read timeout should be set");
             client_stream
-                .write_all(payload)
+                .write_all(&payload)
                 .expect("malformed payload should be written");
-            drop(client_stream);
+            let _ = client_stream.shutdown(Shutdown::Write);
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 read_request(&mut server_stream)

@@ -4784,12 +4784,7 @@ mod tests {
     #[test]
     fn derive_endpoint_hint_signing_key_matches_control_plane_verifier() {
         let signing_secret = vec![9u8; 32];
-        let core = ControlPlaneCore::new(
-            signing_secret.clone(),
-            PolicySet {
-                rules: Vec::new(),
-            },
-        );
+        let core = ControlPlaneCore::new(signing_secret.clone(), PolicySet { rules: Vec::new() });
         let derived = derive_endpoint_hint_signing_key(signing_secret);
         assert_eq!(
             derived.verifying_key().as_bytes(),
@@ -4955,7 +4950,10 @@ mod tests {
         );
         // node_id and peer_node_id are semi-public, so they may appear
         assert!(rendered.contains("node-a"), "debug should show node_id");
-        assert!(rendered.contains("node-b"), "debug should show peer_node_id");
+        assert!(
+            rendered.contains("node-b"),
+            "debug should show peer_node_id"
+        );
     }
 
     #[test]

@@ -122,9 +122,21 @@ Key mandatory constraints carried into this plan:
 - Auto-tunnel runtime now exposes an explicit internal authority mode (`TraversalAuthorityMode::EnforcedV1`) and requires traversal-authoritative peer coverage for all managed peers during bootstrap/reconcile in enforced mode; assignment `peer.N.endpoint` is no longer accepted as mutable runtime authority when enforced traversal mode is active.
 - Traversal runtime programming errors now fail closed instead of being silently swallowed.
 - Backend contract already supports controlled endpoint rotation (`update_peer_endpoint` / `current_peer_endpoint`) and per-peer handshake-recency observation (`peer_latest_handshake_unix`).
-- `rustynet-relay` is still selector-only (HP-3 scope for real relay transport).
+- `rustynet-relay` now provides authenticated relay transport, and `rustynetd` can resolve signed relay-session endpoints through `RelayClient` during enforced traversal reconcile when relay-session signing custody is configured.
 
-Implication: HP-2 has crossed the “backend evidence + bounded probe executor” threshold, completed the enforced authority cutover for managed peers, and now includes health-driven periodic relay reprobe plus direct failback on the reconcile path. Remaining work is broader simultaneous-open WAN behavior and HP-3 relay transport.
+Implication: HP-2 has crossed the “backend evidence + bounded probe executor” threshold, completed the enforced authority cutover for managed peers, and now includes authenticated relay-session runtime wiring on the enforced reconcile path. Remaining work is broader simultaneous-open WAN behavior, measured WAN evidence, and one still-open periodic reprobe regression on retained relay state.
+
+Updated HP-2/HP-4 runtime note (2026-03-25):
+- `rustynet-control` now derives relay-session signing keys from the endpoint-hint signing domain instead of introducing a parallel signer.
+- `rustynetd` now refreshes relay-session tokens on expiry and fail-closes if a configured relay session cannot be established.
+- Verification completed for the new runtime slice with:
+  - `cargo test -p rustynet-control derive_endpoint_hint_signing_key_matches_control_plane_verifier -- --nocapture`
+  - `cargo test -p rustynetd relay_client::tests -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_relay_client_ -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives -- --exact --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --exact --nocapture`
+- Remaining blocker for this slice:
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay -- --exact --nocapture` still fails after an intermediate retained-relay sync, so do not describe periodic direct failback as fully closed out yet.
 
 ## 4) HP-2 Security Contract (Non-Negotiable)
 1. Traversal artifact validity is a hard precondition for endpoint mutation.
@@ -399,4 +411,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

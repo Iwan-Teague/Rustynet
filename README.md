@@ -161,7 +161,7 @@ rustynet dns zone issue \
   --subject-node-id client-40 \
   --nodes "client-40|192.168.18.40:51820|<client_pubkey_hex>;exit-37|192.168.18.37:51820|<exit_pubkey_hex>" \
   --allow "client-40|exit-37" \
-  --records-json /tmp/dns-zone-records.json \
+  --records-manifest /tmp/dns-zone-records.manifest \
   --output /tmp/client-40.dns-zone \
   --verifier-key-output /tmp/dns-zone.pub \
   --zone-name rustynet \
@@ -175,10 +175,11 @@ rustynet dns zone verify \
   --expected-zone-name rustynet \
   --expected-subject-node-id client-40
 ```
-- `--records-json` must be a JSON array of strict objects:
-  - required: `label`, `target_node_id`, `ttl_secs`
-  - optional: `aliases`
-  - unsupported fields are rejected fail-closed
+- `--records-manifest` must be canonical UTF-8 `key=value` text:
+  - required top-level fields: `version=1`, `record_count=<n>`
+  - required per-record fields: `record.<i>.label`, `record.<i>.target_node_id`, `record.<i>.ttl_secs`, `record.<i>.alias_count`
+  - aliases are indexed as `record.<i>.alias.<j>=<label>`
+  - unknown fields, sparse indices, duplicate fields, and whitespace-padded fields are rejected fail-closed
 - `rustynetd` authoritative DNS defaults:
   - zone bundle: `/var/lib/rustynet/rustynetd.dns-zone`
   - verifier key: `/etc/rustynet/dns-zone.pub`

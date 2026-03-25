@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use crate::ops_cross_network_reports;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -4342,7 +4343,7 @@ pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
         "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS",
         DEFAULT_PHASE10_MAX_SOURCE_AGE_SECONDS,
     )?;
-    let max_evidence_age_seconds = i64::try_from(max_evidence_age_seconds)
+    let max_evidence_age_seconds_i64 = i64::try_from(max_evidence_age_seconds)
         .map_err(|_| "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS is too large".to_string())?;
     let now_unix =
         i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
@@ -4403,7 +4404,7 @@ pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
             source_path,
             label,
             now_unix,
-            max_evidence_age_seconds,
+            max_evidence_age_seconds_i64,
         )?;
         phase10_require_non_empty_environment(payload, source_path, label)?;
         phase10_validate_source_artifacts_entries(payload, source_path, label)?;
@@ -4509,6 +4510,33 @@ pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
     if !contains_generation_marker(state_log.as_str()) {
         return Err("state_transition_audit.log missing generation entries".to_string());
     }
+
+    let cross_network_expected_git_commit =
+        std::env::var_os("RUSTYNET_PHASE10_CROSS_NETWORK_EXIT_EXPECTED_GIT_COMMIT")
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current_git_commit()?);
+    let cross_network_required_nat_profiles =
+        std::env::var_os("RUSTYNET_PHASE10_CROSS_NETWORK_NAT_PROFILES")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|profiles| !profiles.is_empty())
+            .unwrap_or_else(ops_cross_network_reports::default_required_nat_profiles);
+    ops_cross_network_reports::validate_cross_network_remote_exit_readiness(
+        artifact_dir.as_path(),
+        max_evidence_age_seconds,
+        Some(cross_network_expected_git_commit.as_str()),
+        &cross_network_required_nat_profiles,
+    )?;
 
     Ok(format!(
         "phase10 readiness checks passed: {}",

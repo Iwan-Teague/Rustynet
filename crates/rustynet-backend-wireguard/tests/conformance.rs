@@ -9,6 +9,7 @@ use rustynet_backend_wireguard::WireguardBackend;
 fn runtime_context() -> RuntimeContext {
     RuntimeContext {
         local_node: NodeId::new("local-node").expect("valid node id"),
+        interface_name: "rustynet0".to_string(),
         mesh_cidr: "100.64.0.0/10".to_string(),
         local_cidr: "100.64.0.1/32".to_string(),
     }

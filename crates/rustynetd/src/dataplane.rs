@@ -332,6 +332,7 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
     pub fn start(&mut self) -> Result<(), DataplaneError> {
         self.backend.start(RuntimeContext {
             local_node: self.local_node.clone(),
+            interface_name: "rustynet0".to_string(),
             mesh_cidr: self.mesh_cidr.clone(),
             local_cidr: self.mesh_cidr.clone(),
         })?;

@@ -20,7 +20,7 @@ const TRAVERSAL_ISSUE_DIR: &str = "/run/rustynet/traversal-issue";
 const DNS_ZONE_PUB_REMOTE: &str = "/run/rustynet/dns-zone-issue/rn-dns-zone.pub";
 const DNS_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue/valid.dns-zone";
 const DNS_STALE_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue/stale.dns-zone";
-const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.json";
+const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.manifest";
 const TRAVERSAL_ENV_REMOTE: &str = "/tmp/rn_issue_dns_traversal.env";
 const TRAVERSAL_PUB_REMOTE: &str = "/run/rustynet/traversal-issue/rn-traversal.pub";
 
@@ -117,7 +117,7 @@ fn run() -> Result<(), String> {
 
     let workspace = ctx.work_dir.clone();
     let base_records = managed_dns_base_records(&config.signer_node_id, &config.client_node_id);
-    let records_json = workspace.join("rn-dns-records.json");
+    let records_manifest = workspace.join("rn-dns-records.manifest");
     let client_scope = assignment_scopes
         .get(&config.client_node_id)
         .ok_or_else(|| {
@@ -126,9 +126,9 @@ fn run() -> Result<(), String> {
                 config.client_node_id
             )
         })?;
-    write_secure_json(
-        &records_json,
-        &managed_dns_records_json_for_scope(&base_records, client_scope)?,
+    write_secure_text(
+        &records_manifest,
+        &managed_dns_records_manifest_for_scope(&base_records, client_scope)?,
     )?;
 
     let issue_dir = ISSUE_DIR;
@@ -155,7 +155,7 @@ fn run() -> Result<(), String> {
         &config.signer_host,
         &["install", "-d", "-m", "0700", issue_dir],
     )?;
-    ctx.scp_to(&records_json, &config.signer_host, DNS_RECORDS_REMOTE)?;
+    ctx.scp_to(&records_manifest, &config.signer_host, DNS_RECORDS_REMOTE)?;
 
     logger.line(
         format!(
@@ -479,11 +479,11 @@ fn run() -> Result<(), String> {
         let scope = assignment_scopes.get(&node_id).ok_or_else(|| {
             format!("missing assignment authority scope for managed DNS node {node_id}")
         })?;
-        let peer_records_local = workspace.join(format!("rn-dns-records-{node_id}.json"));
-        let peer_records_remote = format!("/tmp/rn-dns-records-{node_id}.json");
-        write_secure_json(
+        let peer_records_local = workspace.join(format!("rn-dns-records-{node_id}.manifest"));
+        let peer_records_remote = format!("/tmp/rn-dns-records-{node_id}.manifest");
+        write_secure_text(
             &peer_records_local,
-            &managed_dns_records_json_for_scope(&base_records, scope)?,
+            &managed_dns_records_manifest_for_scope(&base_records, scope)?,
         )?;
         ctx.scp_to(
             &peer_records_local,
@@ -825,7 +825,7 @@ fn issue_dns_bundle(
     zone_name: &str,
     nodes_spec: &str,
     allow_spec: &str,
-    records_json_remote: &str,
+    records_manifest_remote: &str,
     issue_dir: &str,
     output_name: &str,
     generated_at: Option<u64>,
@@ -848,8 +848,8 @@ fn issue_dns_bundle(
         nodes_spec,
         "--allow",
         allow_spec,
-        "--records-json",
-        records_json_remote,
+        "--records-manifest",
+        records_manifest_remote,
         "--output",
         output_path.as_str(),
         "--verifier-key-output",
@@ -1197,10 +1197,10 @@ fn managed_dns_base_records(
     ]
 }
 
-fn managed_dns_records_json_for_scope(
+fn managed_dns_records_manifest_for_scope(
     records: &[ManagedDnsRecordTemplate],
     scope: &AssignmentAuthorityScope,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     let allowed_targets = scope.peer_node_ids.iter().cloned().collect::<HashSet<_>>();
     let filtered = records
         .iter()
@@ -1208,14 +1208,7 @@ fn managed_dns_records_json_for_scope(
             record.target_node_id == scope.node_id
                 || allowed_targets.contains(&record.target_node_id)
         })
-        .map(|record| {
-            json!({
-                "label": record.label,
-                "target_node_id": record.target_node_id,
-                "ttl_secs": record.ttl_secs,
-                "aliases": record.aliases,
-            })
-        })
+        .cloned()
         .collect::<Vec<_>>();
     if filtered.is_empty() {
         return Err(format!(
@@ -1223,7 +1216,25 @@ fn managed_dns_records_json_for_scope(
             scope.node_id
         ));
     }
-    Ok(serde_json::Value::Array(filtered))
+    let mut manifest = String::new();
+    manifest.push_str("version=1\n");
+    manifest.push_str(&format!("record_count={}\n", filtered.len()));
+    for (index, record) in filtered.iter().enumerate() {
+        manifest.push_str(&format!("record.{index}.label={}\n", record.label));
+        manifest.push_str(&format!(
+            "record.{index}.target_node_id={}\n",
+            record.target_node_id
+        ));
+        manifest.push_str(&format!("record.{index}.ttl_secs={}\n", record.ttl_secs));
+        manifest.push_str(&format!(
+            "record.{index}.alias_count={}\n",
+            record.aliases.len()
+        ));
+        for (alias_index, alias) in record.aliases.iter().enumerate() {
+            manifest.push_str(&format!("record.{index}.alias.{alias_index}={alias}\n"));
+        }
+    }
+    Ok(manifest)
 }
 
 fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, String> {
