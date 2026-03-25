@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -103,11 +103,15 @@ impl PrivilegedCommandProgram {
         }
     }
 
-    fn resolve_binary(self) -> Option<&'static str> {
-        self.binary_candidates()
-            .iter()
-            .copied()
-            .find(|candidate| Path::new(candidate).exists())
+    fn resolve_binary(self) -> Result<PathBuf, String> {
+        for candidate in self.binary_candidates() {
+            let candidate_path = Path::new(candidate);
+            if !candidate_path.exists() {
+                continue;
+            }
+            return validate_privileged_program_binary(candidate_path, self.as_str());
+        }
+        Err(format!("no supported binary path found for {self}"))
     }
 }
 
@@ -463,13 +467,11 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
     }
 
     let binary = match program.resolve_binary() {
-        Some(path) => path,
-        None => {
-            return HelperResponse::error(format!("no supported binary path found for {program}",));
-        }
+        Ok(path) => path,
+        Err(err) => return HelperResponse::error(err),
     };
 
-    match run_privileged_subprocess(binary, &request.args, timeout) {
+    match run_privileged_subprocess(&binary, &request.args, timeout) {
         Ok(output) => {
             let status = exit_status_code(output.status);
             let stdout = truncate_lossy(&output.stdout, MAX_OUTPUT_BYTES);
@@ -477,13 +479,54 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
             HelperResponse::success(status, stdout, stderr)
         }
         Err(err) => HelperResponse::error(format!(
-            "{program} command execution failed ({binary}): {err}",
+            "{program} command execution failed ({}): {err}",
+            binary.display(),
         )),
     }
 }
 
+fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{label} binary path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|err| format!("{label} binary canonicalization failed: {err}"))?;
+    let metadata =
+        fs::metadata(&canonical).map_err(|err| format!("{label} binary metadata failed: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{label} binary path must be a regular file: {}",
+            canonical.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "{label} binary is not executable: {} ({mode:03o})",
+            canonical.display()
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{label} binary must not be group/other writable: {} ({mode:03o})",
+            canonical.display()
+        ));
+    }
+    let owner_uid = metadata.uid();
+    if owner_uid != 0 {
+        return Err(format!(
+            "{label} binary must be root-owned: {} (uid={owner_uid})",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 fn run_privileged_subprocess(
-    binary: &str,
+    binary: &Path,
     args: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
@@ -815,6 +858,25 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         ] if is_owned_failclosed_table_token(table)
             && is_interface_name(incoming_interface)
             && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            family,
+            "daddr",
+            cidr,
+            "tcp",
+            "dport",
+            "22",
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_nft_daddr_family_token(family)
+            && is_cidr_for_nft_family(cidr, family) =>
         {
             Ok(())
         }
@@ -1189,7 +1251,8 @@ mod tests {
     use super::{
         HelperRequest, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
         handle_request, is_nft_token, is_safe_token, read_request, run_privileged_subprocess,
-        validate_privileged_helper_socket_security, validate_request,
+        validate_privileged_helper_socket_security, validate_privileged_program_binary,
+        validate_request,
     };
 
     #[test]
@@ -1272,6 +1335,28 @@ mod tests {
             &["list", "table", "inet", "rustynet_g1"],
         )
         .expect("known nft list table schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_management_ssh_fail_closed_rule_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "ip",
+                "daddr",
+                "192.168.18.0/24",
+                "tcp",
+                "dport",
+                "22",
+                "accept",
+            ],
+        )
+        .expect("management ssh fail-closed rule schema should be accepted");
     }
 
     #[test]
@@ -1480,12 +1565,58 @@ mod tests {
             return;
         }
         let err = run_privileged_subprocess(
-            "/bin/sh",
+            Path::new("/bin/sh"),
             &["-c".to_string(), "sleep 1".to_string()],
             Duration::from_millis(50),
         )
         .expect_err("sleeping subprocess should time out");
         assert!(err.contains("timed out after 50 ms"));
+    }
+
+    #[test]
+    fn validate_privileged_program_binary_rejects_group_or_other_writable_binary() {
+        let unique = format!(
+            "rnh-bin-gw-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = PathBuf::from("/tmp").join(unique);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("test binary should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+            .expect("test binary mode should be set");
+
+        let err = validate_privileged_program_binary(&path, "test")
+            .expect_err("group/other writable binary must be rejected");
+        assert!(err.contains("must not be group/other writable"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn validate_privileged_program_binary_rejects_non_root_owned_binary() {
+        if nix::unistd::Uid::current().is_root() {
+            return;
+        }
+
+        let unique = format!(
+            "rnh-bin-owner-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = PathBuf::from("/tmp").join(unique);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("test binary should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("test binary mode should be set");
+
+        let err = validate_privileged_program_binary(&path, "test")
+            .expect_err("non-root-owned binary must be rejected");
+        assert!(err.contains("must be root-owned"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

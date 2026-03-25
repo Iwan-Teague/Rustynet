@@ -2978,7 +2978,7 @@ fn run_allow_failure(program: &str, args: &[&str], envs: &[(&str, &str)]) {
     for (key, value) in envs {
         command.env(key, value);
     }
-    let _ = command.status();
+    let _ = command.output();
 }
 
 fn capture_stdout(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {

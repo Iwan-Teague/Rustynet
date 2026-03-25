@@ -80,7 +80,6 @@ fn run() -> Result<(), String> {
         host_by_node.insert(peer.node_id.clone(), peer.host.clone());
     }
 
-    let mut required_node_ids = vec![config.signer_node_id.clone(), config.client_node_id.clone()];
     if current_exit_node != "none"
         && current_exit_node != config.signer_node_id
         && current_exit_node != config.client_node_id
@@ -90,18 +89,15 @@ fn run() -> Result<(), String> {
                 "client exit_node {current_exit_node} is not mapped to a host; provide --managed-peer {current_exit_node}|<user@host>"
             ));
         }
-        required_node_ids.push(current_exit_node.clone());
     }
+    let assignment_scopes = capture_assignment_authority_scopes(&ctx, &host_by_node)?;
 
     let mut mesh_peers = Vec::new();
-    for node_id in required_node_ids {
-        let host = host_by_node
-            .get(&node_id)
-            .ok_or_else(|| format!("missing host mapping for traversal node id: {node_id}"))?;
+    for (node_id, host) in sorted_node_host_pairs(&host_by_node) {
         mesh_peers.push(ManagedPeerRuntime {
             node_id,
-            address: target_address(host).to_string(),
-            pubkey_hex: ctx.collect_pubkey_hex(host)?,
+            address: target_address(&host).to_string(),
+            pubkey_hex: ctx.collect_pubkey_hex(&host)?,
         });
     }
 
@@ -115,39 +111,24 @@ fn run() -> Result<(), String> {
         })
         .collect::<Vec<_>>()
         .join(";");
-    let allow_spec = mesh_peers
-        .iter()
-        .flat_map(|source| {
-            mesh_peers.iter().filter_map(move |destination| {
-                if source.node_id == destination.node_id {
-                    None
-                } else {
-                    Some(format!("{}|{}", source.node_id, destination.node_id))
-                }
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(";");
+    let allow_spec = build_authorized_allow_spec(&assignment_scopes, &host_by_node)?;
     ensure_safe_spec("NODES_SPEC", &nodes_spec)?;
     ensure_safe_spec("ALLOW_SPEC", &allow_spec)?;
 
     let workspace = ctx.work_dir.clone();
+    let base_records = managed_dns_base_records(&config.signer_node_id, &config.client_node_id);
     let records_json = workspace.join("rn-dns-records.json");
+    let client_scope = assignment_scopes
+        .get(&config.client_node_id)
+        .ok_or_else(|| {
+            format!(
+                "missing assignment authority scope for client node {}",
+                config.client_node_id
+            )
+        })?;
     write_secure_json(
         &records_json,
-        &json!([
-            {
-                "label": MANAGED_LABEL,
-                "target_node_id": config.signer_node_id,
-                "ttl_secs": 300,
-                "aliases": [MANAGED_ALIAS],
-            },
-            {
-                "label": "client",
-                "target_node_id": config.client_node_id,
-                "ttl_secs": 300,
-            },
-        ]),
+        &managed_dns_records_json_for_scope(&base_records, client_scope)?,
     )?;
 
     let issue_dir = ISSUE_DIR;
@@ -281,7 +262,14 @@ fn run() -> Result<(), String> {
         &verifier_local,
         &valid_bundle_local,
     )?;
-    refresh_traversal_bundles(&ctx, &config, &workspace, &nodes_spec, &allow_spec)?;
+    refresh_traversal_bundles(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+    )?;
     restart_managed_dns_stack(&ctx, &config.client_host)?;
 
     let dns_inspect_valid = ctx.capture_root(
@@ -349,7 +337,14 @@ fn run() -> Result<(), String> {
         &verifier_local,
         &stale_bundle_local,
     )?;
-    refresh_traversal_bundles(&ctx, &config, &workspace, &nodes_spec, &allow_spec)?;
+    refresh_traversal_bundles(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+    )?;
     ctx.run_root_allow_failure(
         &config.client_host,
         &[
@@ -453,7 +448,14 @@ fn run() -> Result<(), String> {
         &verifier_local,
         &valid_bundle_local,
     )?;
-    refresh_traversal_bundles(&ctx, &config, &workspace, &nodes_spec, &allow_spec)?;
+    refresh_traversal_bundles(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+    )?;
     restart_managed_dns_stack(&ctx, &config.client_host)?;
     let dns_inspect_restored = ctx.capture_root(
         &config.client_host,
@@ -466,17 +468,62 @@ fn run() -> Result<(), String> {
         ],
     )?;
 
-    let mut distribution_hosts = host_by_node.values().cloned().collect::<Vec<String>>();
-    distribution_hosts.sort();
-    distribution_hosts.dedup();
-    for host in distribution_hosts {
-        if host == config.client_host {
-            continue;
-        }
+    for (node_id, host) in managed_dns_distribution_targets(&host_by_node, &config.client_host) {
+        logger.line(
+            format!(
+                "[managed-dns] issuing valid managed DNS bundle for {node_id} on {}",
+                config.signer_host
+            )
+            .as_str(),
+        )?;
+        let scope = assignment_scopes.get(&node_id).ok_or_else(|| {
+            format!("missing assignment authority scope for managed DNS node {node_id}")
+        })?;
+        let peer_records_local = workspace.join(format!("rn-dns-records-{node_id}.json"));
+        let peer_records_remote = format!("/tmp/rn-dns-records-{node_id}.json");
+        write_secure_json(
+            &peer_records_local,
+            &managed_dns_records_json_for_scope(&base_records, scope)?,
+        )?;
+        ctx.scp_to(
+            &peer_records_local,
+            &config.signer_host,
+            peer_records_remote.as_str(),
+        )?;
+
+        let output_name = format!("valid-{node_id}.dns-zone");
+        issue_dns_bundle(
+            &ctx,
+            &config.signer_host,
+            &passphrase_file,
+            &node_id,
+            &config.zone_name,
+            &nodes_spec,
+            &allow_spec,
+            peer_records_remote.as_str(),
+            issue_dir,
+            output_name.as_str(),
+            None,
+        )?;
+        let _ = ctx.run_root_allow_failure(
+            &config.signer_host,
+            &["rm", "-f", peer_records_remote.as_str()],
+        );
+        let peer_bundle_local = workspace.join(format!("dns-zone-valid-{node_id}.bundle"));
+        let remote_bundle_path = format!("{issue_dir}/{output_name}");
+        capture_remote_text(
+            &ctx,
+            &config.signer_host,
+            remote_bundle_path.as_str(),
+            &peer_bundle_local,
+        )?;
         logger.line(
             format!("[managed-dns] propagating valid managed DNS bundle to {host}").as_str(),
         )?;
-        install_dns_bundle(&ctx, &host, &verifier_local, &valid_bundle_local)?;
+        install_dns_bundle(&ctx, &host, &verifier_local, &peer_bundle_local)?;
+        if host == config.client_host {
+            continue;
+        }
         restart_managed_dns_stack(&ctx, &host)?;
     }
 
@@ -875,6 +922,7 @@ fn refresh_traversal_bundles(
     ctx: &LiveLabContext,
     config: &Config,
     workspace: &Path,
+    host_by_node: &HashMap<String, String>,
     nodes_spec: &str,
     allow_spec: &str,
 ) -> Result<(), String> {
@@ -898,43 +946,44 @@ fn refresh_traversal_bundles(
     ctx.run_root_allow_failure(&config.signer_host, &["rm", "-f", remote_env_path])?;
 
     let traversal_pub_local = workspace.join("traversal.pub");
-    let signer_traversal_local = workspace.join("traversal-signer.bundle");
-    let client_traversal_local = workspace.join("traversal-client.bundle");
     capture_remote_text(
         ctx,
         &config.signer_host,
         TRAVERSAL_PUB_REMOTE,
         &traversal_pub_local,
     )?;
-    let signer_traversal_remote = traversal_bundle_remote_path(&config.signer_node_id);
-    let client_traversal_remote = traversal_bundle_remote_path(&config.client_node_id);
-    capture_remote_text(
-        ctx,
-        &config.signer_host,
-        signer_traversal_remote.as_str(),
-        &signer_traversal_local,
-    )?;
-    capture_remote_text(
-        ctx,
-        &config.signer_host,
-        client_traversal_remote.as_str(),
-        &client_traversal_local,
-    )?;
-
-    install_traversal_bundle(
-        ctx,
-        &config.signer_host,
-        &traversal_pub_local,
-        &signer_traversal_local,
-    )?;
-    install_traversal_bundle(
-        ctx,
-        &config.client_host,
-        &traversal_pub_local,
-        &client_traversal_local,
-    )?;
+    for (node_id, host) in sorted_node_host_pairs(host_by_node) {
+        let traversal_remote = traversal_bundle_remote_path(node_id.as_str());
+        let traversal_local = workspace.join(format!("traversal-{node_id}.bundle"));
+        capture_remote_text(
+            ctx,
+            &config.signer_host,
+            traversal_remote.as_str(),
+            &traversal_local,
+        )?;
+        install_traversal_bundle(ctx, &host, &traversal_pub_local, &traversal_local)?;
+    }
     ctx.run_root_allow_failure(&config.signer_host, &["rm", "-rf", TRAVERSAL_ISSUE_DIR])?;
     Ok(())
+}
+
+fn sorted_node_host_pairs(host_by_node: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut entries = host_by_node
+        .iter()
+        .map(|(node_id, host)| (node_id.clone(), host.clone()))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    entries
+}
+
+fn managed_dns_distribution_targets(
+    host_by_node: &HashMap<String, String>,
+    client_host: &str,
+) -> Vec<(String, String)> {
+    sorted_node_host_pairs(host_by_node)
+        .into_iter()
+        .filter(|(_, host)| host != client_host)
+        .collect()
 }
 
 fn traversal_bundle_remote_path(node_id: &str) -> String {
@@ -1036,6 +1085,18 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
     ctx.wait_for_daemon_socket(client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
     ctx.retry_root(
         client_host,
+        &[
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "rustynet",
+            "state",
+            "refresh",
+        ],
+        5,
+        2,
+    )?;
+    ctx.retry_root(
+        client_host,
         &["systemctl", "restart", "rustynetd-managed-dns.service"],
         5,
         2,
@@ -1047,6 +1108,154 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         2,
     )?;
     Ok(())
+}
+
+fn build_authorized_allow_spec(
+    assignment_scopes: &HashMap<String, AssignmentAuthorityScope>,
+    host_by_node: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut pairs = Vec::new();
+    for node_id in sorted_node_host_pairs(host_by_node)
+        .into_iter()
+        .map(|(node_id, _)| node_id)
+    {
+        let scope = assignment_scopes
+            .get(&node_id)
+            .ok_or_else(|| format!("missing assignment authority scope for {node_id}"))?;
+        for peer_node_id in &scope.peer_node_ids {
+            if !host_by_node.contains_key(peer_node_id.as_str()) {
+                return Err(format!(
+                    "assignment bundle for {node_id} references unmanaged peer {peer_node_id}"
+                ));
+            }
+            pairs.push(format!("{node_id}|{peer_node_id}"));
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    if pairs.is_empty() {
+        return Err(
+            "managed DNS traversal issuance requires at least one authorized allow pair"
+                .to_string(),
+        );
+    }
+    Ok(pairs.join(";"))
+}
+
+fn capture_assignment_authority_scopes(
+    ctx: &LiveLabContext,
+    host_by_node: &HashMap<String, String>,
+) -> Result<HashMap<String, AssignmentAuthorityScope>, String> {
+    let mut scopes = HashMap::new();
+    for (node_id, host) in sorted_node_host_pairs(host_by_node) {
+        let assignment_bundle =
+            ctx.capture_root(&host, &["cat", "/var/lib/rustynet/rustynetd.assignment"])?;
+        let scope = parse_assignment_authority_scope(&assignment_bundle)?;
+        if scope.node_id != node_id {
+            return Err(format!(
+                "assignment bundle subject {subject} does not match expected node {expected} on {host}",
+                subject = scope.node_id,
+                expected = node_id,
+            ));
+        }
+        scopes.insert(node_id, scope);
+    }
+    Ok(scopes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentAuthorityScope {
+    node_id: String,
+    peer_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDnsRecordTemplate {
+    label: String,
+    target_node_id: String,
+    ttl_secs: u64,
+    aliases: Vec<String>,
+}
+
+fn managed_dns_base_records(
+    signer_node_id: &str,
+    client_node_id: &str,
+) -> Vec<ManagedDnsRecordTemplate> {
+    vec![
+        ManagedDnsRecordTemplate {
+            label: MANAGED_LABEL.to_string(),
+            target_node_id: signer_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: vec![MANAGED_ALIAS.to_string()],
+        },
+        ManagedDnsRecordTemplate {
+            label: "client".to_string(),
+            target_node_id: client_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn managed_dns_records_json_for_scope(
+    records: &[ManagedDnsRecordTemplate],
+    scope: &AssignmentAuthorityScope,
+) -> Result<serde_json::Value, String> {
+    let allowed_targets = scope.peer_node_ids.iter().cloned().collect::<HashSet<_>>();
+    let filtered = records
+        .iter()
+        .filter(|record| {
+            record.target_node_id == scope.node_id
+                || allowed_targets.contains(&record.target_node_id)
+        })
+        .map(|record| {
+            json!({
+                "label": record.label,
+                "target_node_id": record.target_node_id,
+                "ttl_secs": record.ttl_secs,
+                "aliases": record.aliases,
+            })
+        })
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(format!(
+            "managed DNS scope for {} produced no policy-authorized records",
+            scope.node_id
+        ));
+    }
+    Ok(serde_json::Value::Array(filtered))
+}
+
+fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, String> {
+    let mut node_id = None;
+    let mut peer_node_ids = Vec::new();
+    for line in bundle.lines() {
+        if let Some(value) = line.strip_prefix("node_id=") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err("assignment bundle node_id must not be empty".to_string());
+            }
+            node_id = Some(trimmed.to_string());
+            continue;
+        }
+        if let Some((prefix, value)) = line.split_once('=') {
+            if prefix.starts_with("peer.") && prefix.ends_with(".node_id") {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "assignment bundle peer id must not be empty: {prefix}"
+                    ));
+                }
+                peer_node_ids.push(trimmed.to_string());
+            }
+        }
+    }
+    peer_node_ids.sort();
+    peer_node_ids.dedup();
+    Ok(AssignmentAuthorityScope {
+        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_string())?,
+        peer_node_ids,
+    })
 }
 
 fn capture_remote_text(
@@ -1323,8 +1532,11 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ManagedPeerSpec, parse_managed_peer_spec, parse_status_field, validate_targets,
+        Config, ManagedPeerSpec, managed_dns_distribution_targets,
+        parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
+        sorted_node_host_pairs, validate_targets,
     };
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn base_config() -> Config {
@@ -1400,5 +1612,76 @@ mod tests {
     fn parse_status_field_returns_none_when_missing() {
         let status = "node_id=client-1 node_role=client state=ExitActive";
         assert!(parse_status_field(status, "exit_node").is_none());
+    }
+
+    #[test]
+    fn sorted_node_host_pairs_returns_deterministic_order() {
+        let mut host_by_node = HashMap::new();
+        host_by_node.insert("client-3".to_string(), "debian@192.168.64.28".to_string());
+        host_by_node.insert("exit-1".to_string(), "debian@192.168.64.22".to_string());
+        host_by_node.insert("client-1".to_string(), "debian@192.168.64.24".to_string());
+        host_by_node.insert("client-2".to_string(), "debian@192.168.64.26".to_string());
+
+        let ordered = sorted_node_host_pairs(&host_by_node);
+
+        assert_eq!(
+            ordered,
+            vec![
+                ("client-1".to_string(), "debian@192.168.64.24".to_string()),
+                ("client-2".to_string(), "debian@192.168.64.26".to_string()),
+                ("client-3".to_string(), "debian@192.168.64.28".to_string()),
+                ("exit-1".to_string(), "debian@192.168.64.22".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_dns_distribution_targets_excludes_client_host() {
+        let mut host_by_node = HashMap::new();
+        host_by_node.insert("exit-1".to_string(), "debian@192.168.64.22".to_string());
+        host_by_node.insert("client-1".to_string(), "debian@192.168.64.24".to_string());
+        host_by_node.insert("client-2".to_string(), "debian@192.168.64.26".to_string());
+
+        let targets = managed_dns_distribution_targets(&host_by_node, "debian@192.168.64.24");
+
+        assert_eq!(
+            targets,
+            vec![
+                ("client-2".to_string(), "debian@192.168.64.26".to_string()),
+                ("exit-1".to_string(), "debian@192.168.64.22".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_assignment_authority_scope_collects_subject_and_peers() {
+        let bundle = "\
+version=1
+node_id=client-2
+peer_count=2
+peer.0.node_id=client-1
+peer.1.node_id=exit-1
+signature=test
+";
+
+        let scope =
+            parse_assignment_authority_scope(bundle).expect("assignment authority should parse");
+
+        assert_eq!(scope.node_id, "client-2");
+        assert_eq!(
+            scope.peer_node_ids,
+            vec!["client-1".to_string(), "exit-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_assignment_authority_scope_rejects_missing_subject() {
+        let bundle = "\
+version=1
+peer.0.node_id=exit-1
+";
+
+        let err = parse_assignment_authority_scope(bundle).expect_err("missing node_id must fail");
+        assert!(err.contains("missing node_id"), "unexpected error: {err}");
     }
 }

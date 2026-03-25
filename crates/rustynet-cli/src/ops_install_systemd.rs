@@ -361,7 +361,7 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         "RUSTYNET_ASSIGNMENT_AUTO_REFRESH",
         assignment_auto_refresh_raw.as_str(),
     )?;
-    parse_install_bool(
+    let auto_tunnel_enforce_enabled = parse_install_bool(
         "RUSTYNET_AUTO_TUNNEL_ENFORCE",
         auto_tunnel_enforce_raw.as_str(),
     )?;
@@ -919,7 +919,14 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
         &["enable", "rustynetd-privileged-helper.service"],
     )?;
     run_command_checked("systemctl", &["enable", "rustynetd.service"])?;
-    run_command_checked("systemctl", &["enable", "rustynetd-managed-dns.service"])?;
+    if auto_tunnel_enforce_enabled {
+        run_command_checked("systemctl", &["enable", "rustynetd-managed-dns.service"])?;
+    } else {
+        let _ = run_command_checked(
+            "systemctl",
+            &["disable", "--now", "rustynetd-managed-dns.service"],
+        );
+    }
 
     if trust_auto_refresh_enabled {
         if !trust_signer_key_path.is_file() {
@@ -976,9 +983,6 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
     wait_for_unit_active("rustynetd.service", 40, 250)?;
 
-    run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
-    wait_for_unit_active("rustynetd-managed-dns.service", 40, 250)?;
-
     if assignment_auto_refresh_enabled {
         let _ = run_command_checked(
             "systemctl",
@@ -988,7 +992,8 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
     if trust_auto_refresh_enabled {
         let _ = run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"]);
     }
-    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled {
+    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled || auto_tunnel_enforce_enabled
+    {
         wait_for_unix_socket(socket_path.as_path(), 40, 250)?;
         let socket_value = display_path(socket_path.as_path());
         run_command_checked_with_env(
@@ -996,6 +1001,10 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             &["state", "refresh"],
             &[("RUSTYNET_DAEMON_SOCKET", socket_value.as_str())],
         )?;
+    }
+    if auto_tunnel_enforce_enabled {
+        run_command_checked("systemctl", &["restart", "rustynetd-managed-dns.service"])?;
+        wait_for_unit_active("rustynetd-managed-dns.service", 40, 250)?;
     }
 
     if trust_auto_refresh_enabled {
@@ -2384,13 +2393,12 @@ fn format_command(command: &str, args: &[&str]) -> String {
 fn installer_unit_start_order(
     trust_auto_refresh_enabled: bool,
     assignment_auto_refresh_enabled: bool,
+    auto_tunnel_enforce_enabled: bool,
 ) -> Vec<&'static str> {
     let mut order = vec![
         "restart rustynetd-privileged-helper.service",
         "restart rustynetd.service",
         "wait rustynetd.service active",
-        "restart rustynetd-managed-dns.service",
-        "wait rustynetd-managed-dns.service active",
     ];
     if assignment_auto_refresh_enabled {
         order.push("start rustynetd-assignment-refresh.service (best-effort post-daemon)");
@@ -2398,8 +2406,13 @@ fn installer_unit_start_order(
     if trust_auto_refresh_enabled {
         order.push("start rustynetd-trust-refresh.service (best-effort post-daemon)");
     }
-    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled {
+    if trust_auto_refresh_enabled || assignment_auto_refresh_enabled || auto_tunnel_enforce_enabled
+    {
         order.push("run rustynet state refresh (strict)");
+    }
+    if auto_tunnel_enforce_enabled {
+        order.push("restart rustynetd-managed-dns.service");
+        order.push("wait rustynetd-managed-dns.service active");
     }
     if trust_auto_refresh_enabled {
         order.push("restart rustynetd-trust-refresh.timer");
@@ -2483,7 +2496,7 @@ mod tests {
 
     #[test]
     fn installer_order_runs_single_strict_state_refresh_after_best_effort_priming() {
-        let order = installer_unit_start_order(true, true);
+        let order = installer_unit_start_order(true, true, true);
         let daemon_idx = order
             .iter()
             .position(|entry| *entry == "restart rustynetd.service")
@@ -2504,6 +2517,10 @@ mod tests {
             .iter()
             .position(|entry| *entry == "run rustynet state refresh (strict)")
             .expect("strict state refresh should be present");
+        let managed_dns_restart_idx = order
+            .iter()
+            .position(|entry| *entry == "restart rustynetd-managed-dns.service")
+            .expect("managed DNS restart should be present");
         assert!(
             daemon_idx < best_effort_assignment_idx,
             "daemon restart must precede best-effort assignment refresh start"
@@ -2520,6 +2537,21 @@ mod tests {
             best_effort_trust_idx < strict_state_refresh_idx,
             "best-effort trust priming must precede strict state refresh"
         );
+        assert!(
+            strict_state_refresh_idx < managed_dns_restart_idx,
+            "strict state refresh must precede managed DNS routing restart"
+        );
+    }
+
+    #[test]
+    fn installer_order_skips_managed_dns_when_auto_tunnel_is_disabled() {
+        let order = installer_unit_start_order(true, false, false);
+        assert!(
+            !order
+                .iter()
+                .any(|entry| entry.contains("rustynetd-managed-dns")),
+            "managed DNS routing must not start before auto-tunnel enforcement is enabled"
+        );
     }
 
     #[test]
@@ -2535,6 +2567,37 @@ mod tests {
         let ipv6_loopback = parse_dns_resolver_bind_addr_install("[::1]:53535")
             .expect_err("ipv6 loopback resolver should be rejected");
         assert!(ipv6_loopback.contains("IPv4 loopback"));
+    }
+
+    #[test]
+    fn refresh_service_templates_execute_refresh_ops_before_state_refresh() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let assignment_template = std::fs::read_to_string(
+            repo_root.join("scripts/systemd/rustynetd-assignment-refresh.service"),
+        )
+        .expect("assignment refresh template should be readable");
+        assert!(
+            assignment_template
+                .contains("ExecStart=/usr/local/bin/rustynet ops refresh-assignment"),
+            "assignment refresh service must execute the Rust assignment refresh path"
+        );
+        assert!(
+            assignment_template.contains("ExecStartPost=/usr/local/bin/rustynet state refresh"),
+            "assignment refresh service must revalidate daemon state after refreshing signed assignment state"
+        );
+
+        let trust_template = std::fs::read_to_string(
+            repo_root.join("scripts/systemd/rustynetd-trust-refresh.service"),
+        )
+        .expect("trust refresh template should be readable");
+        assert!(
+            trust_template.contains("ExecStart=/usr/local/bin/rustynet ops refresh-trust"),
+            "trust refresh service must execute the Rust trust refresh path"
+        );
+        assert!(
+            trust_template.contains("ExecStartPost=/usr/local/bin/rustynet state refresh"),
+            "trust refresh service must revalidate daemon state after refreshing signed trust state"
+        );
     }
 
     #[test]
