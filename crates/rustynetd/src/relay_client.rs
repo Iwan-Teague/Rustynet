@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ed25519_dalek::SigningKey;
 use rustynet_backend_api::{NodeId, SocketEndpoint};
@@ -70,6 +70,8 @@ pub struct RelayClientSession {
     pub last_activity: Instant,
     /// The relay ID this session is bound to.
     pub relay_id: [u8; 16],
+    /// When the session token expires according to the control-plane signer.
+    pub token_expires_at_unix: u64,
 }
 
 impl RelayClientSession {
@@ -84,6 +86,12 @@ impl RelayClientSession {
     /// Returns true if the session has been idle too long.
     pub fn is_idle(&self, idle_timeout: Duration) -> bool {
         self.last_activity.elapsed() > idle_timeout
+    }
+
+    /// Returns true when the session token must be refreshed to avoid expiry.
+    pub fn token_refresh_due(&self, now_unix: u64, refresh_margin_secs: u64) -> bool {
+        self.token_expires_at_unix
+            <= now_unix.saturating_add(refresh_margin_secs)
     }
 }
 
@@ -257,6 +265,7 @@ impl RelayClient {
                                 established_at: now,
                                 last_activity: now,
                                 relay_id,
+                                token_expires_at_unix: token.expires_at_unix,
                             };
                             let endpoint = session.effective_endpoint();
                             self.sessions.insert(peer_node_id.clone(), session);
@@ -310,6 +319,17 @@ impl RelayClient {
     pub fn touch_session(&mut self, peer_node_id: &NodeId) {
         if let Some(session) = self.sessions.get_mut(peer_node_id) {
             session.last_activity = Instant::now();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_session_token_expiry_for_test(
+        &mut self,
+        peer_node_id: &NodeId,
+        token_expires_at_unix: u64,
+    ) {
+        if let Some(session) = self.sessions.get_mut(peer_node_id) {
+            session.token_expires_at_unix = token_expires_at_unix;
         }
     }
 }
@@ -434,6 +454,10 @@ mod tests {
 
     #[test]
     fn relay_client_session_effective_endpoint() {
+        let now_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let session = RelayClientSession {
             session_id: SessionId(12345),
             relay_addr: "192.168.1.1:4500".parse().unwrap(),
@@ -442,6 +466,7 @@ mod tests {
             established_at: Instant::now(),
             last_activity: Instant::now(),
             relay_id: [0xAA; 16],
+            token_expires_at_unix: now_unix + 60,
         };
 
         let endpoint = session.effective_endpoint();
@@ -451,6 +476,10 @@ mod tests {
 
     #[test]
     fn relay_client_session_idle_detection() {
+        let now_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut session = RelayClientSession {
             session_id: SessionId(12345),
             relay_addr: "192.168.1.1:4500".parse().unwrap(),
@@ -459,6 +488,7 @@ mod tests {
             established_at: Instant::now(),
             last_activity: Instant::now(),
             relay_id: [0xAA; 16],
+            token_expires_at_unix: now_unix + 60,
         };
 
         // Fresh session should not be idle
@@ -520,6 +550,10 @@ mod tests {
 
     #[test]
     fn relay_client_cleanup_removes_idle_sessions() {
+        let now_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let signing_key = Arc::new(SigningKey::from_bytes(&[1u8; 32]));
         let mut client = RelayClient::new(
             "node-a".to_string(),
@@ -539,11 +573,30 @@ mod tests {
                 established_at: Instant::now(),
                 last_activity: Instant::now() - Duration::from_secs(120),
                 relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix + 60,
             },
         );
 
         assert_eq!(client.active_session_count(), 1);
         client.cleanup_idle_sessions(Duration::from_secs(60));
         assert_eq!(client.active_session_count(), 0);
+    }
+
+    #[test]
+    fn relay_client_session_token_refresh_due_tracks_expiry_margin() {
+        let now_unix = unix_now();
+        let session = RelayClientSession {
+            session_id: SessionId(7),
+            relay_addr: "192.168.1.1:4500".parse().unwrap(),
+            allocated_port: 5001,
+            peer_node_id: "peer-b".to_string(),
+            established_at: Instant::now(),
+            last_activity: Instant::now(),
+            relay_id: [0xBB; 16],
+            token_expires_at_unix: now_unix + 30,
+        };
+
+        assert!(!session.token_refresh_due(now_unix, 10));
+        assert!(session.token_refresh_due(now_unix, 31));
     }
 }

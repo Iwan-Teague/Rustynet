@@ -2711,6 +2711,20 @@ impl fmt::Display for ControlPlaneError {
 
 impl std::error::Error for ControlPlaneError {}
 
+/// Derive the traversal endpoint-hint signing key from the control-plane
+/// signing secret.
+///
+/// Relay session tokens are bound to the same verifier as traversal hints, so
+/// runtime code can use this helper to issue relay tokens that verify against
+/// the pinned traversal verifier key.
+pub fn derive_endpoint_hint_signing_key(mut signing_secret: Vec<u8>) -> SigningKey {
+    let mut seed = derive_signing_seed(ENDPOINT_HINT_SIGNING_SEED_INFO_V1, &signing_secret);
+    signing_secret.zeroize();
+    let signing_key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    signing_key
+}
+
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
@@ -3033,8 +3047,8 @@ mod tests {
         RELAY_TOKEN_SCOPE, RelaySessionToken, ReplayPolicy, ReusableCredentialPolicy,
         ReusableCredentialRequest, SignedDnsZoneBundleRequest, SignedTokenClaims,
         ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TraversalCoordinationRecord, TrustState, derive_signing_seed, hex_bytes, load_trust_state,
-        persist_trust_state,
+        TraversalCoordinationRecord, TrustState, derive_endpoint_hint_signing_key,
+        derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
     };
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
@@ -4765,6 +4779,22 @@ mod tests {
         // Scope must be set correctly
         assert_eq!(token.scope, RELAY_TOKEN_SCOPE);
         assert_eq!(token.scope, "forward_ciphertext_only");
+    }
+
+    #[test]
+    fn derive_endpoint_hint_signing_key_matches_control_plane_verifier() {
+        let signing_secret = vec![9u8; 32];
+        let core = ControlPlaneCore::new(
+            signing_secret.clone(),
+            PolicySet {
+                rules: Vec::new(),
+            },
+        );
+        let derived = derive_endpoint_hint_signing_key(signing_secret);
+        assert_eq!(
+            derived.verifying_key().as_bytes(),
+            &core.endpoint_hint_verifying_key
+        );
     }
 
     #[test]

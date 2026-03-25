@@ -306,16 +306,33 @@ Reason:
 
 ## Practical Multi-Agent Assignment Example
 
-A safe split for four agents is:
-1. Agent 1: Package A
-2. Agent 2: Package B
-3. Agent 3: Package C
-4. Agent 4: Package D Phase A/B only
+The package list above is still the fine-grained ownership map, but it is now larger than the remaining open work.
 
-Then assign Package E after one of the above agents frees up.
-Package F should be owned by the integrator or by an agent that is only touching validators, reports, and gates after the core runtime work is stable enough for evidence promotion.
+For the current smaller remaining scope, the recommended four-agent split is:
+1. Agent 1: connectivity runtime completion
+   - primary source packages: Package A plus the runtime-facing remainder that used to sit at the A or B boundary
+   - focus: HP-4 relay-client wiring, runtime controller completion, expiry refresh, failback correctness
+2. Agent 2: cross-network evidence and gate completion
+   - primary source package: Package F
+   - focus: real validators, real reports, hard-pass gates, work-plan or exploit-coverage reconciliation tied to evidence
+3. Agent 3: runtime hardening residuals
+   - primary source package: Package C
+   - focus: remaining privileged start.sh removal, Linux or Debian regression revalidation, cross-platform residual cleanup, Rust-only E2E evidence refresh
+4. Agent 4: DNS and serialization hardening
+   - primary source packages: Package D Phase A/B plus Package E
+   - focus: typed bounded parser hardening, helper IPC hardening, Magic DNS residual secure slice
 
-Ready-to-use prompts for those four assignments:
+Why the split changed:
+- Package B is no longer the best standalone prompt because HP-3 relay core now has major implementation coverage; the remaining relay work is mostly runtime integration and evidence.
+- Package E is now small enough to pair safely with Package D for one agent, as long as that agent stays out of Phase C artifact-family migrations.
+- Package F is now large enough and important enough to be a first-class agent stream because the main remaining proof burden is cross-network evidence, not just core runtime code.
+
+Rebalancing rule:
+- keep each of the four agents on roughly one quarter of the remaining work,
+- prefer disjoint write scopes over perfect workload symmetry,
+- if one stream finishes early, move that agent to update owned docs or pick up the next blocked stream only after ownership is handed over explicitly.
+
+Ready-to-use prompts for the current rebalanced four-agent assignments:
 - [AgentKickoffPrompts.md](./AgentKickoffPrompts.md)
 
 ## Final Rule
