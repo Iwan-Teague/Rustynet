@@ -2,7 +2,7 @@
 
 Date: 2026-03-25
 Owner: Rustynet engineering
-Status: proposed migration reference
+Status: partial
 
 ## AI Implementation Prompt
 
@@ -79,12 +79,14 @@ This block is the quick source of truth for what remains in this document.
 If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
-- This entire plan is still open unless a phase is explicitly marked completed with evidence.
-- The execution order is strict: Phase A typed-schema hardening, then Phase B helper IPC, then Phase C artifacts, then Phase D measured streams, then Phase E DNS signer input.
+- This plan is still open overall.
+- The owned trust-boundary parser slice for DNS signer input is complete and verified; do not treat that as the broader artifact-family Phase E having started.
+- Phase B helper IPC is now complete in the owned runtime path.
+- Broader artifact-family parser and format migrations remain open and are still not started in this execution.
 
 `Do first`
-- Start with Phase A by removing dynamic serde_json::Value handling on privileged or trust-adjacent paths.
-- Then move to the framed postcard helper IPC migration before touching lower-risk artifact families.
+- Continue Phase A/B trust-boundary work before any wider artifact-family migration.
+- The next concrete step is documenting any remaining owned DNS proof gaps and blockers exactly, not starting broader artifact migrations.
 
 `Completion proof`
 - Touched phases have concrete code, tests, updated docs, and no long-lived JSON fallback in the active runtime path.
@@ -555,6 +557,10 @@ Targets:
 - live-lab summary/failure digest parsing,
 - fresh-install OS matrix report parsing.
 
+Owned-scope execution update:
+- The first concrete trust-adjacent parser slice in Agent 4 scope landed on 2026-03-25T18:23:04Z by removing the active JSON reader from `rustynet dns zone issue` and replacing it with a bounded canonical text manifest parser.
+- This does not mark the wider artifact/report-family Phase A work complete.
+
 ### Phase B: privileged helper IPC migration
 
 Goal:
@@ -570,6 +576,23 @@ Acceptance:
 - no JSON reader remains in the active helper runtime path,
 - size-limited decode and version negotiation are enforced,
 - regression tests cover malformed frame, unknown version, truncated payload, oversize payload.
+
+Execution record: 2026-03-25T18:33:02Z
+- [x] The active privileged helper client/server path now uses a single framed binary protocol with magic bytes, explicit version, message type, bounded payload length, and one frame per connection.
+- [x] The newline-delimited JSON helper reader/writer was removed from the active runtime path; there is no compatibility fallback.
+- [x] Decoder tests cover invalid magic, unknown version, truncated payload, oversize payload, trailing payload bytes, and round-trip request/response interoperability.
+- Changed files:
+  - `crates/rustynetd/src/privileged_helper.rs`
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynetd/src/privileged_helper.rs`
+  - `cargo test -p rustynetd privileged_helper -- --nocapture`
+- Artifacts:
+  - none
+- Residual risk:
+  - the helper framing logic still lives in `crates/rustynetd/src/privileged_helper.rs`; the shared serialization crate described in Section 10 is still future work
+  - broader artifact/report-family migrations remain open
+- Blocker / prerequisite:
+  - none for the helper IPC slice
 
 ### Phase C: discovery and report artifact migration
 
@@ -619,6 +642,27 @@ Acceptance:
 - signer-adjacent JSON input is gone from the active path,
 - manifest parser rejects duplicate/sparse/unknown record fields,
 - bundle issuance remains fail-closed.
+
+Execution record: 2026-03-25T18:23:04Z
+- [x] Active `rustynet dns zone issue` now requires `--records-manifest`; the `--records-json` reader was removed from the CLI path.
+- [x] The manifest parser is canonical-text only and rejects unknown fields, duplicate keys, sparse alias indices, duplicate aliases, whitespace-padded fields, oversize inputs, and invalid labels.
+- [x] Managed-DNS signer workflows in the owned live managed-DNS and exit-handoff tooling now emit filtered per-node manifests instead of temporary JSON files.
+- Changed files:
+  - `crates/rustynet-cli/src/main.rs`
+  - `crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+  - `crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `README.md`
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/main.rs crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `cargo test -p rustynet-cli dns_zone_records_manifest -- --nocapture`
+  - `cargo fmt --all --check` remains blocked by unrelated formatting diffs in `crates/rustynet-backend-wireguard/src/lib.rs`
+- Artifacts:
+  - none
+- Residual risk:
+  - privileged helper IPC is still newline JSON and remains the next required hardening slice
+  - broader typed-parser cleanup for discovery/report artifact families remains open
+- Blocker / prerequisite:
+  - none for this slice
 
 ## 12) Documentation touchpoints that must be updated with each phase
 
@@ -723,4 +767,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

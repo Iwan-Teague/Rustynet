@@ -1123,11 +1123,14 @@ mod tests {
         // Instead, verify that a very short TTL with no skew tolerance is rejected
         // This tests the boundary condition
         let mut transport_strict = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 0);
-        
+
         // With 1 second TTL and immediate check, should still pass (just barely)
         let hello = make_hello(&sk, "node-a", "node-b");
         assert!(
-            matches!(transport_strict.handle_hello(hello), RelayHelloResponse::Accepted(_)),
+            matches!(
+                transport_strict.handle_hello(hello),
+                RelayHelloResponse::Accepted(_)
+            ),
             "fresh token should be accepted even with strict 0 clock skew"
         );
     }
@@ -1160,7 +1163,10 @@ mod tests {
         let mut transport2 = RelayTransport::new(TEST_RELAY_ID, sk2.verifying_key(), 2, 90);
         let hello = make_hello(&sk2, "honest-node", "peer-1");
         assert!(
-            matches!(transport2.handle_hello(hello), RelayHelloResponse::Accepted(_)),
+            matches!(
+                transport2.handle_hello(hello),
+                RelayHelloResponse::Accepted(_)
+            ),
             "other nodes must not be affected by attacker's session exhaustion"
         );
     }
@@ -1284,4 +1290,3 @@ mod tests {
         );
     }
 }
-

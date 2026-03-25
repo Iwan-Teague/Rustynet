@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use rand::RngCore;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
-use rand::RngCore;
 
 const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -35,7 +35,9 @@ impl StunClient {
 
     fn query_stun_server(&self, server: &str) -> Result<SocketAddr, String> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        socket.set_read_timeout(Some(self.timeout)).map_err(|e| e.to_string())?;
+        socket
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| e.to_string())?;
 
         let server_addrs = server.to_socket_addrs().map_err(|e| e.to_string())?;
         let target = server_addrs.into_iter().next().ok_or("no server address")?;
@@ -43,7 +45,9 @@ impl StunClient {
         let tx_id = self.generate_tx_id();
         let request = self.build_binding_request(&tx_id);
 
-        socket.send_to(&request, target).map_err(|e| e.to_string())?;
+        socket
+            .send_to(&request, target)
+            .map_err(|e| e.to_string())?;
 
         let mut buf = [0u8; 1024];
         let (len, _src) = socket.recv_from(&mut buf).map_err(|e| e.to_string())?;
@@ -92,13 +96,13 @@ impl StunClient {
         let mut xor_mapped_addr = None;
 
         while pos + 4 <= end {
-            let attr_type = u16::from_be_bytes([buf[pos], buf[pos+1]]);
-            let attr_len = u16::from_be_bytes([buf[pos+2], buf[pos+3]]) as usize;
+            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
             let attr_end = pos + 4 + attr_len;
             if attr_end > end {
                 break;
             }
-            let attr_value = &buf[pos+4..attr_end];
+            let attr_value = &buf[pos + 4..attr_end];
 
             if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
                 match self.parse_xor_mapped_address(attr_value) {
@@ -128,25 +132,32 @@ impl StunClient {
 
     fn parse_xor_mapped_address(&self, val: &[u8]) -> Result<SocketAddr, String> {
         if val.len() < 8 {
-             return Err("xor mapped addr too short".to_string());
+            return Err("xor mapped addr too short".to_string());
         }
         let _reserved = val[0];
         let family = val[1];
         let port_xor = u16::from_be_bytes([val[2], val[3]]);
         let port = port_xor ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
 
-        if family == 0x01 { // IPv4
-             if val.len() < 8 { return Err("ipv4 too short".to_string()); }
-             let ip_xor = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
-             let ip = ip_xor ^ STUN_MAGIC_COOKIE;
-             Ok(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::from(ip)), port))
-        } else if family == 0x02 { // IPv6
-             // IPv6 XOR uses the first 32 bits of Transaction ID
-             // But we need the tx_id passed in or stored.
-             // For now, skipping IPv6 support in this simple client.
-             Err("ipv6 stun not supported yet".to_string())
+        if family == 0x01 {
+            // IPv4
+            if val.len() < 8 {
+                return Err("ipv4 too short".to_string());
+            }
+            let ip_xor = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
+            let ip = ip_xor ^ STUN_MAGIC_COOKIE;
+            Ok(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::from(ip)),
+                port,
+            ))
+        } else if family == 0x02 {
+            // IPv6
+            // IPv6 XOR uses the first 32 bits of Transaction ID
+            // But we need the tx_id passed in or stored.
+            // For now, skipping IPv6 support in this simple client.
+            Err("ipv6 stun not supported yet".to_string())
         } else {
-             Err(format!("unknown family: 0x{:02x}", family))
+            Err(format!("unknown family: 0x{:02x}", family))
         }
     }
 
@@ -158,15 +169,19 @@ impl StunClient {
         let family = val[1];
         let port = u16::from_be_bytes([val[2], val[3]]);
 
-        if family == 0x01 { // IPv4
-             if val.len() < 8 { return Err("ipv4 too short".to_string()); }
-             let ip = std::net::Ipv4Addr::new(val[4], val[5], val[6], val[7]);
-             Ok(SocketAddr::new(IpAddr::V4(ip), port))
-        } else if family == 0x02 { // IPv6
-             // Not supported
-             Err("ipv6 mapped addr not supported".to_string())
+        if family == 0x01 {
+            // IPv4
+            if val.len() < 8 {
+                return Err("ipv4 too short".to_string());
+            }
+            let ip = std::net::Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+            Ok(SocketAddr::new(IpAddr::V4(ip), port))
+        } else if family == 0x02 {
+            // IPv6
+            // Not supported
+            Err("ipv6 mapped addr not supported".to_string())
         } else {
-             Err(format!("unknown family: 0x{:02x}", family))
+            Err(format!("unknown family: 0x{:02x}", family))
         }
     }
 }

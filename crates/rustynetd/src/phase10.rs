@@ -15,7 +15,7 @@ use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
 };
 use crate::traversal::{
-    CoordinationSchedule, SimultaneousOpenResult, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
+    CoordinationSchedule, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
     TraversalCandidate as ProbeTraversalCandidate, TraversalDecision, TraversalDecisionReason,
     TraversalEngine, TraversalEngineConfig, TraversalError,
 };
@@ -42,14 +42,14 @@ impl<'a, B: TunnelBackend, S: DataplaneSystem> SimultaneousOpenRuntime
         // passed to execute_simultaneous_open.
         self.controller
             .reconfigure_managed_peer(&self.node_id, endpoint, PathMode::Direct)
-            .map_err(|err| TraversalError::InvalidConfig(err.to_string()))
+            .map_err(|_| TraversalError::InvalidConfig("phase10 direct probe send failed"))
     }
 
     fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
         self.controller
             .backend
             .peer_latest_handshake_unix(&self.node_id)
-            .map_err(|err| TraversalError::InvalidConfig(err.to_string()))
+            .map_err(|_| TraversalError::InvalidConfig("phase10 handshake read failed"))
     }
 }
 
@@ -2687,7 +2687,6 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             TraversalDecision::Direct {
                 endpoint,
                 reason: _,
-                attempts,
             } => {
                 self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
                 self.configure_traversal_paths(node_id, Some(endpoint), relay_endpoint)?;
@@ -2696,15 +2695,13 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 Ok(TraversalProbeReport {
                     decision: TraversalProbeDecision::Direct,
                     reason: TraversalProbeReason::FreshHandshakeObserved,
-                    attempts,
+                    attempts: result.attempts,
                     selected_endpoint: endpoint,
                     latest_handshake_unix: result.latest_handshake_unix,
                 })
             }
             TraversalDecision::Relay {
-                endpoint,
-                reason,
-                attempts,
+                endpoint, reason, ..
             } => {
                 self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
                 self.configure_traversal_paths(node_id, None, Some(endpoint))?;
@@ -2720,7 +2717,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 Ok(TraversalProbeReport {
                     decision: TraversalProbeDecision::Relay,
                     reason,
-                    attempts,
+                    attempts: result.attempts,
                     selected_endpoint: endpoint,
                     latest_handshake_unix: result.latest_handshake_unix,
                 })
@@ -3468,6 +3465,15 @@ mod tests {
         }
     }
 
+    fn test_runtime_context() -> RuntimeContext {
+        RuntimeContext {
+            local_node: NodeId::new("node-a").expect("node should parse"),
+            interface_name: "rustynet0".to_string(),
+            mesh_cidr: "100.64.0.0/10".to_string(),
+            local_cidr: "100.64.0.1/32".to_string(),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn parse_helper_request_command(line: &str) -> Option<String> {
         let payload: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -3708,11 +3714,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "0.0.0.0/0".to_string(),
@@ -3744,11 +3746,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "0.0.0.0/0".to_string(),
@@ -3932,11 +3930,7 @@ mod tests {
 
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node should parse"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             Vec::new(),
             Vec::new(),
             ApplyOptions::default(),
@@ -3966,11 +3960,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 Vec::new(),
                 Vec::new(),
                 ApplyOptions::default(),
@@ -3994,11 +3984,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4024,11 +4010,7 @@ mod tests {
 
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node should parse"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![Route {
                 destination_cidr: "100.100.20.0/24".to_string(),
@@ -4057,11 +4039,7 @@ mod tests {
 
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node should parse"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![Route {
                 destination_cidr: "0.0.0.0/0".to_string(),
@@ -4093,11 +4071,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "0.0.0.0/0".to_string(),
@@ -4156,11 +4130,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4237,11 +4207,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4272,11 +4238,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4296,6 +4258,12 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: current_endpoint,
+                    source: crate::traversal::CandidateSource::Host,
+                    priority: 900,
+                    observed_at_unix: 190,
+                }],
                 &[ProbeTraversalCandidate {
                     endpoint: current_endpoint,
                     source: crate::traversal::CandidateSource::Host,
@@ -4340,11 +4308,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4361,6 +4325,12 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: direct_endpoint,
+                    source: crate::traversal::CandidateSource::ServerReflexive,
+                    priority: 900,
+                    observed_at_unix: 200,
+                }],
                 &[ProbeTraversalCandidate {
                     endpoint: direct_endpoint,
                     source: crate::traversal::CandidateSource::ServerReflexive,
@@ -4403,11 +4373,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node should parse"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),
@@ -4421,6 +4387,15 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
+                &[ProbeTraversalCandidate {
+                    endpoint: SocketEndpoint {
+                        addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
+                        port: 51820,
+                    },
+                    source: crate::traversal::CandidateSource::ServerReflexive,
+                    priority: 700,
+                    observed_at_unix: 200,
+                }],
                 &[ProbeTraversalCandidate {
                     endpoint: SocketEndpoint {
                         addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
@@ -4779,11 +4754,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![],
                 ApplyOptions::default(),
@@ -4993,11 +4964,7 @@ mod tests {
 
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![],
             ApplyOptions::default(),
@@ -5030,11 +4997,7 @@ mod tests {
 
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![],
             ApplyOptions::default(),
@@ -5069,11 +5032,7 @@ mod tests {
         // node-b is not in the directory at all
         let result = controller.apply_dataplane_generation(
             trust_ok(),
-            RuntimeContext {
-                local_node: NodeId::new("node-a").expect("node"),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
-            },
+            test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![],
             ApplyOptions::default(),
@@ -5096,11 +5055,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![],
                 ApplyOptions::default(),
@@ -5166,11 +5121,7 @@ mod tests {
         controller
             .apply_dataplane_generation(
                 trust_ok(),
-                RuntimeContext {
-                    local_node: NodeId::new("node-a").expect("node"),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
-                    local_cidr: "100.64.0.1/32".to_string(),
-                },
+                test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
                     destination_cidr: "100.100.20.0/24".to_string(),

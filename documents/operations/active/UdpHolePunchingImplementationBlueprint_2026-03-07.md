@@ -135,13 +135,31 @@ Primary references in this repository:
 
 | Area | Current state | Gap to close |
 | --- | --- | --- |
-| Runtime path state | `Phase10Controller` stores authoritative per-peer direct/relay endpoints, refreshes peer endpoint bypass routing on path changes, executes a bounded one-sided direct probe loop, and auto-tunnel runtime consumes the controller decision during traversal sync (`crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/daemon.rs`) | Still missing full simultaneous-open WAN traversal and health-driven automatic failover/failback |
+| Runtime path state | `Phase10Controller` stores authoritative per-peer direct/relay endpoints, refreshes peer endpoint bypass routing on path changes, executes a bounded one-sided direct probe loop, and auto-tunnel runtime now resolves authenticated relay-session endpoints through `RelayClient` before arming relay paths when relay-session custody is configured (`crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/daemon.rs`, `crates/rustynetd/src/relay_client.rs`) | Still missing full simultaneous-open WAN traversal, live NAT/WAN evidence, and one retained-relay periodic failback regression |
 | CLI netcheck | Returns structured runtime diagnostics (`path_mode`, `path_reason`, `traversal_authority`, artifact freshness/candidate/error fields, and probe result/reason/attempt count) (`crates/rustynetd/src/daemon.rs`) | Still lacks full multi-peer HP-2 telemetry and relay-transport health evidence |
 | Backend API | `TunnelBackend` now supports controlled endpoint rotation plus per-peer handshake-recency evidence via `update_peer_endpoint`, `current_peer_endpoint`, and `peer_latest_handshake_unix` (`crates/rustynet-backend-api/src/lib.rs`) | Still needs richer endpoint-set/probe surfaces for full HP-2/HP-3 |
-| WireGuard backend | Can configure peers, rotate endpoints, and read bounded handshake-recency evidence via strict `wg` argv calls (`crates/rustynet-backend-wireguard/src/lib.rs`) | Still needs transport-level probe traffic generation beyond endpoint rotation + handshake observation |
-| Control signing model | Signed peer-map, signed assignment bundle, and **RelaySessionToken** (ed25519 signed with ct_eq) are implemented (`crates/rustynet-control/src/lib.rs`). **11 RelaySessionToken tests** cover signing, verification, expiry, ct_eq, and debug redaction. | **UPDATED 2026-03-25**: relay-session token complete. Still needs signed traversal-hint bundle. |
-| Relay crate | **UPDATED 2026-03-25**: Production relay transport implemented with authenticated sessions (`RelayTransport`), constant-time auth, replay protection, rate limiting, per-node session caps, idle/half-open cleanup, and ciphertext-only forwarding (31 tests pass) (`crates/rustynet-relay/src/transport.rs`) | **HP-4 relay client module added** (`crates/rustynetd/src/relay_client.rs`, 8 tests). Remaining: wire into daemon reconcile loop. |
+| WireGuard backend | Can configure peers, rotate endpoints, read bounded handshake-recency evidence via strict `wg` argv calls, and now preserve endpoint-scoped handshake fixtures across endpoint rotation in the in-memory test backend (`crates/rustynet-backend-wireguard/src/lib.rs`) | Still needs transport-level probe traffic generation beyond endpoint rotation + handshake observation |
+| Control signing model | Signed peer-map, signed assignment bundle, and **RelaySessionToken** (ed25519 signed with ct_eq) are implemented; relay-session runtime now derives its signer from the endpoint-hint signing domain instead of introducing a second authority (`crates/rustynet-control/src/lib.rs`). **11 RelaySessionToken tests** cover signing, verification, expiry, ct_eq, and debug redaction. | Traversal-hint issuance/verification is implemented; remaining work is broader WAN evidence and final HP-4 runtime closure |
+| Relay crate | **UPDATED 2026-03-25**: Production relay transport implemented with authenticated sessions (`RelayTransport`), constant-time auth, replay protection, rate limiting, per-node session caps, idle/half-open cleanup, and ciphertext-only forwarding (31 tests pass) (`crates/rustynet-relay/src/transport.rs`) | `rustynetd` relay-session runtime wiring is now in place; remaining work is live evidence plus the retained-relay periodic reprobe regression |
 | Phase10 gates | Current artifacts: netns/leak/perf/failover/state-audit (`scripts/ci/check_phase10_readiness.sh`) | Must add traversal security artifact checks (tamper/replay/failback integrity) |
+
+Updated evidence note (2026-03-25):
+- Implemented runtime slice:
+  - daemon loads relay-session custody inputs,
+  - derives the endpoint-hint relay signer,
+  - resolves authenticated relay-session endpoints before controller relay arming,
+  - refreshes relay-session expiry in-place,
+  - closes relay sessions on direct recovery,
+  - fail-closes when configured relay-session establishment fails.
+- Verification:
+  - `cargo test -p rustynet-control derive_endpoint_hint_signing_key_matches_control_plane_verifier -- --nocapture`
+  - `cargo test -p rustynetd relay_client::tests -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_relay_client_ -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives -- --exact --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --exact --nocapture`
+  - `cargo test -p rustynet-backend-wireguard in_memory_backend_promotes_cached_endpoint_handshake_on_endpoint_update -- --nocapture`
+- Remaining blocker:
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay -- --exact --nocapture` still fails, so periodic direct failback after an intermediate retained-relay reconcile remains open.
 
 ## 4) Required Trust and Key Artifacts
 Traversal activation must require all of the following to validate successfully.
@@ -503,4 +521,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

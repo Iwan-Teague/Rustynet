@@ -10,7 +10,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use live_lab_bin_support as live_lab_support;
-use serde_json::json;
 
 use live_lab_support::{
     Logger, append_env_assignment, capture_root, create_workspace, enforce_host,
@@ -25,7 +24,7 @@ const DNS_ZONE_NAME: &str = "rustynet";
 const DNS_MANAGED_LABEL: &str = "exit";
 const DNS_MANAGED_ALIAS: &str = "gateway";
 const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
-const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.json";
+const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.manifest";
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
 
@@ -324,8 +323,9 @@ fn run() -> Result<(), String> {
                     target.node_id
                 )
             })?;
-            let records_json = managed_dns_records_json_for_scope(&dns_base_records, scope)?;
-            Ok((target.node_id.clone(), records_json))
+            let records_manifest =
+                managed_dns_records_manifest_for_scope(&dns_base_records, scope)?;
+            Ok((target.node_id.clone(), records_manifest))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
 
@@ -993,14 +993,17 @@ fn refresh_dns_bundles(
     }
     let mut verifier_captured = false;
     for target in refresh_targets {
-        let records_json = records_by_node.get(&target.node_id).ok_or_else(|| {
+        let records_manifest = records_by_node.get(&target.node_id).ok_or_else(|| {
             format!(
                 "missing scoped DNS records for exit handoff node {}",
                 target.node_id
             )
         })?;
-        write_file(target.records_local.as_path(), records_json)?;
-        let records_remote = format!("/tmp/rn-exit-handoff-dns-records-{}.json", target.node_id);
+        write_file(target.records_local.as_path(), records_manifest)?;
+        let records_remote = format!(
+            "/tmp/rn-exit-handoff-dns-records-{}.manifest",
+            target.node_id
+        );
         scp_to(
             identity,
             known_hosts,
@@ -1009,7 +1012,7 @@ fn refresh_dns_bundles(
             records_remote.as_str(),
         )?;
         let issue_cmd = format!(
-            "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-json {} --output {} --verifier-key-output {}",
+            "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-manifest {} --output {} --verifier-key-output {}",
             shell_quote(passphrase_remote),
             shell_quote(target.node_id.as_str()),
             shell_quote(nodes_spec),
@@ -1113,7 +1116,7 @@ fn managed_dns_base_records(
     ]
 }
 
-fn managed_dns_records_json_for_scope(
+fn managed_dns_records_manifest_for_scope(
     records: &[ManagedDnsRecordTemplate],
     scope: &AssignmentAuthorityScope,
 ) -> Result<String, String> {
@@ -1124,14 +1127,7 @@ fn managed_dns_records_json_for_scope(
             record.target_node_id == scope.node_id
                 || allowed_targets.contains(&record.target_node_id)
         })
-        .map(|record| {
-            json!({
-                "label": record.label,
-                "target_node_id": record.target_node_id,
-                "ttl_secs": record.ttl_secs,
-                "aliases": record.aliases,
-            })
-        })
+        .cloned()
         .collect::<Vec<_>>();
     if filtered.is_empty() {
         return Err(format!(
@@ -1139,8 +1135,25 @@ fn managed_dns_records_json_for_scope(
             scope.node_id
         ));
     }
-    serde_json::to_string_pretty(&filtered)
-        .map_err(|err| format!("serialize scoped managed DNS records failed: {err}"))
+    let mut manifest = String::new();
+    manifest.push_str("version=1\n");
+    manifest.push_str(&format!("record_count={}\n", filtered.len()));
+    for (index, record) in filtered.iter().enumerate() {
+        manifest.push_str(&format!("record.{index}.label={}\n", record.label));
+        manifest.push_str(&format!(
+            "record.{index}.target_node_id={}\n",
+            record.target_node_id
+        ));
+        manifest.push_str(&format!("record.{index}.ttl_secs={}\n", record.ttl_secs));
+        manifest.push_str(&format!(
+            "record.{index}.alias_count={}\n",
+            record.aliases.len()
+        ));
+        for (alias_index, alias) in record.aliases.iter().enumerate() {
+            manifest.push_str(&format!("record.{index}.alias.{alias_index}={alias}\n"));
+        }
+    }
+    Ok(manifest)
 }
 
 fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, String> {
@@ -1343,7 +1356,7 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, managed_dns_base_records, managed_dns_records_json_for_scope,
+        Config, managed_dns_base_records, managed_dns_records_manifest_for_scope,
         managed_dns_refresh_targets, managed_dns_state_is_valid, parse_assignment_authority_scope,
     };
     use std::path::{Path, PathBuf};
@@ -1425,7 +1438,7 @@ peer.1.endpoint=192.168.128.26:51820
     }
 
     #[test]
-    fn managed_dns_records_json_for_scope_filters_unauthorized_targets() {
+    fn managed_dns_records_manifest_for_scope_filters_unauthorized_targets() {
         let scope = parse_assignment_authority_scope(
             "node_id=exit-1\npeer.0.node_id=client-1\npeer.1.node_id=client-2\n",
         )
@@ -1437,11 +1450,11 @@ peer.1.endpoint=192.168.128.26:51820
             ttl_secs: 300,
             aliases: Vec::new(),
         });
-        let filtered =
-            managed_dns_records_json_for_scope(&records, &scope).expect("records should filter");
-        assert!(filtered.contains("\"target_node_id\": \"exit-1\""));
-        assert!(filtered.contains("\"target_node_id\": \"client-1\""));
-        assert!(!filtered.contains("\"target_node_id\": \"client-9\""));
+        let filtered = managed_dns_records_manifest_for_scope(&records, &scope)
+            .expect("records should filter");
+        assert!(filtered.contains("record.0.target_node_id=exit-1"));
+        assert!(filtered.contains("record.1.target_node_id=client-1"));
+        assert!(!filtered.contains("client-9"));
     }
 }
 

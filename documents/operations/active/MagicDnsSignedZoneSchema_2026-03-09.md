@@ -1,7 +1,7 @@
 # Rustynet Signed Magic DNS Zone Schema
 
 Date: 2026-03-09
-Status: design
+Status: partial
 Scope: secure schema and runtime contract for Magic DNS-like naming
 
 ## AI Implementation Prompt
@@ -80,11 +80,12 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Open scope`
 - The hardened baseline is in place; the remaining work is the next secure slice only.
-- Open items are per-node filtered issuance policy enforcement, OS DNS integration to the loopback authoritative resolver, and adversarial live or semi-live E2E testing.
+- Per-node filtered issuance in the owned operator workflows now emits canonical text manifests instead of JSON.
+- Open items are fresh adversarial live or semi-live E2E testing and any remaining runtime proof gaps that still lack measured evidence.
 
 `Do first`
 - Verify the already-implemented baseline before extending behavior.
-- Then enforce per-node filtered issuance in operator workflows before changing host-level DNS integration.
+- Then finish the remaining adversarial and live-proof work without weakening the signed authoritative path.
 
 `Completion proof`
 - Managed names resolve only through the signed authoritative path, stale or forged bundles fail closed, and managed-zone routing to the loopback resolver works without weakening protected DNS.
@@ -96,6 +97,7 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Clarity note`
 - When in doubt, prefer a narrower signed feature set over a broader DNS feature set with weaker trust guarantees.
+- If unit coverage exists but live or semi-live proof was not rerun in the current execution, record that as a blocker instead of promoting the slice to complete.
 
 ## 0) Purpose
 
@@ -507,7 +509,7 @@ Not for immediate implementation, but this is the right shape:
 rustynet dns zone issue \
   --zone rustynet \
   --subject-node-id client-1 \
-  --records-file /path/to/zone.records.json \
+  --records-manifest /path/to/zone.records.manifest \
   --signing-secret /etc/rustynet/dns-zone.signing.secret \
   --signing-secret-passphrase-file /run/credentials/.../dns_zone_signing_passphrase \
   --output /tmp/client-1.dns-zone \
@@ -583,14 +585,49 @@ Current hardened baseline implemented:
 3. signed bundle state replacing the in-memory-only placeholder path
 4. CLI `dns zone issue` and `dns zone verify` commands
 5. local authoritative resolver for the managed zone, bound to loopback only
+6. signer-side managed-DNS operator workflows emit filtered per-node canonical manifests for `dns zone issue`; the active `--records-json` path is gone
 
 Next secure slice:
 
-1. per-node filtered bundle issuance policy enforcement in operator workflows
-2. OS DNS integration that points managed-zone queries at the local loopback resolver without weakening protected-DNS routing
-3. adversarial E2E tests for stale/forged/replayed managed-zone bundles on live nodes
+1. adversarial E2E tests for stale/forged/replayed/tampered/policy-invalid managed-zone bundles on live or semi-live nodes
+2. fresh measured proof that OS DNS integration still routes managed-zone queries to the loopback authoritative resolver without weakening protected DNS
+3. document any runtime-controller prerequisite exactly instead of masking it in the gate or operator tooling
 
 Do not add dynamic local resolver mutation or OS `/etc/hosts` editing as an alternate naming path.
+
+Execution record: 2026-03-25T18:23:04Z
+- [x] The active signer input path now uses `--records-manifest` canonical text instead of JSON.
+- [x] The owned managed-DNS live issuance workflows keep per-node filtered issuance and now serialize that filtered scope as canonical manifests before signing.
+- Changed files:
+  - `crates/rustynet-cli/src/main.rs`
+  - `crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+  - `crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `README.md`
+  - `documents/operations/active/SerializationFormatHardeningPlan_2026-03-25.md`
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/main.rs crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `cargo test -p rustynet-cli dns_zone_records_manifest -- --nocapture`
+- Artifacts:
+  - none
+- Residual risk:
+  - the privileged helper socket remains newline JSON and still needs Phase B framing hardening
+  - adversarial live or semi-live managed-DNS bundle rejection proof has not been rerun in this execution
+- Blocker / prerequisite:
+  - none for the manifest/operator-workflow slice
+
+Execution record: 2026-03-25T18:33:02Z
+- [x] Existing DNS bundle and resolver adversarial/unit coverage was rerun against the current tree for the signed authoritative path.
+- Verification:
+  - `cargo test -p rustynet-control dns_zone_bundle -- --nocapture`
+  - `cargo test -p rustynetd dns_resolver_ -- --nocapture`
+  - `cargo test -p rustynetd dns_zone -- --nocapture` ran the targeted daemon DNS bundle tests successfully but also surfaced an unrelated failing `tests/state_fetcher.rs::fetcher_dns_zone_applied_updates_bundle_on_disk` assertion (`Skipped` vs `Applied`)
+  - `./scripts/ci/phase10_gates.sh` failed outside the owned DNS slice because `rustynet-backend-stub` and `rustynet-backend-api` tests still initialize `RuntimeContext` without the required `interface_name` field
+- Residual risk:
+  - live or semi-live managed-DNS adversarial proof for stale/forged/replayed/tampered/policy-invalid bundles was not rerun in this execution
+  - the unrelated `state_fetcher` and backend gate failures prevent a clean full phase10-gate claim from this branch state
+- Blocker / prerequisite:
+  - rerun the managed-DNS live or semi-live adversarial path once the lab is available
+  - resolve the unrelated backend and `state_fetcher` test failures before claiming full gate closure
 
 ## 19) Bottom Line
 
@@ -641,4 +678,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

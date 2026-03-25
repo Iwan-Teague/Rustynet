@@ -1369,6 +1369,8 @@ If macOS is not available in the lab, update the gate to mark macOS as `"status"
 
 **Problem:** All six required cross-network reports are missing. Previous attempts failed at lab initialization.
 
+**2026-03-25 status note:** The Phase 10 readiness code path now fails closed on missing or invalid canonical cross-network reports and NAT-matrix coverage, but the six measured reports are still missing and current verification is blocked by unrelated Agent 1 runtime compile failures in `rustynetd`.
+
 **Prerequisite:**
 - Track B (WS-1/WS-2/WS-3) done — so the daemon is self-healing
 - Lab machines reachable (check SSH connectivity before starting)
@@ -1797,6 +1799,20 @@ When Debian-host tests and integration runs are available I will complete code c
 - Execute `./scripts/ci/security_regression_gates.sh` on Debian (G2 gates)
 - Execute `./scripts/ci/traversal_adversarial_gates.sh` on Debian (A4 traversal tests)
 - Execute A4-b live nftables ACL snapshot test on two-node lab
+
+## Session Log — Agent 2 Evidence Gate Wiring 2026-03-25
+
+Status: partial
+
+- Changed files: `crates/rustynet-cli/src/ops_cross_network_reports.rs`, `crates/rustynet-cli/src/ops_phase9.rs`
+- What landed: `ops verify-phase10-readiness` now calls the cross-network schema validator and NAT-matrix validator before Phase 10 readiness can pass, closing the previous proof gap where readiness ignored the six canonical cross-network reports.
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/ops_cross_network_reports.rs crates/rustynet-cli/src/ops_phase9.rs` `pass`
+  - `cargo fmt --all -- --check` `blocked` by unrelated formatting diffs in out-of-scope files
+  - `cargo test -p rustynet-cli validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports -- --nocapture` `blocked` by unrelated compile failures in Agent 1-owned `rustynetd` runtime files
+- Artifacts: none generated; canonical `artifacts/phase10/cross_network_*_report.json` files remain absent.
+- Residual risk: Track E is still incomplete until the six measured cross-network reports exist and the dedicated gate and readiness path are re-run successfully.
+- Blocker / prerequisite: Agent 1 must first restore a compiling `rustynetd` runtime so the CLI readiness path and gate harness can be executed again.
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.
@@ -1833,4 +1849,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-
