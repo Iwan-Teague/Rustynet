@@ -2234,80 +2234,21 @@ write_daemon_environment() {
   if is_macos_host; then
     return 0
   fi
-  if [[ "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
-    print_err "Linux credential blob path must be ${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
-    exit 1
-  fi
-  if [[ "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" != "${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" ]]; then
-    print_err "Linux signing credential blob path must be ${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}."
-    exit 1
-  fi
-  enforce_auto_tunnel_policy
   require_linux_dataplane "write_daemon_environment" || return 0
   if ! sync_egress_interface_with_selected_exit_route; then
     print_err "Failed to derive secure egress interface mapping for current exit selection."
     return 1
   fi
 
-  run_systemd_installer_with_env() {
-    run_root env \
-      RUSTYNET_NODE_ID="${DEVICE_NODE_ID}" \
-      RUSTYNET_NODE_ROLE="${NODE_ROLE}" \
-      RUSTYNET_SOCKET="${SOCKET_PATH}" \
-      RUSTYNET_STATE="${STATE_PATH}" \
-      RUSTYNET_TRUST_EVIDENCE="${TRUST_EVIDENCE_PATH}" \
-      RUSTYNET_TRUST_VERIFIER_KEY="${TRUST_VERIFIER_KEY_PATH}" \
-      RUSTYNET_TRUST_WATERMARK="${TRUST_WATERMARK_PATH}" \
-      RUSTYNET_TRUST_SIGNER_KEY="${TRUST_SIGNER_KEY_PATH}" \
-      RUSTYNET_TRUST_AUTO_REFRESH="$( [[ "${AUTO_REFRESH_TRUST}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_MEMBERSHIP_SNAPSHOT="${MEMBERSHIP_SNAPSHOT_PATH}" \
-      RUSTYNET_MEMBERSHIP_LOG="${MEMBERSHIP_LOG_PATH}" \
-      RUSTYNET_MEMBERSHIP_WATERMARK="${MEMBERSHIP_WATERMARK_PATH}" \
-      RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY="${MEMBERSHIP_OWNER_SIGNING_KEY_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_ENFORCE="$( [[ "${AUTO_TUNNEL_ENFORCE}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_AUTO_TUNNEL_BUNDLE="${AUTO_TUNNEL_BUNDLE_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY="${AUTO_TUNNEL_VERIFIER_KEY_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_WATERMARK="${AUTO_TUNNEL_WATERMARK_PATH}" \
-      RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS="${AUTO_TUNNEL_MAX_AGE_SECS}" \
-      RUSTYNET_TRAVERSAL_BUNDLE="${TRAVERSAL_BUNDLE_PATH}" \
-      RUSTYNET_TRAVERSAL_VERIFIER_KEY="${TRAVERSAL_VERIFIER_KEY_PATH}" \
-      RUSTYNET_TRAVERSAL_WATERMARK="${TRAVERSAL_WATERMARK_PATH}" \
-      RUSTYNET_TRAVERSAL_MAX_AGE_SECS="${TRAVERSAL_MAX_AGE_SECS}" \
-      RUSTYNET_BACKEND="${BACKEND_MODE}" \
-      RUSTYNET_WG_INTERFACE="${WG_INTERFACE}" \
-      RUSTYNET_WG_LISTEN_PORT="${WG_LISTEN_PORT}" \
-      RUSTYNET_WG_PRIVATE_KEY="${WG_PRIVATE_KEY_PATH}" \
-      RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY="${WG_ENCRYPTED_PRIVATE_KEY_PATH}" \
-      RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB="${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
-      RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB="${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}" \
-      RUSTYNET_WG_PUBLIC_KEY="${WG_PUBLIC_KEY_PATH}" \
-      RUSTYNET_EGRESS_INTERFACE="${EGRESS_INTERFACE}" \
-      RUSTYNET_AUTO_PORT_FORWARD_EXIT="$( [[ "${AUTO_PORT_FORWARD_EXIT}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS="${AUTO_PORT_FORWARD_LEASE_SECS}" \
-      RUSTYNET_DATAPLANE_MODE="${DATAPLANE_MODE}" \
-      RUSTYNET_PRIVILEGED_HELPER_SOCKET="${PRIVILEGED_HELPER_SOCKET_PATH}" \
-      RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS="${PRIVILEGED_HELPER_TIMEOUT_MS}" \
-      RUSTYNET_RECONCILE_INTERVAL_MS="${RECONCILE_INTERVAL_MS}" \
-      RUSTYNET_MAX_RECONCILE_FAILURES="${MAX_RECONCILE_FAILURES}" \
-      RUSTYNET_FAIL_CLOSED_SSH_ALLOW="$( [[ "${FAIL_CLOSED_SSH_ALLOW}" == "1" ]] && echo true || echo false )" \
-      RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS="${FAIL_CLOSED_SSH_ALLOW_CIDRS}" \
-      "$@"
-  }
-
   if ! command -v rustynet >/dev/null 2>&1; then
     print_err "rustynet CLI is required for Linux systemd installer operations."
-    unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
     exit 1
   fi
 
-  if ! run_systemd_installer_with_env \
-    RUSTYNET_INSTALL_SOURCE_ROOT="${ROOT_DIR}" \
-    rustynet ops install-systemd; then
+  if ! run_root rustynet ops write-daemon-env --config-path "${CONFIG_FILE}" --egress-interface "${EGRESS_INTERFACE:-}"; then
     print_err "Rust-backed systemd installer invocation failed; setup is fail-closed."
-    unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
     exit 1
   fi
-  unset -f run_systemd_installer_with_env >/dev/null 2>&1 || true
   return 0
 }
 

@@ -108,6 +108,7 @@ Status update (verified against current tree on 2026-03-05):
 - Current gate status in this tree (2026-03-05): `phase10_gates.sh` and `membership_gates.sh` pass end-to-end.
 - Debian two-node remote validation now passes end-to-end on Debian 13 with exit-node NAT active and exit state `ExitActive` (`artifacts/phase10/debian_two_node_remote_validation.md`, generated `2026-03-05T15:43:57Z`, commit `d02a159`).
 - Security risk truth: the primary remaining risk in this document is drift between planned text and current implementation; stale guidance can cause insecure operator assumptions or mis-prioritized engineering work.
+- Status update (verified against current tree on 2026-03-25): GAP-10 blast-radius reduction advanced by migrating `write_daemon_environment` to Rust. This removes significant complexity and environmental variable manipulation from `start.sh`, consolidating it into a testable Rust binary path.
 
 ## 1) Goals
 - Keep Debian 13 behavior stable and secure while improving macOS parity.

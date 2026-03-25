@@ -79,12 +79,11 @@ This block is the quick source of truth for what remains in this document.
 If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
-- The remaining security-relevant migration work is concentrated in the privileged and secret-bearing start.sh subflows and in refreshed Phase I Rust-only E2E evidence.
-- The highest-priority remaining functions are the ones listed in Section 10 under start.sh remaining privileged or secret subflows.
+- The remaining security-relevant migration work is concentrated in refreshed Phase I Rust-only E2E evidence.
+- The Section 10 start.sh privileged flows are now migrated to Rust ops commands.
 
 `Do first`
-- Extract the remaining Section 10 start.sh privileged flows into Rust ops commands.
-- Then refresh the Rust-only remote E2E evidence so the wrapper-only claim is backed by current execution proof.
+- Refresh the Rust-only remote E2E evidence so the wrapper-only claim is backed by current execution proof.
 
 `Completion proof`
 - Each migrated flow is wrapper-only or retired, with code and tests proving path validation, custody, and fail-closed behavior.
@@ -108,6 +107,10 @@ Success criteria:
 
 Related format-hardening plan:
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
+
+## Status Update (2026-03-25)
+- Phase E complete: `start.sh` `write_daemon_environment` logic migrated to `rustynet ops write-daemon-env`. This ensures environment variables for systemd service are generated securely in Rust, enforcing policy defaults and fail-closed behavior before service installation. `start.sh` now delegates this critical step to Rust.
+- Section 10 status: All high-priority `start.sh` privileged/secret subflows listed (`prepare_system_directories`, `ensure_wireguard_keys`, `ensure_membership_files`, `lockdown_blind_exit_local_material`, `configure_trust_material`, `refresh_signed_trust_evidence`, `write_daemon_environment`) are now migrated to Rust ops commands.
 
 ## Status Update (2026-03-06)
 - Phase A complete: `refresh_trust_evidence.sh` and `refresh_assignment_bundle.sh` are thin wrappers to Rust ops commands.

@@ -5,6 +5,7 @@ mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
 mod ops_install_systemd;
+mod ops_write_daemon_env;
 mod ops_live_lab_failure_digest;
 mod ops_live_lab_orchestrator;
 mod ops_network_discovery;
@@ -281,6 +282,10 @@ mod ops_ci_release_perf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpsCommand {
     VerifyRuntimeBinaryCustody,
+    WriteDaemonEnv {
+        config_path: PathBuf,
+        egress_interface: Option<String>,
+    },
     RefreshTrust,
     RefreshSignedTrust,
     BootstrapTunnelCustody,
@@ -666,6 +671,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops verify-runtime-binary-custody does not accept options".to_string());
             }
             Ok(OpsCommand::VerifyRuntimeBinaryCustody)
+        }
+        "write-daemon-env" => {
+            let config_path = parser.required_path("--config-path")?;
+            let egress_interface = parser.value("--egress-interface");
+            Ok(OpsCommand::WriteDaemonEnv {
+                config_path,
+                egress_interface,
+            })
         }
         "refresh-trust" => {
             if args.len() != 1 {
@@ -3158,6 +3171,10 @@ fn execute_trust_verify(
 fn execute_ops(command: OpsCommand) -> Result<String, String> {
     match command {
         OpsCommand::VerifyRuntimeBinaryCustody => execute_ops_verify_runtime_binary_custody(),
+        OpsCommand::WriteDaemonEnv {
+            config_path,
+            egress_interface,
+        } => ops_write_daemon_env::execute_ops_write_daemon_env(config_path, egress_interface),
         OpsCommand::RefreshTrust => execute_ops_refresh_trust(),
         OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
         OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),

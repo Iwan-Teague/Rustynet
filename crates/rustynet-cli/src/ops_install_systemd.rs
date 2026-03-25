@@ -53,7 +53,7 @@ struct InstallSources {
     managed_dns_service: PathBuf,
 }
 
-pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
+pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     require_root_execution()?;
     require_linux_host()?;
 
@@ -1188,7 +1188,7 @@ fn validate_regular_file_non_symlink(path: &Path, label: &str) -> Result<(), Str
     Ok(())
 }
 
-fn read_env_file_values(path: &Path) -> Result<HashMap<String, String>, String> {
+pub(crate) fn read_env_file_values(path: &Path) -> Result<HashMap<String, String>, String> {
     let mut values = HashMap::new();
     if !path.exists() {
         return Ok(values);
