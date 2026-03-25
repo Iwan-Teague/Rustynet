@@ -4685,13 +4685,34 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
         return Err("clear-managed-dns-routing is supported on Linux only".to_string());
     }
 
-    ensure_systemd_resolved_active()?;
     let interface = managed_dns_interface_name_from_env()?;
-    run_resolvectl_action(&["revert", interface.as_str()])?;
+    if let Err(err) = ensure_systemd_resolved_active() {
+        if managed_dns_routing_already_absent(err.as_str()) {
+            return Ok(format!(
+                "managed DNS routing already cleared: interface={interface}"
+            ));
+        }
+        return Err(err);
+    }
+    let revert_output = run_command_capture("resolvectl", &["revert", interface.as_str()])
+        .map_err(|err| format!("execute resolvectl revert {} failed: {err}", interface))?;
+    if !revert_output.status.success() {
+        let detail = command_failure_detail(&revert_output);
+        if managed_dns_routing_already_absent(detail.as_str()) {
+            return Ok(format!(
+                "managed DNS routing already cleared: interface={interface}"
+            ));
+        }
+        return Err(format!("resolvectl revert {} failed: {detail}", interface));
+    }
 
     Ok(format!(
         "managed DNS routing cleared: interface={interface}"
     ))
+}
+
+fn managed_dns_routing_already_absent(detail: &str) -> bool {
+    detail.contains("Failed to resolve interface") || detail.contains("No such device")
 }
 
 fn execute_ops_restart_runtime_service() -> Result<String, String> {
@@ -9972,8 +9993,8 @@ mod tests {
     use super::{
         CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute,
         is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_json,
-        load_signing_key, managed_dns_resolver_server_arg, parse_bool_value,
-        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
         phase6_validate_platform_parity_report, render_launchd_plist,
         required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
@@ -9993,6 +10014,19 @@ mod tests {
             "192.168.1.0/24".to_string(),
         ]);
         assert!(format!("{command:?}").contains("RouteAdvertise"));
+    }
+
+    #[test]
+    fn managed_dns_routing_already_absent_treats_missing_interface_as_idempotent() {
+        assert!(managed_dns_routing_already_absent(
+            "Failed to resolve interface \"rustynet0\": No such device"
+        ));
+        assert!(managed_dns_routing_already_absent(
+            "resolvectl revert rustynet0 failed: No such device"
+        ));
+        assert!(!managed_dns_routing_already_absent(
+            "Failed to contact systemd-resolved"
+        ));
     }
 
     #[test]

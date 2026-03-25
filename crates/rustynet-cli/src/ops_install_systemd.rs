@@ -1048,7 +1048,17 @@ pub(super) fn execute_ops_install_systemd() -> Result<String, String> {
             ],
         )?;
     }
-    run_systemctl_status_with_retry("rustynetd-managed-dns.service", 20, 250)?;
+    if auto_tunnel_enforce_enabled {
+        run_systemctl_status_with_retry("rustynetd-managed-dns.service", 20, 250)?;
+    } else {
+        wait_for_unit_inactive("rustynetd-managed-dns.service", 20, 250)?;
+        let enabled_state = systemctl_unit_enabled_state("rustynetd-managed-dns.service")?;
+        if enabled_state != "disabled" {
+            return Err(format!(
+                "managed DNS routing unit must remain disabled while auto-tunnel enforcement is off (state={enabled_state})"
+            ));
+        }
+    }
     run_command_stream(
         "systemctl",
         &["--no-pager", "--full", "status", "rustynetd.service"],
@@ -2375,11 +2385,52 @@ fn systemctl_unit_active_state(unit: &str) -> Result<String, String> {
     Ok("unknown".to_string())
 }
 
+fn systemctl_unit_enabled_state(unit: &str) -> Result<String, String> {
+    let output = Command::new("systemctl")
+        .args(["is-enabled", unit])
+        .output()
+        .map_err(|err| format!("execute systemctl is-enabled {unit} failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Ok(stderr);
+    }
+    Ok("unknown".to_string())
+}
+
 fn systemctl_state_retryable(state: &str) -> bool {
     matches!(
         state,
         "activating" | "deactivating" | "reloading" | "inactive" | "unknown"
     )
+}
+
+fn wait_for_unit_inactive(unit: &str, attempts: usize, sleep_ms: u64) -> Result<(), String> {
+    let mut last_state = "unknown".to_string();
+    for attempt in 1..=attempts {
+        last_state = systemctl_unit_active_state(unit)?;
+        if last_state == "inactive" {
+            return Ok(());
+        }
+        if attempt < attempts
+            && matches!(
+                last_state.as_str(),
+                "activating" | "deactivating" | "reloading" | "active" | "unknown"
+            )
+        {
+            sleep(Duration::from_millis(sleep_ms));
+            continue;
+        }
+        return Err(format!(
+            "systemd unit {unit} failed to reach inactive state after {attempts} attempts (last_state={last_state}, attempt={attempt}/{attempts})"
+        ));
+    }
+    Err(format!(
+        "systemd unit {unit} failed to reach inactive state after {attempts} attempts (last_state={last_state})"
+    ))
 }
 
 fn format_command(command: &str, args: &[&str]) -> String {
