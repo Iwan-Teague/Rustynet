@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,7 +81,6 @@ use rustynet_backend_wireguard::MacosWireguardBackend;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
-use rustynet_control::AuthSurfaceGuard;
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
@@ -246,22 +246,11 @@ impl StateFetcher {
             dns_zone_name: cfg.dns_zone_name.clone(),
             local_node_id: cfg.node_id.clone(),
             _auto_tunnel_enforce: cfg.auto_tunnel_enforce,
-            trust_url: cfg
-                .trust_url
-                .clone()
-                .or_else(|| std::env::var("RUSTYNET_TRUST_URL").ok()),
-            traversal_url: cfg
-                .traversal_url
-                .clone()
-                .or_else(|| std::env::var("RUSTYNET_TRAVERSAL_URL").ok()),
-            assignment_url: cfg
-                .assignment_url
-                .clone()
-                .or_else(|| std::env::var("RUSTYNET_ASSIGNMENT_URL").ok()),
-            dns_zone_url: cfg
-                .dns_zone_url
-                .clone()
-                .or_else(|| std::env::var("RUSTYNET_DNS_ZONE_URL").ok()),
+            // Hardened daemon paths only consume pinned local custody artifacts.
+            trust_url: None,
+            traversal_url: None,
+            assignment_url: None,
+            dns_zone_url: None,
         }
     }
 
@@ -321,9 +310,11 @@ impl StateFetcher {
         if let Some(url) = &self.trust_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
-                    // write to temp file and run full verification via load_* helpers so we obtain watermark
-                    let tmp = std::env::temp_dir().join("rustynetd.trust.tmp");
-                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    let tmp = write_secure_staged_artifact(
+                        &self.trust_evidence_path,
+                        &body,
+                        "trust evidence",
+                    )?;
 
                     // Load previous watermark (may be missing)
                     let previous_watermark = match load_trust_watermark(&self.trust_watermark_path)
@@ -354,7 +345,10 @@ impl StateFetcher {
                             );
                             Ok(FetchDecision::Applied)
                         }
-                        Err(err) => Err(format!("trust fetch verification failed: {err}")),
+                        Err(err) => {
+                            let _ = fs::remove_file(&tmp);
+                            Err(format!("trust fetch verification failed: {err}"))
+                        }
                     }
                 }
                 Err(_network_err) => Ok(FetchDecision::Skipped),
@@ -368,8 +362,11 @@ impl StateFetcher {
         if let Some(url) = &self.traversal_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
-                    let tmp = std::env::temp_dir().join("rustynetd.traversal.tmp");
-                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    let tmp = write_secure_staged_artifact(
+                        &self.traversal_bundle_path,
+                        &body,
+                        "traversal bundle",
+                    )?;
 
                     let previous_watermark =
                         match load_traversal_watermark(&self.traversal_watermark_path) {
@@ -405,7 +402,10 @@ impl StateFetcher {
                             );
                             Ok(FetchDecision::Applied)
                         }
-                        Err(err) => Err(format!("traversal fetch verification failed: {err}")),
+                        Err(err) => {
+                            let _ = fs::remove_file(&tmp);
+                            Err(format!("traversal fetch verification failed: {err}"))
+                        }
                     }
                 }
                 Err(_network_err) => Ok(FetchDecision::Skipped),
@@ -432,8 +432,8 @@ impl StateFetcher {
             };
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
-                    let tmp = std::env::temp_dir().join("rustynetd.assignment.tmp");
-                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    let tmp =
+                        write_secure_staged_artifact(bundle_path, &body, "assignment bundle")?;
 
                     let previous_watermark = match load_auto_tunnel_watermark(watermark_path) {
                         Ok(val) => val,
@@ -472,7 +472,10 @@ impl StateFetcher {
                             );
                             Ok(FetchDecision::Applied)
                         }
-                        Err(err) => Err(format!("assignment fetch verification failed: {err}")),
+                        Err(err) => {
+                            let _ = fs::remove_file(&tmp);
+                            Err(format!("assignment fetch verification failed: {err}"))
+                        }
                     }
                 }
                 Err(_network_err) => Ok(FetchDecision::Skipped),
@@ -489,8 +492,11 @@ impl StateFetcher {
         if let Some(url) = &self.dns_zone_url {
             match Self::http_get_raw(url.as_str()) {
                 Ok(body) => {
-                    let tmp = std::env::temp_dir().join("rustynetd.dnszone.tmp");
-                    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp failed: {e}"))?;
+                    let tmp = write_secure_staged_artifact(
+                        &self.dns_zone_bundle_path,
+                        &body,
+                        "dns zone bundle",
+                    )?;
 
                     // parse verifier key
                     let verifier_key = std::fs::read_to_string(&self.dns_zone_verifier_key_path)
@@ -539,7 +545,10 @@ impl StateFetcher {
                             );
                             Ok(FetchDecision::Applied)
                         }
-                        Err(err) => Err(format!("dns zone fetch verification failed: {err}")),
+                        Err(err) => {
+                            let _ = fs::remove_file(&tmp);
+                            Err(format!("dns zone fetch verification failed: {err}"))
+                        }
                     }
                 }
                 Err(_network_err) => Ok(FetchDecision::Skipped),
@@ -548,6 +557,64 @@ impl StateFetcher {
             Ok(FetchDecision::Skipped)
         }
     }
+}
+
+fn write_secure_staged_artifact(
+    destination: &Path,
+    body: &[u8],
+    label: &str,
+) -> Result<PathBuf, String> {
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "{label} destination must have a parent directory: {}",
+            destination.display()
+        )
+    })?;
+    let basename = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    for attempt in 0..32u32 {
+        let salt = rand::random::<u64>();
+        let candidate = parent.join(format!(
+            ".{basename}.incoming.{}.{}.{}",
+            std::process::id(),
+            salt,
+            attempt
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(body).map_err(|err| {
+                    let _ = fs::remove_file(&candidate);
+                    format!(
+                        "write staged {label} failed ({}): {err}",
+                        candidate.display()
+                    )
+                })?;
+                file.flush().map_err(|err| {
+                    let _ = fs::remove_file(&candidate);
+                    format!(
+                        "flush staged {label} failed ({}): {err}",
+                        candidate.display()
+                    )
+                })?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "create staged {label} failed ({}): {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to allocate unique staged {label} near {}",
+        destination.display()
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1835,7 +1902,7 @@ struct DaemonRuntime {
     local_route_reconcile_pending: bool,
     max_reconcile_failures: u32,
     remote_ops_expected_subject: String,
-    _remote_ops_guard: Option<AuthSurfaceGuard>,
+    remote_ops_seen_nonces: BTreeMap<String, BTreeSet<u64>>,
     remote_ops_verifying_key: Option<VerifyingKey>,
     membership_state: Option<MembershipState>,
     membership_directory: MembershipDirectory,
@@ -1956,9 +2023,6 @@ impl DaemonRuntime {
             .as_ref()
             .map(|path| load_remote_ops_access_token_verifying_key(path))
             .transpose()?;
-        let remote_ops_guard = remote_ops_verifying_key
-            .as_ref()
-            .map(|_| AuthSurfaceGuard::default());
         Ok(Self {
             controller,
             policy,
@@ -2029,7 +2093,7 @@ impl DaemonRuntime {
             local_route_reconcile_pending: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
             remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
-            _remote_ops_guard: remote_ops_guard,
+            remote_ops_seen_nonces: BTreeMap::new(),
             remote_ops_verifying_key,
             membership_state: None,
             membership_directory: MembershipDirectory::default(),
@@ -3744,7 +3808,7 @@ impl DaemonRuntime {
     }
 
     fn authorize_remote_command(
-        &self,
+        &mut self,
         envelope: &RemoteCommandEnvelope,
         now_unix: u64,
     ) -> Result<IpcCommand, String> {
@@ -3783,6 +3847,16 @@ impl DaemonRuntime {
             verifier
                 .verify(&payload, &signature)
                 .map_err(|e| format!("signature verification failed: {e}"))?;
+
+            let active_window_floor = now_unix.saturating_sub(60);
+            let seen_nonces = self
+                .remote_ops_seen_nonces
+                .entry(envelope.subject.clone())
+                .or_default();
+            seen_nonces.retain(|nonce| *nonce >= active_window_floor);
+            if !seen_nonces.insert(envelope.nonce) {
+                return Err("remote command replay detected".to_string());
+            }
 
             Ok(envelope.command.clone())
         } else {
@@ -5661,6 +5735,17 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     NodeId::new(config.node_id.clone())
         .map_err(|err| DaemonError::InvalidConfig(format!("node id is invalid: {err}")))?;
+
+    if config.trust_url.is_some()
+        || config.traversal_url.is_some()
+        || config.assignment_url.is_some()
+        || config.dns_zone_url.is_some()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "remote network state fetch is disabled in hardened daemon paths; use pinned local signed artifacts"
+                .to_string(),
+        ));
+    }
 
     if !config.socket_path.is_absolute() {
         return Err(DaemonError::InvalidConfig(
@@ -8978,7 +9063,7 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 #[cfg(test)]
 mod tests {
     use std::fs::OpenOptions;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
@@ -9001,10 +9086,10 @@ mod tests {
         AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
         DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
         DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
-        DnsZoneBootstrapError, DnsZoneLoadContext, Duration, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        DnsZoneBootstrapError, DnsZoneLoadContext, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
         MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
-        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, RestrictionMode,
+        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, StateFetcher,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
@@ -9237,7 +9322,11 @@ mod tests {
         let first = runtime.authorize_remote_command(&envelope, now);
         assert!(first.is_ok(), "fresh remote command should authorize");
 
-        // Replay/Expired check: nonce too old
+        let replay = runtime
+            .authorize_remote_command(&envelope, now)
+            .expect_err("fresh remote command replay must be rejected");
+        assert!(replay.contains("replay detected"));
+
         let expired_nonce = now.saturating_sub(61);
         let expired_payload = remote_ops_signature_payload(
             DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
@@ -9252,10 +9341,10 @@ mod tests {
             signature: expired_signature.to_bytes().to_vec(),
         };
 
-        let replay = runtime
+        let expired = runtime
             .authorize_remote_command(&expired_envelope, now)
             .expect_err("expired remote command must be rejected");
-        assert!(replay.contains("nonce expired"));
+        assert!(expired.contains("nonce expired"));
 
         // Tampered check
         let mut tampered = envelope.clone();
@@ -10467,6 +10556,20 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("traversal bundle path must be absolute")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_remote_fetch_urls() {
+        let config = DaemonConfig {
+            trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("remote fetch URLs must be rejected in hardened daemon paths");
+        assert!(
+            err.to_string()
+                .contains("remote network state fetch is disabled in hardened daemon paths")
         );
     }
 
@@ -14979,133 +15082,20 @@ mod tests {
     }
 
     #[test]
-    fn daemon_bootstrap_fetcher_verification_error_causes_permanent_restriction() {
-        let test_dir = secure_test_dir("rustynetd-bootstrap-fetch-error");
-        let state_path = test_dir.join("daemon.state");
-        let trust_path = test_dir.join("trust.evidence");
-        let trust_verifier_path = test_dir.join("trust.pub");
-        let trust_watermark_path = test_dir.join("trust.watermark");
-
-        write_trust_file(&trust_path, &trust_verifier_path, 1);
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{addr}");
-
+    fn state_fetcher_new_from_daemon_discards_remote_fetch_urls() {
         let config = DaemonConfig {
-            state_path: state_path.clone(),
-            trust_evidence_path: trust_path.clone(),
-            trust_verifier_key_path: trust_verifier_path.clone(),
-            trust_watermark_path: trust_watermark_path.clone(),
-            backend_mode: DaemonBackendMode::InMemory,
-            trust_url: Some(url.clone()),
+            trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
+            traversal_url: Some("http://127.0.0.1:8080/traversal".to_string()),
+            assignment_url: Some("http://127.0.0.1:8080/assignment".to_string()),
+            dns_zone_url: Some("http://127.0.0.1:8080/dns".to_string()),
             ..DaemonConfig::default()
         };
 
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-            let response = "HTTP/1.1 200 OK\r\n\r\nsignature=badhex\n";
-            let _ = stream.write_all(response.as_bytes());
-        });
+        let fetcher = StateFetcher::new_from_daemon(&config);
 
-        let mut runtime = DaemonRuntime::new(&config).unwrap();
-        runtime.bootstrap();
-
-        assert_eq!(runtime.restriction_mode, RestrictionMode::Permanent);
-        assert!(
-            runtime
-                .bootstrap_error
-                .as_deref()
-                .unwrap()
-                .contains("remote trust fetch verification failed")
-        );
-
-        let _ = std::fs::remove_dir_all(test_dir);
-    }
-
-    #[test]
-    fn daemon_traversal_preexpiry_refresh_calls_fetcher_when_wired() {
-        let test_dir = secure_test_dir("rustynetd-traversal-preexpiry");
-        let state_path = test_dir.join("daemon.state");
-        let trust_path = test_dir.join("trust.evidence");
-        let trust_verifier_path = test_dir.join("trust.pub");
-        let trust_watermark_path = test_dir.join("trust.watermark");
-        let traversal_path = test_dir.join("traversal.bundle");
-        let traversal_verifier_path = test_dir.join("traversal.pub");
-        let traversal_watermark_path = test_dir.join("traversal.watermark");
-        let membership_snapshot_path = test_dir.join("membership.snapshot");
-        let membership_log_path = test_dir.join("membership.log");
-        let membership_watermark_path = test_dir.join("membership.watermark");
-
-        write_trust_file(&trust_path, &trust_verifier_path, 1);
-        write_membership_files(
-            &membership_snapshot_path,
-            &membership_log_path,
-            "daemon-local",
-        );
-        write_traversal_file(
-            &traversal_path,
-            &traversal_verifier_path,
-            "daemon-local",
-            "node-exit",
-            100,
-            false,
-        );
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{addr}");
-
-        let config = DaemonConfig {
-            state_path: state_path.clone(),
-            trust_evidence_path: trust_path.clone(),
-            trust_verifier_key_path: trust_verifier_path.clone(),
-            trust_watermark_path: trust_watermark_path.clone(),
-            traversal_bundle_path: traversal_path.clone(),
-            traversal_verifier_key_path: traversal_verifier_path.clone(),
-            traversal_watermark_path: traversal_watermark_path.clone(),
-            membership_snapshot_path: membership_snapshot_path.clone(),
-            membership_log_path: membership_log_path.clone(),
-            membership_watermark_path: membership_watermark_path.clone(),
-            backend_mode: DaemonBackendMode::InMemory,
-            traversal_url: Some(url.clone()),
-            ..DaemonConfig::default()
-        };
-
-        let mut runtime = DaemonRuntime::new(&config).unwrap();
-        runtime.refresh_traversal_hint_state(false);
-        assert!(runtime.traversal_hints.is_some());
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                tx.send(true).unwrap();
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(b"HTTP/1.1 500 Error\r\n\r\n");
-            }
-        });
-
-        let expires_at = runtime
-            .traversal_hints
-            .as_ref()
-            .unwrap()
-            .bundles
-            .first()
-            .unwrap()
-            .bundle
-            .expires_at_unix;
-        let future_now = expires_at - 1;
-
-        runtime.maybe_preexpiry_refresh_traversal(future_now);
-
-        assert!(
-            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "fetcher should have been called"
-        );
-
-        let _ = std::fs::remove_dir_all(test_dir);
+        assert!(fetcher.trust_url.is_none());
+        assert!(fetcher.traversal_url.is_none());
+        assert!(fetcher.assignment_url.is_none());
+        assert!(fetcher.dns_zone_url.is_none());
     }
 }

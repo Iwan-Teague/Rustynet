@@ -1,5 +1,98 @@
 # Rustynet UDP Hole Punching + Relay Traversal Plan (2026-03-07)
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. Implement the immediate next code work in Section 10 in order: finish full simultaneous-open and STUN-assisted WAN candidate acquisition beyond the current one-sided proof model.
+2. Then add live WAN and NAT validation harnesses and measured evidence for direct success, relay fallback, and secure failback.
+3. Then implement HP3 relay transport in rustynet-relay.
+4. Only after those are real should you update user-facing claims about internet reachability or connect-from-anywhere behavior.
+5. Keep the required security tests in Section 11 coupled to the implementation as you go.
+
+Scope-specific validation for this document:
+- Targeted rustynetd traversal tests and rustynet-relay transport tests.
+- bash ./scripts/ci/phase10_hp2_gates.sh
+- ./scripts/ci/phase10_gates.sh
+- Live WAN or lab validation harnesses when the environment exists.
+
+Definition of done for this document:
+Section 10 immediate next code work is implemented with evidence, required security tests exist and pass, and the project has measured proof for direct and relay behavior rather than design-only intent.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- HP-1 is implemented enough to proceed, but HP-2 and HP-3 remain the real unfinished core.
+- Open work is the Section 10 immediate next code sequence: full simultaneous-open and STUN-assisted WAN candidate acquisition, live WAN or NAT evidence, and HP3 relay transport.
+
+`Do first`
+- Finish the direct WAN traversal work before extending the relay path.
+- Then add measured validation harnesses so HP2 claims are evidence-backed before HP3 broadens the runtime surface.
+
+`Completion proof`
+- Measured evidence for direct success, relay fallback, and secure failback under realistic NAT or WAN conditions.
+- Updated security tests in Section 11 with passing outputs.
+
+`Do not do`
+- Do not describe the project as internet-reachable or connect-from-anywhere unless the live evidence exists.
+- Do not treat opportunistic port forwarding as the primary correctness path.
+
+`Clarity note`
+- This document is the high-level execution order; use the HP2 ingestion plan and the implementation blueprint for lower-level file and gate details.
+
 Detailed implementation blueprint:
 - [`UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 - Concrete HP-2 ingestion order and gating plan:
@@ -170,3 +263,40 @@ Acceptance:
 - Tailscale blog: How NAT traversal works.
 - Tailscale docs: Firewall ports and connectivity behavior (direct + DERP relay fallback).
 - RFC 8445 (ICE), RFC 5389 (STUN), RFC 8656 (TURN), RFC 6887 (PCP).
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+

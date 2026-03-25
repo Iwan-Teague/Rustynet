@@ -3,6 +3,100 @@
 Date: 2026-03-06  
 Owner: Rustynet engineering
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. Finish Phase E first by extracting the remaining privileged and secret-bearing start.sh flows into Rust ops commands.
+2. Then refresh Phase I evidence by running the Rust-only remote E2E path and retaining proof that the shell path is still wrapper-only.
+3. Keep shell wrappers thin, fail-closed, and non-secret-bearing. Prefer deleting superseded shell logic over preserving dormant alternate execution branches.
+4. For every migrated flow, verify absolute-path checks, symlink rejection, owner and mode checks, tempfile custody, and log redaction remain intact.
+5. Update the migration status in this document as soon as a flow becomes wrapper-only or is fully retired.
+
+Scope-specific validation for this document:
+- Targeted rustynet-cli ops command tests for each extracted flow.
+- ./scripts/ci/phase10_gates.sh
+- ./scripts/ci/membership_gates.sh
+- Linux fresh-install, role-switch, or two-node/four-node smoke paths when available.
+- macOS sanity runs for launchd and keychain flows if your changes touch that surface.
+
+Definition of done for this document:
+The remaining start.sh high-risk flows listed in Section 10 are wrapper-only or retired, Phase I evidence is refreshed, and no active shell path directly handles privileged mutation or secret material.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- The remaining security-relevant migration work is concentrated in the privileged and secret-bearing start.sh subflows and in refreshed Phase I Rust-only E2E evidence.
+- The highest-priority remaining functions are the ones listed in Section 10 under start.sh remaining privileged or secret subflows.
+
+`Do first`
+- Extract the remaining Section 10 start.sh privileged flows into Rust ops commands.
+- Then refresh the Rust-only remote E2E evidence so the wrapper-only claim is backed by current execution proof.
+
+`Completion proof`
+- Each migrated flow is wrapper-only or retired, with code and tests proving path validation, custody, and fail-closed behavior.
+- Phase I evidence is current and shows the remote orchestration path remains argv-only and Rust-driven.
+
+`Do not do`
+- Do not keep dormant shell implementations in active runtime or install paths once the Rust path exists.
+- Do not leave direct shell handling of passphrases, keys, or signed-state mutation in the active path.
+
+`Clarity note`
+- Use git history for rollback, not a second active implementation path in the tree.
+
 ## 1) Goal
 Migrate the most security-critical shell logic (`.sh`) into Rust while preserving current Linux/macOS behavior and keeping Debian 13 compatibility as a hard constraint.
 
@@ -11,6 +105,9 @@ Success criteria:
 - no regression in fail-closed behavior,
 - no regression in key custody controls,
 - all current gates and VM validation scenarios still pass.
+
+Related format-hardening plan:
+- [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
 
 ## Status Update (2026-03-06)
 - Phase A complete: `refresh_trust_evidence.sh` and `refresh_assignment_bundle.sh` are thin wrappers to Rust ops commands.
@@ -188,10 +285,10 @@ Rollout model:
 1. Introduce Rust command.
 2. Swap shell script body to `exec rustynet ops ...` wrapper.
 3. Run gates + VM matrix.
-4. Keep old shell implementation in history for one release cycle.
+4. Keep only git history for rollback; do not keep a second active shell implementation path in-tree.
 
 Rollback model:
-- Repoint wrappers/services back to previous shell implementation by reverting one commit or switching ExecStart target.
+- Roll back by reverting to the prior known-good release or commit; do not preserve two active implementations in-tree.
 - No state schema changes in Phase A/B to keep rollback low-risk.
 
 ## 8) Test Matrix Per Phase
@@ -380,3 +477,40 @@ Rationale:
 - then secures release/evidence integrity pipeline,
 - then removes remaining shell/Python evidence glue,
 - finally addresses less critical but complex e2e orchestration.
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+

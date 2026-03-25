@@ -1,6 +1,104 @@
 # Rustynet Cross-Network Remote Exit Node Plan (2026-03-16)
 **Last Updated:** 2026-03-22T18:43:41Z
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. First reconcile stale status or over-optimistic claims with current code and evidence so the document stays honest.
+2. Then finish Section 8 Phase 1 candidate acquisition and signed traversal input work that is not yet implemented or verified.
+3. Then finish Section 8 Phase 2 HP-2 real WAN simultaneous-open behavior with signed authority, replay protection, and no endpoint-fallback path.
+4. Then finish Section 8 Phase 3 HP-3 production relay transport with constant-time auth, replay protection, rate limiting, bounded queues, idle expiry, and ciphertext-only forwarding.
+5. Then finish Section 8 Phase 4 remote exit-node dataplane integration, including failover, failback, roaming, managed DNS, leak prevention, and route-scope enforcement.
+6. Then finish Section 8 Phase 5 testing, gates, artifacts, and release enforcement, including the six cross-network reports and the hard-pass gate path described later in the document.
+7. Close Section 12 immediate next code work and Section 9 artifact and gate requirements before claiming remote-exit readiness.
+
+Scope-specific validation for this document:
+- Targeted tests for rustynetd, rustynet-relay, rustynet-control, and any touched CLI/report modules.
+- ./scripts/ci/phase10_gates.sh
+- ./scripts/ci/membership_gates.sh
+- bash ./scripts/ci/phase10_hp2_gates.sh if that gate exists in the tree after your changes.
+- All cross-network validators and live scripts named in Sections 9 and 12 when the environment is available.
+- Commit-bound live artifacts under artifacts/phase10 or the documented live-lab paths.
+
+Definition of done for this document:
+All remaining in-scope items in this document are marked complete or explicitly blocked with exact prerequisites, the six cross-network report paths are real and validated, and Rustynet has measured evidence for secure cross-network remote-exit behavior instead of design-only claims.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- Finish honest, measured cross-network remote-exit capability from candidate acquisition through live gates.
+- Remaining code-heavy work is HP-2 real WAN simultaneous-open behavior, HP-3 production relay transport, remote-exit dataplane integration, and the final cross-network gate/report path.
+- The six required cross-network evidence reports and the phase10 cross-network hard-pass gate are still part of the remaining proof burden.
+
+`Do first`
+- Reconcile any stale optimism in this document with current code and evidence.
+- Then finish the remaining Phase 1 and Phase 2 traversal input and WAN simultaneous-open work before extending relay or remote-exit claims.
+
+`Completion proof`
+- Measured code and artifact evidence for direct remote exit, relay remote exit, failback/roaming, adversarial traversal rejection, managed DNS, and soak behavior.
+- Hard-pass cross-network gate output and commit-bound artifacts under the documented paths.
+
+`Do not do`
+- Do not claim Rustynet can securely connect from anywhere until the cross-network reports and hard gate evidence exist.
+- Do not add alternate endpoint-mutation or remote-exit fallback logic.
+
+`Clarity note`
+- If historical status text later in this file conflicts with current code reality, update the stale section immediately instead of working from the stale assumption.
+
 ## Document Status: CRITICAL SECURITY REFERENCE
 This document defines the complete, production-grade architecture for establishing secure cross-network tunnels between Rustynet nodes across the Internet. Every implementation choice must be traceable to a security requirement or threat mitigation in this document.
 
@@ -20,8 +118,8 @@ This plan extends, but does not replace:
 - [Requirements.md](/Users/iwanteague/Desktop/Rustynet/documents/Requirements.md)
 - [SecurityMinimumBar.md](/Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md)
 - [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
-- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](/Users/iwanteague/Desktop/Rustynet/documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
-- [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](/Users/iwanteague/Desktop/Rustynet/documents/operations/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
+- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](/Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
+- [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](/Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 
 If any conflict exists, the stricter security interpretation wins.
 
@@ -354,7 +452,7 @@ Primary source references:
 Primary source references:
 - [README.md:48](/Users/iwanteague/Desktop/Rustynet/README.md#L48)
 - [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
-- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:17](/Users/iwanteague/Desktop/Rustynet/documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md#L17)
+- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:17](/Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md#L17)
 
 ### 4.3 Important architecture truth
 - [rustynet-relay](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/lib.rs) currently contains relay fleet selection primitives, not a production ciphertext relay transport.
@@ -2703,3 +2801,40 @@ let trust_state = match TrustState::load()? {
 | 2026-03-22T18:43 | Added comprehensive Rust testing requirements (Section 8A) | AI + Security Review |
 | 2026-03-22T18:43 | Added property-based testing, fuzzing, CI/CD gates | AI + Security Review |
 | 2026-03-22T18:43 | Document now 2,299 lines (5.4x larger than original) | AI + Security Review |
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+

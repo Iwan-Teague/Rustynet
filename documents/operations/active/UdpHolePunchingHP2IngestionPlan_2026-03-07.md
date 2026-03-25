@@ -1,5 +1,98 @@
 # Rustynet HP-2 Ingestion Plan (Security-First, One Hardened Path)
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. Continue the HP2 wiring in the exact strict order defined in this document, starting from the first section that is not yet implemented or not yet verified.
+2. Verify every section already marked implemented before building on top of it; do not stack new behavior on an unverified assumption.
+3. Maintain the single traversal authority cutover with no assignment-endpoint fallback once enforced mode is active.
+4. Finish the remaining simultaneous-open WAN behavior, broader traversal evidence, and secure failback without adding a second control path.
+5. Add or update the unit, adversarial, smoke, and live tests required by each HP2 slice before marking it implemented.
+
+Scope-specific validation for this document:
+- Targeted rustynetd traversal, daemon, and phase10 tests for the touched HP2 section.
+- Traversal adversarial tests and replay, stale, wrong-signer, and NAT-mismatch gates.
+- bash ./scripts/ci/phase10_hp2_gates.sh
+- Relevant live handoff or WAN validation scripts when the lab is available.
+
+Definition of done for this document:
+Every remaining HP2 section touched in this execution is either marked implemented with evidence or blocked with a precise external prerequisite, and the enforced traversal path still has only one mutation authority.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- HP2-00 is implemented, HP2-02 is partial, and later HP2 sections still contain remaining work even where the baseline exists.
+- The active remaining scope is the first section below this point that is not fully implemented and verified, then every later section in strict order.
+
+`Do first`
+- Do not reopen HP2-00 unless regression evidence exists.
+- Resume from the first not-yet-complete HP2 section and keep moving downward in the document without skipping order.
+
+`Completion proof`
+- Each completed HP2 section has unit, adversarial, smoke, and when available live evidence tied to the exact section.
+- The enforced traversal authority path still blocks assignment-endpoint fallback.
+
+`Do not do`
+- Do not introduce a second authority path for endpoint mutation.
+- Do not mark a section implemented if the code exists but the described tests and proof do not.
+
+`Clarity note`
+- Treat status markers inside each HP2 section as local truth, but re-verify them against code before building later slices on top.
+
 ## 1) Purpose
 Define a concrete, implementation-ordered HP-2 plan to wire real direct UDP hole-punch behavior into runtime control flow without adding legacy/fallback execution branches.
 
@@ -12,8 +105,8 @@ This plan is intentionally strict:
 1. `documents/Requirements.md`
 2. `documents/SecurityMinimumBar.md`
 3. `documents/phase10.md`
-4. `documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`
-5. `documents/operations/UdpHolePunchingImplementationBlueprint_2026-03-07.md`
+4. `documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`
+5. `documents/operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md`
 
 Key mandatory constraints carried into this plan:
 - signed, short-lived traversal hints with anti-replay before endpoint mutation,
@@ -261,3 +354,40 @@ Minimum required checks in artifact payload:
 - All HP-2 gates green in CI.
 - Artifacts generated and readiness check enforces them.
 - Documentation synchronized and explicitly notes HP-3 still required for authenticated ciphertext relay transport service.
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+

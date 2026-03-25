@@ -626,6 +626,32 @@ impl LinuxCommandSystem {
                     "management ssh fail-closed allow rule failed for {cidr_text}: {err}"
                 ))
             })?;
+            // The killswitch only filters outbound traffic. Allowing destination
+            // port 22 preserves node-initiated SSH, but inbound management SSH
+            // also needs sshd reply packets (source port 22) to escape the
+            // host under fail-closed policy.
+            self.run(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    table,
+                    "killswitch",
+                    cidr.nft_family(),
+                    "daddr",
+                    cidr_text.as_str(),
+                    "tcp",
+                    "sport",
+                    "22",
+                    "accept",
+                ],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "management ssh reply fail-closed allow rule failed for {cidr_text}: {err}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -1574,6 +1600,11 @@ impl MacosCommandSystem {
             for cidr in &self.fail_closed_ssh_allow_cidrs {
                 rules.push_str(&format!(
                     "pass out quick {} proto tcp from any to {} port 22 keep state\n",
+                    cidr.pf_family(),
+                    cidr
+                ));
+                rules.push_str(&format!(
+                    "pass out quick {} proto tcp from any port 22 to {} keep state\n",
                     cidr.pf_family(),
                     cidr
                 ));
@@ -4455,7 +4486,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fail_closed_management_allow_rule_targets_ssh_destination_port() {
+    fn fail_closed_management_allow_rules_preserve_inbound_and_outbound_ssh() {
         let socket_path = phase10_test_socket_path("m");
         let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
         let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
@@ -4491,10 +4522,10 @@ mod tests {
             "management allow rule must target destination SSH port"
         );
         assert!(
-            !command_log
+            command_log
                 .iter()
                 .any(|cmd| cmd.contains("tcp sport 22 accept")),
-            "management allow rule must not use source SSH port"
+            "management allow rule must also preserve sshd reply traffic"
         );
     }
 
@@ -4615,6 +4646,31 @@ mod tests {
         assert!(!rules.contains("proto tcp on utun9 to any port 53"));
         assert!(!rules.contains("block drop out quick inet proto udp to any port 53"));
         assert!(!rules.contains("block drop out quick inet proto tcp to any port 53"));
+    }
+
+    #[test]
+    fn macos_render_pf_rules_preserve_inbound_management_ssh_replies() {
+        let system = MacosCommandSystem::new(
+            "utun9",
+            "en0",
+            None,
+            true,
+            vec![
+                "192.168.128.0/24"
+                    .parse::<ManagementCidr>()
+                    .expect("management cidr should parse"),
+            ],
+        )
+        .expect("macos system should construct");
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+        assert!(rules.contains(
+            "pass out quick inet proto tcp from any to 192.168.128.0/24 port 22 keep state"
+        ));
+        assert!(rules.contains(
+            "pass out quick inet proto tcp from any port 22 to 192.168.128.0/24 keep state"
+        ));
     }
 
     #[test]

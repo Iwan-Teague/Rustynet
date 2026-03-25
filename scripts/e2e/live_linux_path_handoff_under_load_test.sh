@@ -6,7 +6,7 @@
 # transitions between direct and relay modes under sustained traffic without
 # leaking unprotected egress or violating ACL/DNS/kill-switch invariants.
 #
-# Required reads: documents/operations/MasterWorkPlan_2026-03-22.md § A3-b
+# Required reads: documents/operations/active/MasterWorkPlan_2026-03-22.md § A3-b
 set -euo pipefail
 umask 077
 

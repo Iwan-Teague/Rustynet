@@ -67,9 +67,9 @@ Current implementation support/security matrix:
 - Fresh-install OS matrix release gate (Debian/Ubuntu/Fedora/Mint/macOS):
   [`documents/operations/FreshInstallOSMatrixReleaseGate.md`](./documents/operations/FreshInstallOSMatrixReleaseGate.md)
 - Traversal architecture and rollout plan:
-  [`documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`](./documents/operations/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
+  [`documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md`](./documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
 - Traversal implementation blueprint (file-level security implementation):
-  [`documents/operations/UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./documents/operations/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
+  [`documents/operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./documents/operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 
 After first setup, run `./start.sh` again anytime to open the terminal control menu.
 

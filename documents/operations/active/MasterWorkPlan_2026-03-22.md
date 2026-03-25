@@ -1,5 +1,99 @@
 # Rustynet Master Work Plan — 2026-03-22
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. First reconcile this master plan with current code and evidence so stale status text does not mislead later agents.
+2. Then work the remaining tracks in security and launch order: Track A first, then Track B, then Track D, then Track E, then Track F. Only work Track C or Track G if unfinished items remain there or your touched code depends on them.
+3. Within each track, complete the highest-impact unfinished slice before moving to a lower-value item. Do not skip a blocker just because a smaller task is easier.
+4. After each track slice, update the summary table, status blocks, session logs, and evidence references in this document immediately.
+5. Do not leave this file claiming a track is done, blocked, or in progress unless the code and evidence actually support that claim.
+
+Scope-specific validation for this document:
+- Repository-standard gates for substantial changes.
+- ./scripts/ci/phase10_gates.sh
+- ./scripts/ci/membership_gates.sh
+- bash ./scripts/ci/phase10_hp2_gates.sh when traversal or relay work is touched.
+- Relevant live Debian or lab runs for Tracks A, B, and E when infrastructure is available.
+
+Definition of done for this document:
+Every remaining track section in this file has current status, current evidence, and no stale blocker language, and the highest-priority unfinished work has been executed rather than merely planned.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- This file is the top-level remaining-work map for the repo, but some lower session logs are historical and may describe old blockers.
+- The real remaining work is concentrated in Track A, Track B, Track D, and Track E, with Track F still future-facing and Track C or G only needing attention if evidence shows unfinished scope.
+
+`Do first`
+- Reconcile stale status lines and historical blocker notes with current code reality.
+- Then execute remaining work in the top-level order already set by the AI prompt: Track A, then Track B, then Track D, then Track E, then Track F.
+
+`Completion proof`
+- The summary table, status sections, and session logs all match the code and artifact reality.
+- No remaining high-priority slice is only planned when it could have been implemented and tested.
+
+`Do not do`
+- Do not treat old session-log blockers as current truth without revalidation.
+- Do not mark tracks done based on document drift or unverified assumptions.
+
+`Clarity note`
+- If this block and a lower historical note disagree, use this block plus the current code and update the stale note.
+
 ## Purpose
 
 This document is the single authoritative reference for all remaining implementation work across the entire Rustynet project. It is organized into parallel development tracks so that multiple agents or developers can work simultaneously with minimal interference. Each item includes specific files to touch, interfaces to implement, tests to write, and acceptance criteria.
@@ -1278,7 +1372,7 @@ If macOS is not available in the lab, update the gate to mark macOS as `"status"
 **Prerequisite:**
 - Track B (WS-1/WS-2/WS-3) done — so the daemon is self-healing
 - Lab machines reachable (check SSH connectivity before starting)
-- Network namespace setup complete (see AGENT_MISSION_CROSSNET.md for netns setup procedure)
+- Network namespace setup complete and documented in the durable cross-network plan (`documents/operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md`)
 
 **Run in order:**
 ```bash
@@ -1703,3 +1797,40 @@ When Debian-host tests and integration runs are available I will complete code c
 - Execute `./scripts/ci/security_regression_gates.sh` on Debian (G2 gates)
 - Execute `./scripts/ci/traversal_adversarial_gates.sh` on Debian (A4 traversal tests)
 - Execute A4-b live nftables ACL snapshot test on two-node lab
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+

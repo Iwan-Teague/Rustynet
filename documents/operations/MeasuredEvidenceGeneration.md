@@ -3,6 +3,9 @@
 ## Purpose
 Generate Phase 6 and Phase 9 release-gate artifacts only from measured evidence. Static/pass-through artifact commits are not accepted.
 
+Related format-hardening plan:
+- [SerializationFormatHardeningPlan_2026-03-25.md](./active/SerializationFormatHardeningPlan_2026-03-25.md)
+
 ## Phase 1: Runtime Baseline Inputs
 
 ### Automated measured input collector

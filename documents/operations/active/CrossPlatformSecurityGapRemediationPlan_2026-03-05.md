@@ -3,6 +3,100 @@
 Date: 2026-03-05  
 Scope: Rustynet install/runtime/dataplane parity hardening across Debian 13 and macOS, with Linux stability preserved as a hard constraint.
 
+## AI Implementation Prompt
+
+```text
+You are the implementation agent for the remaining work in this document.
+Repository root: /Users/iwanteague/Desktop/Rustynet
+
+Mission:
+Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
+
+Mandatory reading order:
+1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
+2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
+3. /Users/iwanteague/Desktop/Rustynet/README.md
+4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
+5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+6. This document
+7. Directly linked scope/design docs and the code you will touch
+
+Non-negotiables:
+- one hardened execution path for each security-sensitive workflow
+- fail closed on missing, stale, invalid, replayed, or unauthorized state
+- no insecure compatibility paths, no legacy fallback branches, and no weakening of tests to make results pass
+- no TODO/FIXME/placeholders for in-scope deliverables
+- do not mark work complete until code, tests, and evidence exist
+
+Execution workflow:
+1. Read this document fully and convert every unchecked, open, pending, partial, or blocked item into a concrete checklist.
+2. Execute the remaining work in the ordered sequence listed below.
+3. Implement in small, verifiable increments, but continue until the remaining in-scope slice is complete or a real external blocker stops you.
+4. After every material code change:
+   - run targeted unit and integration tests for touched crates and modules
+   - run smoke tests, dry runs, or CLI/service validators for the exact workflow you changed
+   - rerun the most relevant gate before moving on
+5. After every completed item:
+   - update this document immediately instead of maintaining a separate private checklist
+   - mark checkboxes and status blocks complete only after verification
+   - append concise evidence: files changed, tests run, artifacts produced, residual risk, and blocker state if any
+   - keep any existing session log, evidence table, acceptance checklist, or status summary current
+6. Before claiming completion:
+   - run repository-standard gates when the scope is substantial:
+     cargo fmt --all -- --check
+     cargo clippy --workspace --all-targets --all-features -- -D warnings
+     cargo check --workspace --all-targets --all-features
+     cargo test --workspace --all-targets --all-features
+     cargo audit --deny warnings
+     cargo deny check bans licenses sources advisories
+   - run the scope-specific validations listed below
+   - if live or lab validation is available, run it; if it is not available, do not fake success and record the blocker precisely
+7. If a test or gate fails, fix the root cause. Never weaken the check, bypass the security control, or mark a synthetic path as good enough.
+
+Document-specific execution order:
+1. First verify and document that the Linux and Debian baseline remains unchanged after prior macOS hardening work.
+2. Then close GAP-06 by replacing any remaining unsafe manual macOS operations with the same validated IPC-driven admin paths used on Linux.
+3. Then close GAP-08 by keeping README, phase docs, runbooks, and support/security matrices synchronized with the code you changed.
+4. Then reduce GAP-10 regression blast radius by further modularizing start.sh without reintroducing weaker shell paths.
+5. Re-run parity and security evidence after every macOS-affecting change and fail closed on any Debian regression.
+
+Scope-specific validation for this document:
+- ./scripts/ci/phase6_gates.sh
+- ./scripts/ci/phase10_gates.sh
+- ./scripts/ci/membership_gates.sh
+- ./scripts/ci/macos_dataplane_smoke.sh
+- Debian two-node or equivalent Linux smoke validation if the lab is available.
+
+Definition of done for this document:
+The acceptance checklist in Section 8 is fully checked, Linux baseline evidence is refreshed, and no macOS parity fix depends on a weaker trust, DNS, lifecycle, or secret-handling path.
+
+If full completion is impossible in one execution, continue until you hit a real external blocker, then mark the exact remaining items as blocked with the reason, the missing prerequisite, and the next concrete step.
+```
+
+## Current Open Work
+
+This block is the quick source of truth for what remains in this document.
+If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+
+`Open scope`
+- This document is mostly closed; the remaining work is narrow.
+- Open items are Linux or Debian regression validation after macOS hardening, GAP-06 ops parity, GAP-08 documentation and support-matrix synchronization, and GAP-10 blast-radius reduction around start.sh.
+
+`Do first`
+- Re-validate the Linux and Debian baseline after any macOS-affecting change.
+- Then close GAP-06 before spending time on lower-risk documentation or structure cleanup.
+
+`Completion proof`
+- The Section 8 acceptance checklist is fully checked, and Linux evidence is refreshed after the macOS work touched in the execution.
+- Phase6, Phase10, membership, and macOS smoke validations stay green.
+
+`Do not do`
+- Do not reopen already remediated macOS gaps without evidence of regression.
+- Do not weaken Linux trust, DNS, service, or custody behavior to improve parity wording.
+
+`Clarity note`
+- Treat this as a residual-gap cleanup document, not as a broad cross-platform feature roadmap.
+
 Status update (verified against current tree on 2026-03-05):
 - This is a remediation plan and includes historical gap statements. Several gaps are now remediated in implementation.
 - Confirmed remediated or materially advanced: GAP-01 (explicit passphrase source wiring), GAP-02 (non-admin privileged-tool fallback removed), GAP-03 (macOS DNS fail-closed PF enforcement), GAP-04 (macOS reports `supports_ipv6=false`), GAP-05 (launchd lifecycle model), GAP-07 (macOS dataplane smoke/security CI gate; further depth still needed).
@@ -556,3 +650,40 @@ Security properties this architecture must preserve:
   - CI evidence that exercises real dataplane security behavior.
 - Documentation and support matrix reflect exactly what is implemented and tested.
 - No "less secure convenience fallback" remains enabled by default.
+## Agent Update Rules
+
+Use these rules every time you modify this document during implementation work.
+
+1. Update the document immediately after each materially completed slice.
+- Do not keep a private checklist that diverges from this file.
+- This document must remain the public execution record.
+
+2. Mark completion conservatively.
+- Use `[x]` only after the code is implemented and verified.
+- Use `Status: partial` when some hardening landed but real work remains.
+- Use `Status: blocked` only for real external blockers; name the blocker precisely.
+
+3. Record evidence under the section you touched, or in the existing session log/evidence table if the document already has one.
+- Minimum evidence fields:
+  - `Changed files:` exact paths
+  - `Verification:` exact commands, tests, smoke runs, dry runs, gates
+  - `Artifacts:` exact generated paths, if any
+  - `Residual risk:` what still remains, if anything
+  - `Blocker / prerequisite:` only when applicable
+
+4. Use exact timestamps and commit references where possible.
+- Prefer UTC timestamps in ISO-8601 format.
+- If commits exist, record the commit SHA that contains the work.
+
+5. Do not delete historical context that still matters.
+- Correct stale claims when they are inaccurate.
+- Do not erase previous findings, checklist items, or session history just to make the document look cleaner.
+
+6. Keep security claims evidence-backed.
+- Never write that a path is secure, complete, hardened, or production-ready without code and verification proof.
+- If live validation is unavailable, state that explicitly and record the missing prerequisite.
+
+7. If tests fail, record the failure honestly and fix the root cause.
+- Do not weaken gates, remove checks, or relabel failures as acceptable.
+- If a fix is incomplete, mark the item partial instead of complete.
+
