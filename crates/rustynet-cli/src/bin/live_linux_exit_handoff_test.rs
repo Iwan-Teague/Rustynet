@@ -3,12 +3,14 @@
 
 mod live_lab_bin_support;
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use live_lab_bin_support as live_lab_support;
+use serde_json::json;
 
 use live_lab_support::{
     Logger, append_env_assignment, capture_root, create_workspace, enforce_host,
@@ -26,6 +28,14 @@ const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
 const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.json";
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDnsRefreshTarget {
+    host: String,
+    node_id: String,
+    records_local: PathBuf,
+    bundle_local: PathBuf,
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -57,8 +67,8 @@ fn run() -> Result<(), String> {
     }
 
     validate_identity(&config.ssh_identity_file)?;
-    let pinned_known_hosts = match config.pinned_known_hosts_file {
-        Some(path) => path,
+    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
+        Some(path) => path.clone(),
         None => load_home_known_hosts_path()?,
     };
     ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
@@ -230,6 +240,20 @@ fn run() -> Result<(), String> {
         &assign_pub_local,
         &client_assignment_local,
     )?;
+    let assignment_scopes = HashMap::from([
+        (
+            config.exit_a_node_id.clone(),
+            parse_assignment_authority_scope(&read_file(&exit_a_assignment_local)?)?,
+        ),
+        (
+            config.exit_b_node_id.clone(),
+            parse_assignment_authority_scope(&read_file(&exit_b_assignment_local)?)?,
+        ),
+        (
+            config.client_node_id.clone(),
+            parse_assignment_authority_scope(&read_file(&client_assignment_local)?)?,
+        ),
+    ]);
 
     let exit_a_refresh_local = workspace.path().join("assignment-refresh-exit-a.env");
     let exit_b_refresh_local = workspace.path().join("assignment-refresh-exit-b.env");
@@ -288,9 +312,22 @@ fn run() -> Result<(), String> {
     let exit_a_traversal_local = workspace.path().join("traversal-exit-a");
     let exit_b_traversal_local = workspace.path().join("traversal-exit-b");
     let client_traversal_local = workspace.path().join("traversal-client");
-    let dns_records_local = workspace.path().join("dns-zone-records.json");
-    let dns_bundle_local = workspace.path().join("dns-zone-valid.bundle");
     let dns_verifier_local = workspace.path().join("dns-zone.pub");
+    let dns_refresh_targets = managed_dns_refresh_targets(workspace.path(), &config);
+    let dns_base_records = managed_dns_base_records(&config.exit_a_node_id, &config.client_node_id);
+    let dns_records_by_node = dns_refresh_targets
+        .iter()
+        .map(|target| {
+            let scope = assignment_scopes.get(&target.node_id).ok_or_else(|| {
+                format!(
+                    "missing assignment authority scope for exit handoff DNS node {}",
+                    target.node_id
+                )
+            })?;
+            let records_json = managed_dns_records_json_for_scope(&dns_base_records, scope)?;
+            Ok((target.node_id.clone(), records_json))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
 
     refresh_traversal_bundles(
         &config.ssh_identity_file,
@@ -307,11 +344,6 @@ fn run() -> Result<(), String> {
         &config.exit_b_node_id,
         &config.client_node_id,
     )?;
-    let dns_records_json = format!(
-        "[\n  {{\"label\":\"{DNS_MANAGED_LABEL}\",\"target_node_id\":\"{}\",\"ttl_secs\":300,\"aliases\":[\"{DNS_MANAGED_ALIAS}\"]}},\n  {{\"label\":\"client\",\"target_node_id\":\"{}\",\"ttl_secs\":300}}\n]\n",
-        config.exit_a_node_id, config.client_node_id
-    );
-    write_file(&dns_records_local, dns_records_json.as_str())?;
     let dns_passphrase_remote = capture_root(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -346,18 +378,16 @@ fn run() -> Result<(), String> {
         mkdir_dns_issue_dir_cmd.as_str(),
     )?;
     logger.line("[exit-handoff] refreshing managed DNS bundle before monitor")?;
-    refresh_dns_bundle(
+    refresh_dns_bundles(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.exit_a_host,
-        &config.client_host,
-        &config.client_node_id,
         &nodes_spec,
         &allow_spec,
         dns_passphrase_remote.as_str(),
-        &dns_records_local,
         &dns_verifier_local,
-        &dns_bundle_local,
+        &dns_records_by_node,
+        &dns_refresh_targets,
     )?;
 
     logger.line("[exit-handoff] enforcing runtime roles")?;
@@ -455,18 +485,16 @@ fn run() -> Result<(), String> {
                 &config.client_node_id,
             )?;
             logger.line("[exit-handoff] refreshing managed DNS bundle during handoff monitor")?;
-            refresh_dns_bundle(
+            refresh_dns_bundles(
                 &config.ssh_identity_file,
                 &work_known_hosts,
                 &config.exit_a_host,
-                &config.client_host,
-                &config.client_node_id,
                 &nodes_spec,
                 &allow_spec,
                 dns_passphrase_remote.as_str(),
-                &dns_records_local,
                 &dns_verifier_local,
-                &dns_bundle_local,
+                &dns_records_by_node,
+                &dns_refresh_targets,
             )?;
             last_traversal_refresh_ts = unix_now();
         }
@@ -527,18 +555,16 @@ fn run() -> Result<(), String> {
                 &config.client_node_id,
             )?;
             logger.line("[exit-handoff] refreshing managed DNS bundle before exit switch")?;
-            refresh_dns_bundle(
+            refresh_dns_bundles(
                 &config.ssh_identity_file,
                 &work_known_hosts,
                 &config.exit_a_host,
-                &config.client_host,
-                &config.client_node_id,
                 &nodes_spec,
                 &allow_spec,
                 dns_passphrase_remote.as_str(),
-                &dns_records_local,
                 &dns_verifier_local,
-                &dns_bundle_local,
+                &dns_records_by_node,
+                &dns_refresh_targets,
             )?;
             last_traversal_refresh_ts = unix_now();
             switch_ts = ts;
@@ -691,6 +717,14 @@ fn run() -> Result<(), String> {
         } else {
             "fail"
         };
+    let check_managed_dns_fresh_all_nodes = if managed_dns_state_is_valid(&client_status_final)
+        && managed_dns_state_is_valid(&exit_a_status_final)
+        && managed_dns_state_is_valid(&exit_b_status_final)
+    {
+        "pass"
+    } else {
+        "fail"
+    };
 
     let overall = [
         check_handoff_reconvergence,
@@ -698,6 +732,7 @@ fn run() -> Result<(), String> {
         check_no_restricted_safe_mode,
         check_exit_b_endpoint_visible,
         check_both_exits_nat,
+        check_managed_dns_fresh_all_nodes,
     ]
     .into_iter()
     .all(|value| value == "pass");
@@ -712,7 +747,7 @@ fn run() -> Result<(), String> {
     });
 
     let report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_exit_handoff\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"exit_a_host\": \"{}\",\n  \"exit_b_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"switch_iteration\": {},\n  \"monitor_iterations\": {},\n  \"reconvergence_seconds\": {},\n  \"checks\": {{\n    \"handoff_reconvergence\": \"{}\",\n    \"no_route_leak_during_handoff\": \"{}\",\n    \"no_restricted_safe_mode\": \"{}\",\n    \"exit_b_endpoint_visible\": \"{}\",\n    \"both_exits_nat\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\",\n    \"{}\"\n  ]\n}}\n",
+        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_exit_handoff\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"exit_a_host\": \"{}\",\n  \"exit_b_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"switch_iteration\": {},\n  \"monitor_iterations\": {},\n  \"reconvergence_seconds\": {},\n  \"checks\": {{\n    \"handoff_reconvergence\": \"{}\",\n    \"no_route_leak_during_handoff\": \"{}\",\n    \"no_restricted_safe_mode\": \"{}\",\n    \"exit_b_endpoint_visible\": \"{}\",\n    \"both_exits_nat\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\",\n    \"{}\"\n  ]\n}}\n",
         captured_at_utc,
         captured_at_unix,
         git_commit,
@@ -728,6 +763,7 @@ fn run() -> Result<(), String> {
         check_no_restricted_safe_mode,
         check_exit_b_endpoint_visible,
         check_both_exits_nat,
+        check_managed_dns_fresh_all_nodes,
         config.log_path.display(),
         config.monitor_log.display(),
     );
@@ -941,60 +977,202 @@ fn refresh_traversal_bundles(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn refresh_dns_bundle(
+fn refresh_dns_bundles(
     identity: &Path,
     known_hosts: &Path,
     signer_host: &str,
-    client_host: &str,
-    client_node_id: &str,
     nodes_spec: &str,
     allow_spec: &str,
     passphrase_remote: &str,
-    records_local: &Path,
     verifier_local: &Path,
-    bundle_local: &Path,
+    records_by_node: &HashMap<String, String>,
+    refresh_targets: &[ManagedDnsRefreshTarget],
 ) -> Result<(), String> {
-    scp_to(
-        identity,
-        known_hosts,
-        records_local,
-        signer_host,
-        DNS_ZONE_RECORDS_REMOTE,
-    )?;
-    let issue_cmd = format!(
-        "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-json {} --output {} --verifier-key-output {}",
-        shell_quote(passphrase_remote),
-        shell_quote(client_node_id),
-        shell_quote(nodes_spec),
-        shell_quote(allow_spec),
-        shell_quote(DNS_ZONE_NAME),
-        shell_quote(DNS_ZONE_RECORDS_REMOTE),
-        shell_quote(DNS_ZONE_VALID_BUNDLE_REMOTE),
-        shell_quote(DNS_ZONE_VERIFIER_REMOTE),
-    );
-    run_root(identity, known_hosts, signer_host, issue_cmd.as_str())?;
-    capture_root_file_to_local(
-        identity,
-        known_hosts,
-        signer_host,
-        DNS_ZONE_VERIFIER_REMOTE,
-        verifier_local,
-    )?;
-    capture_root_file_to_local(
-        identity,
-        known_hosts,
-        signer_host,
-        DNS_ZONE_VALID_BUNDLE_REMOTE,
-        bundle_local,
-    )?;
-    install_dns_bundle(
-        identity,
-        known_hosts,
-        client_host,
-        verifier_local,
-        bundle_local,
-    )?;
+    if refresh_targets.is_empty() {
+        return Err("managed DNS refresh requires at least one target".to_string());
+    }
+    let mut verifier_captured = false;
+    for target in refresh_targets {
+        let records_json = records_by_node.get(&target.node_id).ok_or_else(|| {
+            format!(
+                "missing scoped DNS records for exit handoff node {}",
+                target.node_id
+            )
+        })?;
+        write_file(target.records_local.as_path(), records_json)?;
+        let records_remote = format!("/tmp/rn-exit-handoff-dns-records-{}.json", target.node_id);
+        scp_to(
+            identity,
+            known_hosts,
+            target.records_local.as_path(),
+            signer_host,
+            records_remote.as_str(),
+        )?;
+        let issue_cmd = format!(
+            "rustynet dns zone issue --signing-secret /etc/rustynet/membership.owner.key --signing-secret-passphrase-file {} --subject-node-id {} --nodes {} --allow {} --zone-name {} --records-json {} --output {} --verifier-key-output {}",
+            shell_quote(passphrase_remote),
+            shell_quote(target.node_id.as_str()),
+            shell_quote(nodes_spec),
+            shell_quote(allow_spec),
+            shell_quote(DNS_ZONE_NAME),
+            shell_quote(records_remote.as_str()),
+            shell_quote(DNS_ZONE_VALID_BUNDLE_REMOTE),
+            shell_quote(DNS_ZONE_VERIFIER_REMOTE),
+        );
+        run_root(identity, known_hosts, signer_host, issue_cmd.as_str())?;
+        let cleanup_cmd = format!("rm -f {}", shell_quote(records_remote.as_str()));
+        run_root(identity, known_hosts, signer_host, cleanup_cmd.as_str())?;
+        if !verifier_captured {
+            capture_root_file_to_local(
+                identity,
+                known_hosts,
+                signer_host,
+                DNS_ZONE_VERIFIER_REMOTE,
+                verifier_local,
+            )?;
+            verifier_captured = true;
+        }
+        capture_root_file_to_local(
+            identity,
+            known_hosts,
+            signer_host,
+            DNS_ZONE_VALID_BUNDLE_REMOTE,
+            target.bundle_local.as_path(),
+        )?;
+        install_dns_bundle(
+            identity,
+            known_hosts,
+            target.host.as_str(),
+            verifier_local,
+            target.bundle_local.as_path(),
+        )?;
+    }
     Ok(())
+}
+
+fn managed_dns_refresh_targets(workspace: &Path, config: &Config) -> Vec<ManagedDnsRefreshTarget> {
+    vec![
+        ManagedDnsRefreshTarget {
+            host: config.exit_a_host.clone(),
+            node_id: config.exit_a_node_id.clone(),
+            records_local: workspace.join("dns-zone-records-exit-a.json"),
+            bundle_local: workspace.join("dns-zone-exit-a.bundle"),
+        },
+        ManagedDnsRefreshTarget {
+            host: config.exit_b_host.clone(),
+            node_id: config.exit_b_node_id.clone(),
+            records_local: workspace.join("dns-zone-records-exit-b.json"),
+            bundle_local: workspace.join("dns-zone-exit-b.bundle"),
+        },
+        ManagedDnsRefreshTarget {
+            host: config.client_host.clone(),
+            node_id: config.client_node_id.clone(),
+            records_local: workspace.join("dns-zone-records-client.json"),
+            bundle_local: workspace.join("dns-zone-client.bundle"),
+        },
+    ]
+}
+
+fn managed_dns_state_is_valid(status: &str) -> bool {
+    status.contains("dns_zone_state=valid")
+        && status.contains("dns_zone_error=none")
+        && status.contains("dns_alarm_state=ok")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentAuthorityScope {
+    node_id: String,
+    peer_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDnsRecordTemplate {
+    label: String,
+    target_node_id: String,
+    ttl_secs: u64,
+    aliases: Vec<String>,
+}
+
+fn managed_dns_base_records(
+    signer_node_id: &str,
+    client_node_id: &str,
+) -> Vec<ManagedDnsRecordTemplate> {
+    vec![
+        ManagedDnsRecordTemplate {
+            label: DNS_MANAGED_LABEL.to_string(),
+            target_node_id: signer_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: vec![DNS_MANAGED_ALIAS.to_string()],
+        },
+        ManagedDnsRecordTemplate {
+            label: "client".to_string(),
+            target_node_id: client_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn managed_dns_records_json_for_scope(
+    records: &[ManagedDnsRecordTemplate],
+    scope: &AssignmentAuthorityScope,
+) -> Result<String, String> {
+    let allowed_targets = scope.peer_node_ids.iter().cloned().collect::<HashSet<_>>();
+    let filtered = records
+        .iter()
+        .filter(|record| {
+            record.target_node_id == scope.node_id
+                || allowed_targets.contains(&record.target_node_id)
+        })
+        .map(|record| {
+            json!({
+                "label": record.label,
+                "target_node_id": record.target_node_id,
+                "ttl_secs": record.ttl_secs,
+                "aliases": record.aliases,
+            })
+        })
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(format!(
+            "managed DNS scope for {} produced no policy-authorized records",
+            scope.node_id
+        ));
+    }
+    serde_json::to_string_pretty(&filtered)
+        .map_err(|err| format!("serialize scoped managed DNS records failed: {err}"))
+}
+
+fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, String> {
+    let mut node_id = None;
+    let mut peer_node_ids = Vec::new();
+    for line in bundle.lines() {
+        if let Some(value) = line.strip_prefix("node_id=") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err("assignment bundle node_id must not be empty".to_string());
+            }
+            node_id = Some(trimmed.to_string());
+            continue;
+        }
+        if let Some((prefix, value)) = line.split_once('=') {
+            if prefix.starts_with("peer.") && prefix.ends_with(".node_id") {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "assignment bundle peer id must not be empty: {prefix}"
+                    ));
+                }
+                peer_node_ids.push(trimmed.to_string());
+            }
+        }
+    }
+    peer_node_ids.sort();
+    peer_node_ids.dedup();
+    Ok(AssignmentAuthorityScope {
+        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_string())?,
+        peer_node_ids,
+    })
 }
 
 fn install_assignment_bundle(
@@ -1160,6 +1338,111 @@ fn print_usage() {
     eprintln!(
         "usage: live_linux_exit_handoff_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-a-host <user@host>\n  --exit-b-host <user@host>\n  --client-host <user@host>\n  --exit-a-node-id <id>\n  --exit-b-node-id <id>\n  --client-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --switch-iteration <n>\n  --monitor-iterations <n>\n  --traversal-ttl-secs <n>\n  --report-path <path>\n  --log-path <path>\n  --monitor-log <path>\n  --known-hosts <path>\n  --git-commit <sha>"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Config, managed_dns_base_records, managed_dns_records_json_for_scope,
+        managed_dns_refresh_targets, managed_dns_state_is_valid, parse_assignment_authority_scope,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn sample_config() -> Config {
+        Config {
+            ssh_identity_file: PathBuf::from("/tmp/id"),
+            exit_a_host: "debian@192.168.128.22".to_string(),
+            exit_b_host: "debian@192.168.128.26".to_string(),
+            client_host: "debian@192.168.128.24".to_string(),
+            exit_a_node_id: "exit-1".to_string(),
+            exit_b_node_id: "client-2".to_string(),
+            client_node_id: "client-1".to_string(),
+            ssh_allow_cidrs: "192.168.128.0/24".to_string(),
+            switch_iteration: 20,
+            monitor_iterations: 55,
+            traversal_ttl_secs: 120,
+            traversal_refresh_interval_secs: 60,
+            report_path: PathBuf::from("report.json"),
+            log_path: PathBuf::from("handoff.log"),
+            monitor_log: PathBuf::from("handoff-monitor.log"),
+            pinned_known_hosts_file: None,
+            git_commit: None,
+        }
+    }
+
+    #[test]
+    fn managed_dns_refresh_targets_cover_both_exits_and_client() {
+        let targets = managed_dns_refresh_targets(Path::new("/tmp/exit-handoff"), &sample_config());
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].host, "debian@192.168.128.22");
+        assert_eq!(targets[0].node_id, "exit-1");
+        assert_eq!(
+            targets[0].bundle_local,
+            Path::new("/tmp/exit-handoff").join("dns-zone-exit-a.bundle")
+        );
+        assert_eq!(targets[1].host, "debian@192.168.128.26");
+        assert_eq!(targets[1].node_id, "client-2");
+        assert_eq!(
+            targets[1].bundle_local,
+            Path::new("/tmp/exit-handoff").join("dns-zone-exit-b.bundle")
+        );
+        assert_eq!(targets[2].host, "debian@192.168.128.24");
+        assert_eq!(targets[2].node_id, "client-1");
+        assert_eq!(
+            targets[2].bundle_local,
+            Path::new("/tmp/exit-handoff").join("dns-zone-client.bundle")
+        );
+    }
+
+    #[test]
+    fn managed_dns_state_validator_requires_valid_and_alarm_ok() {
+        assert!(managed_dns_state_is_valid(
+            "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok"
+        ));
+        assert!(!managed_dns_state_is_valid(
+            "dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error"
+        ));
+        assert!(!managed_dns_state_is_valid(
+            "dns_zone_state=valid dns_zone_error=none dns_alarm_state=error"
+        ));
+    }
+
+    #[test]
+    fn parse_assignment_authority_scope_collects_subject_and_peers() {
+        let bundle = "\
+node_id=exit-1
+peer.0.node_id=client-1
+peer.1.node_id=client-2
+peer.1.endpoint=192.168.128.26:51820
+";
+        let scope =
+            parse_assignment_authority_scope(bundle).expect("assignment authority should parse");
+        assert_eq!(scope.node_id, "exit-1");
+        assert_eq!(
+            scope.peer_node_ids,
+            vec!["client-1".to_string(), "client-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_dns_records_json_for_scope_filters_unauthorized_targets() {
+        let scope = parse_assignment_authority_scope(
+            "node_id=exit-1\npeer.0.node_id=client-1\npeer.1.node_id=client-2\n",
+        )
+        .expect("scope should parse");
+        let mut records = managed_dns_base_records("exit-1", "client-1");
+        records.push(super::ManagedDnsRecordTemplate {
+            label: "unauthorized".to_string(),
+            target_node_id: "client-9".to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        });
+        let filtered =
+            managed_dns_records_json_for_scope(&records, &scope).expect("records should filter");
+        assert!(filtered.contains("\"target_node_id\": \"exit-1\""));
+        assert!(filtered.contains("\"target_node_id\": \"client-1\""));
+        assert!(!filtered.contains("\"target_node_id\": \"client-9\""));
+    }
 }
 
 fn utc_now_string() -> String {
