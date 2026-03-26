@@ -45,9 +45,11 @@ CLIENT_TARGET=""
 ENTRY_TARGET=""
 AUX_TARGET=""
 EXTRA_TARGET=""
+FIFTH_CLIENT_TARGET=""
 ENTRY_TARGET_DECLARED=0
 AUX_TARGET_DECLARED=0
 EXTRA_TARGET_DECLARED=0
+FIFTH_CLIENT_TARGET_DECLARED=0
 PROFILE_PATH=""
 DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
@@ -110,6 +112,8 @@ options:
   --entry-target <user@ip|ip>    Entry relay / alternate exit target
   --aux-target <user@ip|ip>      Auxiliary client / blind-exit target
   --extra-target <user@ip|ip>    Optional extra client target
+  --fifth-client-target <user@ip|ip>
+                                Optional fifth client target for six-node live labs
   --ssh-identity-file <path>     SSH private key for key-based authentication
   --ssh-password-file <path>     Deprecated alias of --ssh-identity-file
   --sudo-password-file <path>    Deprecated alias of --ssh-identity-file
@@ -314,7 +318,7 @@ auto_adjust_default_ssh_allow_cidrs_for_targets() {
   if [[ "$SSH_ALLOW_CIDRS" != "$legacy_default" ]]; then
     return 0
   fi
-  for target in "$EXIT_TARGET" "$CLIENT_TARGET" "$ENTRY_TARGET" "$AUX_TARGET" "$EXTRA_TARGET"; do
+  for target in "$EXIT_TARGET" "$CLIENT_TARGET" "$ENTRY_TARGET" "$AUX_TARGET" "$EXTRA_TARGET" "$FIFTH_CLIENT_TARGET"; do
     [[ -n "$target" ]] || continue
     address="$(live_lab_target_address "$target")"
     if ! cidr="$(derive_ipv4_cidr_24 "$address")"; then
@@ -490,6 +494,10 @@ load_profile_file() {
       EXTRA_TARGET)
         EXTRA_TARGET_DECLARED=1
         [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value"
+        ;;
+      FIFTH_CLIENT_TARGET)
+        FIFTH_CLIENT_TARGET_DECLARED=1
+        [[ -z "$FIFTH_CLIENT_TARGET" ]] && FIFTH_CLIENT_TARGET="$value"
         ;;
       SSH_IDENTITY_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
       SSH_PASSWORD_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
@@ -774,6 +782,10 @@ has_four_node_live_topology() {
 
 has_five_node_release_gate_topology() {
   has_four_node_live_topology && has_label extra
+}
+
+managed_peer_labels() {
+  awk -F '\t' '$1 != "exit" && $1 != "client" { print $1 }' "$NODES_TSV"
 }
 
 cross_network_network_id_for_label() {
@@ -1315,6 +1327,9 @@ build_nodes_file() {
   fi
   if [[ -n "$EXTRA_TARGET" ]]; then
     record_node "extra" "$EXTRA_TARGET" "client-4" "client"
+  fi
+  if [[ -n "$FIFTH_CLIENT_TARGET" ]]; then
+    record_node "fifth_client" "$FIFTH_CLIENT_TARGET" "client-5" "client"
   fi
 }
 
@@ -2137,10 +2152,20 @@ validate_runtime_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  local status route_check no_plaintext
+  local status route_check no_plaintext expected_membership_nodes exit_node_id
   status="$(live_lab_status "$target")"
   printf '[status] %s %s\n%s\n' "$node_id" "$target" "$status"
+  expected_membership_nodes="$(node_count)"
+  exit_node_id="$(node_id_for_label exit)"
+  [[ "$status" != *"state=FailClosed"* ]]
+  [[ "$status" != *"restricted_safe_mode=true"* ]]
+  [[ "$status" == *"bootstrap_error=none"* ]]
+  [[ "$status" == *"last_reconcile_error=none"* ]]
+  [[ "$status" == *"encrypted_key_store=true"* ]]
+  [[ "$status" == *"auto_tunnel_enforce=true"* ]]
+  [[ "$status" == *"membership_active_nodes=${expected_membership_nodes}"* ]]
   if [[ "$role" == "client" ]]; then
+    [[ "$status" == *"exit_node=${exit_node_id}"* ]]
     route_check="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true")"
     printf '[route] %s %s\n%s\n' "$node_id" "$target" "$route_check"
     grep -Fq 'dev rustynet0' <<<"$route_check"
@@ -2425,13 +2450,12 @@ stage_run_live_managed_dns() {
     --client-host "$(node_target_for_label client)"
     --client-node-id "$(node_id_for_label client)"
   )
-  for label in entry aux extra; do
-    if has_label "$label"; then
-      cmd+=(
-        --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
-      )
-    fi
-  done
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    cmd+=(
+      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+    )
+  done < <(managed_peer_labels)
   cmd+=(
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS"
     --report-path "$stage_report"
@@ -2460,13 +2484,12 @@ run_periodic_managed_dns_refresh() {
     --client-host "$(node_target_for_label client)"
     --client-node-id "$(node_id_for_label client)"
   )
-  for label in entry aux extra; do
-    if has_label "$label"; then
-      cmd+=(
-        --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
-      )
-    fi
-  done
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    cmd+=(
+      --managed-peer "$(node_id_for_label "$label")|$(node_target_for_label "$label")"
+    )
+  done < <(managed_peer_labels)
   cmd+=(
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS"
     --report-path "$refresh_report"
@@ -3436,6 +3459,7 @@ parse_args() {
       --entry-target) ENTRY_TARGET="$2"; ENTRY_TARGET_DECLARED=1; shift 2 ;;
       --aux-target) AUX_TARGET="$2"; AUX_TARGET_DECLARED=1; shift 2 ;;
       --extra-target) EXTRA_TARGET="$2"; EXTRA_TARGET_DECLARED=1; shift 2 ;;
+      --fifth-client-target) FIFTH_CLIENT_TARGET="$2"; FIFTH_CLIENT_TARGET_DECLARED=1; shift 2 ;;
       --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --ssh-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
       --sudo-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
@@ -3489,13 +3513,18 @@ prompt_missing_inputs() {
       EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@ip or ip, blank if none)')"
     fi
   fi
+  if [[ -z "$FIFTH_CLIENT_TARGET" ]]; then
+    if [[ "$FIFTH_CLIENT_TARGET_DECLARED" -eq 0 ]]; then
+      FIFTH_CLIENT_TARGET="$(prompt_value 'Optional fifth client node for six-node labs (user@ip or ip, blank if none)')"
+    fi
+  fi
 }
 
 maybe_prompt_for_default_profile() {
   if [[ -n "$PROFILE_PATH" ]]; then
     return 0
   fi
-  if [[ -n "$EXIT_TARGET" || -n "$CLIENT_TARGET" || -n "$ENTRY_TARGET" || -n "$AUX_TARGET" || -n "$EXTRA_TARGET" ]]; then
+  if [[ -n "$EXIT_TARGET" || -n "$CLIENT_TARGET" || -n "$ENTRY_TARGET" || -n "$AUX_TARGET" || -n "$EXTRA_TARGET" || -n "$FIFTH_CLIENT_TARGET" ]]; then
     return 0
   fi
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -3538,6 +3567,9 @@ normalize_targets() {
   fi
   if [[ -n "$EXTRA_TARGET" ]]; then
     EXTRA_TARGET="$(normalize_target extra "$EXTRA_TARGET")"
+  fi
+  if [[ -n "$FIFTH_CLIENT_TARGET" ]]; then
+    FIFTH_CLIENT_TARGET="$(normalize_target fifth_client "$FIFTH_CLIENT_TARGET")"
   fi
 }
 

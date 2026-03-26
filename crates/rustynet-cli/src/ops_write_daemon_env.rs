@@ -9,15 +9,27 @@ pub fn execute_ops_write_daemon_env(
     egress_interface: Option<String>,
 ) -> Result<String, String> {
     // 1. Load wizard.env config
-    let mut config = read_env_file_values(&config_path)
-        .map_err(|e| format!("failed to read config file {}: {}", config_path.display(), e))?;
+    let mut config = read_env_file_values(&config_path).map_err(|e| {
+        format!(
+            "failed to read config file {}: {}",
+            config_path.display(),
+            e
+        )
+    })?;
 
     // 2. Apply policy logic (defaults and enforcement)
-    
+
     // Default: NODE_ROLE
-    let setup_complete = config.get("SETUP_COMPLETE").map(|s| s.as_str()).unwrap_or("0");
+    let setup_complete = config
+        .get("SETUP_COMPLETE")
+        .map(|s| s.as_str())
+        .unwrap_or("0");
     if !config.contains_key("NODE_ROLE") {
-        let default_role = if setup_complete == "1" { "admin" } else { "client" };
+        let default_role = if setup_complete == "1" {
+            "admin"
+        } else {
+            "client"
+        };
         config.insert("NODE_ROLE".to_string(), default_role.to_string());
     }
 
@@ -27,7 +39,10 @@ pub fn execute_ops_write_daemon_env(
         match role.as_str() {
             "admin" | "client" | "blind_exit" => role.clone(),
             _ => {
-                eprintln!("[warn] Invalid NODE_ROLE='{}', defaulting to 'client'.", role);
+                eprintln!(
+                    "[warn] Invalid NODE_ROLE='{}', defaulting to 'client'.",
+                    role
+                );
                 "client".to_string()
             }
         }
@@ -41,20 +56,29 @@ pub fn execute_ops_write_daemon_env(
     if node_role == "client" {
         // Force specific settings for client
         if let Some(profile) = config.get("DEFAULT_LAUNCH_PROFILE") {
-             match profile.as_str() {
+            match profile.as_str() {
                 "quick-exit-node" | "quick-hybrid" => {
-                    eprintln!("[warn] Launch profile '{}' is admin-only; forcing 'quick-connect' for client role.", profile);
-                    config.insert("DEFAULT_LAUNCH_PROFILE".to_string(), "quick-connect".to_string());
-                },
+                    eprintln!(
+                        "[warn] Launch profile '{}' is admin-only; forcing 'quick-connect' for client role.",
+                        profile
+                    );
+                    config.insert(
+                        "DEFAULT_LAUNCH_PROFILE".to_string(),
+                        "quick-connect".to_string(),
+                    );
+                }
                 _ => {}
-             }
+            }
         }
         config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
     } else if node_role == "blind_exit" {
         // Force settings for blind_exit
         if config.get("DEFAULT_LAUNCH_PROFILE").map(|s| s.as_str()) != Some("quick-exit-node") {
-             eprintln!("[warn] blind_exit role enforces default launch profile 'quick-exit-node'.");
-             config.insert("DEFAULT_LAUNCH_PROFILE".to_string(), "quick-exit-node".to_string());
+            eprintln!("[warn] blind_exit role enforces default launch profile 'quick-exit-node'.");
+            config.insert(
+                "DEFAULT_LAUNCH_PROFILE".to_string(),
+                "quick-exit-node".to_string(),
+            );
         }
         config.insert("EXIT_CHAIN_HOPS".to_string(), "1".to_string());
         config.remove("EXIT_CHAIN_ENTRY_NODE_ID");
@@ -71,13 +95,15 @@ pub fn execute_ops_write_daemon_env(
 
     // enforce_backend_mode
     if !config.contains_key("BACKEND_MODE") {
-         config.insert("BACKEND_MODE".to_string(), "linux-wireguard".to_string());
+        config.insert("BACKEND_MODE".to_string(), "linux-wireguard".to_string());
     }
 
     // enforce_auto_tunnel_policy
     if config.get("AUTO_TUNNEL_ENFORCE").map(|s| s.as_str()) != Some("1") {
-         eprintln!("[warn] Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1.");
-         config.insert("AUTO_TUNNEL_ENFORCE".to_string(), "1".to_string());
+        eprintln!(
+            "[warn] Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
+        );
+        config.insert("AUTO_TUNNEL_ENFORCE".to_string(), "1".to_string());
     }
 
     // enforce_fail_closed_ssh_policy
@@ -85,19 +111,32 @@ pub fn execute_ops_write_daemon_env(
         config.insert("FAIL_CLOSED_SSH_ALLOW".to_string(), "0".to_string());
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
     } else {
-         if config.get("FAIL_CLOSED_SSH_ALLOW_CIDRS").map(|s| s.trim()).unwrap_or("").is_empty() {
-             return Err("FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_string());
-         }
+        if config
+            .get("FAIL_CLOSED_SSH_ALLOW_CIDRS")
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .is_empty()
+        {
+            return Err(
+                "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_string(),
+            );
+        }
     }
 
     // enforce_wg_listen_port_policy
     if let Some(port) = config.get("WG_LISTEN_PORT") {
         if let Ok(p) = port.parse::<u16>() {
             if p == 0 {
-                 return Err(format!("Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.", port));
+                return Err(format!(
+                    "Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.",
+                    port
+                ));
             }
         } else {
-             return Err(format!("Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.", port));
+            return Err(format!(
+                "Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.",
+                port
+            ));
         }
     }
 
@@ -107,18 +146,27 @@ pub fn execute_ops_write_daemon_env(
     } else {
         // Check lease secs
         if let Some(lease) = config.get("AUTO_PORT_FORWARD_LEASE_SECS") {
-             if let Ok(l) = lease.parse::<u64>() {
-                 if l < 60 {
-                      return Err(format!("Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.", lease));
-                 }
-             } else {
-                  return Err(format!("Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.", lease));
-             }
+            if let Ok(l) = lease.parse::<u64>() {
+                if l < 60 {
+                    return Err(format!(
+                        "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.",
+                        lease
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.",
+                    lease
+                ));
+            }
         }
         // Role check
         if node_role == "client" {
-             eprintln!("[warn] Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '{}'.", node_role);
-             config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
+            eprintln!(
+                "[warn] Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '{}'.",
+                node_role
+            );
+            config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
         }
     }
 
@@ -128,8 +176,8 @@ pub fn execute_ops_write_daemon_env(
     }
 
     // 4. Invoke the single hardened install-systemd path with child-local env overrides.
-    let rustynet_bin =
-        env::current_exe().map_err(|e| format!("failed to resolve current rustynet binary: {e}"))?;
+    let rustynet_bin = env::current_exe()
+        .map_err(|e| format!("failed to resolve current rustynet binary: {e}"))?;
     let mut command = Command::new(rustynet_bin);
     command.arg("ops").arg("install-systemd");
     for (key, value) in config {

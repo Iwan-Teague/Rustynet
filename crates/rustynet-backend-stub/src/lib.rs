@@ -154,6 +154,7 @@ mod tests {
     fn context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("stub-local").expect("node id should be valid"),
+            interface_name: "rustynet0".to_string(),
             mesh_cidr: "100.64.0.0/10".to_string(),
             local_cidr: "100.64.0.1/32".to_string(),
         }

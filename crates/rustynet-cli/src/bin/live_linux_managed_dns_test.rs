@@ -1706,9 +1706,6 @@ fn managed_dns_invalid_state_observed(
     rustynetd_journal: &str,
     expected_reason_fragments: &[&str],
 ) -> bool {
-    if dns_inspect.contains("daemon unreachable") {
-        return true;
-    }
     if dns_inspect.contains("dns inspect: state=invalid")
         && contains_all_reason_fragments(dns_inspect, expected_reason_fragments)
     {
@@ -2248,6 +2245,15 @@ signature=abcd
             "",
             "dns zone preflight failed: dns zone bundle subject node id does not match local node",
             &["subject node id does not match local node"]
+        ));
+    }
+
+    #[test]
+    fn managed_dns_invalid_state_observed_rejects_daemon_unreachable_without_invalid_state() {
+        assert!(!managed_dns_invalid_state_observed(
+            "daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): No such file or directory",
+            "",
+            &["replay detected"]
         ));
     }
 
