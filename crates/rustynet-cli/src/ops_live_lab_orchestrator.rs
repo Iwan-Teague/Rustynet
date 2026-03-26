@@ -1555,10 +1555,14 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         let helper_meta_trimmed = helper_meta.trim().to_string();
         let daemon_parts = daemon_meta_trimmed.split('|').collect::<Vec<_>>();
         let helper_parts = helper_meta_trimmed.split('|').collect::<Vec<_>>();
+        let daemon_owner = daemon_parts.get(2).copied().unwrap_or_default();
+        let daemon_group = daemon_parts.get(3).copied().unwrap_or_default();
+        let daemon_owner_ok = daemon_owner == "root" || daemon_owner == "rustynetd";
         let daemon_ok = daemon_parts.len() == 4
             && daemon_parts[0] == "socket"
             && daemon_parts[1] == "600"
-            && daemon_parts[2] == "root";
+            && daemon_owner_ok
+            && daemon_group == daemon_owner;
         let helper_ok = helper_parts.len() == 4
             && helper_parts[0] == "socket"
             && helper_parts[1] == "660"
@@ -2765,6 +2769,46 @@ mod tests {
         let _ = fs::remove_file(work_dir.join("client.inet_listeners.txt"));
         let _ = fs::remove_file(work_dir.join("client.managed_dns_state.txt"));
         let _ = fs::remove_dir(work_dir.as_path());
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn control_surface_report_accepts_rustynetd_owned_daemon_socket() {
+        let work_dir = temp_path("control-surface-rustynetd-owner-work");
+        fs::create_dir_all(work_dir.as_path()).expect("mkdir");
+        fs::write(
+            work_dir.join("client.daemon_socket.txt"),
+            "socket|600|rustynetd|rustynetd\n",
+        )
+        .expect("write daemon");
+        fs::write(
+            work_dir.join("client.helper_socket.txt"),
+            "socket|660|root|rustynetd\n",
+        )
+        .expect("write helper");
+        fs::write(
+            work_dir.join("client.inet_listeners.txt"),
+            "udp UNCONN 0 0 127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=4))\n",
+        )
+        .expect("write listeners");
+        fs::write(work_dir.join("client.managed_dns_state.txt"), "active\n").expect("write state");
+        let report_path = temp_path("control-surface-rustynetd-owner-report");
+        let status = execute_ops_write_live_linux_control_surface_report(
+            WriteLiveLinuxControlSurfaceReportConfig {
+                report_path: report_path.clone(),
+                dns_bind_addr: "127.0.0.1:53535".to_string(),
+                remote_dns_probe_status: "pass".to_string(),
+                remote_dns_probe_output: "{}".to_string(),
+                work_dir: work_dir.clone(),
+                host_labels: vec!["client".to_string()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "pass");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        assert!(body.contains("\"status\": \"pass\""));
         let _ = fs::remove_file(report_path.as_path());
     }
 
