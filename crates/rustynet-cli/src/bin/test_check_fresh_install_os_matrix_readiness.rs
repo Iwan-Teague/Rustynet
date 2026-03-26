@@ -224,6 +224,66 @@ fn run() -> Result<(), i32> {
         return Err(1);
     }
 
+    let mut wrapper_success_check = Command::new("cargo");
+    wrapper_success_check.current_dir(&repo_root);
+    wrapper_success_check.args([
+        "run",
+        "--quiet",
+        "-p",
+        "rustynet-cli",
+        "--bin",
+        "check_fresh_install_os_matrix_readiness",
+        "--",
+    ]);
+    wrapper_success_check
+        .env(
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH",
+            temp_dir.path().join("report.json"),
+        )
+        .env("RUSTYNET_FRESH_INSTALL_OS_MATRIX_MAX_AGE_SECONDS", "604800")
+        .env("RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE", "linux")
+        .env(
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT",
+            &head_commit,
+        );
+    run_command(&mut wrapper_success_check)?;
+
+    let mut wrapper_stale_child_check = Command::new("cargo");
+    wrapper_stale_child_check.current_dir(&repo_root);
+    wrapper_stale_child_check.args([
+        "run",
+        "--quiet",
+        "-p",
+        "rustynet-cli",
+        "--bin",
+        "check_fresh_install_os_matrix_readiness",
+        "--",
+    ]);
+    wrapper_stale_child_check
+        .env(
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH",
+            temp_dir.path().join("report_with_stale_child.json"),
+        )
+        .env("RUSTYNET_FRESH_INSTALL_OS_MATRIX_MAX_AGE_SECONDS", "604800")
+        .env("RUSTYNET_FRESH_INSTALL_OS_MATRIX_PROFILE", "linux")
+        .env(
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT",
+            &head_commit,
+        );
+    if wrapper_stale_child_check
+        .status()
+        .map_err(|err| {
+            eprintln!("failed to run command: {err}");
+            1
+        })?
+        .success()
+    {
+        eprintln!(
+            "expected wrapper gate to fail when fresh-install report references stale child evidence"
+        );
+        return Err(1);
+    }
+
     println!("fresh install OS matrix readiness self-test: PASS");
     Ok(())
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 const DEFAULT_PHASE10_ARTIFACT_DIR: &str = "artifacts/phase10";
-const DEFAULT_PHASE10_MAX_EVIDENCE_AGE_SECONDS: &str = "2678400";
+const DEFAULT_PHASE10_MAX_EVIDENCE_AGE_SECONDS: &str = "604800";
 const DEFAULT_REQUIRED_NAT_PROFILES: &str = "baseline_lan";
 const DEFAULT_SCHEMA_OUTPUT_BASENAME: &str = "cross_network_remote_exit_schema_validation.md";
 const DEFAULT_NAT_MATRIX_OUTPUT_BASENAME: &str =

@@ -17,11 +17,7 @@ fn main() {
     std::process::exit(code);
 }
 
-#[allow(unreachable_code)]
 fn run() -> Result<(), i32> {
-    println!("Fresh install OS matrix release gate: PASS (bypassed for remote patching)");
-    return Ok(());
-
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
         eprintln!("{err}");

@@ -1346,6 +1346,8 @@ After successful run, update `ShellToRustMigrationPlan_2026-03-06.md` Phase I st
 
 **Problem:** Current report (`fresh_install_os_matrix_report.json`) was captured on 2026-03-08 at commit `4500e38`. The gate has a max age of 7 days. It will fail freshness checks against current HEAD.
 
+**2026-03-26 status note:** `check_fresh_install_os_matrix_readiness` bypass removal landed; Phase 10 gates now fail closed on stale fresh-install evidence (`fresh_install_os_matrix_report evidence is stale; refresh OS matrix evidence`).
+
 **Solution:** Re-run the live lab orchestrator with the current HEAD commit on the lab machines.
 
 ```bash
@@ -1370,6 +1372,15 @@ If macOS is not available in the lab, update the gate to mark macOS as `"status"
 **Problem:** All six required cross-network reports are missing. Previous attempts failed at lab initialization.
 
 **2026-03-25 status note:** The Phase 10 readiness code path now fails closed on missing or invalid canonical cross-network reports and NAT-matrix coverage, but the six measured reports are still missing and current verification is blocked by unrelated Agent 1 runtime compile failures in `rustynetd`.
+
+**2026-03-26 status note:** Runtime compile blocker is cleared; dedicated cross-network gate fails closed on missing canonical reports:
+- `cross_network_direct_remote_exit_report.json`
+- `cross_network_relay_remote_exit_report.json`
+- `cross_network_failback_roaming_report.json`
+- `cross_network_traversal_adversarial_report.json`
+- `cross_network_remote_exit_dns_report.json`
+- `cross_network_remote_exit_soak_report.json`
+Cross-network gate default max evidence age is now aligned to 7 days (604800s) for freshness parity with E1.
 
 **Prerequisite:**
 - Track B (WS-1/WS-2/WS-3) done — so the daemon is self-healing
@@ -1844,6 +1855,43 @@ Status: complete (for this slice)
 
 - Blocker / prerequisite:
   - No code blocker for this slice; remaining blockers are environment/lab availability for live measured evidence.
+
+## Session Log — Track E Fail-Closed Enforcement 2026-03-26
+
+Status: complete (for this slice)
+
+- Changed files:
+  - `crates/rustynet-cli/src/bin/check_fresh_install_os_matrix_readiness.rs`
+  - `crates/rustynet-cli/src/bin/test_check_fresh_install_os_matrix_readiness.rs`
+  - `crates/rustynet-cli/src/bin/phase10_cross_network_exit_gates.rs`
+  - `documents/operations/active/MasterWorkPlan_2026-03-22.md`
+
+- What changed:
+  - Removed unconditional PASS bypass from the fresh-install OS matrix readiness gate binary so E1 now enforces real evidence validation.
+  - Expanded readiness self-test coverage to execute the wrapper gate binary directly and assert:
+    - success on valid fixture report
+    - failure on stale-child replay fixture
+  - Tightened Phase 10 cross-network gate default evidence freshness window from 31 days to 7 days.
+  - Re-ran Phase 10 gates to verify fail-closed behavior on stale E1 evidence.
+
+- Verification:
+  - `cargo check -p rustynet-cli` (pass)
+  - `./scripts/ci/test_check_fresh_install_os_matrix_readiness.sh` (pass)
+  - `./scripts/ci/check_fresh_install_os_matrix_readiness.sh` (expected fail: stale evidence)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (expected fail: missing canonical cross-network reports)
+  - `./scripts/ci/phase10_gates.sh` (expected fail at E1 stale evidence gate)
+
+- Artifacts:
+  - No new measured Track E artifacts generated in this slice.
+
+- Residual risk:
+  - E1 remains blocked until fresh OS matrix evidence is generated on current commit using full required topology.
+  - E2 remains blocked until six canonical cross-network measured reports are generated and validated.
+
+- Blocker / prerequisite:
+  - Live lab topology prerequisites are currently unmet for full Track E completion:
+    - E1 full cross-platform report requires five-node topology (entry, aux, extra).
+    - E2 canonical cross-network reports require distinct client/exit underlay prefixes and cross-network stage execution.
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.
