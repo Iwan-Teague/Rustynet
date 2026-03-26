@@ -8,7 +8,7 @@ cargo run --quiet -p rustynet-cli --bin security_regression_gates -- "$@"
 
 # G1: Grep-based CI gate for secret material equality
 echo "Checking for raw equality on secret material..."
-if grep -rn --include="*.rs" -E '(token|session_key|nonce|mac|hmac|hash|session_id)\s*(==|!=)\s' \
+if grep -rn --include="*.rs" -E '(token|csrf|session_key|nonce|mac|hmac|session_id)\s*(==|!=)\s' \
   crates/rustynet-relay/src/ crates/rustynet-control/src/ 2>/dev/null | \
   grep -v "// EXCEPTION:" | grep -v "ct_eq"; then
   echo "ERROR: raw equality on secret material detected — use subtle::ConstantTimeEq" >&2
@@ -54,4 +54,3 @@ echo "PASS: no imports of deprecated crypto crates in source"
 
 echo "All security regression gates passed."
 exit 0
-

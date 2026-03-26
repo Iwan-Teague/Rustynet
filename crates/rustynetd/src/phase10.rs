@@ -2832,14 +2832,6 @@ fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) ->
         .unwrap_or(false)
 }
 
-fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {
-    match (previous, current) {
-        (_, None) => false,
-        (None, Some(_)) => true,
-        (Some(previous), Some(current)) => current > previous,
-    }
-}
-
 /// Gate peer provisioning on membership status (M4).
 ///
 /// A node that is not positively confirmed `Active` in the membership

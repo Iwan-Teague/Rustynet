@@ -1,0 +1,29 @@
+{
+  "captured_at": "1774551419",
+  "captured_at_unix": 1774551419,
+  "checks": {
+    "internet_route_via_rustynet0": "pass",
+    "no_unexpected_bypass_routes": "pass",
+    "probe_endpoint_route_direct_not_tunnelled": "pass",
+    "probe_host_self_service_reachable": "pass",
+    "probe_service_blocked_from_client": "fail"
+  },
+  "evidence": {
+    "allowed_management_cidrs": [
+      "192.168.64.0/24"
+    ],
+    "client_endpoints": "0KaSJ036/ogwWcaJxYkJo5OR8Gnbj0Ji6yvW6LOWBhM=\t192.168.64.22:51820\n",
+    "client_internet_route": "1.1.1.1 dev rustynet0 table 51820 src 100.68.223.117 uid 1000 \n    cache \n",
+    "client_probe_output": "probe-ok\n",
+    "client_probe_route": "192.168.64.28 dev enp0s1 table 51820 src 192.168.64.24 uid 1000 \n    cache \n",
+    "client_table_51820": "default dev rustynet0 scope link \n100.109.33.213 dev rustynet0 scope link \nblackhole 192.168.1.0/24 \n192.168.64.0/24 dev enp0s1 scope link \n192.168.64.22 dev enp0s1 scope link \n192.168.64.26 dev enp0s1 scope link \n",
+    "probe_self_test": "probe-ok\n",
+    "unexpected_bypass_routes": []
+  },
+  "evidence_mode": "measured",
+  "mode": "live_linux_server_ip_bypass",
+  "phase": "phase10",
+  "probe_host_ip": "192.168.64.28",
+  "probe_port": 18080,
+  "status": "fail"
+}

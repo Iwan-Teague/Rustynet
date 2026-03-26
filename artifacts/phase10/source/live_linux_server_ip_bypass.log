@@ -1,0 +1,22 @@
+Starting underlay HTTP probe service on debian@192.168.64.28 (192.168.64.28:18080)
+Client status
+node_id=client-1 node_role=client state=FailClosed generation=2 exit_node=exit-1 serving_exit_node=false lan_access=off restricted_safe_mode=true restriction_mode=Permanent bootstrap_error=reconcile failure threshold exceeded: 98 reconcile_attempts=205 reconcile_failures=98 last_reconcile_unix=1774551416 last_reconcile_error=traversal authority rejected reconcile apply: traversal authority requires valid signed traversal state: traversal bundle is stale encrypted_key_store=true auto_tunnel_enforce=true dns_zone_state=valid dns_zone_record_count=2 dns_zone_error=none traversal_authority=enforced_v1 traversal_peer_count=0 traversal_probe_max_candidates=8 traversal_probe_max_pairs=24 traversal_probe_rounds=3 traversal_probe_round_spacing_ms=80 traversal_probe_relay_switch_after_failures=3 traversal_probe_handshake_freshness_secs=30 traversal_probe_reprobe_interval_secs=30 traversal_probe_result=none traversal_probe_reason=none traversal_probe_attempts=0 traversal_probe_endpoint=none traversal_probe_latest_handshake_unix=none traversal_probe_next_reprobe_unix=none traversal_probe_peer_count=0 traversal_probe_direct_peers=0 traversal_probe_relay_peers=0 traversal_preexpiry_refresh_events=4 traversal_last_preexpiry_refresh_unix=1774551316 traversal_stale_rejections=6 traversal_replay_rejections=0 traversal_future_dated_rejections=0 traversal_endpoint_change_events=2 traversal_endpoint_fingerprint=5b614d0d37cfdc59e93f21ffb674509178518c6f519ef68ce284bd32be2cce7f traversal_alarm_state=error traversal_alarm_reason=traversal_bundle_is_stale dns_alarm_state=ok dns_alarm_reason=none dns_preexpiry_refresh_events=0 dns_last_preexpiry_refresh_unix=none dns_stale_rejections=0 dns_replay_rejections=0 dns_future_dated_rejections=0 auto_port_forward_exit=false port_forward_external_port=none port_forward_error=none last_assignment=1774551230:1774551230524399771 membership_epoch=4 membership_active_nodes=4
+Client route to internet
+1.1.1.1 dev rustynet0 table 51820 src 100.68.223.117 uid 1000 
+    cache 
+Client route to probe host underlay IP
+192.168.64.28 dev enp0s1 table 51820 src 192.168.64.24 uid 1000 
+    cache 
+Client table 51820
+default dev rustynet0 scope link 
+100.109.33.213 dev rustynet0 scope link 
+blackhole 192.168.1.0/24 
+192.168.64.0/24 dev enp0s1 scope link 
+192.168.64.22 dev enp0s1 scope link 
+192.168.64.26 dev enp0s1 scope link 
+Client endpoints
+0KaSJ036/ogwWcaJxYkJo5OR8Gnbj0Ji6yvW6LOWBhM=	192.168.64.22:51820
+Probe host self-test output
+probe-ok
+Client probe output
+probe-ok

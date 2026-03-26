@@ -1,0 +1,85 @@
+{
+  "captured_at": "1774551694",
+  "captured_at_unix": 1774551694,
+  "checks": {
+    "all_daemon_sockets_secure": "pass",
+    "all_helper_sockets_secure": "pass",
+    "no_rustynet_tcp_listeners": "pass",
+    "remote_underlay_dns_probe_blocked": "pass",
+    "rustynet_udp_loopback_only": "pass"
+  },
+  "dns_bind_addr": "127.0.0.1:53535",
+  "evidence": {
+    "remote_underlay_dns_probe_output": "{\"answer_count\":0,\"answer_ip\":\"\",\"answer_ttl\":0,\"error\":\"dns query receive failed: Resource temporarily unavailable (os error 11)\",\"rcode\":-1}\n"
+  },
+  "evidence_mode": "measured",
+  "hosts": {
+    "aux": {
+      "checks": {
+        "daemon_socket_secure": "pass",
+        "helper_socket_secure": "pass",
+        "no_rustynet_tcp_listener": "pass",
+        "rustynet_udp_loopback_only": "pass"
+      },
+      "evidence": {
+        "daemon_socket_meta": "socket|600|rustynetd|rustynetd",
+        "helper_socket_meta": "socket|660|root|rustynetd",
+        "managed_dns_service_state": "active",
+        "rustynet_listener_lines": [
+          "udp UNCONN 0      0                                      127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=192908,fd=4))"
+        ]
+      }
+    },
+    "client": {
+      "checks": {
+        "daemon_socket_secure": "pass",
+        "helper_socket_secure": "pass",
+        "no_rustynet_tcp_listener": "pass",
+        "rustynet_udp_loopback_only": "pass"
+      },
+      "evidence": {
+        "daemon_socket_meta": "socket|600|rustynetd|rustynetd",
+        "helper_socket_meta": "socket|660|root|rustynetd",
+        "managed_dns_service_state": "active",
+        "rustynet_listener_lines": [
+          "udp UNCONN 0      0                              127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=89779,fd=4))"
+        ]
+      }
+    },
+    "entry": {
+      "checks": {
+        "daemon_socket_secure": "pass",
+        "helper_socket_secure": "pass",
+        "no_rustynet_tcp_listener": "pass",
+        "rustynet_udp_loopback_only": "pass"
+      },
+      "evidence": {
+        "daemon_socket_meta": "socket|600|rustynetd|rustynetd",
+        "helper_socket_meta": "socket|660|root|rustynetd",
+        "managed_dns_service_state": "active",
+        "rustynet_listener_lines": [
+          "udp UNCONN 0      0                                     127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=205388,fd=4))"
+        ]
+      }
+    },
+    "exit": {
+      "checks": {
+        "daemon_socket_secure": "pass",
+        "helper_socket_secure": "pass",
+        "no_rustynet_tcp_listener": "pass",
+        "rustynet_udp_loopback_only": "pass"
+      },
+      "evidence": {
+        "daemon_socket_meta": "socket|600|rustynetd|rustynetd",
+        "helper_socket_meta": "socket|660|root|rustynetd",
+        "managed_dns_service_state": "active",
+        "rustynet_listener_lines": [
+          "udp UNCONN 0      0                               127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=94797,fd=4))"
+        ]
+      }
+    }
+  },
+  "mode": "live_linux_control_surface_exposure",
+  "phase": "phase10",
+  "status": "pass"
+}

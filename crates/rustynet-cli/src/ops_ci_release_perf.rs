@@ -767,12 +767,12 @@ pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
     let required_tests = [
         [
             "rustynetd",
-            "daemon::tests::read_command_rejects_oversized_payload",
+            "daemon::tests::read_command_envelope_rejects_null_byte_payload",
             "",
         ],
         [
             "rustynetd",
-            "daemon::tests::read_command_rejects_null_byte_payload",
+            "daemon::tests::read_command_envelope_rejects_invalid_remote_wire_command",
             "",
         ],
         [

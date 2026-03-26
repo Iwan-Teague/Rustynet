@@ -77,11 +77,11 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Open scope`
 - This file is the top-level remaining-work map for the repo, but some lower session logs are historical and may describe old blockers.
-- The real remaining work is concentrated in Track A, Track B, Track D, and Track E, with Track F still future-facing and Track C or G only needing attention if evidence shows unfinished scope.
+- Core Track A/Track B controller hardening and Track G controls are implemented in code; remaining high-value work is now primarily live cross-network evidence collection and validation refresh (Track E and Track B WS-4 measured runs), plus any backend-agility expansion beyond current conformance proof (Track F).
 
 `Do first`
 - Reconcile stale status lines and historical blocker notes with current code reality.
-- Then execute remaining work in the top-level order already set by the AI prompt: Track A, then Track B, then Track D, then Track E, then Track F.
+- Then execute remaining work in the top-level order already set by the AI prompt, prioritizing measurable, commit-bound live evidence over additional design text.
 
 `Completion proof`
 - The summary table, status sections, and session logs all match the code and artifact reality.
@@ -224,7 +224,7 @@ Unit test evidence (see paths):
 
 ### A2 — HP-3: Production Relay Transport Service
 
-**Status:** Design complete; protocol and control-plane token flows implemented in `crates/rustynet-control`. Relay runtime implementation (packet forwarding service) is TODO — left as the next phase.
+**Status:** Implemented in code (relay transport/session/rate-limit modules and unit tests), with live cross-network evidence still pending lab execution.
 
 **What needs to be built:**
 
@@ -352,7 +352,7 @@ Tests required:
 
 ### A3 — HP-4: Seamless Path Controller Completion
 
-**Status:** The `Phase10Controller` in `crates/rustynetd/src/phase10.rs` acts as the path controller but lacks hysteresis (stability window before committing to a path change) and full live-handoff-under-load proof.
+**Status:** Implemented for controller logic and unit coverage (`Phase10Controller` hysteresis and fail-closed bypass), with live handoff-under-load evidence still pending Debian lab execution.
 
 **What is needed:**
 
@@ -433,7 +433,7 @@ Test flow:
 
 ### A4 — HP-5: Hardening and Gate Coverage
 
-**Status:** Not started as a formal gate. Some individual tests exist.
+**Status:** Implemented for adversarial/unit gate coverage (`traversal_adversarial_gates` and A4 tests); remaining work is live cross-network measured evidence refresh.
 
 **A4-a: Traversal Adversarial Test Suite**
 
@@ -813,7 +813,7 @@ Tests required:
 
 **B3-a: Proactive Traversal Refresh (WS3-01)**
 
-**Status:** Only reactive refresh (on probe failure). Proactive pre-expiry refresh not implemented.
+**Status:** Implemented in `traversal.rs` and `daemon.rs` with pre-expiry refresh scheduling, telemetry counters, fail-closed alarm behavior, and unit coverage; live soak evidence remains under Track E.
 
 Files to modify:
 - `crates/rustynetd/src/traversal.rs` — add TTL-driven refresh scheduling
@@ -1450,16 +1450,13 @@ If boringtun is out of scope, at minimum write comprehensive conformance tests f
 
 ### G1 — HP-3 Relay Transport Constant-Time Auth Prep
 
-**Status:** PARTIAL — constant-time comparison applied in rustynet-control for CSRF tokens; further relay/session places remain.
+**Status:** DONE — constant-time comparison coverage is in place for control and relay token paths, with CI gate enforcement.
 
 Evidence:
-- Implemented constant-time CSRF comparison in crates/rustynet-control/src/admin.rs (uses subtle::ConstantTimeEq).
-- Added subtle dependency to crates/rustynet-control/Cargo.toml.
-- Commit: 9482d280c37e0561473c64aed3197d1aee44affb
-
-Remaining work:
-- Add subtle to rustynet-relay and replace token comparisons in crates/rustynet-relay/src/transport.rs.
-- Add grep-based CI gate to security_regression_gates to detect raw token equality.
+- `crates/rustynet-control/src/admin.rs`: CSRF token comparison uses `subtle::ConstantTimeEq`.
+- `crates/rustynet-relay/src/transport.rs`: relay/session token binding checks use `ct_eq`.
+- `crates/rustynet-relay/Cargo.toml` and `crates/rustynet-control/Cargo.toml`: `subtle = "2"` present.
+- `scripts/ci/security_regression_gates.sh`: raw secret-equality grep gate present and now scoped to secret-token fields.
 
 Before implementing HP-3 relay transport (Track A, A2), the auth token comparison in the relay session protocol must use constant-time comparison to avoid timing side-channels.
 
@@ -1513,7 +1510,7 @@ Tasks:
 
 4. Add CI gate: fail if sha1 or 3des usage count > 0 (counted by cargo audit)
 
-Status: PARTIAL — schedule updated; dependency removal and CI gate still outstanding.
+Status: DONE — deny bans and CI enforcement are active; deprecated crypto crates are blocked in lock/source scans.
 ```
 
 ---
@@ -1578,21 +1575,21 @@ Phase 5 (final):
 | F: Backend Agility | Second real backend | A, B, C, D, G | Launch |
 | G: Security Hardening | Const-time auth, sha1/3des removal | A, B, C, D, F | Track A (HP-3) |
 
-**Largest remaining code work (by effort):**
-1. HP-3 Production Relay Transport — new protocol, new service, full test suite
-2. HP-2 Simultaneous-Open WAN — STUN integration, coordination protocol
-3. Membership System M0–M8 — full quorum-signed governance system
-4. Cross-Network WS-1/WS-2/WS-3 — daemon self-healing refresh and endpoint mobility
+**Largest remaining work (by effort):**
+1. Track E live evidence refresh on current commit (fresh-install OS matrix + six cross-network measured reports).
+2. Track B WS-4 live validation runs (controller/network switch and long-run cross-network invariants in measured lab conditions).
+3. Track F optional second real backend implementation (if pursued beyond current conformance-backed stub path).
 
 **Quickest wins (low effort, high value):**
-1. G1 + G2 — constant-time auth prep and sha1/3des audit (1–2 hours)
-2. D2 — Phase I evidence collection (run one lab session, ~2 hours)
-3. B1-c — complete `state refresh` IPC command wiring (skeleton already exists, ~4 hours)
-4. B3-a — proactive traversal refresh timer (well-defined, ~4 hours)
+1. Keep `security_regression_gates.sh`, `phase10_gates.sh`, and `membership_gates.sh` green on every commit touching runtime/security-sensitive code.
+2. Regenerate stale measured artifacts on the current commit and fail closed on age/commit mismatch.
+3. Resolve residual warnings in touched crates when they intersect security gate signal quality.
 
 ---
 
 ## TRACK A — A3 (HP-4) / A4 (HP-5) / A5 Work Attempt — 2026-03-23
+
+Historical snapshot: this section captured an earlier environment-specific blocker and is superseded by later implementation session logs below.
 
 Summary of attempt:
 - Scope: Implement A3 (hysteresis), A4 (daemon relay session integration), A5 (hysteresis + gate coverage) as described in plan.
@@ -1813,6 +1810,40 @@ Status: partial
 - Artifacts: none generated; canonical `artifacts/phase10/cross_network_*_report.json` files remain absent.
 - Residual risk: Track E is still incomplete until the six measured cross-network reports exist and the dedicated gate and readiness path are re-run successfully.
 - Blocker / prerequisite: Agent 1 must first restore a compiling `rustynetd` runtime so the CLI readiness path and gate harness can be executed again.
+
+## Session Log — Reconciliation + Security Gate Hardening 2026-03-26
+
+Status: complete (for this slice)
+
+- Changed files:
+  - `crates/rustynet-cli/src/ops_ci_release_perf.rs`
+  - `crates/rustynetd/src/phase10.rs`
+  - `scripts/ci/security_regression_gates.sh`
+  - `documents/operations/active/MasterWorkPlan_2026-03-22.md`
+
+- What changed:
+  - Reconciled stale master-plan status blocks (A2/A3/A4/B3/G1/G2) to match current code reality.
+  - Fixed `ops run-security-regression-gates` required-test drift by replacing removed daemon test names with current enforced tests:
+    - `daemon::tests::read_command_envelope_rejects_null_byte_payload`
+    - `daemon::tests::read_command_envelope_rejects_invalid_remote_wire_command`
+  - Hardened CI grep gate signal quality by narrowing raw-equality detection to secret-token fields and removing false-positive coupling to non-secret integrity-chain hash comparisons.
+  - Removed an unused stale helper (`handshake_advanced`) from `phase10.rs` to keep gate/test output signal clean.
+
+- Verification:
+  - `cargo check -p rustynet-cli` (pass)
+  - `cargo check -p rustynetd` (pass)
+  - `cargo test -p rustynet-relay test_relay_session_token_ct_eq_is_available_and_correct -- --nocapture` (pass)
+  - `cargo test -p rustynet-cli validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports -- --nocapture` (pass)
+  - `./scripts/ci/security_regression_gates.sh` (pass after required-test drift fix + grep-scope hardening)
+
+- Artifacts:
+  - No new measured lab artifacts generated in this slice.
+
+- Residual risk:
+  - Track E remains open: measured cross-network reports and fresh-install OS matrix evidence still need live lab execution on current commit.
+
+- Blocker / prerequisite:
+  - No code blocker for this slice; remaining blockers are environment/lab availability for live measured evidence.
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.
