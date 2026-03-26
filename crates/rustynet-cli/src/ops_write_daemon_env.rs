@@ -39,10 +39,7 @@ pub fn execute_ops_write_daemon_env(
         match role.as_str() {
             "admin" | "client" | "blind_exit" => role.clone(),
             _ => {
-                eprintln!(
-                    "[warn] Invalid NODE_ROLE='{}', defaulting to 'client'.",
-                    role
-                );
+                eprintln!("[warn] Invalid NODE_ROLE='{role}', defaulting to 'client'.");
                 "client".to_string()
             }
         }
@@ -59,8 +56,7 @@ pub fn execute_ops_write_daemon_env(
             match profile.as_str() {
                 "quick-exit-node" | "quick-hybrid" => {
                     eprintln!(
-                        "[warn] Launch profile '{}' is admin-only; forcing 'quick-connect' for client role.",
-                        profile
+                        "[warn] Launch profile '{profile}' is admin-only; forcing 'quick-connect' for client role."
                     );
                     config.insert(
                         "DEFAULT_LAUNCH_PROFILE".to_string(),
@@ -110,17 +106,15 @@ pub fn execute_ops_write_daemon_env(
     if config.get("FAIL_CLOSED_SSH_ALLOW").map(|s| s.as_str()) != Some("1") {
         config.insert("FAIL_CLOSED_SSH_ALLOW".to_string(), "0".to_string());
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
-    } else {
-        if config
-            .get("FAIL_CLOSED_SSH_ALLOW_CIDRS")
-            .map(|s| s.trim())
-            .unwrap_or("")
-            .is_empty()
-        {
-            return Err(
-                "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_string(),
-            );
-        }
+    } else if config
+        .get("FAIL_CLOSED_SSH_ALLOW_CIDRS")
+        .map(|s| s.trim())
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Err(
+            "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_string(),
+        );
     }
 
     // enforce_wg_listen_port_policy
@@ -128,14 +122,12 @@ pub fn execute_ops_write_daemon_env(
         if let Ok(p) = port.parse::<u16>() {
             if p == 0 {
                 return Err(format!(
-                    "Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.",
-                    port
+                    "Invalid WG_LISTEN_PORT '{port}'. Expected numeric range 1..65535."
                 ));
             }
         } else {
             return Err(format!(
-                "Invalid WG_LISTEN_PORT '{}'. Expected numeric range 1..65535.",
-                port
+                "Invalid WG_LISTEN_PORT '{port}'. Expected numeric range 1..65535."
             ));
         }
     }
@@ -149,22 +141,19 @@ pub fn execute_ops_write_daemon_env(
             if let Ok(l) = lease.parse::<u64>() {
                 if l < 60 {
                     return Err(format!(
-                        "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.",
-                        lease
+                        "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{lease}'. Expected numeric value >= 60."
                     ));
                 }
             } else {
                 return Err(format!(
-                    "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.",
-                    lease
+                    "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{lease}'. Expected numeric value >= 60."
                 ));
             }
         }
         // Role check
         if node_role == "client" {
             eprintln!(
-                "[warn] Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '{}'.",
-                node_role
+                "[warn] Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '{node_role}'."
             );
             config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
         }
@@ -184,7 +173,7 @@ pub fn execute_ops_write_daemon_env(
         let env_key = if key.starts_with("RUSTYNET_") {
             key
         } else {
-            format!("RUSTYNET_{}", key)
+            format!("RUSTYNET_{key}")
         };
         command.env(env_key, value);
     }

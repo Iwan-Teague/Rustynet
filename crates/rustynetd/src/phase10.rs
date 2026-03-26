@@ -222,6 +222,16 @@ pub struct TraversalProbeReport {
     pub latest_handshake_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TraversalProbeEvaluation<'a> {
+    pub local_candidates: &'a [ProbeTraversalCandidate],
+    pub direct_candidates: &'a [ProbeTraversalCandidate],
+    pub relay_endpoint: Option<SocketEndpoint>,
+    pub now_unix: u64,
+    pub engine_config: TraversalEngineConfig,
+    pub handshake_freshness_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionEvent {
     pub from_state: DataplaneState,
@@ -2612,15 +2622,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     pub fn evaluate_traversal_probes(
         &mut self,
         node_id: &NodeId,
-        local_candidates: &[ProbeTraversalCandidate],
-        direct_candidates: &[ProbeTraversalCandidate],
-        relay_endpoint: Option<SocketEndpoint>,
-        now_unix: u64,
-        engine_config: TraversalEngineConfig,
-        handshake_freshness_secs: u64,
+        evaluation: TraversalProbeEvaluation<'_>,
     ) -> Result<TraversalProbeReport, Phase10Error> {
         self.ensure_started()?;
-        if handshake_freshness_secs == 0 {
+        if evaluation.handshake_freshness_secs == 0 {
             return Err(Phase10Error::TraversalProbeFailed(
                 "handshake freshness window must be greater than zero".to_string(),
             ));
@@ -2629,7 +2634,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Err(Phase10Error::PeerNotManaged);
         }
 
-        if let Some(relay_endpoint) = relay_endpoint {
+        if let Some(relay_endpoint) = evaluation.relay_endpoint {
             self.configure_traversal_paths(node_id, None, Some(relay_endpoint))?;
         }
 
@@ -2638,10 +2643,15 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .current_peer_endpoint(node_id)?
             .ok_or(Phase10Error::PeerNotManaged)?;
         let current_handshake = self.backend.peer_latest_handshake_unix(node_id)?;
-        if direct_candidates
+        if evaluation
+            .direct_candidates
             .iter()
             .any(|candidate| candidate.endpoint == current_endpoint)
-            && handshake_is_fresh(current_handshake, now_unix, handshake_freshness_secs)
+            && handshake_is_fresh(
+                current_handshake,
+                evaluation.now_unix,
+                evaluation.handshake_freshness_secs,
+            )
         {
             return Ok(TraversalProbeReport {
                 decision: TraversalProbeDecision::Direct,
@@ -2652,7 +2662,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             });
         }
 
-        let engine = TraversalEngine::new(engine_config).map_err(|err| {
+        let engine = TraversalEngine::new(evaluation.engine_config).map_err(|err| {
             Phase10Error::TraversalProbeFailed(format!("invalid traversal engine config: {err}"))
         })?;
 
@@ -2674,11 +2684,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                     &mut runtime,
                     &mut waiter,
                     schedule,
-                    local_candidates,
-                    direct_candidates,
-                    relay_endpoint,
-                    now_unix,
-                    handshake_freshness_secs,
+                    evaluation.local_candidates,
+                    evaluation.direct_candidates,
+                    evaluation.relay_endpoint,
+                    evaluation.now_unix,
+                    evaluation.handshake_freshness_secs,
                 )
                 .map_err(|err| Phase10Error::TraversalProbeFailed(err.to_string()))?
         };
@@ -2689,7 +2699,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 reason: _,
             } => {
                 self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
-                self.configure_traversal_paths(node_id, Some(endpoint), relay_endpoint)?;
+                self.configure_traversal_paths(node_id, Some(endpoint), evaluation.relay_endpoint)?;
                 self.reconfigure_managed_peer(node_id, endpoint, PathMode::Direct)?;
 
                 Ok(TraversalProbeReport {
@@ -4250,25 +4260,27 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
-                &[ProbeTraversalCandidate {
-                    endpoint: current_endpoint,
-                    source: crate::traversal::CandidateSource::Host,
-                    priority: 900,
-                    observed_at_unix: 190,
-                }],
-                &[ProbeTraversalCandidate {
-                    endpoint: current_endpoint,
-                    source: crate::traversal::CandidateSource::Host,
-                    priority: 900,
-                    observed_at_unix: 190,
-                }],
-                Some(SocketEndpoint {
-                    addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
-                    port: 443,
-                }),
-                200,
-                TraversalEngineConfig::default(),
-                30,
+                TraversalProbeEvaluation {
+                    local_candidates: &[ProbeTraversalCandidate {
+                        endpoint: current_endpoint,
+                        source: crate::traversal::CandidateSource::Host,
+                        priority: 900,
+                        observed_at_unix: 190,
+                    }],
+                    direct_candidates: &[ProbeTraversalCandidate {
+                        endpoint: current_endpoint,
+                        source: crate::traversal::CandidateSource::Host,
+                        priority: 900,
+                        observed_at_unix: 190,
+                    }],
+                    relay_endpoint: Some(SocketEndpoint {
+                        addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+                        port: 443,
+                    }),
+                    now_unix: 200,
+                    engine_config: TraversalEngineConfig::default(),
+                    handshake_freshness_secs: 30,
+                },
             )
             .expect("existing handshake should keep direct path");
 
@@ -4317,22 +4329,24 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
-                &[ProbeTraversalCandidate {
-                    endpoint: direct_endpoint,
-                    source: crate::traversal::CandidateSource::ServerReflexive,
-                    priority: 900,
-                    observed_at_unix: 200,
-                }],
-                &[ProbeTraversalCandidate {
-                    endpoint: direct_endpoint,
-                    source: crate::traversal::CandidateSource::ServerReflexive,
-                    priority: 900,
-                    observed_at_unix: 200,
-                }],
-                Some(relay_endpoint),
-                210,
-                TraversalEngineConfig::default(),
-                30,
+                TraversalProbeEvaluation {
+                    local_candidates: &[ProbeTraversalCandidate {
+                        endpoint: direct_endpoint,
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 900,
+                        observed_at_unix: 200,
+                    }],
+                    direct_candidates: &[ProbeTraversalCandidate {
+                        endpoint: direct_endpoint,
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 900,
+                        observed_at_unix: 200,
+                    }],
+                    relay_endpoint: Some(relay_endpoint),
+                    now_unix: 210,
+                    engine_config: TraversalEngineConfig::default(),
+                    handshake_freshness_secs: 30,
+                },
             )
             .expect("probe should promote direct candidate");
 
@@ -4379,28 +4393,30 @@ mod tests {
         let report = controller
             .evaluate_traversal_probes(
                 &peer_id,
-                &[ProbeTraversalCandidate {
-                    endpoint: SocketEndpoint {
-                        addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
-                        port: 51820,
-                    },
-                    source: crate::traversal::CandidateSource::ServerReflexive,
-                    priority: 700,
-                    observed_at_unix: 200,
-                }],
-                &[ProbeTraversalCandidate {
-                    endpoint: SocketEndpoint {
-                        addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
-                        port: 51820,
-                    },
-                    source: crate::traversal::CandidateSource::ServerReflexive,
-                    priority: 700,
-                    observed_at_unix: 200,
-                }],
-                Some(relay_endpoint),
-                210,
-                TraversalEngineConfig::default(),
-                30,
+                TraversalProbeEvaluation {
+                    local_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    direct_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "203.0.113.77".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    relay_endpoint: Some(relay_endpoint),
+                    now_unix: 210,
+                    engine_config: TraversalEngineConfig::default(),
+                    handshake_freshness_secs: 30,
+                },
             )
             .expect("relay fallback should be allowed");
 

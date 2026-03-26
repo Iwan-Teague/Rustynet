@@ -1353,6 +1353,22 @@ fn print_usage() {
     );
 }
 
+fn utc_now_string() -> String {
+    let output = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok();
+    if let Some(output) = output {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    "1970-01-01T00:00:00Z".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1456,20 +1472,4 @@ peer.1.endpoint=192.168.128.26:51820
         assert!(filtered.contains("record.1.target_node_id=client-1"));
         assert!(!filtered.contains("client-9"));
     }
-}
-
-fn utc_now_string() -> String {
-    let output = std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok();
-    if let Some(output) = output {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    "1970-01-01T00:00:00Z".to_string()
 }

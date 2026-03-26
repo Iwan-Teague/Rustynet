@@ -4728,7 +4728,7 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
         return Err(err);
     }
     let revert_output = run_command_capture("resolvectl", &["revert", interface.as_str()])
-        .map_err(|err| format!("execute resolvectl revert {} failed: {err}", interface))?;
+        .map_err(|err| format!("execute resolvectl revert {interface} failed: {err}"))?;
     if !revert_output.status.success() {
         let detail = command_failure_detail(&revert_output);
         if managed_dns_routing_already_absent(detail.as_str()) {
@@ -4736,7 +4736,7 @@ fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
                 "managed DNS routing already cleared: interface={interface}"
             ));
         }
-        return Err(format!("resolvectl revert {} failed: {detail}", interface));
+        return Err(format!("resolvectl revert {interface} failed: {detail}"));
     }
 
     Ok(format!(
@@ -9704,8 +9704,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         .map_err(|err| format!("read dns zone records manifest failed: {err}"))?;
     if contents.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES {
         return Err(format!(
-            "dns zone records manifest exceeds maximum size ({} bytes)",
-            DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES
+            "dns zone records manifest exceeds maximum size ({DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES} bytes)"
         ));
     }
 
@@ -9715,8 +9714,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         line_count = line_count.saturating_add(1);
         if line_count > DNS_ZONE_RECORDS_MANIFEST_MAX_LINES {
             return Err(format!(
-                "dns zone records manifest exceeds maximum line count ({})",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_LINES
+                "dns zone records manifest exceeds maximum line count ({DNS_ZONE_RECORDS_MANIFEST_MAX_LINES})"
             ));
         }
         if raw_line.is_empty() {
@@ -9724,8 +9722,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         }
         if raw_line.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES {
             return Err(format!(
-                "dns zone records manifest line exceeds maximum size ({} bytes)",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES
+                "dns zone records manifest line exceeds maximum size ({DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES} bytes)"
             ));
         }
         let (raw_key, raw_value) = raw_line
@@ -9743,20 +9740,17 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         }
         if key.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES {
             return Err(format!(
-                "dns zone records manifest key exceeds maximum size ({} bytes)",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES
+                "dns zone records manifest key exceeds maximum size ({DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_BYTES} bytes)"
             ));
         }
         if value.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES {
             return Err(format!(
-                "dns zone records manifest value exceeds maximum size ({} bytes)",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES
+                "dns zone records manifest value exceeds maximum size ({DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES} bytes)"
             ));
         }
         if key.split('.').count() > DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH {
             return Err(format!(
-                "dns zone records manifest key depth exceeds maximum depth ({})",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH
+                "dns zone records manifest key depth exceeds maximum depth ({DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH})"
             ));
         }
         if !is_allowed_dns_zone_records_manifest_key(key) {
@@ -9779,8 +9773,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
     let record_count = parse_dns_zone_records_manifest_usize_field(&fields, "record_count")?;
     if record_count == 0 || record_count > DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT {
         return Err(format!(
-            "dns zone records manifest record_count must be in range 1..={}",
-            DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT
+            "dns zone records manifest record_count must be in range 1..={DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT}"
         ));
     }
 
@@ -9811,8 +9804,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
             parse_dns_zone_records_manifest_indexed_usize_field(&fields, index, "alias_count")?;
         if alias_count > DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT {
             return Err(format!(
-                "dns zone record {index} alias_count exceeds maximum ({})",
-                DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT
+                "dns zone record {index} alias_count exceeds maximum ({DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT})"
             ));
         }
         expected_field_count = expected_field_count
@@ -9869,11 +9861,11 @@ fn required_dns_zone_records_manifest_field<'a>(
         .ok_or_else(|| format!("missing {key}"))
 }
 
-fn required_dns_zone_records_manifest_alias<'a>(
-    fields: &'a std::collections::BTreeMap<String, String>,
+fn required_dns_zone_records_manifest_alias(
+    fields: &std::collections::BTreeMap<String, String>,
     record_index: usize,
     alias_index: usize,
-) -> Result<&'a str, String> {
+) -> Result<&str, String> {
     let key = format!("record.{record_index}.alias.{alias_index}");
     fields
         .get(&key)

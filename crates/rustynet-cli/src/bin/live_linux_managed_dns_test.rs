@@ -88,12 +88,11 @@ fn run() -> Result<(), String> {
     if current_exit_node != "none"
         && current_exit_node != config.signer_node_id
         && current_exit_node != config.client_node_id
+        && !host_by_node.contains_key(&current_exit_node)
     {
-        if !host_by_node.contains_key(&current_exit_node) {
-            return Err(format!(
-                "client exit_node {current_exit_node} is not mapped to a host; provide --managed-peer {current_exit_node}|<user@host>"
-            ));
-        }
+        return Err(format!(
+            "client exit_node {current_exit_node} is not mapped to a host; provide --managed-peer {current_exit_node}|<user@host>"
+        ));
     }
     let assignment_scopes = capture_assignment_authority_scopes(&ctx, &host_by_node)?;
 

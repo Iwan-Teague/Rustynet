@@ -33,8 +33,8 @@ use crate::key_material::{
 use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
     ApplyOptions, DataplaneState, DataplaneSystem, ManagementCidr, PathMode, Phase10Controller,
-    RouteGrantRequest, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason, TrustEvidence,
-    TrustPolicy,
+    RouteGrantRequest, RuntimeSystem, TraversalProbeDecision, TraversalProbeEvaluation,
+    TraversalProbeReason, TrustEvidence, TrustPolicy,
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
@@ -2036,12 +2036,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
     ) {
         (None, None) => Ok(None),
         (Some(_), None) => Err(DaemonError::InvalidConfig(format!(
-            "{ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is required when {} is set",
-            ASSIGNMENT_SIGNING_SECRET_ENV
+            "{ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_ENV} is set"
         ))),
         (None, Some(_)) => Err(DaemonError::InvalidConfig(format!(
-            "{ASSIGNMENT_SIGNING_SECRET_ENV} is required when {} is set",
-            ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV
+            "{ASSIGNMENT_SIGNING_SECRET_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is set"
         ))),
         (Some(secret_path), Some(passphrase_path)) => {
             let signing_secret =
@@ -3441,12 +3439,14 @@ impl DaemonRuntime {
                 .controller
                 .evaluate_traversal_probes(
                     &remote_node_id,
-                    &local_candidates,
-                    &direct_candidates,
-                    relay_endpoint,
-                    now_unix,
-                    self.traversal_probe_config.clone(),
-                    self.traversal_probe_handshake_freshness_secs,
+                    TraversalProbeEvaluation {
+                        local_candidates: &local_candidates,
+                        direct_candidates: &direct_candidates,
+                        relay_endpoint,
+                        now_unix,
+                        engine_config: self.traversal_probe_config.clone(),
+                        handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
+                    },
                 )
                 .map_err(|err| {
                     format!(
@@ -6385,8 +6385,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             .is_none()
     {
         return Err(DaemonError::InvalidConfig(format!(
-            "{} is required when {} is set",
-            ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV, ASSIGNMENT_SIGNING_SECRET_ENV
+            "{ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_ENV} is set"
         )));
     }
     if config
@@ -6395,8 +6394,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         && config.relay_session_signing_secret_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(format!(
-            "{} is required when {} is set",
-            ASSIGNMENT_SIGNING_SECRET_ENV, ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV
+            "{ASSIGNMENT_SIGNING_SECRET_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is set"
         )));
     }
     if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get() {
@@ -9772,6 +9770,7 @@ mod tests {
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
         let now = unix_now();
@@ -12440,8 +12439,8 @@ mod tests {
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
-        runtime.bootstrap();
         seed_local_probe_candidate(&mut runtime);
+        runtime.bootstrap();
         runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
@@ -12785,6 +12784,7 @@ mod tests {
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
@@ -12938,6 +12938,7 @@ mod tests {
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
         seed_local_probe_candidate(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
@@ -14672,6 +14673,7 @@ mod tests {
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);

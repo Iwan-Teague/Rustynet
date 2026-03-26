@@ -1756,6 +1756,10 @@ fn extract_secret_assignment_excerpt(line: &str) -> Option<String> {
                         .chars()
                         .take_while(|candidate| is_secret_value_char(*candidate))
                         .collect::<String>();
+                    let remainder = value[token.len()..].trim_start();
+                    if remainder.starts_with("::") || remainder.starts_with('(') {
+                        continue;
+                    }
                     if token.len() >= 16 {
                         return Some(line.trim().chars().take(80).collect::<String>());
                     }
@@ -2443,6 +2447,14 @@ mod tests {
     #[test]
     fn secrets_assignment_excerpt_requires_word_boundaries() {
         let line = "RUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"/etc/rustynet/assignment.signing.secret\"";
+        let excerpt = extract_secret_assignment_excerpt(line);
+        assert!(excerpt.is_none());
+    }
+
+    #[test]
+    fn secrets_assignment_excerpt_ignores_code_expression_rhs() {
+        let line =
+            "1118 |         let mut token = RelaySessionToken::sign(&sk, \"node-a\", \"node-b\",";
         let excerpt = extract_secret_assignment_excerpt(line);
         assert!(excerpt.is_none());
     }

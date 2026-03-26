@@ -104,7 +104,7 @@ impl WireguardBackend {
         // But first, we need a map from PublicKey -> NodeId.
         let mut pubkey_to_node_id = BTreeMap::new();
         for (node_id, peer) in &self.peers {
-            pubkey_to_node_id.insert(peer.public_key.clone(), node_id.clone());
+            pubkey_to_node_id.insert(peer.public_key, node_id.clone());
         }
 
         for line in output_str.lines() {
@@ -301,17 +301,7 @@ impl TunnelBackend for WireguardBackend {
         // However, if we are on a platform without wg (e.g. windows test env), we might want to skip.
         // But the requirement says "Implement backend methods".
         // Let's call it. If it fails, we return error.
-        if let Err(e) = self.fetch_latest_handshakes() {
-            // If we can't fetch, maybe we just return cached data?
-            // But if fetch failed, we might not have updated cache.
-            // Let's allow failure if cache exists?
-            // No, strict error handling.
-            // Exception: if command not found, maybe we are in a mode where we can't check.
-            // But Phase10 checks this loop.
-            // If this fails, Phase10 loop fails.
-            // Let's return the error.
-            return Err(e);
-        }
+        self.fetch_latest_handshakes()?;
 
         Ok(self.peer_latest_handshakes_by_node.get(node_id).copied())
     }

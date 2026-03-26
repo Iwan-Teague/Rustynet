@@ -76,7 +76,7 @@ impl StunClient {
         }
         let type_ = u16::from_be_bytes([buf[0], buf[1]]);
         if type_ != STUN_BINDING_RESPONSE {
-            return Err(format!("unexpected response type: 0x{:04x}", type_));
+            return Err(format!("unexpected response type: 0x{type_:04x}"));
         }
         let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
@@ -105,14 +105,12 @@ impl StunClient {
             let attr_value = &buf[pos + 4..attr_end];
 
             if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                match self.parse_xor_mapped_address(attr_value) {
-                    Ok(addr) => xor_mapped_addr = Some(addr),
-                    Err(_) => {} // ignore malformed attr
+                if let Ok(addr) = self.parse_xor_mapped_address(attr_value) {
+                    xor_mapped_addr = Some(addr);
                 }
             } else if attr_type == STUN_ATTR_MAPPED_ADDRESS {
-                match self.parse_mapped_address(attr_value) {
-                    Ok(addr) => mapped_addr = Some(addr),
-                    Err(_) => {}
+                if let Ok(addr) = self.parse_mapped_address(attr_value) {
+                    mapped_addr = Some(addr);
                 }
             }
 
@@ -157,7 +155,7 @@ impl StunClient {
             // For now, skipping IPv6 support in this simple client.
             Err("ipv6 stun not supported yet".to_string())
         } else {
-            Err(format!("unknown family: 0x{:02x}", family))
+            Err(format!("unknown family: 0x{family:02x}"))
         }
     }
 
@@ -181,7 +179,7 @@ impl StunClient {
             // Not supported
             Err("ipv6 mapped addr not supported".to_string())
         } else {
-            Err(format!("unknown family: 0x{:02x}", family))
+            Err(format!("unknown family: 0x{family:02x}"))
         }
     }
 }
