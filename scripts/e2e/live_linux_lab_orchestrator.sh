@@ -3027,6 +3027,22 @@ capture_boot_id() {
   live_lab_capture "$target" "cat /proc/sys/kernel/random/boot_id" | tr -d '[:space:]'
 }
 
+capture_boot_id_with_retry() {
+  local target="$1"
+  local attempts="${2:-24}"
+  local sleep_secs="${3:-2}"
+  local attempt boot_id
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    boot_id="$(capture_boot_id "$target" || true)"
+    if [[ "$boot_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      printf '%s' "$boot_id"
+      return 0
+    fi
+    sleep "$sleep_secs"
+  done
+  return 1
+}
+
 run_host_reboot() {
   local target="$1"
   live_lab_push_sudo_password "$target"
@@ -3150,16 +3166,30 @@ stage_run_reboot_recovery_report() {
     extra_target="$(node_target_for_label extra)"
   fi
 
-  exit_pre="$(capture_boot_id "$exit_target")"
-  client_pre="$(capture_boot_id "$client_target")"
+  if ! exit_pre="$(capture_boot_id_with_retry "$exit_target")"; then
+    exit_pre=""
+    exit_return="fail"
+    exit_boot_change="fail"
+    printf 'exit_pre_capture=fail\n' | tee -a "$observations_file"
+  fi
+  if ! client_pre="$(capture_boot_id_with_retry "$client_target")"; then
+    client_pre=""
+    client_return="fail"
+    client_boot_change="fail"
+    printf 'client_pre_capture=fail\n' | tee -a "$observations_file"
+  fi
   printf 'exit_pre=%s\nclient_pre=%s\n' "$exit_pre" "$client_pre" | tee -a "$observations_file"
 
   printf '[reboot] exit target %s\n' "$exit_target"
   run_host_reboot "$exit_target"
   if ssh_wait_for_host "$exit_target" "$reboot_wait_attempts" "$reboot_wait_sleep_secs"; then
-    exit_post="$(capture_boot_id "$exit_target")"
-    printf 'exit_post=%s\n' "$exit_post" | tee -a "$observations_file"
-    if [[ "$exit_post" == "$exit_pre" || -z "$exit_post" ]]; then
+    if exit_post="$(capture_boot_id_with_retry "$exit_target")"; then
+      printf 'exit_post=%s\n' "$exit_post" | tee -a "$observations_file"
+    else
+      exit_post=""
+      printf 'exit_post_capture=fail\nexit_post=\n' | tee -a "$observations_file"
+    fi
+    if [[ -z "$exit_pre" || "$exit_post" == "$exit_pre" || -z "$exit_post" ]]; then
       exit_boot_change="fail"
     fi
   else
@@ -3224,9 +3254,13 @@ stage_run_reboot_recovery_report() {
   printf '[reboot] client target %s\n' "$client_target"
   run_host_reboot "$client_target"
   if ssh_wait_for_host "$client_target" "$reboot_wait_attempts" "$reboot_wait_sleep_secs"; then
-    client_post="$(capture_boot_id "$client_target")"
-    printf 'client_post=%s\n' "$client_post" | tee -a "$observations_file"
-    if [[ "$client_post" == "$client_pre" || -z "$client_post" ]]; then
+    if client_post="$(capture_boot_id_with_retry "$client_target")"; then
+      printf 'client_post=%s\n' "$client_post" | tee -a "$observations_file"
+    else
+      client_post=""
+      printf 'client_post_capture=fail\nclient_post=\n' | tee -a "$observations_file"
+    fi
+    if [[ -z "$client_pre" || "$client_post" == "$client_pre" || -z "$client_post" ]]; then
       client_boot_change="fail"
     fi
   else
