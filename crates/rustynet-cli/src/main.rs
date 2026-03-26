@@ -5,13 +5,13 @@ mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
 mod ops_install_systemd;
-mod ops_write_daemon_env;
 mod ops_live_lab_failure_digest;
 mod ops_live_lab_orchestrator;
 mod ops_network_discovery;
 mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
+mod ops_write_daemon_env;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -56,11 +56,12 @@ use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
     DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
-    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
-    verify_signed_assignment_state_artifact, verify_signed_traversal_state_artifact,
-    verify_signed_trust_state_artifact,
+    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
+    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
+    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
+    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -72,6 +73,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 90;
+const LOCAL_TRAVERSAL_REFRESH_TTL_SECS: u64 = 120;
 const PINNED_RUNTIME_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
 const DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES: usize = 256 * 1024;
 const DNS_ZONE_RECORDS_MANIFEST_MAX_LINES: usize = 16_384;
@@ -3746,6 +3748,12 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     validate_root_owned_passphrase_file(
         &signing_secret_passphrase_path,
         "assignment signing secret passphrase file",
+    )?;
+    refresh_local_traversal_bundle_from_specs(
+        target_node_id.as_str(),
+        nodes_spec.as_str(),
+        allow_spec.as_str(),
+        daemon_group.as_str(),
     )?;
 
     let now_unix = unix_now();
@@ -8044,7 +8052,178 @@ fn assignment_refresh_available_ops(env_path: &Path) -> Result<bool, String> {
     Ok(status.success())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalTraversalRefreshConfig {
+    local_node_id: String,
+    nodes_spec: String,
+    allow_spec: String,
+}
+
+fn ensure_safe_signed_state_spec(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    let allowed = |ch: char| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '.' | '_' | ':' | '/' | ',' | '@' | '+' | '=' | '-' | '|' | ';'
+            )
+    };
+    if !value.chars().all(allowed) {
+        return Err(format!("{label} contains unsupported characters: {value}"));
+    }
+    Ok(())
+}
+
+fn local_traversal_refresh_env_body(
+    local_node_id: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+) -> Result<String, String> {
+    if !is_valid_assignment_refresh_exit_node_id(local_node_id) {
+        return Err(format!(
+            "assignment refresh target node id contains unsupported characters: {local_node_id}"
+        ));
+    }
+    ensure_safe_signed_state_spec("assignment refresh nodes spec", nodes_spec)?;
+    ensure_safe_signed_state_spec("assignment refresh allow spec", allow_spec)?;
+    let local_allow_prefix = format!("{local_node_id}|");
+    if !allow_spec
+        .split(';')
+        .map(str::trim)
+        .any(|entry| entry.starts_with(local_allow_prefix.as_str()))
+    {
+        return Err(format!(
+            "assignment refresh allow spec does not authorize traversal sources for local node {local_node_id}"
+        ));
+    }
+
+    let ttl_text = LOCAL_TRAVERSAL_REFRESH_TTL_SECS.to_string();
+    let env_body = format!(
+        "{}\n{}\n{}\n",
+        format_env_assignment("NODES_SPEC", nodes_spec)
+            .map_err(|err| format!("encode traversal refresh NODES_SPEC failed: {err}"))?,
+        format_env_assignment("ALLOW_SPEC", allow_spec)
+            .map_err(|err| format!("encode traversal refresh ALLOW_SPEC failed: {err}"))?,
+        format_env_assignment("TRAVERSAL_TTL_SECS", ttl_text.as_str())
+            .map_err(|err| format!("encode traversal refresh TRAVERSAL_TTL_SECS failed: {err}"))?,
+    );
+    Ok(env_body)
+}
+
+fn local_traversal_refresh_config_from_assignment_env(
+    body: &str,
+) -> Result<LocalTraversalRefreshConfig, String> {
+    let local_node_id = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")?
+        .ok_or_else(|| {
+        "assignment refresh env is missing RUSTYNET_ASSIGNMENT_TARGET_NODE_ID".to_string()
+    })?;
+    let nodes_spec = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_NODES")?
+        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_NODES".to_string())?;
+    let allow_spec = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_ALLOW")?
+        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_ALLOW".to_string())?;
+    local_traversal_refresh_env_body(
+        local_node_id.as_str(),
+        nodes_spec.as_str(),
+        allow_spec.as_str(),
+    )?;
+
+    Ok(LocalTraversalRefreshConfig {
+        local_node_id,
+        nodes_spec,
+        allow_spec,
+    })
+}
+
+fn refresh_local_traversal_bundle_from_specs(
+    local_node_id: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+    daemon_group: &str,
+) -> Result<(), String> {
+    let temp_root = std::env::temp_dir();
+    let issue_dir =
+        create_secure_temp_directory(temp_root.as_path(), "rustynet.traversal-refresh.issue.")?;
+    let env_file = issue_dir.join("traversal-refresh.env");
+    let result = (|| -> Result<(), String> {
+        let env_body = local_traversal_refresh_env_body(local_node_id, nodes_spec, allow_spec)?;
+        write_private_bytes_to_file(&env_file, env_body.as_bytes())?;
+        ops_e2e::execute_ops_e2e_issue_traversal_bundles_from_env(
+            ops_e2e::E2eIssueTraversalBundlesFromEnvConfig {
+                env_file: env_file.clone(),
+                issue_dir: issue_dir.clone(),
+            },
+        )?;
+
+        let verifier_source = issue_dir.join("rn-traversal.pub");
+        let bundle_source = issue_dir.join(format!("rn-traversal-{local_node_id}.traversal"));
+        let verifier_dest = env_path_or_default(
+            "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
+            DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
+        )?;
+        let bundle_dest =
+            env_path_or_default("RUSTYNET_TRAVERSAL_BUNDLE", DEFAULT_TRAVERSAL_BUNDLE_PATH)?;
+        let watermark_dest = env_path_or_default(
+            "RUSTYNET_TRAVERSAL_WATERMARK",
+            DEFAULT_TRAVERSAL_WATERMARK_PATH,
+        )?;
+        let daemon_gid = Group::from_name(daemon_group)
+            .map_err(|err| format!("resolve daemon group {daemon_group} failed: {err}"))?
+            .ok_or_else(|| format!("daemon group not found: {daemon_group}"))?
+            .gid;
+
+        install_trust_material_file(
+            verifier_source.as_path(),
+            verifier_dest.as_path(),
+            Uid::from_raw(0),
+            Gid::from_raw(0),
+            0o644,
+            "traversal verifier key",
+        )?;
+        install_trust_material_file(
+            bundle_source.as_path(),
+            bundle_dest.as_path(),
+            Uid::from_raw(0),
+            daemon_gid,
+            0o640,
+            "traversal bundle",
+        )?;
+        remove_file_if_present(watermark_dest.as_path())?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&env_file);
+    let _ = fs::remove_dir_all(&issue_dir);
+    result
+}
+
+fn refresh_local_traversal_bundle_from_assignment_env(
+    assignment_refresh_env_path: &Path,
+) -> Result<(), String> {
+    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
+    let assignment_env = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
+        format!(
+            "read assignment refresh env failed ({}): {err}",
+            assignment_refresh_env_path.display()
+        )
+    })?;
+    let refresh_config =
+        local_traversal_refresh_config_from_assignment_env(assignment_env.as_str())?;
+    let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
+    refresh_local_traversal_bundle_from_specs(
+        refresh_config.local_node_id.as_str(),
+        refresh_config.nodes_spec.as_str(),
+        refresh_config.allow_spec.as_str(),
+        daemon_group.as_str(),
+    )
+}
+
 fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
+    let assignment_refresh_env_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
+        DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH,
+    )?;
     let bundle_path = env_path_or_default(
         "RUSTYNET_AUTO_TUNNEL_BUNDLE",
         DEFAULT_AUTO_TUNNEL_BUNDLE_PATH,
@@ -8055,6 +8234,7 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     )?;
     let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
 
+    refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path.as_path())?;
     remove_file_if_present(bundle_path.as_path())?;
     remove_file_if_present(watermark_path.as_path())?;
     run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
@@ -11840,6 +12020,51 @@ mod tests {
 
         let cleared = rewrite_assignment_refresh_lan_routes(existing, &[]);
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_ROUTES="));
+    }
+
+    #[test]
+    fn local_traversal_refresh_config_uses_assignment_env_specs() {
+        let env = concat!(
+            "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-40\"\n",
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-40|192.168.18.40:51820|abc;exit-49|192.168.18.49:51820|def\"\n",
+            "RUSTYNET_ASSIGNMENT_ALLOW=\"client-40|exit-49;exit-49|client-40\"\n",
+        );
+
+        let config = super::local_traversal_refresh_config_from_assignment_env(env)
+            .expect("valid assignment env should produce traversal refresh config");
+        assert_eq!(config.local_node_id, "client-40");
+        assert_eq!(
+            config.nodes_spec,
+            "client-40|192.168.18.40:51820|abc;exit-49|192.168.18.49:51820|def"
+        );
+        assert_eq!(config.allow_spec, "client-40|exit-49;exit-49|client-40");
+        let env_body = super::local_traversal_refresh_env_body(
+            config.local_node_id.as_str(),
+            config.nodes_spec.as_str(),
+            config.allow_spec.as_str(),
+        )
+        .expect("refresh env body should be derived");
+        assert!(env_body.contains(
+            "NODES_SPEC=\"client-40|192.168.18.40:51820|abc;exit-49|192.168.18.49:51820|def\""
+        ));
+        assert!(env_body.contains("ALLOW_SPEC=\"client-40|exit-49;exit-49|client-40\""));
+        assert!(env_body.contains(&format!(
+            "TRAVERSAL_TTL_SECS=\"{}\"",
+            super::LOCAL_TRAVERSAL_REFRESH_TTL_SECS
+        )));
+    }
+
+    #[test]
+    fn local_traversal_refresh_config_rejects_missing_local_allow_source() {
+        let env = concat!(
+            "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-40\"\n",
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-40|192.168.18.40:51820|abc;exit-49|192.168.18.49:51820|def\"\n",
+            "RUSTYNET_ASSIGNMENT_ALLOW=\"exit-49|client-40\"\n",
+        );
+
+        let err = super::local_traversal_refresh_config_from_assignment_env(env)
+            .expect_err("missing local traversal source must fail closed");
+        assert!(err.contains("does not authorize traversal sources for local node client-40"));
     }
 
     #[test]
