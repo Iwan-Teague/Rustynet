@@ -578,6 +578,28 @@ fn run() -> Result<(), String> {
         &["subject node id does not match local node"],
     )?;
 
+    // Re-issue a fresh valid client bundle after the adversarial sequence.
+    // The original valid bundle can age out during long soak runs.
+    issue_dns_bundle(
+        &ctx,
+        &config.signer_host,
+        &passphrase_file,
+        &config.client_node_id,
+        &config.zone_name,
+        &nodes_spec,
+        &allow_spec,
+        DNS_RECORDS_REMOTE,
+        issue_dir,
+        "valid-refresh.dns-zone",
+        None,
+        None,
+    )?;
+    capture_remote_text(
+        &ctx,
+        &config.signer_host,
+        &format!("{issue_dir}/valid-refresh.dns-zone"),
+        &valid_bundle_local,
+    )?;
     restore_valid_bundle_after_invalid_case(
         &ctx,
         &config,
