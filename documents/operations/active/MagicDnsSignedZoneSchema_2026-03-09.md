@@ -79,13 +79,13 @@ This block is the quick source of truth for what remains in this document.
 If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
-- The hardened baseline is in place; the remaining work is the next secure slice only.
+- The hardened baseline is in place, and the owned adversarial managed-DNS harness is now implemented for the remaining rejection cases.
 - Per-node filtered issuance in the owned operator workflows now emits canonical text manifests instead of JSON.
-- Open items are fresh adversarial live or semi-live E2E testing and any remaining runtime proof gaps that still lack measured evidence.
+- Open items are fresh measured execution of that harness on live or substitute semi-live nodes and any runtime prerequisites blocking that proof.
 
 `Do first`
 - Verify the already-implemented baseline before extending behavior.
-- Then finish the remaining adversarial and live-proof work without weakening the signed authoritative path.
+- Then rerun the adversarial live-proof path without weakening the signed authoritative path, or record the exact lab/runtime blocker if the hosts are unavailable.
 
 `Completion proof`
 - Managed names resolve only through the signed authoritative path, stale or forged bundles fail closed, and managed-zone routing to the loopback resolver works without weakening protected DNS.
@@ -97,7 +97,7 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Clarity note`
 - When in doubt, prefer a narrower signed feature set over a broader DNS feature set with weaker trust guarantees.
-- If unit coverage exists but live or semi-live proof was not rerun in the current execution, record that as a blocker instead of promoting the slice to complete.
+- If the adversarial harness exists but the live or semi-live proof was not rerun successfully in the current execution, record that as a blocker instead of promoting the slice to complete.
 
 ## 0) Purpose
 
@@ -589,9 +589,9 @@ Current hardened baseline implemented:
 
 Next secure slice:
 
-1. adversarial E2E tests for stale/forged/replayed/tampered/policy-invalid managed-zone bundles on live or semi-live nodes
-2. fresh measured proof that OS DNS integration still routes managed-zone queries to the loopback authoritative resolver without weakening protected DNS
-3. document any runtime-controller prerequisite exactly instead of masking it in the gate or operator tooling
+1. rerun the now-implemented adversarial harness so it emits fresh measured evidence for stale, replayed, forged-signature, tampered-payload, and policy-invalid managed-zone bundles
+2. refresh the live proof that OS DNS integration still routes managed-zone queries to the loopback authoritative resolver without weakening protected DNS
+3. document any lab or runtime-controller prerequisite exactly instead of masking it in the gate or operator tooling
 
 Do not add dynamic local resolver mutation or OS `/etc/hosts` editing as an alternate naming path.
 
@@ -628,6 +628,30 @@ Execution record: 2026-03-25T18:33:02Z
 - Blocker / prerequisite:
   - rerun the managed-DNS live or semi-live adversarial path once the lab is available
   - resolve the unrelated backend and `state_fetcher` test failures before claiming full gate closure
+
+Execution record: 2026-03-26T00:19:57Z
+- [x] The owned live managed-DNS validator now measures the missing adversarial bundle classes directly: stale, replayed watermark-digest mismatch, forged signature, tampered payload, and policy-invalid wrong-subject bundles.
+- [x] The managed-DNS report status now fails closed unless those adversarial cases all prove rejection in addition to the existing loopback-authoritative and `systemd-resolved` routing checks.
+- Changed files:
+  - `crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+  - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture`
+  - `cargo test -p rustynet-control dns_zone_bundle -- --nocapture`
+  - `cargo test -p rustynetd dns_resolver_ -- --nocapture`
+  - `cargo test -p rustynetd load_dns_zone_bundle_rejects_equal_watermark_when_payload_digest_differs -- --nocapture`
+  - `cargo test -p rustynetd load_dns_zone_bundle_rejects_record_ip_outside_assignment -- --nocapture`
+  - `cargo test -p rustynetd dns_zone -- --nocapture` still surfaced the unrelated `tests/state_fetcher.rs::fetcher_dns_zone_applied_updates_bundle_on_disk` failure (`left: Skipped`, `right: Applied`) after the targeted DNS tests passed
+  - `./scripts/ci/phase10_gates.sh` is currently blocked outside this slice by `crates/rustynet-cli/src/ops_write_daemon_env.rs:132` because `env::set_var` now requires an unsafe block under the current toolchain
+  - `./scripts/e2e/live_linux_managed_dns_test.sh --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519` was attempted for fresh measured proof but failed before emitting a new report because SSH to `debian@192.168.18.49` timed out
+- Artifacts:
+  - partial log only: `artifacts/phase10/source/managed_dns_report.log`
+  - no fresh `artifacts/phase10/source/managed_dns_report.json` was emitted in this execution
+- Residual risk:
+  - the adversarial harness exists, but the fresh live proof for loopback authoritative routing and fail-closed rejection still lacks a current report artifact
+  - full phase10 gate closure remains blocked outside this slice by the unrelated `state_fetcher` test failure and the unrelated `ops_write_daemon_env.rs` compile failure
+- Blocker / prerequisite:
+  - restore SSH reachability to `debian@192.168.18.49` or provide replacement live/semi-live nodes, then rerun the managed-DNS validator to emit a fresh report before promoting this slice to complete
 
 ## 19) Bottom Line
 

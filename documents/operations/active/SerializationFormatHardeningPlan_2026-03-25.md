@@ -82,11 +82,12 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 - This plan is still open overall.
 - The owned trust-boundary parser slice for DNS signer input is complete and verified; do not treat that as the broader artifact-family Phase E having started.
 - Phase B helper IPC is now complete in the owned runtime path.
+- The owned managed-DNS adversarial proof harness now covers stale, replayed, forged, tampered, and policy-invalid bundle cases locally, but fresh live evidence is still blocked by lab reachability.
 - Broader artifact-family parser and format migrations remain open and are still not started in this execution.
 
 `Do first`
-- Continue Phase A/B trust-boundary work before any wider artifact-family migration.
-- The next concrete step is documenting any remaining owned DNS proof gaps and blockers exactly, not starting broader artifact migrations.
+- Resolve the current managed-DNS lab reachability blocker and rerun the live adversarial DNS proof path before claiming the owned DNS slice complete.
+- Then continue broader artifact-family migration work instead of reopening already-landed parser or helper-IPC slices.
 
 `Completion proof`
 - Touched phases have concrete code, tests, updated docs, and no long-lived JSON fallback in the active runtime path.
@@ -663,6 +664,31 @@ Execution record: 2026-03-25T18:23:04Z
   - broader typed-parser cleanup for discovery/report artifact families remains open
 - Blocker / prerequisite:
   - none for this slice
+
+Execution record: 2026-03-26T00:19:57Z
+- [x] The owned managed-DNS live harness now emits explicit stale, replayed, forged-signature, tampered-payload, and policy-invalid bundle cases instead of proving only the stale-path rejection case.
+- [x] The managed-DNS report status is now fail-closed on all of those adversarial checks in addition to the existing loopback and `systemd-resolved` routing checks.
+- Changed files:
+  - `crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+- Verification:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+  - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture`
+  - `cargo test -p rustynet-control dns_zone_bundle -- --nocapture`
+  - `cargo test -p rustynetd dns_resolver_ -- --nocapture`
+  - `cargo test -p rustynetd load_dns_zone_bundle_rejects_equal_watermark_when_payload_digest_differs -- --nocapture`
+  - `cargo test -p rustynetd load_dns_zone_bundle_rejects_record_ip_outside_assignment -- --nocapture`
+  - `cargo test -p rustynetd dns_zone -- --nocapture` still hit the unrelated `tests/state_fetcher.rs::fetcher_dns_zone_applied_updates_bundle_on_disk` failure (`left: Skipped`, `right: Applied`) after the targeted DNS bundle tests passed
+  - `cargo fmt --all -- --check` is currently blocked by unrelated formatting drift in `crates/rustynet-cli/src/main.rs` and `crates/rustynet-cli/src/ops_write_daemon_env.rs`
+  - `./scripts/ci/phase10_gates.sh` is currently blocked outside this slice by `crates/rustynet-cli/src/ops_write_daemon_env.rs:132` (`env::set_var` now requires an unsafe block under the current toolchain)
+  - `./scripts/e2e/live_linux_managed_dns_test.sh --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519` reached the lab workflow but failed to collect fresh evidence because `debian@192.168.18.49` timed out on SSH
+- Artifacts:
+  - partial log only: `artifacts/phase10/source/managed_dns_report.log` now contains the start of the blocked live run
+  - no fresh `managed_dns_report.json` was emitted in this execution
+- Residual risk:
+  - fresh measured managed-DNS proof is still missing because the live signer host was unreachable
+  - broader artifact/report-family migrations in Phases C and D remain open
+- Blocker / prerequisite:
+  - restore SSH reachability to `debian@192.168.18.49` or provide replacement live/semi-live nodes, then rerun the managed-DNS validator to emit a fresh report artifact before promoting the owned DNS slice to complete
 
 ## 12) Documentation touchpoints that must be updated with each phase
 

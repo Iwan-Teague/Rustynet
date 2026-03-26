@@ -20,9 +20,13 @@ const TRAVERSAL_ISSUE_DIR: &str = "/run/rustynet/traversal-issue";
 const DNS_ZONE_PUB_REMOTE: &str = "/run/rustynet/dns-zone-issue/rn-dns-zone.pub";
 const DNS_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue/valid.dns-zone";
 const DNS_STALE_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue/stale.dns-zone";
+const DNS_REPLAY_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue/replay.dns-zone";
+const DNS_POLICY_INVALID_BUNDLE_REMOTE: &str =
+    "/run/rustynet/dns-zone-issue/policy-invalid.dns-zone";
 const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.manifest";
 const TRAVERSAL_ENV_REMOTE: &str = "/tmp/rn_issue_dns_traversal.env";
 const TRAVERSAL_PUB_REMOTE: &str = "/run/rustynet/traversal-issue/rn-traversal.pub";
+const REPLAY_PROBE_ALIAS: &str = "gatewayreplay";
 
 fn main() {
     let code = match run() {
@@ -132,6 +136,29 @@ fn run() -> Result<(), String> {
     )?;
 
     let issue_dir = ISSUE_DIR;
+    let valid_generated_at = unix_now();
+    let valid_nonce = valid_generated_at.saturating_mul(2).saturating_add(17);
+    let stale_generated_at = valid_generated_at.saturating_sub(7200);
+    let stale_nonce = valid_nonce.saturating_sub(1);
+    let replay_records = managed_dns_replay_records(&base_records, &config.signer_node_id)?;
+    let replay_records_manifest = workspace.join("rn-dns-records-replay.manifest");
+    write_secure_text(
+        &replay_records_manifest,
+        &managed_dns_records_manifest_for_scope(&replay_records, client_scope)?,
+    )?;
+    let policy_invalid_scope = assignment_scopes
+        .get(&config.signer_node_id)
+        .ok_or_else(|| {
+            format!(
+                "missing assignment authority scope for signer node {}",
+                config.signer_node_id
+            )
+        })?;
+    let policy_invalid_records_manifest = workspace.join("rn-dns-records-policy-invalid.manifest");
+    write_secure_text(
+        &policy_invalid_records_manifest,
+        &managed_dns_records_manifest_for_scope(&base_records, policy_invalid_scope)?,
+    )?;
     let passphrase_file = ctx
         .capture_root(
             &config.signer_host,
@@ -156,6 +183,18 @@ fn run() -> Result<(), String> {
         &["install", "-d", "-m", "0700", issue_dir],
     )?;
     ctx.scp_to(&records_manifest, &config.signer_host, DNS_RECORDS_REMOTE)?;
+    let replay_records_remote = "/tmp/rn-dns-records-replay.manifest";
+    ctx.scp_to(
+        &replay_records_manifest,
+        &config.signer_host,
+        replay_records_remote,
+    )?;
+    let policy_invalid_records_remote = "/tmp/rn-dns-records-policy-invalid.manifest";
+    ctx.scp_to(
+        &policy_invalid_records_manifest,
+        &config.signer_host,
+        policy_invalid_records_remote,
+    )?;
 
     logger.line(
         format!(
@@ -175,7 +214,8 @@ fn run() -> Result<(), String> {
         DNS_RECORDS_REMOTE,
         issue_dir,
         "valid.dns-zone",
-        None,
+        Some(valid_generated_at),
+        Some(valid_nonce),
     )?;
     issue_dns_bundle(
         &ctx,
@@ -188,12 +228,43 @@ fn run() -> Result<(), String> {
         DNS_RECORDS_REMOTE,
         issue_dir,
         "stale.dns-zone",
-        Some(unix_now().saturating_sub(7200)),
+        Some(stale_generated_at),
+        Some(stale_nonce),
+    )?;
+    issue_dns_bundle(
+        &ctx,
+        &config.signer_host,
+        &passphrase_file,
+        &config.client_node_id,
+        &config.zone_name,
+        &nodes_spec,
+        &allow_spec,
+        replay_records_remote,
+        issue_dir,
+        "replay.dns-zone",
+        Some(valid_generated_at),
+        Some(valid_nonce),
+    )?;
+    issue_dns_bundle(
+        &ctx,
+        &config.signer_host,
+        &passphrase_file,
+        &config.signer_node_id,
+        &config.zone_name,
+        &nodes_spec,
+        &allow_spec,
+        policy_invalid_records_remote,
+        issue_dir,
+        "policy-invalid.dns-zone",
+        Some(valid_generated_at.saturating_add(1)),
+        Some(valid_nonce.saturating_add(1)),
     )?;
 
     let verifier_local = workspace.join("dns-zone.pub");
     let valid_bundle_local = workspace.join("dns-zone-valid.bundle");
     let stale_bundle_local = workspace.join("dns-zone-stale.bundle");
+    let replay_bundle_local = workspace.join("dns-zone-replay.bundle");
+    let policy_invalid_bundle_local = workspace.join("dns-zone-policy-invalid.bundle");
     capture_remote_text(
         &ctx,
         &config.signer_host,
@@ -212,6 +283,34 @@ fn run() -> Result<(), String> {
         DNS_STALE_BUNDLE_REMOTE,
         &stale_bundle_local,
     )?;
+    capture_remote_text(
+        &ctx,
+        &config.signer_host,
+        DNS_REPLAY_BUNDLE_REMOTE,
+        &replay_bundle_local,
+    )?;
+    capture_remote_text(
+        &ctx,
+        &config.signer_host,
+        DNS_POLICY_INVALID_BUNDLE_REMOTE,
+        &policy_invalid_bundle_local,
+    )?;
+    let valid_bundle_wire = std::fs::read_to_string(&valid_bundle_local).map_err(|err| {
+        format!(
+            "failed to read valid dns bundle {}: {err}",
+            valid_bundle_local.display()
+        )
+    })?;
+    let forged_bundle_local = workspace.join("dns-zone-forged.bundle");
+    write_secure_text(
+        &forged_bundle_local,
+        &rewrite_bundle_signature(&valid_bundle_wire, "0")?,
+    )?;
+    let tampered_bundle_local = workspace.join("dns-zone-tampered.bundle");
+    write_secure_text(
+        &tampered_bundle_local,
+        &rewrite_bundle_line_value(&valid_bundle_wire, "record.0.fqdn", "tampered.rustynet")?,
+    )?;
 
     logger.line("[managed-dns] verifying signed managed DNS bundles on signer host")?;
     ctx.run_root(
@@ -229,6 +328,40 @@ fn run() -> Result<(), String> {
             &config.zone_name,
             "--expected-subject-node-id",
             &config.client_node_id,
+        ],
+    )?;
+    ctx.run_root(
+        &config.signer_host,
+        &[
+            "rustynet",
+            "dns",
+            "zone",
+            "verify",
+            "--bundle",
+            DNS_REPLAY_BUNDLE_REMOTE,
+            "--verifier-key",
+            DNS_ZONE_PUB_REMOTE,
+            "--expected-zone-name",
+            &config.zone_name,
+            "--expected-subject-node-id",
+            &config.client_node_id,
+        ],
+    )?;
+    ctx.run_root(
+        &config.signer_host,
+        &[
+            "rustynet",
+            "dns",
+            "zone",
+            "verify",
+            "--bundle",
+            DNS_POLICY_INVALID_BUNDLE_REMOTE,
+            "--verifier-key",
+            DNS_ZONE_PUB_REMOTE,
+            "--expected-zone-name",
+            &config.zone_name,
+            "--expected-subject-node-id",
+            &config.signer_node_id,
         ],
     )?;
     ctx.run_root(
@@ -324,139 +457,137 @@ fn run() -> Result<(), String> {
         &resolvectl_query_valid,
     )?;
 
-    logger.line(
-        format!(
-            "[managed-dns] installing stale managed DNS bundle on {}",
-            config.client_host
-        )
-        .as_str(),
-    )?;
-    install_dns_bundle(
+    let stale_case = exercise_invalid_bundle_case(
         &ctx,
-        &config.client_host,
+        &logger,
+        &root_dir,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
         &verifier_local,
         &stale_bundle_local,
+        true,
+        "stale",
+        &["stale"],
     )?;
-    refresh_traversal_bundles(
+
+    restore_valid_bundle_after_invalid_case(
         &ctx,
         &config,
         &workspace,
         &host_by_node,
         &nodes_spec,
         &allow_spec,
-    )?;
-    ctx.run_root_allow_failure(
-        &config.client_host,
-        &[
-            "systemctl",
-            "stop",
-            "rustynetd-managed-dns.service",
-            "rustynetd.service",
-            "rustynetd-privileged-helper.service",
-        ],
-    )?;
-    ctx.run_root_allow_failure(
-        &config.client_host,
-        &[
-            "systemctl",
-            "reset-failed",
-            "rustynetd.service",
-            "rustynetd-managed-dns.service",
-            "rustynetd-privileged-helper.service",
-        ],
-    )?;
-    ctx.retry_root(
-        &config.client_host,
-        &["systemctl", "start", "rustynetd-privileged-helper.service"],
-        5,
-        2,
-    )?;
-    ctx.retry_root(
-        &config.client_host,
-        &[
-            "systemctl",
-            "is-active",
-            "rustynetd-privileged-helper.service",
-        ],
-        15,
-        2,
-    )?;
-    ctx.run_root_allow_failure(
-        &config.client_host,
-        &["systemctl", "start", "rustynetd.service"],
-    )?;
-    ctx.wait_for_daemon_socket(&config.client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
-    ctx.run_root_allow_failure(
-        &config.client_host,
-        &["systemctl", "restart", "rustynetd-managed-dns.service"],
-    )?;
-    ctx.retry_root(
-        &config.client_host,
-        &["systemctl", "is-active", "rustynetd-managed-dns.service"],
-        15,
-        2,
-    )?;
-
-    let dns_inspect_stale = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &[
-            "env",
-            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
-            "dns",
-            "inspect",
-        ],
-    )?;
-    let rustynetd_state_stale = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &["systemctl", "is-active", "rustynetd.service"],
-    )?;
-    let rustynetd_journal_stale = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &[
-            "journalctl",
-            "-u",
-            "rustynetd.service",
-            "-n",
-            "40",
-            "--no-pager",
-        ],
-    )?;
-    let direct_query_stale =
-        remote_dns_query_capture(&ctx, &config.client_host, &config, &config.managed_fqdn())?;
-
-    logger.block("[managed-dns] stale dns inspect", &dns_inspect_stale)?;
-    logger.block(
-        "[managed-dns] stale rustynetd state",
-        &rustynetd_state_stale,
-    )?;
-    logger.block(
-        "[managed-dns] stale loopback DNS query",
-        &direct_query_stale,
-    )?;
-
-    logger.line(
-        format!(
-            "[managed-dns] restoring valid managed DNS bundle on {}",
-            config.client_host
-        )
-        .as_str(),
-    )?;
-    install_dns_bundle(
-        &ctx,
-        &config.client_host,
         &verifier_local,
         &valid_bundle_local,
     )?;
-    refresh_traversal_bundles(
+
+    let replay_case = exercise_invalid_bundle_case(
+        &ctx,
+        &logger,
+        &root_dir,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &replay_bundle_local,
+        false,
+        "replay",
+        &["replay detected"],
+    )?;
+    restore_valid_bundle_after_invalid_case(
         &ctx,
         &config,
         &workspace,
         &host_by_node,
         &nodes_spec,
         &allow_spec,
+        &verifier_local,
+        &valid_bundle_local,
     )?;
-    restart_managed_dns_stack(&ctx, &config.client_host)?;
+
+    let forged_case = exercise_invalid_bundle_case(
+        &ctx,
+        &logger,
+        &root_dir,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &forged_bundle_local,
+        true,
+        "forged",
+        &["signature verification failed"],
+    )?;
+    restore_valid_bundle_after_invalid_case(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &valid_bundle_local,
+    )?;
+
+    let tampered_case = exercise_invalid_bundle_case(
+        &ctx,
+        &logger,
+        &root_dir,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &tampered_bundle_local,
+        true,
+        "tampered",
+        &["signature verification failed"],
+    )?;
+    restore_valid_bundle_after_invalid_case(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &valid_bundle_local,
+    )?;
+
+    let policy_invalid_case = exercise_invalid_bundle_case(
+        &ctx,
+        &logger,
+        &root_dir,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &policy_invalid_bundle_local,
+        true,
+        "policy-invalid",
+        &["subject node id does not match local node"],
+    )?;
+
+    restore_valid_bundle_after_invalid_case(
+        &ctx,
+        &config,
+        &workspace,
+        &host_by_node,
+        &nodes_spec,
+        &allow_spec,
+        &verifier_local,
+        &valid_bundle_local,
+    )?;
     let dns_inspect_restored = ctx.capture_root(
         &config.client_host,
         &[
@@ -504,6 +635,7 @@ fn run() -> Result<(), String> {
             issue_dir,
             output_name.as_str(),
             None,
+            None,
         )?;
         let _ = ctx.run_root_allow_failure(
             &config.signer_host,
@@ -536,6 +668,10 @@ fn run() -> Result<(), String> {
     let mut check_alias_query_valid = "fail";
     let mut check_non_managed_refused = "fail";
     let mut check_stale_bundle_fail_closed = "fail";
+    let mut check_replayed_bundle_fail_closed = "fail";
+    let mut check_forged_bundle_fail_closed = "fail";
+    let mut check_tampered_bundle_fail_closed = "fail";
+    let mut check_policy_invalid_bundle_fail_closed = "fail";
     let mut check_valid_bundle_restored = "fail";
 
     if dns_inspect_valid.contains("dns inspect: state=valid")
@@ -573,26 +709,20 @@ fn run() -> Result<(), String> {
         check_non_managed_refused = "pass";
     }
 
-    let mut stale_state_observed = false;
-    if dns_inspect_stale.contains("dns inspect: state=invalid")
-        && dns_inspect_stale.contains("stale")
-    {
-        stale_state_observed = true;
+    if stale_case.passed {
+        check_stale_bundle_fail_closed = "pass";
     }
-    if dns_inspect_stale.contains("daemon unreachable") {
-        stale_state_observed = true;
+    if replay_case.passed {
+        check_replayed_bundle_fail_closed = "pass";
     }
-    if rustynetd_journal_stale.contains("dns zone preflight failed")
-        && rustynetd_journal_stale.contains("stale")
-    {
-        stale_state_observed = true;
+    if forged_case.passed {
+        check_forged_bundle_fail_closed = "pass";
     }
-    if stale_state_observed {
-        let stale_rcode = json_field(&root_dir, &direct_query_stale, "rcode")?;
-        let stale_error = json_field(&root_dir, &direct_query_stale, "error")?;
-        if stale_rcode != "0" || !stale_error.trim().is_empty() {
-            check_stale_bundle_fail_closed = "pass";
-        }
+    if tampered_case.passed {
+        check_tampered_bundle_fail_closed = "pass";
+    }
+    if policy_invalid_case.passed {
+        check_policy_invalid_bundle_fail_closed = "pass";
     }
     if dns_inspect_restored.contains("dns inspect: state=valid") {
         check_valid_bundle_restored = "pass";
@@ -608,6 +738,10 @@ fn run() -> Result<(), String> {
         check_alias_query_valid,
         check_non_managed_refused,
         check_stale_bundle_fail_closed,
+        check_replayed_bundle_fail_closed,
+        check_forged_bundle_fail_closed,
+        check_tampered_bundle_fail_closed,
+        check_policy_invalid_bundle_fail_closed,
         check_valid_bundle_restored,
     ]
     .into_iter()
@@ -641,6 +775,10 @@ fn run() -> Result<(), String> {
             "alias_resolves_to_expected_ip": check_alias_query_valid,
             "non_managed_query_refused": check_non_managed_refused,
             "stale_bundle_fail_closed": check_stale_bundle_fail_closed,
+            "replayed_bundle_fail_closed": check_replayed_bundle_fail_closed,
+            "forged_bundle_fail_closed": check_forged_bundle_fail_closed,
+            "tampered_bundle_fail_closed": check_tampered_bundle_fail_closed,
+            "policy_invalid_bundle_fail_closed": check_policy_invalid_bundle_fail_closed,
             "valid_bundle_restored": check_valid_bundle_restored,
         },
         "source_artifacts": [
@@ -659,7 +797,14 @@ fn run() -> Result<(), String> {
 
     let _ = ctx.run_root_allow_failure(
         &config.signer_host,
-        &["rm", "-f", DNS_RECORDS_REMOTE, &passphrase_file],
+        &[
+            "rm",
+            "-f",
+            DNS_RECORDS_REMOTE,
+            replay_records_remote,
+            policy_invalid_records_remote,
+            &passphrase_file,
+        ],
     );
     let _ = ctx.run_root_allow_failure(
         &config.signer_host,
@@ -829,10 +974,12 @@ fn issue_dns_bundle(
     issue_dir: &str,
     output_name: &str,
     generated_at: Option<u64>,
+    nonce: Option<u64>,
 ) -> Result<(), String> {
     let output_path = format!("{issue_dir}/{output_name}");
     let verifier_key_output = format!("{issue_dir}/rn-dns-zone.pub");
     let generated_at_string = generated_at.map(|value| value.to_string());
+    let nonce_string = nonce.map(|value| value.to_string());
     let mut args = vec![
         "rustynet",
         "dns",
@@ -865,6 +1012,12 @@ fn issue_dns_bundle(
             args.push(generated_at_string.as_str());
         }
     }
+    if nonce.is_some() {
+        args.push("--nonce");
+        if let Some(nonce_string) = nonce_string.as_ref() {
+            args.push(nonce_string.as_str());
+        }
+    }
     ctx.run_root(signer_host, &args)?;
     Ok(())
 }
@@ -874,6 +1027,16 @@ fn install_dns_bundle(
     client_host: &str,
     verifier_local: &Path,
     bundle_local: &Path,
+) -> Result<(), String> {
+    install_dns_bundle_with_options(ctx, client_host, verifier_local, bundle_local, true)
+}
+
+fn install_dns_bundle_with_options(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    verifier_local: &Path,
+    bundle_local: &Path,
+    clear_watermark: bool,
 ) -> Result<(), String> {
     ctx.scp_to(verifier_local, client_host, "/tmp/rn-dns-zone.pub")?;
     ctx.scp_to(bundle_local, client_host, "/tmp/rn-dns-zone.bundle")?;
@@ -907,13 +1070,22 @@ fn install_dns_bundle(
     )?;
     ctx.run_root(
         client_host,
-        &[
-            "rm",
-            "-f",
-            "/var/lib/rustynet/rustynetd.dns-zone.watermark",
-            "/tmp/rn-dns-zone.pub",
-            "/tmp/rn-dns-zone.bundle",
-        ],
+        if clear_watermark {
+            &[
+                "rm",
+                "-f",
+                "/var/lib/rustynet/rustynetd.dns-zone.watermark",
+                "/tmp/rn-dns-zone.pub",
+                "/tmp/rn-dns-zone.bundle",
+            ]
+        } else {
+            &[
+                "rm",
+                "-f",
+                "/tmp/rn-dns-zone.pub",
+                "/tmp/rn-dns-zone.bundle",
+            ]
+        },
     )?;
     Ok(())
 }
@@ -1197,6 +1369,30 @@ fn managed_dns_base_records(
     ]
 }
 
+fn managed_dns_replay_records(
+    records: &[ManagedDnsRecordTemplate],
+    signer_node_id: &str,
+) -> Result<Vec<ManagedDnsRecordTemplate>, String> {
+    let mut replay_records = records.to_vec();
+    let signer_record = replay_records
+        .iter_mut()
+        .find(|record| record.target_node_id == signer_node_id)
+        .ok_or_else(|| {
+            format!("managed DNS replay probe could not find signer record for {signer_node_id}")
+        })?;
+    if signer_record
+        .aliases
+        .iter()
+        .any(|alias| alias == REPLAY_PROBE_ALIAS)
+    {
+        return Err(format!(
+            "managed DNS replay probe alias already present: {REPLAY_PROBE_ALIAS}"
+        ));
+    }
+    signer_record.aliases.push(REPLAY_PROBE_ALIAS.to_string());
+    Ok(replay_records)
+}
+
 fn managed_dns_records_manifest_for_scope(
     records: &[ManagedDnsRecordTemplate],
     scope: &AssignmentAuthorityScope,
@@ -1267,6 +1463,234 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
         node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_string())?,
         peer_node_ids,
     })
+}
+
+fn rewrite_bundle_line_value(
+    bundle: &str,
+    field_key: &str,
+    new_value: &str,
+) -> Result<String, String> {
+    let prefix = format!("{field_key}=");
+    let mut updated = Vec::new();
+    let mut replaced = false;
+    for line in bundle.lines() {
+        if !replaced && line.starts_with(prefix.as_str()) {
+            updated.push(format!("{prefix}{new_value}"));
+            replaced = true;
+        } else {
+            updated.push(line.to_string());
+        }
+    }
+    if !replaced {
+        return Err(format!(
+            "dns bundle field not found for rewrite: {field_key}"
+        ));
+    }
+    Ok(updated.join("\n") + "\n")
+}
+
+fn rewrite_bundle_signature(bundle: &str, fill: &str) -> Result<String, String> {
+    let mut updated = Vec::new();
+    let mut replaced = false;
+    for line in bundle.lines() {
+        if !replaced && line.starts_with("signature=") {
+            let hex = line.trim_start_matches("signature=");
+            if hex.is_empty() {
+                return Err("dns bundle signature line must not be empty".to_string());
+            }
+            updated.push(format!("signature={}", fill.repeat(hex.len())));
+            replaced = true;
+        } else {
+            updated.push(line.to_string());
+        }
+    }
+    if !replaced {
+        return Err("dns bundle is missing signature line".to_string());
+    }
+    Ok(updated.join("\n") + "\n")
+}
+
+#[derive(Debug, Clone)]
+struct InvalidBundleCaseResult {
+    passed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exercise_invalid_bundle_case(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    root_dir: &Path,
+    config: &Config,
+    workspace: &Path,
+    host_by_node: &HashMap<String, String>,
+    nodes_spec: &str,
+    allow_spec: &str,
+    verifier_local: &Path,
+    bundle_local: &Path,
+    clear_watermark: bool,
+    case_label: &str,
+    expected_reason_fragments: &[&str],
+) -> Result<InvalidBundleCaseResult, String> {
+    logger.line(
+        format!(
+            "[managed-dns] installing {case_label} managed DNS bundle on {}",
+            config.client_host
+        )
+        .as_str(),
+    )?;
+    install_dns_bundle_with_options(
+        ctx,
+        &config.client_host,
+        verifier_local,
+        bundle_local,
+        clear_watermark,
+    )?;
+    refresh_traversal_bundles(ctx, config, workspace, host_by_node, nodes_spec, allow_spec)?;
+    restart_managed_dns_stack_allow_invalid_dns(ctx, &config.client_host)?;
+
+    let dns_inspect = ctx.capture_root_allow_failure(
+        &config.client_host,
+        &[
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "rustynet",
+            "dns",
+            "inspect",
+        ],
+    )?;
+    let rustynetd_state = ctx.capture_root_allow_failure(
+        &config.client_host,
+        &["systemctl", "is-active", "rustynetd.service"],
+    )?;
+    let rustynetd_journal = ctx.capture_root_allow_failure(
+        &config.client_host,
+        &[
+            "journalctl",
+            "-u",
+            "rustynetd.service",
+            "-n",
+            "40",
+            "--no-pager",
+        ],
+    )?;
+    let direct_query =
+        remote_dns_query_capture(ctx, &config.client_host, config, &config.managed_fqdn())?;
+
+    logger.block(
+        format!("[managed-dns] {case_label} dns inspect").as_str(),
+        &dns_inspect,
+    )?;
+    logger.block(
+        format!("[managed-dns] {case_label} rustynetd state").as_str(),
+        &rustynetd_state,
+    )?;
+    logger.block(
+        format!("[managed-dns] {case_label} rustynetd journal").as_str(),
+        &rustynetd_journal,
+    )?;
+    logger.block(
+        format!("[managed-dns] {case_label} loopback DNS query").as_str(),
+        &direct_query,
+    )?;
+
+    let passed = managed_dns_invalid_state_observed(
+        dns_inspect.as_str(),
+        rustynetd_journal.as_str(),
+        expected_reason_fragments,
+    ) && dns_query_failed_closed(root_dir, direct_query.as_str())?;
+
+    Ok(InvalidBundleCaseResult { passed })
+}
+
+fn restart_managed_dns_stack_allow_invalid_dns(
+    ctx: &LiveLabContext,
+    client_host: &str,
+) -> Result<(), String> {
+    ctx.run_root_allow_failure(
+        client_host,
+        &[
+            "systemctl",
+            "stop",
+            "rustynetd-managed-dns.service",
+            "rustynetd.service",
+            "rustynetd-privileged-helper.service",
+        ],
+    )?;
+    ctx.run_root_allow_failure(
+        client_host,
+        &[
+            "systemctl",
+            "reset-failed",
+            "rustynetd.service",
+            "rustynetd-managed-dns.service",
+            "rustynetd-privileged-helper.service",
+        ],
+    )?;
+    ctx.retry_root(
+        client_host,
+        &["systemctl", "start", "rustynetd-privileged-helper.service"],
+        5,
+        2,
+    )?;
+    ctx.retry_root(
+        client_host,
+        &[
+            "systemctl",
+            "is-active",
+            "rustynetd-privileged-helper.service",
+        ],
+        15,
+        2,
+    )?;
+    ctx.run_root_allow_failure(client_host, &["systemctl", "start", "rustynetd.service"])?;
+    ctx.run_root_allow_failure(
+        client_host,
+        &["systemctl", "restart", "rustynetd-managed-dns.service"],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_valid_bundle_after_invalid_case(
+    ctx: &LiveLabContext,
+    config: &Config,
+    workspace: &Path,
+    host_by_node: &HashMap<String, String>,
+    nodes_spec: &str,
+    allow_spec: &str,
+    verifier_local: &Path,
+    valid_bundle_local: &Path,
+) -> Result<(), String> {
+    install_dns_bundle(ctx, &config.client_host, verifier_local, valid_bundle_local)?;
+    refresh_traversal_bundles(ctx, config, workspace, host_by_node, nodes_spec, allow_spec)?;
+    restart_managed_dns_stack(ctx, &config.client_host)
+}
+
+fn managed_dns_invalid_state_observed(
+    dns_inspect: &str,
+    rustynetd_journal: &str,
+    expected_reason_fragments: &[&str],
+) -> bool {
+    if dns_inspect.contains("daemon unreachable") {
+        return true;
+    }
+    if dns_inspect.contains("dns inspect: state=invalid")
+        && expected_reason_fragments
+            .iter()
+            .all(|fragment| dns_inspect.contains(fragment))
+    {
+        return true;
+    }
+    rustynetd_journal.contains("dns zone preflight failed")
+        && expected_reason_fragments
+            .iter()
+            .all(|fragment| rustynetd_journal.contains(fragment))
+}
+
+fn dns_query_failed_closed(root_dir: &Path, direct_query: &str) -> Result<bool, String> {
+    let rcode = json_field(root_dir, direct_query, "rcode")?;
+    let error = json_field(root_dir, direct_query, "error")?;
+    Ok(rcode != "0" || !error.trim().is_empty())
 }
 
 fn capture_remote_text(
@@ -1543,9 +1967,11 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ManagedPeerSpec, managed_dns_distribution_targets,
+        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, managed_dns_distribution_targets,
+        managed_dns_invalid_state_observed, managed_dns_replay_records,
         parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
-        sorted_node_host_pairs, validate_targets,
+        rewrite_bundle_line_value, rewrite_bundle_signature, sorted_node_host_pairs,
+        validate_targets,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1694,5 +2120,79 @@ peer.0.node_id=exit-1
 
         let err = parse_assignment_authority_scope(bundle).expect_err("missing node_id must fail");
         assert!(err.contains("missing node_id"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn managed_dns_replay_records_adds_probe_alias_to_signer_record() {
+        let records = vec![
+            ManagedDnsRecordTemplate {
+                label: "exit".to_string(),
+                target_node_id: "exit-1".to_string(),
+                ttl_secs: 300,
+                aliases: vec!["gateway".to_string()],
+            },
+            ManagedDnsRecordTemplate {
+                label: "client".to_string(),
+                target_node_id: "client-1".to_string(),
+                ttl_secs: 300,
+                aliases: Vec::new(),
+            },
+        ];
+
+        let replay =
+            managed_dns_replay_records(&records, "exit-1").expect("replay records should build");
+
+        assert_eq!(
+            replay[0].aliases,
+            vec!["gateway".to_string(), "gatewayreplay".to_string()]
+        );
+        assert!(replay[1].aliases.is_empty());
+    }
+
+    #[test]
+    fn rewrite_bundle_line_value_updates_requested_field() {
+        let bundle = "\
+version=1
+record.0.fqdn=exit.rustynet
+signature=abcd
+";
+
+        let rewritten = rewrite_bundle_line_value(bundle, "record.0.fqdn", "tampered.rustynet")
+            .expect("bundle rewrite should succeed");
+
+        assert!(rewritten.contains("record.0.fqdn=tampered.rustynet"));
+        assert!(rewritten.contains("signature=abcd"));
+    }
+
+    #[test]
+    fn rewrite_bundle_signature_rewrites_signature_hex() {
+        let bundle = "\
+version=1
+record.0.fqdn=exit.rustynet
+signature=abcd
+";
+
+        let rewritten =
+            rewrite_bundle_signature(bundle, "0").expect("signature rewrite should succeed");
+
+        assert!(rewritten.contains("signature=0000"));
+    }
+
+    #[test]
+    fn managed_dns_invalid_state_observed_accepts_dns_inspect_reason_match() {
+        assert!(managed_dns_invalid_state_observed(
+            "dns inspect: state=invalid error=dns zone bundle replay detected",
+            "",
+            &["replay detected"]
+        ));
+    }
+
+    #[test]
+    fn managed_dns_invalid_state_observed_accepts_journal_reason_match() {
+        assert!(managed_dns_invalid_state_observed(
+            "",
+            "dns zone preflight failed: dns zone bundle subject node id does not match local node",
+            &["subject node id does not match local node"]
+        ));
     }
 }
