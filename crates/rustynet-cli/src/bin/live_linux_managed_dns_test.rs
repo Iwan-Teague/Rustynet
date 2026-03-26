@@ -57,6 +57,7 @@ fn run() -> Result<(), String> {
     for host in [&config.signer_host, &config.client_host] {
         ctx.push_sudo_password(host)?;
     }
+    refresh_signer_trust_evidence(&ctx, &config.signer_host)?;
 
     logger.line("[managed-dns] collecting WireGuard public keys")?;
     let client_status_before = ctx.capture_root(
@@ -677,6 +678,9 @@ fn run() -> Result<(), String> {
         install_dns_bundle(&ctx, &host, &verifier_local, &peer_bundle_local)?;
         if host == config.client_host {
             continue;
+        }
+        if host == config.signer_host {
+            refresh_signer_trust_evidence(&ctx, &host)?;
         }
         restart_managed_dns_stack(&ctx, &host)?;
     }
@@ -1302,6 +1306,15 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         2,
     )?;
     Ok(())
+}
+
+fn refresh_signer_trust_evidence(ctx: &LiveLabContext, signer_host: &str) -> Result<(), String> {
+    ctx.retry_root(
+        signer_host,
+        &["rustynet", "ops", "refresh-signed-trust"],
+        5,
+        2,
+    )
 }
 
 fn build_authorized_allow_spec(
