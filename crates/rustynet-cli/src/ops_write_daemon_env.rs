@@ -1,8 +1,13 @@
 use std::env;
-use std::path::{Path, PathBuf};
-use crate::ops_install_systemd::{execute_ops_install_systemd, read_env_file_values};
+use std::path::PathBuf;
+use std::process::Command;
 
-pub fn execute_ops_write_daemon_env(config_path: PathBuf, egress_interface: Option<String>) -> Result<String, String> {
+use crate::ops_install_systemd::read_env_file_values;
+
+pub fn execute_ops_write_daemon_env(
+    config_path: PathBuf,
+    egress_interface: Option<String>,
+) -> Result<String, String> {
     // 1. Load wizard.env config
     let mut config = read_env_file_values(&config_path)
         .map_err(|e| format!("failed to read config file {}: {}", config_path.display(), e))?;
@@ -122,16 +127,39 @@ pub fn execute_ops_write_daemon_env(config_path: PathBuf, egress_interface: Opti
         config.insert("EGRESS_INTERFACE".to_string(), egress);
     }
 
-    // 4. Set ENV variables for ops_install_systemd to consume
+    // 4. Invoke the single hardened install-systemd path with child-local env overrides.
+    let rustynet_bin =
+        env::current_exe().map_err(|e| format!("failed to resolve current rustynet binary: {e}"))?;
+    let mut command = Command::new(rustynet_bin);
+    command.arg("ops").arg("install-systemd");
     for (key, value) in config {
         let env_key = if key.starts_with("RUSTYNET_") {
             key
         } else {
             format!("RUSTYNET_{}", key)
         };
-        env::set_var(env_key, value);
+        command.env(env_key, value);
     }
-
-    // 5. Call install-systemd
-    execute_ops_install_systemd()
+    let output = command
+        .output()
+        .map_err(|e| format!("failed to execute rustynet ops install-systemd: {e}"))?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            Ok("systemd environment written and install-systemd completed".to_string())
+        } else {
+            Ok(stdout)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("child exited with status {}", output.status)
+        };
+        Err(format!("rustynet ops install-systemd failed: {detail}"))
+    }
 }
