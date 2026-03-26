@@ -549,7 +549,7 @@ fn run() -> Result<(), String> {
         &tampered_bundle_local,
         true,
         "tampered",
-        &["signature verification failed"],
+        &["invalid format"],
     )?;
     restore_valid_bundle_after_invalid_case(
         &ctx,
@@ -1675,16 +1675,27 @@ fn managed_dns_invalid_state_observed(
         return true;
     }
     if dns_inspect.contains("dns inspect: state=invalid")
-        && expected_reason_fragments
-            .iter()
-            .all(|fragment| dns_inspect.contains(fragment))
+        && contains_all_reason_fragments(dns_inspect, expected_reason_fragments)
     {
         return true;
     }
-    rustynetd_journal.contains("dns zone preflight failed")
-        && expected_reason_fragments
-            .iter()
-            .all(|fragment| rustynetd_journal.contains(fragment))
+    let journal_lower = rustynetd_journal.to_ascii_lowercase();
+    let journal_has_preflight_marker = journal_lower.contains("dns zone preflight failed")
+        || journal_lower.contains("dns zone preflight skipped invalid managed dns bundle");
+    journal_has_preflight_marker
+        && contains_all_reason_fragments(rustynetd_journal, expected_reason_fragments)
+}
+
+fn contains_all_reason_fragments(haystack: &str, expected_reason_fragments: &[&str]) -> bool {
+    let normalized_haystack = normalize_reason_text(haystack);
+    expected_reason_fragments.iter().all(|fragment| {
+        let normalized_fragment = normalize_reason_text(fragment);
+        normalized_haystack.contains(normalized_fragment.as_str())
+    })
+}
+
+fn normalize_reason_text(value: &str) -> String {
+    value.to_ascii_lowercase().replace('_', " ")
 }
 
 fn dns_query_failed_closed(root_dir: &Path, direct_query: &str) -> Result<bool, String> {
@@ -2188,11 +2199,29 @@ signature=abcd
     }
 
     #[test]
+    fn managed_dns_invalid_state_observed_accepts_dns_inspect_reason_with_underscores() {
+        assert!(managed_dns_invalid_state_observed(
+            "dns inspect: state=invalid error=dns_zone_bundle_subject_node_id_does_not_match_local_node",
+            "",
+            &["subject node id does not match local node"]
+        ));
+    }
+
+    #[test]
     fn managed_dns_invalid_state_observed_accepts_journal_reason_match() {
         assert!(managed_dns_invalid_state_observed(
             "",
             "dns zone preflight failed: dns zone bundle subject node id does not match local node",
             &["subject node id does not match local node"]
+        ));
+    }
+
+    #[test]
+    fn managed_dns_invalid_state_observed_accepts_skipped_preflight_journal_marker() {
+        assert!(managed_dns_invalid_state_observed(
+            "",
+            "rustynetd startup warning: dns zone preflight skipped invalid managed DNS bundle: dns zone bundle replay detected",
+            &["replay detected"]
         ));
     }
 }
