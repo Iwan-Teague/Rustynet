@@ -59,6 +59,7 @@ These are the current implementation-driving documents.
 - [operations/active/README.md](./operations/active/README.md)
 
 Active set:
+- [CrossNetworkConnectivityImplementationPlan_2026-03-27.md](./operations/active/CrossNetworkConnectivityImplementationPlan_2026-03-27.md)
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./operations/active/MagicDnsSignedZoneSchema_2026-03-09.md)

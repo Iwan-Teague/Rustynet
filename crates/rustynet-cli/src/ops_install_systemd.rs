@@ -980,18 +980,19 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         &["restart", "rustynetd-privileged-helper.service"],
     )?;
 
+    if assignment_auto_refresh_enabled {
+        run_command_checked(
+            "systemctl",
+            &["start", "rustynetd-assignment-refresh.service"],
+        )?;
+    }
+    if trust_auto_refresh_enabled {
+        run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"])?;
+    }
+
     run_command_checked("systemctl", &["restart", "rustynetd.service"])?;
     wait_for_unit_active("rustynetd.service", 40, 250)?;
 
-    if assignment_auto_refresh_enabled {
-        let _ = run_command_checked(
-            "systemctl",
-            &["start", "rustynetd-assignment-refresh.service"],
-        );
-    }
-    if trust_auto_refresh_enabled {
-        let _ = run_command_checked("systemctl", &["start", "rustynetd-trust-refresh.service"]);
-    }
     if trust_auto_refresh_enabled || assignment_auto_refresh_enabled || auto_tunnel_enforce_enabled
     {
         wait_for_unix_socket(socket_path.as_path(), 40, 250)?;
@@ -2446,17 +2447,15 @@ fn installer_unit_start_order(
     assignment_auto_refresh_enabled: bool,
     auto_tunnel_enforce_enabled: bool,
 ) -> Vec<&'static str> {
-    let mut order = vec![
-        "restart rustynetd-privileged-helper.service",
-        "restart rustynetd.service",
-        "wait rustynetd.service active",
-    ];
+    let mut order = vec!["restart rustynetd-privileged-helper.service"];
     if assignment_auto_refresh_enabled {
-        order.push("start rustynetd-assignment-refresh.service (best-effort post-daemon)");
+        order.push("start rustynetd-assignment-refresh.service (strict pre-daemon)");
     }
     if trust_auto_refresh_enabled {
-        order.push("start rustynetd-trust-refresh.service (best-effort post-daemon)");
+        order.push("start rustynetd-trust-refresh.service (strict pre-daemon)");
     }
+    order.push("restart rustynetd.service");
+    order.push("wait rustynetd.service active");
     if trust_auto_refresh_enabled || assignment_auto_refresh_enabled || auto_tunnel_enforce_enabled
     {
         order.push("run rustynet state refresh (strict)");
@@ -2533,24 +2532,22 @@ mod tests {
     }
 
     #[test]
-    fn installer_order_runs_single_strict_state_refresh_after_best_effort_priming() {
+    fn installer_order_primes_signed_state_before_first_daemon_start() {
         let order = installer_unit_start_order(true, true, true);
         let daemon_idx = order
             .iter()
             .position(|entry| *entry == "restart rustynetd.service")
             .expect("daemon restart should be present");
-        let best_effort_assignment_idx = order
+        let strict_assignment_idx = order
             .iter()
             .position(|entry| {
-                *entry == "start rustynetd-assignment-refresh.service (best-effort post-daemon)"
+                *entry == "start rustynetd-assignment-refresh.service (strict pre-daemon)"
             })
-            .expect("best-effort assignment refresh start should be present");
-        let best_effort_trust_idx = order
+            .expect("strict assignment refresh start should be present");
+        let strict_trust_idx = order
             .iter()
-            .position(|entry| {
-                *entry == "start rustynetd-trust-refresh.service (best-effort post-daemon)"
-            })
-            .expect("best-effort trust refresh start should be present");
+            .position(|entry| *entry == "start rustynetd-trust-refresh.service (strict pre-daemon)")
+            .expect("strict trust refresh start should be present");
         let strict_state_refresh_idx = order
             .iter()
             .position(|entry| *entry == "run rustynet state refresh (strict)")
@@ -2560,20 +2557,20 @@ mod tests {
             .position(|entry| *entry == "restart rustynetd-managed-dns.service")
             .expect("managed DNS restart should be present");
         assert!(
-            daemon_idx < best_effort_assignment_idx,
-            "daemon restart must precede best-effort assignment refresh start"
+            strict_assignment_idx < daemon_idx,
+            "assignment refresh must seed signed state before daemon restart"
         );
         assert!(
-            daemon_idx < best_effort_trust_idx,
-            "daemon restart must precede best-effort trust refresh start"
+            strict_trust_idx < daemon_idx,
+            "trust refresh must seed signed state before daemon restart"
         );
         assert!(
-            best_effort_assignment_idx < strict_state_refresh_idx,
-            "best-effort assignment priming must precede strict state refresh"
+            strict_assignment_idx < strict_state_refresh_idx,
+            "assignment priming must precede strict state refresh"
         );
         assert!(
-            best_effort_trust_idx < strict_state_refresh_idx,
-            "best-effort trust priming must precede strict state refresh"
+            strict_trust_idx < strict_state_refresh_idx,
+            "trust priming must precede strict state refresh"
         );
         assert!(
             strict_state_refresh_idx < managed_dns_restart_idx,

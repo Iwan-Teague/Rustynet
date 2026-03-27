@@ -3,6 +3,7 @@
 This folder contains operations documents that still drive active implementation, migration, or hardening work.
 
 Current active set:
+- [CrossNetworkConnectivityImplementationPlan_2026-03-27.md](./CrossNetworkConnectivityImplementationPlan_2026-03-27.md)
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
