@@ -300,6 +300,7 @@ enum OpsCommand {
     RefreshSignedTrust,
     BootstrapTunnelCustody,
     RefreshAssignment,
+    StateRefreshIfSocketPresent,
     CollectPhase1MeasuredInput,
     RunPhase1Baseline,
     PrepareAdvisoryDb {
@@ -713,6 +714,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops refresh-assignment does not accept options".to_string());
             }
             Ok(OpsCommand::RefreshAssignment)
+        }
+        "state-refresh-if-socket-present" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops state-refresh-if-socket-present does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::StateRefreshIfSocketPresent)
         }
         "collect-phase1-measured-input" => {
             if args.len() != 1 {
@@ -3189,6 +3198,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::RefreshSignedTrust => execute_ops_refresh_signed_trust(),
         OpsCommand::BootstrapTunnelCustody => execute_ops_bootstrap_wireguard_custody(),
         OpsCommand::RefreshAssignment => execute_ops_refresh_assignment(),
+        OpsCommand::StateRefreshIfSocketPresent => execute_ops_state_refresh_if_socket_present(),
         OpsCommand::CollectPhase1MeasuredInput => {
             ops_phase1::execute_ops_collect_phase1_measured_input()
         }
@@ -3858,6 +3868,26 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         generated_at_unix,
         expires_at_unix
     ))
+}
+
+fn execute_ops_state_refresh_if_socket_present() -> Result<String, String> {
+    require_root_execution()?;
+
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let socket_present = socket_exists_and_is_socket(socket_path.as_path(), "daemon socket")?;
+    if !socket_present {
+        return Ok(format!(
+            "state refresh skipped: daemon socket is absent ({})",
+            socket_path.display()
+        ));
+    }
+
+    let response = send_command_with_socket(IpcCommand::StateRefresh, socket_path.clone())?;
+    if response.ok {
+        Ok(response.message)
+    } else {
+        Err(response.message)
+    }
 }
 
 fn execute_ops_verify_runtime_binary_custody() -> Result<String, String> {
@@ -10354,6 +10384,7 @@ fn help_text() -> String {
         "  ops refresh-signed-trust",
         "  ops bootstrap-wireguard-custody",
         "  ops refresh-assignment",
+        "  ops state-refresh-if-socket-present",
         "  ops collect-phase1-measured-input",
         "  ops run-phase1-baseline",
         "  ops check-no-unsafe-rust-sources [--root <path>]",
@@ -11897,6 +11928,14 @@ mod tests {
             "force-local-assignment-refresh-now".to_string(),
         ]);
         assert!(format!("{force_assignment_refresh:?}").contains("ForceLocalAssignmentRefreshNow"));
+
+        let state_refresh_if_socket_present = parse_command(&[
+            "ops".to_string(),
+            "state-refresh-if-socket-present".to_string(),
+        ]);
+        assert!(
+            format!("{state_refresh_if_socket_present:?}").contains("StateRefreshIfSocketPresent")
+        );
 
         let lan_coupling = parse_command(&[
             "ops".to_string(),

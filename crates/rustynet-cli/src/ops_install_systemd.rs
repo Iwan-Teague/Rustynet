@@ -2608,7 +2608,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_service_templates_execute_refresh_ops_before_state_refresh() {
+    fn refresh_service_templates_execute_refresh_ops_before_socket_aware_state_refresh() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let assignment_template = std::fs::read_to_string(
             repo_root.join("scripts/systemd/rustynetd-assignment-refresh.service"),
@@ -2620,8 +2620,10 @@ mod tests {
             "assignment refresh service must execute the Rust assignment refresh path"
         );
         assert!(
-            assignment_template.contains("ExecStartPost=/usr/local/bin/rustynet state refresh"),
-            "assignment refresh service must revalidate daemon state after refreshing signed assignment state"
+            assignment_template.contains(
+                "ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present"
+            ),
+            "assignment refresh service must use the socket-aware daemon revalidation path after refreshing signed assignment state"
         );
 
         let trust_template = std::fs::read_to_string(
@@ -2633,8 +2635,10 @@ mod tests {
             "trust refresh service must execute the Rust trust refresh path"
         );
         assert!(
-            trust_template.contains("ExecStartPost=/usr/local/bin/rustynet state refresh"),
-            "trust refresh service must revalidate daemon state after refreshing signed trust state"
+            trust_template.contains(
+                "ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present"
+            ),
+            "trust refresh service must use the socket-aware daemon revalidation path after refreshing signed trust state"
         );
     }
 

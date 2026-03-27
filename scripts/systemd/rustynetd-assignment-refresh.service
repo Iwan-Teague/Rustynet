@@ -19,7 +19,7 @@ Environment=RUSTYNET_DAEMON_GROUP=rustynetd
 LoadCredentialEncrypted=signing_key_passphrase:/etc/rustynet/credentials/signing_key_passphrase.cred
 ExecStartPre=/usr/local/bin/rustynet ops verify-runtime-binary-custody
 ExecStart=/usr/local/bin/rustynet ops refresh-assignment
-ExecStartPost=/usr/local/bin/rustynet state refresh
+ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present
 User=root
 Group=root
 NoNewPrivileges=true
