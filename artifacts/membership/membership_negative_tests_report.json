@@ -1,9 +1,0 @@
-{
-  "phase": "membership",
-  "evidence_mode": "measured",
-  "environment": "ci",
-  "captured_at_unix": 1772980620,
-  "status": "pass",
-  "tampered_log_detected": true,
-  "tampered_snapshot_detected": true
-}

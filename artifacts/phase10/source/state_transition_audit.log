@@ -1,3 +1,0 @@
-generation=1 from=Init to=ControlTrusted reason=trusted_state_loaded
-generation=1 from=ControlTrusted to=DataplaneApplied reason=dataplane_apply_succeeded
-generation=1 from=DataplaneApplied to=ExitActive reason=authorized_exit_selected

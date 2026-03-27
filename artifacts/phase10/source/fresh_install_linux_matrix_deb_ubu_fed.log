@@ -1,5 +1,0 @@
-[four-node-fresh] Running full cleanup + fresh bootstrap on all four hosts
-[four-node-fresh] Host debian@192.168.18.37: cleanup
-spawn scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 /tmp/rustynet-four-node.lOTMw2/rn_cleanup.sh debian@192.168.18.37:/tmp/rn_cleanup.sh
-ssh: connect to host 192.168.18.37 port 22: Operation not permitted
-scp: Connection closed

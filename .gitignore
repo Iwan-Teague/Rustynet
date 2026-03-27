@@ -15,16 +15,10 @@
 .DS_Store
 __pycache__/
 
-# Local live-lab runs and operator-specific saved profiles
-/artifacts/live_lab/
-/artifacts/live_lab/**
-/artifacts/phase10/source/managed_dns_report.json
-/artifacts/phase10/source/managed_dns_report.log
-/artifacts/perf/phase1/backend_contract_perf.json
-/artifacts/perf/phase1/measured_input.json
-/artifacts/release/platform_parity_report.json
-/artifacts/release/sbom.cargo-metadata.json
-/artifacts/release/sbom.sha256
+# Generated artifacts are local-only by default.
+# Existing tracked artifact files remain tracked until explicitly removed from the index.
+/artifacts/**
+!/artifacts/**/.gitkeep
 /profiles/live_lab/*.env
 !/profiles/live_lab/default_four_node.env
 !/profiles/live_lab/default_five_node.env
