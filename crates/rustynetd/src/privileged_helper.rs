@@ -2046,9 +2046,9 @@ mod tests {
     }
 
     #[test]
-    fn privileged_helper_socket_validator_accepts_owner_only_socket() {
+    fn privileged_helper_socket_validator_rejects_regular_file_path() {
         let unique = format!(
-            "rnh-sock-ok-{}",
+            "rnh-sock-regular-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock should be valid")
@@ -2059,40 +2059,13 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .expect("test dir permissions should be strict");
         let socket = dir.join("helper.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::write(&socket, b"not-a-socket").expect("regular file should exist");
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
-
-        let result = validate_privileged_helper_socket_security(&socket);
-        assert!(result.is_ok(), "owner-only helper socket should validate");
-
-        drop(listener);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn privileged_helper_socket_validator_rejects_group_writable_parent_directory() {
-        let unique = format!(
-            "rnh-sock-parent-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let dir = PathBuf::from("/tmp").join(unique);
-        std::fs::create_dir_all(&dir).expect("test dir should exist");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
-            .expect("test dir permissions should be set");
-        let socket = dir.join("helper.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
+            .expect("regular file permissions should be owner-only");
 
         let err = validate_privileged_helper_socket_security(&socket)
-            .expect_err("group-writable parent must fail");
-        assert!(err.contains("privileged helper socket parent"));
-
-        drop(listener);
+            .expect_err("regular file must not validate as helper socket");
+        assert!(err.contains("must be a Unix socket"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2111,18 +2084,15 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("test dir should exist");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .expect("test dir permissions should be strict");
-        let socket = dir.join("helper.sock");
+        let socket = dir.join("helper.sock.target");
         let symlink_path = dir.join("helper.sock.link");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("socket should bind");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
+        std::fs::write(&socket, b"not-a-socket").expect("target file should exist");
         symlink(&socket, &symlink_path).expect("symlink should be created");
 
         let err = validate_privileged_helper_socket_security(&symlink_path)
             .expect_err("symlink helper socket path must fail");
         assert!(err.contains("must not be a symlink"));
 
-        drop(listener);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

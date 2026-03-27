@@ -19,6 +19,8 @@
 //!   relay_id) tuples.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -158,6 +160,8 @@ pub struct RelayClient {
     config: RelayClientConfig,
     /// The UDP socket used for relay communication.
     socket: Option<UdpSocket>,
+    #[cfg(test)]
+    scripted_establishments: VecDeque<Result<u16, RelayClientError>>,
 }
 
 impl RelayClient {
@@ -169,6 +173,8 @@ impl RelayClient {
             sessions: HashMap::new(),
             config,
             socket: None,
+            #[cfg(test)]
+            scripted_establishments: VecDeque::new(),
         }
     }
 
@@ -220,6 +226,29 @@ impl RelayClient {
             ttl_secs,
         );
         let token_expires_at_unix = token.expires_at_unix;
+
+        #[cfg(test)]
+        if let Some(scripted) = self.scripted_establishments.pop_front() {
+            return match scripted {
+                Ok(allocated_port) => {
+                    let now = Instant::now();
+                    let session = RelayClientSession {
+                        session_id: SessionId::from([0xAA; 16]),
+                        relay_addr,
+                        allocated_port,
+                        peer_node_id: peer_node_id.clone(),
+                        established_at: now,
+                        last_activity: now,
+                        relay_id,
+                        token_expires_at_unix,
+                    };
+                    let endpoint = session.effective_endpoint();
+                    self.sessions.insert(peer_node_id.clone(), session);
+                    Ok(endpoint)
+                }
+                Err(err) => Err(err),
+            };
+        }
 
         // Build hello message
         let hello = RelayHello {
@@ -337,6 +366,11 @@ impl RelayClient {
         if let Some(session) = self.sessions.get_mut(peer_node_id) {
             session.token_expires_at_unix = token_expires_at_unix;
         }
+    }
+
+    #[cfg(test)]
+    pub fn script_establish_session_result(&mut self, result: Result<u16, RelayClientError>) {
+        self.scripted_establishments.push_back(result);
     }
 }
 

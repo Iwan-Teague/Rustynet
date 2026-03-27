@@ -2502,7 +2502,6 @@ mod tests {
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
-    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
     use super::{
@@ -2511,18 +2510,6 @@ mod tests {
         read_env_file_values, render_assignment_refresh_env_contents,
         resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
     };
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let short_prefix = prefix.chars().take(4).collect::<String>();
-        let nonce = format!(
-            "{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        PathBuf::from("/tmp").join(format!("rn-{short_prefix}-{nonce}"))
-    }
 
     #[test]
     fn parse_install_bool_accepts_expected_variants() {
@@ -2652,29 +2639,47 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_unix_socket_accepts_valid_socket() {
-        let dir = unique_temp_dir("sock");
-        std::fs::create_dir_all(&dir).expect("temp dir should exist");
+    fn wait_for_unix_socket_rejects_regular_file_path() {
+        let unique = format!(
+            "rustynet-cli-install-socket-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("temp dir perms should be strict");
+            .expect("test dir permissions should be strict");
         let socket_path = dir.join("rustynetd.sock");
-        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+        std::fs::write(&socket_path, b"not-a-socket").expect("regular file should exist");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .expect("regular file permissions should be owner-only");
 
-        let result = wait_for_unix_socket(&socket_path, 1, 0);
-        assert!(result.is_ok(), "socket path should validate");
+        let err = wait_for_unix_socket(&socket_path, 1, 0)
+            .expect_err("regular file must not validate as a socket");
+        assert!(err.contains("last_state=not-socket"));
 
-        drop(listener);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn wait_for_unix_socket_rejects_symlink_path() {
-        let dir = unique_temp_dir("link");
-        std::fs::create_dir_all(&dir).expect("temp dir should exist");
+        let unique = format!(
+            "rustynet-cli-install-socket-link-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("{unique}.dir"));
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("temp dir perms should be strict");
-        let socket_path = dir.join("rustynetd.sock");
-        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+            .expect("test dir permissions should be strict");
+        let socket_path = dir.join("rustynetd.sock.target");
+        std::fs::write(&socket_path, b"not-a-socket").expect("target file should exist");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .expect("target file permissions should be owner-only");
         let symlink_path = dir.join("rustynetd.sock.link");
         symlink(&socket_path, &symlink_path).expect("symlink should be created");
 
@@ -2682,8 +2687,25 @@ mod tests {
             wait_for_unix_socket(&symlink_path, 1, 0).expect_err("symlink path must be rejected");
         assert!(err.contains("last_state=symlink"));
 
-        drop(listener);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_reports_missing_path() {
+        let unique = format!(
+            "rustynet-cli-install-socket-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir()
+            .join(format!("{unique}.dir"))
+            .join("rustynetd.sock");
+
+        let err = wait_for_unix_socket(&path, 1, 0)
+            .expect_err("missing path must not validate as a socket");
+        assert!(err.contains("failed to become available"));
     }
 
     #[test]

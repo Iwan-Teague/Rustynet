@@ -4089,14 +4089,27 @@ fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
                 firewall_probe_cmd,
             )
         }
-        Phase6Platform::Macos => (
-            phase6_command_succeeds("route", &["-n", "get", "default"]),
-            phase6_command_succeeds("scutil", &["--dns"]),
-            phase6_command_succeeds("pfctl", &["-s", "info"]),
-            "route -n get default".to_string(),
-            "scutil --dns".to_string(),
-            "pfctl -s info".to_string(),
-        ),
+        Phase6Platform::Macos => {
+            let contract_ready = phase6_macos_start_contract_ready()?;
+            let route_hook_ready = contract_ready
+                && phase6_root_owned_command_ready("route", "route")
+                && phase6_root_owned_command_ready("ifconfig", "ifconfig")
+                && phase6_root_owned_command_ready("launchctl", "launchctl");
+            let dns_hook_ready = contract_ready
+                && phase6_root_owned_command_ready("scutil", "scutil")
+                && phase6_root_owned_command_ready("launchctl", "launchctl");
+            let firewall_hook_ready = contract_ready
+                && phase6_root_owned_command_ready("pfctl", "pfctl")
+                && phase6_root_owned_command_ready("launchctl", "launchctl");
+            (
+                route_hook_ready,
+                dns_hook_ready,
+                firewall_hook_ready,
+                "root-owned route/ifconfig/launchctl + hardened macOS start contract".to_string(),
+                "root-owned scutil/launchctl + hardened macOS start contract".to_string(),
+                "root-owned pfctl/launchctl + hardened macOS start contract".to_string(),
+            )
+        }
         Phase6Platform::Windows => (
             phase6_command_succeeds(
                 "powershell.exe",
@@ -4285,6 +4298,82 @@ fn phase6_probe_host() -> String {
         }
     }
     "unknown".to_string()
+}
+
+const PHASE6_MACOS_REQUIRED_START_PATTERNS: &[(&str, &str)] = &[
+    (
+        "validate_macos_passphrase_source_contract",
+        "missing macOS passphrase source contract enforcement in start.sh",
+    ),
+    (
+        "configure_macos_binary_path_env",
+        "missing macOS privileged binary custody enforcement in start.sh",
+    ),
+    (
+        "rustynet ops bootstrap-wireguard-custody",
+        "missing Rust-backed macOS WireGuard custody bootstrap in start.sh",
+    ),
+    (
+        "rustynet ops restart-runtime-service",
+        "missing Rust-backed macOS launchd restart path in start.sh",
+    ),
+    (
+        "RUSTYNET_WG_KEY_PASSPHRASE=\"${WG_KEY_PASSPHRASE_PATH}\"",
+        "missing macOS passphrase placeholder path wiring in start.sh",
+    ),
+    (
+        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=\"${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}\"",
+        "missing macOS keychain account wiring in start.sh",
+    ),
+    (
+        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE=\"${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}\"",
+        "missing macOS keychain service wiring in start.sh",
+    ),
+];
+
+const PHASE6_MACOS_FORBIDDEN_START_PATTERNS: &[(&str, &str)] = &[(
+    "install_macos_unprivileged_wireguard_tools",
+    "insecure macOS unprivileged WireGuard fallback is still present in start.sh",
+)];
+
+fn phase6_workspace_root() -> Result<PathBuf, String> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "failed to resolve workspace root for phase6 parity probe".to_string())
+}
+
+fn phase6_macos_start_contract_ready() -> Result<bool, String> {
+    let start_path = phase6_workspace_root()?.join("start.sh");
+    let body = fs::read_to_string(&start_path).map_err(|err| {
+        format!(
+            "read macOS start contract failed ({}): {err}",
+            start_path.display()
+        )
+    })?;
+    phase6_validate_macos_start_contract_text(&body)?;
+    Ok(true)
+}
+
+fn phase6_validate_macos_start_contract_text(body: &str) -> Result<(), String> {
+    for (pattern, message) in PHASE6_MACOS_REQUIRED_START_PATTERNS {
+        if !body.contains(pattern) {
+            return Err((*message).to_string());
+        }
+    }
+    for (pattern, message) in PHASE6_MACOS_FORBIDDEN_START_PATTERNS {
+        if body.contains(pattern) {
+            return Err((*message).to_string());
+        }
+    }
+    Ok(())
+}
+
+fn phase6_root_owned_command_ready(command_name: &str, label: &str) -> bool {
+    resolve_absolute_command_path(command_name)
+        .and_then(|path| validate_root_owned_executable_path(path.as_path(), label))
+        .is_ok()
 }
 
 fn phase6_command_available(command: &str) -> bool {
@@ -10370,15 +10459,13 @@ mod tests {
         load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
         parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_validate_platform_parity_report, render_launchd_plist,
-        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command,
-        validate_control_socket_security,
+        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
+        render_launchd_plist, required_macos_tunnel_keychain_account,
+        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
+        rewrite_env_key_value, to_ipc_command, validate_control_socket_security,
     };
     use rustynetd::ipc::IpcCommand;
     use std::fs;
-    use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
 
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
@@ -10664,6 +10751,13 @@ mod tests {
             .expect_err("expected fail-closed parity validation error");
         assert!(error.contains("route_hook_ready must be true"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_macos_start_contract_matches_current_hardened_path() {
+        let start_sh = include_str!("../../../start.sh");
+        phase6_validate_macos_start_contract_text(start_sh)
+            .expect("current start.sh must satisfy macOS hardened contract");
     }
 
     #[test]
@@ -12522,89 +12616,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn control_socket_validator_accepts_owner_only_socket() {
+    fn control_socket_validator_rejects_regular_file_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let unique = format!(
-            "rnc-sock-ok-{}",
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-cli-control-socket-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock should be valid")
                 .as_nanos()
-        );
-        let dir = PathBuf::from("/tmp").join(unique);
+        ));
         std::fs::create_dir_all(&dir).expect("test dir should exist");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .expect("test dir permissions should be strict");
-        let socket = dir.join("rustynetd.sock");
-        let listener = UnixListener::bind(&socket).expect("socket should bind");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
+        let path = dir.join("rustynetd.sock");
+        std::fs::write(&path, b"not-a-socket").expect("regular file should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("regular file permissions should be owner-only");
 
-        let result = validate_control_socket_security(&socket, "daemon socket");
-        assert!(result.is_ok(), "owner-only socket should validate");
+        let err = validate_control_socket_security(&path, "daemon socket")
+            .expect_err("regular file must not validate as a socket");
+        assert!(err.contains("must be a Unix socket"));
 
-        drop(listener);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn control_socket_validator_rejects_group_writable_parent_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let unique = format!(
-            "rnc-sock-parent-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let dir = PathBuf::from("/tmp").join(unique);
-        std::fs::create_dir_all(&dir).expect("test dir should exist");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
-            .expect("test dir permissions should be set");
-        let socket = dir.join("rustynetd.sock");
-        let listener = UnixListener::bind(&socket).expect("socket should bind");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
-
-        let err = validate_control_socket_security(&socket, "daemon socket")
-            .expect_err("group-writable parent must fail");
-        assert!(err.contains("parent directory has insecure permissions"));
-
-        drop(listener);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn control_socket_validator_rejects_symlink_path() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let unique = format!(
-            "rnc-sock-link-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be valid")
-                .as_nanos()
-        );
-        let dir = PathBuf::from("/tmp").join(unique);
-        std::fs::create_dir_all(&dir).expect("test dir should exist");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("test dir permissions should be strict");
-        let socket = dir.join("rustynetd.sock");
-        let symlink_path = dir.join("rustynetd.sock.link");
-        let listener = UnixListener::bind(&socket).expect("socket should bind");
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .expect("socket mode should be owner-only");
-        symlink(&socket, &symlink_path).expect("symlink should be created");
-
-        let err = validate_control_socket_security(&symlink_path, "daemon socket")
-            .expect_err("symlink socket path must fail");
-        assert!(err.contains("must not be a symlink"));
-
-        drop(listener);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -6,34 +6,44 @@ use std::process::{Command, ExitStatus, Stdio};
 
 const REQUIRED_PATTERNS: &[(&str, &str, &str)] = &[
     (
-        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH",
+        "validate_macos_passphrase_source_contract",
         "start.sh",
-        "missing explicit macOS passphrase source contract wiring in start.sh",
+        "missing macOS passphrase source contract enforcement in start.sh",
     ),
     (
-        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT",
+        "configure_macos_binary_path_env",
         "start.sh",
-        "missing macOS keychain account passphrase contract wiring in start.sh",
+        "missing macOS privileged binary custody enforcement in start.sh",
     ),
     (
-        "rustynetd key store-passphrase",
+        "rustynet ops bootstrap-wireguard-custody",
         "start.sh",
-        "missing macOS keychain passphrase provisioning command in start.sh",
+        "missing Rust-backed macOS WireGuard custody bootstrap in start.sh",
+    ),
+    (
+        "rustynet ops restart-runtime-service",
+        "start.sh",
+        "missing Rust-backed macOS launchd restart path in start.sh",
+    ),
+    (
+        "RUSTYNET_WG_KEY_PASSPHRASE=\"${WG_KEY_PASSPHRASE_PATH}\"",
+        "start.sh",
+        "missing macOS passphrase placeholder path wiring in start.sh",
+    ),
+    (
+        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=\"${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}\"",
+        "start.sh",
+        "missing macOS keychain account wiring in start.sh",
+    ),
+    (
+        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE=\"${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}\"",
+        "start.sh",
+        "missing macOS keychain service wiring in start.sh",
     ),
     (
         "install_macos_unprivileged_wireguard_tools",
         "start.sh",
         "insecure macOS unprivileged wireguard fallback is still present",
-    ),
-    (
-        r#"launchctl bootstrap system "${MACOS_LAUNCHD_HELPER_PLIST_PATH}""#,
-        "start.sh",
-        "launchd helper bootstrap wiring missing in start.sh",
-    ),
-    (
-        r#"launchctl bootstrap "${daemon_domain}" "${MACOS_LAUNCHD_DAEMON_PLIST_PATH}""#,
-        "start.sh",
-        "launchd daemon bootstrap wiring missing in start.sh",
     ),
 ];
 
@@ -103,7 +113,7 @@ fn run() -> Result<(), i32> {
 fn run_rg(root_dir: &Path, pattern: &str, target: &str) -> Result<bool, i32> {
     let status = Command::new("rg")
         .current_dir(root_dir)
-        .args(["-n", pattern, target])
+        .args(["-F", "-n", pattern, target])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

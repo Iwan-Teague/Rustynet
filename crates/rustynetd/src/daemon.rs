@@ -9526,12 +9526,11 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::net::{SocketAddr, UdpSocket};
+    use std::net::SocketAddr;
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Arc;
-    use std::thread;
     use std::time::Duration;
 
     use crate::ipc::{
@@ -9539,7 +9538,7 @@ mod tests {
         REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
         read_command_envelope, remote_ops_signature_payload,
     };
-    use crate::relay_client::{RelayClient, RelayClientConfig};
+    use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
 
     use ed25519_dalek::{Signer, SigningKey};
     use rustynet_backend_api::{NodeId, SocketEndpoint};
@@ -10846,6 +10845,7 @@ mod tests {
         local_node_id: &str,
         session_timeout: Duration,
         recv_timeout: Duration,
+        scripted_establishments: Vec<Result<u16, RelayClientError>>,
     ) -> RelayClient {
         let signing_key = SigningKey::from_bytes(&[23u8; 32]);
         let mut relay_client = RelayClient::new(
@@ -10858,74 +10858,10 @@ mod tests {
                 recv_timeout,
             },
         );
+        for result in scripted_establishments {
+            relay_client.script_establish_session_result(result);
+        }
         relay_client
-            .bind(UdpSocket::bind("0.0.0.0:0").expect("test relay socket should bind"))
-            .expect("test relay client should bind");
-        relay_client
-    }
-
-    fn discover_test_relay_ip() -> std::net::IpAddr {
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("probe socket should bind");
-        socket
-            .connect("8.8.8.8:80")
-            .expect("probe socket should determine local interface");
-        let ip = socket
-            .local_addr()
-            .expect("probe local addr should be available")
-            .ip();
-        assert!(
-            !ip.is_loopback() && !ip.is_unspecified(),
-            "test relay ip must be routable and non-special"
-        );
-        ip
-    }
-
-    fn spawn_mock_relay_server(allocated_ports: &[u16]) -> (SocketAddr, thread::JoinHandle<()>) {
-        let relay_ip = discover_test_relay_ip();
-        let socket =
-            UdpSocket::bind(SocketAddr::new(relay_ip, 0)).expect("mock relay socket should bind");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("mock relay timeout should be set");
-        let relay_addr = socket
-            .local_addr()
-            .expect("mock relay local addr should be available");
-        let ports = allocated_ports.to_vec();
-        let handle = thread::spawn(move || {
-            let mut buf = [0u8; 1500];
-            for (index, allocated_port) in ports.into_iter().enumerate() {
-                let (_len, from_addr) = socket
-                    .recv_from(&mut buf)
-                    .expect("mock relay should receive hello");
-                let session_id = [(index as u8).saturating_add(1); 16];
-                let mut ack = Vec::with_capacity(11);
-                ack.push(0x02);
-                ack.extend_from_slice(&session_id);
-                ack.extend_from_slice(&allocated_port.to_be_bytes());
-                socket
-                    .send_to(&ack, from_addr)
-                    .expect("mock relay should send ack");
-            }
-        });
-        (relay_addr, handle)
-    }
-
-    fn spawn_silent_relay_server() -> (SocketAddr, thread::JoinHandle<()>) {
-        let relay_ip = discover_test_relay_ip();
-        let socket =
-            UdpSocket::bind(SocketAddr::new(relay_ip, 0)).expect("silent relay socket should bind");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("silent relay timeout should be set");
-        let relay_addr = socket
-            .local_addr()
-            .expect("silent relay local addr should be available");
-        let handle = thread::spawn(move || {
-            let mut buf = [0u8; 1500];
-            let _ = socket.recv_from(&mut buf);
-            thread::sleep(Duration::from_millis(250));
-        });
-        (relay_addr, handle)
     }
 
     fn build_runtime_with_custom_relay(
@@ -12554,7 +12490,7 @@ mod tests {
 
     #[test]
     fn daemon_runtime_relay_client_upgrades_relay_candidate_endpoint() {
-        let (relay_addr, relay_handle) = spawn_mock_relay_server(&[61_001]);
+        let relay_addr: SocketAddr = "203.0.113.10:40000".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
             "rustynetd-runtime-relay-client-upgrade",
             relay_addr,
@@ -12564,6 +12500,7 @@ mod tests {
             "daemon-local",
             Duration::from_millis(200),
             Duration::from_millis(50),
+            vec![Ok(61_001)],
         ));
 
         runtime.bootstrap();
@@ -12601,15 +12538,12 @@ mod tests {
                 .has_session(&exit_node)
         );
 
-        relay_handle
-            .join()
-            .expect("mock relay server should complete cleanly");
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_relay_client_refreshes_expiring_session_without_forced_reprobe() {
-        let (relay_addr, relay_handle) = spawn_mock_relay_server(&[61_001, 61_002]);
+        let relay_addr: SocketAddr = "203.0.113.11:40001".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
             "rustynetd-runtime-relay-client-refresh",
             relay_addr,
@@ -12619,6 +12553,7 @@ mod tests {
             "daemon-local",
             Duration::from_millis(200),
             Duration::from_millis(50),
+            vec![Ok(61_001), Ok(61_002)],
         ));
         runtime.relay_session_token_ttl_secs = 60;
         runtime.relay_session_refresh_margin_secs = 20;
@@ -12675,15 +12610,12 @@ mod tests {
             initial_status.next_reprobe_unix
         );
 
-        relay_handle
-            .join()
-            .expect("mock relay server should complete cleanly");
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn daemon_runtime_relay_client_failure_fail_closes_when_configured() {
-        let (relay_addr, relay_handle) = spawn_silent_relay_server();
+        let relay_addr: SocketAddr = "203.0.113.12:40002".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
             "rustynetd-runtime-relay-client-fail-closed",
             relay_addr,
@@ -12693,6 +12625,7 @@ mod tests {
             "daemon-local",
             Duration::from_millis(120),
             Duration::from_millis(40),
+            vec![Err(RelayClientError::Timeout)],
         ));
 
         runtime.bootstrap();
@@ -12717,10 +12650,6 @@ mod tests {
                 .expect("relay client should be configured")
                 .has_session(&exit_node)
         );
-
-        relay_handle
-            .join()
-            .expect("silent relay server should complete cleanly");
         let _ = std::fs::remove_dir_all(test_dir);
     }
 

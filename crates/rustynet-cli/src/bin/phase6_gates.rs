@@ -78,8 +78,23 @@ fn run() -> Result<(), i32> {
         &["--all-features"],
     )?;
 
-    if env::var("RUSTYNET_PHASE6_COLLECT_PARITY").ok().as_deref() == Some("1") {
-        run_ops(&root_dir, "collect-platform-parity-bundle", &[])?;
+    let parity_environment = env::var("RUSTYNET_PHASE6_PARITY_ENVIRONMENT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ci".to_string());
+
+    if cfg!(target_os = "macos")
+        || env::var("RUSTYNET_PHASE6_COLLECT_PARITY").ok().as_deref() == Some("1")
+    {
+        run_ops_with_env(
+            &root_dir,
+            "collect-platform-parity-bundle",
+            &[(
+                "RUSTYNET_PHASE6_PARITY_ENVIRONMENT",
+                parity_environment.as_str(),
+            )],
+            &[],
+        )?;
     }
 
     if env::var("RUSTYNET_PHASE6_GENERATE_PARITY_REPORT")
@@ -88,10 +103,6 @@ fn run() -> Result<(), i32> {
         .unwrap_or("1")
         == "1"
     {
-        let parity_environment = env::var("RUSTYNET_PHASE6_PARITY_ENVIRONMENT")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "ci".to_string());
         run_ops_with_env(
             &root_dir,
             "generate-platform-parity-report",
@@ -176,31 +187,6 @@ fn run_required_test(
             eprintln!(
                 "failed to execute required test helper for package={package} filter={test_filter}: {err}"
             );
-            1
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(status_code(status))
-    }
-}
-
-fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[&str]) -> Result<(), i32> {
-    let status = Command::new("cargo")
-        .current_dir(root_dir)
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "rustynet-cli",
-            "--",
-            "ops",
-            ops_subcommand,
-        ])
-        .args(args)
-        .status()
-        .map_err(|err| {
-            eprintln!("failed to run ops {ops_subcommand}: {err}");
             1
         })?;
     if status.success() {

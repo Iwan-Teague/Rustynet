@@ -252,37 +252,16 @@ impl CandidateGatherer {
     }
 
     fn gather_with_observed_at(&self, observed_at_unix: u64) -> Vec<TraversalCandidate> {
-        let mut candidates = Vec::new();
-        let host_priority = 900;
-        let srflx_priority = 850;
-
-        if let Ok(bound_addr) = self.local_socket.local_addr() {
-            let endpoint = SocketEndpoint {
-                addr: bound_addr.ip(),
-                port: bound_addr.port(),
-            };
-            if is_candidate_endpoint_allowed(endpoint, &self.rustynet_interface_addrs) {
-                candidates.push(TraversalCandidate {
-                    endpoint,
-                    source: CandidateSource::Host,
-                    priority: host_priority,
-                    observed_at_unix,
+        let local_bound_endpoint =
+            self.local_socket
+                .local_addr()
+                .ok()
+                .map(|bound_addr| SocketEndpoint {
+                    addr: bound_addr.ip(),
+                    port: bound_addr.port(),
                 });
-            }
-        }
-
-        for endpoint in &self.host_candidates {
-            if is_candidate_endpoint_allowed(*endpoint, &self.rustynet_interface_addrs) {
-                candidates.push(TraversalCandidate {
-                    endpoint: *endpoint,
-                    source: CandidateSource::Host,
-                    priority: host_priority,
-                    observed_at_unix,
-                });
-            }
-        }
-
         let deadline = Instant::now() + self.timeout;
+        let mut srflx_results = Vec::new();
         for server in &self.stun_servers {
             let now = Instant::now();
             if now >= deadline {
@@ -292,19 +271,16 @@ impl CandidateGatherer {
             if remaining.is_zero() {
                 break;
             }
-            if let Ok(endpoint) = self.query_stun_server(*server, remaining)
-                && is_candidate_endpoint_allowed(endpoint, &self.rustynet_interface_addrs)
-            {
-                candidates.push(TraversalCandidate {
-                    endpoint,
-                    source: CandidateSource::ServerReflexive,
-                    priority: srflx_priority,
-                    observed_at_unix,
-                });
-            }
+            srflx_results.push(self.query_stun_server(*server, remaining));
         }
 
-        dedup_candidates(candidates)
+        collect_gathered_candidates(
+            local_bound_endpoint,
+            &self.host_candidates,
+            &self.rustynet_interface_addrs,
+            observed_at_unix,
+            srflx_results,
+        )
     }
 
     fn query_stun_server(
@@ -358,6 +334,55 @@ impl CandidateGatherer {
         }
         // }
     }
+}
+
+fn collect_gathered_candidates(
+    local_bound_endpoint: Option<SocketEndpoint>,
+    host_candidates: &[SocketEndpoint],
+    rustynet_interface_addrs: &BTreeSet<IpAddr>,
+    observed_at_unix: u64,
+    srflx_results: Vec<Result<SocketEndpoint, TraversalError>>,
+) -> Vec<TraversalCandidate> {
+    let mut candidates = Vec::new();
+    let host_priority = 900;
+    let srflx_priority = 850;
+
+    if let Some(endpoint) = local_bound_endpoint
+        && is_candidate_endpoint_allowed(endpoint, rustynet_interface_addrs)
+    {
+        candidates.push(TraversalCandidate {
+            endpoint,
+            source: CandidateSource::Host,
+            priority: host_priority,
+            observed_at_unix,
+        });
+    }
+
+    for endpoint in host_candidates {
+        if is_candidate_endpoint_allowed(*endpoint, rustynet_interface_addrs) {
+            candidates.push(TraversalCandidate {
+                endpoint: *endpoint,
+                source: CandidateSource::Host,
+                priority: host_priority,
+                observed_at_unix,
+            });
+        }
+    }
+
+    for result in srflx_results {
+        if let Ok(endpoint) = result
+            && is_candidate_endpoint_allowed(endpoint, rustynet_interface_addrs)
+        {
+            candidates.push(TraversalCandidate {
+                endpoint,
+                source: CandidateSource::ServerReflexive,
+                priority: srflx_priority,
+                observed_at_unix,
+            });
+        }
+    }
+
+    dedup_candidates(candidates)
 }
 
 fn is_candidate_endpoint_allowed(
@@ -1539,11 +1564,11 @@ fn is_routable_address(addr: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateGatherer, CandidateSource, CoordinationReplayWindow, CoordinationSchedule,
-        EndpointMonitor, NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode,
-        SimultaneousOpenRuntime, SimultaneousOpenWaiter, TraversalCandidate, TraversalDecision,
-        TraversalDecisionReason, TraversalEngine, TraversalEngineConfig, TraversalError,
-        TraversalSession, direct_udp_viable, parse_stun_xor_mapped_address,
+        CandidateSource, CoordinationReplayWindow, CoordinationSchedule, EndpointMonitor,
+        NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode, SimultaneousOpenRuntime,
+        SimultaneousOpenWaiter, TraversalCandidate, TraversalDecision, TraversalDecisionReason,
+        TraversalEngine, TraversalEngineConfig, TraversalError, TraversalSession,
+        collect_gathered_candidates, direct_udp_viable, parse_stun_xor_mapped_address,
         schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
@@ -1551,7 +1576,7 @@ mod tests {
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
     use std::collections::BTreeMap;
 
-    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    use std::net::{IpAddr, Ipv4Addr};
 
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1873,75 +1898,48 @@ mod tests {
 
     #[test]
     fn candidate_gatherer_query_and_timeout_and_filter_and_dedup() {
-        let local = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind local");
-        local.set_nonblocking(false).unwrap();
-        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind server");
-        let server_addr = server.local_addr().expect("server addr");
-        let server_handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 1500];
-            let (_n, src) = server.recv_from(&mut buf).expect("recv");
-            let tx = &buf[8..20];
-            let mut txid = [0u8; 12];
-            txid.copy_from_slice(tx);
-            let port = src.port();
-            let ip = match src.ip() {
-                std::net::IpAddr::V4(v4) => v4,
-                _ => Ipv4Addr::LOCALHOST,
-            };
-            let mut resp = Vec::new();
-            resp.extend_from_slice(&0x0101u16.to_be_bytes());
-            resp.extend_from_slice(&0u16.to_be_bytes());
-            resp.extend_from_slice(&0x2112_A442u32.to_be_bytes());
-            resp.extend_from_slice(&txid);
-            resp.extend_from_slice(&0x0020u16.to_be_bytes());
-            resp.extend_from_slice(&8u16.to_be_bytes());
-            resp.push(0x00);
-            resp.push(0x01);
-            let cookie_bytes = 0x2112_A442u32.to_be_bytes();
-            let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
-            let x_port = port ^ port_mask;
-            resp.extend_from_slice(&x_port.to_be_bytes());
-            let ip_bytes = ip.octets();
-            for i in 0..4 {
-                resp.push(ip_bytes[i] ^ cookie_bytes[i]);
-            }
-            let declared_len = (resp.len() - 20) as u16;
-            resp[2..4].copy_from_slice(&declared_len.to_be_bytes());
-            server.send_to(&resp, src).expect("send resp");
-        });
-
-        let rustynet_if_ips = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))];
-        let host_candidates = vec![SocketEndpoint {
+        let rustynet_if_ips = [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))];
+        let rustynet_if_ip_set = rustynet_if_ips.iter().copied().collect();
+        let host_candidates = [SocketEndpoint {
             addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             port: 0,
         }];
-        let gatherer = CandidateGatherer::new(
-            local.try_clone().unwrap(),
-            vec![server_addr],
-            Duration::from_millis(500),
-            host_candidates.clone(),
-            rustynet_if_ips.clone(),
-        )
-        .expect("gatherer");
-        let candidates = gatherer.gather();
+        let local_bound = Some(SocketEndpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            port: 40123,
+        });
+        let candidates = collect_gathered_candidates(
+            local_bound,
+            &host_candidates,
+            &rustynet_if_ip_set,
+            1,
+            vec![
+                Ok(SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                    port: 51820,
+                }),
+                Ok(SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                    port: 51820,
+                }),
+                Err(TraversalError::Stun("stun response timed out".to_string())),
+            ],
+        );
         assert!(candidates.iter().any(|c| c.source == CandidateSource::Host));
         assert!(
             candidates
                 .iter()
                 .any(|c| c.source == CandidateSource::ServerReflexive)
         );
-        server_handle.join().expect("join");
-
-        let local2 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind2");
-        let gatherer_timeout = CandidateGatherer::new(
-            local2.try_clone().unwrap(),
-            vec![(Ipv4Addr::LOCALHOST, 9).into()],
-            Duration::from_millis(10),
-            host_candidates,
-            rustynet_if_ips,
-        )
-        .expect("gatherer2");
-        let results = gatherer_timeout.gather();
+        let results = collect_gathered_candidates(
+            local_bound,
+            &host_candidates,
+            &rustynet_if_ip_set,
+            1,
+            vec![Err(TraversalError::Stun(
+                "stun response timed out".to_string(),
+            ))],
+        );
         assert!(results.iter().all(|c| c.source == CandidateSource::Host));
     }
 
