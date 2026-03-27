@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -339,16 +340,6 @@ fn build_report(
     writeln!(report, "- wireguard_interface: {}", config.wg_interface).unwrap();
     writeln!(report, "- route_table: {DEFAULT_ROUTE_TABLE}").unwrap();
     writeln!(report, "- privileged_coverage: {}", sudo.summary).unwrap();
-    writeln!(
-        report,
-        "- probe_targets: {}",
-        if config.probe_targets.is_empty() {
-            "none".to_string()
-        } else {
-            config.probe_targets.join(", ")
-        }
-    )
-    .unwrap();
     writeln!(report).unwrap();
     writeln!(
         report,
@@ -373,11 +364,8 @@ fn build_report(
             sudo,
         ),
     );
-    append_command_section(
-        &mut report,
-        "Routes",
-        &run_command(CommandSpec::plain("ip route", "ip", &["route"]), sudo),
-    );
+    let routes = run_command(CommandSpec::plain("ip route", "ip", &["route"]), sudo);
+    append_command_section(&mut report, "Routes", &routes);
     append_command_section(
         &mut report,
         "Routing Rules",
@@ -386,18 +374,15 @@ fn build_report(
             sudo,
         ),
     );
-    append_command_section(
-        &mut report,
-        "RustyNet Route Table",
-        &run_command(
-            CommandSpec::plain(
-                "ip route show table 51820",
-                "ip",
-                &["route", "show", "table", DEFAULT_ROUTE_TABLE],
-            ),
-            sudo,
+    let route_table = run_command(
+        CommandSpec::plain(
+            "ip route show table 51820",
+            "ip",
+            &["route", "show", "table", DEFAULT_ROUTE_TABLE],
         ),
+        sudo,
     );
+    append_command_section(&mut report, "RustyNet Route Table", &route_table);
 
     let listeners = run_command(
         CommandSpec::prefer_root("ss -ltnup", "ss", &["-ltnup"]),
@@ -438,18 +423,24 @@ fn build_report(
     );
     append_command_section(&mut report, "RustyNet Netcheck", &rustynet_netcheck);
 
-    append_command_section(
-        &mut report,
-        "WireGuard Endpoints",
-        &run_command(
-            CommandSpec::prefer_root(
-                &format!("wg show {} endpoints", config.wg_interface),
-                "wg",
-                &["show", &config.wg_interface, "endpoints"],
-            ),
-            sudo,
+    let wg_endpoints = run_command(
+        CommandSpec::prefer_root(
+            &format!("wg show {} endpoints", config.wg_interface),
+            "wg",
+            &["show", &config.wg_interface, "endpoints"],
         ),
+        sudo,
     );
+    append_command_section(&mut report, "WireGuard Endpoints", &wg_endpoints);
+    let wg_allowed_ips = run_command(
+        CommandSpec::prefer_root(
+            &format!("wg show {} allowed-ips", config.wg_interface),
+            "wg",
+            &["show", &config.wg_interface, "allowed-ips"],
+        ),
+        sudo,
+    );
+    append_command_section(&mut report, "WireGuard Allowed IPs", &wg_allowed_ips);
     append_command_section(
         &mut report,
         "WireGuard Latest Handshakes",
@@ -522,7 +513,26 @@ fn build_report(
         filter_nft_lines,
     );
 
-    for target in &config.probe_targets {
+    let resolved_probe_targets = resolve_probe_targets(
+        config,
+        &routes,
+        &route_table,
+        &wg_endpoints,
+        &wg_allowed_ips,
+    );
+    writeln!(
+        report,
+        "- probe_targets: {}",
+        if resolved_probe_targets.is_empty() {
+            "none".to_string()
+        } else {
+            resolved_probe_targets.join(", ")
+        }
+    )
+    .unwrap();
+    writeln!(report).unwrap();
+
+    for target in &resolved_probe_targets {
         append_command_section(
             &mut report,
             &format!("Route Probe {target}"),
@@ -578,6 +588,159 @@ fn build_stat_args() -> Vec<String> {
     let mut args = vec!["-c".to_string(), "%n size=%s mtime=%y".to_string()];
     args.extend(STATE_PATHS.iter().map(|path| (*path).to_string()));
     args
+}
+
+fn resolve_probe_targets(
+    config: &Config,
+    routes: &CommandRecord,
+    route_table: &CommandRecord,
+    wg_endpoints: &CommandRecord,
+    wg_allowed_ips: &CommandRecord,
+) -> Vec<String> {
+    let mut targets = BTreeSet::new();
+    for target in &config.probe_targets {
+        let trimmed = target.trim();
+        if !trimmed.is_empty() {
+            targets.insert(trimmed.to_string());
+        }
+    }
+
+    for target in auto_probe_targets(routes, route_table, wg_endpoints, wg_allowed_ips) {
+        targets.insert(target);
+    }
+
+    targets.into_iter().collect()
+}
+
+fn auto_probe_targets(
+    routes: &CommandRecord,
+    route_table: &CommandRecord,
+    wg_endpoints: &CommandRecord,
+    wg_allowed_ips: &CommandRecord,
+) -> Vec<String> {
+    let mut targets = BTreeSet::new();
+
+    if routes.exit_code == Some(0) {
+        for target in parse_default_gateway_targets(&routes.output) {
+            targets.insert(target);
+        }
+    }
+    if route_table.exit_code == Some(0) {
+        for target in parse_host_route_targets(&route_table.output) {
+            targets.insert(target);
+        }
+    }
+    if wg_endpoints.exit_code == Some(0) {
+        for target in parse_wg_endpoint_targets(&wg_endpoints.output) {
+            targets.insert(target);
+        }
+    }
+    if wg_allowed_ips.exit_code == Some(0) {
+        for target in parse_wg_allowed_ip_targets(&wg_allowed_ips.output) {
+            targets.insert(target);
+        }
+    }
+
+    targets.into_iter().collect()
+}
+
+fn parse_default_gateway_targets(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "default" || parts.next()? != "via" {
+                return None;
+            }
+            parse_private_probe_ipv4(parts.next()?)
+        })
+        .collect()
+}
+
+fn parse_host_route_targets(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let destination = line.split_whitespace().next()?;
+            parse_private_probe_cidr_or_ip(destination)
+        })
+        .collect()
+}
+
+fn parse_wg_endpoint_targets(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _peer = parts.next()?;
+            let endpoint = parts.next()?;
+            if endpoint == "(none)" || endpoint == "off" {
+                return None;
+            }
+            let host = endpoint.rsplit_once(':').map_or(endpoint, |(host, _)| host);
+            parse_private_probe_ipv4(host.trim_matches(['[', ']']))
+        })
+        .collect()
+}
+
+fn parse_wg_allowed_ip_targets(output: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(_peer) = parts.next() else {
+            continue;
+        };
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        for entry in rest.split(',') {
+            if let Some(target) = parse_private_probe_cidr_or_ip(entry.trim()) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+fn parse_private_probe_cidr_or_ip(value: &str) -> Option<String> {
+    let token = value.trim();
+    if token.is_empty() || token == "default" {
+        return None;
+    }
+    let candidate = token
+        .split_once('/')
+        .map_or(token, |(ip, prefix)| if prefix == "32" { ip } else { "" });
+    parse_private_probe_ipv4(candidate)
+}
+
+fn parse_private_probe_ipv4(value: &str) -> Option<String> {
+    let octets = parse_ipv4_octets(value)?;
+    if is_private_or_mesh_ipv4(&octets) {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_ipv4_octets(value: &str) -> Option<[u8; 4]> {
+    let mut octets = [0u8; 4];
+    let mut parts = value.split('.');
+    for slot in &mut octets {
+        *slot = parts.next()?.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
+}
+
+fn is_private_or_mesh_ipv4(octets: &[u8; 4]) -> bool {
+    match octets {
+        [10, _, _, _] => true,
+        [172, second, _, _] if (16..=31).contains(second) => true,
+        [192, 168, _, _] => true,
+        [100, second, _, _] if (64..=127).contains(second) => true,
+        [127, _, _, _] => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -989,6 +1152,7 @@ Notes:
   - Output is markdown and is written with 0600 permissions.
   - The collector excludes private keys, passphrases, and signing secrets.
   - rustynet status/netcheck are run from the pulled repository via cargo for commit-bound evidence.
+  - With no --probe-target flags, the collector auto-discovers private/mesh probe targets from current routes and WireGuard state.
 "
 }
 
@@ -1073,5 +1237,45 @@ tcp   LISTEN 0      128    127.0.0.1:8080  0.0.0.0:*     users:((\"python\",pid=
         assert!(filtered.contains("0.0.0.0:22"));
         assert!(filtered.contains("0.0.0.0:51820"));
         assert!(!filtered.contains("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn auto_probe_targets_are_discovered_from_private_state() {
+        let routes = CommandRecord {
+            command_display: "ip route".to_string(),
+            exit_code: Some(0),
+            output: "default via 192.168.64.1 dev eth0\n10.0.0.0/24 dev rustynet0".to_string(),
+            ran_with_sudo: false,
+        };
+        let route_table = CommandRecord {
+            command_display: "ip route show table 51820".to_string(),
+            exit_code: Some(0),
+            output: "100.109.33.213 dev rustynet0 scope link\n1.1.1.1 dev rustynet0".to_string(),
+            ran_with_sudo: false,
+        };
+        let wg_endpoints = CommandRecord {
+            command_display: "wg show rustynet0 endpoints".to_string(),
+            exit_code: Some(0),
+            output: "peer-a\t192.168.64.22:51820\npeer-b\t203.0.113.10:51820".to_string(),
+            ran_with_sudo: false,
+        };
+        let wg_allowed_ips = CommandRecord {
+            command_display: "wg show rustynet0 allowed-ips".to_string(),
+            exit_code: Some(0),
+            output: "peer-a\t100.109.33.213/32, 0.0.0.0/0\npeer-b\t192.168.128.30/32".to_string(),
+            ran_with_sudo: false,
+        };
+
+        let targets = auto_probe_targets(&routes, &route_table, &wg_endpoints, &wg_allowed_ips);
+
+        assert_eq!(
+            targets,
+            vec![
+                "100.109.33.213".to_string(),
+                "192.168.128.30".to_string(),
+                "192.168.64.1".to_string(),
+                "192.168.64.22".to_string()
+            ]
+        );
     }
 }
