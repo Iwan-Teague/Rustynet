@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -554,6 +554,7 @@ pub struct LinuxCommandSystem {
     prior_ipv4_forwarding: Option<bool>,
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
+    traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,7 +598,13 @@ impl LinuxCommandSystem {
             prior_ipv4_forwarding: None,
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
+            traversal_bootstrap_allow_endpoints: Vec::new(),
         })
+    }
+
+    pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
+        self.traversal_bootstrap_allow_endpoints = dedupe_socket_addrs(endpoints);
+        self
     }
 
     fn run(&self, program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), SystemError> {
@@ -704,6 +711,24 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    fn apply_traversal_bootstrap_allow_rules(&self, table: &str) -> Result<(), SystemError> {
+        for endpoint in &self.traversal_bootstrap_allow_endpoints {
+            let args = Self::traversal_bootstrap_allow_rule_args(
+                table,
+                self.egress_interface.as_str(),
+                *endpoint,
+            );
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            self.run(PrivilegedCommandProgram::Nft, &arg_refs)
+                .map_err(|err| {
+                    SystemError::FirewallApplyFailed(format!(
+                        "traversal bootstrap allow rule failed for {endpoint}: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     fn apply_fail_closed_management_bypass_routes(&self) -> Result<(), SystemError> {
         if !self.fail_closed_ssh_allow {
             return Ok(());
@@ -792,6 +817,31 @@ impl LinuxCommandSystem {
         args.push("table".to_string());
         args.push("51820".to_string());
         args
+    }
+
+    fn traversal_bootstrap_allow_rule_args(
+        table: &str,
+        egress_interface: &str,
+        endpoint: SocketAddr,
+    ) -> Vec<String> {
+        vec![
+            "add".to_string(),
+            "rule".to_string(),
+            "inet".to_string(),
+            table.to_string(),
+            "killswitch".to_string(),
+            "oifname".to_string(),
+            egress_interface.to_string(),
+            nft_family_for_ip(endpoint.ip()).to_string(),
+            "daddr".to_string(),
+            endpoint.ip().to_string(),
+            "udp".to_string(),
+            "dport".to_string(),
+            endpoint.port().to_string(),
+            "accept".to_string(),
+            "comment".to_string(),
+            "rustynet_traversal_bootstrap".to_string(),
+        ]
     }
 
     fn set_ipv4_forwarding(&self, enabled: bool) -> Result<(), SystemError> {
@@ -895,6 +945,7 @@ impl LinuxCommandSystem {
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.apply_fail_closed_management_allow_rules(table.as_str())?;
+        self.apply_traversal_bootstrap_allow_rules(table.as_str())?;
         self.firewall_table = Some(table.clone());
         Ok(table)
     }
@@ -1521,6 +1572,7 @@ pub struct MacosCommandSystem {
     allow_egress_interface: bool,
     ipv6_blocked: bool,
     dns_protected: bool,
+    traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
 }
 
 impl MacosCommandSystem {
@@ -1554,7 +1606,13 @@ impl MacosCommandSystem {
             allow_egress_interface: false,
             ipv6_blocked: false,
             dns_protected: false,
+            traversal_bootstrap_allow_endpoints: Vec::new(),
         })
+    }
+
+    pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
+        self.traversal_bootstrap_allow_endpoints = dedupe_socket_addrs(endpoints);
+        self
     }
 
     fn run(&self, program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), SystemError> {
@@ -1657,6 +1715,15 @@ impl MacosCommandSystem {
                     cidr
                 ));
             }
+        }
+        for endpoint in &self.traversal_bootstrap_allow_endpoints {
+            rules.push_str(&format!(
+                "pass out quick {} proto udp on {} to {} port {} keep state\n",
+                pf_family_for_ip(endpoint.ip()),
+                self.egress_interface,
+                endpoint.ip(),
+                endpoint.port()
+            ));
         }
         if self.ipv6_blocked {
             rules.push_str("block drop out quick inet6 all\n");
@@ -2061,6 +2128,31 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::Linux(system) => system.block_all_egress(),
             RuntimeSystem::Macos(system) => system.block_all_egress(),
         }
+    }
+}
+
+fn dedupe_socket_addrs(endpoints: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for endpoint in endpoints {
+        if seen.insert(endpoint) {
+            deduped.push(endpoint);
+        }
+    }
+    deduped
+}
+
+fn nft_family_for_ip(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "ip",
+        IpAddr::V6(_) => "ip6",
+    }
+}
+
+fn pf_family_for_ip(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "inet",
+        IpAddr::V6(_) => "inet6",
     }
 }
 
@@ -4590,6 +4682,38 @@ mod tests {
     }
 
     #[test]
+    fn traversal_bootstrap_allow_rule_args_use_ipv4_endpoint_on_egress_interface() {
+        let args = LinuxCommandSystem::traversal_bootstrap_allow_rule_args(
+            "rustynet_g1",
+            "enp0s1",
+            "203.0.113.10:3478"
+                .parse::<SocketAddr>()
+                .expect("endpoint should parse"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "add".to_string(),
+                "rule".to_string(),
+                "inet".to_string(),
+                "rustynet_g1".to_string(),
+                "killswitch".to_string(),
+                "oifname".to_string(),
+                "enp0s1".to_string(),
+                "ip".to_string(),
+                "daddr".to_string(),
+                "203.0.113.10".to_string(),
+                "udp".to_string(),
+                "dport".to_string(),
+                "3478".to_string(),
+                "accept".to_string(),
+                "comment".to_string(),
+                "rustynet_traversal_bootstrap".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn peer_endpoint_bypass_route_args_use_ipv6_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "fd00::10".parse().expect("valid ipv6"),
@@ -4711,6 +4835,26 @@ mod tests {
         assert!(rules.contains(
             "pass out quick inet proto tcp from any port 22 to 192.168.128.0/24 keep state"
         ));
+    }
+
+    #[test]
+    fn macos_render_pf_rules_allow_configured_traversal_bootstrap_endpoints() {
+        let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct")
+            .with_traversal_bootstrap_allow_endpoints(vec![
+                "203.0.113.10:3478"
+                    .parse::<SocketAddr>()
+                    .expect("stun endpoint should parse"),
+            ]);
+        let rules = system
+            .render_pf_rules(true)
+            .expect("rule render should succeed");
+        assert!(
+            rules.contains(
+                "pass out quick inet proto udp on en0 to 203.0.113.10 port 3478 keep state"
+            )
+        );
+        assert!(rules.contains("block drop out quick all"));
     }
 
     #[test]

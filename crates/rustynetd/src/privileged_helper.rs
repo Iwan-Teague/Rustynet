@@ -3,8 +3,8 @@
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::IpAddr;
 use std::net::Shutdown;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -993,6 +993,14 @@ fn is_cidr_for_nft_family(cidr: &str, family: &str) -> bool {
     }
 }
 
+fn is_exact_ip_for_nft_family(address: &str, family: &str) -> bool {
+    match family {
+        "ip" => address.parse::<Ipv4Addr>().is_ok(),
+        "ip6" => address.parse::<Ipv6Addr>().is_ok(),
+        _ => false,
+    }
+}
+
 fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
     match args {
         [
@@ -1114,6 +1122,31 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         ] if is_owned_failclosed_table_token(table)
             && is_interface_name(incoming_interface)
             && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            family,
+            "daddr",
+            address,
+            "udp",
+            "dport",
+            port,
+            "accept",
+            "comment",
+            "rustynet_traversal_bootstrap",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(interface)
+            && is_nft_daddr_family_token(family)
+            && is_exact_ip_for_nft_family(address, family)
+            && is_u16_token(port) =>
         {
             Ok(())
         }
@@ -1634,6 +1667,59 @@ mod tests {
             ],
         )
         .expect("management ssh fail-closed rule schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_traversal_bootstrap_allow_rule_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "ip",
+                "daddr",
+                "203.0.113.10",
+                "udp",
+                "dport",
+                "3478",
+                "accept",
+                "comment",
+                "rustynet_traversal_bootstrap",
+            ],
+        )
+        .expect("traversal bootstrap allow rule schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_traversal_bootstrap_allow_rule_with_cidr() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "ip",
+                "daddr",
+                "203.0.113.0/24",
+                "udp",
+                "dport",
+                "3478",
+                "accept",
+                "comment",
+                "rustynet_traversal_bootstrap",
+            ],
+        )
+        .expect_err("cidr traversal bootstrap rule schema should be rejected");
+        assert!(err.contains("unsupported nft add rule argument schema"));
     }
 
     #[test]
