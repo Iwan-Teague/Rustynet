@@ -165,6 +165,8 @@ pub struct GenerateCrossNetworkRemoteExitReportConfig {
     pub nat_profile: String,
     pub impairment_profile: String,
     pub check_overrides: Vec<String>,
+    pub path_status_line: Option<String>,
+    pub path_evidence_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +296,81 @@ fn collect_existing_artifacts(paths: &[PathBuf]) -> Vec<String> {
         }
     }
     collected
+}
+
+fn extract_inline_field(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
+    let path_mode = extract_inline_field(status_line, "path_mode")
+        .ok_or_else(|| "status line missing path_mode".to_string())?;
+    let path_programmed_mode = extract_inline_field(status_line, "path_programmed_mode")
+        .ok_or_else(|| "status line missing path_programmed_mode".to_string())?;
+    let path_live_proven = match extract_inline_field(status_line, "path_live_proven")
+        .ok_or_else(|| "status line missing path_live_proven".to_string())?
+        .as_str()
+    {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(format!(
+                "status line path_live_proven must be true|false, got {other}"
+            ));
+        }
+    };
+    let path_latest_live_handshake_unix =
+        match extract_inline_field(status_line, "path_latest_live_handshake_unix") {
+            Some(value) if value == "none" => None,
+            Some(value) => Some(value.parse::<u64>().map_err(|err| {
+                format!("status line path_latest_live_handshake_unix invalid: {err}")
+            })?),
+            None => None,
+        };
+    let relay_session_state = extract_inline_field(status_line, "relay_session_state");
+
+    Ok(json!({
+        "path_mode": path_mode,
+        "path_programmed_mode": path_programmed_mode,
+        "path_live_proven": path_live_proven,
+        "path_latest_live_handshake_unix": path_latest_live_handshake_unix,
+        "relay_session_state": relay_session_state,
+    }))
+}
+
+fn path_evidence_from_report(path: &Path) -> Result<Value, String> {
+    let report_path = resolve_path(path)?;
+    let payload = parse_report_payload(report_path.as_path())?;
+    payload
+        .as_object()
+        .and_then(|object| object.get("path_evidence"))
+        .cloned()
+        .ok_or_else(|| format!("{}: report is missing path_evidence", report_path.display()))
+}
+
+fn resolve_optional_path_evidence(
+    status: &str,
+    path_status_line: Option<String>,
+    path_evidence_report: Option<PathBuf>,
+) -> Result<Option<Value>, String> {
+    let resolved = if let Some(status_line) = non_empty_option(path_status_line) {
+        path_evidence_from_status_line(status_line.as_str()).map(Some)
+    } else if let Some(path_evidence_report) = path_evidence_report {
+        path_evidence_from_report(path_evidence_report.as_path()).map(Some)
+    } else {
+        Ok(None)
+    };
+
+    match resolved {
+        Ok(path_evidence) => Ok(path_evidence),
+        Err(_err) if status == CHECK_FAIL => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn current_git_commit() -> Result<String, String> {
@@ -631,6 +708,91 @@ fn validate_report_payload(
             if all_required_checks_pass {
                 problems
                     .push("status=fail requires at least one required check to fail".to_string());
+            }
+        }
+    }
+
+    let path_evidence = payload_object
+        .get("path_evidence")
+        .and_then(Value::as_object);
+    let requires_live_path_evidence =
+        status == CHECK_PASS && !matches!(spec.suite, "cross_network_traversal_adversarial");
+    if requires_live_path_evidence && path_evidence.is_none() {
+        problems.push("path_evidence must be present for pass reports".to_string());
+    }
+    if let Some(path_evidence) = path_evidence {
+        let path_mode = value_as_non_empty_string(path_evidence.get("path_mode"));
+        let path_programmed_mode =
+            value_as_non_empty_string(path_evidence.get("path_programmed_mode"));
+        let path_live_proven = path_evidence
+            .get("path_live_proven")
+            .and_then(Value::as_bool);
+        let path_latest_live_handshake_unix = path_evidence
+            .get("path_latest_live_handshake_unix")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0);
+        let relay_session_state =
+            value_as_non_empty_string(path_evidence.get("relay_session_state"));
+
+        if requires_live_path_evidence {
+            if path_mode.is_none() {
+                problems.push("path_evidence.path_mode must be a non-empty string".to_string());
+            }
+            if path_programmed_mode.is_none() {
+                problems.push(
+                    "path_evidence.path_programmed_mode must be a non-empty string".to_string(),
+                );
+            }
+            if path_live_proven != Some(true) {
+                problems.push("path_evidence.path_live_proven must be true".to_string());
+            }
+            if path_latest_live_handshake_unix.is_none() {
+                problems.push(
+                    "path_evidence.path_latest_live_handshake_unix must be a positive integer"
+                        .to_string(),
+                );
+            }
+        }
+
+        if let Some(path_mode) = path_mode.as_deref() {
+            if requires_live_path_evidence && path_mode.ends_with("_programmed") {
+                problems.push(
+                    "path_evidence.path_mode must represent a live path, not a programmed path"
+                        .to_string(),
+                );
+            }
+            match spec.suite {
+                "cross_network_direct_remote_exit" if status == CHECK_PASS => {
+                    if path_mode != "direct_active" {
+                        problems.push(
+                            "direct remote-exit pass reports require path_evidence.path_mode=direct_active"
+                                .to_string(),
+                        );
+                    }
+                }
+                "cross_network_relay_remote_exit" if status == CHECK_PASS => {
+                    if path_mode != "relay_active" {
+                        problems.push(
+                            "relay remote-exit pass reports require path_evidence.path_mode=relay_active"
+                                .to_string(),
+                        );
+                    }
+                    if relay_session_state.as_deref() != Some("live") {
+                        problems.push(
+                            "relay remote-exit pass reports require path_evidence.relay_session_state=live"
+                                .to_string(),
+                        );
+                    }
+                }
+                "cross_network_failback_roaming" if status == CHECK_PASS => {
+                    if path_mode != "direct_active" {
+                        problems.push(
+                            "failback pass reports require path_evidence.path_mode=direct_active"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1194,6 +1356,16 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
             config.implementation_state.trim().to_string()
         },
     });
+    if let Some(path_evidence) = resolve_optional_path_evidence(
+        &status,
+        config.path_status_line,
+        config.path_evidence_report,
+    )? {
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .insert("path_evidence".to_string(), path_evidence);
+    }
     if status == CHECK_FAIL {
         let failure_summary = if config.failure_summary.trim().is_empty() {
             format!("{} is not implemented yet", spec.title)
@@ -1643,6 +1815,22 @@ mod tests {
             checks.insert((*check).to_string(), Value::String(CHECK_PASS.to_string()));
         }
 
+        let path_mode = match spec.suite {
+            "cross_network_direct_remote_exit" => "direct_active",
+            "cross_network_relay_remote_exit" => "relay_active",
+            "cross_network_failback_roaming" => "direct_active",
+            _ => "direct_active",
+        };
+        let path_programmed_mode = match spec.suite {
+            "cross_network_relay_remote_exit" => "relay_programmed",
+            _ => "direct_programmed",
+        };
+        let relay_session_state = if spec.suite == "cross_network_relay_remote_exit" {
+            "live"
+        } else {
+            "unused"
+        };
+
         let mut payload = json!({
             "schema_version": SCHEMA_VERSION,
             "phase": PHASE_NAME,
@@ -1659,6 +1847,18 @@ mod tests {
             "log_artifacts": [log_path.display().to_string()],
             "implementation_state": "live_measured_validator",
         });
+        if status == CHECK_PASS && spec.suite != "cross_network_traversal_adversarial" {
+            payload.as_object_mut().expect("payload object").insert(
+                "path_evidence".to_string(),
+                json!({
+                    "path_mode": path_mode,
+                    "path_programmed_mode": path_programmed_mode,
+                    "path_live_proven": true,
+                    "path_latest_live_handshake_unix": unix_now(),
+                    "relay_session_state": relay_session_state,
+                }),
+            );
+        }
         if status == CHECK_FAIL {
             payload.as_object_mut().expect("payload object").insert(
                 "failure_summary".to_string(),
@@ -1727,6 +1927,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_report_payload_rejects_pass_status_without_live_path_evidence() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_direct_remote_exit").expect("direct spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .remove("path_evidence");
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors
+                .iter()
+                .any(|entry| entry.contains("path_evidence must be present")),
+            "expected missing path evidence error, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports() {
         let temp_dir = TempDir::create().expect("temp dir");
         for spec in REPORT_SPECS {
@@ -1740,5 +1963,104 @@ mod tests {
             &default_required_nat_profiles(),
         )
         .expect("complete canonical reports should validate");
+    }
+
+    #[test]
+    fn generate_fail_report_ignores_missing_inherited_path_evidence() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let child_report_path = temp_dir.path().join("child-fail-report.json");
+        let source_path = temp_dir.path().join("source.log");
+        let log_path = temp_dir.path().join("parent.log");
+        let report_path = temp_dir.path().join("parent-report.json");
+        fs::write(&source_path, "source\n").expect("write source artifact");
+        fs::write(&child_report_path, "{\n  \"status\": \"fail\"\n}\n")
+            .expect("write child fail report");
+
+        let config = GenerateCrossNetworkRemoteExitReportConfig {
+            suite: "cross_network_remote_exit_dns".to_string(),
+            report_path: report_path.clone(),
+            log_path,
+            status: CHECK_FAIL.to_string(),
+            failure_summary: "direct child failed before live path proof".to_string(),
+            environment: "unit_test".to_string(),
+            implementation_state: "live_measured_validator".to_string(),
+            source_artifacts: vec![source_path],
+            log_artifacts: Vec::new(),
+            client_host: Some("client-host".to_string()),
+            exit_host: Some("exit-host".to_string()),
+            relay_host: None,
+            probe_host: None,
+            client_network_id: Some("client-net".to_string()),
+            exit_network_id: Some("exit-net".to_string()),
+            relay_network_id: None,
+            nat_profile: "baseline_lan".to_string(),
+            impairment_profile: "none".to_string(),
+            check_overrides: Vec::new(),
+            path_status_line: None,
+            path_evidence_report: Some(child_report_path),
+        };
+
+        execute_ops_generate_cross_network_remote_exit_report(config)
+            .expect("fail report should still be written");
+
+        let payload = parse_report_payload(report_path.as_path()).expect("parse generated report");
+        assert_eq!(
+            payload
+                .get("status")
+                .and_then(Value::as_str)
+                .expect("status should be present"),
+            CHECK_FAIL
+        );
+        assert!(
+            payload.get("path_evidence").is_none(),
+            "fail report should omit inherited path evidence when child evidence is unavailable"
+        );
+    }
+
+    #[test]
+    fn generate_pass_report_rejects_missing_inherited_path_evidence() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let child_report_path = temp_dir.path().join("child-fail-report.json");
+        let source_path = temp_dir.path().join("source.log");
+        let log_path = temp_dir.path().join("parent.log");
+        let report_path = temp_dir.path().join("parent-report.json");
+        fs::write(&source_path, "source\n").expect("write source artifact");
+        fs::write(&child_report_path, "{\n  \"status\": \"fail\"\n}\n")
+            .expect("write child fail report");
+
+        let config = GenerateCrossNetworkRemoteExitReportConfig {
+            suite: "cross_network_remote_exit_dns".to_string(),
+            report_path,
+            log_path,
+            status: CHECK_PASS.to_string(),
+            failure_summary: String::new(),
+            environment: "unit_test".to_string(),
+            implementation_state: "live_measured_validator".to_string(),
+            source_artifacts: vec![source_path],
+            log_artifacts: Vec::new(),
+            client_host: Some("client-host".to_string()),
+            exit_host: Some("exit-host".to_string()),
+            relay_host: None,
+            probe_host: None,
+            client_network_id: Some("client-net".to_string()),
+            exit_network_id: Some("exit-net".to_string()),
+            relay_network_id: None,
+            nat_profile: "baseline_lan".to_string(),
+            impairment_profile: "none".to_string(),
+            check_overrides: vec![
+                "managed_dns_resolution_success=pass".to_string(),
+                "remote_exit_dns_fail_closed=pass".to_string(),
+                "remote_exit_no_underlay_leak=pass".to_string(),
+            ],
+            path_status_line: None,
+            path_evidence_report: Some(child_report_path),
+        };
+
+        let err = execute_ops_generate_cross_network_remote_exit_report(config)
+            .expect_err("pass report must reject missing inherited live path evidence");
+        assert!(
+            err.contains("report is missing path_evidence"),
+            "expected inherited path evidence failure, got: {err}"
+        );
     }
 }

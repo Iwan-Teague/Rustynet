@@ -16,6 +16,7 @@ use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
     DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_DNS_ZONE_WATERMARK_PATH,
+    DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
 };
 
 const ENV_DST: &str = "/etc/default/rustynetd";
@@ -240,6 +241,15 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     let traversal_max_age_secs =
         env_string_or_existing_default("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", "120", &existing_env)?;
+    let traversal_stun_servers_raw =
+        env_string_or_existing_default("RUSTYNET_TRAVERSAL_STUN_SERVERS", "", &existing_env)?;
+    let traversal_stun_gather_timeout_default =
+        DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS.to_string();
+    let traversal_stun_gather_timeout_ms = env_string_or_existing_default(
+        "RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS",
+        traversal_stun_gather_timeout_default.as_str(),
+        &existing_env,
+    )?;
     let dns_zone_max_age_default = DEFAULT_DNS_ZONE_MAX_AGE_SECS.to_string();
     let dns_zone_bundle_path = env_path_or_existing_default(
         "RUSTYNET_DNS_ZONE_BUNDLE",
@@ -376,6 +386,11 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     parse_nonzero_u64(
         "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
         traversal_max_age_secs.as_str(),
+    )?;
+    parse_traversal_stun_servers_install(traversal_stun_servers_raw.as_str())?;
+    parse_nonzero_u64(
+        "RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS",
+        traversal_stun_gather_timeout_ms.as_str(),
     )?;
     parse_nonzero_u64(
         "RUSTYNET_DNS_ZONE_MAX_AGE_SECS",
@@ -792,6 +807,14 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_string(),
             traversal_max_age_secs,
+        ),
+        (
+            "RUSTYNET_TRAVERSAL_STUN_SERVERS".to_string(),
+            traversal_stun_servers_raw,
+        ),
+        (
+            "RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS".to_string(),
+            traversal_stun_gather_timeout_ms,
         ),
         ("RUSTYNET_BACKEND".to_string(), backend_mode),
         ("RUSTYNET_WG_INTERFACE".to_string(), wireguard_interface),
@@ -1322,6 +1345,19 @@ fn parse_nonzero_u64(key: &str, value: &str) -> Result<u64, String> {
         ));
     }
     Ok(parsed)
+}
+
+fn parse_traversal_stun_servers_install(value: &str) -> Result<Vec<SocketAddr>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<SocketAddr>()
+                .map_err(|err| format!("invalid traversal stun servers entry {entry}: {err}"))
+        })
+        .collect()
 }
 
 fn parse_dns_resolver_bind_addr_install(value: &str) -> Result<SocketAddr, String> {
@@ -2506,8 +2542,9 @@ mod tests {
     use super::{
         assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order,
         parse_dev_interface_token, parse_dns_resolver_bind_addr_install, parse_install_bool,
-        read_env_file_values, render_assignment_refresh_env_contents,
-        resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
+        parse_traversal_stun_servers_install, read_env_file_values,
+        render_assignment_refresh_env_contents, resolve_selected_exit_node_id,
+        systemctl_state_retryable, wait_for_unix_socket,
     };
 
     #[test]
@@ -2605,6 +2642,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_traversal_stun_servers_install_accepts_empty_and_valid_socket_addr_lists() {
+        let empty = parse_traversal_stun_servers_install("").expect("empty list should parse");
+        assert!(empty.is_empty());
+
+        let parsed = parse_traversal_stun_servers_install("203.0.113.10:3478, 198.51.100.20:3478")
+            .expect("socket addr list should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "203.0.113.10:3478".parse().unwrap(),
+                "198.51.100.20:3478".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_traversal_stun_servers_install_rejects_invalid_entries() {
+        let err = parse_traversal_stun_servers_install("stun.example.com:3478")
+            .expect_err("hostname entry should fail strict install validation");
+        assert!(err.contains("invalid traversal stun servers entry"));
+    }
+
+    #[test]
     fn refresh_service_templates_execute_refresh_ops_before_socket_aware_state_refresh() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let assignment_template = std::fs::read_to_string(
@@ -2636,6 +2696,33 @@ mod tests {
                 "ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present"
             ),
             "trust refresh service must use the socket-aware daemon revalidation path after refreshing signed trust state"
+        );
+    }
+
+    #[test]
+    fn rustynetd_service_template_passes_traversal_stun_configuration() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains("Environment=RUSTYNET_TRAVERSAL_STUN_SERVERS="),
+            "rustynetd service template must expose traversal stun servers in the environment"
+        );
+        assert!(
+            service_template.contains("Environment=RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS=2000"),
+            "rustynetd service template must expose traversal stun gather timeout in the environment"
+        );
+        assert!(
+            service_template
+                .contains("--traversal-stun-servers ${RUSTYNET_TRAVERSAL_STUN_SERVERS}"),
+            "rustynetd service template must pass traversal stun servers to the daemon"
+        );
+        assert!(
+            service_template.contains(
+                "--traversal-stun-gather-timeout-ms ${RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
+            ),
+            "rustynetd service template must pass traversal stun gather timeout to the daemon"
         );
     }
 

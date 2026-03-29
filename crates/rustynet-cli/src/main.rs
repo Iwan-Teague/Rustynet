@@ -984,6 +984,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .value("--impairment-profile")
                         .unwrap_or_else(|| "none".to_string()),
                     check_overrides,
+                    path_status_line: parser.value("--path-status-line"),
+                    path_evidence_report: parser.optional_path("--path-evidence-report"),
                 },
             })
         }
@@ -10402,7 +10404,7 @@ fn help_text() -> String {
         "  ops verify-phase6-platform-readiness",
         "  ops verify-phase6-parity-evidence",
         "  ops verify-required-test-output --output <path> --package <name> --test-filter <pattern>",
-        "  ops generate-cross-network-remote-exit-report --suite <suite> --report-path <path> --log-path <path> --status <pass|fail> [--failure-summary <text>] [--environment <label>] [--implementation-state <label>] [--source-artifact <path>]... [--log-artifact <path>]... [--client-host <host>] [--exit-host <host>] [--relay-host <host>] [--probe-host <host>] [--client-network-id <id>] [--exit-network-id <id>] [--relay-network-id <id>] [--nat-profile <profile>] [--impairment-profile <profile>] [--check <name=pass|fail>]...",
+        "  ops generate-cross-network-remote-exit-report --suite <suite> --report-path <path> --log-path <path> --status <pass|fail> [--failure-summary <text>] [--environment <label>] [--implementation-state <label>] [--source-artifact <path>]... [--log-artifact <path>]... [--client-host <host>] [--exit-host <host>] [--relay-host <host>] [--probe-host <host>] [--client-network-id <id>] [--exit-network-id <id>] [--relay-network-id <id>] [--nat-profile <profile>] [--impairment-profile <profile>] [--path-status-line <status-text>] [--path-evidence-report <path>] [--check <name=pass|fail>]...",
         "  ops validate-cross-network-remote-exit-reports [--reports <path[,path...]>] [--artifact-dir <path>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
         "  ops validate-cross-network-nat-matrix [--reports <path[,path...]>] [--artifact-dir <path>] [--required-nat-profiles <profile[,profile...]>] [--output <path>] [--max-evidence-age-seconds <secs>] [--expected-git-commit <sha>] [--require-pass-status]",
         "  ops read-cross-network-report-fields --report-path <path> [--include-status] [--check <name>]... [--network-field <name>]... [--default-value <text>]",
@@ -10999,6 +11001,10 @@ mod tests {
             "artifacts/phase10/source/cross_network_direct_remote_exit.log".to_string(),
             "--status".to_string(),
             "fail".to_string(),
+            "--path-status-line".to_string(),
+            "node_id=client-1 path_mode=direct_active path_programmed_mode=direct_programmed path_live_proven=true path_latest_live_handshake_unix=123 relay_session_state=unused".to_string(),
+            "--path-evidence-report".to_string(),
+            "artifacts/phase10/child_report.json".to_string(),
             "--source-artifact".to_string(),
             "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh".to_string(),
             "--source-artifact".to_string(),
@@ -11011,6 +11017,15 @@ mod tests {
         assert!(
             format!("{generate_cross_network_report:?}")
                 .contains("GenerateCrossNetworkRemoteExitReport")
+        );
+        assert!(
+            format!("{generate_cross_network_report:?}").contains("path_status_line: Some"),
+            "{generate_cross_network_report:?}"
+        );
+        assert!(
+            format!("{generate_cross_network_report:?}")
+                .contains("path_evidence_report: Some(\"artifacts/phase10/child_report.json\")"),
+            "{generate_cross_network_report:?}"
         );
 
         let validate_cross_network_reports = parse_command(&[

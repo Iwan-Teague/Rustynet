@@ -1173,6 +1173,27 @@ struct TraversalProbeCurrentState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimePathStateSummary {
+    live_mode: &'static str,
+    live_reason: String,
+    programmed_mode: &'static str,
+    programmed_reason: String,
+    live_proven: bool,
+    programmed_peer_count: usize,
+    live_peer_count: usize,
+    programmed_direct_peers: usize,
+    programmed_relay_peers: usize,
+    live_direct_peers: usize,
+    live_relay_peers: usize,
+    latest_live_handshake_unix: Option<u64>,
+    relay_session_configured: bool,
+    relay_session_state: &'static str,
+    relay_session_established_peers: usize,
+    relay_session_expired_peers: usize,
+    relay_session_next_expiry_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TraversalBootstrapError {
     Missing,
     Io(String),
@@ -3031,7 +3052,29 @@ impl DaemonRuntime {
     }
 
     fn netcheck_response_line(&self) -> String {
-        let (path_mode, path_reason) = self.netcheck_path_state();
+        let path_state = self.runtime_path_state_summary();
+        let path_mode = path_state.live_mode;
+        let path_reason = sanitize_netcheck_value(path_state.live_reason.as_str());
+        let path_programmed_mode = path_state.programmed_mode;
+        let path_programmed_reason = sanitize_netcheck_value(path_state.programmed_reason.as_str());
+        let path_live_proven = if path_state.live_proven {
+            "true"
+        } else {
+            "false"
+        };
+        let path_latest_live_handshake_unix = path_state
+            .latest_live_handshake_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let relay_session_configured = if path_state.relay_session_configured {
+            "true"
+        } else {
+            "false"
+        };
+        let relay_session_next_expiry_unix = path_state
+            .relay_session_next_expiry_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let traversal_authority = self.traversal_authority_mode().as_str();
         let (
             probe_result,
@@ -3203,29 +3246,17 @@ impl DaemonRuntime {
                 .join(",")
         };
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} local_host_candidates={local_host_candidates}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} local_host_candidates={local_host_candidates}",
+            path_state.programmed_peer_count,
+            path_state.live_peer_count,
+            path_state.programmed_direct_peers,
+            path_state.programmed_relay_peers,
+            path_state.live_direct_peers,
+            path_state.live_relay_peers,
+            path_state.relay_session_state,
+            path_state.relay_session_established_peers,
+            path_state.relay_session_expired_peers,
         )
-    }
-
-    fn netcheck_path_state(&self) -> (&'static str, &'static str) {
-        match self.controller.state() {
-            DataplaneState::FailClosed => ("fail_closed", "fail_closed"),
-            DataplaneState::ExitActive | DataplaneState::DataplaneApplied => {
-                if self.controller.has_active_relay_path() {
-                    ("relay_active", "relay_endpoint_programmed")
-                } else if self.controller.has_armed_relay_path() {
-                    ("direct_active", "relay_armed")
-                } else if self.traversal_authority_mode().is_enforced()
-                    && self.traversal_hints.is_some()
-                {
-                    ("direct_active", "traversal_authority")
-                } else {
-                    ("direct_active", "static_assignment")
-                }
-            }
-            DataplaneState::ControlTrusted => ("control_trusted", "control_trusted"),
-            DataplaneState::Init => ("initializing", "init"),
-        }
     }
 
     fn all_local_candidates(&self) -> Vec<ProbeTraversalCandidate> {
@@ -3267,7 +3298,24 @@ impl DaemonRuntime {
     }
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
+        let now_unix = unix_now();
         if let Some(relay_client) = self.relay_client.as_mut() {
+            let freshness_secs = self.traversal_probe_handshake_freshness_secs;
+            let active_relay_peers = self
+                .traversal_probe_statuses
+                .iter()
+                .filter(|(_node_id, status)| {
+                    status.decision == TraversalProbeDecision::Relay
+                        && status
+                            .latest_handshake_unix
+                            .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
+                            .unwrap_or(false)
+                })
+                .map(|(node_id, _status)| node_id.clone())
+                .collect::<Vec<_>>();
+            for node_id in active_relay_peers {
+                relay_client.touch_session(&node_id);
+            }
             relay_client
                 .cleanup_idle_sessions(Duration::from_secs(self.relay_session_idle_timeout_secs));
         }
@@ -3317,8 +3365,6 @@ impl DaemonRuntime {
                 extra_peers.join(",")
             ));
         }
-
-        let now_unix = unix_now();
         let local_candidates = self.all_local_candidates();
         let previous_statuses = self.traversal_probe_statuses.clone();
         let mut statuses = BTreeMap::new();
@@ -3418,6 +3464,12 @@ impl DaemonRuntime {
                         remote_node_id.as_str()
                     )
                 })?;
+            if matches!(current.path, Some(PathMode::Relay))
+                && self.traversal_handshake_is_fresh(latest_handshake_unix, now_unix)
+                && let Some(relay_client) = self.relay_client.as_mut()
+            {
+                relay_client.touch_session(&remote_node_id);
+            }
 
             if !probe_due {
                 let mut retained = existing_status.cloned().ok_or_else(|| {
@@ -3456,6 +3508,10 @@ impl DaemonRuntime {
                 })?;
             if report.decision == TraversalProbeDecision::Direct {
                 self.close_relay_session(&remote_node_id);
+            } else if self.traversal_handshake_is_fresh(report.latest_handshake_unix, now_unix)
+                && let Some(relay_client) = self.relay_client.as_mut()
+            {
+                relay_client.touch_session(&remote_node_id);
             }
             statuses.insert(
                 remote_node_id.clone(),
@@ -3803,6 +3859,263 @@ impl DaemonRuntime {
             direct_peers,
             relay_peers,
         )
+    }
+
+    fn runtime_path_state_summary(&self) -> RuntimePathStateSummary {
+        let now_unix = unix_now();
+        match self.controller.state() {
+            DataplaneState::FailClosed => {
+                return RuntimePathStateSummary {
+                    live_mode: "fail_closed",
+                    live_reason: "fail_closed".to_string(),
+                    programmed_mode: "fail_closed",
+                    programmed_reason: "fail_closed".to_string(),
+                    live_proven: false,
+                    programmed_peer_count: 0,
+                    live_peer_count: 0,
+                    programmed_direct_peers: 0,
+                    programmed_relay_peers: 0,
+                    live_direct_peers: 0,
+                    live_relay_peers: 0,
+                    latest_live_handshake_unix: None,
+                    relay_session_configured: self.relay_client.is_some(),
+                    relay_session_state: if self.relay_client.is_some() {
+                        "unused"
+                    } else {
+                        "disabled"
+                    },
+                    relay_session_established_peers: 0,
+                    relay_session_expired_peers: 0,
+                    relay_session_next_expiry_unix: None,
+                };
+            }
+            DataplaneState::ControlTrusted => {
+                return RuntimePathStateSummary {
+                    live_mode: "control_trusted",
+                    live_reason: "control_trusted".to_string(),
+                    programmed_mode: "control_trusted",
+                    programmed_reason: "control_trusted".to_string(),
+                    live_proven: false,
+                    programmed_peer_count: 0,
+                    live_peer_count: 0,
+                    programmed_direct_peers: 0,
+                    programmed_relay_peers: 0,
+                    live_direct_peers: 0,
+                    live_relay_peers: 0,
+                    latest_live_handshake_unix: None,
+                    relay_session_configured: self.relay_client.is_some(),
+                    relay_session_state: if self.relay_client.is_some() {
+                        "unused"
+                    } else {
+                        "disabled"
+                    },
+                    relay_session_established_peers: 0,
+                    relay_session_expired_peers: 0,
+                    relay_session_next_expiry_unix: None,
+                };
+            }
+            DataplaneState::Init => {
+                return RuntimePathStateSummary {
+                    live_mode: "initializing",
+                    live_reason: "init".to_string(),
+                    programmed_mode: "initializing",
+                    programmed_reason: "init".to_string(),
+                    live_proven: false,
+                    programmed_peer_count: 0,
+                    live_peer_count: 0,
+                    programmed_direct_peers: 0,
+                    programmed_relay_peers: 0,
+                    live_direct_peers: 0,
+                    live_relay_peers: 0,
+                    latest_live_handshake_unix: None,
+                    relay_session_configured: self.relay_client.is_some(),
+                    relay_session_state: if self.relay_client.is_some() {
+                        "unused"
+                    } else {
+                        "disabled"
+                    },
+                    relay_session_established_peers: 0,
+                    relay_session_expired_peers: 0,
+                    relay_session_next_expiry_unix: None,
+                };
+            }
+            DataplaneState::DataplaneApplied | DataplaneState::ExitActive => {}
+        }
+
+        let relay_session_configured = self.relay_client.is_some();
+        let managed_peer_ids = self.controller.managed_peer_ids();
+        let programmed_peer_count = managed_peer_ids.len();
+        let mut programmed_direct_peers = 0usize;
+        let mut programmed_relay_peers = 0usize;
+        let mut live_direct_peers = 0usize;
+        let mut live_relay_peers = 0usize;
+        let mut latest_live_handshake_unix: Option<u64> = None;
+        let mut relay_session_established_peers = 0usize;
+        let mut relay_session_expired_peers = 0usize;
+        let mut relay_session_next_expiry_unix: Option<u64> = None;
+        let mut direct_live_reasons = BTreeSet::new();
+
+        for node_id in managed_peer_ids {
+            let Some(path) = self.controller.peer_path(&node_id) else {
+                continue;
+            };
+            let status = self.traversal_probe_statuses.get(&node_id);
+            let handshake_unix = status.and_then(|entry| entry.latest_handshake_unix);
+            let handshake_fresh = self.traversal_handshake_is_fresh(handshake_unix, now_unix);
+
+            match path {
+                PathMode::Direct => {
+                    programmed_direct_peers = programmed_direct_peers.saturating_add(1);
+                    if handshake_fresh {
+                        live_direct_peers = live_direct_peers.saturating_add(1);
+                        latest_live_handshake_unix = Some(
+                            latest_live_handshake_unix
+                                .unwrap_or(0)
+                                .max(handshake_unix.expect(
+                                "fresh direct handshake must carry a latest handshake timestamp",
+                            )),
+                        );
+                        if let Some(status) = status {
+                            direct_live_reasons.insert(status.reason.as_str());
+                        }
+                    }
+                }
+                PathMode::Relay => {
+                    programmed_relay_peers = programmed_relay_peers.saturating_add(1);
+                    let session = self
+                        .relay_client
+                        .as_ref()
+                        .and_then(|client| client.session_for_peer(&node_id));
+                    if let Some(session) = session {
+                        relay_session_established_peers =
+                            relay_session_established_peers.saturating_add(1);
+                        relay_session_next_expiry_unix =
+                            Some(match relay_session_next_expiry_unix {
+                                Some(value) => value.min(session.token_expires_at_unix),
+                                None => session.token_expires_at_unix,
+                            });
+                        if session.token_expires_at_unix <= now_unix {
+                            relay_session_expired_peers =
+                                relay_session_expired_peers.saturating_add(1);
+                        } else if handshake_fresh {
+                            live_relay_peers = live_relay_peers.saturating_add(1);
+                            latest_live_handshake_unix = Some(
+                                latest_live_handshake_unix
+                                    .unwrap_or(0)
+                                    .max(handshake_unix.expect(
+                                    "fresh relay handshake must carry a latest handshake timestamp",
+                                )),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let programmed_mode = if programmed_relay_peers > 0 && programmed_direct_peers > 0 {
+            "mixed_programmed"
+        } else if programmed_relay_peers > 0 {
+            "relay_programmed"
+        } else {
+            "direct_programmed"
+        };
+        let programmed_reason = if programmed_relay_peers > 0 {
+            "relay_endpoint_programmed".to_string()
+        } else if self.controller.has_armed_relay_path() {
+            "relay_armed".to_string()
+        } else if self.traversal_authority_mode().is_enforced() && self.traversal_hints.is_some() {
+            "traversal_authority".to_string()
+        } else {
+            "static_assignment".to_string()
+        };
+
+        let live_peer_count = live_direct_peers.saturating_add(live_relay_peers);
+        let live_mode = if live_peer_count == 0 {
+            programmed_mode
+        } else if live_peer_count < programmed_peer_count {
+            "mixed_active"
+        } else if live_relay_peers == programmed_peer_count {
+            "relay_active"
+        } else if live_direct_peers == programmed_peer_count {
+            "direct_active"
+        } else {
+            "mixed_active"
+        };
+        let live_reason = match live_mode {
+            "direct_active" => {
+                if direct_live_reasons.len() == 1 {
+                    direct_live_reasons
+                        .iter()
+                        .next()
+                        .copied()
+                        .unwrap_or("fresh_handshake_observed")
+                        .to_string()
+                } else {
+                    "fresh_handshake_observed".to_string()
+                }
+            }
+            "relay_active" => "relay_session_alive_with_fresh_handshake".to_string(),
+            "mixed_active" => {
+                if live_peer_count < programmed_peer_count {
+                    "partial_live_proof".to_string()
+                } else {
+                    "mixed_live_paths".to_string()
+                }
+            }
+            _ => {
+                if programmed_relay_peers > 0 {
+                    if !relay_session_configured {
+                        "relay_session_disabled".to_string()
+                    } else if relay_session_established_peers == 0 {
+                        "relay_session_missing".to_string()
+                    } else if relay_session_expired_peers > 0 {
+                        "relay_session_expired".to_string()
+                    } else {
+                        "relay_handshake_unproven".to_string()
+                    }
+                } else if programmed_direct_peers > 0 {
+                    "direct_handshake_unproven".to_string()
+                } else {
+                    programmed_reason.clone()
+                }
+            }
+        };
+
+        let relay_session_state = if !relay_session_configured {
+            "disabled"
+        } else if programmed_relay_peers == 0 {
+            "unused"
+        } else if relay_session_established_peers == 0 {
+            "missing"
+        } else if relay_session_expired_peers > 0 {
+            "expired"
+        } else if relay_session_established_peers < programmed_relay_peers {
+            "partial"
+        } else if live_relay_peers == programmed_relay_peers {
+            "live"
+        } else {
+            "established_unproven"
+        };
+
+        RuntimePathStateSummary {
+            live_mode,
+            live_reason,
+            programmed_mode,
+            programmed_reason,
+            live_proven: live_peer_count == programmed_peer_count && programmed_peer_count > 0,
+            programmed_peer_count,
+            live_peer_count,
+            programmed_direct_peers,
+            programmed_relay_peers,
+            live_direct_peers,
+            live_relay_peers,
+            latest_live_handshake_unix,
+            relay_session_configured,
+            relay_session_state,
+            relay_session_established_peers,
+            relay_session_expired_peers,
+            relay_session_next_expiry_unix,
+        }
     }
 
     fn traversal_remote_node_id(
@@ -4270,6 +4583,7 @@ impl DaemonRuntime {
 
         match command {
             IpcCommand::Status => {
+                self.refresh_traversal_hint_state(false);
                 let last_assignment = self
                     .last_applied_assignment
                     .map(|watermark| format!("{}:{}", watermark.generated_at_unix, watermark.nonce))
@@ -4363,8 +4677,27 @@ impl DaemonRuntime {
                 let dns_stale_rejections = self.dns_zone_stale_rejections.to_string();
                 let dns_replay_rejections = self.dns_zone_replay_rejections.to_string();
                 let dns_future_dated_rejections = self.dns_zone_future_dated_rejections.to_string();
+                let path_state = self.runtime_path_state_summary();
+                let path_live_proven = if path_state.live_proven {
+                    "true"
+                } else {
+                    "false"
+                };
+                let path_latest_live_handshake_unix = path_state
+                    .latest_live_handshake_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let relay_session_configured = if path_state.relay_session_configured {
+                    "true"
+                } else {
+                    "false"
+                };
+                let relay_session_next_expiry_unix = path_state
+                    .relay_session_next_expiry_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string());
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -4395,6 +4728,23 @@ impl DaemonRuntime {
                     } else {
                         "false"
                     },
+                    path_state.live_mode,
+                    path_state.live_reason,
+                    path_state.programmed_mode,
+                    path_state.programmed_reason,
+                    path_live_proven,
+                    path_state.programmed_peer_count,
+                    path_state.live_peer_count,
+                    path_state.programmed_direct_peers,
+                    path_state.programmed_relay_peers,
+                    path_state.live_direct_peers,
+                    path_state.live_relay_peers,
+                    path_latest_live_handshake_unix,
+                    relay_session_configured,
+                    path_state.relay_session_state,
+                    path_state.relay_session_established_peers,
+                    path_state.relay_session_expired_peers,
+                    relay_session_next_expiry_unix,
                     dns_zone_state,
                     dns_zone_record_count,
                     dns_zone_error,
@@ -8761,6 +9111,13 @@ fn validate_traversal_candidate_ip(
                     "candidate index {index} uses disallowed special address"
                 )));
             }
+            if matches!(candidate_type, TraversalCandidateType::Relay)
+                && (v4.is_private() || is_shared_carrier_grade_nat_ipv4(v4))
+            {
+                return Err(TraversalBootstrapError::InvalidFormat(format!(
+                    "relay candidate index {index} must not use private transport address"
+                )));
+            }
             if matches!(candidate_type, TraversalCandidateType::ServerReflexive)
                 && !is_global_unicast_ipv4(v4)
             {
@@ -8845,6 +9202,11 @@ fn select_runtime_relay_candidate(
         .relay_id
         .as_deref()
         .ok_or_else(|| "relay candidate missing relay_id".to_string())?;
+    if let std::net::IpAddr::V4(v4) = candidate.endpoint.ip()
+        && (v4.is_private() || is_shared_carrier_grade_nat_ipv4(v4))
+    {
+        return Err("relay candidate must not use private transport address".to_string());
+    }
     Ok(Some(RuntimeRelayCandidate {
         endpoint: candidate.endpoint,
         relay_id: relay_transport_id_from_label(relay_id_label)?,
@@ -8953,6 +9315,11 @@ fn is_global_unicast_ipv4(value: std::net::Ipv4Addr) -> bool {
         return false;
     }
     true
+}
+
+fn is_shared_carrier_grade_nat_ipv4(value: std::net::Ipv4Addr) -> bool {
+    let octets = value.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
 }
 
 fn is_global_unicast_ipv6(value: std::net::Ipv6Addr) -> bool {
@@ -12394,6 +12761,24 @@ mod tests {
 
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
+        assert!(status.message.contains("path_mode=relay_programmed"));
+        assert!(
+            status
+                .message
+                .contains("path_reason=relay_session_disabled")
+        );
+        assert!(
+            status
+                .message
+                .contains("path_programmed_mode=relay_programmed")
+        );
+        assert!(
+            status
+                .message
+                .contains("path_programmed_reason=relay_endpoint_programmed")
+        );
+        assert!(status.message.contains("path_live_proven=false"));
+        assert!(status.message.contains("relay_session_state=disabled"));
         assert!(status.message.contains("traversal_authority=enforced_v1"));
         assert!(status.message.contains("traversal_probe_max_candidates=4"));
         assert!(status.message.contains("traversal_probe_max_pairs=4"));
@@ -12432,6 +12817,24 @@ mod tests {
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=relay_programmed"));
+        assert!(
+            netcheck
+                .message
+                .contains("path_reason=relay_session_disabled")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_mode=relay_programmed")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_reason=relay_endpoint_programmed")
+        );
+        assert!(netcheck.message.contains("path_live_proven=false"));
+        assert!(netcheck.message.contains("relay_session_state=disabled"));
         assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
         assert!(
             netcheck
@@ -13027,6 +13430,23 @@ mod tests {
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=direct_active"));
+        assert!(
+            netcheck
+                .message
+                .contains("path_reason=fresh_handshake_observed")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_mode=direct_programmed")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_reason=relay_armed")
+        );
+        assert!(netcheck.message.contains("path_live_proven=true"));
         assert!(netcheck.message.contains("traversal_probe_result=direct"));
         assert!(
             netcheck
@@ -13435,13 +13855,21 @@ mod tests {
 
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
-        assert!(status.message.contains("traversal_stale_rejections=1"));
-        assert!(status.message.contains("traversal_replay_rejections=1"));
-        assert!(
-            status
-                .message
-                .contains("traversal_future_dated_rejections=1")
-        );
+        assert_eq!(runtime.traversal_stale_rejections, 1);
+        assert_eq!(runtime.traversal_replay_rejections, 1);
+        assert_eq!(runtime.traversal_future_dated_rejections, 2);
+        assert!(status.message.contains(&format!(
+            "traversal_stale_rejections={}",
+            runtime.traversal_stale_rejections
+        )));
+        assert!(status.message.contains(&format!(
+            "traversal_replay_rejections={}",
+            runtime.traversal_replay_rejections
+        )));
+        assert!(status.message.contains(&format!(
+            "traversal_future_dated_rejections={}",
+            runtime.traversal_future_dated_rejections
+        )));
         assert!(status.message.contains("traversal_alarm_state=error"));
 
         let _ = std::fs::remove_file(state_path);
@@ -14350,6 +14778,39 @@ mod tests {
     }
 
     #[test]
+    fn load_traversal_bundle_rejects_private_relay_candidate() {
+        let test_dir = secure_test_dir("rustynetd-traversal-private-relay");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        write_traversal_file_with_custom_relay(
+            &traversal_path,
+            &traversal_verifier_path,
+            "node-a",
+            "node-b",
+            1,
+            "192.168.100.10:443"
+                .parse()
+                .expect("relay addr should parse"),
+            "relay-lan-1",
+        );
+
+        let err = load_traversal_bundle(
+            &traversal_path,
+            &traversal_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("private relay candidate must be rejected");
+        assert!(matches!(
+            err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(err.to_string().contains("relay candidate"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn preflight_allows_missing_traversal_bundle_without_verifier_key() {
         let test_dir = secure_test_dir("rustynetd-preflight-traversal-optional");
         let state_path = test_dir.join("daemon.state");
@@ -14607,12 +15068,25 @@ mod tests {
 
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
-        assert!(netcheck.message.contains("path_mode=relay_active"));
+        assert!(netcheck.message.contains("path_mode=relay_programmed"));
         assert!(
             netcheck
                 .message
-                .contains("path_reason=relay_endpoint_programmed")
+                .contains("path_reason=relay_session_disabled")
         );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_mode=relay_programmed")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("path_programmed_reason=relay_endpoint_programmed")
+        );
+        assert!(netcheck.message.contains("path_live_proven=false"));
+        assert!(netcheck.message.contains("relay_session_configured=false"));
+        assert!(netcheck.message.contains("relay_session_state=disabled"));
         assert!(netcheck.message.contains("traversal_status=valid"));
         assert!(netcheck.message.contains("candidate_count=2"));
         assert!(netcheck.message.contains("host_candidates=1"));

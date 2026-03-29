@@ -49,6 +49,7 @@ FAILBACK_MONITOR_LOG=""
 FAILBACK_SLO_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
+PATH_STATUS_LINE=""
 CLIENT_ADDR=""
 EXIT_ADDR=""
 RELAY_ADDR=""
@@ -112,6 +113,9 @@ write_report() {
   )
   local item
   set +u
+  if [[ -n "$PATH_STATUS_LINE" ]]; then
+    args+=(--path-status-line "$PATH_STATUS_LINE")
+  fi
   for item in "${SOURCE_ARTIFACTS[@]}"; do
     [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
@@ -454,6 +458,7 @@ EOF
 
   FAILURE_SUMMARY="capturing endpoint roam recovery evidence"
   client_status_after_roam="$(live_lab_status "$CLIENT_HOST")"
+  PATH_STATUS_LINE="$client_status_after_roam"
   client_route_after_roam="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
   client_endpoints_after_roam="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints || true")"
   live_lab_log "Client status after roam"

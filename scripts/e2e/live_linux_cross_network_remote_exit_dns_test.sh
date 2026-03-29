@@ -83,6 +83,9 @@ write_report() {
   )
   local item
   set +u
+  if [[ -n "$DIRECT_REPORT_PATH" ]]; then
+    args+=(--path-evidence-report "$DIRECT_REPORT_PATH")
+  fi
   for item in "${SOURCE_ARTIFACTS[@]}"; do
     [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")

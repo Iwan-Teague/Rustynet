@@ -50,6 +50,7 @@ CLIENT_PLAINTEXT_FILE=""
 EXIT_PLAINTEXT_FILE=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
+PATH_STATUS_LINE=""
 
 usage() {
   cat <<'USAGE'
@@ -96,6 +97,9 @@ write_report() {
   )
   local item
   set +u
+  if [[ -n "$PATH_STATUS_LINE" ]]; then
+    args+=(--path-status-line "$PATH_STATUS_LINE")
+  fi
   for item in "${SOURCE_ARTIFACTS[@]}"; do
     [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
@@ -284,6 +288,7 @@ main() {
   FAILURE_SUMMARY="capturing direct remote-exit steady-state evidence"
   client_status="$(live_lab_status "$CLIENT_HOST")"
   exit_status="$(live_lab_status "$EXIT_HOST")"
+  PATH_STATUS_LINE="$client_status"
   client_internet_route="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
   client_endpoints="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints || true")"
   exit_nft="$(live_lab_capture_root "$EXIT_HOST" "root nft list ruleset || true")"

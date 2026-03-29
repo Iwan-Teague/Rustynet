@@ -11,12 +11,13 @@ use rustynetd::daemon::{
     DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS, DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES,
     DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS, DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
     DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS,
-    DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS, DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
-    DEFAULT_TRAVERSAL_WATERMARK_PATH, DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_TRUST_WATERMARK_PATH, DEFAULT_TRUSTED_HELPER_SOCKET_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_LISTEN_PORT, DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
-    DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
+    DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS, DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
+    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
+    DEFAULT_TRUST_EVIDENCE_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_TRUST_WATERMARK_PATH,
+    DEFAULT_TRUSTED_HELPER_SOCKET_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+    DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_LISTEN_PORT,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, DaemonBackendMode,
+    DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon,
 };
 use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
@@ -535,6 +536,25 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "traversal max age must be greater than 0".to_string())?;
                 index += 2;
             }
+            Some("--traversal-stun-servers") => {
+                let (stun_servers, next_index) =
+                    parse_optional_socket_addr_csv_arg(args, index, "--traversal-stun-servers")?;
+                config.traversal_stun_servers = stun_servers;
+                index = next_index;
+            }
+            Some("--traversal-stun-gather-timeout-ms") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--traversal-stun-gather-timeout-ms requires a value".to_string()
+                })?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid traversal stun gather timeout: {err}"))?;
+                config.traversal_stun_gather_timeout_ms =
+                    NonZeroU64::new(parsed).ok_or_else(|| {
+                        "traversal stun gather timeout must be greater than 0".to_string()
+                    })?;
+                index += 2;
+            }
             Some("--traversal-probe-max-candidates") => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--traversal-probe-max-candidates requires a value".to_string()
@@ -848,6 +868,28 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
         }
     }
     Ok(config)
+}
+
+fn parse_optional_socket_addr_csv_arg(
+    args: &[String],
+    index: usize,
+    flag: &str,
+) -> Result<(Vec<SocketAddr>, usize), String> {
+    if let Some(value) = args.get(index + 1) {
+        if value.starts_with("--") {
+            return Ok((Vec::new(), index + 1));
+        }
+        let parsed = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::parse::<SocketAddr>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("invalid {flag} value: {err}"))?;
+        Ok((parsed, index + 2))
+    } else {
+        Ok((Vec::new(), index + 1))
+    }
 }
 
 fn run_membership_command(args: &[String]) -> Result<(), String> {
@@ -1166,7 +1208,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -1189,6 +1231,10 @@ fn help_text() -> String {
         &format!("  traversal_verifier_key={DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH}"),
         &format!("  traversal_watermark={DEFAULT_TRAVERSAL_WATERMARK_PATH}"),
         &format!("  traversal_max_age_secs={DEFAULT_TRAVERSAL_MAX_AGE_SECS}"),
+        "  traversal_stun_servers=<empty>",
+        &format!(
+            "  traversal_stun_gather_timeout_ms={DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
+        ),
         &format!(
             "  traversal_probe_max_candidates={DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES}"
         ),
@@ -1342,6 +1388,10 @@ mod tests {
             "/tmp/rustynet.traversal.watermark".to_string(),
             "--traversal-max-age-secs".to_string(),
             "90".to_string(),
+            "--traversal-stun-servers".to_string(),
+            "203.0.113.10:3478,198.51.100.20:3478".to_string(),
+            "--traversal-stun-gather-timeout-ms".to_string(),
+            "2500".to_string(),
             "--traversal-probe-max-candidates".to_string(),
             "4".to_string(),
             "--traversal-probe-max-pairs".to_string(),
@@ -1371,6 +1421,16 @@ mod tests {
             std::path::PathBuf::from("/tmp/rustynet.traversal.watermark")
         );
         assert_eq!(config.traversal_max_age_secs.get(), 90);
+        assert_eq!(
+            config.traversal_stun_servers,
+            vec![
+                "203.0.113.10:3478".parse::<std::net::SocketAddr>().unwrap(),
+                "198.51.100.20:3478"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+            ]
+        );
+        assert_eq!(config.traversal_stun_gather_timeout_ms.get(), 2500);
         assert_eq!(config.traversal_probe_max_candidates.get(), 4);
         assert_eq!(config.traversal_probe_max_pairs.get(), 8);
         assert_eq!(config.traversal_probe_simultaneous_open_rounds.get(), 2);
@@ -1378,6 +1438,45 @@ mod tests {
         assert_eq!(config.traversal_probe_relay_switch_after_failures.get(), 2);
         assert_eq!(config.traversal_probe_handshake_freshness_secs.get(), 15);
         assert_eq!(config.traversal_probe_reprobe_interval_secs.get(), 45);
+    }
+
+    #[test]
+    fn parse_daemon_config_allows_empty_traversal_stun_servers_when_value_is_omitted() {
+        let args = vec!["--traversal-stun-servers".to_string()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.traversal_stun_servers.is_empty());
+    }
+
+    #[test]
+    fn parse_daemon_config_allows_empty_traversal_stun_servers_when_next_flag_follows() {
+        let args = vec![
+            "--traversal-stun-servers".to_string(),
+            "--node-id".to_string(),
+            "node-a".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.traversal_stun_servers.is_empty());
+        assert_eq!(config.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_traversal_stun_servers() {
+        let args = vec![
+            "--traversal-stun-servers".to_string(),
+            "stun.example.com:3478".to_string(),
+        ];
+        let err = parse_daemon_config(&args).expect_err("invalid server list should fail");
+        assert!(err.contains("invalid --traversal-stun-servers value"));
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_zero_traversal_stun_gather_timeout() {
+        let args = vec![
+            "--traversal-stun-gather-timeout-ms".to_string(),
+            "0".to_string(),
+        ];
+        let err = parse_daemon_config(&args).expect_err("zero timeout should fail");
+        assert!(err.contains("traversal stun gather timeout must be greater than 0"));
     }
 
     #[test]

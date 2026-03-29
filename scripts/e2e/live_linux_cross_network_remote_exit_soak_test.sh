@@ -46,6 +46,7 @@ MONITOR_LOG_PATH=""
 MONITOR_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
+PATH_STATUS_LINE=""
 CLIENT_ADDR=""
 EXIT_ADDR=""
 WORK_DIR=""
@@ -108,6 +109,9 @@ write_report() {
   )
   local item
   set +u
+  if [[ -n "$PATH_STATUS_LINE" ]]; then
+    args+=(--path-status-line "$PATH_STATUS_LINE")
+  fi
   for item in "${SOURCE_ARTIFACTS[@]}"; do
     [[ -n "$item" ]] || continue
     args+=(--source-artifact "$item")
@@ -205,6 +209,7 @@ main() {
   local artifact_dir direct_rc bypass_rc
   local sample_result sample_reason
   local client_status client_route client_endpoints
+  local final_client_status
   local sample_ts start_ts end_ts elapsed_secs deadline
   local samples=0 failing_samples=0 consecutive_failures=0 max_consecutive_observed=0
   local first_failure_reason=""
@@ -446,6 +451,12 @@ main() {
   if [[ "$pre_bypass_check" == 'pass' && "$post_bypass_check" == 'pass' ]]; then
     CHECK_REMOTE_EXIT_SERVER_IP_BYPASS_IS_NARROW="pass"
   fi
+
+  FAILURE_SUMMARY="capturing final live-path evidence after soak"
+  final_client_status="$(live_lab_status "$CLIENT_HOST")"
+  PATH_STATUS_LINE="$final_client_status"
+  live_lab_log "Final client status after soak"
+  printf '%s\n' "$final_client_status"
 
   if (( samples > 0 && elapsed_secs >= SOAK_DURATION_SECS && failing_samples <= SOAK_MAX_FAILING_SAMPLES && max_consecutive_observed <= SOAK_MAX_CONSECUTIVE_FAILURES && bypass_rc == 0 )) && [[ "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' ]]; then
     CHECK_LONG_SOAK_STABLE="pass"
