@@ -10,6 +10,17 @@ const STUN_BINDING_RESPONSE: u16 = 0x0101;
 const STUN_ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
+/// Result of a STUN query containing full mapped endpoint information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StunResult {
+    /// The full mapped public endpoint (IP + port) as seen by the STUN server.
+    pub mapped_endpoint: SocketAddr,
+    /// The STUN server that was queried.
+    pub server: SocketAddr,
+    /// The local address of the socket used for the query.
+    pub local_addr: SocketAddr,
+}
+
 #[derive(Debug, Clone)]
 pub struct StunClient {
     servers: Vec<String>,
@@ -21,6 +32,41 @@ impl StunClient {
         Self { servers, timeout }
     }
 
+    /// Gather public mapped endpoints from STUN servers.
+    ///
+    /// This method returns full `SocketAddr` (IP + port) as observed by each STUN server.
+    /// Unlike `gather_public_ips`, this method returns the actual mapped port, not a guess.
+    ///
+    /// # Arguments
+    /// * `socket` - Optional socket to use for queries. If provided, the mapped endpoint
+    ///              reflects the NAT mapping for that specific socket. If `None`, creates
+    ///              ephemeral sockets per query (legacy behavior, not recommended).
+    ///
+    /// # Returns
+    /// A vector of `StunResult` containing the full mapped endpoint information.
+    pub fn gather_mapped_endpoints(&self, socket: Option<&UdpSocket>) -> Vec<StunResult> {
+        let mut results = Vec::new();
+        for server in &self.servers {
+            match self.query_stun_server_full(server, socket) {
+                Ok(result) => {
+                    // Deduplicate by mapped endpoint
+                    if !results
+                        .iter()
+                        .any(|r: &StunResult| r.mapped_endpoint == result.mapped_endpoint)
+                    {
+                        results.push(result);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        results
+    }
+
+    /// Legacy method that returns only IPs.
+    ///
+    /// **DEPRECATED**: Use `gather_mapped_endpoints` instead. This method guesses the port
+    /// by using the local listen port, which is incorrect for NATs that don't preserve ports.
     pub fn gather_public_ips(&self) -> Vec<IpAddr> {
         let mut ips = Vec::new();
         for server in &self.servers {
@@ -31,6 +77,50 @@ impl StunClient {
             }
         }
         ips
+    }
+
+    /// Query a STUN server and return full result with metadata.
+    fn query_stun_server_full(
+        &self,
+        server: &str,
+        provided_socket: Option<&UdpSocket>,
+    ) -> Result<StunResult, String> {
+        let server_addrs = server.to_socket_addrs().map_err(|e| e.to_string())?;
+        let target = server_addrs.into_iter().next().ok_or("no server address")?;
+
+        // Use provided socket or create ephemeral
+        let owned_socket: Option<UdpSocket>;
+        let socket: &UdpSocket = match provided_socket {
+            Some(s) => s,
+            None => {
+                owned_socket = Some(UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?);
+                owned_socket.as_ref().unwrap()
+            }
+        };
+
+        socket
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| e.to_string())?;
+
+        let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+
+        let tx_id = self.generate_tx_id();
+        let request = self.build_binding_request(&tx_id);
+
+        socket
+            .send_to(&request, target)
+            .map_err(|e| e.to_string())?;
+
+        let mut buf = [0u8; 1024];
+        let (len, _src) = socket.recv_from(&mut buf).map_err(|e| e.to_string())?;
+
+        let mapped_endpoint = self.parse_binding_response(&buf[..len], &tx_id)?;
+
+        Ok(StunResult {
+            mapped_endpoint,
+            server: target,
+            local_addr,
+        })
     }
 
     fn query_stun_server(&self, server: &str) -> Result<SocketAddr, String> {
@@ -181,5 +271,76 @@ impl StunClient {
         } else {
             Err(format!("unknown family: 0x{family:02x}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stun_result_contains_full_endpoint() {
+        // Verify StunResult structure captures full mapped endpoint
+        let result = StunResult {
+            mapped_endpoint: "1.2.3.4:12345".parse().unwrap(),
+            server: "74.125.250.129:3478".parse().unwrap(),
+            local_addr: "0.0.0.0:51820".parse().unwrap(),
+        };
+
+        // The mapped port should be preserved, not guessed
+        assert_eq!(result.mapped_endpoint.port(), 12345);
+        assert_eq!(result.mapped_endpoint.ip().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_address_extracts_full_endpoint() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+
+        // XOR-MAPPED-ADDRESS for 192.0.2.1:32853 (RFC 5389 example)
+        // Port XOR: 32853 XOR (0x2112 >> 0) = 0x8055 XOR 0x2112 = 0xA147 (unxor'd port)
+        // Actually let's use a simpler test value
+        // mapped port 51820 = 0xCA6C, cookie upper = 0x2112, xor = 0xEB7E
+        // mapped IP 203.0.113.1, xor with cookie 0x2112A442 = ...
+
+        // Build test value for 1.2.3.4:5678
+        // port 5678 = 0x162E, XOR with 0x2112 = 0x373C
+        // ip 1.2.3.4 = 0x01020304, XOR with 0x2112A442 = 0x2110A746
+        let val = [
+            0x00, // reserved
+            0x01, // IPv4
+            0x37, 0x3C, // XOR'd port (5678 XOR 0x2112)
+            0x21, 0x10, 0xA7, 0x46, // XOR'd IP (1.2.3.4 XOR 0x2112A442)
+        ];
+
+        let result = client.parse_xor_mapped_address(&val).unwrap();
+        assert_eq!(result.port(), 5678);
+        assert_eq!(result.ip().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_parse_mapped_address_extracts_full_endpoint() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+
+        // MAPPED-ADDRESS for 10.20.30.40:9999
+        let val = [
+            0x00, // reserved
+            0x01, // IPv4
+            0x27, 0x0F, // port 9999
+            10, 20, 30, 40, // IP
+        ];
+
+        let result = client.parse_mapped_address(&val).unwrap();
+        assert_eq!(result.port(), 9999);
+        assert_eq!(result.ip().to_string(), "10.20.30.40");
+    }
+
+    #[test]
+    fn test_gather_mapped_endpoints_returns_vec_of_socket_addr() {
+        // This is a structural test - actual STUN queries need network
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+
+        // With no servers, should return empty vec
+        let results = client.gather_mapped_endpoints(None);
+        assert!(results.is_empty());
     }
 }
