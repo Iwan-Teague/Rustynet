@@ -47,7 +47,7 @@ use crate::relay_client::{RelayClient, RelayClientConfig};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
-use crate::stun_client::StunClient;
+use crate::stun_client::{StunClient, StunResult};
 use crate::traversal::{
     CandidateSource as ProbeCandidateSource,
     DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES as TRAVERSAL_DEFAULT_MAX_CANDIDATES,
@@ -1950,7 +1950,8 @@ struct DaemonRuntime {
     traversal_probe_reprobe_interval_secs: u64,
     local_host_candidates: BTreeMap<String, Vec<IpAddr>>,
     local_stun_candidates: Vec<SocketAddr>,
-    stun_result_rx: Option<mpsc::Receiver<Vec<IpAddr>>>,
+    /// Receives full mapped endpoints from STUN, not just IPs.
+    stun_result_rx: Option<mpsc::Receiver<Vec<StunResult>>>,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -2066,16 +2067,18 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             let signing_secret =
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
             let signing_key = derive_endpoint_hint_signing_key(signing_secret);
+            let relay_config = RelayClientConfig::default();
+            let bind_port = relay_config.local_port.unwrap_or(0);
             let mut relay_client = RelayClient::new(
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
                 Arc::new(signing_key),
-                RelayClientConfig::default(),
+                relay_config,
             );
             let socket =
-                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).map_err(|err| {
-                    DaemonError::Io(format!("bind relay client socket failed: {err}"))
-                })?;
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, bind_port))).map_err(
+                    |err| DaemonError::Io(format!("bind relay client socket failed: {err}")),
+                )?;
             relay_client
                 .bind(socket)
                 .map_err(|err| DaemonError::Io(format!("initialize relay client failed: {err}")))?;
@@ -2199,9 +2202,11 @@ impl DaemonRuntime {
                     // Initial jitter
                     sleep(Duration::from_millis(500));
                     loop {
-                        let ips = client.gather_public_ips();
-                        if !ips.is_empty() {
-                            let _ = tx.send(ips);
+                        // Use gather_mapped_endpoints to get full SocketAddr including
+                        // the actual mapped port, not a guessed port
+                        let results = client.gather_mapped_endpoints(None);
+                        if !results.is_empty() {
+                            let _ = tx.send(results);
                         }
                         sleep(Duration::from_secs(
                             DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS,
@@ -3038,13 +3043,15 @@ impl DaemonRuntime {
 
     fn poll_stun_results(&mut self) {
         if let Some(rx) = self.stun_result_rx.as_mut() {
-            while let Ok(ips) = rx.try_recv() {
-                self.local_stun_candidates = ips
+            while let Ok(stun_results) = rx.try_recv() {
+                // Use the actual mapped endpoints from STUN, not guessed ports.
+                // This is critical for NATs that don't preserve the local port.
+                self.local_stun_candidates = stun_results
                     .into_iter()
-                    .map(|ip| SocketAddr::new(ip, self.wg_listen_port))
+                    .map(|result| result.mapped_endpoint)
                     .collect();
                 eprintln!(
-                    "rustynetd: stun candidates updated: {:?}",
+                    "rustynetd: stun candidates updated (using actual mapped ports): {:?}",
                     self.local_stun_candidates
                 );
             }

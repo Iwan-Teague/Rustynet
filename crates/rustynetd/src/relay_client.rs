@@ -42,6 +42,19 @@ pub struct RelayClientConfig {
     pub max_sessions_per_peer: usize,
     /// Socket receive timeout for relay operations.
     pub recv_timeout: Duration,
+    /// Optional local port to bind the relay client socket to.
+    ///
+    /// If `None`, an ephemeral port is used. For better NAT traversal behavior,
+    /// consider binding to the same local port as the WireGuard transport. Note
+    /// that this requires WireGuard to use SO_REUSEADDR/SO_REUSEPORT (not default
+    /// in kernel WG), or for the relay socket to be bound before WireGuard starts.
+    ///
+    /// # Security note
+    ///
+    /// Using a fixed port exposes a predictable local service endpoint. Only use
+    /// if the network environment requires stable NAT mappings and the host
+    /// firewall is properly configured.
+    pub local_port: Option<u16>,
 }
 
 impl Default for RelayClientConfig {
@@ -51,6 +64,7 @@ impl Default for RelayClientConfig {
             keepalive_interval: Duration::from_secs(25),
             max_sessions_per_peer: 2,
             recv_timeout: Duration::from_secs(5),
+            local_port: None,
         }
     }
 }
@@ -178,10 +192,16 @@ impl RelayClient {
         }
     }
 
+    /// Returns the configured local port for the relay client socket, if any.
+    pub fn local_port(&self) -> Option<u16> {
+        self.config.local_port
+    }
+
     /// Binds the relay client to a local socket.
     ///
-    /// This should be called with the same socket used for WireGuard traffic
-    /// to ensure NAT mappings are shared for hole punching.
+    /// This should be called with a socket bound to the desired local address.
+    /// For best NAT traversal behavior, consider using the same local port as
+    /// the WireGuard transport (see `RelayClientConfig::local_port`).
     pub fn bind(&mut self, socket: UdpSocket) -> Result<(), RelayClientError> {
         socket.set_read_timeout(Some(self.config.recv_timeout))?;
         socket.set_write_timeout(Some(self.config.recv_timeout))?;
@@ -339,6 +359,14 @@ impl RelayClient {
             .retain(|_, session| !session.is_idle(idle_timeout));
     }
 
+    /// Removes a specific session for a peer.
+    ///
+    /// Used during clean failover to release a relay session before
+    /// transitioning to a different path.
+    pub fn remove_session(&mut self, peer_node_id: &NodeId) -> Option<RelayClientSession> {
+        self.sessions.remove(peer_node_id)
+    }
+
     /// Returns the number of active sessions.
     pub fn active_session_count(&self) -> usize {
         self.sessions.len()
@@ -355,6 +383,93 @@ impl RelayClient {
         if let Some(session) = self.sessions.get_mut(peer_node_id) {
             session.last_activity = Instant::now();
         }
+    }
+
+    /// Returns the keepalive interval from config.
+    pub fn keepalive_interval(&self) -> Duration {
+        self.config.keepalive_interval
+    }
+
+    /// Returns peer IDs that need keepalive packets sent.
+    ///
+    /// A session needs keepalive when `last_activity` is older than
+    /// `keepalive_interval` but not yet idle (cleanup would handle idle).
+    pub fn sessions_needing_keepalive(&self) -> Vec<NodeId> {
+        let keepalive_threshold = self.config.keepalive_interval;
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.last_activity.elapsed() >= keepalive_threshold)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect()
+    }
+
+    /// Sends a keepalive packet to maintain NAT binding for a relay session.
+    ///
+    /// Keepalives are small UDP packets sent to the relay's allocated port
+    /// to refresh NAT mappings. The relay should echo or acknowledge.
+    ///
+    /// # Returns
+    /// `Ok(())` if the keepalive was sent successfully.
+    pub fn send_keepalive(&mut self, peer_node_id: &NodeId) -> Result<(), RelayClientError> {
+        let session = self
+            .sessions
+            .get(peer_node_id)
+            .ok_or(RelayClientError::NoRelayAvailable)?;
+
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or(RelayClientError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "relay socket not bound",
+            )))?;
+
+        // Keepalive is a minimal packet to the allocated port.
+        // Use a simple format: [KEEPALIVE_MSG_TYPE, session_id[0..4]]
+        // This is enough to keep NAT mappings alive without being a full hello.
+        let mut keepalive = [0u8; 5];
+        keepalive[0] = RELAY_KEEPALIVE_MSG_TYPE;
+        keepalive[1..5].copy_from_slice(&session.session_id.as_bytes()[0..4]);
+
+        let target = SocketAddr::new(session.relay_addr.ip(), session.allocated_port);
+        socket.send_to(&keepalive, target)?;
+
+        // Update last activity since we just sent something
+        if let Some(session) = self.sessions.get_mut(peer_node_id) {
+            session.last_activity = Instant::now();
+        }
+
+        Ok(())
+    }
+
+    /// Sends keepalives to all sessions that need them.
+    ///
+    /// Returns the number of keepalives sent and any errors encountered.
+    pub fn send_all_keepalives(&mut self) -> (usize, Vec<(NodeId, RelayClientError)>) {
+        let peers_needing_keepalive = self.sessions_needing_keepalive();
+        let mut sent = 0;
+        let mut errors = Vec::new();
+
+        for peer_id in peers_needing_keepalive {
+            match self.send_keepalive(&peer_id) {
+                Ok(()) => sent += 1,
+                Err(e) => errors.push((peer_id, e)),
+            }
+        }
+
+        (sent, errors)
+    }
+
+    /// Returns sessions with tokens expiring soon.
+    ///
+    /// This allows the daemon to proactively refresh tokens before they expire.
+    pub fn sessions_needing_token_refresh(&self, now_unix: u64) -> Vec<(NodeId, u64)> {
+        let refresh_margin = 60; // 60 seconds before expiry
+        self.sessions
+            .iter()
+            .filter(|(_, session)| session.token_refresh_due(now_unix, refresh_margin))
+            .map(|(peer_id, session)| (peer_id.clone(), session.token_expires_at_unix))
+            .collect()
     }
 
     #[cfg(test)]
@@ -378,6 +493,7 @@ impl RelayClient {
 const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
 const RELAY_HELLO_ACK_MSG_TYPE: u8 = 0x02;
 const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
+const RELAY_KEEPALIVE_MSG_TYPE: u8 = 0x04;
 
 /// Serializes a RelayHello message for wire transmission.
 fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
@@ -647,5 +763,504 @@ mod tests {
 
         assert!(!session.token_refresh_due(now_unix, 10));
         assert!(session.token_refresh_due(now_unix, 31));
+    }
+
+    #[test]
+    fn relay_client_scripted_establish_session_success() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[2u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        // Script a successful establishment
+        client.script_establish_session_result(Ok(5001));
+
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let relay_id = [0xAA; 16];
+
+        let endpoint = client
+            .establish_session(&peer_id, relay_addr, relay_id, 60)
+            .expect("should succeed with scripted result");
+
+        assert_eq!(endpoint.port, 5001);
+        assert!(client.has_session(&peer_id));
+        assert_eq!(client.active_session_count(), 1);
+    }
+
+    #[test]
+    fn relay_client_scripted_establish_session_failure_then_success() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[3u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        // Script a failure followed by success (simulating retry scenario)
+        client.script_establish_session_result(Err(RelayClientError::Timeout));
+        client.script_establish_session_result(Ok(5002));
+
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let relay_id = [0xAA; 16];
+
+        // First attempt fails
+        let err = client
+            .establish_session(&peer_id, relay_addr, relay_id, 60)
+            .expect_err("first attempt should fail");
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert!(!client.has_session(&peer_id));
+
+        // Second attempt succeeds
+        let endpoint = client
+            .establish_session(&peer_id, relay_addr, relay_id, 60)
+            .expect("second attempt should succeed");
+        assert_eq!(endpoint.port, 5002);
+        assert!(client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_close_session_removes_from_map() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[4u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        client.script_establish_session_result(Ok(5003));
+
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let relay_id = [0xAA; 16];
+
+        client
+            .establish_session(&peer_id, relay_addr, relay_id, 60)
+            .expect("should succeed");
+        assert!(client.has_session(&peer_id));
+
+        let closed = client.close_session(&peer_id);
+        assert!(closed.is_some());
+        assert!(!client.has_session(&peer_id));
+        assert_eq!(client.active_session_count(), 0);
+    }
+
+    #[test]
+    fn relay_client_touch_session_updates_last_activity() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[5u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        let peer_id = test_node_id("peer-b");
+
+        // Manually insert an old session
+        client.sessions.insert(
+            peer_id.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x55; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5004,
+                peer_node_id: peer_id.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now() - Duration::from_secs(100),
+                relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        // Session should be idle
+        let session = client.session_for_peer(&peer_id).unwrap();
+        assert!(session.is_idle(Duration::from_secs(60)));
+
+        // Touch session
+        client.touch_session(&peer_id);
+
+        // Session should no longer be idle
+        let session = client.session_for_peer(&peer_id).unwrap();
+        assert!(!session.is_idle(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn relay_client_relay_endpoint_for_peer_returns_correct_endpoint() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[6u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        let peer_id = test_node_id("peer-b");
+
+        // No session yet
+        assert!(client.relay_endpoint_for_peer(&peer_id).is_none());
+
+        // Add session
+        client.sessions.insert(
+            peer_id.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x66; 16]),
+                relay_addr: "10.0.0.1:4500".parse().unwrap(),
+                allocated_port: 6000,
+                peer_node_id: peer_id.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xCC; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        let endpoint = client
+            .relay_endpoint_for_peer(&peer_id)
+            .expect("should have endpoint");
+        assert_eq!(endpoint.addr.to_string(), "10.0.0.1");
+        assert_eq!(endpoint.port, 6000);
+    }
+
+    #[test]
+    fn relay_client_sessions_needing_keepalive_returns_stale_sessions() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[7u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig {
+                keepalive_interval: Duration::from_secs(25),
+                ..Default::default()
+            },
+        );
+
+        let peer_a = test_node_id("peer-a");
+        let peer_b = test_node_id("peer-b");
+
+        // Add session with recent activity (should NOT need keepalive)
+        client.sessions.insert(
+            peer_a.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x77; 16]),
+                relay_addr: "10.0.0.1:4500".parse().unwrap(),
+                allocated_port: 7001,
+                peer_node_id: peer_a.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xDD; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        // Add session with old activity (should need keepalive)
+        client.sessions.insert(
+            peer_b.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x88; 16]),
+                relay_addr: "10.0.0.2:4500".parse().unwrap(),
+                allocated_port: 7002,
+                peer_node_id: peer_b.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now() - Duration::from_secs(30),
+                relay_id: [0xEE; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        let needs_keepalive = client.sessions_needing_keepalive();
+        assert_eq!(needs_keepalive.len(), 1);
+        assert_eq!(needs_keepalive[0], peer_b);
+    }
+
+    #[test]
+    fn relay_client_sessions_needing_token_refresh_returns_expiring_sessions() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[8u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        let peer_a = test_node_id("peer-a");
+        let peer_b = test_node_id("peer-b");
+
+        // Add session with long-lived token (should NOT need refresh)
+        client.sessions.insert(
+            peer_a.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x99; 16]),
+                relay_addr: "10.0.0.1:4500".parse().unwrap(),
+                allocated_port: 8001,
+                peer_node_id: peer_a.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix + 300, // Expires in 5 minutes
+            },
+        );
+
+        // Add session with soon-expiring token (should need refresh)
+        client.sessions.insert(
+            peer_b.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0xAA; 16]),
+                relay_addr: "10.0.0.2:4500".parse().unwrap(),
+                allocated_port: 8002,
+                peer_node_id: peer_b.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xBB; 16],
+                token_expires_at_unix: now_unix + 30, // Expires in 30 seconds
+            },
+        );
+
+        let needs_refresh = client.sessions_needing_token_refresh(now_unix);
+        assert_eq!(needs_refresh.len(), 1);
+        assert_eq!(needs_refresh[0].0, peer_b);
+        assert_eq!(needs_refresh[0].1, now_unix + 30);
+    }
+
+    #[test]
+    fn relay_client_keepalive_interval_returns_config_value() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[9u8; 32]));
+        let client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig {
+                keepalive_interval: Duration::from_secs(42),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(client.keepalive_interval(), Duration::from_secs(42));
+    }
+
+    #[test]
+    fn relay_client_local_port_config_returns_configured_value() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[10u8; 32]));
+        let client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig {
+                local_port: Some(51820),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(client.local_port(), Some(51820));
+    }
+
+    #[test]
+    fn relay_client_local_port_default_is_none() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[11u8; 32]));
+        let client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        assert_eq!(client.local_port(), None);
+    }
+
+    /// Verifies that session cleanup preserves live sessions while removing only
+    /// expired/idle ones. This ensures fail-closed behavior during transitions.
+    #[test]
+    fn relay_client_cleanup_preserves_live_sessions_removes_only_idle() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[12u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        // Insert a live session (active recently)
+        let live_peer = test_node_id("live-peer");
+        client.sessions.insert(
+            live_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x11; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5000,
+                peer_node_id: live_peer.clone(),
+                established_at: Instant::now() - Duration::from_secs(10),
+                last_activity: Instant::now() - Duration::from_secs(5), // Recent activity
+                relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        // Insert an idle session (inactive for too long)
+        let idle_peer = test_node_id("idle-peer");
+        client.sessions.insert(
+            idle_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x22; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5001,
+                peer_node_id: idle_peer.clone(),
+                established_at: Instant::now() - Duration::from_secs(120),
+                last_activity: Instant::now() - Duration::from_secs(120), // Idle
+                relay_id: [0xBB; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        assert_eq!(client.active_session_count(), 2);
+
+        // Cleanup with 60-second idle threshold
+        client.cleanup_idle_sessions(Duration::from_secs(60));
+
+        // Live session should remain, idle session should be removed
+        assert_eq!(client.active_session_count(), 1);
+        assert!(client.has_session(&live_peer));
+        assert!(!client.has_session(&idle_peer));
+    }
+
+    /// Verifies that expired tokens are correctly identified for refresh,
+    /// supporting Phase D token refresh across long uptime.
+    #[test]
+    fn relay_client_token_refresh_identifies_multiple_expiring_sessions() {
+        let now_unix = 1000u64;
+        let signing_key = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        // Session expiring soon (within margin)
+        let expiring_peer_1 = test_node_id("expiring-1");
+        client.sessions.insert(
+            expiring_peer_1.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x01; 16]),
+                relay_addr: "10.0.0.1:4500".parse().unwrap(),
+                allocated_port: 6000,
+                peer_node_id: expiring_peer_1.clone(),
+                established_at: Instant::now() - Duration::from_secs(100),
+                last_activity: Instant::now() - Duration::from_secs(5),
+                relay_id: [0x11; 16],
+                token_expires_at_unix: now_unix + 30, // Expires in 30s, within 60s margin
+            },
+        );
+
+        // Another session expiring soon
+        let expiring_peer_2 = test_node_id("expiring-2");
+        client.sessions.insert(
+            expiring_peer_2.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x02; 16]),
+                relay_addr: "10.0.0.2:4500".parse().unwrap(),
+                allocated_port: 6001,
+                peer_node_id: expiring_peer_2.clone(),
+                established_at: Instant::now() - Duration::from_secs(200),
+                last_activity: Instant::now() - Duration::from_secs(10),
+                relay_id: [0x22; 16],
+                token_expires_at_unix: now_unix + 45, // Expires in 45s, within 60s margin
+            },
+        );
+
+        // Session not expiring soon
+        let healthy_peer = test_node_id("healthy-peer");
+        client.sessions.insert(
+            healthy_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x03; 16]),
+                relay_addr: "10.0.0.3:4500".parse().unwrap(),
+                allocated_port: 6002,
+                peer_node_id: healthy_peer.clone(),
+                established_at: Instant::now() - Duration::from_secs(50),
+                last_activity: Instant::now() - Duration::from_secs(2),
+                relay_id: [0x33; 16],
+                token_expires_at_unix: now_unix + 3600, // Expires in 1 hour
+            },
+        );
+
+        let needs_refresh = client.sessions_needing_token_refresh(now_unix);
+
+        // Should find exactly 2 sessions needing refresh
+        assert_eq!(needs_refresh.len(), 2);
+        let refresh_peers: Vec<_> = needs_refresh.iter().map(|(n, _)| n.clone()).collect();
+        assert!(refresh_peers.contains(&expiring_peer_1));
+        assert!(refresh_peers.contains(&expiring_peer_2));
+        assert!(!refresh_peers.contains(&healthy_peer));
+    }
+
+    /// Verifies that remove_session correctly removes a specific session,
+    /// supporting clean failover transitions.
+    #[test]
+    fn relay_client_remove_session_supports_clean_failover() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[14u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        // Create two sessions
+        let peer_1 = test_node_id("peer-1");
+        let peer_2 = test_node_id("peer-2");
+
+        client.sessions.insert(
+            peer_1.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0xAA; 16]),
+                relay_addr: "10.0.0.1:4500".parse().unwrap(),
+                allocated_port: 7000,
+                peer_node_id: peer_1.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0x11; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        client.sessions.insert(
+            peer_2.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0xBB; 16]),
+                relay_addr: "10.0.0.2:4500".parse().unwrap(),
+                allocated_port: 7001,
+                peer_node_id: peer_2.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0x22; 16],
+                token_expires_at_unix: now_unix + 300,
+            },
+        );
+
+        assert_eq!(client.active_session_count(), 2);
+
+        // Remove one session (simulating failover cleanup)
+        client.remove_session(&peer_1);
+
+        // Only peer_2 should remain
+        assert_eq!(client.active_session_count(), 1);
+        assert!(!client.has_session(&peer_1));
+        assert!(client.has_session(&peer_2));
     }
 }

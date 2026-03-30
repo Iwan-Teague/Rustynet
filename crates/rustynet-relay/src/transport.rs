@@ -260,6 +260,18 @@ impl RelayTransport {
         })
     }
 
+    /// Refresh session activity timestamp without forwarding data.
+    ///
+    /// Used by keepalive packets to prevent session idle timeout.
+    pub fn touch_session(&mut self, session_id: SessionId) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or("session not found")?;
+        session.last_packet_at = Instant::now();
+        Ok(())
+    }
+
     /// Forward a ciphertext payload from one session to its paired session.
     ///
     /// Returns:
@@ -1284,6 +1296,91 @@ mod tests {
             transport.handle_hello(cloned_hello),
             RelayHelloResponse::Rejected(RejectReason::ReplayedNonce),
             "replayed nonce must be rejected even with valid signature"
+        );
+    }
+
+    // ── Keepalive / touch_session tests ───────────────────────────────────────
+
+    #[test]
+    fn touch_session_updates_last_packet_at() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let ack = match transport.handle_hello(hello) {
+            RelayHelloResponse::Accepted(ack) => ack,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        // Age the session
+        if let Some(session) = transport.sessions.get_mut(&ack.session_id) {
+            session.last_packet_at = Instant::now() - Duration::from_secs(100);
+        }
+
+        // Touch should update timestamp
+        assert!(
+            transport.touch_session(ack.session_id).is_ok(),
+            "touch_session should succeed for valid session"
+        );
+
+        // Verify timestamp was updated (should be recent now)
+        if let Some(session) = transport.sessions.get(&ack.session_id) {
+            assert!(
+                session.last_packet_at.elapsed() < Duration::from_secs(1),
+                "last_packet_at should be recent after touch"
+            );
+        }
+    }
+
+    #[test]
+    fn touch_session_rejects_unknown_session() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let unknown_session = SessionId::from([0xDE; 16]);
+        assert!(
+            transport.touch_session(unknown_session).is_err(),
+            "touch_session must reject unknown session"
+        );
+    }
+
+    #[test]
+    fn touch_session_prevents_idle_cleanup() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        // Create two sessions
+        let hello_a = make_hello(&sk, "node-a", "node-b");
+        let ack_a = match transport.handle_hello(hello_a) {
+            RelayHelloResponse::Accepted(ack) => ack,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        let hello_b = make_hello(&sk, "node-b", "node-a");
+        let ack_b = match transport.handle_hello(hello_b) {
+            RelayHelloResponse::Accepted(ack) => ack,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        // Age both sessions past idle threshold
+        for session in transport.sessions.values_mut() {
+            session.last_packet_at = Instant::now() - Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS + 1);
+        }
+
+        // Touch only session A
+        let _ = transport.touch_session(ack_a.session_id);
+
+        // Run cleanup
+        transport.cleanup_idle_sessions();
+
+        // Session A should survive, session B should be cleaned
+        assert!(
+            transport.sessions.contains_key(&ack_a.session_id),
+            "touched session should survive cleanup"
+        );
+        assert!(
+            !transport.sessions.contains_key(&ack_b.session_id),
+            "untouched idle session should be cleaned up"
         );
     }
 }
