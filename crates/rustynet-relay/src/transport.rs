@@ -1364,7 +1364,8 @@ mod tests {
 
         // Age both sessions past idle threshold
         for session in transport.sessions.values_mut() {
-            session.last_packet_at = Instant::now() - Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS + 1);
+            session.last_packet_at =
+                Instant::now() - Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS + 1);
         }
 
         // Touch only session A

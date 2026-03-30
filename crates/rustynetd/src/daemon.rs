@@ -2075,10 +2075,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
                 Arc::new(signing_key),
                 relay_config,
             );
-            let socket =
-                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, bind_port))).map_err(
-                    |err| DaemonError::Io(format!("bind relay client socket failed: {err}")),
-                )?;
+            let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, bind_port)))
+                .map_err(|err| {
+                    DaemonError::Io(format!("bind relay client socket failed: {err}"))
+                })?;
             relay_client
                 .bind(socket)
                 .map_err(|err| DaemonError::Io(format!("initialize relay client failed: {err}")))?;
