@@ -2751,6 +2751,27 @@ mod tests {
     }
 
     #[test]
+    fn privileged_helper_service_template_preserves_tun_device_access_for_helper_owned_setup() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template = std::fs::read_to_string(
+            repo_root.join("scripts/systemd/rustynetd-privileged-helper.service"),
+        )
+        .expect("rustynetd privileged-helper service template should be readable");
+        assert!(
+            service_template.contains("PrivateDevices=true"),
+            "rustynetd privileged-helper service template should keep the private device namespace enabled"
+        );
+        assert!(
+            service_template.contains("BindPaths=/dev/net/tun"),
+            "rustynetd privileged-helper service template must expose only /dev/net/tun into the private device namespace for helper-assisted TUN creation"
+        );
+        assert!(
+            service_template.contains("DeviceAllow=/dev/net/tun rw"),
+            "rustynetd privileged-helper service template must allow read/write access to /dev/net/tun for helper-assisted userspace-shared setup"
+        );
+    }
+
+    #[test]
     fn wait_for_unix_socket_rejects_regular_file_path() {
         let unique = format!(
             "rustynet-cli-install-socket-{}",
