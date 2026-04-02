@@ -291,12 +291,12 @@ main() {
   if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
     direct_client_underlay="$CLIENT_UNDERLAY_IP"
   else
-    direct_client_underlay="$(live_lab_target_address "$CLIENT_HOST")"
+    direct_client_underlay="$(live_lab_resolved_target_address "$CLIENT_HOST")"
   fi
   if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
     direct_exit_underlay="$EXIT_UNDERLAY_IP"
   else
-    direct_exit_underlay="$(live_lab_target_address "$EXIT_HOST")"
+    direct_exit_underlay="$(live_lab_resolved_target_address "$EXIT_HOST")"
   fi
   CLIENT_ADDR="$direct_client_underlay"
   EXIT_ADDR="$direct_exit_underlay"

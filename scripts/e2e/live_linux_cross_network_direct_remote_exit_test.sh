@@ -221,12 +221,12 @@ main() {
   if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
     EXIT_ADDR="$EXIT_UNDERLAY_IP"
   else
-    EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
+    EXIT_ADDR="$(live_lab_resolved_target_address "$EXIT_HOST")"
   fi
   if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
     CLIENT_ADDR="$CLIENT_UNDERLAY_IP"
   else
-    CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
+    CLIENT_ADDR="$(live_lab_resolved_target_address "$CLIENT_HOST")"
   fi
 
   NODES_SPEC="${EXIT_NODE_ID}|${EXIT_ADDR}:51820|${EXIT_PUB_HEX};${CLIENT_NODE_ID}|${CLIENT_ADDR}:51820|${CLIENT_PUB_HEX}"

@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nix::unistd::Uid;
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::{
-    ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
-    NodeMetadata,
+    AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
+    EndpointHintCandidateType, NodeMetadata,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
@@ -969,11 +969,32 @@ struct GenericAssignmentSpec {
 struct GenericTraversalNodeSpec {
     node_id: String,
     endpoint: String,
+    public_key: [u8; 32],
 }
 
 struct GenericTraversalAllowSpec {
     source_node_id: String,
     target_node_id: String,
+}
+
+#[derive(Debug)]
+struct IssuedAssignmentBundle {
+    target_node_id: String,
+    wire: String,
+}
+
+#[derive(Debug)]
+struct IssuedTraversalPairBundle {
+    source_node_id: String,
+    target_node_id: String,
+    wire: String,
+}
+
+#[derive(Debug)]
+struct IssuedTraversalArtifacts {
+    verifier_key_hex: String,
+    pair_bundles: Vec<IssuedTraversalPairBundle>,
+    aggregate_bundles: BTreeMap<String, String>,
 }
 
 pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
@@ -989,12 +1010,29 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
     ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
 
-    let known_node_ids = parse_generic_nodes(nodes_spec.as_str())?
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    let known_node_ids = nodes
         .iter()
         .map(|node| node.node_id.clone())
         .collect::<BTreeSet<_>>();
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
     prepare_clean_issue_dir(config.issue_dir.as_path(), "assignment issue dir")?;
+
+    for pair in &allow_pairs {
+        if !known_node_ids.contains(pair.target_node_id.as_str()) {
+            return Err(format!(
+                "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.target_node_id
+            ));
+        }
+        if !known_node_ids.contains(pair.source_node_id.as_str()) {
+            return Err(format!(
+                "source node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.source_node_id
+            ));
+        }
+    }
 
     for assignment in &assignment_specs {
         if !known_node_ids.contains(assignment.target_node_id.as_str()) {
@@ -1012,8 +1050,6 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
         }
     }
 
-    let cli_path = std::env::current_exe()
-        .map_err(|err| format!("resolve current rustynet CLI path failed: {err}"))?;
     let verifier_key_output = config.issue_dir.join("rn-assignment.pub");
     let passphrase_path = materialize_signing_passphrase_temp("rustynet-assignment-passphrase")?;
     let result = (|| -> Result<(), String> {
@@ -1025,40 +1061,24 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             Path::new(passphrase_path.as_str()),
         )?;
-        let verifier_key_hex = assignment_verifier_key_hex(signing_secret.as_slice());
-        for assignment in &assignment_specs {
+        let (verifier_key_hex, bundles) = issue_assignment_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignment_specs.as_slice(),
+            300,
+        )?;
+        for bundle in &bundles {
             let output_path = config.issue_dir.join(format!(
                 "rn-assignment-{}.assignment",
-                assignment.target_node_id
+                bundle.target_node_id
             ));
-            let output_text = output_path.display().to_string();
-            let mut args = vec![
-                "assignment",
-                "issue",
-                "--target-node-id",
-                assignment.target_node_id.as_str(),
-                "--nodes",
-                nodes_spec.as_str(),
-                "--allow",
-                allow_spec.as_str(),
-                "--signing-secret",
-                "/etc/rustynet/assignment.signing.secret",
-                "--signing-secret-passphrase-file",
-                passphrase_path.as_str(),
-                "--output",
-                output_text.as_str(),
-            ];
-            if let Some(exit_node_id) = assignment.exit_node_id.as_ref() {
-                args.push("--exit-node-id");
-                args.push(exit_node_id.as_str());
-            }
-            args.push("--ttl-secs");
-            args.push("300");
-            run_status_path(
-                cli_path.as_path(),
-                args.as_slice(),
-                "issuing live-lab assignment bundle failed",
-            )?;
+            fs::write(output_path.as_path(), bundle.wire.as_bytes()).map_err(|err| {
+                format!(
+                    "write assignment bundle failed ({}): {err}",
+                    output_path.display()
+                )
+            })?;
         }
         fs::write(
             verifier_key_output.as_path(),
@@ -1139,8 +1159,6 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     }
     prepare_clean_issue_dir(config.issue_dir.as_path(), "traversal issue dir")?;
 
-    let cli_path = std::env::current_exe()
-        .map_err(|err| format!("resolve current rustynet CLI path failed: {err}"))?;
     let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
     let passphrase_path = materialize_signing_passphrase_temp("rustynet-traversal-passphrase")?;
     let result = (|| -> Result<(), String> {
@@ -1152,61 +1170,23 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             Path::new(passphrase_path.as_str()),
         )?;
-        let verifier_key_hex = traversal_verifier_key_hex(signing_secret.as_slice());
-        let generated_at = unix_now();
-        let nonce = generated_at.saturating_mul(1000).saturating_add(1);
-        for pair in &allow_pairs {
-            let target_endpoint = endpoints_by_node
-                .get(pair.target_node_id.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
-                        pair.target_node_id
-                    )
-                })?;
-            let candidates = format!(
-                "host|{target_endpoint}|900;relay|{target_endpoint}|700|relay-{}",
-                pair.target_node_id
-            );
-            let output_path = config.issue_dir.join(format!(
+        let traversal_artifacts = issue_traversal_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            ttl_secs,
+        )?;
+        for pair_bundle in &traversal_artifacts.pair_bundles {
+            let pair_path = config.issue_dir.join(format!(
                 "rn-traversal-{}-{}.bundle",
-                pair.source_node_id, pair.target_node_id
+                pair_bundle.source_node_id, pair_bundle.target_node_id
             ));
-            let output_text = output_path.display().to_string();
-            let generated_at_text = generated_at.to_string();
-            let nonce_text = nonce.to_string();
-            let ttl_text = ttl_secs.to_string();
-            let args = [
-                "traversal",
-                "issue",
-                "--source-node-id",
-                pair.source_node_id.as_str(),
-                "--target-node-id",
-                pair.target_node_id.as_str(),
-                "--nodes",
-                nodes_spec.as_str(),
-                "--allow",
-                allow_spec.as_str(),
-                "--signing-secret",
-                "/etc/rustynet/assignment.signing.secret",
-                "--signing-secret-passphrase-file",
-                passphrase_path.as_str(),
-                "--candidates",
-                candidates.as_str(),
-                "--generated-at",
-                generated_at_text.as_str(),
-                "--nonce",
-                nonce_text.as_str(),
-                "--output",
-                output_text.as_str(),
-                "--ttl-secs",
-                ttl_text.as_str(),
-            ];
-            run_status_path(
-                cli_path.as_path(),
-                args.as_slice(),
-                "issuing live-lab traversal bundle failed",
-            )?;
+            fs::write(pair_path.as_path(), pair_bundle.wire.as_bytes()).map_err(|err| {
+                format!(
+                    "write traversal pair bundle failed ({}): {err}",
+                    pair_path.display()
+                )
+            })?;
         }
 
         let mut aggregate_paths = Vec::new();
@@ -1214,24 +1194,11 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             let aggregate_path = config
                 .issue_dir
                 .join(format!("rn-traversal-{}.traversal", node.node_id));
-            let mut aggregate = String::new();
-            for pair in &allow_pairs {
-                if pair.source_node_id != node.node_id {
-                    continue;
-                }
-                let pair_path = config.issue_dir.join(format!(
-                    "rn-traversal-{}-{}.bundle",
-                    pair.source_node_id, pair.target_node_id
-                ));
-                let body = fs::read_to_string(pair_path.as_path()).map_err(|err| {
-                    format!(
-                        "read traversal pair bundle failed ({}): {err}",
-                        pair_path.display()
-                    )
-                })?;
-                aggregate.push_str(body.as_str());
-                aggregate.push('\n');
-            }
+            let aggregate = traversal_artifacts
+                .aggregate_bundles
+                .get(node.node_id.as_str())
+                .cloned()
+                .unwrap_or_default();
             fs::write(aggregate_path.as_path(), aggregate.as_bytes()).map_err(|err| {
                 format!(
                     "write aggregated traversal bundle failed ({}): {err}",
@@ -1243,7 +1210,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
 
         fs::write(
             verifier_key_output.as_path(),
-            format!("{verifier_key_hex}\n").as_bytes(),
+            format!("{}\n", traversal_artifacts.verifier_key_hex).as_bytes(),
         )
         .map_err(|err| {
             format!(
@@ -1252,10 +1219,10 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             )
         })?;
         set_unix_mode(verifier_key_output.as_path(), 0o600)?;
-        for pair in &allow_pairs {
+        for pair_bundle in &traversal_artifacts.pair_bundles {
             let pair_path = config.issue_dir.join(format!(
                 "rn-traversal-{}-{}.bundle",
-                pair.source_node_id, pair.target_node_id
+                pair_bundle.source_node_id, pair_bundle.target_node_id
             ));
             set_unix_mode(pair_path.as_path(), 0o600)?;
         }
@@ -1386,6 +1353,152 @@ fn issue_two_node_traversal_artifacts(
         verifier_key_hex: core.endpoint_hint_verifier_key_hex(),
         exit_bundle_wire: ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&exit_bundle),
         client_bundle_wire: ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&client_bundle),
+    })
+}
+
+fn control_plane_core_from_generic_specs(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+) -> Result<ControlPlaneCore, String> {
+    let policy = PolicySet {
+        rules: allow_pairs
+            .iter()
+            .map(|pair| PolicyRule {
+                src: format!("node:{}", pair.source_node_id),
+                dst: format!("node:{}", pair.target_node_id),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            })
+            .collect::<Vec<_>>(),
+    };
+    let core = ControlPlaneCore::new(signing_secret.to_vec(), policy);
+    let now_unix = unix_now();
+    for node in nodes {
+        core.nodes
+            .upsert(NodeMetadata {
+                node_id: node.node_id.clone(),
+                hostname: node.node_id.clone(),
+                os: "linux".to_string(),
+                tags: Vec::new(),
+                owner: node.node_id.clone(),
+                endpoint: node.endpoint.clone(),
+                last_seen_unix: now_unix,
+                public_key: node.public_key,
+            })
+            .map_err(|err| format!("register node failed: {err}"))?;
+    }
+    Ok(core)
+}
+
+fn issue_assignment_bundle_artifacts(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+    assignment_specs: &[GenericAssignmentSpec],
+    ttl_secs: u64,
+) -> Result<(String, Vec<IssuedAssignmentBundle>), String> {
+    let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
+    let generated_at_unix = unix_now();
+    let bundles = assignment_specs
+        .iter()
+        .enumerate()
+        .map(|(index, assignment)| {
+            let bundle = core
+                .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                    node_id: assignment.target_node_id.clone(),
+                    generated_at_unix,
+                    ttl_secs,
+                    nonce: crate::generate_assignment_nonce().saturating_add(index as u64),
+                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    exit_node_id: assignment.exit_node_id.clone(),
+                    lan_routes: Vec::new(),
+                })
+                .map_err(|err| format!("issue assignment bundle failed: {err}"))?;
+            if !core.verify_signed_auto_tunnel_bundle(&bundle) {
+                return Err(format!(
+                    "self-verify failed for assignment bundle target {}",
+                    assignment.target_node_id
+                ));
+            }
+            Ok(IssuedAssignmentBundle {
+                target_node_id: assignment.target_node_id.clone(),
+                wire: ControlPlaneCore::signed_auto_tunnel_bundle_to_wire(&bundle),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((assignment_verifier_key_hex(signing_secret), bundles))
+}
+
+fn issue_traversal_bundle_artifacts(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+    ttl_secs: u64,
+) -> Result<IssuedTraversalArtifacts, String> {
+    let endpoints_by_node = nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), node.endpoint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
+    let generated_at_unix = unix_now();
+    let mut aggregate_bundles = BTreeMap::<String, String>::new();
+    let mut pair_bundles = Vec::new();
+
+    for (index, pair) in allow_pairs.iter().enumerate() {
+        let target_endpoint = endpoints_by_node
+            .get(pair.target_node_id.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                    pair.target_node_id
+                )
+            })?;
+        let bundle = core
+            .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+                source_node_id: pair.source_node_id.clone(),
+                target_node_id: pair.target_node_id.clone(),
+                generated_at_unix,
+                ttl_secs,
+                nonce: traversal_nonce(generated_at_unix, index as u64),
+                candidates: vec![
+                    EndpointHintCandidate {
+                        candidate_type: EndpointHintCandidateType::Host,
+                        endpoint: target_endpoint.clone(),
+                        relay_id: None,
+                        priority: 900,
+                    },
+                    EndpointHintCandidate {
+                        candidate_type: EndpointHintCandidateType::Relay,
+                        endpoint: target_endpoint.clone(),
+                        relay_id: Some(format!("relay-{}", pair.target_node_id)),
+                        priority: 700,
+                    },
+                ],
+            })
+            .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
+        if !core.verify_signed_endpoint_hint_bundle(&bundle) {
+            return Err(format!(
+                "self-verify failed for traversal bundle {} -> {}",
+                pair.source_node_id, pair.target_node_id
+            ));
+        }
+        let wire = ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle);
+        aggregate_bundles
+            .entry(pair.source_node_id.clone())
+            .or_default()
+            .push_str(format!("{wire}\n").as_str());
+        pair_bundles.push(IssuedTraversalPairBundle {
+            source_node_id: pair.source_node_id.clone(),
+            target_node_id: pair.target_node_id.clone(),
+            wire,
+        });
+    }
+
+    Ok(IssuedTraversalArtifacts {
+        verifier_key_hex: traversal_verifier_key_hex(signing_secret),
+        pair_bundles,
+        aggregate_bundles,
     })
 }
 
@@ -2794,18 +2907,21 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
             continue;
         }
         let parts = trimmed.split('|').collect::<Vec<_>>();
-        if parts.len() < 2 {
+        if parts.len() < 3 {
             return Err(format!(
-                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|..."
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
             ));
         }
         let node_id = parts[0].trim();
         let endpoint = parts[1].trim();
+        let public_key_hex = parts[2].trim();
         ensure_safe_token("node-id", node_id)?;
         ensure_safe_token("endpoint", endpoint)?;
+        ensure_hex_32("node-public-key-hex", public_key_hex)?;
         nodes.push(GenericTraversalNodeSpec {
             node_id: node_id.to_string(),
             endpoint: endpoint.to_string(),
+            public_key: decode_hex_32(public_key_hex)?,
         });
     }
     if nodes.is_empty() {
@@ -2915,29 +3031,6 @@ fn materialize_signing_passphrase_temp(prefix: &str) -> Result<String, String> {
     )?;
     set_unix_mode(Path::new(output_path.as_str()), 0o600)?;
     Ok(output_path)
-}
-
-fn run_status_path(program: &Path, args: &[&str], context: &str) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| format!("{context}: failed to spawn {}: {err}", program.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => "no stdout/stderr output".to_string(),
-        (true, false) => format!("stderr={stderr}"),
-        (false, true) => format!("stdout={stdout}"),
-        (false, false) => format!("stdout={stdout}; stderr={stderr}"),
-    };
-    Err(format!(
-        "{context}: status={} {}",
-        output.status.code().unwrap_or(-1),
-        detail
-    ))
 }
 
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
@@ -4546,7 +4639,9 @@ mod tests {
     use super::{
         AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, assignment_verifier_key_hex, decode_base64,
         decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
-        issue_two_node_traversal_artifacts, traversal_verifier_key_hex,
+        issue_assignment_bundle_artifacts, issue_traversal_bundle_artifacts,
+        issue_two_node_traversal_artifacts, parse_generic_allow_specs,
+        parse_generic_assignment_specs, parse_generic_nodes, traversal_verifier_key_hex,
         write_assignment_refresh_env,
     };
     use rustynet_control::ControlPlaneCore;
@@ -4677,5 +4772,134 @@ mod tests {
             ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
                 .endpoint_hint_verifier_key_hex()
         );
+    }
+
+    #[test]
+    fn generic_assignment_bundle_artifacts_issue_without_recursive_cli() {
+        let nodes = parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+        let assignments =
+            parse_generic_assignment_specs("exit-1|-;client-1|exit-1").expect("assignments");
+
+        let (verifier_key_hex, bundles) = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect("assignment artifacts should issue");
+
+        assert!(!verifier_key_hex.is_empty());
+        assert_eq!(bundles.len(), 2);
+        let exit_bundle = bundles
+            .iter()
+            .find(|bundle| bundle.target_node_id == "exit-1")
+            .expect("exit bundle");
+        let client_bundle = bundles
+            .iter()
+            .find(|bundle| bundle.target_node_id == "client-1")
+            .expect("client bundle");
+        assert!(exit_bundle.wire.contains("node_id=exit-1"));
+        assert!(exit_bundle.wire.contains("signature="));
+        assert!(client_bundle.wire.contains("node_id=client-1"));
+        assert!(client_bundle.wire.contains("kind=exit_default"));
+        assert!(client_bundle.wire.contains("via_node=exit-1"));
+    }
+
+    #[test]
+    fn generic_traversal_bundle_artifacts_issue_pair_and_aggregate_outputs() {
+        let nodes = parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+
+        let artifacts = issue_traversal_bundle_artifacts(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+        )
+        .expect("traversal artifacts should issue");
+
+        assert!(!artifacts.verifier_key_hex.is_empty());
+        assert_eq!(artifacts.pair_bundles.len(), 2);
+        assert!(
+            artifacts.pair_bundles[0]
+                .wire
+                .contains("source_node_id=client-1")
+        );
+        assert!(
+            artifacts.pair_bundles[0]
+                .wire
+                .contains("target_node_id=exit-1")
+        );
+        assert!(
+            artifacts
+                .aggregate_bundles
+                .get("client-1")
+                .expect("client aggregate")
+                .contains("candidate.0.addr=192.168.64.22")
+        );
+        assert!(
+            artifacts
+                .aggregate_bundles
+                .get("exit-1")
+                .expect("exit aggregate")
+                .contains("candidate.0.addr=192.168.64.24")
+        );
+    }
+
+    #[test]
+    fn generic_assignment_bundle_artifacts_reject_hostname_endpoints() {
+        let nodes = parse_generic_nodes(
+            "exit-1|debian-headless-1:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+        let assignments =
+            parse_generic_assignment_specs("exit-1|-;client-1|exit-1").expect("assignments");
+
+        let err = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect_err("hostname endpoints must fail closed");
+
+        assert!(err.contains("requested node endpoint is invalid"));
+    }
+
+    #[test]
+    fn generic_traversal_bundle_artifacts_reject_hostname_endpoints() {
+        let nodes = parse_generic_nodes(
+            "exit-1|debian-headless-1:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+
+        let err = issue_traversal_bundle_artifacts(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+        )
+        .expect_err("hostname traversal endpoints must fail closed");
+
+        assert!(err.contains("candidate endpoint is invalid"));
     }
 }

@@ -473,12 +473,12 @@ main() {
   if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
     CLIENT_ADDR="$CLIENT_UNDERLAY_IP"
   else
-    CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
+    CLIENT_ADDR="$(live_lab_resolved_target_address "$CLIENT_HOST")"
   fi
   if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
     EXIT_ADDR="$EXIT_UNDERLAY_IP"
   else
-    EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
+    EXIT_ADDR="$(live_lab_resolved_target_address "$EXIT_HOST")"
   fi
   choose_alias || return 1
   CLIENT_IFACE="$(capture_default_route_iface "$CLIENT_HOST" | tr -d '[:space:]')"

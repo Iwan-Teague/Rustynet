@@ -268,17 +268,17 @@ main() {
   if [[ -n "$CLIENT_UNDERLAY_IP" ]]; then
     CLIENT_ADDR="$CLIENT_UNDERLAY_IP"
   else
-    CLIENT_ADDR="$(live_lab_target_address "$CLIENT_HOST")"
+    CLIENT_ADDR="$(live_lab_resolved_target_address "$CLIENT_HOST")"
   fi
   if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
     EXIT_ADDR="$EXIT_UNDERLAY_IP"
   else
-    EXIT_ADDR="$(live_lab_target_address "$EXIT_HOST")"
+    EXIT_ADDR="$(live_lab_resolved_target_address "$EXIT_HOST")"
   fi
   if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
     RELAY_ADDR="$RELAY_UNDERLAY_IP"
   else
-    RELAY_ADDR="$(live_lab_target_address "$RELAY_HOST")"
+    RELAY_ADDR="$(live_lab_resolved_target_address "$RELAY_HOST")"
   fi
 
   topology_result="$(cargo run --quiet -p rustynet-cli -- ops classify-cross-network-topology --ip-a "$CLIENT_ADDR" --ip-b "$EXIT_ADDR")" || return 1

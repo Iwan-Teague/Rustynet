@@ -320,7 +320,7 @@ auto_adjust_default_ssh_allow_cidrs_for_targets() {
   fi
   for target in "$EXIT_TARGET" "$CLIENT_TARGET" "$ENTRY_TARGET" "$AUX_TARGET" "$EXTRA_TARGET" "$FIFTH_CLIENT_TARGET"; do
     [[ -n "$target" ]] || continue
-    address="$(live_lab_target_address "$target")"
+    address="$(live_lab_resolved_target_address "$target")"
     if ! cidr="$(derive_ipv4_cidr_24 "$address")"; then
       # Keep explicit/default value unchanged for non-IPv4 targets.
       return 0
@@ -816,7 +816,7 @@ cross_network_underlay_ip_for_label() {
   if [[ -z "$target" ]]; then
     return 1
   fi
-  live_lab_target_address "$target"
+  live_lab_resolved_target_address "$target"
 }
 
 cross_network_relay_label() {
@@ -1987,10 +1987,10 @@ build_onehop_specs() {
   exit_node_id="$(node_id_for_label exit)"
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     if [[ "$first" == "1" ]]; then
-      nodes_spec="${node_id}|$(live_lab_target_address "$target"):51820|${pub_hex}"
+      nodes_spec="${node_id}|$(live_lab_resolved_target_address "$target"):51820|${pub_hex}"
       first="0"
     else
-      nodes_spec="${nodes_spec};${node_id}|$(live_lab_target_address "$target"):51820|${pub_hex}"
+      nodes_spec="${nodes_spec};${node_id}|$(live_lab_resolved_target_address "$target"):51820|${pub_hex}"
     fi
     if [[ "$node_id" == "$exit_node_id" ]]; then
       assignments_spec="${assignments_spec:+${assignments_spec};}${node_id}|-"
@@ -3290,7 +3290,7 @@ stage_run_reboot_recovery_report() {
     client_return="fail"
     client_boot_change="fail"
     printf 'client_reboot_wait=fail\n' | tee -a "$observations_file"
-    arp -an | rg "$(printf '%s' "$(live_lab_target_address "$client_target")" | sed 's/\./\\./g')" | tee -a "$observations_file" || true
+    arp -an | rg "$(printf '%s' "$(live_lab_resolved_target_address "$client_target")" | sed 's/\./\\./g')" | tee -a "$observations_file" || true
     cargo run --quiet -p rustynet-cli -- ops scan-ipv4-port-range \
       --network-prefix 192.168.18 \
       --start-host 1 \

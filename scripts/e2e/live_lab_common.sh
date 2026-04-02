@@ -176,6 +176,21 @@ live_lab_target_address() {
   printf '%s' "${target#*@}"
 }
 
+live_lab_resolved_target_address() {
+  local target="$1"
+  local resolved hostname
+  resolved="$(ssh -G "$target" 2>/dev/null)" || {
+    live_lab_target_address "$target"
+    return 0
+  }
+  hostname="$(awk '$1=="hostname"{print $2; exit}' <<<"$resolved")"
+  if [[ -n "$hostname" ]]; then
+    printf '%s' "$hostname"
+    return 0
+  fi
+  live_lab_target_address "$target"
+}
+
 live_lab_remote_src_dir() {
   local target="$1"
   local user
