@@ -519,11 +519,13 @@ validate_loaded_config_or_die() {
 
 enforce_backend_mode() {
   local expected="linux-wireguard"
+  local alternate="linux-wireguard-userspace-shared"
   if is_macos_host; then
     expected="macos-wireguard"
+    alternate="macos-wireguard-userspace-shared"
   fi
-  if [[ "${BACKEND_MODE}" != "${expected}" ]]; then
-    print_err "Invalid backend '${BACKEND_MODE}' for host profile ${HOST_PROFILE}; expected '${expected}'."
+  if [[ "${BACKEND_MODE}" != "${expected}" && "${BACKEND_MODE}" != "${alternate}" ]]; then
+    print_err "Invalid backend '${BACKEND_MODE}' for host profile ${HOST_PROFILE}; expected '${expected}' or '${alternate}'."
     exit 1
   fi
 }

@@ -2266,6 +2266,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_a4_expired_coordination_record_rejected() {
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
+            action: RuleAction::Allow,
+        });
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
+            core.nodes
+                .upsert(NodeMetadata {
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec![],
+                    owner: "user".to_string(),
+                    endpoint: endpoint.to_string(),
+                    last_seen_unix: 0,
+                    public_key: [0u8; 32],
+                })
+                .expect("upsert node");
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signed = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [3u8; 16],
+                probe_start_unix: now.saturating_sub(5),
+                node_a: "node-a".to_string(),
+                node_b: "node-b".to_string(),
+                issued_at_unix: now.saturating_sub(20),
+                expires_at_unix: now.saturating_sub(1),
+                nonce: [0xcd; 16],
+            })
+            .expect("sign");
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+        let err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-b").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay,
+            now,
+        );
+        assert!(
+            matches!(err, Err(TraversalError::CoordinationExpired)),
+            "expired coordination must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_a4_wrong_node_coordination_record_rejected() {
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
+            action: RuleAction::Allow,
+        });
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
+            core.nodes
+                .upsert(NodeMetadata {
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec![],
+                    owner: "user".to_string(),
+                    endpoint: endpoint.to_string(),
+                    last_seen_unix: 0,
+                    public_key: [0u8; 32],
+                })
+                .expect("upsert node");
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signed = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [4u8; 16],
+                probe_start_unix: now.saturating_add(1),
+                node_a: "node-a".to_string(),
+                node_b: "node-b".to_string(),
+                issued_at_unix: now,
+                expires_at_unix: now.saturating_add(20),
+                nonce: [0xef; 16],
+            })
+            .expect("sign");
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+        let err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-c").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay,
+            now,
+        );
+        assert!(
+            matches!(err, Err(TraversalError::CoordinationNodeMismatch)),
+            "wrong-node coordination must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_a4_malformed_coordination_payload_rejected() {
+        let mut policy = PolicySet::default();
+        policy.rules.push(PolicyRule {
+            src: "node:node-a".to_string(),
+            dst: "node:node-b".to_string(),
+            protocol: Protocol::Udp,
+            action: RuleAction::Allow,
+        });
+        let core = ControlPlaneCore::new(vec![0u8; 32], policy);
+        for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
+            core.nodes
+                .upsert(NodeMetadata {
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec![],
+                    owner: "user".to_string(),
+                    endpoint: endpoint.to_string(),
+                    last_seen_unix: 0,
+                    public_key: [0u8; 32],
+                })
+                .expect("upsert node");
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut signed = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [5u8; 16],
+                probe_start_unix: now.saturating_add(1),
+                node_a: "node-a".to_string(),
+                node_b: "node-b".to_string(),
+                issued_at_unix: now,
+                expires_at_unix: now.saturating_add(20),
+                nonce: [0xaa; 16],
+            })
+            .expect("sign");
+        signed.payload = signed.payload.replace("node_b=node-b\n", "");
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let mut replay = CoordinationReplayWindow::default();
+        let err = engine.validate_signed_coordination_record(
+            &signed,
+            &NodeId::new("node-a").unwrap(),
+            &NodeId::new("node-b").unwrap(),
+            &core.endpoint_hint_verifying_key,
+            &mut replay,
+            now,
+        );
+        assert!(
+            matches!(err, Err(TraversalError::Coordination(_))),
+            "malformed coordination payload must be rejected: {err:?}"
+        );
+    }
+
     /// A4: Candidate count exceeding `max_candidates` must be rejected; the
     /// engine must never panic or allocate unboundedly on a flooded input.
     #[test]

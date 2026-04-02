@@ -520,12 +520,12 @@ fn utc_now_string() -> String {
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
         .ok();
-    if let Some(output) = output {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !text.is_empty() {
-                return text;
-            }
+    if let Some(output) = output
+        && output.status.success()
+    {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !text.is_empty() {
+            return text;
         }
     }
     "1970-01-01T00:00:00Z".to_string()

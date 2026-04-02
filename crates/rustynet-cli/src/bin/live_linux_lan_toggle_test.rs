@@ -769,10 +769,10 @@ fn wait_for_lan_access_state(
         "lan_access=off"
     };
     for _ in 0..attempts {
-        if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"]) {
-            if status.contains(expected) {
-                return true;
-            }
+        if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"])
+            && status.contains(expected)
+        {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }

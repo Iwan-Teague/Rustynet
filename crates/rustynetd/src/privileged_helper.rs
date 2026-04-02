@@ -1266,6 +1266,20 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         ["link", "add", "dev", interface, "type", "wireguard"] if is_interface_name(interface) => {
             Ok(())
         }
+        [
+            "tuntap",
+            "add",
+            "dev",
+            interface,
+            "mode",
+            "tun",
+            "user",
+            owner_uid,
+            "group",
+            owner_gid,
+        ] if is_interface_name(interface) && is_u32_token(owner_uid) && is_u32_token(owner_gid) => {
+            Ok(())
+        }
         ["link", "set", "up", "dev", interface] if is_interface_name(interface) => Ok(()),
         ["link", "set", "down", "dev", interface] if is_interface_name(interface) => Ok(()),
         ["link", "del", "dev", interface] if is_interface_name(interface) => Ok(()),
@@ -1607,6 +1621,26 @@ mod tests {
             ],
         )
         .expect("known ip schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_linux_userspace_shared_tuntap_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "tuntap",
+                "add",
+                "dev",
+                "rustynet0",
+                "mode",
+                "tun",
+                "user",
+                "1001",
+                "group",
+                "1001",
+            ],
+        )
+        .expect("tuntap schema should be accepted");
     }
 
     #[test]

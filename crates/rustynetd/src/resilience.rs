@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -223,10 +223,11 @@ fn create_restricted_file(path: &Path) -> Result<File, ResilienceError> {
 }
 
 fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
-    const MAX_ATTEMPTS: usize = 50;
+    const MAX_WAIT: Duration = Duration::from_secs(3);
     const WAIT_MS: u64 = 10;
+    let deadline = Instant::now() + MAX_WAIT;
 
-    for _ in 0..MAX_ATTEMPTS {
+    loop {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -244,12 +245,14 @@ fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    return Err(ResilienceError::Io);
+                }
                 sleep(Duration::from_millis(WAIT_MS));
             }
             Err(_) => return Err(ResilienceError::Io),
         }
     }
-    Err(ResilienceError::Io)
 }
 
 fn lock_path_for(path: &Path) -> PathBuf {
@@ -291,11 +294,14 @@ impl Drop for StateLockGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use std::sync::Arc;
 
     use super::{
-        ReconnectPolicy, ResilienceError, SessionStateSnapshot, load_session_snapshot,
-        next_reconnect_delay_ms, persist_session_snapshot,
+        ReconnectPolicy, ResilienceError, SessionStateSnapshot, acquire_lock,
+        load_session_snapshot, lock_path_for, next_reconnect_delay_ms, persist_session_snapshot,
     };
 
     #[test]
@@ -379,6 +385,45 @@ mod tests {
         let _ = std::fs::remove_file(&*path);
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".lock");
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn persist_waits_for_brief_lock_contention() {
+        let unique = format!(
+            "rustynet-session-lock-contention-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = Arc::new(std::env::temp_dir().join(unique));
+        let lock_path = lock_path_for(&path);
+
+        let held_lock = acquire_lock(&lock_path).expect("initial lock acquisition should succeed");
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let snapshot = SessionStateSnapshot {
+                timestamp_unix: 2_000,
+                peer_ids: vec!["node-lock".to_string()],
+                selected_exit_node: Some("exit-lock".to_string()),
+                lan_access_enabled: true,
+            };
+            persist_session_snapshot(&snapshot, &*writer_path)
+        });
+
+        thread::sleep(Duration::from_millis(750));
+        drop(held_lock);
+
+        writer
+            .join()
+            .expect("writer thread should not panic")
+            .expect("write should succeed after lock is released");
+
+        let restored = load_session_snapshot(&*path).expect("snapshot should remain readable");
+        assert_eq!(restored.timestamp_unix, 2_000);
+
+        let _ = std::fs::remove_file(&*path);
         let _ = std::fs::remove_file(lock_path);
     }
 }

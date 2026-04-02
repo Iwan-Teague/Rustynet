@@ -90,7 +90,6 @@ mod daemon {
     /// Maps allocated ports to session IDs for ciphertext forwarding.
     struct PortAllocation {
         session_id: SessionId,
-        peer_addr: Option<SocketAddr>,
     }
 
     /// Relay daemon state.
@@ -102,8 +101,6 @@ mod daemon {
         allocated_sockets: Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
         /// Next port to try allocating.
         next_port: Arc<RwLock<u16>>,
-        /// Map from session_id to allocated port for cleanup.
-        session_ports: Arc<RwLock<HashMap<SessionId, u16>>>,
     }
 
     impl RelayDaemon {
@@ -146,7 +143,6 @@ mod daemon {
                 control_socket,
                 allocated_sockets: Arc::new(RwLock::new(HashMap::new())),
                 next_port: Arc::new(RwLock::new(config.port_range_start)),
-                session_ports: Arc::new(RwLock::new(HashMap::new())),
             })
         }
 
@@ -199,42 +195,18 @@ mod daemon {
             // Spawn cleanup task
             let transport_cleanup = Arc::clone(&self.transport);
             let allocated_cleanup = Arc::clone(&self.allocated_sockets);
-            let session_ports_cleanup = Arc::clone(&self.session_ports);
             let cleanup_interval = self.config.cleanup_interval_secs;
 
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(cleanup_interval));
                 loop {
                     ticker.tick().await;
-                    let mut transport = transport_cleanup.write().await;
-                    transport.cleanup_idle_sessions();
-                    // Note: allocated socket cleanup would require tracking
-                    // which sessions are still valid - simplified here
-                    drop(transport);
-
-                    // Clean up orphaned allocated sockets
-                    let mut sockets = allocated_cleanup.write().await;
-                    let mut ports_map = session_ports_cleanup.write().await;
-
-                    // Remove sockets for sessions that no longer exist
-                    let orphan_ports: Vec<u16> = sockets
-                        .iter()
-                        .filter(|(_, (_, alloc))| {
-                            !ports_map
-                                .values()
-                                .any(|p| *p == alloc.session_id.as_bytes()[0] as u16)
-                        })
-                        .map(|(port, _)| *port)
-                        .collect();
-
-                    for port in orphan_ports {
-                        sockets.remove(&port);
+                    {
+                        let mut transport = transport_cleanup.write().await;
+                        let _ = transport.cleanup_idle_sessions();
                     }
-
-                    // Also clean ports_map for consistency
-                    ports_map.retain(|sid, _| {
-                        sockets.values().any(|(_, alloc)| alloc.session_id == *sid)
-                    });
+                    Self::prune_inactive_allocated_sockets(&allocated_cleanup, &transport_cleanup)
+                        .await;
                 }
             });
 
@@ -287,11 +259,17 @@ mod daemon {
 
             let response = {
                 let mut transport = self.transport.write().await;
-                transport.handle_hello(hello)
+                transport.handle_hello_from_tuple(hello, from_addr)
             };
 
             match response {
                 RelayHelloResponse::Accepted(ack) => {
+                    Self::prune_inactive_allocated_sockets(
+                        &self.allocated_sockets,
+                        &self.transport,
+                    )
+                    .await;
+
                     // Allocate a port for this session
                     let (allocated_port, socket) = self.allocate_port().await?;
 
@@ -304,15 +282,9 @@ mod daemon {
                                 socket,
                                 PortAllocation {
                                     session_id: ack.session_id,
-                                    peer_addr: Some(from_addr),
                                 },
                             ),
                         );
-                    }
-
-                    {
-                        let mut ports = self.session_ports.write().await;
-                        ports.insert(ack.session_id, allocated_port);
                     }
 
                     // Send ack with allocated port
@@ -350,7 +322,6 @@ mod daemon {
         async fn spawn_forward_task(&self, port: u16) {
             let allocated_sockets = Arc::clone(&self.allocated_sockets);
             let transport = Arc::clone(&self.transport);
-            let session_ports = Arc::clone(&self.session_ports);
 
             tokio::spawn(async move {
                 let mut buf = [0u8; 65536];
@@ -362,7 +333,7 @@ mod daemon {
                         sockets.get(&port).map(|(s, _)| s.local_addr())
                     };
 
-                    let Ok(Some(_)) = socket_result.map(|r| r.ok()) else {
+                    let Some(Some(_)) = socket_result.map(|result| result.ok()) else {
                         // Socket no longer exists
                         break;
                     };
@@ -386,9 +357,8 @@ mod daemon {
                         // Check for keepalive packet (5 bytes: msg_type + 4 bytes session prefix)
                         // Keepalives refresh session activity but don't forward to peer
                         if len == 5 && buf[0] == RELAY_KEEPALIVE_MSG_TYPE {
-                            // Touch session to keep it alive
                             let mut t = transport.write().await;
-                            let _ = t.touch_session(session_id);
+                            let _ = t.touch_session_from_tuple(session_id, from_addr);
                             continue;
                         }
 
@@ -398,24 +368,24 @@ mod daemon {
                             t.forward_packet(session_id, &buf[..len], from_addr)
                         };
 
-                        if let Ok(Some((peer_session_id, payload))) = forward_result {
-                            // Find peer's allocated port and address
-                            let peer_info = {
-                                let ports = session_ports.read().await;
+                        match forward_result {
+                            Ok(Some(target)) => {
                                 let sockets = allocated_sockets.read().await;
-                                ports.get(&peer_session_id).and_then(|peer_port| {
-                                    sockets
-                                        .get(peer_port)
-                                        .and_then(|(_, alloc)| alloc.peer_addr)
-                                        .map(|addr| (*peer_port, addr))
-                                })
-                            };
-
-                            if let Some((peer_port, peer_addr)) = peer_info {
-                                let sockets = allocated_sockets.read().await;
-                                if let Some((peer_socket, _)) = sockets.get(&peer_port) {
-                                    let _ = peer_socket.send_to(&payload, peer_addr).await;
+                                if let Some((peer_socket, _)) =
+                                    sockets.get(&target.peer_allocated_port)
+                                {
+                                    let _ = peer_socket
+                                        .send_to(&target.payload, target.peer_addr)
+                                        .await;
                                 }
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                Self::prune_inactive_allocated_sockets(
+                                    &allocated_sockets,
+                                    &transport,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -425,12 +395,36 @@ mod daemon {
                 }
             });
         }
+
+        async fn prune_inactive_allocated_sockets(
+            allocated_sockets: &Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
+            transport: &Arc<RwLock<RelayTransport>>,
+        ) {
+            let active_sessions = {
+                let transport = transport.read().await;
+                let sockets = allocated_sockets.read().await;
+                sockets
+                    .iter()
+                    .filter_map(|(port, (_socket, alloc))| {
+                        transport
+                            .has_session(alloc.session_id)
+                            .then_some((*port, alloc.session_id))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+
+            let mut sockets = allocated_sockets.write().await;
+            sockets.retain(|port, (_socket, alloc)| {
+                active_sessions
+                    .get(port)
+                    .map(|session_id| *session_id == alloc.session_id)
+                    .unwrap_or(false)
+            });
+        }
     }
 
     /// Parses a RelayHello from wire format.
     fn parse_relay_hello(data: &[u8]) -> Result<rustynet_relay::transport::RelayHello, String> {
-        use rustynet_control::RelaySessionToken;
-
         if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
             return Err("not a hello message".to_string());
         }

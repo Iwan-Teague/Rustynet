@@ -466,21 +466,21 @@ fn resolve_node_id(config: &Config, host_name: &str) -> String {
         return node_id.clone();
     }
     let state_node = Path::new(RUSTYNET_STATE_DIR).join("node-id");
-    if let Some(value) = read_trimmed_file(&state_node) {
-        if !value.is_empty() {
-            return value;
-        }
+    if let Some(value) = read_trimmed_file(&state_node)
+        && !value.is_empty()
+    {
+        return value;
     }
     let config_node = Path::new(RUSTYNET_CONFIG_DIR).join("node-id");
-    if let Some(value) = read_trimmed_file(&config_node) {
-        if !value.is_empty() {
-            return value;
-        }
+    if let Some(value) = read_trimmed_file(&config_node)
+        && !value.is_empty()
+    {
+        return value;
     }
-    if let Some(value) = resolve_node_id_from_runtime_status() {
-        if !value.is_empty() {
-            return value;
-        }
+    if let Some(value) = resolve_node_id_from_runtime_status()
+        && !value.is_empty()
+    {
+        return value;
     }
     host_name.to_string()
 }
@@ -493,10 +493,10 @@ fn resolve_node_id_from_runtime_status() -> Option<String> {
         .output()
         .ok()
         .and_then(command_output_stdout_if_success);
-    if let Some(status) = direct {
-        if let Some(node_id) = parse_status_field(status.as_str(), "node_id") {
-            return Some(node_id);
-        }
+    if let Some(status) = direct
+        && let Some(node_id) = parse_status_field(status.as_str(), "node_id")
+    {
+        return Some(node_id);
     }
 
     Command::new("sudo")
@@ -533,14 +533,12 @@ fn detect_wg_interface(wg_available: bool) -> Option<String> {
             return Some(iface.to_string());
         }
     }
-    if wg_available {
-        if let Ok(output) = run_capture("wg", &["show", "interfaces"]) {
-            if let Some(first) = output.split_whitespace().next() {
-                if !first.is_empty() {
-                    return Some(first.to_string());
-                }
-            }
-        }
+    if wg_available
+        && let Ok(output) = run_capture("wg", &["show", "interfaces"])
+        && let Some(first) = output.split_whitespace().next()
+        && !first.is_empty()
+    {
+        return Some(first.to_string());
     }
     None
 }

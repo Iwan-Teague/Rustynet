@@ -91,14 +91,68 @@ live_lab_seed_known_hosts_file() {
   chmod 600 "$destination"
 }
 
+live_lab_known_hosts_lookup_host() {
+  local host="$1"
+  local port="$2"
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+  if [[ -z "$port" || "$port" == "22" ]]; then
+    printf '%s' "$host"
+    return 0
+  fi
+  printf '[%s]:%s' "$host" "$port"
+}
+
 live_lab_require_pinned_host_entry() {
   local target="$1"
-  local host
-  host="$(live_lab_target_address "$target")"
-  if ! ssh-keygen -F "$host" -f "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >/dev/null 2>&1; then
-    echo "pinned known_hosts file lacks host key for ${host}: $LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >&2
+  local resolved raw_host port hostkeyalias hostname lookup_host
+  local -a lookup_candidates=()
+  raw_host="$(live_lab_target_address "$target")"
+  resolved="$(ssh -G "$target" 2>/dev/null)" || {
+    echo "failed resolving SSH target for host-key verification: ${target}" >&2
     exit 1
+  }
+  port="$(awk '$1=="port"{print $2; exit}' <<<"$resolved")"
+  hostkeyalias="$(awk '$1=="hostkeyalias"{print $2; exit}' <<<"$resolved")"
+  hostname="$(awk '$1=="hostname"{print $2; exit}' <<<"$resolved")"
+
+  if [[ -n "$hostkeyalias" && "$hostkeyalias" != "none" ]]; then
+    lookup_host="$(live_lab_known_hosts_lookup_host "$hostkeyalias" "$port")" || {
+      echo "failed rendering hostkeyalias known_hosts lookup for ${target}" >&2
+      exit 1
+    }
+    lookup_candidates+=("$lookup_host")
   fi
+
+  lookup_host="$(live_lab_known_hosts_lookup_host "$raw_host" "$port")" || {
+    echo "failed rendering raw host known_hosts lookup for ${target}" >&2
+    exit 1
+  }
+  lookup_candidates+=("$lookup_host")
+
+  if [[ -n "$hostname" ]]; then
+    lookup_host="$(live_lab_known_hosts_lookup_host "$hostname" "$port")" || {
+      echo "failed rendering resolved host known_hosts lookup for ${target}" >&2
+      exit 1
+    }
+    if [[ " ${lookup_candidates[*]} " != *" ${lookup_host} "* ]]; then
+      lookup_candidates+=("$lookup_host")
+    fi
+  fi
+
+  for lookup_host in "${lookup_candidates[@]}"; do
+    if ssh-keygen -F "$lookup_host" -f "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  if [[ "${#lookup_candidates[@]}" -eq 0 ]]; then
+    echo "pinned known_hosts verification resolved no lookup candidates for ${target}" >&2
+  else
+    echo "pinned known_hosts file lacks host key for ${target}; checked ${lookup_candidates[*]} in ${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE}" >&2
+  fi
+  exit 1
 }
 
 live_lab_prepare_worker_known_hosts() {

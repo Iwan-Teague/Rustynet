@@ -191,9 +191,10 @@ main() {
   local exit_refresh_local relay_refresh_local client_refresh_local
   local traversal_env traversal_pub_local
   local exit_traversal_local relay_traversal_local client_traversal_local
-  local client_status relay_status exit_status client_route relay_endpoints client_plaintext_check relay_plaintext_check exit_plaintext_check
+  local client_status client_netcheck relay_status exit_status client_route relay_endpoints client_plaintext_check relay_plaintext_check exit_plaintext_check
   local bypass_status
   local artifact_dir
+  local relay_path_live signed_state_healthy
 
   FAILURE_SUMMARY="initializing relay remote-exit live-lab runtime"
   live_lab_init "rustynet-cross-network-relay-remote-exit" "$SSH_IDENTITY_FILE"
@@ -309,7 +310,8 @@ main() {
 
   FAILURE_SUMMARY="capturing relay remote-exit steady-state evidence"
   client_status="$(live_lab_status "$CLIENT_HOST")"
-  PATH_STATUS_LINE="$client_status"
+  client_netcheck="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck")"
+  PATH_STATUS_LINE="$client_netcheck"
   relay_status="$(live_lab_status "$RELAY_HOST")"
   exit_status="$(live_lab_status "$EXIT_HOST")"
   client_route="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
@@ -328,8 +330,19 @@ main() {
   printf '%s\n' "$client_route"
   live_lab_log "Relay endpoints"
   printf '%s\n' "$relay_endpoints"
+  live_lab_log "Client netcheck"
+  printf '%s\n' "$client_netcheck"
 
-  if grep -Fq "exit_node=${RELAY_NODE_ID}" <<<"$client_status" && grep -Fq 'state=ExitActive' <<<"$client_status"; then
+  relay_path_live=0
+  if [[ "$client_netcheck" == *"path_mode=relay_active"* && "$client_netcheck" == *"path_live_proven=true"* && "$client_netcheck" == *"relay_session_state=live"* ]]; then
+    relay_path_live=1
+  fi
+  signed_state_healthy=0
+  if [[ "$client_netcheck" != *"traversal_alarm_state=critical"* && "$client_netcheck" != *"traversal_alarm_state=error"* && "$client_netcheck" != *"traversal_alarm_state=missing"* && "$client_netcheck" != *"dns_alarm_state=critical"* && "$client_netcheck" != *"dns_alarm_state=error"* && "$client_netcheck" != *"dns_alarm_state=missing"* && "$client_netcheck" == *"traversal_error=none"* ]]; then
+    signed_state_healthy=1
+  fi
+
+  if (( relay_path_live == 1 )) && grep -Fq "exit_node=${RELAY_NODE_ID}" <<<"$client_status" && grep -Fq 'state=ExitActive' <<<"$client_status"; then
     CHECK_CLIENT_EXIT_IS_RELAY="pass"
   fi
   if grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$relay_status"; then
@@ -358,7 +371,7 @@ main() {
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="fail"
   fi
 
-  if [[ "$CHECK_CLIENT_EXIT_IS_RELAY" == 'pass' && "$CHECK_RELAY_EXIT_IS_FINAL" == 'pass' && "$CHECK_RELAY_SERVES_EXIT" == 'pass' && "$CHECK_FINAL_EXIT_SERVES" == 'pass' && "$CHECK_CLIENT_ROUTE_VIA_RUSTYNET" == 'pass' && "$CHECK_RELAY_PEER_VISIBILITY" == 'pass' && "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' ]]; then
+  if [[ "$CHECK_CLIENT_EXIT_IS_RELAY" == 'pass' && "$CHECK_RELAY_EXIT_IS_FINAL" == 'pass' && "$CHECK_RELAY_SERVES_EXIT" == 'pass' && "$CHECK_FINAL_EXIT_SERVES" == 'pass' && "$CHECK_CLIENT_ROUTE_VIA_RUSTYNET" == 'pass' && "$CHECK_RELAY_PEER_VISIBILITY" == 'pass' && "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' ]] && (( signed_state_healthy == 1 )); then
     CHECK_RELAY_REMOTE_EXIT_SUCCESS="pass"
   fi
 

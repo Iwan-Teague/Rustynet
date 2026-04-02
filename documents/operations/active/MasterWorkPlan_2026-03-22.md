@@ -1,6 +1,6 @@
 # Rustynet Master Work Plan — 2026-03-22
 
-## AI Implementation Prompt
+## Execution Scope
 
 ```text
 You are the implementation agent for the remaining work in this document.
@@ -73,7 +73,7 @@ If full completion is impossible in one execution, continue until you hit a real
 ## Current Open Work
 
 This block is the quick source of truth for what remains in this document.
-If historical notes later in the file conflict with this block, the AI prompt, or current code reality, update the stale section instead of following the stale note.
+If historical notes later in the file conflict with this block, the execution scope above, or current code reality, update the stale section instead of following the stale note.
 
 `Open scope`
 - This file is the top-level remaining-work map for the repo, but some lower session logs are historical and may describe old blockers.
@@ -81,7 +81,7 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 
 `Do first`
 - Reconcile stale status lines and historical blocker notes with current code reality.
-- Then execute remaining work in the top-level order already set by the AI prompt, prioritizing measurable, commit-bound live evidence over additional design text.
+- Then execute remaining work in the top-level order already set by the execution scope above, prioritizing measurable, commit-bound live evidence over additional design text.
 
 `Completion proof`
 - The summary table, status sections, and session logs all match the code and artifact reality.

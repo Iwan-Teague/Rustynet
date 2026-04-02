@@ -2727,6 +2727,30 @@ mod tests {
     }
 
     #[test]
+    fn rustynetd_service_template_preserves_backend_env_and_tun_device_access() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains("Environment=RUSTYNET_BACKEND=linux-wireguard"),
+            "rustynetd service template must keep linux-wireguard as the default backend"
+        );
+        assert!(
+            service_template.contains("--backend ${RUSTYNET_BACKEND}"),
+            "rustynetd service template must pass the configured backend mode through unchanged"
+        );
+        assert!(
+            service_template.contains("BindPaths=/dev/net/tun"),
+            "rustynetd service template must expose only /dev/net/tun into the private device namespace"
+        );
+        assert!(
+            service_template.contains("DeviceAllow=/dev/net/tun rw"),
+            "rustynetd service template must allow read/write access to /dev/net/tun for userspace-shared mode"
+        );
+    }
+
+    #[test]
     fn wait_for_unix_socket_rejects_regular_file_path() {
         let unique = format!(
             "rustynet-cli-install-socket-{}",

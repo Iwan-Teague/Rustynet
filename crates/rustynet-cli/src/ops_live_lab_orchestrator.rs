@@ -1727,25 +1727,25 @@ pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
     let mut updated = Vec::new();
     for line in body.lines() {
         let mut line_out = line.to_string();
-        if let Some((key, value)) = line.split_once('=') {
-            if is_peer_endpoint_key(key.trim()) {
-                let (_, port) = split_endpoint_host_port(value).ok_or_else(|| {
-                    format!(
-                        "invalid peer endpoint value {:?} in {}",
-                        value.trim(),
-                        assignment_path.display()
-                    )
-                })?;
-                let port_num = port.parse::<u16>().map_err(|err| {
-                    format!(
-                        "invalid endpoint port {:?} in {}: {err}",
-                        port,
-                        assignment_path.display()
-                    )
-                })?;
-                line_out = format!("{}={endpoint_ip}:{port_num}", key.trim());
-                replaced += 1;
-            }
+        if let Some((key, value)) = line.split_once('=')
+            && is_peer_endpoint_key(key.trim())
+        {
+            let (_, port) = split_endpoint_host_port(value).ok_or_else(|| {
+                format!(
+                    "invalid peer endpoint value {:?} in {}",
+                    value.trim(),
+                    assignment_path.display()
+                )
+            })?;
+            let port_num = port.parse::<u16>().map_err(|err| {
+                format!(
+                    "invalid endpoint port {:?} in {}: {err}",
+                    port,
+                    assignment_path.display()
+                )
+            })?;
+            line_out = format!("{}={endpoint_ip}:{port_num}", key.trim());
+            replaced += 1;
         }
         updated.push(line_out);
     }

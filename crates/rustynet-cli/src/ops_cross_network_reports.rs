@@ -26,6 +26,8 @@ struct CrossNetworkReportSpec {
     required_participants: &'static [&'static str],
     required_network_fields: &'static [&'static str],
     required_checks: &'static [&'static str],
+    required_pass_source_artifacts: &'static [&'static str],
+    required_pass_log_artifacts: &'static [&'static str],
 }
 
 const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
@@ -45,6 +47,10 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "remote_exit_no_underlay_leak",
             "remote_exit_server_ip_bypass_is_narrow",
         ],
+        required_pass_source_artifacts: &[
+            "cross_network_direct_remote_exit_server_ip_bypass_report.json",
+        ],
+        required_pass_log_artifacts: &["cross_network_direct_remote_exit_server_ip_bypass.log"],
     },
     CrossNetworkReportSpec {
         filename: "cross_network_relay_remote_exit_report.json",
@@ -63,6 +69,10 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "remote_exit_no_underlay_leak",
             "remote_exit_server_ip_bypass_is_narrow",
         ],
+        required_pass_source_artifacts: &[
+            "cross_network_relay_remote_exit_server_ip_bypass_report.json",
+        ],
+        required_pass_log_artifacts: &["cross_network_relay_remote_exit_server_ip_bypass.log"],
     },
     CrossNetworkReportSpec {
         filename: "cross_network_failback_roaming_report.json",
@@ -84,6 +94,16 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "no_underlay_leak_while_reconnecting",
             "signed_state_valid_while_reconnecting",
         ],
+        required_pass_source_artifacts: &[
+            "cross_network_failback_roaming_relay_stage_report.json",
+            "cross_network_failback_roaming_server_ip_bypass_report.json",
+            "cross_network_failback_roaming_slo_summary.json",
+        ],
+        required_pass_log_artifacts: &[
+            "cross_network_failback_roaming_relay_stage.log",
+            "cross_network_failback_roaming_server_ip_bypass.log",
+            "cross_network_failback_roaming_monitor.log",
+        ],
     },
     CrossNetworkReportSpec {
         filename: "cross_network_traversal_adversarial_report.json",
@@ -103,6 +123,15 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "rogue_endpoint_rejected",
             "control_surface_exposure_blocked",
         ],
+        required_pass_source_artifacts: &[
+            "cross_network_traversal_adversarial_endpoint_hijack_report.json",
+            "cross_network_traversal_adversarial_control_surface_report.json",
+        ],
+        required_pass_log_artifacts: &[
+            "cross_network_traversal_adversarial_local_tests.log",
+            "cross_network_traversal_adversarial_endpoint_hijack.log",
+            "cross_network_traversal_adversarial_control_surface.log",
+        ],
     },
     CrossNetworkReportSpec {
         filename: "cross_network_remote_exit_dns_report.json",
@@ -119,6 +148,14 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "managed_dns_resolution_success",
             "remote_exit_dns_fail_closed",
             "remote_exit_no_underlay_leak",
+        ],
+        required_pass_source_artifacts: &[
+            "cross_network_remote_exit_dns_direct_remote_exit_report.json",
+            "cross_network_remote_exit_dns_managed_dns_report.json",
+        ],
+        required_pass_log_artifacts: &[
+            "cross_network_remote_exit_dns_direct_remote_exit.log",
+            "cross_network_remote_exit_dns_managed_dns.log",
         ],
     },
     CrossNetworkReportSpec {
@@ -140,6 +177,16 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "direct_remote_exit_ready",
             "post_soak_bypass_ready",
             "no_plaintext_passphrase_files",
+        ],
+        required_pass_source_artifacts: &[
+            "cross_network_remote_exit_soak_direct_remote_exit_report.json",
+            "cross_network_remote_exit_soak_server_ip_bypass_report.json",
+            "cross_network_remote_exit_soak_monitor_summary.json",
+        ],
+        required_pass_log_artifacts: &[
+            "cross_network_remote_exit_soak_direct_remote_exit.log",
+            "cross_network_remote_exit_soak_server_ip_bypass.log",
+            "cross_network_remote_exit_soak_monitor.log",
         ],
     },
 ];
@@ -310,6 +357,8 @@ fn extract_inline_field(line: &str, key: &str) -> Option<String> {
 fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
     let path_mode = extract_inline_field(status_line, "path_mode")
         .ok_or_else(|| "status line missing path_mode".to_string())?;
+    let path_reason = extract_inline_field(status_line, "path_reason")
+        .ok_or_else(|| "status line missing path_reason".to_string())?;
     let path_programmed_mode = extract_inline_field(status_line, "path_programmed_mode")
         .ok_or_else(|| "status line missing path_programmed_mode".to_string())?;
     let path_live_proven = match extract_inline_field(status_line, "path_live_proven")
@@ -333,14 +382,32 @@ fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
             None => None,
         };
     let relay_session_state = extract_inline_field(status_line, "relay_session_state");
+    let traversal_alarm_state = extract_inline_field(status_line, "traversal_alarm_state");
+    let dns_alarm_state = extract_inline_field(status_line, "dns_alarm_state");
+    let traversal_error = extract_inline_field(status_line, "traversal_error");
 
     Ok(json!({
         "path_mode": path_mode,
+        "path_reason": path_reason,
         "path_programmed_mode": path_programmed_mode,
         "path_live_proven": path_live_proven,
         "path_latest_live_handshake_unix": path_latest_live_handshake_unix,
         "relay_session_state": relay_session_state,
+        "traversal_alarm_state": traversal_alarm_state,
+        "dns_alarm_state": dns_alarm_state,
+        "traversal_error": traversal_error,
     }))
+}
+
+fn artifact_list_has_basename(entries: &[Value], basename: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry.as_str().is_some_and(|raw_path| {
+            Path::new(raw_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                == Some(basename)
+        })
+    })
 }
 
 fn path_evidence_from_report(path: &Path) -> Result<Value, String> {
@@ -722,6 +789,7 @@ fn validate_report_payload(
     }
     if let Some(path_evidence) = path_evidence {
         let path_mode = value_as_non_empty_string(path_evidence.get("path_mode"));
+        let path_reason = value_as_non_empty_string(path_evidence.get("path_reason"));
         let path_programmed_mode =
             value_as_non_empty_string(path_evidence.get("path_programmed_mode"));
         let path_live_proven = path_evidence
@@ -733,10 +801,17 @@ fn validate_report_payload(
             .filter(|value| *value > 0);
         let relay_session_state =
             value_as_non_empty_string(path_evidence.get("relay_session_state"));
+        let traversal_alarm_state =
+            value_as_non_empty_string(path_evidence.get("traversal_alarm_state"));
+        let dns_alarm_state = value_as_non_empty_string(path_evidence.get("dns_alarm_state"));
+        let traversal_error = value_as_non_empty_string(path_evidence.get("traversal_error"));
 
         if requires_live_path_evidence {
             if path_mode.is_none() {
                 problems.push("path_evidence.path_mode must be a non-empty string".to_string());
+            }
+            if path_reason.is_none() {
+                problems.push("path_evidence.path_reason must be a non-empty string".to_string());
             }
             if path_programmed_mode.is_none() {
                 problems.push(
@@ -750,6 +825,32 @@ fn validate_report_payload(
                 problems.push(
                     "path_evidence.path_latest_live_handshake_unix must be a positive integer"
                         .to_string(),
+                );
+            }
+            if traversal_alarm_state
+                .as_deref()
+                .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
+            {
+                problems.push(
+                    "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports"
+                        .to_string(),
+                );
+            }
+            if dns_alarm_state
+                .as_deref()
+                .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
+            {
+                problems.push(
+                    "path_evidence.dns_alarm_state must not be critical|error|missing for pass reports"
+                        .to_string(),
+                );
+            }
+            if traversal_error
+                .as_deref()
+                .is_some_and(|value| value != "none")
+            {
+                problems.push(
+                    "path_evidence.traversal_error must equal none for pass reports".to_string(),
                 );
             }
         }
@@ -793,6 +894,33 @@ fn validate_report_payload(
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    if status == CHECK_PASS {
+        if let Some(entries) = payload_object
+            .get("source_artifacts")
+            .and_then(Value::as_array)
+        {
+            for basename in spec.required_pass_source_artifacts {
+                if !artifact_list_has_basename(entries, basename) {
+                    problems.push(format!(
+                        "source_artifacts must include measured evidence file {basename:?}"
+                    ));
+                }
+            }
+        }
+        if let Some(entries) = payload_object
+            .get("log_artifacts")
+            .and_then(Value::as_array)
+        {
+            for basename in spec.required_pass_log_artifacts {
+                if !artifact_list_has_basename(entries, basename) {
+                    problems.push(format!(
+                        "log_artifacts must include measured evidence file {basename:?}"
+                    ));
+                }
             }
         }
     }
@@ -1777,6 +1905,33 @@ mod tests {
             .map_err(|err| format!("write source artifact failed: {err}"))?;
         fs::write(&log_path, "measured log\n")
             .map_err(|err| format!("write log artifact failed: {err}"))?;
+        let mut source_artifacts = vec![source_path.display().to_string()];
+        let mut log_artifacts = vec![log_path.display().to_string()];
+        for basename in spec.required_pass_source_artifacts {
+            let artifact_path = artifact_dir.join(basename);
+            let artifact_body = if basename.ends_with(".json") {
+                "{\n  \"status\": \"pass\"\n}\n".to_string()
+            } else {
+                format!("measured {basename}\n")
+            };
+            fs::write(&artifact_path, artifact_body).map_err(|err| {
+                format!(
+                    "write source artifact failed ({}): {err}",
+                    artifact_path.display()
+                )
+            })?;
+            source_artifacts.push(artifact_path.display().to_string());
+        }
+        for basename in spec.required_pass_log_artifacts {
+            let artifact_path = artifact_dir.join(basename);
+            fs::write(&artifact_path, format!("measured {basename}\n")).map_err(|err| {
+                format!(
+                    "write log artifact failed ({}): {err}",
+                    artifact_path.display()
+                )
+            })?;
+            log_artifacts.push(artifact_path.display().to_string());
+        }
 
         let mut participants = Map::new();
         for field in spec.required_participants {
@@ -1843,8 +1998,8 @@ mod tests {
             "participants": Value::Object(participants),
             "network_context": Value::Object(network_context),
             "checks": Value::Object(checks),
-            "source_artifacts": [source_path.display().to_string()],
-            "log_artifacts": [log_path.display().to_string()],
+            "source_artifacts": source_artifacts,
+            "log_artifacts": log_artifacts,
             "implementation_state": "live_measured_validator",
         });
         if status == CHECK_PASS && spec.suite != "cross_network_traversal_adversarial" {
@@ -1852,10 +2007,14 @@ mod tests {
                 "path_evidence".to_string(),
                 json!({
                     "path_mode": path_mode,
+                    "path_reason": "fresh_handshake_observed",
                     "path_programmed_mode": path_programmed_mode,
                     "path_live_proven": true,
                     "path_latest_live_handshake_unix": unix_now(),
                     "relay_session_state": relay_session_state,
+                    "traversal_alarm_state": "ok",
+                    "dns_alarm_state": "ok",
+                    "traversal_error": "none",
                 }),
             );
         }
@@ -2024,9 +2183,26 @@ mod tests {
         let source_path = temp_dir.path().join("source.log");
         let log_path = temp_dir.path().join("parent.log");
         let report_path = temp_dir.path().join("parent-report.json");
+        let direct_report_path = temp_dir
+            .path()
+            .join("cross_network_remote_exit_dns_direct_remote_exit_report.json");
+        let direct_log_path = temp_dir
+            .path()
+            .join("cross_network_remote_exit_dns_direct_remote_exit.log");
+        let managed_dns_report_path = temp_dir
+            .path()
+            .join("cross_network_remote_exit_dns_managed_dns_report.json");
+        let managed_dns_log_path = temp_dir
+            .path()
+            .join("cross_network_remote_exit_dns_managed_dns.log");
         fs::write(&source_path, "source\n").expect("write source artifact");
         fs::write(&child_report_path, "{\n  \"status\": \"fail\"\n}\n")
             .expect("write child fail report");
+        fs::write(&direct_report_path, "child direct report\n").expect("write child direct report");
+        fs::write(&direct_log_path, "child direct log\n").expect("write child direct log");
+        fs::write(&managed_dns_report_path, "managed dns report\n")
+            .expect("write managed dns report");
+        fs::write(&managed_dns_log_path, "managed dns log\n").expect("write managed dns log");
 
         let config = GenerateCrossNetworkRemoteExitReportConfig {
             suite: "cross_network_remote_exit_dns".to_string(),
@@ -2036,8 +2212,8 @@ mod tests {
             failure_summary: String::new(),
             environment: "unit_test".to_string(),
             implementation_state: "live_measured_validator".to_string(),
-            source_artifacts: vec![source_path],
-            log_artifacts: Vec::new(),
+            source_artifacts: vec![source_path, direct_report_path, managed_dns_report_path],
+            log_artifacts: vec![direct_log_path, managed_dns_log_path],
             client_host: Some("client-host".to_string()),
             exit_host: Some("exit-host".to_string()),
             relay_host: None,
@@ -2061,6 +2237,66 @@ mod tests {
         assert!(
             err.contains("report is missing path_evidence"),
             "expected inherited path evidence failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_failback_pass_without_measured_child_artifacts() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_failback_roaming").expect("failback spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        let source_artifacts = payload
+            .as_object_mut()
+            .expect("payload object")
+            .get_mut("source_artifacts")
+            .and_then(Value::as_array_mut)
+            .expect("source artifacts array");
+        source_artifacts.retain(|entry| {
+            let Some(raw_path) = entry.as_str() else {
+                return true;
+            };
+            !raw_path.ends_with("cross_network_failback_roaming_relay_stage_report.json")
+        });
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.iter().any(|entry| entry.contains(
+                "source_artifacts must include measured evidence file \"cross_network_failback_roaming_relay_stage_report.json\""
+            )),
+            "expected missing failback child artifact error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_pass_status_with_critical_path_alarm() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_direct_remote_exit").expect("direct spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .get_mut("path_evidence")
+            .and_then(Value::as_object_mut)
+            .expect("path evidence object")
+            .insert(
+                "traversal_alarm_state".to_string(),
+                Value::String("critical".to_string()),
+            );
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.iter().any(|entry| entry.contains(
+                "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports"
+            )),
+            "expected critical traversal alarm rejection, got: {errors:?}"
         );
     }
 }

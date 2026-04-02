@@ -10,3 +10,6 @@ Archive criteria:
 Archived items:
 - [SecurityReview-2026-03-24.md](./SecurityReview-2026-03-24.md)
 - [SimulationSecurityGapAssessment.md](./SimulationSecurityGapAssessment.md)
+
+Rule:
+- these documents are useful for retrospective context, but they are not a substitute for the active ledgers, current runbooks, or current validated evidence

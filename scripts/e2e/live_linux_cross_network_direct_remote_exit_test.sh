@@ -180,9 +180,10 @@ main() {
   local issue_env assign_pub_local exit_assignment_local client_assignment_local
   local exit_refresh_local client_refresh_local
   local traversal_env traversal_pub_local exit_traversal_local client_traversal_local
-  local bypass_status client_status exit_status client_internet_route client_endpoints exit_nft
+  local bypass_status client_status client_netcheck exit_status client_internet_route client_endpoints exit_nft
   local client_plaintext_check exit_plaintext_check
   local artifact_dir
+  local path_proven_direct signed_state_healthy
 
   FAILURE_SUMMARY="initializing live-lab runtime"
 
@@ -287,8 +288,9 @@ main() {
 
   FAILURE_SUMMARY="capturing direct remote-exit steady-state evidence"
   client_status="$(live_lab_status "$CLIENT_HOST")"
+  client_netcheck="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck")"
   exit_status="$(live_lab_status "$EXIT_HOST")"
-  PATH_STATUS_LINE="$client_status"
+  PATH_STATUS_LINE="$client_netcheck"
   client_internet_route="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
   client_endpoints="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints || true")"
   exit_nft="$(live_lab_capture_root "$EXIT_HOST" "root nft list ruleset || true")"
@@ -311,8 +313,19 @@ main() {
   printf '%s\n' "$client_internet_route"
   live_lab_log "Client endpoints"
   printf '%s\n' "$client_endpoints"
+  live_lab_log "Client netcheck"
+  printf '%s\n' "$client_netcheck"
 
-  if grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status" && grep -Fq 'state=ExitActive' <<<"$client_status"; then
+  path_proven_direct=0
+  if [[ "$client_netcheck" == *"path_mode=direct_active"* && "$client_netcheck" == *"path_live_proven=true"* ]]; then
+    path_proven_direct=1
+  fi
+  signed_state_healthy=0
+  if [[ "$client_netcheck" != *"traversal_alarm_state=critical"* && "$client_netcheck" != *"traversal_alarm_state=error"* && "$client_netcheck" != *"traversal_alarm_state=missing"* && "$client_netcheck" != *"dns_alarm_state=critical"* && "$client_netcheck" != *"dns_alarm_state=error"* && "$client_netcheck" != *"dns_alarm_state=missing"* && "$client_netcheck" == *"traversal_error=none"* ]]; then
+    signed_state_healthy=1
+  fi
+
+  if (( path_proven_direct == 1 )) && grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status" && grep -Fq 'state=ExitActive' <<<"$client_status"; then
     CHECK_CLIENT_EXIT_SELECTED="pass"
   fi
   if grep -Fq 'serving_exit_node=true' <<<"$exit_status"; then
@@ -338,7 +351,7 @@ main() {
     CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC="fail"
   fi
 
-  if [[ "$CHECK_CLIENT_EXIT_SELECTED" == 'pass' && "$CHECK_EXIT_SERVING_ROUTE" == 'pass' && "$CHECK_CLIENT_ROUTE_VIA_RUSTYNET" == 'pass' && "$CHECK_EXIT_ENDPOINT_VISIBLE" == 'pass' && "$CHECK_EXIT_MASQUERADE_PRESENT" == 'pass' && "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' ]]; then
+  if [[ "$CHECK_CLIENT_EXIT_SELECTED" == 'pass' && "$CHECK_EXIT_SERVING_ROUTE" == 'pass' && "$CHECK_CLIENT_ROUTE_VIA_RUSTYNET" == 'pass' && "$CHECK_EXIT_ENDPOINT_VISIBLE" == 'pass' && "$CHECK_EXIT_MASQUERADE_PRESENT" == 'pass' && "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' && "$CHECK_CROSS_NETWORK_TOPOLOGY_HEURISTIC" == 'pass' ]] && (( signed_state_healthy == 1 )); then
     CHECK_DIRECT_REMOTE_EXIT_SUCCESS="pass"
   fi
 

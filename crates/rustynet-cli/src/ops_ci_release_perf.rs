@@ -1081,6 +1081,18 @@ pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
         ),
         (
             "rustynetd",
+            "daemon::tests::daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap",
+        ),
+        (
+            "rustynetd",
+            "daemon::tests::daemon_runtime_transport_socket_identity_blocker_rejects_bound_relay_side_socket",
+        ),
+        (
+            "rustynetd",
+            "daemon::tests::daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker",
+        ),
+        (
+            "rustynetd",
             "traversal::tests::adversarial_gate_nat_mismatch_blocks_unauthorized_direct_and_keeps_safe_relay_fallback",
         ),
         (
@@ -1108,6 +1120,8 @@ pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
     let backend_tests = [
         "tests::latest_handshake_parser_rejects_oversized_or_malformed_output",
         "tests::linux_backend_reads_latest_handshake_for_configured_peer",
+        "tests::linux_backend_reports_transport_socket_identity_blocker",
+        "tests::macos_backend_reports_transport_socket_identity_blocker",
     ];
     for test_name in backend_tests {
         run_logged_test(

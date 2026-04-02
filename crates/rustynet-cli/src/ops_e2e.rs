@@ -1021,13 +1021,17 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             "assignment signing secret",
         )?;
+        let signing_secret = crate::load_assignment_signing_secret(
+            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(passphrase_path.as_str()),
+        )?;
+        let verifier_key_hex = assignment_verifier_key_hex(signing_secret.as_slice());
         for assignment in &assignment_specs {
             let output_path = config.issue_dir.join(format!(
                 "rn-assignment-{}.assignment",
                 assignment.target_node_id
             ));
             let output_text = output_path.display().to_string();
-            let verifier_text = verifier_key_output.display().to_string();
             let mut args = vec![
                 "assignment",
                 "issue",
@@ -1043,8 +1047,6 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
                 passphrase_path.as_str(),
                 "--output",
                 output_text.as_str(),
-                "--verifier-key-output",
-                verifier_text.as_str(),
             ];
             if let Some(exit_node_id) = assignment.exit_node_id.as_ref() {
                 args.push("--exit-node-id");
@@ -1058,6 +1060,16 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
                 "issuing live-lab assignment bundle failed",
             )?;
         }
+        fs::write(
+            verifier_key_output.as_path(),
+            format!("{verifier_key_hex}\n").as_bytes(),
+        )
+        .map_err(|err| {
+            format!(
+                "write assignment verifier key failed ({}): {err}",
+                verifier_key_output.display()
+            )
+        })?;
         set_unix_mode(verifier_key_output.as_path(), 0o600)?;
         for assignment in &assignment_specs {
             let output_path = config.issue_dir.join(format!(
@@ -1136,6 +1148,11 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             Path::new("/etc/rustynet/assignment.signing.secret"),
             "assignment signing secret",
         )?;
+        let signing_secret = crate::load_assignment_signing_secret(
+            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(passphrase_path.as_str()),
+        )?;
+        let verifier_key_hex = traversal_verifier_key_hex(signing_secret.as_slice());
         let generated_at = unix_now();
         let nonce = generated_at.saturating_mul(1000).saturating_add(1);
         for pair in &allow_pairs {
@@ -1156,7 +1173,6 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
                 pair.source_node_id, pair.target_node_id
             ));
             let output_text = output_path.display().to_string();
-            let verifier_text = verifier_key_output.display().to_string();
             let generated_at_text = generated_at.to_string();
             let nonce_text = nonce.to_string();
             let ttl_text = ttl_secs.to_string();
@@ -1183,8 +1199,6 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
                 nonce_text.as_str(),
                 "--output",
                 output_text.as_str(),
-                "--verifier-key-output",
-                verifier_text.as_str(),
                 "--ttl-secs",
                 ttl_text.as_str(),
             ];
@@ -1227,6 +1241,16 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             aggregate_paths.push(aggregate_path);
         }
 
+        fs::write(
+            verifier_key_output.as_path(),
+            format!("{verifier_key_hex}\n").as_bytes(),
+        )
+        .map_err(|err| {
+            format!(
+                "write traversal verifier key failed ({}): {err}",
+                verifier_key_output.display()
+            )
+        })?;
         set_unix_mode(verifier_key_output.as_path(), 0o600)?;
         for pair in &allow_pairs {
             let pair_path = config.issue_dir.join(format!(
@@ -1254,6 +1278,16 @@ struct TwoNodeTraversalArtifacts {
     verifier_key_hex: String,
     exit_bundle_wire: String,
     client_bundle_wire: String,
+}
+
+fn assignment_verifier_key_hex(signing_secret: &[u8]) -> String {
+    ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
+        .assignment_verifier_key_hex()
+}
+
+fn traversal_verifier_key_hex(signing_secret: &[u8]) -> String {
+    ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
+        .endpoint_hint_verifier_key_hex()
 }
 
 fn issue_two_node_traversal_artifacts(
@@ -4510,10 +4544,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, decode_base64, decode_hex_32, ensure_safe_token,
-        extract_last_assignment_generated, issue_two_node_traversal_artifacts,
+        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, assignment_verifier_key_hex, decode_base64,
+        decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
+        issue_two_node_traversal_artifacts, traversal_verifier_key_hex,
         write_assignment_refresh_env,
     };
+    use rustynet_control::ControlPlaneCore;
+    use rustynet_policy::PolicySet;
 
     #[test]
     fn safe_token_accepts_expected_charset() {
@@ -4620,5 +4657,25 @@ mod tests {
         );
         assert!(artifacts.exit_bundle_wire.contains("signature="));
         assert!(artifacts.client_bundle_wire.contains("signature="));
+    }
+
+    #[test]
+    fn assignment_verifier_key_helper_matches_control_plane_core() {
+        let signing_secret = [11u8; 32];
+        assert_eq!(
+            assignment_verifier_key_hex(signing_secret.as_slice()),
+            ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
+                .assignment_verifier_key_hex()
+        );
+    }
+
+    #[test]
+    fn traversal_verifier_key_helper_matches_control_plane_core() {
+        let signing_secret = [12u8; 32];
+        assert_eq!(
+            traversal_verifier_key_hex(signing_secret.as_slice()),
+            ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
+                .endpoint_hint_verifier_key_hex()
+        );
     }
 }

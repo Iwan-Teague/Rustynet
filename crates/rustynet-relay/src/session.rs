@@ -2,6 +2,7 @@
 
 //! Relay session tracking and pairing logic.
 
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use rand::RngCore;
@@ -33,6 +34,9 @@ pub struct RelaySession {
     pub node_id: String,
     pub peer_node_id: String,
     pub allocated_port: u16,
+    pub hello_source_addr: SocketAddr,
+    pub bound_peer_addr: Option<SocketAddr>,
+    pub expires_at_unix: u64,
     pub established_at: Instant,
     pub last_packet_at: Instant,
 }

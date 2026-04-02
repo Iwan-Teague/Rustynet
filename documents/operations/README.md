@@ -1,62 +1,44 @@
 # Operations Docs Index
 
-## Purpose
+This file separates:
+- active execution ledgers and active work plans
+- evergreen runbooks, policies, matrices, and gate references
+- archived point-in-time reviews
 
-This index separates:
-- active work documents,
-- evergreen operational/reference documents,
-- archived completed historical reviews.
+## How To Use This Folder
 
-The goal is to make open implementation work easier to spot without hiding the current runbooks, policies, schemas, and gate-reference material that still defines how Rustynet should operate.
+Start with these, depending on what you are doing:
+
+- active implementation status: [active/README.md](./active/README.md)
+- service and runtime operation: [ProductionRunbook.md](./ProductionRunbook.md)
+- live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md) and [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md)
+- release-readiness and support posture: [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md) and [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
+- phase10 exit-node and dataplane behavior: [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
+- security and compliance mapping: [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md), [ComplianceControlMap.md](./ComplianceControlMap.md), and [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 
 ## Classification Rules
 
 ### Active Work
-
-Keep a document in `operations/active/` when it:
-- contains open implementation work,
-- contains pending backlog items,
-- defines a current migration/design stream still in progress,
-- is the current planning surface for active engineering work.
+Keep a document in `operations/active/` when it still drives current implementation, migration, or hardening work.
 
 ### Evergreen Reference
-
-Keep a document in the main `operations/` folder when it:
-- is a current runbook, checklist, schema, policy, support matrix, or gate reference,
-- is still used to operate, validate, or understand the current system,
-- would be harmful to hide simply because implementation is mature.
+Keep a document in `operations/` when it is still used to operate, validate, or understand the current system.
 
 ### Done Archive
+Move a document into `operations/done/` when it is historical evidence rather than current operating guidance.
 
-Move a document into `operations/done/` when it is a point-in-time review or audit that:
-- is historical rather than operational,
-- does not define current open work,
-- is preserved as evidence/history rather than as a current operating reference.
+## Current Active Set
 
-## Current Snapshot
+See [active/README.md](./active/README.md) for the current list.
 
-Original audited operations markdown set: `43` documents.
-
-Current classification:
-- `11` active work docs under [active/](./active/)
-- `28` evergreen reference docs in `operations/`
-- `4` archived completed historical docs under [done/](./done/)
-
-## Active Work Documents
-
-- [active/CrossNetworkRemoteExitNodePlan_2026-03-16.md](./active/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
-- [active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
-- [active/MagicDnsSignedZoneSchema_2026-03-09.md](./active/MagicDnsSignedZoneSchema_2026-03-09.md)
+The two primary execution ledgers are:
 - [active/MasterWorkPlan_2026-03-22.md](./active/MasterWorkPlan_2026-03-22.md)
-- [active/SecurityHardeningBacklog_2026-03-09.md](./active/SecurityHardeningBacklog_2026-03-09.md)
-- [active/SerializationFormatHardeningPlan_2026-03-25.md](./active/SerializationFormatHardeningPlan_2026-03-25.md)
-- [active/ShellToRustMigrationPlan_2026-03-06.md](./active/ShellToRustMigrationPlan_2026-03-06.md)
-- [active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](./active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
-- [active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md](./active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
-- [active/UdpHolePunchingImplementationBlueprint_2026-03-07.md](./active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
-- [active/RustynetComparativeVpnExploitCoverage_2026-03-14.md](./active/RustynetComparativeVpnExploitCoverage_2026-03-14.md)
+- [active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 
-## Evergreen Reference Documents
+Supporting active implementation plan for the remaining production shared-transport delta:
+- [active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
+
+## High-Value Evergreen References
 
 - [BackendAgilityValidation.md](./BackendAgilityValidation.md)
 - [CompatibilitySupportPolicy.md](./CompatibilitySupportPolicy.md)
@@ -64,8 +46,6 @@ Current classification:
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](./CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [CrossNetworkRemoteExitIncidentPlaybook.md](./CrossNetworkRemoteExitIncidentPlaybook.md)
-- [CryptoDeprecationSchedule.md](./CryptoDeprecationSchedule.md)
-- [DependencyExceptionPolicy.md](./DependencyExceptionPolicy.md)
 - [DisasterRecoveryValidation.md](./DisasterRecoveryValidation.md)
 - [FinalLaunchChecklist.md](./FinalLaunchChecklist.md)
 - [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md)
@@ -77,8 +57,6 @@ Current classification:
 - [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
 - [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
 - [PolicyRolloutRunbook.md](./PolicyRolloutRunbook.md)
-- [PostQuantumTransitionPlan.md](./PostQuantumTransitionPlan.md)
-- [PrivacyRetentionPolicy.md](./PrivacyRetentionPolicy.md)
 - [ProductionRunbook.md](./ProductionRunbook.md)
 - [ProductionSLOAndIncidentReadiness.md](./ProductionSLOAndIncidentReadiness.md)
 - [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
@@ -87,10 +65,16 @@ Current classification:
 - [SecurityRegressionLessons_2026-03-07.md](./SecurityRegressionLessons_2026-03-07.md)
 - [VulnerabilityResponse.md](./VulnerabilityResponse.md)
 
-## Done Archive
+## Archived Reviews
 
-Archived completed historical documents live under [done/](./done/):
+Historical operations reviews live under [done/](./done/):
 - [done/ComparativeSecurityFlawAssessment_2026-03-06.md](./done/ComparativeSecurityFlawAssessment_2026-03-06.md)
 - [done/FallbackLogicAudit_2026-03-06.md](./done/FallbackLogicAudit_2026-03-06.md)
 - [done/RustynetAdversarialHardeningAudit_2026-03-14.md](./done/RustynetAdversarialHardeningAudit_2026-03-14.md)
 - [done/SecurityReview_2026-03-03.md](./done/SecurityReview_2026-03-03.md)
+
+## Documentation Rules
+
+- Keep this index current when documents are added, removed, renamed, or archived.
+- Do not add standalone prompt documents under `operations/`.
+- Keep execution guidance inside the owning active ledger or plan.

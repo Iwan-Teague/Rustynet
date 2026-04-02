@@ -76,6 +76,7 @@ Group=rustynetd
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
+BindPaths=/dev/net/tun
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
@@ -89,6 +90,7 @@ RestrictRealtime=true
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
+DeviceAllow=/dev/net/tun rw
 ReadWritePaths=-/run/rustynet /var/lib/rustynet /etc/rustynet
 UMask=0077
 

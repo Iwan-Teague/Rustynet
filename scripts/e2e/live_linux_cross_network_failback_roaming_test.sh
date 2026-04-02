@@ -217,10 +217,11 @@ main() {
   local client_status client_route client_endpoints client_netcheck
   local issue_env assign_pub_local exit_assignment_local relay_assignment_local client_assignment_local
   local exit_refresh_local relay_refresh_local client_refresh_local
-  local client_status_after_roam client_route_after_roam client_endpoints_after_roam
+  local client_status_after_roam client_netcheck_after_roam client_route_after_roam client_endpoints_after_roam
   local artifact_dir
   local route_leak_samples signed_state_invalid_samples netcheck_invalid route_has_underlay_dev
   local route_line
+  local final_direct_path_live final_signed_state_healthy
 
   FAILURE_SUMMARY="bootstrapping relay remote-exit path before failback"
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rustynet-cross-network-failback-roaming.XXXXXX")"
@@ -342,7 +343,7 @@ main() {
       "$(printf '%s' "$client_status" | tr -s ' ' | tr '\n' ';')" \
       "$(printf '%s' "$client_endpoints" | tr -s ' ' | tr '\n' ';')" \
       "$(printf '%s' "$client_netcheck" | tr -s ' ' | tr '\n' ';')" >> "$FAILBACK_MONITOR_LOG"
-    if [[ -z "$first_switch_ts" ]] && grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status" && grep -Fq 'dev rustynet0' <<<"$client_route"; then
+    if [[ -z "$first_switch_ts" ]] && grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status" && grep -Fq 'dev rustynet0' <<<"$client_route" && [[ "$client_netcheck" == *"path_mode=direct_active"* ]] && [[ "$client_netcheck" == *"path_live_proven=true"* ]]; then
       first_switch_ts="$local_ts"
     fi
     sleep 1
@@ -458,17 +459,29 @@ EOF
 
   FAILURE_SUMMARY="capturing endpoint roam recovery evidence"
   client_status_after_roam="$(live_lab_status "$CLIENT_HOST")"
-  PATH_STATUS_LINE="$client_status_after_roam"
+  client_netcheck_after_roam="$(live_lab_capture_root "$CLIENT_HOST" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck || true")"
+  PATH_STATUS_LINE="$client_netcheck_after_roam"
   client_route_after_roam="$(live_lab_capture "$CLIENT_HOST" "ip -4 route get 1.1.1.1 || true")"
   client_endpoints_after_roam="$(live_lab_capture_root "$CLIENT_HOST" "root wg show rustynet0 endpoints || true")"
   live_lab_log "Client status after roam"
   printf '%s\n' "$client_status_after_roam"
+  live_lab_log "Client netcheck after roam"
+  printf '%s\n' "$client_netcheck_after_roam"
   live_lab_log "Client route after roam"
   printf '%s\n' "$client_route_after_roam"
   live_lab_log "Client endpoints after roam"
   printf '%s\n' "$client_endpoints_after_roam"
 
-  if grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status_after_roam" && grep -Fq 'dev rustynet0' <<<"$client_route_after_roam" && grep -Fq "${ROAM_ALIAS_IP}:51820" <<<"$client_endpoints_after_roam"; then
+  final_direct_path_live=0
+  if [[ "$client_netcheck_after_roam" == *"path_mode=direct_active"* && "$client_netcheck_after_roam" == *"path_live_proven=true"* ]]; then
+    final_direct_path_live=1
+  fi
+  final_signed_state_healthy=0
+  if [[ "$client_netcheck_after_roam" != *"traversal_alarm_state=critical"* && "$client_netcheck_after_roam" != *"traversal_alarm_state=error"* && "$client_netcheck_after_roam" != *"traversal_alarm_state=missing"* && "$client_netcheck_after_roam" != *"dns_alarm_state=critical"* && "$client_netcheck_after_roam" != *"dns_alarm_state=error"* && "$client_netcheck_after_roam" != *"dns_alarm_state=missing"* && "$client_netcheck_after_roam" == *"traversal_error=none"* ]]; then
+    final_signed_state_healthy=1
+  fi
+
+  if (( final_direct_path_live == 1 )) && (( final_signed_state_healthy == 1 )) && grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status_after_roam" && grep -Fq 'dev rustynet0' <<<"$client_route_after_roam" && grep -Fq "${ROAM_ALIAS_IP}:51820" <<<"$client_endpoints_after_roam"; then
     CHECK_ENDPOINT_ROAM_RECOVERY_SUCCESS="pass"
   fi
 

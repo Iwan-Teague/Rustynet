@@ -42,18 +42,12 @@ pub struct RelayClientConfig {
     pub max_sessions_per_peer: usize,
     /// Socket receive timeout for relay operations.
     pub recv_timeout: Duration,
-    /// Optional local port to bind the relay client socket to.
+    /// Optional local port hint for an authoritative relay transport socket.
     ///
-    /// If `None`, an ephemeral port is used. For better NAT traversal behavior,
-    /// consider binding to the same local port as the WireGuard transport. Note
-    /// that this requires WireGuard to use SO_REUSEADDR/SO_REUSEPORT (not default
-    /// in kernel WG), or for the relay socket to be bound before WireGuard starts.
-    ///
-    /// # Security note
-    ///
-    /// Using a fixed port exposes a predictable local service endpoint. Only use
-    /// if the network environment requires stable NAT mappings and the host
-    /// firewall is properly configured.
+    /// This value is configuration only; it does not establish authority by
+    /// itself. A separate daemon-owned socket bound to the same local port is
+    /// not equivalent to the backend's authoritative peer-traffic transport
+    /// socket and must not be treated as such.
     pub local_port: Option<u16>,
 }
 
@@ -104,9 +98,20 @@ impl RelayClientSession {
         self.last_activity.elapsed() > idle_timeout
     }
 
+    /// Returns true if the signed relay session has expired.
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        self.token_expires_at_unix <= now_unix
+    }
+
     /// Returns true when the session token must be refreshed to avoid expiry.
     pub fn token_refresh_due(&self, now_unix: u64, refresh_margin_secs: u64) -> bool {
         self.token_expires_at_unix <= now_unix.saturating_add(refresh_margin_secs)
+    }
+
+    /// Returns true when the selected backend endpoint is the live relay
+    /// endpoint allocated for this session.
+    pub fn matches_selected_endpoint(&self, endpoint: SocketEndpoint) -> bool {
+        self.effective_endpoint() == endpoint
     }
 }
 
@@ -115,6 +120,8 @@ impl RelayClientSession {
 pub enum RelayClientError {
     /// Socket I/O error.
     Io(io::Error),
+    /// Backend authoritative transport operation failed.
+    AuthoritativeTransport(String),
     /// Token signing failed.
     TokenSigning(String),
     /// Session establishment was rejected by the relay.
@@ -133,6 +140,9 @@ impl std::fmt::Display for RelayClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "relay I/O error: {err}"),
+            Self::AuthoritativeTransport(msg) => {
+                write!(f, "relay authoritative transport error: {msg}")
+            }
             Self::TokenSigning(msg) => write!(f, "token signing failed: {msg}"),
             Self::SessionRejected(reason) => write!(f, "relay session rejected: {reason}"),
             Self::Timeout => f.write_str("relay session establishment timed out"),
@@ -176,6 +186,8 @@ pub struct RelayClient {
     socket: Option<UdpSocket>,
     #[cfg(test)]
     scripted_establishments: VecDeque<Result<u16, RelayClientError>>,
+    #[cfg(test)]
+    bound_override: bool,
 }
 
 impl RelayClient {
@@ -189,6 +201,8 @@ impl RelayClient {
             socket: None,
             #[cfg(test)]
             scripted_establishments: VecDeque::new(),
+            #[cfg(test)]
+            bound_override: false,
         }
     }
 
@@ -199,14 +213,30 @@ impl RelayClient {
 
     /// Binds the relay client to a local socket.
     ///
-    /// This should be called with a socket bound to the desired local address.
-    /// For best NAT traversal behavior, consider using the same local port as
-    /// the WireGuard transport (see `RelayClientConfig::local_port`).
+    /// This must be called only with an authoritative transport socket owned by
+    /// the selected backend transport path, or by a test harness explicitly
+    /// modeling that authority. A second socket bound to the same local port is
+    /// not sufficient.
     pub fn bind(&mut self, socket: UdpSocket) -> Result<(), RelayClientError> {
         socket.set_read_timeout(Some(self.config.recv_timeout))?;
         socket.set_write_timeout(Some(self.config.recv_timeout))?;
         self.socket = Some(socket);
         Ok(())
+    }
+
+    /// Returns true when the relay client has an authoritative transport socket
+    /// bound for live relay control traffic.
+    pub fn is_bound(&self) -> bool {
+        self.socket.is_some() || {
+            #[cfg(test)]
+            {
+                self.bound_override
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
     }
 
     /// Establishes a relay session for the given peer.
@@ -232,12 +262,68 @@ impl RelayClient {
         relay_id: [u8; 16],
         ttl_secs: u64,
     ) -> Result<SocketEndpoint, RelayClientError> {
-        // Check capacity
+        #[cfg(test)]
+        if !self.scripted_establishments.is_empty() {
+            return self.establish_session_with_round_trip(
+                peer_node_id,
+                relay_addr,
+                relay_id,
+                ttl_secs,
+                |_target, _hello_bytes, _timeout| {
+                    unreachable!(
+                        "scripted relay-client establishment should short-circuit before transport"
+                    )
+                },
+            );
+        }
+
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or(RelayClientError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "relay socket not bound",
+            )))?
+            .try_clone()?;
+        self.establish_session_with_round_trip(
+            peer_node_id,
+            relay_addr,
+            relay_id,
+            ttl_secs,
+            |target, hello_bytes, timeout| {
+                socket.set_read_timeout(Some(timeout))?;
+                socket.send_to(hello_bytes, target)?;
+                let mut buf = [0u8; 1500];
+                loop {
+                    match socket.recv_from(&mut buf) {
+                        Ok((len, from_addr)) if from_addr == relay_addr => {
+                            return Ok((buf[..len].to_vec(), from_addr));
+                        }
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                        Err(e) => return Err(RelayClientError::Io(e)),
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn establish_session_with_round_trip<F>(
+        &mut self,
+        peer_node_id: &NodeId,
+        relay_addr: SocketAddr,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+        mut round_trip: F,
+    ) -> Result<SocketEndpoint, RelayClientError>
+    where
+        F: FnMut(SocketAddr, &[u8], Duration) -> Result<(Vec<u8>, SocketAddr), RelayClientError>,
+    {
         if self.sessions.len() >= self.config.max_sessions_per_peer * 16 {
             return Err(RelayClientError::CapacityExceeded);
         }
 
-        // Create signed session token
         let token = RelaySessionToken::sign(
             &self.signing_key,
             self.node_id.as_str(),
@@ -277,62 +363,32 @@ impl RelayClient {
             session_token: token,
         };
 
-        // Send hello to relay
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or(RelayClientError::Io(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "relay socket not bound",
-            )))?;
-
         let hello_bytes = serialize_relay_hello(&hello);
-        socket.send_to(&hello_bytes, relay_addr)?;
-
-        // Wait for acknowledgment
-        let deadline = Instant::now() + self.config.session_timeout;
-        let mut buf = [0u8; 1500];
-
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(RelayClientError::Timeout);
+        let (response, from_addr) =
+            round_trip(relay_addr, &hello_bytes, self.config.session_timeout)?;
+        if from_addr != relay_addr {
+            return Err(RelayClientError::InvalidResponse(format!(
+                "unexpected relay response source {from_addr}"
+            )));
+        }
+        match parse_relay_hello_ack(&response) {
+            Ok(ack) => {
+                let now = Instant::now();
+                let session = RelayClientSession {
+                    session_id: ack.session_id,
+                    relay_addr,
+                    allocated_port: ack.allocated_port,
+                    peer_node_id: peer_node_id.clone(),
+                    established_at: now,
+                    last_activity: now,
+                    relay_id,
+                    token_expires_at_unix,
+                };
+                let endpoint = session.effective_endpoint();
+                self.sessions.insert(peer_node_id.clone(), session);
+                Ok(endpoint)
             }
-
-            socket.set_read_timeout(Some(remaining.min(Duration::from_secs(1))))?;
-
-            match socket.recv_from(&mut buf) {
-                Ok((len, from_addr)) => {
-                    if from_addr != relay_addr {
-                        continue; // Ignore packets from other sources
-                    }
-
-                    match parse_relay_hello_ack(&buf[..len]) {
-                        Ok(ack) => {
-                            let now = Instant::now();
-                            let session = RelayClientSession {
-                                session_id: ack.session_id,
-                                relay_addr,
-                                allocated_port: ack.allocated_port,
-                                peer_node_id: peer_node_id.clone(),
-                                established_at: now,
-                                last_activity: now,
-                                relay_id,
-                                token_expires_at_unix,
-                            };
-                            let endpoint = session.effective_endpoint();
-                            self.sessions.insert(peer_node_id.clone(), session);
-                            return Ok(endpoint);
-                        }
-                        Err(e) => {
-                            return Err(RelayClientError::SessionRejected(e));
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-                Err(e) => return Err(RelayClientError::Io(e)),
-            }
+            Err(e) => Err(RelayClientError::SessionRejected(e)),
         }
     }
 
@@ -346,6 +402,19 @@ impl RelayClient {
         self.sessions
             .get(peer_node_id)
             .map(|s| s.effective_endpoint())
+    }
+
+    /// Returns true if the peer's selected backend endpoint matches the active
+    /// relay session endpoint.
+    pub fn session_matches_selected_endpoint(
+        &self,
+        peer_node_id: &NodeId,
+        endpoint: SocketEndpoint,
+    ) -> bool {
+        self.sessions
+            .get(peer_node_id)
+            .map(|session| session.matches_selected_endpoint(endpoint))
+            .unwrap_or(false)
     }
 
     /// Closes the session for a peer.
@@ -422,7 +491,8 @@ impl RelayClient {
             .ok_or(RelayClientError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "relay socket not bound",
-            )))?;
+            )))?
+            .try_clone()?;
 
         // Keepalive is a minimal packet to the allocated port.
         // Use a simple format: [KEEPALIVE_MSG_TYPE, session_id[0..4]]
@@ -431,10 +501,32 @@ impl RelayClient {
         keepalive[0] = RELAY_KEEPALIVE_MSG_TYPE;
         keepalive[1..5].copy_from_slice(&session.session_id.as_bytes()[0..4]);
 
-        let target = SocketAddr::new(session.relay_addr.ip(), session.allocated_port);
-        socket.send_to(&keepalive, target)?;
+        self.send_keepalive_with_sender(peer_node_id, |target, keepalive| {
+            socket.send_to(keepalive, target)?;
+            Ok(())
+        })
+    }
 
-        // Update last activity since we just sent something
+    pub fn send_keepalive_with_sender<F>(
+        &mut self,
+        peer_node_id: &NodeId,
+        mut sender: F,
+    ) -> Result<(), RelayClientError>
+    where
+        F: FnMut(SocketAddr, &[u8]) -> Result<(), RelayClientError>,
+    {
+        let session = self
+            .sessions
+            .get(peer_node_id)
+            .ok_or(RelayClientError::NoRelayAvailable)?;
+
+        let mut keepalive = [0u8; 5];
+        keepalive[0] = RELAY_KEEPALIVE_MSG_TYPE;
+        keepalive[1..5].copy_from_slice(&session.session_id.as_bytes()[0..4]);
+
+        let target = SocketAddr::new(session.relay_addr.ip(), session.allocated_port);
+        sender(target, &keepalive)?;
+
         if let Some(session) = self.sessions.get_mut(peer_node_id) {
             session.last_activity = Instant::now();
         }
@@ -484,8 +576,24 @@ impl RelayClient {
     }
 
     #[cfg(test)]
+    pub fn set_session_last_activity_for_test(
+        &mut self,
+        peer_node_id: &NodeId,
+        last_activity: Instant,
+    ) {
+        if let Some(session) = self.sessions.get_mut(peer_node_id) {
+            session.last_activity = last_activity;
+        }
+    }
+
+    #[cfg(test)]
     pub fn script_establish_session_result(&mut self, result: Result<u16, RelayClientError>) {
         self.scripted_establishments.push_back(result);
+    }
+
+    #[cfg(test)]
+    pub fn set_bound_for_test(&mut self, value: bool) {
+        self.bound_override = value;
     }
 }
 
@@ -708,6 +816,7 @@ mod tests {
 
         assert_eq!(client.active_session_count(), 0);
         assert!(!client.has_session(&test_node_id("peer-b")));
+        assert!(!client.is_bound());
     }
 
     #[test]
@@ -1052,8 +1161,77 @@ mod tests {
     }
 
     #[test]
-    fn relay_client_local_port_config_returns_configured_value() {
+    fn relay_client_establish_session_with_round_trip_uses_provided_transport() {
         let signing_key = Arc::new(SigningKey::from_bytes(&[10u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let allocated_port: u16 = 5010;
+        let session_id = [0x66; 16];
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |target, _payload, _timeout| {
+                    assert_eq!(target, relay_addr);
+                    let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
+                    ack.extend_from_slice(&session_id);
+                    ack.extend_from_slice(&allocated_port.to_be_bytes());
+                    Ok((ack, relay_addr))
+                },
+            )
+            .expect("round-trip establish should succeed");
+
+        assert_eq!(endpoint.addr, relay_addr.ip());
+        assert_eq!(endpoint.port, allocated_port);
+        assert!(client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_send_keepalive_with_sender_uses_allocated_port() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[11u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        client.script_establish_session_result(Ok(5008));
+        client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |_target, _payload, _timeout| Err(RelayClientError::Timeout),
+            )
+            .expect("scripted establish should succeed");
+
+        let mut observed = None;
+        client
+            .send_keepalive_with_sender(&peer_id, |target, payload| {
+                observed = Some((target, payload.to_vec()));
+                Ok(())
+            })
+            .expect("keepalive send should succeed");
+
+        let (target, payload) = observed.expect("keepalive should be observed");
+        assert_eq!(target, "192.168.1.1:5008".parse().unwrap());
+        assert_eq!(payload.len(), 5);
+        assert_eq!(payload[0], RELAY_KEEPALIVE_MSG_TYPE);
+    }
+
+    #[test]
+    fn relay_client_local_port_config_returns_configured_value() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[12u8; 32]));
         let client = RelayClient::new(
             test_node_id("node-a"),
             signing_key,
@@ -1067,8 +1245,27 @@ mod tests {
     }
 
     #[test]
+    fn relay_client_local_port_hint_does_not_imply_authoritative_binding() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig {
+                local_port: Some(51820),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(client.local_port(), Some(51820));
+        assert!(
+            !client.is_bound(),
+            "configured local port must not be treated as an authoritative transport socket"
+        );
+    }
+
+    #[test]
     fn relay_client_local_port_default_is_none() {
-        let signing_key = Arc::new(SigningKey::from_bytes(&[11u8; 32]));
+        let signing_key = Arc::new(SigningKey::from_bytes(&[14u8; 32]));
         let client = RelayClient::new(
             test_node_id("node-a"),
             signing_key,

@@ -1,5 +1,35 @@
 # Rustynet
 
+## Current Focus
+
+- finish an honest production transport-owning backend for traversal and relay on the real peer-traffic path
+- refresh commit-bound live evidence for traversal, relay, failback, and fresh-install gates
+- keep repository guidance current in ledgers, runbooks, and indexes rather than standalone prompt files
+
+## Read First
+
+If you are implementing or reviewing work in this repository, start here:
+
+- [AGENTS.md](/Users/iwanteague/Desktop/Rustynet/AGENTS.md)
+- [CLAUDE.md](/Users/iwanteague/Desktop/Rustynet/CLAUDE.md)
+- [documents/README.md](./documents/README.md)
+- [documents/Requirements.md](./documents/Requirements.md)
+- [documents/SecurityMinimumBar.md](./documents/SecurityMinimumBar.md)
+
+Primary execution ledgers:
+
+- [documents/operations/active/MasterWorkPlan_2026-03-22.md](./documents/operations/active/MasterWorkPlan_2026-03-22.md)
+- [documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
+
+Operational indexes and runbook maps:
+
+- [documents/operations/README.md](./documents/operations/README.md)
+- [documents/operations/active/README.md](./documents/operations/active/README.md)
+
+Repository guidance rule:
+
+- standalone prompt documents are not part of the long-term source of truth; use the active ledgers, runbooks, and index files above
+
 ## Quick Start Wizard
 
 Run the interactive setup/menu wizard:
@@ -45,7 +75,7 @@ The wizard handles:
 - exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
 - main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
 - `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
-- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime now validates signed traversal bundles, requires traversal-authoritative peer coverage for all managed peers in enforced auto-tunnel mode, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and runs a deterministic one-sided direct-probe loop that falls back to relay when direct cannot be proven; relay-backed sessions are periodically reprobed on reconcile, and direct-active peers now use live backend handshake evidence to avoid stale cached path decisions before failing back from relay when direct becomes healthy again; traversal probe fanout, freshness, and reprobe cadence are now explicit daemon policy (`--traversal-probe-max-candidates`, `--traversal-probe-max-pairs`, `--traversal-probe-rounds`, `--traversal-probe-round-spacing-ms`, `--traversal-probe-relay-switch-after-failures`, `--traversal-probe-handshake-freshness-secs`, `--traversal-probe-reprobe-interval-secs`) instead of implicit runtime defaults; production WAN simultaneous-open hole punching and relay transport remain HP-2/HP-3 work
+- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime validates signed traversal bundles and signed coordination records, requires traversal-authoritative peer coverage for all managed peers in enforced auto-tunnel mode, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and only promotes `direct_active` or `relay_active` from fresh live proof rather than programmed state; relay-backed sessions are periodically reprobed on reconcile, and direct-active peers now use live backend handshake evidence to avoid stale cached path decisions before failing back from relay when direct becomes healthy again; traversal probe fanout, freshness, and reprobe cadence are explicit daemon policy (`--traversal-probe-max-candidates`, `--traversal-probe-max-pairs`, `--traversal-probe-rounds`, `--traversal-probe-round-spacing-ms`, `--traversal-probe-relay-switch-after-failures`, `--traversal-probe-handshake-freshness-secs`, `--traversal-probe-reprobe-interval-secs`) instead of implicit runtime defaults; the daemon now consumes an explicit backend-owned authoritative shared-transport contract for STUN round trips, relay hello/refresh, keepalive, and transport-identity diagnostics when a backend provides it, but current production WireGuard backends still explicitly block those workflows on separate daemon-owned sockets because they remain command-only adapters over OS-managed peer sockets and do not yet expose authoritative packet I/O or a backend-owned datagram multiplexer; the explicit non-default mode names `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` are now wired through daemon/start parsing and host-profile enforcement, but both still fail closed with that precise blocker, so plug-and-play cross-network completion remains blocked on a production backend mode that can satisfy the shared-transport contract plus fresh commit-bound live direct/relay/failback evidence
 - `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) and uses runtime-authored path states (`direct_active`, `relay_active`, `fail_closed`) instead of a static transport string
 - traversal artifact custody and probe policy are configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`, `--traversal-probe-*`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
 - Magic DNS is now a signed control-plane path only: `rustynetd` loads a signed DNS-zone bundle from pinned custody paths, cross-checks every managed record against signed assignment state, answers the managed zone from a loopback-only authoritative resolver (`--dns-zone-*`, `--dns-resolver-bind-addr`), returns `SERVFAIL` for managed-name queries when signed DNS state is missing/invalid/stale, and refuses non-managed names rather than falling back to ad hoc local overrides or `/etc/hosts`; the supported Linux host-integration path is a dedicated `systemd-resolved` unit (`rustynetd-managed-dns.service`) that routes the private zone through the Rustynet interface only, with no `/etc/hosts` or raw resolver fallback

@@ -906,8 +906,7 @@ pub fn git_head_commit(root_dir: &Path) -> Result<String, String> {
 
 pub fn read_last_matching_line(text: &str, needle: &str) -> String {
     text.lines()
-        .filter(|line| line.contains(needle))
-        .next_back()
+        .rfind(|line| line.contains(needle))
         .unwrap_or("")
         .to_string()
 }

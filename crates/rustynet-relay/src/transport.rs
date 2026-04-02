@@ -89,6 +89,21 @@ pub enum RelayHelloResponse {
     Rejected(RejectReason),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayForwardError {
+    SessionNotFound,
+    SessionExpired,
+    UnauthorizedSourceTuple,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayForwardTarget {
+    pub peer_session_id: SessionId,
+    pub peer_allocated_port: u16,
+    pub peer_addr: SocketAddr,
+    pub payload: Vec<u8>,
+}
+
 pub struct RelayTransport {
     /// This relay's own identifier.  Every accepted token must have a matching
     /// `relay_id`; tokens issued for a different relay are rejected.
@@ -137,7 +152,11 @@ impl RelayTransport {
     /// 8. `relay_id` binding (ct_eq: token.relay_id == self.relay_id)
     /// 9. Scope enforcement (token.scope == "forward_ciphertext_only")
     /// 10. Per-node session capacity
-    pub fn handle_hello(&mut self, hello: RelayHello) -> RelayHelloResponse {
+    pub fn handle_hello_from_tuple(
+        &mut self,
+        hello: RelayHello,
+        observed_addr: SocketAddr,
+    ) -> RelayHelloResponse {
         // Check 1: Hello rate limit — shed before any crypto work
         if !self.hello_limiter.check(&hello.node_id) {
             return RelayHelloResponse::Rejected(RejectReason::RateLimitExceeded);
@@ -236,6 +255,8 @@ impl RelayTransport {
         self.nonce_store.insert(hello.session_token.nonce);
 
         // Allocate session
+        self.remove_session_for_pair(&hello.node_id, &hello.peer_node_id);
+
         let session_id = SessionId::generate();
         let allocated_port = self.allocate_port();
 
@@ -244,6 +265,9 @@ impl RelayTransport {
             node_id: hello.node_id.clone(),
             peer_node_id: hello.peer_node_id.clone(),
             allocated_port,
+            hello_source_addr: observed_addr,
+            bound_peer_addr: None,
+            expires_at_unix: hello.session_token.expires_at_unix,
             established_at: Instant::now(),
             last_packet_at: Instant::now(),
         };
@@ -260,9 +284,43 @@ impl RelayTransport {
         })
     }
 
+    #[cfg(test)]
+    pub fn handle_hello(&mut self, hello: RelayHello) -> RelayHelloResponse {
+        let observed_addr = SocketAddr::from(([127, 0, 0, 1], 40_000));
+        self.handle_hello_from_tuple(hello, observed_addr)
+    }
+
     /// Refresh session activity timestamp without forwarding data.
     ///
     /// Used by keepalive packets to prevent session idle timeout.
+    pub fn touch_session_from_tuple(
+        &mut self,
+        session_id: SessionId,
+        from_addr: SocketAddr,
+    ) -> Result<bool, RelayForwardError> {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return Err(RelayForwardError::SessionNotFound);
+        };
+        if session.expires_at_unix <= now_unix {
+            self.remove_session(session_id);
+            return Err(RelayForwardError::SessionExpired);
+        }
+        match session.bound_peer_addr {
+            Some(bound_addr) if bound_addr == from_addr => {
+                session.last_packet_at = Instant::now();
+                Ok(true)
+            }
+            Some(_) => Err(RelayForwardError::UnauthorizedSourceTuple),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
     pub fn touch_session(&mut self, session_id: SessionId) -> Result<(), String> {
         let session = self
             .sessions
@@ -270,6 +328,10 @@ impl RelayTransport {
             .ok_or("session not found")?;
         session.last_packet_at = Instant::now();
         Ok(())
+    }
+
+    pub fn has_session(&self, session_id: SessionId) -> bool {
+        self.sessions.contains_key(&session_id)
     }
 
     /// Forward a ciphertext payload from one session to its paired session.
@@ -284,53 +346,106 @@ impl RelayTransport {
         &mut self,
         session_id: SessionId,
         payload: &[u8],
-        _from_addr: SocketAddr,
-    ) -> Result<Option<(SessionId, Vec<u8>)>, String> {
+        from_addr: SocketAddr,
+    ) -> Result<Option<RelayForwardTarget>, RelayForwardError> {
         // Silently drop oversized payloads (do not error — avoids amplification)
         if payload.len() > MAX_PACKET_SIZE_BYTES {
             return Ok(None);
         }
 
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return Err("session not found".to_string());
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Err(RelayForwardError::SessionNotFound);
+        };
+        if session.expires_at_unix <= now_unix {
+            self.remove_session(session_id);
+            return Err(RelayForwardError::SessionExpired);
+        }
+
+        {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("session should remain available while forwarding");
+            match session.bound_peer_addr {
+                Some(bound_addr) if bound_addr == from_addr => {}
+                Some(_) => return Err(RelayForwardError::UnauthorizedSourceTuple),
+                None => {
+                    if session.hello_source_addr.ip() != from_addr.ip() {
+                        return Err(RelayForwardError::UnauthorizedSourceTuple);
+                    }
+                    session.bound_peer_addr = Some(from_addr);
+                }
+            }
+
+            // Rate limit check — silent drop on excess
+            if !self
+                .rate_limiter
+                .check_packet(&session.node_id, payload.len())
+            {
+                return Ok(None);
+            }
+
+            // Update last_packet_at
+            session.last_packet_at = Instant::now();
+        }
+
+        let (peer_session_id, current_node_id, current_peer_node_id) = {
+            let session = self
+                .sessions
+                .get(&session_id)
+                .expect("session should remain available while forwarding");
+            (
+                self.node_pair_index
+                    .get(&(session.peer_node_id.clone(), session.node_id.clone()))
+                    .copied(),
+                session.node_id.clone(),
+                session.peer_node_id.clone(),
+            )
         };
 
-        // Rate limit check — silent drop on excess
-        if !self
-            .rate_limiter
-            .check_packet(&session.node_id, payload.len())
-        {
+        let Some(peer_sid) = peer_session_id else {
+            // Half-open: no paired session yet; silently drop
+            return Ok(None);
+        };
+
+        let Some(peer_session) = self.sessions.get_mut(&peer_sid) else {
+            self.node_pair_index
+                .remove(&(current_peer_node_id, current_node_id));
+            return Ok(None);
+        };
+        if peer_session.expires_at_unix <= now_unix {
+            self.remove_session(peer_sid);
             return Ok(None);
         }
-
-        // Update last_packet_at
-        session.last_packet_at = Instant::now();
-
-        // Find paired session
-        let peer_session_id = self
-            .node_pair_index
-            .get(&(session.peer_node_id.clone(), session.node_id.clone()))
-            .copied();
-
-        if let Some(peer_sid) = peer_session_id {
-            if let Some(peer_session) = self.sessions.get_mut(&peer_sid) {
-                peer_session.last_packet_at = Instant::now();
-            }
-            // Forward payload as-is — never inspect content
-            Ok(Some((peer_sid, payload.to_vec())))
-        } else {
-            // Half-open: no paired session yet; silently drop
-            Ok(None)
-        }
+        let Some(peer_addr) = peer_session.bound_peer_addr else {
+            return Ok(None);
+        };
+        peer_session.last_packet_at = Instant::now();
+        // Forward payload as-is — never inspect content
+        Ok(Some(RelayForwardTarget {
+            peer_session_id: peer_sid,
+            peer_allocated_port: peer_session.allocated_port,
+            peer_addr,
+            payload: payload.to_vec(),
+        }))
     }
 
     /// Evict idle, half-open, and stale sessions, and prune the nonce store.
     ///
     /// Should be called periodically (e.g., every 10 seconds).
-    pub fn cleanup_idle_sessions(&mut self) {
+    pub fn cleanup_idle_sessions(&mut self) -> Vec<RelaySession> {
         let now = Instant::now();
         let idle_threshold = Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS);
         let half_open_threshold = Duration::from_secs(HALF_OPEN_SESSION_TIMEOUT_SECS);
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         let mut to_remove = Vec::new();
 
@@ -343,19 +458,21 @@ impl RelayTransport {
                 .contains_key(&(session.peer_node_id.clone(), session.node_id.clone()));
 
             // Remove session if:
+            // - it has expired according to the signed session token, OR
             // - it is half-open (no paired session) and exceeds the half-open timeout, OR
             // - it is idle (no recent packets) and exceeds the idle timeout
+            let is_expired = session.expires_at_unix <= now_unix;
             let is_stale_half_open = !has_pair && age > half_open_threshold;
             let is_idle = idle > idle_threshold;
-            if is_stale_half_open || is_idle {
+            if is_expired || is_stale_half_open || is_idle {
                 to_remove.push(*session_id);
             }
         }
 
+        let mut removed = Vec::new();
         for sid in to_remove {
-            if let Some(session) = self.sessions.remove(&sid) {
-                self.node_pair_index
-                    .remove(&(session.node_id.clone(), session.peer_node_id.clone()));
+            if let Some(session) = self.remove_session(sid) {
+                removed.push(session);
             }
         }
 
@@ -363,6 +480,8 @@ impl RelayTransport {
         // to prevent unbounded memory growth while keeping anti-replay guarantees.
         self.nonce_store
             .prune(Duration::from_secs(NONCE_RETENTION_SECS));
+
+        removed
     }
 
     fn allocate_port(&self) -> u16 {
@@ -375,6 +494,24 @@ impl RelayTransport {
     #[cfg(test)]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    fn remove_session_for_pair(&mut self, node_id: &str, peer_node_id: &str) {
+        let Some(existing_session_id) = self
+            .node_pair_index
+            .get(&(node_id.to_string(), peer_node_id.to_string()))
+            .copied()
+        else {
+            return;
+        };
+        self.remove_session(existing_session_id);
+    }
+
+    fn remove_session(&mut self, session_id: SessionId) -> Option<RelaySession> {
+        let session = self.sessions.remove(&session_id)?;
+        self.node_pair_index
+            .remove(&(session.node_id.clone(), session.peer_node_id.clone()));
+        Some(session)
     }
 }
 
@@ -475,6 +612,25 @@ mod tests {
             node_id: node_id.to_string(),
             peer_node_id: peer_node_id.to_string(),
             session_token: make_valid_token(signing_key, node_id, peer_node_id, 60),
+        }
+    }
+
+    fn observed_addr(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::from((ip, port))
+    }
+
+    fn accept_hello_from(
+        transport: &mut RelayTransport,
+        signing_key: &SigningKey,
+        node_id: &str,
+        peer_node_id: &str,
+        from_addr: SocketAddr,
+    ) -> SessionId {
+        match transport
+            .handle_hello_from_tuple(make_hello(signing_key, node_id, peer_node_id), from_addr)
+        {
+            RelayHelloResponse::Accepted(ack) => ack.session_id,
+            other => panic!("expected accepted hello, got {other:?}"),
         }
     }
 
@@ -800,30 +956,41 @@ mod tests {
         let (sk, _) = make_test_keypair();
         let mut transport = make_transport(&sk);
 
-        let sid_a = match transport.handle_hello(make_hello(&sk, "node-a", "node-b")) {
-            RelayHelloResponse::Accepted(ack) => ack.session_id,
-            _ => panic!("expected accepted"),
-        };
-        let sid_b = match transport.handle_hello(make_hello(&sk, "node-b", "node-a")) {
-            RelayHelloResponse::Accepted(ack) => ack.session_id,
-            _ => panic!("expected accepted"),
-        };
+        let hello_a = observed_addr([198, 51, 100, 10], 40_000);
+        let data_a = observed_addr([198, 51, 100, 10], 51_820);
+        let hello_b = observed_addr([203, 0, 113, 20], 41_000);
+        let data_b = observed_addr([203, 0, 113, 20], 51_821);
+
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+        let sid_b = accept_hello_from(&mut transport, &sk, "node-b", "node-a", hello_b);
 
         let payload_a = b"ciphertext from A";
-        let (fwd_sid, fwd_payload) = transport
-            .forward_packet(sid_a, payload_a, "0.0.0.0:0".parse().unwrap())
-            .unwrap()
-            .expect("should forward");
-        assert_eq!(fwd_sid, sid_b);
-        assert_eq!(fwd_payload, payload_a);
+        assert_eq!(
+            transport
+                .forward_packet(sid_a, payload_a, data_a)
+                .expect("forwarding should not error before pairing"),
+            None,
+            "first packet must bind node-a but not forward before node-b is bound"
+        );
 
         let payload_b = b"ciphertext from B";
-        let (fwd_sid, fwd_payload) = transport
-            .forward_packet(sid_b, payload_b, "0.0.0.0:0".parse().unwrap())
+        let forward_b = transport
+            .forward_packet(sid_b, payload_b, data_b)
             .unwrap()
             .expect("should forward");
-        assert_eq!(fwd_sid, sid_a);
-        assert_eq!(fwd_payload, payload_b);
+        assert_eq!(forward_b.peer_session_id, sid_a);
+        assert_eq!(forward_b.peer_allocated_port, 50_000);
+        assert_eq!(forward_b.peer_addr, data_a);
+        assert_eq!(forward_b.payload, payload_b);
+
+        let forward_a = transport
+            .forward_packet(sid_a, payload_a, data_a)
+            .unwrap()
+            .expect("bound sessions should forward bidirectionally");
+        assert_eq!(forward_a.peer_session_id, sid_b);
+        assert_eq!(forward_a.peer_allocated_port, 50_001);
+        assert_eq!(forward_a.peer_addr, data_b);
+        assert_eq!(forward_a.payload, payload_a);
     }
 
     #[test]
@@ -831,11 +998,15 @@ mod tests {
         let (sk, _) = make_test_keypair();
         let mut transport = make_transport(&sk);
 
-        let sid_a = match transport.handle_hello(make_hello(&sk, "node-a", "node-b")) {
-            RelayHelloResponse::Accepted(ack) => ack.session_id,
-            _ => panic!("expected accepted"),
-        };
-        let _ = transport.handle_hello(make_hello(&sk, "node-b", "node-a"));
+        let hello_a = observed_addr([198, 51, 100, 11], 40_010);
+        let data_a = observed_addr([198, 51, 100, 11], 51_830);
+        let hello_b = observed_addr([203, 0, 113, 21], 41_010);
+        let data_b = observed_addr([203, 0, 113, 21], 51_831);
+
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+        let sid_b = accept_hello_from(&mut transport, &sk, "node-b", "node-a", hello_b);
+        let _ = transport.forward_packet(sid_a, b"bind-a", data_a);
+        let _ = transport.forward_packet(sid_b, b"bind-b", data_b);
 
         // Test with byte patterns that could confuse parsers
         for payload in [
@@ -843,11 +1014,13 @@ mod tests {
             vec![0xFFu8; 100],
             (0u8..100).collect::<Vec<_>>(),
         ] {
-            let result = transport
-                .forward_packet(sid_a, &payload, "0.0.0.0:0".parse().unwrap())
-                .unwrap();
-            if let Some((_, forwarded)) = result {
-                assert_eq!(forwarded, payload, "payload must be forwarded verbatim");
+            let result = transport.forward_packet(sid_a, &payload, data_a).unwrap();
+            if let Some(forwarded) = result {
+                assert_eq!(
+                    forwarded.payload, payload,
+                    "payload must be forwarded verbatim"
+                );
+                assert_eq!(forwarded.peer_session_id, sid_b);
             }
         }
     }
@@ -859,16 +1032,18 @@ mod tests {
         let (sk, _) = make_test_keypair();
         let mut transport = make_transport(&sk);
 
-        let sid_a = match transport.handle_hello(make_hello(&sk, "node-a", "node-b")) {
-            RelayHelloResponse::Accepted(ack) => ack.session_id,
-            _ => panic!("expected accepted"),
-        };
-        let _ = transport.handle_hello(make_hello(&sk, "node-b", "node-a"));
+        let hello_a = observed_addr([198, 51, 100, 12], 40_020);
+        let data_a = observed_addr([198, 51, 100, 12], 51_840);
+        let hello_b = observed_addr([203, 0, 113, 22], 41_020);
+        let data_b = observed_addr([203, 0, 113, 22], 51_841);
+
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+        let sid_b = accept_hello_from(&mut transport, &sk, "node-b", "node-a", hello_b);
+        let _ = transport.forward_packet(sid_a, b"bind-a", data_a);
+        let _ = transport.forward_packet(sid_b, b"bind-b", data_b);
 
         let oversized = vec![0u8; MAX_PACKET_SIZE_BYTES + 1];
-        let result = transport
-            .forward_packet(sid_a, &oversized, "0.0.0.0:0".parse().unwrap())
-            .unwrap();
+        let result = transport.forward_packet(sid_a, &oversized, data_a).unwrap();
         assert_eq!(result, None, "oversized payload must be silently dropped");
         // Session still live — drop does not tear down the session
         assert_eq!(transport.session_count(), 2);
@@ -882,25 +1057,276 @@ mod tests {
         let mut transport = make_transport(&sk);
         transport.rate_limiter.max_pps = 5;
 
-        let sid_a = match transport.handle_hello(make_hello(&sk, "node-a", "node-b")) {
-            RelayHelloResponse::Accepted(ack) => ack.session_id,
-            _ => panic!("expected accepted"),
-        };
-        let _ = transport.handle_hello(make_hello(&sk, "node-b", "node-a"));
+        let hello_a = observed_addr([198, 51, 100, 13], 40_030);
+        let data_a = observed_addr([198, 51, 100, 13], 51_850);
+        let hello_b = observed_addr([203, 0, 113, 23], 41_030);
+        let data_b = observed_addr([203, 0, 113, 23], 51_851);
+
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+        let sid_b = accept_hello_from(&mut transport, &sk, "node-b", "node-a", hello_b);
+        let _ = transport.forward_packet(sid_a, b"bind-a", data_a);
+        let _ = transport.forward_packet(sid_b, b"bind-b", data_b);
 
         for _ in 0..5 {
-            assert!(
-                transport
-                    .forward_packet(sid_a, b"data", "0.0.0.0:0".parse().unwrap())
-                    .is_ok()
-            );
+            assert!(transport.forward_packet(sid_a, b"data", data_a).is_ok());
         }
         // Excess — silent drop
-        let result = transport
-            .forward_packet(sid_a, b"data", "0.0.0.0:0".parse().unwrap())
-            .unwrap();
+        let result = transport.forward_packet(sid_a, b"data", data_a).unwrap();
         assert_eq!(result, None);
         assert_eq!(transport.session_count(), 2); // sessions intact
+    }
+
+    #[test]
+    fn test_wrong_source_tuple_rejected_after_binding() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let hello_a = observed_addr([198, 51, 100, 14], 40_040);
+        let data_a = observed_addr([198, 51, 100, 14], 51_860);
+        let spoof_a = observed_addr([198, 51, 100, 14], 60_000);
+        let hello_b = observed_addr([203, 0, 113, 24], 41_040);
+        let data_b = observed_addr([203, 0, 113, 24], 51_861);
+
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+        let sid_b = accept_hello_from(&mut transport, &sk, "node-b", "node-a", hello_b);
+        let _ = transport.forward_packet(sid_a, b"bind-a", data_a);
+        let _ = transport.forward_packet(sid_b, b"bind-b", data_b);
+
+        let err = transport
+            .forward_packet(sid_a, b"spoof", spoof_a)
+            .expect_err("bound session must reject tuple changes");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    #[test]
+    fn test_new_hello_replaces_existing_session_for_same_pair() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let sid_old = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 21], 40_110),
+        );
+        let sid_new = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 21], 40_111),
+        );
+
+        assert_ne!(sid_old, sid_new);
+        assert!(!transport.has_session(sid_old));
+        assert!(transport.has_session(sid_new));
+        assert_eq!(transport.session_count(), 1);
+    }
+
+    #[test]
+    fn test_unbound_session_rejects_different_source_ip() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let sid_a = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 15], 40_050),
+        );
+
+        let err = transport
+            .forward_packet(sid_a, b"spoof", observed_addr([203, 0, 113, 25], 51_870))
+            .expect_err("unbound session must reject a different source IP");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    #[test]
+    fn test_stale_tuple_reuse_after_cleanup_is_rejected() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let old_hello = observed_addr([198, 51, 100, 16], 40_060);
+        let old_data = observed_addr([198, 51, 100, 16], 51_880);
+        let peer_hello = observed_addr([203, 0, 113, 26], 41_060);
+        let peer_data = observed_addr([203, 0, 113, 26], 51_881);
+
+        let sid_old = accept_hello_from(&mut transport, &sk, "node-a", "node-b", old_hello);
+        let sid_peer = accept_hello_from(&mut transport, &sk, "node-b", "node-a", peer_hello);
+        let _ = transport.forward_packet(sid_old, b"bind-a", old_data);
+        let _ = transport.forward_packet(sid_peer, b"bind-b", peer_data);
+        for session in transport.sessions.values_mut() {
+            session.last_packet_at =
+                Instant::now() - Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS + 1);
+        }
+        let removed = transport.cleanup_idle_sessions();
+        assert_eq!(
+            removed.len(),
+            2,
+            "cleanup must remove both stale paired sessions"
+        );
+        assert_eq!(transport.session_count(), 0);
+
+        let sid_new = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([203, 0, 113, 27], 40_061),
+        );
+        assert_eq!(
+            transport
+                .sessions
+                .get(&sid_new)
+                .expect("new session should exist")
+                .allocated_port,
+            50_000,
+            "cleaned ports must be reusable"
+        );
+        let err = transport
+            .forward_packet(sid_new, b"stale", old_data)
+            .expect_err("old tuple must not claim a reused relay port");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    #[test]
+    fn test_cross_session_forwarding_attempt_is_rejected() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let sid_ab = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 17], 40_070),
+        );
+        let sid_ba = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-b",
+            "node-a",
+            observed_addr([203, 0, 113, 28], 41_070),
+        );
+        let _ = transport.forward_packet(
+            sid_ab,
+            b"bind-ab",
+            observed_addr([198, 51, 100, 17], 51_890),
+        );
+        let _ =
+            transport.forward_packet(sid_ba, b"bind-ba", observed_addr([203, 0, 113, 28], 51_891));
+
+        let sid_cd = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-c",
+            "node-d",
+            observed_addr([198, 51, 100, 18], 40_080),
+        );
+        let sid_dc = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-d",
+            "node-c",
+            observed_addr([203, 0, 113, 29], 41_080),
+        );
+        let _ = transport.forward_packet(
+            sid_cd,
+            b"bind-cd",
+            observed_addr([198, 51, 100, 18], 51_892),
+        );
+        let _ =
+            transport.forward_packet(sid_dc, b"bind-dc", observed_addr([203, 0, 113, 29], 51_893));
+
+        let err = transport
+            .forward_packet(
+                sid_ab,
+                b"cross-talk",
+                observed_addr([198, 51, 100, 18], 51_892),
+            )
+            .expect_err("session AB must reject session CD's bound tuple");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    #[test]
+    fn test_keepalive_rejects_unbound_and_wrong_tuple_activity() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let sid_a = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 19], 40_090),
+        );
+
+        assert!(
+            !transport
+                .touch_session_from_tuple(sid_a, observed_addr([198, 51, 100, 19], 51_894))
+                .expect("unbound keepalive should be ignored, not accepted")
+        );
+
+        let sid_b = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-b",
+            "node-a",
+            observed_addr([203, 0, 113, 30], 41_090),
+        );
+        let _ =
+            transport.forward_packet(sid_a, b"bind-a", observed_addr([198, 51, 100, 19], 51_894));
+        let _ =
+            transport.forward_packet(sid_b, b"bind-b", observed_addr([203, 0, 113, 30], 51_895));
+
+        let err = transport
+            .touch_session_from_tuple(sid_a, observed_addr([198, 51, 100, 19], 60_001))
+            .expect_err("bound keepalive must reject a different tuple");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    #[test]
+    fn test_expired_session_forwarding_is_rejected_and_cleaned_up() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let sid_a = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 20], 40_100),
+        );
+        let sid_b = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-b",
+            "node-a",
+            observed_addr([203, 0, 113, 31], 41_100),
+        );
+        let _ =
+            transport.forward_packet(sid_a, b"bind-a", observed_addr([198, 51, 100, 20], 51_896));
+        let _ =
+            transport.forward_packet(sid_b, b"bind-b", observed_addr([203, 0, 113, 31], 51_897));
+
+        transport
+            .sessions
+            .get_mut(&sid_a)
+            .expect("session should exist")
+            .expires_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(1);
+
+        let err = transport
+            .forward_packet(sid_a, b"expired", observed_addr([198, 51, 100, 20], 51_896))
+            .expect_err("expired session must not forward");
+        assert_eq!(err, RelayForwardError::SessionExpired);
+        assert!(!transport.has_session(sid_a));
+        assert!(transport.has_session(sid_b));
     }
 
     // ── Session cleanup ───────────────────────────────────────────────────────

@@ -6,7 +6,10 @@ pub mod transport;
 
 pub use rate_limit::RateLimiter;
 pub use session::{RelaySession, SessionId};
-pub use transport::{RejectReason, RelayHello, RelayHelloAck, RelayHelloResponse, RelayTransport};
+pub use transport::{
+    RejectReason, RelayForwardError, RelayForwardTarget, RelayHello, RelayHelloAck,
+    RelayHelloResponse, RelayTransport,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayNode {

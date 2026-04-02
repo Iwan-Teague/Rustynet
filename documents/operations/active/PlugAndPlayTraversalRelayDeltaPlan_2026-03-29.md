@@ -3,7 +3,7 @@
 **Repository Root:** `/Users/iwanteague/Desktop/Rustynet`
 **Scope:** Production-grade, secure, plug-and-play cross-network connectivity with direct UDP when possible and ciphertext-only relay fallback when direct is not provable.
 
-## AI Implementation Prompt
+## Execution Scope
 ```text
 You are the implementation agent for the remaining plug-and-play connectivity work in this repository.
 Repository root: /Users/iwanteague/Desktop/Rustynet
@@ -27,7 +27,7 @@ Mandatory reading order:
 6. /Users/iwanteague/Desktop/Rustynet/documents/phase10.md
 7. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md
 8. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md
-9. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/CrossNetworkConnectivityImplementationPlan_2026-03-27.md
+9. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/MasterWorkPlan_2026-03-22.md
 10. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md
 11. This document
 12. The code you touch
@@ -86,7 +86,7 @@ Definition of done for this document:
 - no in-scope items are deferred.
 ```
 
-## AI Agent Execution and Progress Contract
+## Execution And Progress Contract
 This file must also function as the implementation ledger for the agent carrying out the work.
 
 Execution rules:
@@ -132,6 +132,9 @@ Current authoritative truth must come from:
 3. `documents/phase10.md`
 4. current runtime evidence
 5. lower-precedence active plans only insofar as they still match code reality
+
+Supporting implementation plan for the remaining production shared-transport delta:
+- [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 
 Where documents conflict:
 - [README.md](/Users/iwanteague/Desktop/Rustynet/README.md) and [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md) currently state that full production WAN simultaneous-open and full relay transport are still open work.
@@ -713,10 +716,13 @@ This phase must happen first because bad candidates poison everything above them
 Tasks:
 - [x] Fix STUN to return full mapped endpoints.
 - [x] Stop guessing public port from `wg_listen_port`.
-- [x] Align STUN gathering with actual transport socket identity.
-- [x] Align relay session establishment with the documented transport identity model.
-- [ ] Add unit tests and live diagnostics proving candidate correctness.
-  - In progress: STUN tests added, need Linux environment for execution
+- [ ] Align STUN gathering with actual transport socket identity.
+  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs), [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now define and consume an explicit backend-owned authoritative shared-transport round-trip contract for STUN refresh plus transport-identity diagnostics, and the in-memory backend proves that path under test; current production WireGuard backends still report an opaque-socket blocker, so live completion remains unresolved until a production backend mode actually owns peer datagrams.
+  - Verified 2026-03-31: non-default backend mode names `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` now parse in [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs) and survive host-profile enforcement in [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh), but [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) still rejects them fail-closed with a precise blocker because no production transport-owning backend exists in-tree yet.
+- [ ] Align relay session establishment with the documented transport identity model.
+  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs), [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now route relay hello/refresh and keepalive through the same backend-owned authoritative shared-transport contract when a backend provides it, and the in-memory backend proves that establish/keepalive path under test; production WireGuard backends still surface an opaque-socket blocker and remain unresolved until a production backend mode actually owns peer datagrams.
+- [x] Add unit tests and live diagnostics proving candidate correctness.
+  - Verified 2026-03-30: [stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs) now has mock-server and malformed-response coverage for provided-socket identity and strict bounds checking, and [daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now exposes `stun_candidate_local_addrs` and `stun_transport_port_binding` in status/netcheck so transport-identity mismatches are explicit.
 
 Success criteria:
 - published srflx candidates correspond to measured public socket tuples,
@@ -725,13 +731,15 @@ Success criteria:
 ### Phase B: Finish Direct WAN Simultaneous-Open on the Live Runtime Path
 Tasks:
 - [x] Reconcile traversal engine design with active runtime behavior.
-  - Verified: execute_simultaneous_open uses WireGuard handshake probing
+  - Verified 2026-03-30: [daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs), [phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [traversal.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/traversal.rs) now carry validated signed coordination from the signed traversal bundle set into live direct-probe execution; the runtime no longer fabricates a zeroed `CoordinationSchedule`.
 - [x] Ensure direct probe executor is truly two-sided where required.
-  - Verified: Both sides run traversal, each sends probes to the other's candidates
+  - Verified 2026-03-30: coordinated simultaneous-open is now only attempted when a validated signed coordination schedule exists for the local/remote node pair; otherwise the runtime declines direct and stays on relay, or fail-closes when no relay exists.
 - [x] Make the active runtime prove direct path using fresh handshake evidence.
   - Verified: handshake_is_fresh() checks timestamp before declaring success
 - [ ] Add roaming and re-probe correctness tests.
-- [ ] Add active-path liveness / consent-equivalent expiry tests for direct mode.
+  - In progress 2026-03-30: relay->direct recovery and live-handshake retention regression coverage now use fresh signed coordination refreshes, but broader roaming/network-change coverage is still open.
+- [x] Add active-path liveness / consent-equivalent expiry tests for direct mode.
+  - Verified 2026-03-30: `daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay` proves stale direct handshake evidence demotes runtime state back to relay-programmed/unproven instead of retaining a stale `direct_active` claim.
 
 Success criteria:
 - direct path succeeds in permissive NAT scenarios without manual router work,
@@ -745,12 +753,15 @@ Tasks:
   - Uses allocated-port demultiplexing per design
   - Parses RelayHello, allocates ports, forwards ciphertext
 - [x] Define and implement the allocated-port relay data-plane contract.
-  - Control port receives hello, allocates session port, returns ack
-  - Session port receives ciphertext, forwards to paired session
+  - Verified 2026-03-30: `crates/rustynet-relay/src/session.rs`, `crates/rustynet-relay/src/transport.rs`, and `crates/rustynet-relay/src/main.rs` now keep tuple attribution single-authority inside `RelayTransport`, bind the post-allocation dataplane tuple only from the hello-observed source IP, reject later tuple changes and unauthorized keepalive, replace same-pair sessions deterministically, and clear attribution before port reuse.
 - [ ] Wire daemon relay client to real relay infrastructure.
+  - In progress 2026-03-31: `crates/rustynetd/src/relay_client.rs`, `crates/rustynetd/src/phase10.rs`, and `crates/rustynetd/src/daemon.rs` now execute relay hello/refresh and keepalive through the explicit backend-owned authoritative shared-transport contract when available, and the in-memory backend proves the same-authority transport model under test; full completion still requires a production backend mode because current Linux/macOS WireGuard backends expose only opaque OS-managed peer-traffic sockets.
 - [ ] Ensure relay session establishment and refresh are live.
+  - In progress 2026-03-30: local runtime tests cover establishment, refresh, fail-closed failure, and relay-active truthfulness, but full completion still depends on the shared backend transport-socket identity from Phase A plus live cross-network evidence.
 - [ ] Ensure backend traffic can actually traverse the relay path.
+  - In progress 2026-03-30: `relay_active` now requires the selected backend endpoint to match the authenticated relay session endpoint plus fresh handshake evidence; end-to-end live dataplane proof is still pending shared-socket wiring and lab validation.
 - [ ] Prove relay-active with traffic/handshake evidence.
+  - In progress 2026-03-30: local backend-handshake proof is enforced and tested, but no fresh live cross-network artifact for commit `06e3e2ed745b4439505991bea775246cde8ed653` exists yet.
 
 Success criteria:
 - when direct fails, relay goes live automatically,
@@ -760,21 +771,31 @@ Success criteria:
 ### Phase D: Failover / Failback / Roaming Hardening
 Tasks:
 - [ ] Direct->relay failover with no leak.
+  - In progress 2026-03-30: `crates/rustynetd/src/daemon.rs` now has `daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay`, which proves stale direct handshake evidence drops the runtime back to `relay_programmed` with `path_live_proven=false` instead of retaining a stale `direct_active` claim. Fresh live cross-network failover evidence is still missing.
 - [ ] Relay->direct failback on fresh proof.
+  - In progress 2026-03-30: `scripts/e2e/live_linux_cross_network_failback_roaming_test.sh` now records failback only when `rustynet netcheck` reports `path_mode=direct_active` and `path_live_proven=true`; a fresh measured failback artifact for the current commit is still required.
 - [ ] Session/token refresh across long-running uptime.
+  - In progress 2026-03-30: local runtime coverage from earlier slices still exercises relay session establishment and refresh, but this document does not yet have a long-running live uptime artifact for the current commit.
 - [ ] Network-change / IP-change reprobe correctness.
-- [ ] Active-path consent/liveness expiry behaves fail-closed across transitions.
+  - In progress 2026-03-30: `scripts/e2e/live_linux_cross_network_failback_roaming_test.sh` now requires fresh live direct proof plus healthy signed-state alarms before endpoint-roam recovery can pass, but no fresh roaming artifact exists yet.
+- [x] Active-path consent/liveness expiry behaves fail-closed across transitions.
+  - Verified 2026-03-30: `daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay` proves stale direct liveness demotes the path to relay-programmed/unproven instead of overclaiming continued direct reachability.
 
 Success criteria:
 - path transitions preserve encryption, ACL, DNS fail-close, and kill-switch.
 
 ### Phase E: Evidence and Gates
 Tasks:
-- [ ] Update/extend live scripts.
-- [ ] Update CI gates.
+- [x] Update/extend live scripts.
+  - Verified 2026-03-30: `scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh`, `scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh`, and `scripts/e2e/live_linux_cross_network_failback_roaming_test.sh` now use `rustynet netcheck` and refuse pass states unless the selected path is live-proven and the signed traversal/DNS state is healthy.
+- [x] Update CI gates.
+  - Verified 2026-03-30: `crates/rustynet-cli/src/ops_cross_network_reports.rs` now makes pass reports fail closed unless they contain `path_reason`, healthy path alarms, `traversal_error=none`, and the suite-specific measured child artifacts that prove the claimed direct/relay/failback/DNS/soak outcome.
 - [ ] Generate commit-bound artifacts.
-- [ ] Require both direct and relay evidence before internet-reachability claims.
-- [ ] Update this document's progress ledger with final evidence.
+  - Blocked 2026-03-30: `./scripts/ci/phase10_cross_network_exit_gates.sh` correctly fails because the six canonical live cross-network report artifacts are absent for the current commit.
+- [x] Require both direct and relay evidence before internet-reachability claims.
+  - Verified 2026-03-30: canonical report validation now rejects pass reports that rely on a final steady-state snapshot without the measured suite artifacts and healthy live path proof.
+- [x] Update this document's progress ledger with final evidence.
+  - Verified 2026-03-30: Section 18 now records the final audited gate/artifact state for `HEAD` instead of relying on older intermediate slice notes.
 
 Success criteria:
 - the documented scripts and gates prove the product promise honestly.
@@ -889,16 +910,14 @@ Before product claims are updated, evidence must show:
 
 ## 17. Immediate Next Code Work
 If implementation starts from this document, the first code slices should be:
-1. **STUN correctness slice**
-   - fix srflx endpoint acquisition in `stun_client.rs` and `daemon.rs`
-2. **Socket-identity slice**
-   - align relay client and transport socket usage with backend socket semantics
-3. **Relay daemon slice**
-   - replace `rustynet-relay/src/main.rs` placeholder with real public UDP service using allocated relay ports
-4. **Live relay runtime slice**
-   - make relay-active genuinely achievable in `rustynetd`
-5. **Evidence slice**
-   - update scripts/gates and regenerate artifacts
+1. **Backend-owned shared transport slice**
+   - implement a backend-owned multiplexed transport capability that can safely carry peer traffic, STUN, and relay control on the same authoritative socket identity
+2. **Live-lab evidence slice**
+   - generate the six canonical cross-network reports for current `HEAD`
+3. **Fresh-install evidence slice**
+   - regenerate `artifacts/phase10/fresh_install_os_matrix_report.json` for current `HEAD`
+4. **Final release validation slice**
+   - rerun `phase10_gates.sh`, `phase10_cross_network_exit_gates.sh`, and `membership_gates.sh` on the regenerated evidence set
 
 ## 18. Progress Ledger
 Use this section as the execution log while implementing the plan.
@@ -907,20 +926,94 @@ Use this section as the execution log while implementing the plan.
 - [ ] Phase A complete
   - [x] Fix STUN to return full mapped endpoints (stun_client.rs)
   - [x] Update daemon.rs to use actual mapped endpoints
-  - [ ] Run tests and gates (blocked: Windows dev env, needs Linux target)
+  - [x] Make the fail-closed blocker explicit and test-backed: a same-local-port daemon side socket is not authoritative backend transport identity
+  - [ ] Production WireGuard backends are still command-only adapters over OS-managed peer-traffic sockets, so daemon STUN gathering remains blocked pending a backend-owned datagram multiplexer or equivalent authoritative packet-I/O capability
+  - [ ] Production WireGuard backends still lack that backend-owned transport capability for relay establishment, so the daemon now refuses to auto-bind a second relay client socket and leaves relay bootstrap blocked instead
+  - [x] Added and ran candidate-correctness parser/diagnostic tests for the current STUN path
 - [ ] Phase B complete
-  - [x] Verified traversal engine design matches runtime behavior
-  - [x] Confirmed probe executor uses WireGuard handshake for proof
+  - [x] Audit rollback resolved: active phase10 traversal now consumes validated signed coordination schedule instead of a fabricated zeroed schedule
+  - [x] Runtime declines direct or fail-closes when signed coordination is missing, stale, replayed, malformed, forged, or for the wrong node pair
+  - [x] Confirmed probe executor still uses WireGuard handshake freshness for proof
+  - [x] Added direct-liveness expiry regression coverage proving stale direct proof demotes back to relay-programmed/unproven state
   - [ ] Add roaming/re-probe tests
 - [ ] Phase C complete
   - [x] Implemented real relay daemon binary with allocated-port demux
+  - [x] Audit rollback resolved: allocated-port relay tuple-binding, cleanup, and stale port reuse are now hardened and test-backed
+  - [x] Runtime path reporting no longer promotes relay sessions to `relay_active` without selected-endpoint match plus fresh handshake proof
   - [ ] Wire to real relay infrastructure
   - [ ] Prove relay-active with live traffic
 - [ ] Phase D complete
+  - [x] Direct-path liveness expiry now falls back to relay-programmed/unproven state under test
+  - [ ] Fresh live failover artifact
+  - [ ] Fresh live failback/roaming artifact
+  - [ ] Long-uptime session/token refresh artifact
 - [ ] Phase E complete
+  - [x] Live scripts now require `rustynet netcheck` live path proof and healthy signed-state alarms before pass
+  - [x] Canonical report validation now requires suite-specific measured child artifacts and healthy path alarms for pass reports
+  - [x] Progress ledger updated with final audited gate and artifact state for current `HEAD`
+  - [x] Root-caused and fixed the hidden single-thread gate regressions in STUN provided-socket identity testing and session-snapshot lock contention
+  - [ ] Generate six canonical commit-bound cross-network reports for current `HEAD`
+  - [ ] Resolve the unrelated stale fresh-install artifact blocker in `./scripts/ci/phase10_gates.sh` or regenerate that evidence as a separate task
 
 ### 18.2 Evidence Entries
 For each completed slice, append an entry using this format:
+
+```text
+Date: 2026-03-30
+Phase / Slice: Audit rollback before continued implementation
+Files reviewed:
+  - crates/rustynetd/src/stun_client.rs
+  - crates/rustynetd/src/daemon.rs
+  - crates/rustynetd/src/traversal.rs
+  - crates/rustynetd/src/phase10.rs
+  - crates/rustynetd/src/relay_client.rs
+  - crates/rustynet-relay/src/main.rs
+  - crates/rustynet-relay/src/transport.rs
+Findings:
+  - Phase A socket-identity claims were optimistic: daemon STUN discovery still calls `gather_mapped_endpoints(None)` and relay session establishment still binds a separate relay socket.
+  - Phase B coordination claims were optimistic: the active phase10 path still passes a zeroed `CoordinationSchedule` instead of validated signed coordination timing/state.
+  - Phase C allocated-port contract claims were optimistic: the relay daemon allocates ports, but source-tuple binding/rejection and cleanup attribution are not hardened to the document's required contract yet.
+Security invariants verified:
+  - Direct and relay live-state claims still depend on fresh handshake evidence in runtime status.
+  - No unsigned endpoint-mutation path was introduced by the audited transport code.
+Notes / blockers:
+  - Actual backend transport-socket identity is still not exposed to traversal/STUN code in the current runtime shape.
+  - Continue from Phase A with candidate-correctness tests/diagnostics and keep later phases unchecked until runtime wiring is real.
+```
+
+```text
+Date: 2026-03-30
+Phase / Slice: Phase A - candidate correctness tests and diagnostics
+Files changed:
+  - crates/rustynetd/src/stun_client.rs
+    - Hardened binding-response parsing to reject attributes that run past the declared message boundary.
+    - Added IPv6 XOR-MAPPED-ADDRESS decoding for parser coverage.
+    - Added a loopback mock-server test proving `gather_mapped_endpoints(Some(&socket))` preserves the caller's socket identity.
+    - Added malformed-response coverage for truncated STUN attributes.
+  - crates/rustynetd/src/daemon.rs
+    - Retained full STUN observations in runtime instead of only the mapped endpoints.
+    - Added `stun_candidate_local_addrs` and `stun_transport_port_binding` diagnostics to status/netcheck output.
+    - Added test coverage for the new STUN transport-port diagnostic helpers and status/netcheck reporting path.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/stun_client.rs crates/rustynetd/src/daemon.rs`
+  - `cargo test -p rustynetd test_gather_mapped_endpoints_uses_provided_socket_identity -- --nocapture`
+  - `cargo test -p rustynetd test_parse_xor_mapped_address_extracts_ipv6_endpoint -- --nocapture`
+  - `cargo test -p rustynetd test_parse_binding_response_rejects_attribute_past_message_boundary -- --nocapture`
+  - `cargo test -p rustynetd stun_local_port_match_state_reports_mismatch_when_observed_port_differs -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence -- --nocapture`
+  - `cargo check -p rustynetd`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_gates.sh` (fails outside this slice in `scripts/ci/fresh_install_os_matrix_release_gate.sh`: stale child report `git_commit` mismatch)
+Live evidence / artifacts:
+  - Status/netcheck now emit transport-identity diagnostics for the STUN worker (`stun_candidate_local_addrs`, `stun_transport_port_binding`).
+Security invariants verified:
+  - STUN parsing now fails closed on malformed attribute bounds instead of silently accepting an incomplete message.
+  - Candidate diagnostics now make STUN-vs-WireGuard port mismatches explicit instead of hiding them behind only the mapped endpoint list.
+Notes / blockers:
+  - This slice does not resolve the underlying backend transport-socket identity gap.
+  - Phase A remains incomplete until STUN and relay establishment are bound to the real transport identity used by backend peer traffic.
+  - `phase10_gates.sh` is currently blocked by stale fresh-install fixture evidence, not by the STUN/parser changes in this slice.
+```
 
 ```text
 Date: 2026-03-30
@@ -1001,6 +1094,839 @@ Notes:
   - Daemon listens on control port (default 4500)
   - Allocates ports from configurable range (default 50000-59999)
   - Graceful shutdown on SIGINT
+```
+
+```text
+Date: 2026-03-30
+Phase / Slice: Phase B - signed coordination wired into live direct traversal
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Extended the signed traversal bundle-set parser to ingest signed traversal coordination sections alongside endpoint-hint sections on the same authority path.
+    - Indexed signed coordination records by node pair and validated them just-in-time with the traversal replay window before live direct probes.
+    - Added daemon/runtime tests for mixed artifact ingestion, coordination-required relay fallback, and coordinated relay->direct recovery with fresh signed refreshes.
+  - crates/rustynetd/src/phase10.rs
+    - Removed the fabricated zeroed `CoordinationSchedule` from `evaluate_traversal_probes()`.
+    - Required a validated coordination schedule before coordinated direct probing, returning relay when armed or fail-closing when no relay exists.
+    - Preserved fresh WireGuard handshake evidence as the only basis for `direct_active`.
+  - crates/rustynetd/src/traversal.rs
+    - Added adversarial coverage for expired, wrong-node, and malformed signed coordination records in addition to the existing forged-signature and replay tests.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/daemon.rs crates/rustynetd/src/phase10.rs crates/rustynetd/src/traversal.rs`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd coordination_record_validation_and_execute_simultaneous_open_behaviour -- --nocapture`
+  - `cargo test -p rustynetd test_a4_ -- --nocapture`
+  - `cargo test -p rustynetd phase10::tests::traversal_probe_ -- --nocapture`
+  - `cargo test -p rustynetd traversal_bundle_set_accepts_signed_coordination_and_rejects_malformed_section -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_requires_signed_coordination_for_direct_probe_attempts -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_gates.sh` (fails in `scripts/ci/fresh_install_os_matrix_release_gate.sh`)
+Live evidence / artifacts:
+  - `artifacts/phase10/source/traversal_path_selection_report.json`
+  - `artifacts/phase10/source/traversal_probe_security_report.json`
+Security invariants verified:
+  - The live runtime no longer synthesizes a zeroed coordination schedule for simultaneous-open.
+  - Signed coordination is consumed only on the existing hardened path: signed traversal artifact -> daemon validation/replay window -> deterministic phase10 decision -> backend apply.
+  - Direct promotion still requires fresh handshake proof; a validated schedule alone is insufficient.
+  - Missing, stale, replayed, malformed, forged, and wrong-node coordination records now decline direct probing or fail closed instead of silently downgrading to an invented schedule.
+Residual risks / blockers:
+  - Coordinated reprobes now require freshly issued signed coordination records; reusing the same nonce is rejected by design. Full startup/network-change/pre-expiry coordination refresh publication remains broader Phase B/Phase D work.
+  - `./scripts/ci/phase10_gates.sh` is still blocked outside this slice by stale fresh-install evidence: `artifacts/phase10/fresh_install_os_matrix_report.json` is bound to commit `c86a62a766b8af8382dfa57805aec8b4cad284ff` while `HEAD` is `06e3e2ed745b4439505991bea775246cde8ed653`.
+```
+
+```text
+Date: 2026-03-30
+Phase / Slice: Phase C - allocated-port relay contract hardening and relay_active truthfulness
+Files changed:
+  - crates/rustynet-relay/src/session.rs
+    - Added hello-observed source tuple, bound dataplane tuple, and signed-session expiry to `RelaySession`.
+  - crates/rustynet-relay/src/transport.rs
+    - Made `RelayTransport` the single authority for tuple attribution and relay forwarding decisions.
+    - Added fail-closed forwarding errors for missing, expired, and unauthorized session activity.
+    - Bound post-allocation dataplane traffic only when the first ciphertext packet matches the hello-observed source IP, rejected later tuple changes, ignored unbound keepalive, replaced same-pair sessions deterministically, and expired/cleaned sessions before reuse.
+    - Added adversarial tests for wrong source tuple, stale tuple reuse after cleanup, cross-session forwarding attempts, unauthorized keepalive, expired session forwarding, and same-pair replacement.
+  - crates/rustynet-relay/src/main.rs
+    - Removed duplicate peer-address/session-port authority from the daemon loop.
+    - Forwarding now obeys only the `RelayTransport`-selected target tuple/port.
+    - Added immediate and periodic pruning of inactive allocated sockets so removed sessions lose port attribution before reuse.
+  - crates/rustynet-relay/src/lib.rs
+    - Exported relay forwarding decision/error types used by the hardened daemon loop.
+  - crates/rustynetd/src/relay_client.rs
+    - Added helpers to distinguish expired sessions and selected-endpoint match against the backend.
+  - crates/rustynetd/src/daemon.rs
+    - Tightened `runtime_path_state_summary()` so `relay_active` requires both an authenticated relay session whose effective endpoint matches the currently selected backend endpoint and a fresh backend handshake on that endpoint.
+    - Added runtime tests proving relay stays programmed without proof, becomes live only with selected-endpoint plus fresh handshake, and drops back to unproven when the selected endpoint no longer matches the authenticated relay session.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynet-relay/src/main.rs crates/rustynet-relay/src/transport.rs crates/rustynet-relay/src/session.rs crates/rustynet-relay/src/lib.rs crates/rustynetd/src/relay_client.rs crates/rustynetd/src/daemon.rs`
+  - `cargo check -p rustynet-relay`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynet-relay -- --nocapture`
+  - `cargo test -p rustynetd relay_client::tests -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_relay_ -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay -- --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_gates.sh` (fails in `scripts/ci/fresh_install_os_matrix_release_gate.sh`)
+Live evidence / artifacts:
+  - `artifacts/phase10/source/traversal_path_selection_report.json`
+  - `artifacts/phase10/source/traversal_probe_security_report.json`
+Security invariants verified:
+  - One allocated relay port now maps to exactly one live authorized session at a time.
+  - Source-tuple spoofing, stale tuple reuse after cleanup, unauthorized keepalive, session cross-talk, and expired-session forwarding all fail closed under test.
+  - The relay daemon remains ciphertext-only; no open-proxy or alternate framing path was introduced.
+  - `relay_active` now requires real selected-endpoint consistency plus fresh backend handshake proof; a stored session object or programmed relay endpoint alone is insufficient.
+Residual risks / blockers:
+  - `crates/rustynetd/src/daemon.rs` no longer binds the relay client on a separate socket in `load_relay_client()`, but current production WireGuard backends still expose only opaque OS-managed peer-traffic sockets. A backend-owned multiplexed transport interface is still required before relay establishment can honestly share the authoritative transport identity. That remains open Phase A work and limits completion of Phase C's live-runtime claims.
+  - Fresh live cross-network evidence for commit `06e3e2ed745b4439505991bea775246cde8ed653` is still required before claiming end-to-end relay runtime completion.
+  - `./scripts/ci/phase10_gates.sh` is still blocked outside this slice by stale fresh-install evidence: `artifacts/phase10/fresh_install_os_matrix_report.json` is bound to commit `c86a62a766b8af8382dfa57805aec8b4cad284ff` while `HEAD` is `06e3e2ed745b4439505991bea775246cde8ed653`.
+```
+
+```text
+Date: 2026-03-30
+Phase / Slice: Phase D/E - failover truthfulness and canonical evidence hardening
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Added `daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay`, which proves stale direct handshake proof demotes runtime state back to relay-programmed/unproven instead of retaining a stale `direct_active` claim.
+  - crates/rustynet-cli/src/ops_cross_network_reports.rs
+    - Added suite-specific required pass artifacts for the six canonical cross-network report families.
+    - Extended `path_evidence` parsing/validation to require `path_reason`, healthy traversal/DNS alarm states, and `traversal_error=none` for pass reports.
+    - Added validator tests that reject failback pass reports without measured child artifacts and reject pass reports with critical path alarms.
+  - scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh
+    - Direct pass now requires `rustynet netcheck` to show `path_mode=direct_active`, `path_live_proven=true`, and healthy signed-state alarms.
+  - scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh
+    - Relay pass now requires `path_mode=relay_active`, `path_live_proven=true`, `relay_session_state=live`, and healthy signed-state alarms.
+  - scripts/e2e/live_linux_cross_network_failback_roaming_test.sh
+    - Failback/roam success now records a switch only on fresh live direct proof and only passes final roam recovery when the post-roam path is direct-active/live-proven with healthy signed-state alarms.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/daemon.rs crates/rustynet-cli/src/ops_cross_network_reports.rs`
+  - `bash -n scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh`
+  - `bash -n scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh`
+  - `bash -n scripts/e2e/live_linux_cross_network_failback_roaming_test.sh`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`
+  - `cargo test -p rustynet-cli --bin rustynet-cli validate_report_payload_rejects_failback_pass_without_measured_child_artifacts -- --nocapture`
+  - `cargo test -p rustynet-cli --bin rustynet-cli validate_report_payload_rejects_pass_status_with_critical_path_alarm -- --nocapture`
+  - `cargo test -p rustynet-cli --bin rustynet-cli validate_cross_network_remote_exit_readiness_accepts_complete_canonical_reports -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed because the canonical live reports are absent for the current commit)
+  - `./scripts/ci/phase10_gates.sh` (fails outside this slice in `scripts/ci/fresh_install_os_matrix_release_gate.sh`: stale child report `git_commit` mismatch)
+Live evidence / artifacts:
+  - No fresh live cross-network artifacts were generated in this local session.
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` now fails closed on the missing canonical reports instead of permitting proof-less success:
+    - `artifacts/phase10/cross_network_direct_remote_exit_report.json`
+    - `artifacts/phase10/cross_network_relay_remote_exit_report.json`
+    - `artifacts/phase10/cross_network_failback_roaming_report.json`
+    - `artifacts/phase10/cross_network_traversal_adversarial_report.json`
+    - `artifacts/phase10/cross_network_remote_exit_dns_report.json`
+    - `artifacts/phase10/cross_network_remote_exit_soak_report.json`
+Security invariants verified:
+  - Stale direct liveness proof no longer preserves a direct-active claim under test.
+  - Direct, relay, and failback pass conditions in the live scripts now require live `rustynet netcheck` proof instead of a programmed steady-state snapshot.
+  - Canonical pass reports now require suite-specific measured child artifacts, so a final steady-state report without measured failback/relay/DNS/soak evidence is rejected.
+  - Critical traversal alarms, critical DNS alarms, and non-`none` traversal errors now block pass reports.
+Residual risks / blockers:
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` remains blocked until fresh live-lab runs generate the six canonical cross-network reports for the current commit.
+  - `./scripts/ci/phase10_gates.sh` remains blocked outside this slice because `artifacts/phase10/fresh_install_os_matrix_report.json` is still bound to commit `c86a62a766b8af8382dfa57805aec8b4cad284ff` while `HEAD` is `06e3e2ed745b4439505991bea775246cde8ed653`.
+  - Phase A remains incomplete because STUN candidate gathering and relay establishment are still not tied to the backend transport socket identity; that still limits full end-to-end plug-and-play claims.
+```
+
+```text
+Date: 2026-03-31
+Phase / Slice: Phase A hardening - explicit backend transport-socket blocker enforcement
+Files changed:
+  - crates/rustynet-backend-api/src/lib.rs
+    - Added `TunnelBackend::transport_socket_identity_blocker()` so production backends can explicitly declare when the authoritative peer-traffic socket is backend-owned and opaque to daemon STUN/relay bootstrap.
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Linux and macOS WireGuard backends now report the exact blocker: peer traffic is delegated to an OS-managed WireGuard / `wireguard-go` UDP socket, so daemon-side shared-socket traversal/relay bootstrap needs a backend-owned multiplexed transport interface.
+  - crates/rustynetd/src/relay_client.rs
+    - Added `RelayClient::is_bound()` and kept new clients unbound until an authoritative transport socket is supplied.
+  - crates/rustynetd/src/daemon.rs
+    - Stopped auto-binding a separate relay client UDP socket in `load_relay_client()`.
+    - Stopped starting the production STUN worker when the active backend reports an opaque transport-socket blocker.
+    - Added `transport_socket_identity_state` / `transport_socket_identity_error` diagnostics to status and netcheck.
+    - Added fail-closed runtime handling so a configured relay path reports `blocked_transport_identity` instead of silently treating a second daemon-owned socket as authoritative.
+    - Added `daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap`.
+  - README.md
+    - Reconciled the repo-level transport status text to explain that production WireGuard backends now explicitly block separate-socket STUN/relay bootstrap and still need a backend-owned shared transport interface.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-api/src/lib.rs crates/rustynet-backend-wireguard/src/lib.rs crates/rustynetd/src/relay_client.rs crates/rustynetd/src/daemon.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-api`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap -- --nocapture`
+  - `cargo test -p rustynetd relay_client_new_creates_empty_session_map -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_client_upgrades_relay_candidate_endpoint -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed on the six missing canonical cross-network reports)
+  - `./scripts/ci/phase10_gates.sh` (fails closed on stale `fresh_install_os_matrix_report.json` commit binding)
+Live evidence / artifacts:
+  - No fresh live cross-network artifacts were generated in this local session.
+  - `artifacts/phase10/source/traversal_path_selection_report.json` and `artifacts/phase10/source/traversal_probe_security_report.json` were regenerated by `./scripts/ci/phase10_hp2_gates.sh`.
+Security invariants verified:
+  - Production WireGuard backends no longer let the daemon infer authority from a second UDP socket for STUN or relay bootstrap.
+  - Relay runtime truthfulness remains proof-based: `relay_active` still requires authenticated session consistency plus fresh backend handshake evidence.
+  - When the authoritative backend transport socket is unavailable to the daemon, runtime status now reports that blocker explicitly and the configured relay path fails closed instead of bootstrapping on a separate socket.
+Residual risks / blockers:
+  - This slice does not create the missing backend-owned shared transport interface; Phase A remains incomplete until a backend can safely multiplex peer traffic, STUN, and relay control on the same authoritative transport identity.
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` still fails only because the six canonical live cross-network reports are absent for `06e3e2ed745b4439505991bea775246cde8ed653`.
+  - `./scripts/ci/phase10_gates.sh` still fails only because `artifacts/phase10/fresh_install_os_matrix_report.json` is commit-stale (`c86a62a766b8af8382dfa57805aec8b4cad284ff` vs `06e3e2ed745b4439505991bea775246cde8ed653`).
+```
+
+```text
+Date: 2026-03-31
+Phase / Slice: Pre-live-lab hardening - gate regression cleanup and validation
+Files changed:
+  - crates/rustynet-backend-api/src/lib.rs
+    - Tightened the transport-identity blocker contract so a same-local-port daemon side socket is explicitly rejected as non-authoritative.
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Updated Linux/macOS blocker text and tests to match the stricter authoritative-transport rule.
+  - crates/rustynetd/src/daemon.rs
+    - Fixed traversal rejection-counter fixture timing so replay/freshness accounting stays deterministic under long serial gate runs.
+  - crates/rustynetd/src/relay_client.rs
+    - Tightened relay-client binding semantics so `local_port` remains a hint only and never implies authoritative transport identity.
+  - crates/rustynetd/src/stun_client.rs
+    - Reworked the provided-socket STUN identity test to use a scripted socket instead of sandbox-sensitive loopback binds.
+  - crates/rustynetd/src/resilience.rs
+    - Replaced the fixed 500 ms snapshot lock budget with a deadline-based wait window and added a lock-contention regression test.
+  - README.md
+    - Reconciled repo-level transport status text with the stricter same-port/non-authoritative rule.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-api/src/lib.rs crates/rustynet-backend-wireguard/src/lib.rs crates/rustynetd/src/daemon.rs crates/rustynetd/src/relay_client.rs crates/rustynetd/src/stun_client.rs crates/rustynetd/src/resilience.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-api`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynet-backend-wireguard transport_socket_identity_blocker -- --nocapture`
+  - `cargo test -p rustynetd stun_client::tests::test_gather_mapped_endpoints_uses_provided_socket_identity -- --exact --nocapture`
+  - `RUST_TEST_THREADS=1 cargo test -p rustynetd stun_client::tests::test_gather_mapped_endpoints_uses_provided_socket_identity -- --exact --nocapture`
+  - `cargo test -p rustynetd daemon::tests::daemon_runtime_traversal_rejection_counters_increment_for_stale_replay_and_future_dated -- --exact --nocapture`
+  - `cargo test -p rustynetd resilience::tests::concurrent_persist_keeps_snapshot_integrity -- --exact --nocapture`
+  - `RUST_TEST_THREADS=1 cargo test -p rustynetd resilience::tests::concurrent_persist_keeps_snapshot_integrity -- --exact --nocapture`
+  - `cargo test -p rustynetd resilience::tests::persist_waits_for_brief_lock_contention -- --exact --nocapture`
+  - `RUST_TEST_THREADS=1 cargo test -p rustynetd resilience::tests::persist_waits_for_brief_lock_contention -- --exact --nocapture`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo check --workspace --all-targets --all-features`
+  - `cargo test --workspace --all-targets --all-features`
+  - `cargo audit --deny warnings`
+  - `cargo deny check bans licenses sources advisories`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed on the six missing canonical reports)
+  - `./scripts/ci/phase10_gates.sh` (fails closed on stale `fresh_install_os_matrix_report.json` commit binding)
+  - `./scripts/ci/membership_gates.sh` rerun advanced past the previous hidden `phase8`/STUN/resilience regressions and through the repeated workspace validation stack; the remaining blocker is inherited Phase 10 evidence gating, validated separately via `./scripts/ci/phase10_gates.sh`
+Artifacts / evidence:
+  - No fresh live cross-network artifacts were generated in this slice.
+  - `artifacts/phase10/source/traversal_path_selection_report.json` and `artifacts/phase10/source/traversal_probe_security_report.json` were regenerated by `./scripts/ci/phase10_hp2_gates.sh`.
+Security invariants verified:
+  - Production runtime still fails closed when the authoritative backend transport socket is opaque to the daemon.
+  - A daemon-owned second socket, including one bound to the same local port, is never treated as authoritative transport identity.
+  - Direct and relay truthfulness semantics remain proof-based while the new gate fixes remove false negatives rather than softening enforcement.
+Residual risks / blockers:
+  - The backend-owned shared transport interface is still not implemented; STUN gathering and relay establishment remain architecture-blocked in production backends.
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` still fails only because the six canonical live cross-network reports are absent for `06e3e2ed745b4439505991bea775246cde8ed653`.
+  - `./scripts/ci/phase10_gates.sh` still fails only because `artifacts/phase10/fresh_install_os_matrix_report.json` is commit-stale (`c86a62a766b8af8382dfa57805aec8b4cad284ff` vs `06e3e2ed745b4439505991bea775246cde8ed653`).
+  - `./scripts/ci/membership_gates.sh` no longer reproduces the earlier hidden runtime/test regressions, but because it delegates into the same Phase 10 CI path its remaining red state is the inherited stale fresh-install evidence blocker until that artifact is regenerated honestly.
+```
+
+### 18.3 Final Audited Artifact and Gate State
+- Current `HEAD`: `06e3e2ed745b4439505991bea775246cde8ed653`
+- Canonical cross-network report artifact expectation and current state:
+  - `artifacts/phase10/cross_network_direct_remote_exit_report.json`: missing
+  - `artifacts/phase10/cross_network_relay_remote_exit_report.json`: missing
+  - `artifacts/phase10/cross_network_failback_roaming_report.json`: missing
+  - `artifacts/phase10/cross_network_traversal_adversarial_report.json`: missing
+  - `artifacts/phase10/cross_network_remote_exit_dns_report.json`: missing
+  - `artifacts/phase10/cross_network_remote_exit_soak_report.json`: missing
+- Non-canonical cross-network artifacts currently present under `artifacts/phase10`:
+  - `cross_network_direct_remote_exit_report_64_to_18.json`
+  - `cross_network_remote_exit_schema_validation.md`
+  - These do not satisfy the canonical gate contract and are intentionally ignored by the canonical report collector.
+- Fresh-install matrix artifact state:
+  - `artifacts/phase10/fresh_install_os_matrix_report.json`: present
+  - embedded `git_commit`: `c86a62a766b8af8382dfa57805aec8b4cad284ff`
+  - current `HEAD`: `06e3e2ed745b4439505991bea775246cde8ed653`
+  - result: stale and correctly rejected by `./scripts/ci/phase10_gates.sh`
+- Gate outcomes re-verified on 2026-03-31:
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass
+  - `cargo check --workspace --all-targets --all-features`: pass
+  - `cargo test --workspace --all-targets --all-features`: pass
+  - `cargo audit --deny warnings`: pass
+  - `cargo deny check bans licenses sources advisories`: pass
+  - `./scripts/ci/phase10_hp2_gates.sh`: pass
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh`: fail closed on the six missing canonical reports
+  - `./scripts/ci/phase10_gates.sh`: fail closed on stale `fresh_install_os_matrix_report.json` commit binding
+  - `./scripts/ci/membership_gates.sh`: the prior hidden runtime/test failures are cleared; remaining red state is inherited from the same stale Phase 10 fresh-install evidence gate
+- Final honest closeout status:
+  - The validator and gate path now matches the strict product claim surface: missing or stale evidence stays red, production backends do not bootstrap STUN or relay on a second daemon-owned socket, and the earlier hidden single-thread gate regressions have been removed.
+  - This plan is not complete. Remaining prerequisites are a backend-owned shared transport capability that includes authoritative packet-I/O or a backend-owned datagram multiplexer, fresh commit-bound live cross-network artifacts, and a fresh-install matrix report for the current commit.
+
+```text
+Date: 2026-03-31
+Phase / Slice: Pre-live-lab backend-mode plumbing and membership gate regression cleanup
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Added explicit `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` backend modes, precise fail-closed blocker text, and config/runtime validation that rejects those modes until a production transport-owning backend exists.
+  - crates/rustynetd/src/main.rs
+    - Added daemon CLI parsing/help coverage for the new backend mode values.
+  - start.sh
+    - Updated host-profile enforcement so Linux/macOS accept either the existing command-only mode or the matching non-default `*-userspace-shared` mode name without silently rewriting it.
+  - crates/rustynet-cli/src/main.rs
+    - Fixed the VM-lab module path so the inherited `membership_gates.sh` compile blocker no longer hides the real pre-live validation state.
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Applied narrow clippy-driven cleanups so the VM-lab code no longer fails the membership gate workspace lint path.
+  - README.md
+    - Reconciled the repo-level transport status text to mention the explicit non-default backend mode names and their current fail-closed blocker status.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/vm_lab/mod.rs crates/rustynetd/src/main.rs crates/rustynetd/src/daemon.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynetd`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo clippy -p rustynet-cli --bin rustynet-cli -- -D warnings`
+  - `cargo test -p rustynetd validate_daemon_config_rejects_linux_userspace_shared_backend_with_precise_blocker -- --nocapture`
+  - `cargo test -p rustynetd validate_daemon_config_rejects_macos_userspace_shared_backend_with_precise_blocker -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker -- --nocapture`
+  - `cargo test -p rustynetd parse_daemon_config_accepts_userspace_shared_backend_values -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed on the six missing canonical live cross-network reports)
+  - `./scripts/ci/phase10_gates.sh` (fails closed on stale `artifacts/phase10/fresh_install_os_matrix_report.json` commit binding)
+  - `./scripts/ci/membership_gates.sh` rerun advanced through the previous missing-module/clippy blockers and through the full workspace lint/check/test stack; because [crates/rustynet-cli/src/ops_ci_release_perf.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_ci_release_perf.rs) delegates the tail of that gate into the same Phase 10 readiness path, its remaining red state is the separately verified stale fresh-install evidence blocker rather than the old CLI regression.
+Artifacts / evidence:
+  - No new live cross-network artifacts were generated in this slice.
+  - `artifacts/phase10/source/traversal_path_selection_report.json` and `artifacts/phase10/source/traversal_probe_security_report.json` were regenerated by `./scripts/ci/phase10_hp2_gates.sh`.
+Security invariants verified:
+  - Explicit `*-userspace-shared` mode names do not widen capability claims; production runtime still fails closed until a transport-owning backend exists.
+  - Host-profile/start parsing now preserves an explicitly selected non-default backend mode instead of silently rejecting or rewriting it.
+  - The prior membership gate failure was a real CLI/module-path regression and is now removed without weakening any traversal, relay, or evidence gates.
+Residual risks / blockers:
+  - The actual production transport-owning backend runtime is still absent; the new mode names remain intentionally blocked.
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` still fails only because the six canonical live cross-network reports are absent for `06e3e2ed745b4439505991bea775246cde8ed653`.
+  - `./scripts/ci/phase10_gates.sh` still fails only because `artifacts/phase10/fresh_install_os_matrix_report.json` is commit-stale (`c86a62a766b8af8382dfa57805aec8b4cad284ff` vs `06e3e2ed745b4439505991bea775246cde8ed653`).
+```
+
+```text
+Date: 2026-03-31
+Phase / Slice: Shared-transport authoritative backend contract implementation and post-fix validation
+Files changed:
+  - crates/rustynet-backend-api/src/lib.rs
+    - Added an explicit backend-owned authoritative shared-transport contract for identity, round-trip operations, and one-way sends so STUN and relay control no longer have to infer authority from daemon-owned sockets.
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Implemented the authoritative shared-transport contract for the in-memory backend, added operation recording/script hooks, and kept production Linux/macOS backends fail-closed behind the existing opaque-socket blocker.
+  - crates/rustynetd/src/phase10.rs
+    - Threaded the backend-owned authoritative shared-transport contract through the controller surface without leaking backend-specific types into transport-agnostic layers.
+  - crates/rustynetd/src/stun_client.rs
+    - Added authoritative round-trip STUN gathering so candidate publication and diagnostics can consume measured tuples from the backend-owned transport path.
+  - crates/rustynetd/src/relay_client.rs
+    - Added authoritative relay establish/keepalive APIs and restored the scripted test path so test-only relay establishment does not require a bound socket.
+  - crates/rustynetd/src/daemon.rs
+    - Replaced daemon-owned STUN worker socket assumptions with backend-owned authoritative transport refresh, routed relay hello/refresh/keepalive through the same contract, exposed transport-identity diagnostics, and fixed the endpoint-mismatch regression test so it exercises the intended selected-endpoint branch with authoritative transport present.
+  - README.md
+    - Reconciled the repo-level transport status paragraph to state that the daemon now consumes an explicit backend-owned shared-transport contract when available, while production command-only WireGuard modes remain architecture-blocked.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Updated Phase A and Phase C checklist text plus this evidence ledger entry to match the implemented contract and the remaining production/backend blockers honestly.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/relay_client.rs crates/rustynetd/src/daemon.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-api`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynet-backend-wireguard authoritative_transport -- --nocapture`
+  - `cargo test -p rustynetd authoritative_stun_refresh_uses_backend_shared_transport_identity -- --nocapture`
+  - `cargo test -p rustynetd relay_establish_and_keepalive_use_backend_shared_transport_identity -- --nocapture`
+  - `cargo test -p rustynetd relay_client_establish_session_with_round_trip_uses_provided_transport -- --nocapture`
+  - `cargo test -p rustynetd relay_client_send_keepalive_with_sender_uses_allocated_port -- --nocapture`
+  - `cargo test -p rustynetd test_gather_mapped_endpoints_with_round_trip_uses_authoritative_local_addr -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_transport_socket_identity_blocker_rejects_bound_relay_side_socket -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_is_programmed_but_not_live_without_fresh_handshake -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`
+  - `cargo test -p rustynetd relay_client_scripted_establish_session_success -- --nocapture`
+  - `cargo test -p rustynetd relay_client_scripted_establish_session_failure_then_success -- --nocapture`
+  - `cargo test -p rustynetd relay_client_close_session_removes_from_map -- --nocapture`
+  - `cargo test -p rustynetd --lib`
+  - `cargo check --workspace --all-targets --all-features`
+  - `cargo test --workspace --all-targets --all-features`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo audit --deny warnings`
+  - `cargo deny check bans licenses sources advisories`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed only on the six missing canonical live cross-network reports)
+  - `cargo run --quiet -p rustynet-cli --bin phase10_gates --` (fails closed only on stale fresh-install matrix child-commit evidence for current `HEAD`)
+  - `./scripts/ci/membership_gates.sh` (fails after the shared-transport/runtime checks stay green because the current CLI tree has unrelated `OpsCommand::VmLabSyncBootstrap` / `VmLabWriteLiveLabProfile` / `VmLabRunLiveLab` variants that are not yet handled exhaustively in [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs))
+Artifacts / evidence:
+  - No new live cross-network artifacts were generated in this slice.
+  - `./scripts/ci/phase10_hp2_gates.sh` now passes with the shared-transport-backed traversal/relay non-live contract in place.
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` still fails only because the six canonical cross-network reports are absent for current `HEAD`.
+  - `cargo run --quiet -p rustynet-cli --bin phase10_gates --` still fails only because the fresh-install readiness fixture detects stale child-report commit binding.
+Security invariants verified:
+  - STUN round trips now use an explicit backend-owned authoritative transport contract when a backend exposes one; the daemon no longer treats a second daemon-owned socket as authoritative transport identity.
+  - Relay hello/refresh and keepalive now use that same backend-owned authoritative transport contract when available; same-local-port side sockets are still rejected as non-authoritative.
+  - Production Linux/macOS WireGuard adapters remain fail-closed and truthfully blocked because they are still command-only wrappers over OS-managed peer sockets without authoritative packet I/O or a backend-owned datagram multiplexer.
+  - `direct_active` and `relay_active` semantics remain proof-based: relay liveness still requires authenticated session/selected-endpoint consistency plus fresh backend handshake evidence.
+Residual risks / blockers:
+  - This slice does not create a production backend mode that owns peer datagrams; the in-memory/test backend proves the contract, but production Linux/macOS command-only modes remain architecture-blocked and intentionally fail closed.
+  - Fresh live cross-network evidence and fresh-install matrix evidence for current `HEAD` remain separate release blockers.
+  - `./scripts/ci/membership_gates.sh` is currently blocked by an unrelated CLI compile regression in [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs) around new VM-lab `OpsCommand` variants; that blocker is outside this shared-transport write slice and does not come from the shared-transport runtime changes above.
+```
+
+```text
+Date: 2026-03-31
+Phase / Slice: Shared-transport architecture audit - precise backend blocker reconciliation
+Files changed:
+  - crates/rustynet-backend-api/src/lib.rs
+    - Tightened the transport-socket blocker contract to state that a safe shared-transport solution needs backend-owned packet I/O or a backend-owned datagram multiplexer, not just a second socket on the same local port.
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Tightened Linux/macOS blocker strings and tests to record the real architecture limit precisely: current production adapters are command-only wrappers over OS-managed peer sockets and do not expose authoritative packet I/O or multiplexed datagram transport.
+  - README.md
+    - Reconciled the repo-level transport status text to match the stricter architecture finding.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Updated the Phase A blocker text and final closeout status to describe the exact shared-transport prerequisite honestly.
+Tests and gates run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-api/src/lib.rs crates/rustynet-backend-wireguard/src/lib.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-api`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard transport_socket_identity_blocker -- --nocapture`
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed only on the six missing canonical live reports)
+  - `./scripts/ci/phase10_gates.sh` (fails closed only on stale `artifacts/phase10/fresh_install_os_matrix_report.json` commit binding)
+Artifacts / evidence:
+  - No new live artifacts were generated in this slice.
+Security invariants verified:
+  - The repository now records the remaining shared-transport blocker precisely enough that same-port side sockets, command-runner shims, and other pseudo-authority paths are explicitly out of bounds.
+  - Production runtime behavior remains fail-closed: no second daemon-owned socket is treated as authoritative for STUN or relay bootstrap.
+Residual risks / blockers:
+  - This slice does not implement the missing backend-owned datagram multiplexer or equivalent authoritative packet-I/O capability; Linux kernel WireGuard and macOS `wireguard-go` remain command-only/OS-managed in the current architecture.
+  - Fresh live cross-network artifacts and the stale fresh-install matrix artifact remain separate evidence blockers.
+```
+
+```text
+Date: 2026-03-31
+Phase / Slice: Production transport-owning backend plan - Phase 1 crate restructure and dependency introduction
+Files changed:
+  - Cargo.lock
+    - Locked the newly introduced released userspace-backend dependencies and their transitive graph for the current tree.
+  - crates/rustynet-backend-wireguard/Cargo.toml
+    - Added released pinned dependencies `boringtun = "0.7.0"` and `tun-rs = "2.8.2"` for the future userspace-shared backend implementation.
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Kept the crate root as a stable module boundary with public re-exports for the existing in-memory and command-only backend types.
+  - crates/rustynet-backend-wireguard/src/in_memory.rs
+    - Preserved the in-memory backend implementation and tests under its own module without widening product claims.
+  - crates/rustynet-backend-wireguard/src/linux_command.rs
+    - Preserved the Linux command-only backend implementation and blocker behavior under its own module.
+  - crates/rustynet-backend-wireguard/src/macos_command.rs
+    - Preserved the macOS command-only backend implementation and blocker behavior under its own module.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Added the Phase 1 userspace-shared module boundary root with test-backed ownership scaffolding for future Linux/macOS shared backend modes.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Added the Phase 1 runtime ownership boundary scaffold for a single backend-owned worker.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs
+    - Added the Phase 1 authoritative socket boundary scaffold expressing single-owner transport and one outstanding round-trip at a time.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs
+    - Added the Phase 1 userspace WireGuard engine boundary scaffold without exposing backend-internal engine types outside the backend crate.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs
+    - Added the Phase 1 TUN lifecycle boundary scaffold, including the rule that helper-assisted setup must not become helper-owned runtime datapath.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs
+    - Added the Phase 1 authenticated handshake telemetry boundary scaffold so later phases keep handshake freshness sourced from userspace-engine evidence only.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 1 complete with exact validation and remaining-open scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/lib.rs crates/rustynet-backend-wireguard/src/in_memory.rs crates/rustynet-backend-wireguard/src/linux_command.rs crates/rustynet-backend-wireguard/src/macos_command.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs crates/rustynet-backend-wireguard/tests/conformance.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+  - backend crate unit tests: 20 passed
+  - backend crate conformance tests: 3 passed
+Security invariants verified:
+  - Phase 1 does not introduce a fake userspace backend or widen any product/runtime claim.
+  - Linux and macOS production command-only backends remain fail-closed and continue to report blocker behavior unchanged.
+  - The future shared-backend module tree now records the intended single-owner runtime, authoritative socket, TUN, engine, and handshake boundaries without adding a second transport-authority path.
+  - The future shared-backend boundary tests explicitly reject fallback-by-shape design drift such as command-backend fallback or helper-owned runtime datapath.
+What Phase 1 completed:
+  - backend crate restructure into intentional modules
+  - released dependency introduction for the future userspace-shared backend
+  - preserved current behavior for in-memory/Linux/macOS backends
+What remains for Phase 2:
+  - build the real Linux userspace-shared runtime worker
+  - own the authoritative UDP socket
+  - start/stop resource lifecycle
+  - authoritative identity only after successful start
+  - no hidden fallback on partial startup failure
+Residual risks / blockers:
+  - This slice does not implement a transport-owning backend yet; it only prepares the crate and dependency substrate for that work.
+  - macOS shared-backend parity remains intentionally unclaimed.
+  - Live cross-network evidence and fresh-install matrix evidence remain separate blockers outside this Phase 1 slice.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 2 Linux userspace-shared runtime skeleton
+Files changed:
+  - crates/rustynet-backend-wireguard/src/lib.rs
+    - Re-exported the new Linux userspace-shared backend type without changing daemon wiring or default backend behavior.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Replaced the Phase 1 scaffold root with a real `LinuxUserspaceSharedBackend` implementation that validates inputs, binds runtime startup/shutdown to a worker-owned resource model, exposes authoritative transport identity only while running, and keeps later-phase workflows fail-closed.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Implemented the single-owner runtime worker, explicit request/reply control path, worker-owned transport/peer/handshake containers, ready handshake, and deterministic shutdown/join behavior.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs
+    - Implemented the real authoritative UDP socket binder and local-address identity reporting for the configured listen port.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs
+    - Implemented the real `boringtun`-backed key-material wrapper that reads the configured private key and owns the future peer engine state container inside the backend crate.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs
+    - Replaced the scaffold with the owned handshake telemetry container required for later authenticated handshake evidence.
+  - crates/rustynet-backend-wireguard/tests/conformance.rs
+    - Added lifecycle coverage for the new Linux userspace-shared backend and explicit regression checks that the command-only Linux/macOS blocker strings remain unchanged.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 2 complete with exact validation outcomes and Phase 3 remaining-open scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/lib.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs crates/rustynet-backend-wireguard/tests/conformance.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `CARGO_TARGET_DIR=/tmp/rustynet-phase2-target-escalated cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `CARGO_TARGET_DIR=/tmp/rustynet-phase2-check cargo check -p rustynet-backend-wireguard`
+Validation outcomes:
+  - `rustfmt --edition 2024 ...`: pass
+  - `cargo fmt --all -- --check`: fails on unrelated pre-existing formatting drift in [mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/vm_lab/mod.rs)
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - sandboxed `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: blocked by sandbox `EPERM` on real UDP socket binds
+  - unsandboxed backend-only rerun with isolated target dir: pass
+  - final isolated-target backend `cargo check`: pass
+  - backend crate unit tests: 22 passed
+  - backend crate conformance tests: 6 passed
+Security invariants verified:
+  - The new Linux userspace-shared backend owns a real authoritative UDP socket and exposes its identity only after successful start; no daemon-owned or helper-owned side socket was introduced.
+  - The runtime worker is the single owner of the authoritative socket, peer engine container, endpoint table, outstanding round-trip container, and handshake telemetry container; the public backend object does not duplicate transport ownership.
+  - Startup failure after socket bind but before full runtime readiness rolls back cleanly and releases the port with no hidden fallback to command-only mode.
+  - Later-phase transport-sensitive methods still fail closed with precise errors rather than pretending to provide STUN, relay, peer ciphertext, TUN, or handshake liveness features that Phase 2 does not implement.
+What Phase 2 completed:
+  - real `linux-wireguard-userspace-shared` backend type inside the backend crate
+  - real authoritative UDP socket binding on `start(...)`
+  - real worker thread plus request/reply control path
+  - authoritative transport identity only after successful start
+  - deterministic shutdown and partial-start rollback
+  - unchanged fail-closed blocker behavior for command-only Linux/macOS backends
+What remains for Phase 3:
+  - authoritative transport round-trip/send implementation on the same socket
+  - one-outstanding-round-trip enforcement and peer-endpoint rejection
+  - same-socket STUN and relay control proof
+Residual risks / blockers:
+  - This slice does not yet wire STUN, relay control, peer ciphertext, TUN datapath, or authenticated handshake advancement into the new backend; those remain later phases.
+  - Daemon/start/install selection surfaces are still intentionally untouched in this slice, so product/runtime behavior remains unchanged and the new mode is not yet selectable end-to-end.
+  - The untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits non-blocking dead-code warnings until the real TUN phase lands.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 3 same-socket STUN and relay control
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Replaced the earlier Phase 2 fail-closed authoritative round-trip/send stubs with real delegation into the userspace-shared runtime and added backend-slice tests for STUN, relay, concurrency, target rejection, timeout cleanup, and transport-generation proof.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Implemented real authoritative round-trip/send runtime messages, single in-flight generic round-trip enforcement, configured-peer target rejection, same-socket response demultiplexing, peer-path ingress routing for all non-round-trip datagrams, authoritative transport-generation recording, and waiter cleanup on timeout/shutdown/worker exit.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs
+    - Added authoritative socket send/receive helpers plus a monotonic authoritative transport-generation token so tests can prove same-socket identity without relying on same-port inference.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs
+    - Added conservative peer ciphertext ingress accounting at the engine boundary so non-round-trip datagrams are not dropped and the backend can prove they used the same authoritative transport generation as STUN and relay control.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 3 complete with exact validation results and remaining Phase 4 scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_establish_and_keepalive_use_backend_shared_transport_identity -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+  - backend crate unit tests: 30 passed
+  - backend crate conformance tests: 6 passed
+  - targeted daemon authoritative-transport compatibility tests: 4 passed
+  - non-blocking warning only: untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits dead-code warnings because the TUN phase remains intentionally open
+Security invariants verified:
+  - STUN round trips, relay hello/refresh round trips, relay keepalive sends, and peer ciphertext ingress accounting all use the same backend-owned authoritative socket generation rather than a daemon-owned or same-port side socket.
+  - The runtime worker remains the sole owner of authoritative socket state, peer engine state, endpoint state, outstanding generic round-trip state, and handshake telemetry state.
+  - Only one generic authoritative round trip is allowed at a time; concurrent attempts are rejected fail-closed.
+  - Generic authoritative round trips that target configured peer endpoints are rejected fail-closed to avoid ambiguity with peer ciphertext.
+  - Timed-out or canceled round trips do not leave stale waiter attribution behind; late packets fall through to peer-path accounting instead of satisfying an old waiter.
+  - Command-only Linux/macOS backends remain unchanged and still report precise blocker behavior.
+What Phase 3 completed:
+  - authoritative round-trip support on the Linux userspace-shared backend
+  - authoritative one-way send support on the same backend-owned socket
+  - strict one-outstanding-generic-round-trip enforcement
+  - configured-peer-endpoint rejection for generic round trips
+  - same-transport-generation proof across STUN, relay control, relay keepalive, and peer-path ingress accounting
+What remains for Phase 4:
+  - authenticated userspace-engine handshake truth
+  - full peer ciphertext engine integration beyond conservative ingress accounting
+  - TUN datapath ownership and later daemon/install/start selection work
+Residual risks / blockers:
+  - This slice does not yet provide authenticated handshake timestamps, full peer ciphertext datapath parity, or TUN lifecycle ownership; `direct_active` and `relay_active` truthfulness still depend on later phases.
+  - Daemon/start/install selection surfaces remain intentionally untouched, so the new Linux userspace-shared backend is still not selectable end-to-end.
+  - macOS userspace-shared parity remains unimplemented and unclaimed.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 6 simulated proof and pre-live-lab validation
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Added test-only recording of real peer-ciphertext egress on the authoritative socket so the proof bundle can assert the actual authoritative transport generation used by the peer path rather than inferring from receive-side coincidence.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Added the local multi-peer simulated proof test showing one Linux userspace-shared backend instance using the same authoritative transport generation for peer ciphertext, STUN round trip, relay round trip, and relay keepalive, and added the stronger restart/rollover regression that cancels stale round-trip state across same-port socket-generation rollover.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 6 complete with exact validation outcomes and Phase 7 remaining-open scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+  - backend crate unit tests: 42 passed
+  - backend crate conformance tests: 6 passed
+  - targeted daemon validation: intentionally not rerun because no daemon code changed in this slice
+Security invariants verified:
+  - The authoritative transport proof is now generation-level rather than local-address-only, so same-port coincidence is not treated as authority.
+  - One Linux userspace-shared backend instance now has local simulated proof that peer ciphertext, STUN, relay round trip, and relay keepalive all traverse the same authoritative transport generation on the production backend path.
+  - Restart on the same local port advances the authoritative transport generation, cancels stale in-flight round-trip state, and prevents late packets from the old socket generation from satisfying stale waiters.
+  - Existing fail-closed negative coverage remains intact for no identity before start, no identity after shutdown, concurrent round-trip rejection, round-trip-to-peer-endpoint rejection, no handshake from programmed state, and command-only backend blockers.
+What Phase 6 completed:
+  - local multi-peer simulated same-generation proof for peer ciphertext, STUN, and relay control on the production Linux userspace-shared backend path
+  - explicit negative proof that same-port-after-restart is a different authoritative socket generation
+  - explicit negative proof that transport-generation rollover invalidates stale round-trip state
+  - preservation of truthful, conservative product claims while strengthening pre-lab confidence
+What remains for Phase 7:
+  - the broader regression stack and targeted daemon/backend/workspace validation required by Phase 7
+  - CI gate execution
+  - later live-lab evidence generation and artifact refresh
+Residual risks / blockers:
+  - The new Linux userspace-shared backend now has strong local simulated proof, but the final Phase 7 regression/gate pass still needs to confirm no broader workspace regressions remain.
+  - No live evidence or artifact refresh was attempted in this slice, so repo-level completion claims remain intentionally conservative.
+  - macOS userspace-shared parity remains unimplemented and unclaimed.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 5 TUN lifecycle, helper boundary, and selection surfaces
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs
+    - Replaced the Phase 1 scaffold with a real Linux TUN lifecycle abstraction, including direct backend-owned setup, helper-assisted host setup, deterministic cleanup, and test hooks that prove TUN ownership transfer and rollback without introducing a helper-owned datapath.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Wired the Linux userspace-shared backend through the new TUN lifecycle, kept startup fail-closed on TUN/socket/runtime failure, added deterministic shutdown cleanup, and expanded backend tests for TUN failure, rollback, authoritative transport state, and no silent downgrade.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Made the runtime worker the long-lived owner of the opened TUN device in addition to the authoritative socket, engine state, endpoint table, round-trip state, and handshake telemetry.
+  - crates/rustynet-backend-wireguard/tests/conformance.rs
+    - Updated the userspace-shared conformance path to use the test TUN lifecycle while preserving the command-only blocker coverage.
+  - crates/rustynetd/src/daemon.rs
+    - Replaced the old Linux userspace-shared blocker path with real backend construction on Linux, honest config validation, no-silent-downgrade startup behavior, and targeted runtime/status tests for authoritative backend shared transport reporting.
+  - crates/rustynetd/src/privileged_helper.rs
+    - Added the narrow `ip tuntap add dev <iface> mode tun user <uid> group <gid>` validation path required for helper-assisted Linux TUN creation.
+  - crates/rustynet-cli/src/ops_install_systemd.rs
+    - Added a service-template regression test that preserves explicit backend mode selection and verifies `/dev/net/tun` access remains present in the generated systemd unit.
+  - scripts/systemd/rustynetd.service
+    - Preserved `RUSTYNET_BACKEND` passthrough while adding explicit `/dev/net/tun` access for the daemon service template without changing the default backend.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 5 complete with exact validation outcomes and Phase 6 remaining-open scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/tests/conformance.rs crates/rustynetd/src/daemon.rs crates/rustynetd/src/privileged_helper.rs crates/rustynet-cli/src/ops_install_systemd.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo check -p rustynetd`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo test -p rustynetd validate_daemon_config_accepts_linux_userspace_shared_backend -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture`
+  - `cargo test -p rustynet-cli --bin rustynet-cli rustynetd_service_template_preserves_backend_env_and_tun_device_access -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo check -p rustynetd`: pass
+  - `cargo check -p rustynet-cli --bin rustynet-cli`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+  - backend crate unit tests: 40 passed
+  - backend crate conformance tests: 6 passed
+  - targeted daemon construction/status/blocker tests: 3 passed
+  - targeted CLI service-template regression test: pass
+Security invariants verified:
+  - The backend runtime, not the daemon or helper, is now the long-lived owner of the TUN handle, authoritative UDP socket, userspace WireGuard engine state, endpoint table, round-trip state, and handshake telemetry.
+  - Helper involvement remains narrow and host-setup only; the helper never owns long-lived packet forwarding, authoritative transport identity, STUN/relay control traffic, or the userspace engine.
+  - TUN setup or later startup failure tears down partial state deterministically and never silently downgrades to the command-only backend.
+  - Explicit `linux-wireguard-userspace-shared` selection now survives daemon/config/install/start/systemd surfaces unchanged while Linux/macOS default backend selection remains `linux-wireguard` and `macos-wireguard`.
+  - Command-only Linux/macOS backends remain unchanged and continue to fail closed on authoritative transport identity.
+  - Unsupported capability claims, including `auto_port_forward_exit`, remain unchanged and unclaimed for the userspace-shared backend.
+What Phase 5 completed:
+  - real Linux TUN lifecycle support for the userspace-shared backend
+  - helper-assisted host setup without helper-owned datapath or authority
+  - end-to-end explicit mode selection for `linux-wireguard-userspace-shared` across daemon/config/install/start/systemd surfaces
+  - authoritative backend shared transport status reporting for the real Linux userspace-shared backend
+  - deterministic startup rollback and shutdown cleanup with no silent downgrade
+What remains for Phase 6:
+  - simulated multi-peer proof that peer ciphertext, STUN, relay round trips, and relay keepalive all share the same authoritative transport generation on the production Linux backend path
+  - integrated negative proof for same-port-new-socket rejection, transport-generation rollover cleanup, and stale-handshake invalidation on the production Linux backend path
+  - later full regression, gate, and live-evidence work
+Residual risks / blockers:
+  - The new Linux userspace-shared backend is now selectable, but the Phase 6 simulated-proof bundle still needs to prove the full same-generation invariant end-to-end before final completion claims are justified.
+  - macOS userspace-shared parity remains unimplemented and unclaimed.
+  - README and repo-level completion claims remain intentionally conservative until later proof, gate, and live-evidence phases land.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 4 userspace engine integration and handshake telemetry
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs
+    - Replaced the Phase 3 ingress-only engine boundary with real per-peer `boringtun::noise::Tunn` ownership, endpoint/allowed-IP matching, inbound ciphertext decapsulation, outbound plaintext encapsulation from the backend-internal test boundary, authenticated handshake observation extraction, and honest byte accounting.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs
+    - Tightened handshake telemetry so it records monotonic per-peer timestamps only from authenticated engine evidence and clears that state on peer replacement or removal.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Wired runtime-owned peer state, endpoint mutation, authenticated handshake propagation, honest peer/stats queries, and the backend-internal plaintext injection path into the single-owner worker without weakening Phase 3 authoritative socket behavior.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Added Phase 4 backend tests for authenticated handshake advancement, negative handshake cases, peer replacement/removal, honest endpoint reporting, honest stats, and restart freshness reset.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Marked Phase 4 complete with exact validation outcomes and Phase 5 remaining-open scope.
+Tests and validation run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+  - backend crate unit tests: 38 passed
+  - backend crate conformance tests: 6 passed
+  - targeted daemon truthfulness regression tests: 4 passed
+Security invariants verified:
+  - The runtime worker remains the sole owner of authoritative socket state, per-peer userspace engine state, endpoint state, round-trip state, and handshake telemetry.
+  - Authenticated handshake freshness now advances only from userspace-engine evidence; configuration changes, endpoint programming, STUN traffic, relay control traffic, and backend startup do not fabricate handshake proof.
+  - Phase 3 same-socket authoritative transport behavior remains intact while peer ciphertext and plaintext test-boundary traffic now traverse the same backend-owned engine/runtime boundary.
+  - Peer removal and peer replacement clear prior handshake telemetry so stale authenticated state is not preserved across runtime-owned peer mutations or backend restart.
+  - Stats and current-endpoint queries report runtime-owned state honestly and do not overclaim relay or live-path facts.
+What Phase 4 completed:
+  - runtime-owned per-peer userspace WireGuard engine state
+  - authenticated handshake telemetry sourced from engine evidence only
+  - honest `configure_peer(...)`, `update_peer_endpoint(...)`, `current_peer_endpoint(...)`, `peer_latest_handshake_unix(...)`, `remove_peer(...)`, and `stats(...)` behavior on the Linux userspace-shared backend
+  - backend-internal plaintext-to-ciphertext proof path without widening host TUN or daemon mode-selection claims
+What remains for Phase 5:
+  - host TUN lifecycle and helper-boundary integration
+  - daemon/install/start selection-surface wiring for `linux-wireguard-userspace-shared`
+  - end-to-end mode activation and later live evidence/gate work
+Residual risks / blockers:
+  - The Phase 4 plaintext path is still the backend-internal test boundary rather than the final host TUN lifecycle, so full Linux runtime dataplane parity remains incomplete.
+  - The new Linux userspace-shared backend is still intentionally not wired into daemon/install/start selection surfaces in this slice.
+  - macOS userspace-shared parity remains unimplemented and unclaimed.
+```
+
+```text
+Date: 2026-04-01
+Phase / Slice: Production transport-owning backend plan - Phase 7 final regression and gate validation
+Files changed:
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Recorded the full Phase 7 validation order, reruns, outcomes, and exact pre-live-lab blockers without widening any completion claim.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added the public Phase 7 validation evidence entry with exact pass/fail classification and blocker prerequisites.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/lib.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs crates/rustynet-backend-wireguard/tests/conformance.rs crates/rustynetd/src/daemon.rs crates/rustynetd/src/main.rs crates/rustynetd/src/privileged_helper.rs crates/rustynetd/src/stun_client.rs crates/rustynetd/src/relay_client.rs crates/rustynet-cli/src/main.rs crates/rustynet-cli/src/ops_write_daemon_env.rs crates/rustynet-cli/src/ops_install_systemd.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_ -- --nocapture`
+  - `cargo check --workspace --all-targets --all-features`
+  - `cargo test --workspace --all-targets --all-features`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo audit --deny warnings`
+  - `cargo deny check bans licenses sources advisories`
+  - `./scripts/ci/phase10_hp2_gates.sh`
+  - `./scripts/ci/membership_gates.sh`
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh`
+  - `./scripts/ci/phase10_gates.sh`
+Reruns performed:
+  - No code-regression reruns were required in this validation pass.
+  - `membership_gates.sh` was allowed to run to completion so the tail failure could be classified precisely instead of being mistaken for a userspace-shared runtime regression.
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo check -p rustynetd`: pass
+  - targeted backend tests: pass
+  - targeted daemon runtime tests: pass
+  - `cargo check --workspace --all-targets --all-features`: pass
+  - `cargo test --workspace --all-targets --all-features`: pass
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass
+  - `cargo audit --deny warnings`: fail
+    - root cause: `tun-rs 2.8.2` pulls `route_manager` and `netconfig-rs`, which pull `netlink-packet-core`, which still depends on unmaintained `paste 1.0.15` (`RUSTSEC-2024-0436`)
+  - `cargo deny check bans licenses sources advisories`: fail
+    - root cause: same `paste 1.0.15` advisory plus license-policy rejection of `BSD-2-Clause` and `ISC` licenses introduced by the new `boringtun` / `tun-rs` dependency chain; the rejecting crates observed in this run were `ip_network`, `ip_network_table`, `libloading`, `ring`, and `untrusted`
+  - `./scripts/ci/phase10_hp2_gates.sh`: pass
+  - `./scripts/ci/membership_gates.sh`: fail only because it delegates into the stale fresh-install evidence gate already proven by `phase10_gates.sh`; no hidden userspace-shared backend regression was observed
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh`: fail only because the six canonical live cross-network reports are still missing for current `HEAD`
+  - `./scripts/ci/phase10_gates.sh`: fail only because `artifacts/phase10/fresh_install_os_matrix_report.json` is stale for current `HEAD`
+    - exact gate output: `report=c86a62a766b8af8382dfa57805aec8b4cad284ff expected=06e3e2ed745b4439505991bea775246cde8ed653`
+Security invariants re-verified:
+  - The Linux userspace-shared backend still owns the authoritative UDP socket, TUN runtime state, userspace engine state, round-trip control state, and handshake telemetry without daemon-side or helper-side transport authority.
+  - Command-only Linux/macOS backends remain unchanged and still fail closed on authoritative shared transport.
+  - `direct_active` still requires fresh handshake proof.
+  - `relay_active` still requires fresh handshake proof plus authenticated relay-session consistency.
+  - No validation result showed second-socket authority, silent downgrade from userspace-shared to command-only, or weakened gate semantics.
+  - Evidence gates remain fail-closed on missing or stale artifacts.
+What Phase 7 established:
+  - The Phases 1 through 6 backend/runtime work is present and regression-clean under fmt, check, test, clippy, targeted daemon truthfulness tests, and Phase 10 HP2 traversal gates.
+  - The remaining blockers before honest pre-live-lab readiness are no longer runtime-behavior ambiguities; they are now explicit dependency-policy blockers and explicit stale/missing evidence blockers.
+What remains before claiming pre-live-lab readiness:
+  - remove or replace the `tun-rs 2.8.2` dependency path that introduces unmaintained `paste 1.0.15`, or land a policy-approved secure alternative without weakening audit/deny gates
+  - resolve the repository license-policy failures introduced by the `boringtun` / `tun-rs` dependency chain without weakening the deny gate
+  - regenerate `artifacts/phase10/fresh_install_os_matrix_report.json` for current `HEAD`
+  - run the live lab on `linux-wireguard-userspace-shared` and generate the six canonical cross-network reports for current `HEAD`
+Residual risks / blockers:
+  - Phase 7 cannot be declared cleanly complete while `cargo audit` and `cargo deny` are red on the new userspace-shared dependency chain.
+  - `membership_gates.sh` remains red until the stale fresh-install evidence blocker is resolved; the current failure is inherited from the fresh-install release gate rather than from the backend implementation itself.
+  - The repo is not yet pre-live-lab ready because the fresh-install evidence still points at an older commit and the six canonical live cross-network reports are still absent for current `HEAD`.
+  - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
+Date: 2026-03-30
+Phase / Slice: Final closeout honesty pass
+Files changed:
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Reconciled stale checklist state, added the final audited artifact/gate inventory, and recorded the current `HEAD` blocker set explicitly.
+  - README.md
+    - Downgraded the traversal/relay status paragraph so it matches audited runtime and evidence reality instead of older HP2/HP3 wording.
+Tests and gates run:
+  - `./scripts/ci/phase10_hp2_gates.sh` (pass)
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed: six canonical cross-network reports missing)
+  - `./scripts/ci/phase10_gates.sh` (fails closed: `artifacts/phase10/fresh_install_os_matrix_report.json` git_commit mismatch)
+Artifact audit:
+  - Verified canonical cross-network report paths are still absent for current `HEAD`.
+  - Verified `artifacts/phase10/fresh_install_os_matrix_report.json` exists but is stale: `git_commit=c86a62a766b8af8382dfa57805aec8b4cad284ff`, expected `06e3e2ed745b4439505991bea775246cde8ed653`.
+  - Verified canonical live-script output paths still match the gate contract even though the measured artifacts themselves are not present.
+Security invariants verified:
+  - The closeout gate surface remains fail-closed on missing canonical evidence, stale commit-bound evidence, and unproven live path claims.
+  - No softer product claim survived in the plan ledger or README transport-status summary.
+Residual risks / blockers:
+  - Fresh live-lab execution is still required to generate the six canonical cross-network reports for current `HEAD`.
+  - Fresh-install matrix evidence still needs regeneration on current `HEAD`; the stale report remains intentionally blocking.
+  - Phase A transport-socket identity work remains incomplete and still limits end-to-end plug-and-play completion claims.
 ```
 
 ## 19. Definition of Done for This Document

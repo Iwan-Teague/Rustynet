@@ -1479,16 +1479,17 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
             node_id = Some(trimmed.to_string());
             continue;
         }
-        if let Some((prefix, value)) = line.split_once('=') {
-            if prefix.starts_with("peer.") && prefix.ends_with(".node_id") {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err(format!(
-                        "assignment bundle peer id must not be empty: {prefix}"
-                    ));
-                }
-                peer_node_ids.push(trimmed.to_string());
+        if let Some((prefix, value)) = line.split_once('=')
+            && prefix.starts_with("peer.")
+            && prefix.ends_with(".node_id")
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "assignment bundle peer id must not be empty: {prefix}"
+                ));
             }
+            peer_node_ids.push(trimmed.to_string());
         }
     }
     peer_node_ids.sort();
@@ -1935,12 +1936,12 @@ fn utc_now_string() -> String {
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
         .ok();
-    if let Some(output) = output {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !text.is_empty() {
-                return text;
-            }
+    if let Some(output) = output
+        && output.status.success()
+    {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !text.is_empty() {
+            return text;
         }
     }
     "1970-01-01T00:00:00Z".to_string()

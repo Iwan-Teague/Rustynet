@@ -649,12 +649,15 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "--backend requires a value".to_string())?;
                 config.backend_mode = match value.as_str() {
                     "linux-wireguard" => DaemonBackendMode::LinuxWireguard,
+                    "linux-wireguard-userspace-shared" => {
+                        DaemonBackendMode::LinuxWireguardUserspaceShared
+                    }
                     "macos-wireguard" => DaemonBackendMode::MacosWireguard,
+                    "macos-wireguard-userspace-shared" => {
+                        DaemonBackendMode::MacosWireguardUserspaceShared
+                    }
                     _ => {
-                        return Err(
-                            "invalid backend value: expected linux-wireguard or macos-wireguard"
-                                .to_string(),
-                        );
+                        return Err("invalid backend value: expected linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or macos-wireguard-userspace-shared".to_string());
                     }
                 };
                 index += 2;
@@ -1208,7 +1211,7 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|macos-wireguard>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -1293,7 +1296,7 @@ mod tests {
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
         DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
-        DEFAULT_DNS_ZONE_WATERMARK_PATH, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+        DEFAULT_DNS_ZONE_WATERMARK_PATH, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DaemonBackendMode,
     };
     use rustynetd::phase10::ManagementCidr;
 
@@ -1477,6 +1480,29 @@ mod tests {
         ];
         let err = parse_daemon_config(&args).expect_err("zero timeout should fail");
         assert!(err.contains("traversal stun gather timeout must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_accepts_userspace_shared_backend_values() {
+        let linux = parse_daemon_config(&[
+            "--backend".to_string(),
+            "linux-wireguard-userspace-shared".to_string(),
+        ])
+        .expect("linux userspace-shared backend should parse");
+        assert_eq!(
+            linux.backend_mode,
+            DaemonBackendMode::LinuxWireguardUserspaceShared
+        );
+
+        let macos = parse_daemon_config(&[
+            "--backend".to_string(),
+            "macos-wireguard-userspace-shared".to_string(),
+        ])
+        .expect("macos userspace-shared backend should parse");
+        assert_eq!(
+            macos.backend_mode,
+            DaemonBackendMode::MacosWireguardUserspaceShared
+        );
     }
 
     #[test]

@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "debian-headless-1",
+      "ssh_target": "debian-headless-1",
+      "ssh_user": "debian",
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.64.22",
+      "parent_device": "iwan's MacBook Air",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "exit-1",
+      "lab_role": "exit",
+      "mesh_ip": "100.64.0.1",
+      "exit_capable": true,
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian headless 1",
+        "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 1.utm"
+      }
+    },
+    {
+      "alias": "debian-headless-2",
+      "ssh_target": "debian-headless-2",
+      "ssh_user": "debian",
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.64.24",
+      "parent_device": "iwan's MacBook Air",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "client-1",
+      "lab_role": "client",
+      "mesh_ip": "100.64.0.2",
+      "exit_capable": false,
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian headless 2",
+        "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 2.utm"
+      }
+    },
+    {
+      "alias": "debian-headless-3",
+      "ssh_target": "debian-headless-3",
+      "ssh_user": "debian",
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.64.26",
+      "parent_device": "iwan's MacBook Air",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "relay-1",
+      "lab_role": "relay",
+      "mesh_ip": "100.64.0.3",
+      "exit_capable": false,
+      "relay_capable": true,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian headless 3",
+        "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 3.utm"
+      }
+    },
+    {
+      "alias": "debian-headless-4",
+      "ssh_target": "debian-headless-4",
+      "ssh_user": "debian",
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.64.28",
+      "parent_device": "iwan's MacBook Air",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "aux-1",
+      "lab_role": "aux",
+      "mesh_ip": "100.64.0.4",
+      "exit_capable": false,
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "headless debian 4",
+        "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/headless debian 4.utm"
+      }
+    },
+    {
+      "alias": "debian-headless-5",
+      "ssh_target": "debian-headless-5",
+      "ssh_user": "debian",
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.64.29",
+      "parent_device": "iwan's MacBook Air",
+      "last_known_network": "utm-shared-192.168.64.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
+      "node_id": "extra-1",
+      "lab_role": "extra",
+      "mesh_ip": "100.64.0.5",
+      "exit_capable": false,
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "headless debian 5",
+        "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/headless debian 5.utm"
+      }
+    }
+  ]
+}

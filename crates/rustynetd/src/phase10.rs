@@ -20,8 +20,8 @@ use crate::traversal::{
     TraversalEngine, TraversalEngineConfig, TraversalError,
 };
 use rustynet_backend_api::{
-    BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
-    SocketEndpoint, TunnelBackend,
+    AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendError, BackendErrorKind,
+    ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelBackend,
 };
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, MembershipDirectory, MembershipStatus,
@@ -195,6 +195,7 @@ pub enum TraversalProbeReason {
     ExistingFreshHandshake,
     FreshHandshakeObserved,
     NoDirectCandidatesRelayArmed,
+    CoordinationRequiredRelayArmed,
     DirectProbeExhaustedRelayArmed,
 }
 
@@ -205,6 +206,9 @@ impl TraversalProbeReason {
             TraversalProbeReason::FreshHandshakeObserved => "fresh_handshake_observed",
             TraversalProbeReason::NoDirectCandidatesRelayArmed => {
                 "no_direct_candidates_relay_armed"
+            }
+            TraversalProbeReason::CoordinationRequiredRelayArmed => {
+                "coordination_required_relay_armed"
             }
             TraversalProbeReason::DirectProbeExhaustedRelayArmed => {
                 "direct_probe_exhausted_relay_armed"
@@ -230,6 +234,8 @@ pub struct TraversalProbeEvaluation<'a> {
     pub now_unix: u64,
     pub engine_config: TraversalEngineConfig,
     pub handshake_freshness_secs: u64,
+    pub coordination_schedule: Option<CoordinationSchedule>,
+    pub coordination_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2650,10 +2656,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     /// can simulate time passing without sleeping.
     #[cfg(test)]
     pub fn backdate_pending_since_for_test(&mut self, node_id: &NodeId, elapsed: Duration) {
-        if let Some(peer) = self.managed_peers.get_mut(node_id) {
-            if let Some(since) = peer.pending_since {
-                peer.pending_since = Some(since - elapsed);
-            }
+        if let Some(peer) = self.managed_peers.get_mut(node_id)
+            && let Some(since) = peer.pending_since
+        {
+            peer.pending_since = Some(since - elapsed);
         }
     }
 
@@ -2754,6 +2760,49 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             });
         }
 
+        if evaluation.direct_candidates.is_empty() {
+            let relay_endpoint = evaluation.relay_endpoint.ok_or_else(|| {
+                Phase10Error::TraversalProbeFailed(
+                    "traversal failed closed: no direct candidates and no relay endpoint"
+                        .to_string(),
+                )
+            })?;
+            self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
+            self.configure_traversal_paths(node_id, None, Some(relay_endpoint))?;
+            self.reconfigure_managed_peer(node_id, relay_endpoint, PathMode::Relay)?;
+            return Ok(TraversalProbeReport {
+                decision: TraversalProbeDecision::Relay,
+                reason: TraversalProbeReason::NoDirectCandidatesRelayArmed,
+                attempts: 0,
+                selected_endpoint: relay_endpoint,
+                latest_handshake_unix: current_handshake,
+            });
+        }
+
+        let schedule = match evaluation.coordination_schedule {
+            Some(schedule) => schedule,
+            None => {
+                if let Some(relay_endpoint) = evaluation.relay_endpoint {
+                    self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
+                    self.configure_traversal_paths(node_id, None, Some(relay_endpoint))?;
+                    self.reconfigure_managed_peer(node_id, relay_endpoint, PathMode::Relay)?;
+                    return Ok(TraversalProbeReport {
+                        decision: TraversalProbeDecision::Relay,
+                        reason: TraversalProbeReason::CoordinationRequiredRelayArmed,
+                        attempts: 0,
+                        selected_endpoint: relay_endpoint,
+                        latest_handshake_unix: current_handshake,
+                    });
+                }
+                let detail = evaluation.coordination_error.unwrap_or_else(|| {
+                    "validated signed traversal coordination required for direct probe".to_string()
+                });
+                return Err(Phase10Error::TraversalProbeFailed(format!(
+                    "traversal failed closed: {detail}"
+                )));
+            }
+        };
+
         let engine = TraversalEngine::new(evaluation.engine_config).map_err(|err| {
             Phase10Error::TraversalProbeFailed(format!("invalid traversal engine config: {err}"))
         })?;
@@ -2764,12 +2813,6 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 node_id: node_id.clone(),
             };
             let mut waiter = Phase10PeerWaiter;
-            let schedule = CoordinationSchedule {
-                session_id: [0u8; 16],
-                nonce: [0u8; 16],
-                probe_start_unix: 0,
-                wait_duration: Duration::ZERO,
-            };
 
             engine
                 .execute_simultaneous_open(
@@ -2851,6 +2894,31 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn managed_peer_ids(&self) -> Vec<NodeId> {
         self.managed_peers.keys().cloned().collect()
+    }
+
+    pub fn authoritative_transport_identity(&self) -> Option<AuthoritativeTransportIdentity> {
+        self.backend.authoritative_transport_identity()
+    }
+
+    pub fn authoritative_transport_round_trip(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<AuthoritativeTransportResponse, Phase10Error> {
+        Ok(self
+            .backend
+            .authoritative_transport_round_trip(remote_addr, payload, timeout)?)
+    }
+
+    pub fn authoritative_transport_send(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<AuthoritativeTransportIdentity, Phase10Error> {
+        Ok(self
+            .backend
+            .authoritative_transport_send(remote_addr, payload)?)
     }
 
     #[cfg(test)]
@@ -3565,6 +3633,15 @@ mod tests {
             interface_name: "rustynet0".to_string(),
             mesh_cidr: "100.64.0.0/10".to_string(),
             local_cidr: "100.64.0.1/32".to_string(),
+        }
+    }
+
+    fn sample_coordination_schedule(now_unix: u64) -> CoordinationSchedule {
+        CoordinationSchedule {
+            session_id: [0x11; 16],
+            nonce: [0x22; 16],
+            probe_start_unix: now_unix,
+            wait_duration: Duration::ZERO,
         }
     }
 
@@ -4372,6 +4449,8 @@ mod tests {
                     now_unix: 200,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    coordination_schedule: None,
+                    coordination_error: None,
                 },
             )
             .expect("existing handshake should keep direct path");
@@ -4438,6 +4517,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    coordination_schedule: Some(sample_coordination_schedule(210)),
+                    coordination_error: None,
                 },
             )
             .expect("probe should promote direct candidate");
@@ -4508,6 +4589,8 @@ mod tests {
                     now_unix: 210,
                     engine_config: TraversalEngineConfig::default(),
                     handshake_freshness_secs: 30,
+                    coordination_schedule: Some(sample_coordination_schedule(210)),
+                    coordination_error: None,
                 },
             )
             .expect("relay fallback should be allowed");
@@ -4522,6 +4605,147 @@ mod tests {
         assert_eq!(
             controller.managed_peer_endpoint(&peer_id),
             Some(relay_endpoint)
+        );
+    }
+
+    #[test]
+    fn traversal_probe_declines_direct_without_valid_coordination_when_relay_is_armed() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+        let relay_endpoint = SocketEndpoint {
+            addr: "198.51.100.40".parse::<IpAddr>().expect("ip should parse"),
+            port: 443,
+        };
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let report = controller
+            .evaluate_traversal_probes(
+                &peer_id,
+                TraversalProbeEvaluation {
+                    local_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "198.51.100.10".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    direct_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "198.51.100.11".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    relay_endpoint: Some(relay_endpoint),
+                    now_unix: 210,
+                    engine_config: TraversalEngineConfig::default(),
+                    handshake_freshness_secs: 30,
+                    coordination_schedule: None,
+                    coordination_error: Some(
+                        "validated traversal coordination for peer node-b is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .expect("relay fallback should be allowed");
+
+        assert_eq!(report.decision, TraversalProbeDecision::Relay);
+        assert_eq!(
+            report.reason,
+            TraversalProbeReason::CoordinationRequiredRelayArmed
+        );
+        assert_eq!(report.attempts, 0);
+        assert_eq!(report.selected_endpoint, relay_endpoint);
+        assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Relay));
+    }
+
+    #[test]
+    fn traversal_probe_fails_closed_without_valid_coordination_and_without_relay() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let err = controller
+            .evaluate_traversal_probes(
+                &peer_id,
+                TraversalProbeEvaluation {
+                    local_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "198.51.100.10".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    direct_candidates: &[ProbeTraversalCandidate {
+                        endpoint: SocketEndpoint {
+                            addr: "198.51.100.11".parse::<IpAddr>().expect("ip should parse"),
+                            port: 51820,
+                        },
+                        source: crate::traversal::CandidateSource::ServerReflexive,
+                        priority: 700,
+                        observed_at_unix: 200,
+                    }],
+                    relay_endpoint: None,
+                    now_unix: 210,
+                    engine_config: TraversalEngineConfig::default(),
+                    handshake_freshness_secs: 30,
+                    coordination_schedule: None,
+                    coordination_error: Some(
+                        "validated traversal coordination for peer node-b is unavailable"
+                            .to_string(),
+                    ),
+                },
+            )
+            .expect_err("missing coordination must fail closed without relay");
+
+        assert!(matches!(err, Phase10Error::TraversalProbeFailed(_)));
+        assert!(
+            err.to_string()
+                .contains("validated traversal coordination for peer node-b is unavailable")
         );
     }
 

@@ -1019,14 +1019,13 @@ fn filter_env_lines(output: &str, allowed_keys: &[&str], allowed_prefixes: &[&st
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(key) = parse_env_key(trimmed) {
-            if allowed_keys.contains(&key)
+        if let Some(key) = parse_env_key(trimmed)
+            && (allowed_keys.contains(&key)
                 || allowed_prefixes
                     .iter()
-                    .any(|prefix| key.starts_with(prefix))
-            {
-                retained.push(trimmed.to_string());
-            }
+                    .any(|prefix| key.starts_with(prefix)))
+        {
+            retained.push(trimmed.to_string());
         }
     }
     retained.join("\n")

@@ -395,13 +395,12 @@ impl Drop for ProbeCleanup {
         if let Ok(pid_text) = self
             .ctx
             .capture_root_allow_failure(&self.host, &["cat", &self.pid_path])
+            && let Ok(pid) = pid_text.trim().parse::<i32>()
         {
-            if let Ok(pid) = pid_text.trim().parse::<i32>() {
-                let pid_string = pid.to_string();
-                let _ = self
-                    .ctx
-                    .run_root_allow_failure(&self.host, &["kill", &pid_string]);
-            }
+            let pid_string = pid.to_string();
+            let _ = self
+                .ctx
+                .run_root_allow_failure(&self.host, &["kill", &pid_string]);
         }
         let _ = self
             .ctx

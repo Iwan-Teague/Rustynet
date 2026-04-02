@@ -12,6 +12,7 @@ mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
 mod ops_write_daemon_env;
+mod vm_lab;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -449,6 +450,60 @@ enum OpsCommand {
     },
     GenerateLiveLinuxLabFailureDigest {
         config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig,
+    },
+    VmLabList {
+        config: vm_lab::VmLabListConfig,
+    },
+    VmLabStart {
+        config: vm_lab::VmLabStartConfig,
+    },
+    VmLabSyncRepo {
+        config: vm_lab::VmLabSyncRepoConfig,
+    },
+    VmLabSyncBootstrap {
+        config: vm_lab::VmLabSyncBootstrapConfig,
+    },
+    VmLabRun {
+        config: vm_lab::VmLabExecConfig,
+    },
+    VmLabBootstrap {
+        config: vm_lab::VmLabExecConfig,
+    },
+    VmLabWriteLiveLabProfile {
+        config: vm_lab::VmLabWriteLiveLabProfileConfig,
+    },
+    VmLabRunLiveLab {
+        config: vm_lab::VmLabRunLiveLabConfig,
+    },
+    VmLabCheckKnownHosts {
+        config: vm_lab::VmLabCheckKnownHostsConfig,
+    },
+    VmLabPreflight {
+        config: vm_lab::VmLabPreflightConfig,
+    },
+    VmLabStatus {
+        config: vm_lab::VmLabStatusConfig,
+    },
+    VmLabStop {
+        config: vm_lab::VmLabStopConfig,
+    },
+    VmLabRestart {
+        config: vm_lab::VmLabRestartConfig,
+    },
+    VmLabCollectArtifacts {
+        config: vm_lab::VmLabCollectArtifactsConfig,
+    },
+    VmLabWriteTopology {
+        config: vm_lab::VmLabWriteTopologyConfig,
+    },
+    VmLabIssueAndDistributeState {
+        config: vm_lab::VmLabIssueDistributeStateConfig,
+    },
+    VmLabRunSuite {
+        config: vm_lab::VmLabRunSuiteConfig,
+    },
+    VmLabBootstrapPhase {
+        config: vm_lab::VmLabBootstrapPhaseConfig,
     },
     RebindLinuxFreshInstallOsMatrixInputs {
         config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig,
@@ -1621,6 +1676,399 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     overall_status: parser.required("--overall-status")?,
                     output_json: parser.required_path("--output-json")?,
                     output_md: parser.required_path("--output-md")?,
+                },
+            })
+        }
+        "vm-lab-list" => Ok(OpsCommand::VmLabList {
+            config: vm_lab::VmLabListConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+            },
+        }),
+        "vm-lab-start" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabStart {
+                config: vm_lab::VmLabStartConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    select_all: parser.has_flag("--all"),
+                    utmctl_path: parser
+                        .path_or_default("--utmctl-path", vm_lab::default_utmctl_path()),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
+                },
+            })
+        }
+        "vm-lab-sync-repo" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabSyncRepo {
+                config: vm_lab::VmLabSyncRepoConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    repo_url: parser.value("--repo-url"),
+                    local_source_dir: parser.optional_path("--local-source-dir"),
+                    dest_dir: parser.required("--dest-dir")?,
+                    branch: parser
+                        .value("--branch")
+                        .unwrap_or_else(|| "main".to_string()),
+                    remote: parser
+                        .value("--remote")
+                        .unwrap_or_else(|| "origin".to_string()),
+                    ssh_user: parser.value("--ssh-user"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 900)?,
+                },
+            })
+        }
+        "vm-lab-sync-bootstrap" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            let argv = collect_repeated_option_values_allow_leading_dash(&args[1..], "--arg")?;
+            let dest_dir = parser.required("--dest-dir")?;
+            Ok(OpsCommand::VmLabSyncBootstrap {
+                config: vm_lab::VmLabSyncBootstrapConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    repo_url: parser.value("--repo-url"),
+                    local_source_dir: parser.optional_path("--local-source-dir"),
+                    workdir: parser
+                        .value("--workdir")
+                        .unwrap_or_else(|| dest_dir.clone()),
+                    dest_dir,
+                    branch: parser
+                        .value("--branch")
+                        .unwrap_or_else(|| "main".to_string()),
+                    remote: parser
+                        .value("--remote")
+                        .unwrap_or_else(|| "origin".to_string()),
+                    program: parser.required("--program")?,
+                    argv,
+                    ssh_user: parser.value("--ssh-user"),
+                    sudo: parser.has_flag("--sudo"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
+                },
+            })
+        }
+        "vm-lab-run" | "vm-lab-bootstrap" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            let argv = collect_repeated_option_values_allow_leading_dash(&args[1..], "--arg")?;
+            let config = vm_lab::VmLabExecConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                vm_aliases,
+                raw_targets,
+                select_all: parser.has_flag("--all"),
+                workdir: parser.required("--workdir")?,
+                program: parser.required("--program")?,
+                argv,
+                ssh_user: parser.value("--ssh-user"),
+                sudo: parser.has_flag("--sudo"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
+            };
+            if subcommand == "vm-lab-run" {
+                Ok(OpsCommand::VmLabRun { config })
+            } else {
+                Ok(OpsCommand::VmLabBootstrap { config })
+            }
+        }
+        "vm-lab-write-live-lab-profile" => {
+            Ok(OpsCommand::VmLabWriteLiveLabProfile {
+                config: vm_lab::VmLabWriteLiveLabProfileConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    output_path: parser.required_path("--output")?,
+                    exit_vm: parser.value("--exit-vm"),
+                    exit_target: parser.value("--exit-target"),
+                    client_vm: parser.value("--client-vm"),
+                    client_target: parser.value("--client-target"),
+                    entry_vm: parser.value("--entry-vm"),
+                    entry_target: parser.value("--entry-target"),
+                    aux_vm: parser.value("--aux-vm"),
+                    aux_target: parser.value("--aux-target"),
+                    extra_vm: parser.value("--extra-vm"),
+                    extra_target: parser.value("--extra-target"),
+                    fifth_client_vm: parser.value("--fifth-client-vm"),
+                    fifth_client_target: parser.value("--fifth-client-target"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                    ssh_known_hosts_file: parser.optional_path("--ssh-known-hosts-file"),
+                    ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
+                    network_id: parser.value("--network-id"),
+                    traversal_ttl_secs: match parser.value("--traversal-ttl-secs") {
+                        Some(value) => Some(value.parse::<u64>().map_err(|err| {
+                            format!("invalid value for --traversal-ttl-secs: {err}")
+                        })?),
+                        None => None,
+                    },
+                    cross_network_nat_profiles: parser.value("--cross-network-nat-profiles"),
+                    cross_network_required_nat_profiles: parser
+                        .value("--cross-network-required-nat-profiles"),
+                    cross_network_impairment_profile: parser
+                        .value("--cross-network-impairment-profile"),
+                    source_mode: parser.value("--source-mode"),
+                    repo_ref: parser.value("--repo-ref"),
+                    report_dir: parser.optional_path("--report-dir"),
+                },
+            })
+        }
+        "vm-lab-run-live-lab" => Ok(OpsCommand::VmLabRunLiveLab {
+            config: vm_lab::VmLabRunLiveLabConfig {
+                profile_path: parser.required_path("--profile")?,
+                script_path: parser
+                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
+                dry_run: parser.has_flag("--dry-run"),
+                skip_gates: parser.has_flag("--skip-gates"),
+                skip_soak: parser.has_flag("--skip-soak"),
+                skip_cross_network: parser.has_flag("--skip-cross-network"),
+                source_mode: parser.value("--source-mode"),
+                repo_ref: parser.value("--repo-ref"),
+                report_dir: parser.optional_path("--report-dir"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+            },
+        }),
+        "vm-lab-check-known-hosts" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabCheckKnownHosts {
+                config: vm_lab::VmLabCheckKnownHostsConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    known_hosts_path: parser
+                        .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
+                },
+            })
+        }
+        "vm-lab-preflight" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            let mut require_commands =
+                collect_repeated_option_values(&args[1..], "--require-command");
+            if let Some(csv_commands) = parser.value("--require-commands") {
+                require_commands.extend(split_csv(csv_commands));
+            }
+            Ok(OpsCommand::VmLabPreflight {
+                config: vm_lab::VmLabPreflightConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    require_commands,
+                    min_free_kib: parser.parse_u64_or_default("--min-free-kib", 1_048_576)?,
+                    require_rustynet_installed: parser.has_flag("--require-rustynet-installed"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                },
+            })
+        }
+        "vm-lab-status" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabStatus {
+                config: vm_lab::VmLabStatusConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    ssh_user: parser.value("--ssh-user"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                },
+            })
+        }
+        "vm-lab-stop" | "vm-lab-shutdown" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabStop {
+                config: vm_lab::VmLabStopConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    select_all: parser.has_flag("--all"),
+                    utmctl_path: parser
+                        .path_or_default("--utmctl-path", vm_lab::default_utmctl_path()),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
+                },
+            })
+        }
+        "vm-lab-restart" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabRestart {
+                config: vm_lab::VmLabRestartConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    utmctl_path: parser
+                        .path_or_default("--utmctl-path", vm_lab::default_utmctl_path()),
+                    service: parser.value("--service"),
+                    ssh_user: parser.value("--ssh-user"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                },
+            })
+        }
+        "vm-lab-collect-artifacts" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabCollectArtifacts {
+                config: vm_lab::VmLabCollectArtifactsConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    ssh_user: parser.value("--ssh-user"),
+                    output_dir: parser.required_path("--output-dir")?,
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 300)?,
+                },
+            })
+        }
+        "vm-lab-write-topology" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabWriteTopology {
+                config: vm_lab::VmLabWriteTopologyConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    output_path: parser.required_path("--output")?,
+                    vm_aliases,
+                    select_all: parser.has_flag("--all"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    suite: parser.required("--suite")?,
+                },
+            })
+        }
+        "vm-lab-issue-and-distribute-state" => Ok(OpsCommand::VmLabIssueAndDistributeState {
+            config: vm_lab::VmLabIssueDistributeStateConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                topology_path: parser.required_path("--topology")?,
+                authority_vm: parser.required("--authority-vm")?,
+                ssh_user: parser.value("--ssh-user"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
+            },
+        }),
+        "vm-lab-run-suite" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabRunSuite {
+                config: vm_lab::VmLabRunSuiteConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    suite: parser.required("--suite")?,
+                    topology_path: parser.optional_path("--topology"),
+                    profile_path: parser.optional_path("--profile"),
+                    ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                    vm_aliases,
+                    select_all: parser.has_flag("--all"),
+                    dry_run: parser.has_flag("--dry-run"),
+                    nat_profile: parser.value("--nat-profile"),
+                    impairment_profile: parser.value("--impairment-profile"),
+                    report_dir: parser.optional_path("--report-dir"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                },
+            })
+        }
+        "vm-lab-bootstrap-phase" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabBootstrapPhase {
+                config: vm_lab::VmLabBootstrapPhaseConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    phase: parser.required("--phase")?,
+                    repo_url: parser.value("--repo-url"),
+                    local_source_dir: parser.optional_path("--local-source-dir"),
+                    dest_dir: parser.value("--dest-dir"),
+                    branch: parser
+                        .value("--branch")
+                        .unwrap_or_else(|| "main".to_string()),
+                    remote: parser
+                        .value("--remote")
+                        .unwrap_or_else(|| "origin".to_string()),
+                    ssh_user: parser.value("--ssh-user"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
                 },
             })
         }
@@ -3380,6 +3828,40 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::GenerateLiveLinuxLabFailureDigest { config } => {
             ops_live_lab_failure_digest::execute_ops_generate_live_linux_lab_failure_digest(config)
+        }
+        OpsCommand::VmLabList { config } => vm_lab::execute_ops_vm_lab_list(config),
+        OpsCommand::VmLabStart { config } => vm_lab::execute_ops_vm_lab_start(config),
+        OpsCommand::VmLabSyncRepo { config } => vm_lab::execute_ops_vm_lab_sync_repo(config),
+        OpsCommand::VmLabSyncBootstrap { config } => {
+            vm_lab::execute_ops_vm_lab_sync_bootstrap(config)
+        }
+        OpsCommand::VmLabRun { config } => vm_lab::execute_ops_vm_lab_run(config, "ran"),
+        OpsCommand::VmLabBootstrap { config } => {
+            vm_lab::execute_ops_vm_lab_run(config, "bootstrapped")
+        }
+        OpsCommand::VmLabWriteLiveLabProfile { config } => {
+            vm_lab::execute_ops_vm_lab_write_live_lab_profile(config)
+        }
+        OpsCommand::VmLabRunLiveLab { config } => vm_lab::execute_ops_vm_lab_run_live_lab(config),
+        OpsCommand::VmLabCheckKnownHosts { config } => {
+            vm_lab::execute_ops_vm_lab_check_known_hosts(config)
+        }
+        OpsCommand::VmLabPreflight { config } => vm_lab::execute_ops_vm_lab_preflight(config),
+        OpsCommand::VmLabStatus { config } => vm_lab::execute_ops_vm_lab_status(config),
+        OpsCommand::VmLabStop { config } => vm_lab::execute_ops_vm_lab_stop(config),
+        OpsCommand::VmLabRestart { config } => vm_lab::execute_ops_vm_lab_restart(config),
+        OpsCommand::VmLabCollectArtifacts { config } => {
+            vm_lab::execute_ops_vm_lab_collect_artifacts(config)
+        }
+        OpsCommand::VmLabWriteTopology { config } => {
+            vm_lab::execute_ops_vm_lab_write_topology(config)
+        }
+        OpsCommand::VmLabIssueAndDistributeState { config } => {
+            vm_lab::execute_ops_vm_lab_issue_and_distribute_state(config)
+        }
+        OpsCommand::VmLabRunSuite { config } => vm_lab::execute_ops_vm_lab_run_suite(config),
+        OpsCommand::VmLabBootstrapPhase { config } => {
+            vm_lab::execute_ops_vm_lab_bootstrap_phase(config)
         }
         OpsCommand::RebindLinuxFreshInstallOsMatrixInputs { config } => {
             ops_fresh_install_os_matrix::execute_ops_rebind_linux_fresh_install_os_matrix_inputs(
@@ -5925,10 +6407,11 @@ fn resolve_absolute_command_path(command_name: &str) -> Result<PathBuf, String> 
     let path_env = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_string())?;
     for base in std::env::split_paths(path_env.as_os_str()) {
         let candidate = base.join(command_name);
-        if let Ok(metadata) = fs::metadata(candidate.as_path()) {
-            if metadata.is_file() && (metadata.mode() & 0o111) != 0 {
-                return Ok(candidate);
-            }
+        if let Ok(metadata) = fs::metadata(candidate.as_path())
+            && metadata.is_file()
+            && (metadata.mode() & 0o111) != 0
+        {
+            return Ok(candidate);
         }
     }
     Err(format!(
@@ -9678,6 +10161,30 @@ fn collect_repeated_option_values(args: &[String], key: &str) -> Vec<String> {
     values
 }
 
+fn collect_repeated_option_values_allow_leading_dash(
+    args: &[String],
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        if args[index] == key {
+            if index + 1 >= args.len() {
+                return Err(format!("missing value for repeated option: {key}"));
+            }
+            values.push(args[index + 1].clone());
+            index += 2;
+            continue;
+        }
+        if index + 1 < args.len() && !args[index + 1].starts_with("--") {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(values)
+}
+
 fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, String> {
     let mut nodes = Vec::new();
     for raw in encoded
@@ -10439,6 +10946,25 @@ fn help_text() -> String {
         "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
+        "  ops vm-lab-list [--inventory <path>]",
+        "  ops vm-lab-start [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-sync-repo [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--branch <name>] [--remote <name>] [--ssh-user <user>] [--timeout-secs <secs>]",
+        "  ops vm-lab-sync-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--workdir <absolute-path>] [--branch <name>] [--remote <name>] --program <path|name> [--arg <value>]... [--ssh-user <user>] [--sudo] [--timeout-secs <secs>]",
+        "  ops vm-lab-run [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--sudo] [--timeout-secs <secs>]",
+        "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--sudo] [--timeout-secs <secs>]",
+        "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
+        "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",
+        "  ops vm-lab-preflight [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>] [--require-same-network] [--require-command <name>]... [--require-commands <name[,name...]>] [--min-free-kib <kib>] [--require-rustynet-installed] [--timeout-secs <secs>]",
+        "  ops vm-lab-status [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-user <user>] [--timeout-secs <secs>]",
+        "  ops vm-lab-stop [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-shutdown [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-restart [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--service <name>] [--ssh-user <user>] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-collect-artifacts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --output-dir <path> [--ssh-user <user>] [--timeout-secs <secs>]",
+        "  ops vm-lab-write-topology [--inventory <path>] --suite <direct-remote-exit|relay-remote-exit|failback-roaming|full-live-lab> --output <path> [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--require-same-network]",
+        "  ops vm-lab-issue-and-distribute-state [--inventory <path>] --topology <path> --authority-vm <alias> [--ssh-user <user>] [--timeout-secs <secs>]",
+        "  ops vm-lab-run-suite [--inventory <path>] --suite <direct-remote-exit|relay-remote-exit|failback-roaming|full-live-lab> [--topology <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] --ssh-identity-file <path> [--nat-profile <profile>] [--impairment-profile <profile>] [--report-dir <path>] [--dry-run] [--timeout-secs <secs>]",
+        "  ops vm-lab-bootstrap-phase [--inventory <path>] --phase <sync-source|build-release|install-release|restart-runtime|verify-runtime|all> [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] [--repo-url <url> | --local-source-dir <path>] [--dest-dir <absolute-path>] [--branch <name>] [--remote <name>] [--ssh-user <user>] [--timeout-secs <secs>]",
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
@@ -12092,6 +12618,299 @@ mod tests {
             "/run/rustynet/traversal-issue".to_string(),
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
+
+        let vm_lab_list = parse_command(&["ops".to_string(), "vm-lab-list".to_string()]);
+        assert!(format!("{vm_lab_list:?}").contains("VmLabList"));
+
+        let vm_lab_start = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-start".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--vm".to_string(),
+            "debian-headless-3".to_string(),
+            "--timeout-secs".to_string(),
+            "120".to_string(),
+        ]);
+        assert!(format!("{vm_lab_start:?}").contains("VmLabStart"));
+        assert!(format!("{vm_lab_start:?}").contains("debian-headless-3"));
+
+        let vm_lab_sync = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-sync-repo".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--vm".to_string(),
+            "debian-headless-2".to_string(),
+            "--target".to_string(),
+            "root@192.168.18.51".to_string(),
+            "--repo-url".to_string(),
+            "git@github.com:iwanteague/Rustyfin.git".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustyfin".to_string(),
+            "--branch".to_string(),
+            "main".to_string(),
+            "--ssh-user".to_string(),
+            "root".to_string(),
+        ]);
+        assert!(format!("{vm_lab_sync:?}").contains("VmLabSyncRepo"));
+        assert!(format!("{vm_lab_sync:?}").contains("Rustyfin"));
+        assert!(format!("{vm_lab_sync:?}").contains("root@192.168.18.51"));
+
+        let vm_lab_sync_local = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-sync-repo".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--local-source-dir".to_string(),
+            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustynet".to_string(),
+        ]);
+        assert!(format!("{vm_lab_sync_local:?}").contains("VmLabSyncRepo"));
+        assert!(format!("{vm_lab_sync_local:?}").contains("/Users/iwanteague/Desktop/Rustynet"));
+
+        let vm_lab_sync_bootstrap = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-sync-bootstrap".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--require-same-network".to_string(),
+            "--repo-url".to_string(),
+            "git@github.com:iwanteague/Rustyfin.git".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustyfin".to_string(),
+            "--program".to_string(),
+            "cargo".to_string(),
+            "--arg".to_string(),
+            "build".to_string(),
+            "--arg".to_string(),
+            "--release".to_string(),
+        ]);
+        assert!(format!("{vm_lab_sync_bootstrap:?}").contains("VmLabSyncBootstrap"));
+        assert!(format!("{vm_lab_sync_bootstrap:?}").contains("require_same_network: true"));
+
+        let vm_lab_sync_bootstrap_local = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-sync-bootstrap".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--local-source-dir".to_string(),
+            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustynet".to_string(),
+            "--program".to_string(),
+            "sh".to_string(),
+            "--arg".to_string(),
+            "-lc".to_string(),
+            "--arg".to_string(),
+            "pwd".to_string(),
+        ]);
+        assert!(format!("{vm_lab_sync_bootstrap_local:?}").contains("VmLabSyncBootstrap"));
+        assert!(
+            format!("{vm_lab_sync_bootstrap_local:?}")
+                .contains("/Users/iwanteague/Desktop/Rustynet")
+        );
+
+        let vm_lab_run = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-run".to_string(),
+            "--vm".to_string(),
+            "debian-headless-2".to_string(),
+            "--target".to_string(),
+            "debian@192.168.18.52".to_string(),
+            "--workdir".to_string(),
+            "/home/debian/Rustyfin".to_string(),
+            "--program".to_string(),
+            "cargo".to_string(),
+            "--arg".to_string(),
+            "build".to_string(),
+            "--arg".to_string(),
+            "--release".to_string(),
+            "--sudo".to_string(),
+        ]);
+        assert!(format!("{vm_lab_run:?}").contains("VmLabRun"));
+        assert!(format!("{vm_lab_run:?}").contains("debian@192.168.18.52"));
+        assert!(format!("{vm_lab_run:?}").contains("--release"));
+
+        let vm_lab_bootstrap = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-bootstrap".to_string(),
+            "--all".to_string(),
+            "--workdir".to_string(),
+            "/home/debian/Rustyfin".to_string(),
+            "--program".to_string(),
+            "cargo".to_string(),
+            "--arg".to_string(),
+            "build".to_string(),
+        ]);
+        assert!(format!("{vm_lab_bootstrap:?}").contains("VmLabBootstrap"));
+        assert!(format!("{vm_lab_bootstrap:?}").contains("VmLabBootstrap"));
+
+        let vm_lab_profile = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-write-live-lab-profile".to_string(),
+            "--output".to_string(),
+            "/tmp/live_lab.env".to_string(),
+            "--ssh-identity-file".to_string(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
+            "--exit-vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--client-target".to_string(),
+            "debian@192.168.18.52".to_string(),
+            "--require-same-network".to_string(),
+        ]);
+        assert!(format!("{vm_lab_profile:?}").contains("VmLabWriteLiveLabProfile"));
+        assert!(format!("{vm_lab_profile:?}").contains("debian-headless-1"));
+
+        let vm_lab_live_lab = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-run-live-lab".to_string(),
+            "--profile".to_string(),
+            "/tmp/live_lab.env".to_string(),
+            "--dry-run".to_string(),
+            "--skip-gates".to_string(),
+        ]);
+        assert!(format!("{vm_lab_live_lab:?}").contains("VmLabRunLiveLab"));
+        assert!(format!("{vm_lab_live_lab:?}").contains("dry_run: true"));
+
+        let vm_lab_known_hosts = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-check-known-hosts".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+            "--known-hosts-file".to_string(),
+            "/Users/iwanteague/.ssh/known_hosts".to_string(),
+        ]);
+        assert!(format!("{vm_lab_known_hosts:?}").contains("VmLabCheckKnownHosts"));
+
+        let vm_lab_preflight = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-preflight".to_string(),
+            "--all".to_string(),
+            "--require-command".to_string(),
+            "git".to_string(),
+            "--require-command".to_string(),
+            "cargo".to_string(),
+            "--require-rustynet-installed".to_string(),
+        ]);
+        assert!(format!("{vm_lab_preflight:?}").contains("VmLabPreflight"));
+        assert!(format!("{vm_lab_preflight:?}").contains("require_rustynet_installed: true"));
+
+        let vm_lab_status = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-status".to_string(),
+            "--target".to_string(),
+            "debian@192.168.18.53".to_string(),
+        ]);
+        assert!(format!("{vm_lab_status:?}").contains("VmLabStatus"));
+
+        let vm_lab_stop = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-stop".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+        ]);
+        assert!(format!("{vm_lab_stop:?}").contains("VmLabStop"));
+
+        let vm_lab_shutdown = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-shutdown".to_string(),
+            "--all".to_string(),
+        ]);
+        assert!(format!("{vm_lab_shutdown:?}").contains("VmLabStop"));
+
+        let vm_lab_restart = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-restart".to_string(),
+            "--target".to_string(),
+            "debian@192.168.18.54".to_string(),
+            "--service".to_string(),
+            "rustynetd.service".to_string(),
+        ]);
+        assert!(format!("{vm_lab_restart:?}").contains("VmLabRestart"));
+        assert!(format!("{vm_lab_restart:?}").contains("rustynetd.service"));
+
+        let vm_lab_collect_artifacts = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-collect-artifacts".to_string(),
+            "--all".to_string(),
+            "--output-dir".to_string(),
+            "/tmp/vm-lab-artifacts".to_string(),
+        ]);
+        assert!(format!("{vm_lab_collect_artifacts:?}").contains("VmLabCollectArtifacts"));
+
+        let vm_lab_write_topology = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-write-topology".to_string(),
+            "--suite".to_string(),
+            "relay-remote-exit".to_string(),
+            "--output".to_string(),
+            "/tmp/vm-lab-topology.json".to_string(),
+            "--all".to_string(),
+        ]);
+        assert!(format!("{vm_lab_write_topology:?}").contains("VmLabWriteTopology"));
+
+        let vm_lab_issue_state = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-issue-and-distribute-state".to_string(),
+            "--topology".to_string(),
+            "/tmp/vm-lab-topology.json".to_string(),
+            "--authority-vm".to_string(),
+            "debian-headless-1".to_string(),
+        ]);
+        assert!(format!("{vm_lab_issue_state:?}").contains("VmLabIssueAndDistributeState"));
+
+        let vm_lab_run_suite = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-run-suite".to_string(),
+            "--suite".to_string(),
+            "direct-remote-exit".to_string(),
+            "--ssh-identity-file".to_string(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
+            "--dry-run".to_string(),
+            "--all".to_string(),
+        ]);
+        assert!(format!("{vm_lab_run_suite:?}").contains("VmLabRunSuite"));
+        assert!(format!("{vm_lab_run_suite:?}").contains("dry_run: true"));
+
+        let vm_lab_bootstrap_phase = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-bootstrap-phase".to_string(),
+            "--phase".to_string(),
+            "all".to_string(),
+            "--repo-url".to_string(),
+            "git@github.com:iwanteague/Rustynet.git".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustynet".to_string(),
+            "--all".to_string(),
+        ]);
+        assert!(format!("{vm_lab_bootstrap_phase:?}").contains("VmLabBootstrapPhase"));
+        assert!(format!("{vm_lab_bootstrap_phase:?}").contains("phase: \"all\""));
+
+        let vm_lab_bootstrap_phase_local = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-bootstrap-phase".to_string(),
+            "--phase".to_string(),
+            "sync-source".to_string(),
+            "--local-source-dir".to_string(),
+            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "--dest-dir".to_string(),
+            "/home/debian/Rustynet".to_string(),
+            "--vm".to_string(),
+            "debian-headless-1".to_string(),
+        ]);
+        assert!(format!("{vm_lab_bootstrap_phase_local:?}").contains("VmLabBootstrapPhase"));
+        assert!(
+            format!("{vm_lab_bootstrap_phase_local:?}")
+                .contains("/Users/iwanteague/Desktop/Rustynet")
+        );
     }
 
     #[test]

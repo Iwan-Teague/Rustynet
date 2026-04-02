@@ -2,7 +2,8 @@
 
 use std::error::Error;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(String);
@@ -32,6 +33,19 @@ impl fmt::Display for NodeId {
 pub struct SocketEndpoint {
     pub addr: IpAddr,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeTransportIdentity {
+    pub local_addr: SocketAddr,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeTransportResponse {
+    pub local_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +182,64 @@ pub trait TunnelBackend: Send + Sync {
     fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError>;
 
     fn stats(&self) -> Result<TunnelStats, BackendError>;
+
+    /// Returns diagnostics for the backend-owned authoritative shared transport
+    /// when the backend can safely originate STUN and relay control traffic on
+    /// the same peer-traffic transport identity.
+    fn authoritative_transport_identity(&self) -> Option<AuthoritativeTransportIdentity> {
+        None
+    }
+
+    /// Executes a bounded request/response exchange on the backend-owned
+    /// authoritative peer-traffic transport identity.
+    fn authoritative_transport_round_trip(
+        &mut self,
+        _remote_addr: SocketAddr,
+        _payload: &[u8],
+        _timeout: Duration,
+    ) -> Result<AuthoritativeTransportResponse, BackendError> {
+        Err(BackendError::internal(format!(
+            "authoritative shared transport round trip unavailable: {}",
+            self.transport_socket_identity_blocker().unwrap_or_else(|| {
+                "backend does not expose backend-owned authoritative transport operations"
+                    .to_string()
+            })
+        )))
+    }
+
+    /// Sends a datagram on the backend-owned authoritative peer-traffic
+    /// transport identity without waiting for a response.
+    fn authoritative_transport_send(
+        &mut self,
+        _remote_addr: SocketAddr,
+        _payload: &[u8],
+    ) -> Result<AuthoritativeTransportIdentity, BackendError> {
+        Err(BackendError::internal(format!(
+            "authoritative shared transport send unavailable: {}",
+            self.transport_socket_identity_blocker().unwrap_or_else(|| {
+                "backend does not expose backend-owned authoritative transport operations"
+                    .to_string()
+            })
+        )))
+    }
+
+    /// Returns a blocker reason when the backend owns peer transport on an
+    /// opaque socket identity that cannot be safely shared with daemon-side
+    /// STUN or relay bootstrap paths.
+    ///
+    /// Production code must treat a returned blocker as fail-closed for any
+    /// workflow that would otherwise create a second UDP socket and infer that
+    /// it represents the authoritative peer-traffic transport identity.
+    ///
+    /// Binding a second socket to the same local port is not sufficient. The
+    /// authoritative transport path must be the same backend-owned socket, or a
+    /// backend-owned multiplexed transport capability explicitly provided by the
+    /// backend that can safely demultiplex STUN/relay control traffic alongside
+    /// the real peer-traffic socket identity. Command-only backends that merely
+    /// configure an OS-managed tunnel do not satisfy this requirement.
+    fn transport_socket_identity_blocker(&self) -> Option<String> {
+        None
+    }
 
     fn shutdown(&mut self) -> Result<(), BackendError>;
 }

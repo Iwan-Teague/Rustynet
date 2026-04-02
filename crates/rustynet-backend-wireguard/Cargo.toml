@@ -8,3 +8,5 @@ authors.workspace = true
 [dependencies]
 rustynet-backend-api = { path = "../rustynet-backend-api" }
 base64 = "0.22"
+boringtun = "0.7.0"
+tun-rs = "2.8.2"

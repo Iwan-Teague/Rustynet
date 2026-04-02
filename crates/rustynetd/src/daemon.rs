@@ -14,8 +14,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc};
-use std::thread::{self, sleep};
+use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{
@@ -43,21 +43,21 @@ use crate::privileged_helper::{
     DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS, PrivilegedCommandClient,
     PrivilegedCommandProgram,
 };
-use crate::relay_client::{RelayClient, RelayClientConfig};
+use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
-use crate::stun_client::{StunClient, StunResult};
+use crate::stun_client::{StunClient, StunResult, StunTransportRoundTrip};
 use crate::traversal::{
-    CandidateSource as ProbeCandidateSource,
+    CandidateSource as ProbeCandidateSource, CoordinationReplayWindow, CoordinationSchedule,
     DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES as TRAVERSAL_DEFAULT_MAX_CANDIDATES,
     DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS as TRAVERSAL_DEFAULT_MAX_PAIRS,
     DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES as TRAVERSAL_DEFAULT_RELAY_SWITCH_AFTER_FAILURES,
     DEFAULT_TRAVERSAL_PROBE_ROUND_SPACING_MS as TRAVERSAL_DEFAULT_ROUND_SPACING_MS,
     DEFAULT_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS as TRAVERSAL_DEFAULT_SIMULTANEOUS_ROUNDS,
     DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS as TRAVERSAL_DEFAULT_STUN_GATHER_TIMEOUT_MS,
-    EndpointMonitor, TraversalCandidate as ProbeTraversalCandidate, TraversalEngineConfig,
-    VerifiedTraversalIndex, VerifiedTraversalRecord,
+    EndpointMonitor, TraversalCandidate as ProbeTraversalCandidate, TraversalEngine,
+    TraversalEngineConfig, VerifiedTraversalIndex, VerifiedTraversalRecord,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(target_os = "linux")]
@@ -78,18 +78,21 @@ use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
     RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
 };
+use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "linux")]
 use rustynet_backend_wireguard::LinuxWireguardBackend;
 #[cfg(target_os = "macos")]
 use rustynet_backend_wireguard::MacosWireguardBackend;
+#[cfg(test)]
+use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperation;
 use rustynet_backend_wireguard::WireguardBackend;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
-use rustynet_control::derive_endpoint_hint_signing_key;
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
 };
+use rustynet_control::{SignedTraversalCoordinationRecord, derive_endpoint_hint_signing_key};
 use rustynet_dns_zone::{
     DnsZoneError, DnsZoneWatermark, SignedDnsZoneBundle as DnsZoneBundle,
     canonicalize_dns_zone_name, dns_zone_payload_digest, dns_zone_watermark_ordering,
@@ -188,7 +191,7 @@ const MAX_TRAVERSAL_VALUE_BYTES: usize = 512;
 const MAX_TRAVERSAL_KEY_DEPTH: usize = 3;
 const MAX_TRAVERSAL_FIELD_COUNT: usize = 1_024;
 const MAX_TRAVERSAL_CANDIDATE_COUNT: usize = 8;
-const MAX_TRAVERSAL_BUNDLE_ENTRY_COUNT: usize = MAX_AUTO_TUNNEL_PEER_COUNT;
+const MAX_TRAVERSAL_BUNDLE_ENTRY_COUNT: usize = MAX_AUTO_TUNNEL_PEER_COUNT * 2;
 const MAX_TRAVERSAL_PROBE_SIMULTANEOUS_OPEN_ROUNDS: u8 = 8;
 const MAX_TRAVERSAL_PROBE_ROUND_SPACING_MS: u64 = 5_000;
 const MAX_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES: u8 = 16;
@@ -640,7 +643,9 @@ pub enum DaemonDataplaneMode {
 pub enum DaemonBackendMode {
     InMemory,
     LinuxWireguard,
+    LinuxWireguardUserspaceShared,
     MacosWireguard,
+    MacosWireguardUserspaceShared,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -656,6 +661,17 @@ impl Default for DaemonBackendMode {
         }
         #[allow(unreachable_code)]
         DaemonBackendMode::LinuxWireguard
+    }
+}
+
+impl DaemonBackendMode {
+    fn userspace_shared_blocker(self) -> Option<&'static str> {
+        match self {
+            DaemonBackendMode::MacosWireguardUserspaceShared => Some(
+                "macos-wireguard-userspace-shared backend is not implemented: crates/rustynet-backend-wireguard currently contains only the command-only macOS wireguard-go adapter plus the in-memory shared-transport test backend, and the repository does not yet provide a backend-owned Rust userspace WireGuard engine or TUN/runtime datapath that can own the authoritative peer UDP socket for peer traffic, STUN, and relay control on the same transport identity",
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -1148,9 +1164,23 @@ struct TraversalBundleEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalCoordinationEnvelope {
+    record: SignedTraversalCoordinationRecord,
+    payload_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TraversalBundleSetEnvelope {
     bundles: Vec<TraversalBundleEnvelope>,
+    coordinations: Vec<TraversalCoordinationEnvelope>,
+    verifier_key_bytes: [u8; 32],
     watermark: TraversalWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraversalSectionEnvelope {
+    Bundle(TraversalBundleEnvelope),
+    Coordination(TraversalCoordinationEnvelope),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1191,6 +1221,35 @@ struct RuntimePathStateSummary {
     relay_session_established_peers: usize,
     relay_session_expired_peers: usize,
     relay_session_next_expiry_unix: Option<u64>,
+}
+
+fn format_stun_local_addrs(observations: &[StunResult]) -> String {
+    if observations.is_empty() {
+        return "none".to_string();
+    }
+    observations
+        .iter()
+        .map(|result| result.local_addr.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn stun_local_port_match_state(observations: &[StunResult], wg_listen_port: u16) -> &'static str {
+    let mut any_match = false;
+    let mut any_mismatch = false;
+    for observation in observations {
+        if observation.local_addr.port() == wg_listen_port {
+            any_match = true;
+        } else {
+            any_mismatch = true;
+        }
+    }
+    match (any_match, any_mismatch) {
+        (false, false) => "none",
+        (true, false) => "all_match_wg_listen_port",
+        (false, true) => "all_mismatch_wg_listen_port",
+        (true, true) => "mixed",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1567,6 +1626,8 @@ struct MembershipWatermark {
 enum DaemonBackend {
     #[allow(dead_code)]
     InMemory(WireguardBackend),
+    #[allow(dead_code)]
+    LinuxUserspaceShared(LinuxUserspaceSharedBackend),
     #[cfg(target_os = "linux")]
     Linux(LinuxWireguardBackend<PrivilegedHelperWireguardRunner>),
     #[cfg(target_os = "macos")]
@@ -1700,6 +1761,59 @@ impl DaemonBackend {
                     ))
                 }
             }
+            DaemonBackendMode::LinuxWireguardUserspaceShared => {
+                let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
+                    DaemonError::InvalidConfig(
+                        "wg private key path is required for linux-wireguard-userspace-shared backend"
+                            .to_string(),
+                    )
+                })?;
+                validate_private_key_permissions(private_key)?;
+                #[cfg(test)]
+                {
+                    let backend = LinuxUserspaceSharedBackend::new_for_test(
+                        config.wg_interface.clone(),
+                        private_key.to_string_lossy().to_string(),
+                        config.wg_listen_port,
+                    )
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    Ok(Self::LinuxUserspaceShared(backend))
+                }
+                #[cfg(all(not(test), target_os = "linux"))]
+                {
+                    let helper_socket = config
+                        .privileged_helper_socket_path
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DaemonError::InvalidConfig(
+                                "privileged helper socket path is required for linux-wireguard-userspace-shared backend"
+                                    .to_string(),
+                            )
+                        })?;
+                    let helper_client = PrivilegedCommandClient::new(
+                        helper_socket.clone(),
+                        Duration::from_millis(config.privileged_helper_timeout_ms.get()),
+                    )
+                    .map_err(DaemonError::InvalidConfig)?;
+                    let backend = LinuxUserspaceSharedBackend::new_with_helper_runner(
+                        config.wg_interface.clone(),
+                        private_key.to_string_lossy().to_string(),
+                        config.wg_listen_port,
+                        PrivilegedHelperWireguardRunner::new(helper_client),
+                        Uid::effective().as_raw(),
+                        Gid::effective().as_raw(),
+                    )
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    Ok(Self::LinuxUserspaceShared(backend))
+                }
+                #[cfg(all(not(test), not(target_os = "linux")))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "linux-wireguard-userspace-shared backend is only supported on linux"
+                            .to_string(),
+                    ))
+                }
+            }
             DaemonBackendMode::MacosWireguard => {
                 #[cfg(target_os = "macos")]
                 {
@@ -1741,6 +1855,12 @@ impl DaemonBackend {
                     ))
                 }
             }
+            DaemonBackendMode::MacosWireguardUserspaceShared => Err(DaemonError::InvalidConfig(
+                DaemonBackendMode::MacosWireguardUserspaceShared
+                    .userspace_shared_blocker()
+                    .expect("macos shared backend blocker should exist")
+                    .to_string(),
+            )),
         }
     }
 }
@@ -1749,6 +1869,7 @@ impl TunnelBackend for DaemonBackend {
     fn name(&self) -> &'static str {
         match self {
             DaemonBackend::InMemory(backend) => backend.name(),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.name(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.name(),
             #[cfg(target_os = "macos")]
@@ -1759,6 +1880,7 @@ impl TunnelBackend for DaemonBackend {
     fn capabilities(&self) -> BackendCapabilities {
         match self {
             DaemonBackend::InMemory(backend) => backend.capabilities(),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.capabilities(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.capabilities(),
             #[cfg(target_os = "macos")]
@@ -1769,6 +1891,7 @@ impl TunnelBackend for DaemonBackend {
     fn start(&mut self, context: RuntimeContext) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.start(context),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.start(context),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.start(context),
             #[cfg(target_os = "macos")]
@@ -1779,6 +1902,7 @@ impl TunnelBackend for DaemonBackend {
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.configure_peer(peer),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.configure_peer(peer),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.configure_peer(peer),
             #[cfg(target_os = "macos")]
@@ -1793,6 +1917,9 @@ impl TunnelBackend for DaemonBackend {
     ) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.update_peer_endpoint(node_id, endpoint),
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.update_peer_endpoint(node_id, endpoint)
+            }
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.update_peer_endpoint(node_id, endpoint),
             #[cfg(target_os = "macos")]
@@ -1806,6 +1933,7 @@ impl TunnelBackend for DaemonBackend {
     ) -> Result<Option<SocketEndpoint>, BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.current_peer_endpoint(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.current_peer_endpoint(node_id),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.current_peer_endpoint(node_id),
             #[cfg(target_os = "macos")]
@@ -1821,6 +1949,9 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::InMemory(backend) => {
                 backend.cached_peer_latest_handshake_unix_for_test(node_id)
             }
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.peer_latest_handshake_unix(node_id)
+            }
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.peer_latest_handshake_unix(node_id),
             #[cfg(target_os = "macos")]
@@ -1831,6 +1962,7 @@ impl TunnelBackend for DaemonBackend {
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.remove_peer(node_id),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.remove_peer(node_id),
             #[cfg(target_os = "macos")]
@@ -1841,6 +1973,7 @@ impl TunnelBackend for DaemonBackend {
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.apply_routes(routes),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.apply_routes(routes),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.apply_routes(routes),
             #[cfg(target_os = "macos")]
@@ -1851,6 +1984,7 @@ impl TunnelBackend for DaemonBackend {
     fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.set_exit_mode(mode),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.set_exit_mode(mode),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.set_exit_mode(mode),
             #[cfg(target_os = "macos")]
@@ -1861,6 +1995,7 @@ impl TunnelBackend for DaemonBackend {
     fn stats(&self) -> Result<TunnelStats, BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.stats(),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.stats(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.stats(),
             #[cfg(target_os = "macos")]
@@ -1868,9 +2003,85 @@ impl TunnelBackend for DaemonBackend {
         }
     }
 
+    fn authoritative_transport_identity(
+        &self,
+    ) -> Option<rustynet_backend_api::AuthoritativeTransportIdentity> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.authoritative_transport_identity(),
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.authoritative_transport_identity()
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.authoritative_transport_identity(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.authoritative_transport_identity(),
+        }
+    }
+
+    fn authoritative_transport_round_trip(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<rustynet_backend_api::AuthoritativeTransportResponse, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+        }
+    }
+
+    fn authoritative_transport_send(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<rustynet_backend_api::AuthoritativeTransportIdentity, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
+        }
+    }
+
+    fn transport_socket_identity_blocker(&self) -> Option<String> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.transport_socket_identity_blocker(),
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.transport_socket_identity_blocker()
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.transport_socket_identity_blocker(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.transport_socket_identity_blocker(),
+        }
+    }
+
     fn shutdown(&mut self) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.shutdown(),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.shutdown(),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(backend) => backend.shutdown(),
             #[cfg(target_os = "macos")]
@@ -1892,6 +2103,9 @@ impl DaemonBackend {
                     .set_endpoint_latest_handshake_unix_for_test(endpoint, latest_handshake_unix);
                 Ok(())
             }
+            DaemonBackend::LinuxUserspaceShared(_) => Err(BackendError::invalid_input(
+                "test handshake injection is only supported for in-memory backend",
+            )),
             #[cfg(target_os = "linux")]
             DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
                 "test handshake injection is only supported for in-memory backend",
@@ -1900,6 +2114,118 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
                 "test handshake injection is only supported for in-memory backend",
             )),
+        }
+    }
+
+    fn configure_authoritative_shared_transport_for_test(
+        &mut self,
+        local_addr: SocketAddr,
+        label: &str,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.configure_authoritative_shared_transport_for_test(
+                    local_addr,
+                    label.to_string(),
+                );
+                Ok(())
+            }
+            DaemonBackend::LinuxUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+        }
+    }
+
+    fn script_authoritative_round_trip_for_test(
+        &mut self,
+        result: Result<rustynet_backend_api::AuthoritativeTransportResponse, BackendError>,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.script_authoritative_round_trip_for_test(result);
+                Ok(())
+            }
+            DaemonBackend::LinuxUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+        }
+    }
+
+    fn script_authoritative_stun_round_trip_for_test(
+        &mut self,
+        remote_addr: SocketAddr,
+        mapped_endpoint: SocketAddr,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.script_authoritative_stun_round_trip_for_test(remote_addr, mapped_endpoint);
+                Ok(())
+            }
+            DaemonBackend::LinuxUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+        }
+    }
+
+    fn script_authoritative_send_result_for_test(
+        &mut self,
+        result: Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.script_authoritative_send_result_for_test(result);
+                Ok(())
+            }
+            DaemonBackend::LinuxUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+        }
+    }
+
+    fn authoritative_transport_operations_for_test(
+        &self,
+    ) -> Vec<RecordedAuthoritativeTransportOperation> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.recorded_authoritative_transport_operations_for_test()
+            }
+            DaemonBackend::LinuxUserspaceShared(_) => Vec::new(),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(_) => Vec::new(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(_) => Vec::new(),
         }
     }
 }
@@ -1949,9 +2275,10 @@ struct DaemonRuntime {
     traversal_probe_handshake_freshness_secs: u64,
     traversal_probe_reprobe_interval_secs: u64,
     local_host_candidates: BTreeMap<String, Vec<IpAddr>>,
+    local_stun_observations: Vec<StunResult>,
     local_stun_candidates: Vec<SocketAddr>,
-    /// Receives full mapped endpoints from STUN, not just IPs.
-    stun_result_rx: Option<mpsc::Receiver<Vec<StunResult>>>,
+    transport_socket_identity_blocker: Option<String>,
+    next_stun_refresh_at: Option<Instant>,
     trust_policy: TrustPolicy,
     selected_exit_node: Option<String>,
     lan_access_enabled: bool,
@@ -1979,6 +2306,9 @@ struct DaemonRuntime {
     dns_zone_last_preexpiry_refresh_unix: Option<u64>,
     traversal_hints: Option<TraversalBundleSetEnvelope>,
     verified_traversal_index: VerifiedTraversalIndex,
+    verified_traversal_coordination_index:
+        BTreeMap<(String, String), SignedTraversalCoordinationRecord>,
+    traversal_coordination_replay_window: CoordinationReplayWindow,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
     traversal_stale_rejections: u64,
@@ -2067,21 +2397,12 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             let signing_secret =
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
             let signing_key = derive_endpoint_hint_signing_key(signing_secret);
-            let relay_config = RelayClientConfig::default();
-            let bind_port = relay_config.local_port.unwrap_or(0);
-            let mut relay_client = RelayClient::new(
+            let relay_client = RelayClient::new(
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
                 Arc::new(signing_key),
-                relay_config,
+                RelayClientConfig::default(),
             );
-            let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, bind_port)))
-                .map_err(|err| {
-                    DaemonError::Io(format!("bind relay client socket failed: {err}"))
-                })?;
-            relay_client
-                .bind(socket)
-                .map_err(|err| DaemonError::Io(format!("initialize relay client failed: {err}")))?;
             Ok(Some(relay_client))
         }
     }
@@ -2102,6 +2423,11 @@ impl DaemonRuntime {
         };
         let trust_policy = TrustPolicy::default();
         let backend = DaemonBackend::from_config(config)?;
+        let relay_client = load_relay_client(config)?;
+        let transport_socket_identity_blocker = backend
+            .transport_socket_identity_blocker()
+            .filter(|_| !config.traversal_stun_servers.is_empty() || relay_client.is_some());
+        let transport_socket_identity_blocked = transport_socket_identity_blocker.is_some();
         let controller = Phase10Controller::new(
             backend,
             daemon_system(config)?,
@@ -2124,7 +2450,6 @@ impl DaemonRuntime {
             .as_ref()
             .map(|path| load_remote_ops_access_token_verifying_key(path))
             .transpose()?;
-        let relay_client = load_relay_client(config)?;
         Ok(Self {
             controller,
             policy,
@@ -2186,35 +2511,16 @@ impl DaemonRuntime {
                 .traversal_probe_reprobe_interval_secs
                 .get(),
             local_host_candidates: BTreeMap::new(),
+            local_stun_observations: Vec::new(),
             local_stun_candidates: Vec::new(),
-            stun_result_rx: {
-                let (tx, rx) = mpsc::channel();
-                let servers = config.traversal_stun_servers.clone();
-                let timeout = Duration::from_millis(config.traversal_stun_gather_timeout_ms.get());
-                thread::spawn(move || {
-                    if servers.is_empty() {
-                        return;
-                    }
-                    let client = StunClient::new(
-                        servers.into_iter().map(|addr| addr.to_string()).collect(),
-                        timeout,
-                    );
-                    // Initial jitter
-                    sleep(Duration::from_millis(500));
-                    loop {
-                        // Use gather_mapped_endpoints to get full SocketAddr including
-                        // the actual mapped port, not a guessed port
-                        let results = client.gather_mapped_endpoints(None);
-                        if !results.is_empty() {
-                            let _ = tx.send(results);
-                        }
-                        sleep(Duration::from_secs(
-                            DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS,
-                        ));
-                    }
-                });
-                Some(rx)
+            next_stun_refresh_at: if config.traversal_stun_servers.is_empty()
+                || transport_socket_identity_blocked
+            {
+                None
+            } else {
+                Some(Instant::now())
             },
+            transport_socket_identity_blocker,
             trust_policy,
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -2242,6 +2548,8 @@ impl DaemonRuntime {
             dns_zone_last_preexpiry_refresh_unix: None,
             traversal_hints: None,
             verified_traversal_index: VerifiedTraversalIndex::new(),
+            verified_traversal_coordination_index: BTreeMap::new(),
+            traversal_coordination_replay_window: CoordinationReplayWindow::default(),
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
             traversal_stale_rejections: 0,
@@ -2647,6 +2955,7 @@ impl DaemonRuntime {
             .as_secs();
 
         self.verified_traversal_index = VerifiedTraversalIndex::new();
+        self.verified_traversal_coordination_index = BTreeMap::new();
 
         for bundle_envelope in &envelope.bundles {
             let bundle = &bundle_envelope.bundle;
@@ -2687,6 +2996,15 @@ impl DaemonRuntime {
                 record,
             );
         }
+
+        for coordination in &envelope.coordinations {
+            let key = traversal_coordination_pair_key(
+                coordination.record.node_a.as_str(),
+                coordination.record.node_b.as_str(),
+            );
+            self.verified_traversal_coordination_index
+                .insert(key, coordination.record.clone());
+        }
     }
 
     fn refresh_traversal_hint_state(&mut self, force_reprobe: bool) {
@@ -2722,6 +3040,7 @@ impl DaemonRuntime {
             Err(TraversalBootstrapError::Missing) => {
                 self.traversal_hints = None;
                 self.verified_traversal_index = VerifiedTraversalIndex::new();
+                self.verified_traversal_coordination_index = BTreeMap::new();
                 self.traversal_hint_error = None;
                 self.traversal_probe_statuses.clear();
             }
@@ -2729,6 +3048,7 @@ impl DaemonRuntime {
                 self.record_traversal_bootstrap_error(&err);
                 self.traversal_hints = None;
                 self.verified_traversal_index = VerifiedTraversalIndex::new();
+                self.verified_traversal_coordination_index = BTreeMap::new();
                 self.traversal_hint_error = Some(err.to_string());
                 self.traversal_probe_statuses.clear();
             }
@@ -3042,19 +3362,113 @@ impl DaemonRuntime {
     }
 
     fn poll_stun_results(&mut self) {
-        if let Some(rx) = self.stun_result_rx.as_mut() {
-            while let Ok(stun_results) = rx.try_recv() {
-                // Use the actual mapped endpoints from STUN, not guessed ports.
-                // This is critical for NATs that don't preserve the local port.
-                self.local_stun_candidates = stun_results
-                    .into_iter()
-                    .map(|result| result.mapped_endpoint)
-                    .collect();
-                eprintln!(
-                    "rustynetd: stun candidates updated (using actual mapped ports): {:?}",
-                    self.local_stun_candidates
-                );
+        let Some(next_refresh_at) = self.next_stun_refresh_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < next_refresh_at {
+            return;
+        }
+        self.next_stun_refresh_at =
+            Some(now + Duration::from_secs(DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS));
+        if self.transport_socket_identity_blocker.is_some()
+            || self.traversal_probe_config.stun_servers.is_empty()
+        {
+            return;
+        }
+
+        let client = StunClient::new(
+            self.traversal_probe_config
+                .stun_servers
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect(),
+            Duration::from_millis(self.traversal_probe_config.stun_gather_timeout_ms),
+        );
+        let results = client.gather_mapped_endpoints_with_round_trip(|target, request, timeout| {
+            self.controller
+                .authoritative_transport_round_trip(target, request, timeout)
+                .map(|response| StunTransportRoundTrip {
+                    response: response.payload,
+                    remote_addr: response.remote_addr,
+                    local_addr: response.local_addr,
+                })
+                .map_err(|err| err.to_string())
+        });
+        self.local_stun_observations = results.clone();
+        self.local_stun_candidates = results
+            .into_iter()
+            .map(|result| result.mapped_endpoint)
+            .collect();
+        if !self.local_stun_candidates.is_empty() {
+            eprintln!(
+                "rustynetd: authoritative stun candidates updated: {:?}",
+                self.local_stun_candidates
+            );
+        }
+    }
+
+    fn stun_candidate_local_addrs(&self) -> String {
+        format_stun_local_addrs(&self.local_stun_observations)
+    }
+
+    fn stun_transport_port_binding(&self) -> &'static str {
+        stun_local_port_match_state(&self.local_stun_observations, self.wg_listen_port)
+    }
+
+    fn transport_socket_identity_requested(&self) -> bool {
+        self.relay_client.is_some() || !self.traversal_probe_config.stun_servers.is_empty()
+    }
+
+    fn transport_socket_identity_state(&self) -> &'static str {
+        if self.transport_socket_identity_blocker.is_some() {
+            "blocked_backend_opaque_socket"
+        } else if self.controller.authoritative_transport_identity().is_some() {
+            "authoritative_backend_shared_transport"
+        } else if self.transport_socket_identity_requested() {
+            "authoritative_backend_shared_transport_unavailable"
+        } else {
+            "not_required"
+        }
+    }
+
+    fn transport_socket_identity_error(&self) -> String {
+        if let Some(blocker) = self.transport_socket_identity_blocker.as_deref() {
+            sanitize_netcheck_value(blocker)
+        } else if self.transport_socket_identity_requested()
+            && self.controller.authoritative_transport_identity().is_none()
+        {
+            "backend_authoritative_shared_transport_not_exposed".to_string()
+        } else {
+            "none".to_string()
+        }
+    }
+
+    fn transport_socket_identity_label(&self) -> String {
+        self.controller
+            .authoritative_transport_identity()
+            .map(|identity| sanitize_netcheck_value(&identity.label))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn transport_socket_identity_local_addr(&self) -> String {
+        self.controller
+            .authoritative_transport_identity()
+            .map(|identity| sanitize_netcheck_value(&identity.local_addr.to_string()))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn relay_session_inactive_state(&self) -> &'static str {
+        if self.relay_client.is_some() {
+            if self.transport_socket_identity_blocker.is_some() {
+                "blocked_transport_identity"
+            } else if self.controller.authoritative_transport_identity().is_none() {
+                "unavailable_authoritative_transport"
+            } else {
+                "unused"
             }
+        } else {
+            "disabled"
         }
     }
 
@@ -3236,6 +3650,12 @@ impl DaemonRuntime {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let stun_candidate_local_addrs = self.stun_candidate_local_addrs();
+        let stun_transport_port_binding = self.stun_transport_port_binding();
+        let transport_socket_identity_state = self.transport_socket_identity_state();
+        let transport_socket_identity_error = self.transport_socket_identity_error();
+        let transport_socket_identity_label = self.transport_socket_identity_label();
+        let transport_socket_identity_local_addr = self.transport_socket_identity_local_addr();
         let local_host_candidates = if self.local_host_candidates.is_empty() {
             "none".to_string()
         } else {
@@ -3253,7 +3673,7 @@ impl DaemonRuntime {
                 .join(",")
         };
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} local_host_candidates={local_host_candidates}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} transport_socket_identity_state={transport_socket_identity_state} transport_socket_identity_error={transport_socket_identity_error} transport_socket_identity_label={transport_socket_identity_label} transport_socket_identity_local_addr={transport_socket_identity_local_addr} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} stun_candidate_local_addrs={stun_candidate_local_addrs} stun_transport_port_binding={stun_transport_port_binding} local_host_candidates={local_host_candidates}",
             path_state.programmed_peer_count,
             path_state.live_peer_count,
             path_state.programmed_direct_peers,
@@ -3306,7 +3726,7 @@ impl DaemonRuntime {
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         let now_unix = unix_now();
-        if let Some(relay_client) = self.relay_client.as_mut() {
+        if let Some(mut relay_client) = self.relay_client.take() {
             let freshness_secs = self.traversal_probe_handshake_freshness_secs;
             let active_relay_peers = self
                 .traversal_probe_statuses
@@ -3323,8 +3743,29 @@ impl DaemonRuntime {
             for node_id in active_relay_peers {
                 relay_client.touch_session(&node_id);
             }
+            if self.transport_socket_identity_blocker.is_none() {
+                for peer_node_id in relay_client.sessions_needing_keepalive() {
+                    if let Err(err) = relay_client.send_keepalive_with_sender(
+                        &peer_node_id,
+                        |remote_addr, payload| {
+                            self.controller
+                                .authoritative_transport_send(remote_addr, payload)
+                                .map(|_| ())
+                                .map_err(|error| {
+                                    RelayClientError::AuthoritativeTransport(error.to_string())
+                                })
+                        },
+                    ) {
+                        eprintln!(
+                            "rustynetd: relay keepalive failed for peer {}: {err}",
+                            peer_node_id.as_str()
+                        );
+                    }
+                }
+            }
             relay_client
                 .cleanup_idle_sessions(Duration::from_secs(self.relay_session_idle_timeout_secs));
+            self.relay_client = Some(relay_client);
         }
         if !matches!(
             self.controller.state(),
@@ -3494,6 +3935,15 @@ impl DaemonRuntime {
                 continue;
             }
 
+            let (coordination_schedule, coordination_error) = if direct_candidates.is_empty() {
+                (None, None)
+            } else {
+                match self.validated_traversal_coordination_schedule(&remote_node_id, now_unix) {
+                    Ok(schedule) => (schedule, None),
+                    Err(err) => (None, Some(err)),
+                }
+            };
+
             let report = self
                 .controller
                 .evaluate_traversal_probes(
@@ -3505,6 +3955,8 @@ impl DaemonRuntime {
                         now_unix,
                         engine_config: self.traversal_probe_config.clone(),
                         handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
+                        coordination_schedule,
+                        coordination_error,
                     },
                 )
                 .map_err(|err| {
@@ -3608,11 +4060,14 @@ impl DaemonRuntime {
         bundle: &TraversalBundleEnvelope,
         now_unix: u64,
     ) -> Result<Option<SocketEndpoint>, String> {
+        if self.transport_socket_identity_blocker.is_some() {
+            return Ok(None);
+        }
         let Some(relay_candidate) = select_runtime_relay_candidate(&bundle.bundle.candidates)?
         else {
             return Ok(None);
         };
-        let Some(relay_client) = self.relay_client.as_mut() else {
+        let Some(relay_client) = self.relay_client.as_ref() else {
             return Ok(None);
         };
         let needs_refresh = match relay_client.session_for_peer(remote_node_id) {
@@ -3626,20 +4081,30 @@ impl DaemonRuntime {
         if !needs_refresh {
             return Ok(relay_client.relay_endpoint_for_peer(remote_node_id));
         }
-        let endpoint = relay_client
-            .establish_session(
-                remote_node_id,
-                relay_candidate.endpoint,
-                relay_candidate.relay_id,
-                self.relay_session_token_ttl_secs,
+        let mut relay_client = self
+            .relay_client
+            .take()
+            .expect("relay client should remain available during establish");
+        let endpoint = relay_client.establish_session_with_round_trip(
+            remote_node_id,
+            relay_candidate.endpoint,
+            relay_candidate.relay_id,
+            self.relay_session_token_ttl_secs,
+            |remote_addr, payload, timeout| {
+                self.controller
+                    .authoritative_transport_round_trip(remote_addr, payload, timeout)
+                    .map(|response| (response.payload, response.remote_addr))
+                    .map_err(|err| RelayClientError::AuthoritativeTransport(err.to_string()))
+            },
+        );
+        self.relay_client = Some(relay_client);
+        let endpoint = endpoint.map_err(|err| {
+            format!(
+                "relay session establishment failed for peer {} via {}: {err}",
+                remote_node_id.as_str(),
+                relay_candidate.endpoint
             )
-            .map_err(|err| {
-                format!(
-                    "relay session establishment failed for peer {} via {}: {err}",
-                    remote_node_id.as_str(),
-                    relay_candidate.endpoint
-                )
-            })?;
+        })?;
         Ok(Some(endpoint))
     }
 
@@ -3741,6 +4206,56 @@ impl DaemonRuntime {
                 remote_node_id.as_str()
             )
         })
+    }
+
+    fn validated_traversal_coordination_schedule(
+        &mut self,
+        remote_node_id: &NodeId,
+        now_unix: u64,
+    ) -> Result<Option<CoordinationSchedule>, String> {
+        let key =
+            traversal_coordination_pair_key(self.local_node_id.as_str(), remote_node_id.as_str());
+        let Some(record) = self
+            .verified_traversal_coordination_index
+            .get(&key)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let verifier_key_bytes = self
+            .traversal_hints
+            .as_ref()
+            .map(|envelope| envelope.verifier_key_bytes)
+            .ok_or_else(|| {
+                format!(
+                    "validated traversal coordination for peer {} is unavailable because traversal state is not loaded",
+                    remote_node_id.as_str()
+                )
+            })?;
+        let local_node_id = NodeId::new(self.local_node_id.clone()).map_err(|err| {
+            format!(
+                "local traversal coordination identity is invalid for peer {}: {err}",
+                remote_node_id.as_str()
+            )
+        })?;
+        let engine = TraversalEngine::new(self.traversal_probe_config.clone())
+            .map_err(|err| format!("invalid traversal engine config: {err}"))?;
+        engine
+            .validate_signed_coordination_record(
+                &record,
+                &local_node_id,
+                remote_node_id,
+                &verifier_key_bytes,
+                &mut self.traversal_coordination_replay_window,
+                now_unix,
+            )
+            .map(Some)
+            .map_err(|err| {
+                format!(
+                    "validated traversal coordination for peer {} is unavailable: {err}",
+                    remote_node_id.as_str()
+                )
+            })
     }
 
     fn build_verified_traversal_index(
@@ -3886,11 +4401,7 @@ impl DaemonRuntime {
                     live_relay_peers: 0,
                     latest_live_handshake_unix: None,
                     relay_session_configured: self.relay_client.is_some(),
-                    relay_session_state: if self.relay_client.is_some() {
-                        "unused"
-                    } else {
-                        "disabled"
-                    },
+                    relay_session_state: self.relay_session_inactive_state(),
                     relay_session_established_peers: 0,
                     relay_session_expired_peers: 0,
                     relay_session_next_expiry_unix: None,
@@ -3911,11 +4422,7 @@ impl DaemonRuntime {
                     live_relay_peers: 0,
                     latest_live_handshake_unix: None,
                     relay_session_configured: self.relay_client.is_some(),
-                    relay_session_state: if self.relay_client.is_some() {
-                        "unused"
-                    } else {
-                        "disabled"
-                    },
+                    relay_session_state: self.relay_session_inactive_state(),
                     relay_session_established_peers: 0,
                     relay_session_expired_peers: 0,
                     relay_session_next_expiry_unix: None,
@@ -3936,11 +4443,7 @@ impl DaemonRuntime {
                     live_relay_peers: 0,
                     latest_live_handshake_unix: None,
                     relay_session_configured: self.relay_client.is_some(),
-                    relay_session_state: if self.relay_client.is_some() {
-                        "unused"
-                    } else {
-                        "disabled"
-                    },
+                    relay_session_state: self.relay_session_inactive_state(),
                     relay_session_established_peers: 0,
                     relay_session_expired_peers: 0,
                     relay_session_next_expiry_unix: None,
@@ -3959,6 +4462,7 @@ impl DaemonRuntime {
         let mut latest_live_handshake_unix: Option<u64> = None;
         let mut relay_session_established_peers = 0usize;
         let mut relay_session_expired_peers = 0usize;
+        let mut relay_session_selected_endpoint_peers = 0usize;
         let mut relay_session_next_expiry_unix: Option<u64> = None;
         let mut direct_live_reasons = BTreeSet::new();
 
@@ -3989,22 +4493,33 @@ impl DaemonRuntime {
                 }
                 PathMode::Relay => {
                     programmed_relay_peers = programmed_relay_peers.saturating_add(1);
+                    let current_endpoint = self.controller.managed_peer_endpoint(&node_id);
                     let session = self
                         .relay_client
                         .as_ref()
                         .and_then(|client| client.session_for_peer(&node_id));
                     if let Some(session) = session {
-                        relay_session_established_peers =
-                            relay_session_established_peers.saturating_add(1);
                         relay_session_next_expiry_unix =
                             Some(match relay_session_next_expiry_unix {
                                 Some(value) => value.min(session.token_expires_at_unix),
                                 None => session.token_expires_at_unix,
                             });
-                        if session.token_expires_at_unix <= now_unix {
+                        if session.is_expired(now_unix) {
                             relay_session_expired_peers =
                                 relay_session_expired_peers.saturating_add(1);
-                        } else if handshake_fresh {
+                            continue;
+                        }
+
+                        relay_session_established_peers =
+                            relay_session_established_peers.saturating_add(1);
+                        let selected_endpoint_matches = current_endpoint
+                            .map(|endpoint| session.matches_selected_endpoint(endpoint))
+                            .unwrap_or(false);
+                        if selected_endpoint_matches {
+                            relay_session_selected_endpoint_peers =
+                                relay_session_selected_endpoint_peers.saturating_add(1);
+                        }
+                        if selected_endpoint_matches && handshake_fresh {
                             live_relay_peers = live_relay_peers.saturating_add(1);
                             latest_live_handshake_unix = Some(
                                 latest_live_handshake_unix
@@ -4061,7 +4576,7 @@ impl DaemonRuntime {
                     "fresh_handshake_observed".to_string()
                 }
             }
-            "relay_active" => "relay_session_alive_with_fresh_handshake".to_string(),
+            "relay_active" => "relay_selected_endpoint_with_fresh_handshake".to_string(),
             "mixed_active" => {
                 if live_peer_count < programmed_peer_count {
                     "partial_live_proof".to_string()
@@ -4073,10 +4588,16 @@ impl DaemonRuntime {
                 if programmed_relay_peers > 0 {
                     if !relay_session_configured {
                         "relay_session_disabled".to_string()
-                    } else if relay_session_established_peers == 0 {
-                        "relay_session_missing".to_string()
+                    } else if self.transport_socket_identity_blocker.is_some() {
+                        "relay_transport_identity_blocked".to_string()
+                    } else if self.controller.authoritative_transport_identity().is_none() {
+                        "relay_transport_unavailable".to_string()
                     } else if relay_session_expired_peers > 0 {
                         "relay_session_expired".to_string()
+                    } else if relay_session_established_peers == 0 {
+                        "relay_session_missing".to_string()
+                    } else if relay_session_selected_endpoint_peers < programmed_relay_peers {
+                        "relay_endpoint_unselected".to_string()
                     } else {
                         "relay_handshake_unproven".to_string()
                     }
@@ -4090,6 +4611,10 @@ impl DaemonRuntime {
 
         let relay_session_state = if !relay_session_configured {
             "disabled"
+        } else if self.transport_socket_identity_blocker.is_some() {
+            "blocked_transport_identity"
+        } else if self.controller.authoritative_transport_identity().is_none() {
+            "unavailable_authoritative_transport"
         } else if programmed_relay_peers == 0 {
             "unused"
         } else if relay_session_established_peers == 0 {
@@ -4100,6 +4625,8 @@ impl DaemonRuntime {
             "partial"
         } else if live_relay_peers == programmed_relay_peers {
             "live"
+        } else if relay_session_selected_endpoint_peers < programmed_relay_peers {
+            "endpoint_unselected"
         } else {
             "established_unproven"
         };
@@ -4684,6 +5211,13 @@ impl DaemonRuntime {
                 let dns_stale_rejections = self.dns_zone_stale_rejections.to_string();
                 let dns_replay_rejections = self.dns_zone_replay_rejections.to_string();
                 let dns_future_dated_rejections = self.dns_zone_future_dated_rejections.to_string();
+                let stun_candidate_local_addrs = self.stun_candidate_local_addrs();
+                let stun_transport_port_binding = self.stun_transport_port_binding();
+                let transport_socket_identity_state = self.transport_socket_identity_state();
+                let transport_socket_identity_error = self.transport_socket_identity_error();
+                let transport_socket_identity_label = self.transport_socket_identity_label();
+                let transport_socket_identity_local_addr =
+                    self.transport_socket_identity_local_addr();
                 let path_state = self.runtime_path_state_summary();
                 let path_live_proven = if path_state.live_proven {
                     "true"
@@ -4704,7 +5238,7 @@ impl DaemonRuntime {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string());
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -4752,6 +5286,10 @@ impl DaemonRuntime {
                     path_state.relay_session_established_peers,
                     path_state.relay_session_expired_peers,
                     relay_session_next_expiry_unix,
+                    transport_socket_identity_state,
+                    transport_socket_identity_error,
+                    transport_socket_identity_label,
+                    transport_socket_identity_local_addr,
                     dns_zone_state,
                     dns_zone_record_count,
                     dns_zone_error,
@@ -4789,6 +5327,8 @@ impl DaemonRuntime {
                     dns_stale_rejections,
                     dns_replay_rejections,
                     dns_future_dated_rejections,
+                    stun_candidate_local_addrs,
+                    stun_transport_port_binding,
                     if self.auto_port_forward_exit {
                         "true"
                     } else {
@@ -4970,10 +5510,22 @@ impl DaemonRuntime {
                     PrivilegedCommandProgram::Ip,
                     &["link", "set", "down", "dev", self.wg_interface.as_str()],
                 )?,
+                DaemonBackendMode::LinuxWireguardUserspaceShared => {
+                    return Err(
+                        "interface down is not supported for linux-wireguard-userspace-shared backend; use backend shutdown"
+                            .to_string(),
+                    );
+                }
                 DaemonBackendMode::MacosWireguard => client.run_capture(
                     PrivilegedCommandProgram::Ifconfig,
                     &[self.wg_interface.as_str(), "down"],
                 )?,
+                DaemonBackendMode::MacosWireguardUserspaceShared => {
+                    return Err(DaemonBackendMode::MacosWireguardUserspaceShared
+                        .userspace_shared_blocker()
+                        .expect("macos shared backend blocker should exist")
+                        .to_string());
+                }
                 DaemonBackendMode::InMemory => {
                     return Err("interface down is not supported for in-memory backend".to_string());
                 }
@@ -4983,7 +5535,11 @@ impl DaemonRuntime {
             }
             let command_label = match self.backend_mode {
                 DaemonBackendMode::LinuxWireguard => "ip link set down",
+                DaemonBackendMode::LinuxWireguardUserspaceShared => "linux userspace-shared down",
                 DaemonBackendMode::MacosWireguard => "ifconfig down",
+                DaemonBackendMode::MacosWireguardUserspaceShared => {
+                    "macos-wireguard-userspace-shared blocked"
+                }
                 DaemonBackendMode::InMemory => "interface down",
             };
             return Err(format!(
@@ -6468,6 +7024,25 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "in-memory backend is disabled in production daemon paths".to_string(),
         ));
     }
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::MacosWireguardUserspaceShared
+    ) {
+        let blocker = config
+            .backend_mode
+            .userspace_shared_blocker()
+            .expect("macos userspace-shared blocker should exist");
+        return Err(DaemonError::InvalidConfig(blocker.to_string()));
+    }
+    #[cfg(all(not(test), not(target_os = "linux")))]
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::LinuxWireguardUserspaceShared
+    ) {
+        return Err(DaemonError::InvalidConfig(
+            "linux-wireguard-userspace-shared backend is only supported on linux".to_string(),
+        ));
+    }
 
     NodeId::new(config.node_id.clone())
         .map_err(|err| DaemonError::InvalidConfig(format!("node id is invalid: {err}")))?;
@@ -6822,11 +7397,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     if matches!(
         config.backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+        DaemonBackendMode::LinuxWireguard
+            | DaemonBackendMode::LinuxWireguardUserspaceShared
+            | DaemonBackendMode::MacosWireguard
     ) && config.wg_private_key_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "wg private key path is required for linux-wireguard or macos-wireguard backend"
+            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, or macos-wireguard backend"
                 .to_string(),
         ));
     }
@@ -6839,11 +7416,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
     if matches!(
         config.backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
+        DaemonBackendMode::LinuxWireguard
+            | DaemonBackendMode::LinuxWireguardUserspaceShared
+            | DaemonBackendMode::MacosWireguard
     ) && config.privileged_helper_socket_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "privileged helper socket path is required for linux-wireguard or macos-wireguard backend"
+            "privileged helper socket path is required for linux-wireguard, linux-wireguard-userspace-shared, or macos-wireguard backend"
                 .to_string(),
         ));
     }
@@ -7536,6 +8115,7 @@ fn is_allowed_traversal_key(key: &str) -> bool {
     if matches!(
         key,
         "version"
+            | "type"
             | "path_policy"
             | "source_node_id"
             | "target_node_id"
@@ -7543,6 +8123,11 @@ fn is_allowed_traversal_key(key: &str) -> bool {
             | "expires_at_unix"
             | "nonce"
             | "candidate_count"
+            | "session_id"
+            | "probe_start_unix"
+            | "node_a"
+            | "node_b"
+            | "issued_at_unix"
             | "signature"
     ) {
         return true;
@@ -7556,6 +8141,14 @@ fn is_allowed_traversal_key(key: &str) -> bool {
     }
 
     false
+}
+
+fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -8669,6 +9262,7 @@ fn load_traversal_bundle_set(
     }
 
     let verifying_key = load_traversal_verifying_key(verifier_key_path)?;
+    let verifier_key_bytes = verifying_key.to_bytes();
     let content = read_traversal_bundle_content(path)?;
     let sections = split_traversal_bundle_sections(&content)?;
     if sections.len() > MAX_TRAVERSAL_BUNDLE_ENTRY_COUNT {
@@ -8678,17 +9272,18 @@ fn load_traversal_bundle_set(
     }
 
     let mut bundles = Vec::with_capacity(sections.len());
+    let mut coordinations = Vec::new();
     for section in &sections {
-        bundles.push(parse_traversal_bundle_section(
-            section,
-            &verifying_key,
-            max_age_secs,
-            trust_policy,
-        )?);
+        match parse_traversal_bundle_section(section, &verifying_key, max_age_secs, trust_policy)? {
+            TraversalSectionEnvelope::Bundle(bundle) => bundles.push(bundle),
+            TraversalSectionEnvelope::Coordination(coordination) => {
+                coordinations.push(coordination)
+            }
+        }
     }
     let Some(first_bundle) = bundles.first() else {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "traversal bundle set is empty".to_string(),
+            "traversal bundle set contains no endpoint hint entries".to_string(),
         ));
     };
     for bundle in &bundles[1..] {
@@ -8703,7 +9298,21 @@ fn load_traversal_bundle_set(
         }
     }
 
-    let payload_digest = traversal_snapshot_payload_digest(&bundles)?;
+    let mut seen_coordination_pairs = BTreeSet::new();
+    for coordination in &coordinations {
+        let key = traversal_coordination_pair_key(
+            coordination.record.node_a.as_str(),
+            coordination.record.node_b.as_str(),
+        );
+        if !seen_coordination_pairs.insert(key) {
+            return Err(TraversalBootstrapError::InvalidFormat(
+                "traversal bundle contains duplicate coordination entries for a node pair"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let payload_digest = traversal_snapshot_payload_digest(&bundles, &coordinations)?;
     let watermark = TraversalWatermark {
         generated_at_unix: first_bundle.bundle.generated_at_unix,
         nonce: first_bundle.bundle.nonce,
@@ -8726,7 +9335,12 @@ fn load_traversal_bundle_set(
         }
     }
 
-    Ok(TraversalBundleSetEnvelope { bundles, watermark })
+    Ok(TraversalBundleSetEnvelope {
+        bundles,
+        coordinations,
+        verifier_key_bytes,
+        watermark,
+    })
 }
 
 fn read_traversal_bundle_content(path: &Path) -> Result<String, TraversalBootstrapError> {
@@ -8795,7 +9409,7 @@ fn parse_traversal_bundle_section(
     verifying_key: &VerifyingKey,
     max_age_secs: u64,
     trust_policy: TrustPolicy,
-) -> Result<TraversalBundleEnvelope, TraversalBootstrapError> {
+) -> Result<TraversalSectionEnvelope, TraversalBootstrapError> {
     let mut payload = String::new();
     let mut signature_hex: Option<String> = None;
     let mut fields = std::collections::HashMap::new();
@@ -8852,6 +9466,14 @@ fn parse_traversal_bundle_section(
         return Err(TraversalBootstrapError::InvalidFormat(
             "unsupported traversal version".to_string(),
         ));
+    }
+    if fields.get("type").map(String::as_str) == Some("traversal_coordination") {
+        return parse_traversal_coordination_section(
+            &payload,
+            &fields,
+            signature_hex,
+            verifying_key,
+        );
     }
     if fields.get("path_policy").map(String::as_str) != Some("direct_preferred_relay_allowed") {
         return Err(TraversalBootstrapError::InvalidFormat(
@@ -9061,7 +9683,7 @@ fn parse_traversal_bundle_section(
         nonce,
         payload_digest: Some(payload_digest),
     };
-    Ok(TraversalBundleEnvelope {
+    Ok(TraversalSectionEnvelope::Bundle(TraversalBundleEnvelope {
         bundle: TraversalBundle {
             source_node_id,
             target_node_id,
@@ -9071,13 +9693,147 @@ fn parse_traversal_bundle_section(
             candidates,
         },
         watermark,
-    })
+    }))
+}
+
+fn parse_traversal_coordination_section(
+    payload: &str,
+    fields: &std::collections::HashMap<String, String>,
+    signature_hex: Option<String>,
+    verifying_key: &VerifyingKey,
+) -> Result<TraversalSectionEnvelope, TraversalBootstrapError> {
+    let expected_field_count = 9usize;
+    if fields.len() != expected_field_count {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "unexpected field count for traversal coordination: expected {expected_field_count}, got {}",
+            fields.len()
+        )));
+    }
+
+    let session_id = decode_traversal_hex_to_fixed::<16>(
+        fields
+            .get("session_id")
+            .ok_or_else(|| {
+                TraversalBootstrapError::InvalidFormat(
+                    "missing coordination session_id".to_string(),
+                )
+            })?
+            .as_str(),
+    )
+    .map_err(|_| {
+        TraversalBootstrapError::InvalidFormat("invalid coordination session_id".to_string())
+    })?;
+    if session_id.iter().all(|value| *value == 0) {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "coordination session_id must not be all zeros".to_string(),
+        ));
+    }
+    let probe_start_unix = fields
+        .get("probe_start_unix")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(
+                "missing coordination probe_start_unix".to_string(),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat(
+                "invalid coordination probe_start_unix".to_string(),
+            )
+        })?;
+    let node_a = fields
+        .get("node_a")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing coordination node_a".to_string())
+        })?
+        .trim()
+        .to_string();
+    let node_b = fields
+        .get("node_b")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat("missing coordination node_b".to_string())
+        })?
+        .trim()
+        .to_string();
+    NodeId::new(node_a.clone())
+        .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
+    NodeId::new(node_b.clone())
+        .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
+    let issued_at_unix = fields
+        .get("issued_at_unix")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(
+                "missing coordination issued_at_unix".to_string(),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat(
+                "invalid coordination issued_at_unix".to_string(),
+            )
+        })?;
+    let expires_at_unix = fields
+        .get("expires_at_unix")
+        .ok_or_else(|| {
+            TraversalBootstrapError::InvalidFormat(
+                "missing coordination expires_at_unix".to_string(),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            TraversalBootstrapError::InvalidFormat(
+                "invalid coordination expires_at_unix".to_string(),
+            )
+        })?;
+    let nonce = decode_traversal_hex_to_fixed::<16>(
+        fields
+            .get("nonce")
+            .ok_or_else(|| {
+                TraversalBootstrapError::InvalidFormat("missing coordination nonce".to_string())
+            })?
+            .as_str(),
+    )
+    .map_err(|_| {
+        TraversalBootstrapError::InvalidFormat("invalid coordination nonce".to_string())
+    })?;
+    if nonce.iter().all(|value| *value == 0) {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "coordination nonce must not be all zeros".to_string(),
+        ));
+    }
+
+    let signature_hex = signature_hex.ok_or_else(|| {
+        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_string())
+    })?;
+    let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| TraversalBootstrapError::SignatureInvalid)?;
+
+    Ok(TraversalSectionEnvelope::Coordination(
+        TraversalCoordinationEnvelope {
+            record: SignedTraversalCoordinationRecord {
+                payload: payload.to_string(),
+                signature_hex,
+                session_id,
+                probe_start_unix,
+                node_a,
+                node_b,
+                issued_at_unix,
+                expires_at_unix,
+                nonce,
+            },
+            payload_digest: sha256_digest(payload.as_bytes()),
+        },
+    ))
 }
 
 fn traversal_snapshot_payload_digest(
     bundles: &[TraversalBundleEnvelope],
+    coordinations: &[TraversalCoordinationEnvelope],
 ) -> Result<[u8; 32], TraversalBootstrapError> {
-    if bundles.len() == 1 {
+    if coordinations.is_empty() && bundles.len() == 1 {
         return bundles[0]
             .watermark
             .payload_digest
@@ -9103,6 +9859,34 @@ fn traversal_snapshot_payload_digest(
     let mut hasher = Sha256::new();
     for (_source_node_id, _target_node_id, digest) in ordered_digests {
         hasher.update(digest);
+    }
+    if !coordinations.is_empty() {
+        let mut ordered_coordination_digests = coordinations
+            .iter()
+            .map(|coordination| {
+                Ok((
+                    traversal_coordination_pair_key(
+                        coordination.record.node_a.as_str(),
+                        coordination.record.node_b.as_str(),
+                    ),
+                    coordination.record.probe_start_unix,
+                    coordination.payload_digest,
+                ))
+            })
+            .collect::<Result<Vec<_>, TraversalBootstrapError>>()?;
+        ordered_coordination_digests.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        });
+        for ((node_a, node_b), probe_start_unix, digest) in ordered_coordination_digests {
+            hasher.update(b"coordination");
+            hasher.update(node_a.as_bytes());
+            hasher.update(node_b.as_bytes());
+            hasher.update(probe_start_unix.to_be_bytes());
+            hasher.update(digest);
+        }
     }
     Ok(hasher.finalize().into())
 }
@@ -9906,12 +10690,12 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::net::SocketAddr;
+    use std::net::{SocketAddr, UdpSocket};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::ipc::{
         CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
@@ -9921,7 +10705,8 @@ mod tests {
     use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rustynet_backend_api::{NodeId, SocketEndpoint};
+    use rustynet_backend_api::{NodeId, RuntimeContext, SocketEndpoint, TunnelBackend};
+    use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
@@ -9948,6 +10733,7 @@ mod tests {
         zeroize_optional_bytes,
     };
     use crate::phase10::{DataplaneState, PathMode, TraversalProbeDecision, TraversalProbeReason};
+    use crate::stun_client::StunResult;
 
     fn hex_encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
@@ -9955,6 +10741,54 @@ mod tests {
             out.push_str(&format!("{byte:02x}"));
         }
         out
+    }
+
+    #[test]
+    fn format_stun_local_addrs_reports_none_when_empty() {
+        assert_eq!(super::format_stun_local_addrs(&[]), "none");
+    }
+
+    #[test]
+    fn stun_local_port_match_state_reports_mismatch_when_observed_port_differs() {
+        let observations = vec![StunResult {
+            mapped_endpoint: "198.51.100.20:61000"
+                .parse()
+                .expect("endpoint should parse"),
+            server: "198.51.100.1:3478".parse().expect("server should parse"),
+            local_addr: "0.0.0.0:49152".parse().expect("local addr should parse"),
+        }];
+        assert_eq!(
+            super::stun_local_port_match_state(&observations, 51820),
+            "all_mismatch_wg_listen_port"
+        );
+        assert_eq!(
+            super::format_stun_local_addrs(&observations),
+            "0.0.0.0:49152"
+        );
+    }
+
+    #[test]
+    fn stun_local_port_match_state_reports_mixed_when_ports_do_not_agree() {
+        let observations = vec![
+            StunResult {
+                mapped_endpoint: "198.51.100.20:61000"
+                    .parse()
+                    .expect("endpoint should parse"),
+                server: "198.51.100.1:3478".parse().expect("server should parse"),
+                local_addr: "0.0.0.0:51820".parse().expect("local addr should parse"),
+            },
+            StunResult {
+                mapped_endpoint: "198.51.100.21:61001"
+                    .parse()
+                    .expect("endpoint should parse"),
+                server: "198.51.100.2:3478".parse().expect("server should parse"),
+                local_addr: "0.0.0.0:49152".parse().expect("local addr should parse"),
+            },
+        ];
+        assert_eq!(
+            super::stun_local_port_match_state(&observations, 51820),
+            "mixed"
+        );
     }
 
     fn write_signed_kv_artifact(path: &Path, verifier_path: &Path, seed: [u8; 32], payload: &str) {
@@ -10003,6 +10837,80 @@ mod tests {
             ),
         )
         .expect("signed artifact should be written");
+    }
+
+    fn write_signed_kv_sections(
+        path: &Path,
+        verifier_path: &Path,
+        seed: [u8; 32],
+        payloads: &[String],
+    ) {
+        write_signed_kv_sections_with_verifier_seed(path, verifier_path, seed, seed, payloads);
+    }
+
+    fn write_signed_kv_sections_with_verifier_seed(
+        path: &Path,
+        verifier_path: &Path,
+        signer_seed: [u8; 32],
+        verifier_seed: [u8; 32],
+        payloads: &[String],
+    ) {
+        let signing_key = SigningKey::from_bytes(&signer_seed);
+        let verifier_signing_key = SigningKey::from_bytes(&verifier_seed);
+        std::fs::write(
+            verifier_path,
+            format!(
+                "{}\n",
+                hex_encode(verifier_signing_key.verifying_key().as_bytes())
+            ),
+        )
+        .expect("verifier key should be written");
+
+        let mut body = String::new();
+        for (index, payload) in payloads.iter().enumerate() {
+            if index > 0 {
+                body.push('\n');
+            }
+            let signature = signing_key.sign(payload.as_bytes());
+            body.push_str(payload);
+            body.push_str(&format!(
+                "signature={}\n",
+                hex_encode(&signature.to_bytes())
+            ));
+        }
+        std::fs::write(path, body).expect("signed sections should be written");
+    }
+
+    fn traversal_bundle_payload(
+        source_node: &str,
+        target_node: &str,
+        nonce: u64,
+        relay_addr: SocketAddr,
+        relay_label: &str,
+        generated: u64,
+        expires: u64,
+    ) -> String {
+        format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id={source_node}\ntarget_node_id={target_node}\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr={}\ncandidate.1.port={}\ncandidate.1.family=ipv4\ncandidate.1.relay_id={relay_label}\ncandidate.1.priority=20\n",
+            relay_addr.ip(),
+            relay_addr.port(),
+        )
+    }
+
+    fn traversal_coordination_payload(
+        session_id: [u8; 16],
+        probe_start_unix: u64,
+        node_a: &str,
+        node_b: &str,
+        issued_at_unix: u64,
+        expires_at_unix: u64,
+        nonce: [u8; 16],
+    ) -> String {
+        format!(
+            "version=1\ntype=traversal_coordination\nsession_id={}\nprobe_start_unix={probe_start_unix}\nnode_a={node_a}\nnode_b={node_b}\nissued_at_unix={issued_at_unix}\nexpires_at_unix={expires_at_unix}\nnonce={}\n",
+            hex_encode(&session_id),
+            hex_encode(&nonce),
+        )
     }
 
     #[allow(dead_code)]
@@ -11026,6 +11934,23 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct TraversalFixtureTiming {
+        generated_at_unix: u64,
+        ttl_secs: u64,
+        tamper_after_sign: bool,
+    }
+
+    impl TraversalFixtureTiming {
+        fn fresh(ttl_secs: u64, tamper_after_sign: bool) -> Self {
+            Self {
+                generated_at_unix: unix_now(),
+                ttl_secs,
+                tamper_after_sign,
+            }
+        }
+    }
+
     fn write_dns_zone_file_with_timing(
         path: &Path,
         verifier_path: &Path,
@@ -11154,13 +12079,13 @@ mod tests {
         std::fs::write(path, body).expect("traversal file should be written");
     }
 
-    fn write_traversal_file(
+    fn write_traversal_file_with_timing(
         path: &Path,
         verifier_path: &Path,
         source_node: &str,
         target_node: &str,
         nonce: u64,
-        tamper_after_sign: bool,
+        timing: TraversalFixtureTiming,
     ) {
         let signing_key = SigningKey::from_bytes(&[23u8; 32]);
         std::fs::write(
@@ -11169,8 +12094,8 @@ mod tests {
         )
         .expect("traversal verifier key should be written");
 
-        let generated = unix_now();
-        let expires = generated.saturating_add(60);
+        let generated = timing.generated_at_unix;
+        let expires = generated.saturating_add(timing.ttl_secs);
         let payload = format!(
             "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id={source_node}\ntarget_node_id={target_node}\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n"
         );
@@ -11180,10 +12105,55 @@ mod tests {
             payload,
             hex_encode(&signature.to_bytes())
         );
-        if tamper_after_sign {
+        if timing.tamper_after_sign {
             body = body.replace("candidate_count=2", "candidate_count=3");
         }
         std::fs::write(path, body).expect("traversal file should be written");
+    }
+
+    fn write_traversal_file(
+        path: &Path,
+        verifier_path: &Path,
+        source_node: &str,
+        target_node: &str,
+        nonce: u64,
+        tamper_after_sign: bool,
+    ) {
+        write_traversal_file_with_timing(
+            path,
+            verifier_path,
+            source_node,
+            target_node,
+            nonce,
+            TraversalFixtureTiming::fresh(60, tamper_after_sign),
+        );
+    }
+
+    fn write_traversal_file_with_coordination(
+        path: &Path,
+        verifier_path: &Path,
+        source_node: &str,
+        target_node: &str,
+        nonce: u64,
+        coordination_payload: &str,
+    ) {
+        let generated = unix_now();
+        let expires = generated.saturating_add(60);
+        let bundle_payload = traversal_bundle_payload(
+            source_node,
+            target_node,
+            nonce,
+            "203.0.113.77:443".parse().expect("relay addr should parse"),
+            "relay-eu-1",
+            generated,
+            expires,
+        );
+        write_signed_kv_sections(
+            path,
+            verifier_path,
+            [23u8; 32],
+            &[bundle_payload, coordination_payload.to_string()],
+        );
     }
 
     fn write_traversal_file_with_custom_relay(
@@ -11221,6 +12191,23 @@ mod tests {
         .expect("custom relay traversal file should be written");
     }
 
+    fn valid_coordination_payload_for_peer(
+        local_node_id: &str,
+        remote_node_id: &str,
+        now_unix: u64,
+        marker: u8,
+    ) -> String {
+        traversal_coordination_payload(
+            [marker; 16],
+            now_unix,
+            local_node_id,
+            remote_node_id,
+            now_unix.saturating_sub(1),
+            now_unix.saturating_add(20),
+            [marker.saturating_add(1); 16],
+        )
+    }
+
     fn build_test_relay_client(
         local_node_id: &str,
         session_timeout: Duration,
@@ -11236,12 +12223,54 @@ mod tests {
                 keepalive_interval: Duration::from_secs(25),
                 max_sessions_per_peer: 2,
                 recv_timeout,
+                local_port: None,
             },
         );
         for result in scripted_establishments {
             relay_client.script_establish_session_result(result);
         }
         relay_client
+    }
+
+    fn relay_hello_ack_bytes(session_id: [u8; 16], allocated_port: u16) -> Vec<u8> {
+        let mut bytes = vec![0x02];
+        bytes.extend_from_slice(&session_id);
+        bytes.extend_from_slice(&allocated_port.to_be_bytes());
+        bytes
+    }
+
+    fn configure_runtime_authoritative_transport(
+        runtime: &mut DaemonRuntime,
+        local_addr: SocketAddr,
+    ) {
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .configure_authoritative_shared_transport_for_test(
+                local_addr,
+                "daemon-test-authoritative-shared-transport",
+            )
+            .expect("authoritative transport should be configurable for in-memory backend");
+    }
+
+    fn script_runtime_authoritative_relay_ack(
+        runtime: &mut DaemonRuntime,
+        relay_addr: SocketAddr,
+        local_addr: SocketAddr,
+        session_id: [u8; 16],
+        allocated_port: u16,
+    ) {
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_round_trip_for_test(Ok(
+                rustynet_backend_api::AuthoritativeTransportResponse {
+                    local_addr,
+                    remote_addr: relay_addr,
+                    payload: relay_hello_ack_bytes(session_id, allocated_port),
+                },
+            ))
+            .expect("relay authoritative round trip should be scriptable");
     }
 
     fn build_runtime_with_custom_relay(
@@ -11309,6 +12338,149 @@ mod tests {
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
+        let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        (runtime, test_dir)
+    }
+
+    fn free_udp_port() -> u16 {
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .expect("ephemeral udp port should be available");
+        socket.local_addr().expect("local addr").port()
+    }
+
+    fn write_valid_userspace_shared_private_key(path: &Path) {
+        std::fs::write(path, b"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n")
+            .expect("valid userspace-shared private key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("userspace-shared private key permissions should be restrictive");
+        }
+    }
+
+    fn build_runtime_with_linux_userspace_shared_backend(
+        test_name: &str,
+    ) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.33:40023".parse().expect("relay addr");
+        let test_dir = secure_test_dir(test_name);
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        let private_key_path = test_dir.join("wireguard.key");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 11);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            11,
+            false,
+        );
+        write_traversal_file_with_custom_relay(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            12,
+            relay_addr,
+            "relay-eu-1",
+        );
+        write_valid_userspace_shared_private_key(&private_key_path);
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            traversal_probe_handshake_freshness_secs: NonZeroU64::new(15)
+                .expect("test traversal handshake freshness should be non-zero"),
+            traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
+                .expect("test traversal reprobe interval should be non-zero"),
+            traversal_stun_servers: vec![
+                "127.0.0.1:3478"
+                    .parse()
+                    .expect("test stun server should parse"),
+            ],
+            backend_mode: DaemonBackendMode::LinuxWireguardUserspaceShared,
+            wg_private_key_path: Some(private_key_path),
+            privileged_helper_socket_path: Some(test_dir.join("privileged-helper.sock")),
+            wg_listen_port: free_udp_port(),
+            ..DaemonConfig::default()
+        };
+        let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        (runtime, test_dir)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn current_platform_production_backend_mode() -> DaemonBackendMode {
+        #[cfg(target_os = "linux")]
+        {
+            DaemonBackendMode::LinuxWireguard
+        }
+        #[cfg(target_os = "macos")]
+        {
+            DaemonBackendMode::MacosWireguard
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn build_runtime_with_blocked_production_backend(
+        test_name: &str,
+    ) -> (DaemonRuntime, std::path::PathBuf) {
+        let test_dir = secure_test_dir(test_name);
+        let private_key_path = test_dir.join("wireguard.key");
+        std::fs::write(&private_key_path, b"wireguard-private-key\n")
+            .expect("test private key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("test private key permissions should be restrictive");
+        }
+
+        let mut config = DaemonConfig {
+            backend_mode: current_platform_production_backend_mode(),
+            traversal_stun_servers: vec![
+                "127.0.0.1:3478"
+                    .parse()
+                    .expect("test stun server should parse"),
+            ],
+            wg_private_key_path: Some(private_key_path),
+            privileged_helper_socket_path: Some(test_dir.join("privileged-helper.sock")),
+            ..DaemonConfig::default()
+        };
+        #[cfg(target_os = "macos")]
+        {
+            config.wg_interface = "utun9".to_string();
+            config.egress_interface = "en0".to_string();
+        }
+
         let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         (runtime, test_dir)
     }
@@ -11528,6 +12700,43 @@ mod tests {
             err.to_string()
                 .contains("supported only with linux-wireguard backend")
         );
+    }
+
+    #[test]
+    fn validate_daemon_config_accepts_linux_userspace_shared_backend() {
+        let test_dir = secure_test_dir("rustynetd-validate-linux-userspace-shared");
+        let private_key_path = test_dir.join("wireguard.key");
+        std::fs::write(&private_key_path, b"valid-wireguard-private-key\n")
+            .expect("test private key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("test private key permissions should be restrictive");
+        }
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::LinuxWireguardUserspaceShared,
+            wg_private_key_path: Some(private_key_path),
+            privileged_helper_socket_path: Some(test_dir.join("privileged-helper.sock")),
+            ..DaemonConfig::default()
+        };
+        validate_daemon_config(&config)
+            .expect("linux userspace-shared backend config should now validate");
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_macos_userspace_shared_backend_with_precise_blocker() {
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::MacosWireguardUserspaceShared,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("unimplemented macos userspace-shared backend must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("macos-wireguard-userspace-shared backend is not implemented"));
+        assert!(message.contains("backend-owned Rust userspace WireGuard engine"));
+        assert!(message.contains("authoritative peer UDP socket"));
     }
 
     #[test]
@@ -12238,6 +13447,67 @@ mod tests {
     }
 
     #[test]
+    fn traversal_bundle_set_accepts_signed_coordination_and_rejects_malformed_section() {
+        let test_dir = secure_test_dir("rustynetd-traversal-coordination-ingestion");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let verifier_path = test_dir.join("traversal.verifier.pub");
+
+        let valid_coordination =
+            valid_coordination_payload_for_peer("node-a", "node-b", unix_now(), 0x31);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &verifier_path,
+            "node-a",
+            "node-b",
+            300,
+            &valid_coordination,
+        );
+        let envelope = load_traversal_bundle_set(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("mixed traversal bundle should load");
+        assert_eq!(envelope.bundles.len(), 1);
+        assert_eq!(envelope.coordinations.len(), 1);
+        assert_eq!(envelope.coordinations[0].record.node_a, "node-a");
+        assert_eq!(envelope.coordinations[0].record.node_b, "node-b");
+
+        let malformed_coordination = format!(
+            "version=1\ntype=traversal_coordination\nsession_id={}\nprobe_start_unix={}\nnode_a=node-a\nissued_at_unix={}\nexpires_at_unix={}\nnonce={}\n",
+            hex_encode(&[0x33; 16]),
+            unix_now(),
+            unix_now(),
+            unix_now().saturating_add(20),
+            hex_encode(&[0x44; 16]),
+        );
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &verifier_path,
+            "node-a",
+            "node-b",
+            301,
+            &malformed_coordination,
+        );
+        let err = load_traversal_bundle_set(
+            &traversal_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("malformed coordination section must fail closed");
+        assert!(matches!(
+            err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn artifact_limitgate_rejects_count_overflow_for_assignment_and_traversal() {
         let test_dir = secure_test_dir("rustynetd-artifact-limit-count-overflow");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -12713,13 +13983,15 @@ mod tests {
             1,
             false,
         );
-        write_traversal_file(
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x41);
+        write_traversal_file_with_coordination(
             &traversal_path,
             &traversal_verifier_path,
             "daemon-local",
             "node-exit",
             2,
-            false,
+            &coordination_payload,
         );
 
         let config = DaemonConfig {
@@ -12758,6 +14030,18 @@ mod tests {
         seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
         runtime.controller.set_stability_windows(0, 0);
+        runtime.local_stun_observations = vec![StunResult {
+            mapped_endpoint: "198.51.100.20:61000"
+                .parse()
+                .expect("mapped endpoint should parse"),
+            server: "198.51.100.1:3478".parse().expect("server should parse"),
+            local_addr: "0.0.0.0:49152".parse().expect("local addr should parse"),
+        }];
+        runtime.local_stun_candidates = runtime
+            .local_stun_observations
+            .iter()
+            .map(|result| result.mapped_endpoint)
+            .collect();
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
         assert_eq!(
@@ -12792,6 +14076,16 @@ mod tests {
         );
         assert!(status.message.contains("path_live_proven=false"));
         assert!(status.message.contains("relay_session_state=disabled"));
+        assert!(
+            status
+                .message
+                .contains("stun_candidate_local_addrs=0.0.0.0:49152")
+        );
+        assert!(
+            status
+                .message
+                .contains("stun_transport_port_binding=all_mismatch_wg_listen_port")
+        );
         assert!(status.message.contains("traversal_authority=enforced_v1"));
         assert!(status.message.contains("traversal_probe_max_candidates=4"));
         assert!(status.message.contains("traversal_probe_max_pairs=4"));
@@ -12828,6 +14122,16 @@ mod tests {
                 .contains("traversal_probe_next_reprobe_unix=none")
         );
 
+        let refreshed_coordination =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x42);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            3,
+            &refreshed_coordination,
+        );
         let netcheck = runtime.handle_command(IpcCommand::Netcheck);
         assert!(netcheck.ok);
         assert!(netcheck.message.contains("path_mode=relay_programmed"));
@@ -12848,6 +14152,16 @@ mod tests {
         );
         assert!(netcheck.message.contains("path_live_proven=false"));
         assert!(netcheck.message.contains("relay_session_state=disabled"));
+        assert!(
+            netcheck
+                .message
+                .contains("stun_candidate_local_addrs=0.0.0.0:49152")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("stun_transport_port_binding=all_mismatch_wg_listen_port")
+        );
         assert!(netcheck.message.contains("traversal_authority=enforced_v1"));
         assert!(
             netcheck
@@ -12953,6 +14267,510 @@ mod tests {
                 .expect("relay client should be configured")
                 .has_session(&exit_node)
         );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap() {
+        let relay_addr: SocketAddr = "203.0.113.16:40006".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-transport-identity-blocked",
+            relay_addr,
+            "relay-eu-1",
+        );
+        runtime.transport_socket_identity_blocker =
+            Some("authoritative backend udp socket unavailable".to_string());
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            vec![Ok(61_013)],
+        ));
+
+        runtime.bootstrap();
+
+        assert_eq!(runtime.controller.state(), DataplaneState::FailClosed);
+        assert!(
+            runtime
+                .traversal_hint_error
+                .as_deref()
+                .expect("blocked relay bootstrap should record traversal error")
+                .contains("validated signed traversal coordination required for direct probe")
+        );
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("relay_session_configured=true"));
+        assert!(
+            status
+                .message
+                .contains("relay_session_state=blocked_transport_identity")
+        );
+        assert!(
+            status
+                .message
+                .contains("transport_socket_identity_state=blocked_backend_opaque_socket")
+        );
+        assert!(status.message.contains(
+            "transport_socket_identity_error=authoritative_backend_udp_socket_unavailable"
+        ));
+        assert!(
+            !runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should remain configured")
+                .has_session(&NodeId::new("node-exit").expect("test node id should parse"))
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_transport_socket_identity_blocker_rejects_bound_relay_side_socket() {
+        let relay_addr: SocketAddr = "203.0.113.26:40016".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-transport-bound-side-socket-blocked",
+            relay_addr,
+            "relay-eu-1",
+        );
+        runtime.transport_socket_identity_blocker =
+            Some("authoritative backend udp socket unavailable".to_string());
+        let mut relay_client = build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            vec![Ok(61_023)],
+        );
+        relay_client.set_bound_for_test(true);
+        assert!(relay_client.is_bound());
+        runtime.relay_client = Some(relay_client);
+
+        runtime.bootstrap();
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(
+            status
+                .message
+                .contains("relay_session_state=blocked_transport_identity")
+        );
+        assert!(
+            !runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should remain configured")
+                .has_session(&NodeId::new("node-exit").expect("test node id should parse"))
+        );
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("relay_session_state=blocked_transport_identity")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=blocked_backend_opaque_socket")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker() {
+        let (runtime, test_dir) = build_runtime_with_blocked_production_backend(
+            "rustynetd-runtime-production-backend-transport-identity-blocked",
+        );
+
+        assert!(
+            runtime.transport_socket_identity_blocker.is_some(),
+            "production backend should report an authoritative transport blocker"
+        );
+        assert!(
+            runtime.next_stun_refresh_at.is_none(),
+            "daemon must not schedule authoritative STUN refresh when backend transport is opaque"
+        );
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "blocked_backend_opaque_socket"
+        );
+        assert_eq!(runtime.local_stun_candidates.len(), 0);
+        assert_eq!(runtime.stun_candidate_local_addrs(), "none");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state() {
+        let (mut runtime, test_dir) = build_runtime_with_linux_userspace_shared_backend(
+            "rustynetd-runtime-linux-userspace-shared-authoritative-transport",
+        );
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .start(RuntimeContext {
+                local_node: NodeId::new("daemon-local").expect("test node id should parse"),
+                interface_name: runtime.wg_interface.clone(),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.0.1/32".to_string(),
+            })
+            .expect("linux userspace-shared backend should start");
+
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(
+            status
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity() {
+        let relay_addr: SocketAddr = "203.0.113.31:40021".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-authoritative-stun-shared-transport",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let stun_server: SocketAddr = "198.51.100.1:3478"
+            .parse()
+            .expect("stun server should parse");
+        let mapped_endpoint: SocketAddr = "198.51.100.24:62000"
+            .parse()
+            .expect("mapped endpoint should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        runtime.traversal_probe_config.stun_servers = vec![stun_server];
+        runtime.next_stun_refresh_at = Some(Instant::now());
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_stun_round_trip_for_test(stun_server, mapped_endpoint)
+            .expect("stun authoritative round trip should be scriptable");
+
+        runtime.bootstrap();
+        runtime.poll_stun_results();
+
+        assert_eq!(runtime.local_stun_candidates, vec![mapped_endpoint]);
+        assert_eq!(runtime.stun_candidate_local_addrs(), "0.0.0.0:51820");
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            operations[0].kind,
+            RecordedAuthoritativeTransportOperationKind::RoundTrip
+        );
+        assert_eq!(operations[0].local_addr, authoritative_local_addr);
+        assert_eq!(operations[0].remote_addr, stun_server);
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_local_addr=0.0.0.0:51820")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("stun_candidates=198.51.100.24:62000")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("stun_candidate_local_addrs=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_establish_and_keepalive_use_backend_shared_transport_identity() {
+        let relay_addr: SocketAddr = "203.0.113.32:40022".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-authoritative-relay-shared-transport",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let allocated_port = 61_044;
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x44; 16],
+            allocated_port,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(60),
+            );
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_send_result_for_test(Ok(()))
+            .expect("relay authoritative keepalive send should be scriptable");
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay runtime sync should succeed");
+
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(
+            operations[0].kind,
+            RecordedAuthoritativeTransportOperationKind::RoundTrip
+        );
+        assert_eq!(operations[0].local_addr, authoritative_local_addr);
+        assert_eq!(operations[0].remote_addr, relay_addr);
+        assert_eq!(
+            operations[1].kind,
+            RecordedAuthoritativeTransportOperationKind::Send
+        );
+        assert_eq!(operations[1].local_addr, authoritative_local_addr);
+        assert_eq!(
+            operations[1].remote_addr,
+            SocketAddr::new(relay_addr.ip(), allocated_port)
+        );
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
+                addr: relay_addr.ip(),
+                port: allocated_port,
+            })
+        );
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(
+            status
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        assert!(
+            status
+                .message
+                .contains("transport_socket_identity_local_addr=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_session_is_programmed_but_not_live_without_fresh_handshake() {
+        let relay_addr: SocketAddr = "203.0.113.13:40003".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-session-unproven",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x10; 16],
+            61_010,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=relay_programmed"));
+        assert!(
+            netcheck
+                .message
+                .contains("path_reason=relay_handshake_unproven")
+        );
+        assert!(netcheck.message.contains("path_live_proven=false"));
+        assert!(
+            netcheck
+                .message
+                .contains("relay_session_state=established_unproven")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("relay_session_established_peers=1")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake() {
+        let relay_addr: SocketAddr = "203.0.113.14:40004".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-session-live",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x11; 16],
+            61_011,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let relay_endpoint = SocketEndpoint {
+            addr: relay_addr.ip(),
+            port: 61_011,
+        };
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(relay_endpoint, Some(unix_now()))
+            .expect("relay handshake injection should succeed");
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(PathMode::Relay)
+        );
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(relay_endpoint)
+        );
+        assert!(netcheck.message.contains("path_mode=relay_active"));
+        assert!(
+            netcheck
+                .message
+                .contains("path_reason=relay_selected_endpoint_with_fresh_handshake")
+        );
+        assert!(netcheck.message.contains("path_live_proven=true"));
+        assert!(netcheck.message.contains("relay_session_state=live"));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_session_endpoint_mismatch_is_not_live() {
+        let relay_addr: SocketAddr = "203.0.113.15:40005".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-endpoint-mismatch",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x12; 16],
+            61_012,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            vec![Ok(61_012)],
+        ));
+
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let established_relay_endpoint = SocketEndpoint {
+            addr: relay_addr.ip(),
+            port: 61_012,
+        };
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(established_relay_endpoint, Some(unix_now()))
+            .expect("relay handshake injection should succeed");
+        runtime
+            .controller
+            .configure_traversal_paths(
+                &exit_node,
+                None,
+                Some(SocketEndpoint {
+                    addr: relay_addr.ip(),
+                    port: 61_013,
+                }),
+            )
+            .expect("controller relay endpoint should be reconfigurable");
+
+        let path_state = runtime.runtime_path_state_summary();
+        assert_eq!(path_state.live_mode, "relay_programmed");
+        assert_eq!(path_state.live_reason, "relay_endpoint_unselected");
+        assert!(!path_state.live_proven);
+        assert_eq!(path_state.relay_session_state, "endpoint_unselected");
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -13070,8 +14888,8 @@ mod tests {
     }
 
     #[test]
-    fn daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay() {
-        let test_dir = secure_test_dir("rustynetd-runtime-traversal-periodic-reprobe");
+    fn daemon_runtime_requires_signed_coordination_for_direct_probe_attempts() {
+        let test_dir = secure_test_dir("rustynetd-runtime-requires-coordination");
         let state_path = test_dir.join("daemon.state");
         let trust_path = test_dir.join("trust.evidence");
         let trust_verifier_path = test_dir.join("trust.verifier.pub");
@@ -13106,6 +14924,94 @@ mod tests {
             "node-exit",
             2,
             false,
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let status = runtime
+            .traversal_probe_statuses
+            .get(&exit_node)
+            .expect("relay status should exist");
+        assert_eq!(status.decision, TraversalProbeDecision::Relay);
+        assert_eq!(
+            status.reason,
+            TraversalProbeReason::CoordinationRequiredRelayArmed
+        );
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(PathMode::Relay)
+        );
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
+                addr: "203.0.113.77".parse().expect("ipv4 should parse"),
+                port: 443,
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-periodic-reprobe");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x51);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            &coordination_payload,
         );
 
         let config = DaemonConfig {
@@ -13170,6 +15076,17 @@ mod tests {
             Some(PathMode::Relay)
         );
 
+        let refreshed_coordination =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x52);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            3,
+            &refreshed_coordination,
+        );
+        runtime.refresh_traversal_hint_state(false);
         runtime
             .traversal_probe_statuses
             .get_mut(&exit_node)
@@ -13251,13 +15168,15 @@ mod tests {
             1,
             false,
         );
-        write_traversal_file(
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x61);
+        write_traversal_file_with_coordination(
             &traversal_path,
             &traversal_verifier_path,
             "daemon-local",
             "node-exit",
             2,
-            false,
+            &coordination_payload,
         );
 
         let config = DaemonConfig {
@@ -13298,6 +15217,17 @@ mod tests {
             .backend_mut_for_test()
             .set_test_endpoint_latest_handshake_unix(direct_endpoint, Some(unix_now()))
             .expect("test handshake injection should succeed");
+        let refreshed_coordination =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x62);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            3,
+            &refreshed_coordination,
+        );
+        runtime.refresh_traversal_hint_state(false);
         runtime
             .traversal_probe_statuses
             .get_mut(&exit_node)
@@ -13344,6 +15274,156 @@ mod tests {
                 .expect("live handshake should be reflected in retained status")
                 >= prior_evaluated_at_unix
         );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-direct-expiry-failover");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x81);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            &coordination_payload,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            traversal_probe_handshake_freshness_secs: NonZeroU64::new(60)
+                .expect("test traversal handshake freshness should be non-zero"),
+            traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
+                .expect("test traversal reprobe interval should be non-zero"),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
+        runtime.bootstrap();
+        runtime.controller.set_stability_windows(0, 0);
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let direct_endpoint = SocketEndpoint {
+            addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+            port: 51820,
+        };
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(direct_endpoint, Some(unix_now()))
+            .expect("test handshake injection should succeed");
+        let refreshed_coordination =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x82);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            3,
+            &refreshed_coordination,
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime
+            .traversal_probe_statuses
+            .get_mut(&exit_node)
+            .expect("relay probe status should exist")
+            .next_reprobe_unix = Some(unix_now());
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("due reprobe should promote direct path");
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(PathMode::Direct)
+        );
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_test_endpoint_latest_handshake_unix(
+                direct_endpoint,
+                Some(
+                    unix_now().saturating_sub(runtime.traversal_probe_handshake_freshness_secs + 1),
+                ),
+            )
+            .expect("stale handshake injection should succeed");
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("stale direct liveness should reprobe and fall back to relay");
+
+        let failover_status = runtime
+            .traversal_probe_statuses
+            .get(&exit_node)
+            .expect("relay failover status should exist");
+        assert_eq!(failover_status.decision, TraversalProbeDecision::Relay);
+        assert_eq!(
+            failover_status.reason,
+            TraversalProbeReason::CoordinationRequiredRelayArmed
+        );
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(PathMode::Relay)
+        );
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=relay_programmed"));
+        assert!(netcheck.message.contains("path_live_proven=false"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -13435,6 +15515,17 @@ mod tests {
                 Some(unix_now()),
             )
             .expect("test handshake injection should succeed");
+        let refreshed_coordination =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x72);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            3,
+            &refreshed_coordination,
+        );
+        runtime.refresh_traversal_hint_state(false);
         runtime
             .traversal_probe_statuses
             .get_mut(&exit_node)
@@ -13829,17 +15920,22 @@ mod tests {
         );
         runtime.refresh_traversal_hint_state(true);
 
-        write_traversal_file(
+        let valid_generated = unix_now();
+        write_traversal_file_with_timing(
             &traversal_path,
             &traversal_verifier_path,
             "daemon-local",
             "node-exit",
             42,
-            false,
+            TraversalFixtureTiming {
+                generated_at_unix: valid_generated,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
         );
         runtime.refresh_traversal_hint_state(true);
 
-        let replay_generated = unix_now();
+        let replay_generated = valid_generated;
         let replay_expires = replay_generated.saturating_add(60);
         let replay_payload = format!(
             "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={replay_generated}\nexpires_at_unix={replay_expires}\nnonce=41\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
@@ -15108,7 +17204,7 @@ mod tests {
         assert!(
             netcheck
                 .message
-                .contains("traversal_probe_reason=direct_probe_exhausted_relay_armed")
+                .contains("traversal_probe_reason=coordination_required_relay_armed")
         );
         assert!(runtime.controller.has_armed_relay_path());
 
