@@ -1026,6 +1026,20 @@ Validation outcomes:
   - `./scripts/ci/phase10_gates.sh` fails only because `artifacts/phase10/fresh_install_os_matrix_report.json` is stale for current `HEAD`; in this run the gate reported `report=c86a62a766b8af8382dfa57805aec8b4cad284ff expected=06e3e2ed745b4439505991bea775246cde8ed653`
   - `./scripts/ci/membership_gates.sh` does not expose a userspace-shared backend regression; it ultimately fails only because it delegates into the same stale fresh-install evidence gate already reported by `phase10_gates.sh`
 
+Post-phase live-lab correction from 2026-04-02:
+- Two reduced five-node helper reruns on committed `main` materially advanced the production Linux userspace-shared path:
+  - [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now prepares and scrubs runtime WireGuard key material for `linux-wireguard-userspace-shared` exactly like the command-only Linux backend, which cleared the earlier startup failure on missing `/run/rustynet/wireguard.key`.
+  - [scripts/systemd/rustynetd-privileged-helper.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd-privileged-helper.service) and [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs) now expose `/dev/net/tun` inside the privileged-helper private device namespace, which cleared the earlier helper failure on `ip tuntap add ...` returning `open: No such file or directory`.
+- The current reduced-lab truth is now more precise than the earlier Phase 7 closeout:
+  - the helper flow preserves `linux-wireguard-userspace-shared`
+  - the daemon starts far enough to create the userspace-owned TUN on at least part of the five-node topology
+  - the lab now gets through bootstrap, membership, assignments, and traversal issuance before failing in baseline runtime enforcement
+- The remaining blocker is not a harness or policy artifact. It is still a real backend implementation gap:
+  - the Linux userspace-shared backend continues to fail closed on route application and exit-mode work because [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) still routes `apply_routes(...)` and `set_exit_mode(...)` into later-phase fail-closed placeholders
+  - on failing nodes, `rustynet status` now reports `last_reconcile_error=reconcile dataplane apply failed: backend error: Internal: linux userspace-shared backend does not yet implement route application; later production transport-owning phases remain open`
+  - `rustynetd-managed-dns.service` failures are secondary symptoms of that fail-closed dataplane state, not the primary cause
+- Therefore the previous “dependency-policy plus evidence only” blocker set was incomplete. Pre-live-lab readiness still also requires honest route application and exit-mode implementation for the Linux userspace-shared backend.
+
 Security invariants re-verified:
 - The Linux userspace-shared backend remains the sole owner of the authoritative UDP socket, userspace engine state, TUN runtime state, round-trip control state, and handshake telemetry.
 - Command-only Linux/macOS backends remain unchanged and still fail closed on authoritative shared transport.
@@ -1037,13 +1051,16 @@ Security invariants re-verified:
 
 Phase 7 status:
 - Validation execution is complete.
-- Phase 7 is not cleanly complete yet because the new userspace-shared dependency chain still violates the repository's audit and license policy gates, and the fresh-install / live cross-network evidence set is still stale or missing for current `HEAD`.
+- Phase 7 is not cleanly complete yet because the reduced five-node live-lab reruns proved an additional runtime implementation gap remains in the Linux userspace-shared backend: route application and exit-mode programming still fail closed under real baseline enforcement.
+- The new userspace-shared dependency chain also still violates the repository's audit and license policy gates, and the fresh-install / live cross-network evidence set is still stale or missing for current `HEAD`.
 
 Exact prerequisites before this plan can be declared pre-live-lab ready:
-1. Replace or otherwise remove the `tun-rs 2.8.2` dependency path that introduces unmaintained `paste 1.0.15`, or prove a policy-approved secure alternative with code and validation.
-2. Resolve the repository license-policy failures introduced by the `boringtun` / `tun-rs` dependency chain without weakening the deny gate.
-3. Regenerate the fresh-install matrix evidence for current `HEAD`.
-4. Run the live lab and regenerate the six canonical cross-network reports for current `HEAD`.
+1. Implement honest Linux userspace-shared route application and exit-mode programming so the backend no longer fails closed when baseline runtime enforcement needs dataplane routes.
+2. Re-run the reduced five-node helper lab until `enforce_baseline_runtime` succeeds on the full topology without managed-DNS fallout from missing dataplane state.
+3. Replace or otherwise remove the `tun-rs 2.8.2` dependency path that introduces unmaintained `paste 1.0.15`, or prove a policy-approved secure alternative with code and validation.
+4. Resolve the repository license-policy failures introduced by the `boringtun` / `tun-rs` dependency chain without weakening the deny gate.
+5. Regenerate the fresh-install matrix evidence for current `HEAD`.
+6. Run the live lab and regenerate the six canonical cross-network reports for current `HEAD`.
 
 ## 15. Exact File Map For Engineers
 The following files must be treated as the primary implementation surface:

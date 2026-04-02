@@ -1905,6 +1905,76 @@ Residual risks / blockers:
 ```
 
 ```text
+Date: 2026-04-02
+Phase / Slice: Reduced five-node live-lab reruns on committed `main` after userspace-shared selection/helper fixes
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Extended runtime WireGuard key preparation and scrubbing to include `linux-wireguard-userspace-shared`, and added daemon regression coverage so the encrypted-key runtime file is materialized for the userspace backend before startup instead of failing on missing `/run/rustynet/wireguard.key`.
+  - scripts/systemd/rustynetd-privileged-helper.service
+    - Added `/dev/net/tun` bind/access inside the privileged-helper private device namespace so helper-assisted `ip tuntap add ...` can open the host TUN device.
+  - crates/rustynet-cli/src/ops_install_systemd.rs
+    - Added a regression test proving the privileged-helper service template preserves `/dev/net/tun` access while keeping `PrivateDevices=true`.
+  - documents/operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md
+    - Corrected the production-backend plan status so it no longer implies “policy blockers only”; the new live-lab evidence proves a remaining route/exit-mode implementation gap.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this public evidence entry for the reduced live-lab reruns and the newly proven blocker.
+Commands run:
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd runtime_key_ -- --nocapture`
+  - `cargo test -p rustynetd validate_daemon_config_accepts_linux_userspace_shared_backend -- --nocapture`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo test -p rustynet-cli --bin rustynet-cli rustynetd_service_template_preserves_backend_env_and_tun_device_access -- --nocapture`
+  - `cargo test -p rustynet-cli --bin rustynet-cli privileged_helper_service_template_preserves_tun_device_access_for_helper_owned_setup -- --nocapture`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode local-head --repo-ref HEAD`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-command git --require-command cargo --require-command systemctl --timeout-secs 120`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node.env --skip-gates --skip-soak --skip-cross-network`
+  - `ssh debian-headless-1 'sudo -n systemctl status rustynetd-managed-dns.service --no-pager -l ...'`
+  - `ssh debian-headless-1 'sudo -n /usr/local/bin/rustynet status ...'`
+  - `ssh debian-headless-3 'sudo -n systemctl status rustynetd-managed-dns.service --no-pager -l ...'`
+Validation and live-lab outcomes:
+  - The reduced helper flow now preserves `RUSTYNET_BACKEND=linux-wireguard-userspace-shared` into `/etc/default/rustynetd`, and the userspace backend no longer fails on missing runtime key material.
+  - The first rerun after the daemon key fix advanced past the old startup crash and proved the next blocker was helper-side `/dev/net/tun` access.
+  - The second rerun after the helper-unit fix advanced through:
+    - `bootstrap_hosts`
+    - `collect_pubkeys`
+    - `membership_setup`
+    - `distribute_membership_state`
+    - `issue_and_distribute_assignments`
+    - `issue_and_distribute_traversal`
+  - The lab still failed at `enforce_baseline_runtime`, with artifacts captured under:
+    - `artifacts/live_lab/20260402T111820Z`
+    - `artifacts/live_lab/20260402T113358Z`
+  - On failing nodes, `rustynetd-managed-dns.service` is only the visible symptom:
+    - exit/admin now fails with `resolvectl default-route rustynet0 no failed: Failed to resolve interface "rustynet0": No such device`
+    - `rustynet status` on the exit node reports `last_reconcile_error=reconcile dataplane apply failed: backend error: Internal: linux userspace-shared backend does not yet implement route application; later production transport-owning phases remain open`
+  - Mixed node results make the current blocker precise rather than ambiguous:
+    - `entry` and `aux` completed `e2e enforce host`
+    - `exit`, `client`, and `extra` remained fail-closed during baseline runtime enforcement
+Security invariants re-verified:
+  - No daemon-owned or helper-owned side socket was introduced.
+  - The userspace backend still fails closed rather than faking route or exit-node success.
+  - Command-only backend modes remain unchanged.
+  - Managed-DNS enforcement still fails closed when the dataplane interface is not present.
+What this live-lab slice actually proved:
+  - The earlier helper-path blockers are resolved:
+    - userspace backend selection survives the five-node helper flow
+    - runtime WireGuard key material is prepared correctly for the userspace backend
+    - the privileged helper can now open `/dev/net/tun` for helper-assisted TUN creation
+  - The remaining blocker is a real backend implementation gap, not a harness bug or evidence-policy issue:
+    - Linux userspace-shared still does not honestly implement `apply_routes(...)`
+    - exit-mode / baseline dataplane programming therefore still fail closed under real enforcement
+What remains before the reduced live lab can complete honestly:
+  - implement Linux userspace-shared route application and exit-mode programming in the backend/runtime path
+  - rerun the reduced five-node helper lab until `enforce_baseline_runtime` succeeds on all nodes
+  - only after that resume the stale fresh-install evidence regeneration and the six canonical live cross-network report runs
+Residual risks / blockers:
+  - The repo is still not ready for an honest live-lab completion claim because the production Linux userspace-shared backend remains incomplete for route/exit-mode programming.
+  - Dependency-policy blockers from the Phase 7 validation run remain unresolved and still must be fixed before final gate-clean status can be claimed.
+  - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
 Date: 2026-03-30
 Phase / Slice: Final closeout honesty pass
 Files changed:
