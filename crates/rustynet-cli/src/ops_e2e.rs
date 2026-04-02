@@ -1442,10 +1442,11 @@ fn issue_traversal_bundle_artifacts(
         .collect::<BTreeMap<_, _>>();
     let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
     let generated_at_unix = unix_now();
+    let snapshot_nonce = traversal_nonce(generated_at_unix, 0);
     let mut aggregate_bundles = BTreeMap::<String, String>::new();
     let mut pair_bundles = Vec::new();
 
-    for (index, pair) in allow_pairs.iter().enumerate() {
+    for pair in allow_pairs {
         let target_endpoint = endpoints_by_node
             .get(pair.target_node_id.as_str())
             .ok_or_else(|| {
@@ -1460,7 +1461,7 @@ fn issue_traversal_bundle_artifacts(
                 target_node_id: pair.target_node_id.clone(),
                 generated_at_unix,
                 ttl_secs,
-                nonce: traversal_nonce(generated_at_unix, index as u64),
+                nonce: snapshot_nonce,
                 candidates: vec![EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::Host,
                     endpoint: target_endpoint.clone(),
@@ -4824,6 +4825,28 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
 
         assert!(!artifacts.verifier_key_hex.is_empty());
         assert_eq!(artifacts.pair_bundles.len(), 2);
+        let nonces = artifacts
+            .pair_bundles
+            .iter()
+            .filter_map(|bundle| {
+                bundle
+                    .wire
+                    .lines()
+                    .find_map(|line| line.strip_prefix("nonce="))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let generated_at_values = artifacts
+            .pair_bundles
+            .iter()
+            .filter_map(|bundle| {
+                bundle
+                    .wire
+                    .lines()
+                    .find_map(|line| line.strip_prefix("generated_at_unix="))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(nonces.len(), 1);
+        assert_eq!(generated_at_values.len(), 1);
         assert!(
             artifacts.pair_bundles[0]
                 .wire
