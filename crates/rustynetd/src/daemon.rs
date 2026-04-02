@@ -673,6 +673,15 @@ impl DaemonBackendMode {
             _ => None,
         }
     }
+
+    fn requires_runtime_wireguard_key_material(self) -> bool {
+        matches!(
+            self,
+            DaemonBackendMode::LinuxWireguard
+                | DaemonBackendMode::LinuxWireguardUserspaceShared
+                | DaemonBackendMode::MacosWireguard
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -6955,10 +6964,7 @@ fn scrub_runtime_wireguard_key_material(
     runtime_path: Option<&Path>,
     encrypted_private_key_path: Option<&Path>,
 ) -> Result<(), String> {
-    if !matches!(
-        backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
-    ) {
+    if !backend_mode.requires_runtime_wireguard_key_material() {
         return Ok(());
     }
     if encrypted_private_key_path.is_none() {
@@ -6989,10 +6995,7 @@ fn prepare_runtime_wireguard_key_material(
     encrypted_private_key_path: Option<&Path>,
     passphrase_path: Option<&Path>,
 ) -> Result<(), String> {
-    if !matches!(
-        backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
-    ) {
+    if !backend_mode.requires_runtime_wireguard_key_material() {
         return Ok(());
     }
 
@@ -7349,10 +7352,10 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "auto tunnel enforce requires bundle, verifier key, and watermark paths".to_string(),
         ));
     }
-    if matches!(
-        config.backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
-    ) {
+    if config
+        .backend_mode
+        .requires_runtime_wireguard_key_material()
+    {
         if let Some(path) = config.wg_private_key_path.as_ref() {
             if !path.is_absolute() {
                 return Err(DaemonError::InvalidConfig(
@@ -7604,10 +7607,10 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         validate_auto_tunnel_bundle_permissions(bundle_path)?;
         validate_auto_tunnel_verifier_key_permissions(verifier_key_path)?;
     }
-    if matches!(
-        config.backend_mode,
-        DaemonBackendMode::LinuxWireguard | DaemonBackendMode::MacosWireguard
-    ) {
+    if config
+        .backend_mode
+        .requires_runtime_wireguard_key_material()
+    {
         if let Some(path) = config.wg_private_key_path.as_ref() {
             validate_private_key_permissions(path)?;
         }
@@ -10702,6 +10705,8 @@ mod tests {
         REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
         read_command_envelope, remote_ops_signature_payload,
     };
+    #[cfg(not(target_os = "macos"))]
+    use crate::key_material::encrypt_private_key;
     use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
 
     use ed25519_dalek::{Signer, SigningKey};
@@ -12875,63 +12880,114 @@ mod tests {
 
     #[test]
     fn runtime_key_prepare_requires_plaintext_key_when_encrypted_store_disabled() {
-        let test_dir = secure_test_dir("rustynetd-runtime-key-prepare-plaintext");
-        let runtime_key_path = test_dir.join("wireguard.key");
-
-        let err = prepare_runtime_wireguard_key_material(
+        for backend_mode in [
             DaemonBackendMode::LinuxWireguard,
-            Some(runtime_key_path.as_path()),
-            None,
-            None,
-        )
-        .expect_err("missing plaintext runtime key must be rejected");
-        assert!(err.contains("wireguard private key"));
+            DaemonBackendMode::LinuxWireguardUserspaceShared,
+        ] {
+            let test_dir = secure_test_dir("rustynetd-runtime-key-prepare-plaintext");
+            let runtime_key_path = test_dir.join("wireguard.key");
 
-        std::fs::write(&runtime_key_path, b"private-key\n")
-            .expect("runtime key should be writable");
+            let err = prepare_runtime_wireguard_key_material(
+                backend_mode,
+                Some(runtime_key_path.as_path()),
+                None,
+                None,
+            )
+            .expect_err("missing plaintext runtime key must be rejected");
+            assert!(err.contains("wireguard private key"));
+
+            std::fs::write(&runtime_key_path, b"private-key\n")
+                .expect("runtime key should be writable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&runtime_key_path, std::fs::Permissions::from_mode(0o600))
+                    .expect("runtime key permissions should be restrictive");
+            }
+
+            prepare_runtime_wireguard_key_material(
+                backend_mode,
+                Some(runtime_key_path.as_path()),
+                None,
+                None,
+            )
+            .expect("existing plaintext runtime key should be accepted");
+
+            let _ = std::fs::remove_dir_all(test_dir);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn runtime_key_prepare_decrypts_encrypted_store_for_linux_userspace_shared_backend() {
+        let test_dir = secure_test_dir("rustynetd-runtime-key-prepare-userspace-encrypted");
+        let runtime_key_path = test_dir.join("wireguard.key");
+        let encrypted_key_path = test_dir.join("wireguard.key.enc");
+        let passphrase_path = test_dir.join("wireguard.passphrase");
+        let expected_runtime_key = b"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n";
+
+        std::fs::write(&passphrase_path, b"phase7-test-passphrase\n")
+            .expect("passphrase should be writable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&runtime_key_path, std::fs::Permissions::from_mode(0o600))
-                .expect("runtime key permissions should be restrictive");
+            std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
+                .expect("passphrase permissions should be restrictive");
         }
+        encrypt_private_key(
+            expected_runtime_key,
+            encrypted_key_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("encrypted key should be created");
 
         prepare_runtime_wireguard_key_material(
-            DaemonBackendMode::LinuxWireguard,
+            DaemonBackendMode::LinuxWireguardUserspaceShared,
             Some(runtime_key_path.as_path()),
-            None,
-            None,
+            Some(encrypted_key_path.as_path()),
+            Some(passphrase_path.as_path()),
         )
-        .expect("existing plaintext runtime key should be accepted");
+        .expect(
+            "userspace-shared backend should materialize the runtime key from encrypted storage",
+        );
+
+        let actual_runtime_key =
+            std::fs::read(&runtime_key_path).expect("runtime key should have been written");
+        assert_eq!(actual_runtime_key, expected_runtime_key);
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]
     fn runtime_key_scrub_only_removes_ephemeral_file_when_encrypted_store_is_used() {
-        let test_dir = secure_test_dir("rustynetd-runtime-key-scrub");
-        let runtime_key_path = test_dir.join("wireguard.key");
-        let encrypted_key_path = test_dir.join("wireguard.key.enc");
-        std::fs::write(&runtime_key_path, b"private-key\n")
-            .expect("runtime key should be writable");
-
-        scrub_runtime_wireguard_key_material(
+        for backend_mode in [
             DaemonBackendMode::LinuxWireguard,
-            Some(runtime_key_path.as_path()),
-            None,
-        )
-        .expect("plaintext key mode should not scrub runtime key");
-        assert!(runtime_key_path.exists());
+            DaemonBackendMode::LinuxWireguardUserspaceShared,
+        ] {
+            let test_dir = secure_test_dir("rustynetd-runtime-key-scrub");
+            let runtime_key_path = test_dir.join("wireguard.key");
+            let encrypted_key_path = test_dir.join("wireguard.key.enc");
+            std::fs::write(&runtime_key_path, b"private-key\n")
+                .expect("runtime key should be writable");
 
-        scrub_runtime_wireguard_key_material(
-            DaemonBackendMode::LinuxWireguard,
-            Some(runtime_key_path.as_path()),
-            Some(encrypted_key_path.as_path()),
-        )
-        .expect("encrypted key mode should scrub runtime key");
-        assert!(!runtime_key_path.exists());
+            scrub_runtime_wireguard_key_material(
+                backend_mode,
+                Some(runtime_key_path.as_path()),
+                None,
+            )
+            .expect("plaintext key mode should not scrub runtime key");
+            assert!(runtime_key_path.exists());
 
-        let _ = std::fs::remove_dir_all(test_dir);
+            scrub_runtime_wireguard_key_material(
+                backend_mode,
+                Some(runtime_key_path.as_path()),
+                Some(encrypted_key_path.as_path()),
+            )
+            .expect("encrypted key mode should scrub runtime key");
+            assert!(!runtime_key_path.exists());
+
+            let _ = std::fs::remove_dir_all(test_dir);
+        }
     }
 
     #[test]
