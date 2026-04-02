@@ -1461,20 +1461,12 @@ fn issue_traversal_bundle_artifacts(
                 generated_at_unix,
                 ttl_secs,
                 nonce: traversal_nonce(generated_at_unix, index as u64),
-                candidates: vec![
-                    EndpointHintCandidate {
-                        candidate_type: EndpointHintCandidateType::Host,
-                        endpoint: target_endpoint.clone(),
-                        relay_id: None,
-                        priority: 900,
-                    },
-                    EndpointHintCandidate {
-                        candidate_type: EndpointHintCandidateType::Relay,
-                        endpoint: target_endpoint.clone(),
-                        relay_id: Some(format!("relay-{}", pair.target_node_id)),
-                        priority: 700,
-                    },
-                ],
+                candidates: vec![EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::Host,
+                    endpoint: target_endpoint.clone(),
+                    relay_id: None,
+                    priority: 900,
+                }],
             })
             .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
         if !core.verify_signed_endpoint_hint_bundle(&bundle) {
@@ -4842,6 +4834,8 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
                 .wire
                 .contains("target_node_id=exit-1")
         );
+        assert!(artifacts.pair_bundles[0].wire.contains("candidate_count=1"));
+        assert!(!artifacts.pair_bundles[0].wire.contains("type=relay"));
         assert!(
             artifacts
                 .aggregate_bundles
