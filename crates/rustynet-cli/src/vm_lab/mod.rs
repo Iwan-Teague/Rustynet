@@ -122,6 +122,7 @@ pub struct VmLabWriteLiveLabProfileConfig {
     pub cross_network_nat_profiles: Option<String>,
     pub cross_network_required_nat_profiles: Option<String>,
     pub cross_network_impairment_profile: Option<String>,
+    pub backend: Option<String>,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
     pub report_dir: Option<PathBuf>,
@@ -834,6 +835,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
     if let Some(value) = config.cross_network_impairment_profile.as_deref() {
         ensure_no_control_chars("cross-network impairment profile", value)?;
     }
+    if let Some(value) = config.backend.as_deref() {
+        ensure_no_control_chars("backend", value)?;
+    }
     if let Some(value) = config.source_mode.as_deref() {
         ensure_no_control_chars("source mode", value)?;
     }
@@ -906,6 +910,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
             "CROSS_NETWORK_IMPAIRMENT_PROFILE",
             value,
         )?);
+    }
+    if let Some(value) = config.backend.as_deref() {
+        lines.push(format_env_assignment("RUSTYNET_BACKEND", value)?);
     }
     if let Some(value) = config.source_mode.as_deref() {
         lines.push(format_env_assignment("SOURCE_MODE", value)?);
@@ -4546,6 +4553,7 @@ directory = "vendor"
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
+            backend: Some("linux-wireguard-userspace-shared".to_string()),
             source_mode: Some("local-head".to_string()),
             repo_ref: Some("HEAD".to_string()),
             report_dir: None,
@@ -4556,6 +4564,7 @@ directory = "vendor"
         assert!(body.contains("EXIT_TARGET=\"debian@exit-host\""));
         assert!(body.contains("CLIENT_TARGET=\"debian@client-host\""));
         assert!(body.contains("SSH_IDENTITY_FILE="));
+        assert!(body.contains("RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\""));
         assert!(body.contains("SOURCE_MODE=\"local-head\""));
         cleanup_temp_inventory(inventory.as_path());
     }

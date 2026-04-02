@@ -471,7 +471,11 @@ live_lab_enforce_host() {
   local node_id="$3"
   local ssh_allow_cidrs="$4"
   local src_dir="$5"
-  live_lab_run_root "$target" "root rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'" || return 1
+  local backend_env=""
+  if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
+    backend_env="env RUSTYNET_BACKEND='${RUSTYNET_BACKEND}' "
+  fi
+  live_lab_run_root "$target" "root ${backend_env}rustynet ops e2e-enforce-host --role '${role}' --node-id '${node_id}' --src-dir '${src_dir}' --ssh-allow-cidrs '${ssh_allow_cidrs}'" || return 1
 }
 
 live_lab_apply_role_coupling() {

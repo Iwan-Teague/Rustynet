@@ -199,6 +199,7 @@ pub fn execute_ops_e2e_bootstrap_host(
     if !src_dir.is_dir() {
         return Err(format!("source dir is missing: {}", src_dir.display()));
     }
+    let backend_mode = e2e_backend_mode_from_env()?;
 
     if !skip_apt {
         install_linux_e2e_prerequisites()?;
@@ -509,23 +510,27 @@ pub fn execute_ops_e2e_bootstrap_host(
             "assignment signing secret init failed during e2e bootstrap",
         )?;
 
+        let mut install_env = vec![
+            ("RUSTYNET_NODE_ID", node_id.as_str()),
+            ("RUSTYNET_NODE_ROLE", role.as_str()),
+            ("RUSTYNET_TRUST_AUTO_REFRESH", "true"),
+            ("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false"),
+            ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false"),
+            ("RUSTYNET_WG_LISTEN_PORT", "51820"),
+            ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
+            (
+                "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
+                ssh_allow_cidrs.as_str(),
+            ),
+            ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
+        ];
+        if let Some(value) = backend_mode.as_deref() {
+            install_env.push(("RUSTYNET_BACKEND", value));
+        }
         run_status(
             "rustynet",
             &["ops", "install-systemd"],
-            &[
-                ("RUSTYNET_NODE_ID", node_id.as_str()),
-                ("RUSTYNET_NODE_ROLE", role.as_str()),
-                ("RUSTYNET_TRUST_AUTO_REFRESH", "true"),
-                ("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false"),
-                ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "false"),
-                ("RUSTYNET_WG_LISTEN_PORT", "51820"),
-                ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
-                (
-                    "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
-                    ssh_allow_cidrs.as_str(),
-                ),
-                ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
-            ],
+            install_env.as_slice(),
             "install-systemd failed during e2e bootstrap",
         )?;
 
@@ -581,34 +586,39 @@ pub fn execute_ops_e2e_enforce_host(
     let auto_refresh = Path::new("/etc/rustynet/trust-evidence.key").is_file();
     let assignment_auto_refresh = Path::new("/etc/rustynet/assignment.signing.secret").is_file()
         && Path::new("/etc/rustynet/assignment-refresh.env").is_file();
+    let backend_mode = e2e_backend_mode_from_env()?;
 
+    let mut install_env = vec![
+        ("RUSTYNET_NODE_ID", node_id.as_str()),
+        ("RUSTYNET_NODE_ROLE", role.as_str()),
+        (
+            "RUSTYNET_TRUST_AUTO_REFRESH",
+            if auto_refresh { "true" } else { "false" },
+        ),
+        (
+            "RUSTYNET_ASSIGNMENT_AUTO_REFRESH",
+            if assignment_auto_refresh {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "true"),
+        ("RUSTYNET_WG_LISTEN_PORT", "51820"),
+        ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
+        (
+            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
+            ssh_allow_cidrs.as_str(),
+        ),
+        ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
+    ];
+    if let Some(value) = backend_mode.as_deref() {
+        install_env.push(("RUSTYNET_BACKEND", value));
+    }
     run_status(
         "rustynet",
         &["ops", "install-systemd"],
-        &[
-            ("RUSTYNET_NODE_ID", node_id.as_str()),
-            ("RUSTYNET_NODE_ROLE", role.as_str()),
-            (
-                "RUSTYNET_TRUST_AUTO_REFRESH",
-                if auto_refresh { "true" } else { "false" },
-            ),
-            (
-                "RUSTYNET_ASSIGNMENT_AUTO_REFRESH",
-                if assignment_auto_refresh {
-                    "true"
-                } else {
-                    "false"
-                },
-            ),
-            ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "true"),
-            ("RUSTYNET_WG_LISTEN_PORT", "51820"),
-            ("RUSTYNET_FAIL_CLOSED_SSH_ALLOW", "true"),
-            (
-                "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS",
-                ssh_allow_cidrs.as_str(),
-            ),
-            ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
-        ],
+        install_env.as_slice(),
         "install-systemd enforce pass failed",
     )?;
 
@@ -3050,6 +3060,25 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
+    }
+}
+
+fn e2e_backend_mode_from_env() -> Result<Option<String>, String> {
+    match std::env::var("RUSTYNET_BACKEND") {
+        Ok(value) => match value.as_str() {
+            "" => Ok(None),
+            "linux-wireguard"
+            | "linux-wireguard-userspace-shared"
+            | "macos-wireguard"
+            | "macos-wireguard-userspace-shared" => Ok(Some(value)),
+            _ => Err(format!(
+                "unsupported RUSTYNET_BACKEND for e2e bootstrap/enforce: {value}"
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("RUSTYNET_BACKEND must be valid UTF-8".to_string())
+        }
     }
 }
 

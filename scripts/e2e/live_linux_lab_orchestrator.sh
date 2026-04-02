@@ -16,6 +16,7 @@ NETWORK_ID="rn-live-lab-${RUN_ID}"
 SSH_ALLOW_CIDRS="192.168.18.0/24"
 REPO_REF="HEAD"
 SOURCE_MODE="local-head"
+RUSTYNET_BACKEND="${RUSTYNET_BACKEND:-}"
 REPORT_DIR="${ROOT_DIR}/artifacts/live_lab/${RUN_ID}"
 LOG_DIR="${REPORT_DIR}/logs"
 VERIFICATION_DIR="${REPORT_DIR}/verification"
@@ -516,6 +517,7 @@ load_profile_file() {
       CROSS_NETWORK_EXIT_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_EXIT_UNDERLAY_IP" ]] && CROSS_NETWORK_EXIT_UNDERLAY_IP="$value" ;;
       CROSS_NETWORK_RELAY_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_RELAY_UNDERLAY_IP" ]] && CROSS_NETWORK_RELAY_UNDERLAY_IP="$value" ;;
       CROSS_NETWORK_PROBE_UNDERLAY_IP) [[ -z "$CROSS_NETWORK_PROBE_UNDERLAY_IP" ]] && CROSS_NETWORK_PROBE_UNDERLAY_IP="$value" ;;
+      RUSTYNET_BACKEND) [[ -z "$RUSTYNET_BACKEND" ]] && RUSTYNET_BACKEND="$value" ;;
       SOURCE_MODE)
         if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
           SOURCE_MODE="$value"
@@ -1838,7 +1840,11 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
-run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
+backend_env=()
+if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
+  backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
+fi
+run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" "${backend_env[@]}" \
   rustynet ops e2e-bootstrap-host \
   --role "${ROLE}" \
   --node-id "${NODE_ID}" \
@@ -1943,6 +1949,9 @@ NETWORK_ID=${NETWORK_ID}
 SSH_ALLOW_CIDRS=${SSH_ALLOW_CIDRS}
 SOURCE_ARCHIVE=/tmp/rn_source.tar.gz
 EOF_ENV
+  if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
+    printf 'RUSTYNET_BACKEND=%s\n' "${RUSTYNET_BACKEND}" >> "$env_path"
+  fi
   printf '[bootstrap] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
   live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh"
   live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env"
