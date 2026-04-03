@@ -14,7 +14,8 @@ use nix::unistd::Uid;
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
-    EndpointHintCandidateType, NodeMetadata,
+    EndpointHintCandidateType, NodeMetadata, SignedTraversalCoordinationRecord,
+    TraversalCoordinationRecord,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
@@ -1453,8 +1454,10 @@ fn issue_traversal_bundle_artifacts(
     let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
     let generated_at_unix = unix_now();
     let snapshot_nonce = traversal_nonce(generated_at_unix, 0);
+    let coordination_ttl_secs = ttl_secs.min(30);
     let mut aggregate_bundles = BTreeMap::<String, String>::new();
     let mut pair_bundles = Vec::new();
+    let mut emitted_coordination_pairs = BTreeSet::new();
 
     for pair in allow_pairs {
         let target_endpoint = endpoints_by_node
@@ -1496,6 +1499,42 @@ fn issue_traversal_bundle_artifacts(
             target_node_id: pair.target_node_id.clone(),
             wire,
         });
+
+        let coordination_key = traversal_coordination_pair_key(
+            pair.source_node_id.as_str(),
+            pair.target_node_id.as_str(),
+        );
+        if !emitted_coordination_pairs.insert(coordination_key) {
+            continue;
+        }
+
+        let signed_coordination = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: random_nonzero_coordination_bytes(),
+                probe_start_unix: generated_at_unix,
+                node_a: pair.source_node_id.clone(),
+                node_b: pair.target_node_id.clone(),
+                issued_at_unix: generated_at_unix,
+                expires_at_unix: generated_at_unix.saturating_add(coordination_ttl_secs),
+                nonce: random_nonzero_coordination_bytes(),
+            })
+            .map_err(|err| format!("issue traversal coordination failed: {err}"))?;
+        if !core.verify_signed_traversal_coordination_record(&signed_coordination) {
+            return Err(format!(
+                "self-verify failed for traversal coordination {} <-> {}",
+                pair.source_node_id, pair.target_node_id
+            ));
+        }
+
+        let coordination_wire = signed_traversal_coordination_record_to_wire(&signed_coordination);
+        aggregate_bundles
+            .entry(pair.source_node_id.clone())
+            .or_default()
+            .push_str(format!("{coordination_wire}\n").as_str());
+        aggregate_bundles
+            .entry(pair.target_node_id.clone())
+            .or_default()
+            .push_str(format!("{coordination_wire}\n").as_str());
     }
 
     Ok(IssuedTraversalArtifacts {
@@ -1510,6 +1549,28 @@ fn traversal_nonce(now_unix: u64, offset: u64) -> u64 {
         .saturating_mul(1_000)
         .saturating_add(u64::from(std::process::id()))
         .saturating_add(offset)
+}
+
+fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
+}
+
+fn random_nonzero_coordination_bytes() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    while bytes.iter().all(|value| *value == 0) {
+        OsRng.fill_bytes(&mut bytes);
+    }
+    bytes
+}
+
+fn signed_traversal_coordination_record_to_wire(
+    record: &SignedTraversalCoordinationRecord,
+) -> String {
+    format!("{}signature={}\n", record.payload, record.signature_hex)
 }
 
 pub fn execute_ops_run_debian_two_node_e2e(
@@ -4895,13 +4956,33 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
                 .expect("client aggregate")
                 .contains("candidate.0.addr=192.168.64.22")
         );
-        assert!(
-            artifacts
-                .aggregate_bundles
-                .get("exit-1")
-                .expect("exit aggregate")
-                .contains("candidate.0.addr=192.168.64.24")
+        let client_aggregate = artifacts
+            .aggregate_bundles
+            .get("client-1")
+            .expect("client aggregate");
+        let exit_aggregate = artifacts
+            .aggregate_bundles
+            .get("exit-1")
+            .expect("exit aggregate");
+        assert!(exit_aggregate.contains("candidate.0.addr=192.168.64.24"));
+        assert!(client_aggregate.contains("type=traversal_coordination"));
+        assert!(exit_aggregate.contains("type=traversal_coordination"));
+        assert_eq!(
+            client_aggregate
+                .matches("type=traversal_coordination")
+                .count(),
+            1
         );
+        assert_eq!(
+            exit_aggregate
+                .matches("type=traversal_coordination")
+                .count(),
+            1
+        );
+        assert!(client_aggregate.contains("node_a=client-1"));
+        assert!(client_aggregate.contains("node_b=exit-1"));
+        assert!(client_aggregate.contains("probe_start_unix="));
+        assert!(client_aggregate.contains("session_id="));
     }
 
     #[test]

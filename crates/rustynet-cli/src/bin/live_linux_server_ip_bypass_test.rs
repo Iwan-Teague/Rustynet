@@ -113,7 +113,10 @@ fn run() -> Result<(), i32> {
         })?;
 
     let probe_ip = if probe_bind_ip.is_empty() {
-        LiveLabContext::target_address(&probe_host).to_string()
+        LiveLabContext::resolved_target_address(&probe_host).map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?
     } else {
         parse_ipv4(&probe_bind_ip, "probe bind ip")
             .map_err(|err| {

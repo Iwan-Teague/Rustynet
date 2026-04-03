@@ -164,6 +164,28 @@ impl UserspaceEngine {
         Ok(())
     }
 
+    pub(crate) fn initiate_handshake(
+        &mut self,
+        node_id: &NodeId,
+        transport_generation: u64,
+        force_resend: bool,
+    ) -> Result<EngineProcessingOutcome, BackendError> {
+        let Some(peer_state) = self.peer_states.get_mut(node_id) else {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        };
+        let mut encrypt_buf = vec![0u8; MAX_ENCRYPTED_PACKET_BYTES];
+        let initial_result = peer_state
+            .tunnel
+            .format_handshake_initiation(&mut encrypt_buf, force_resend);
+        Ok(drive_outbound_result(
+            node_id,
+            peer_state,
+            transport_generation,
+            initial_result,
+            &mut self.recorded_tunnel_plaintext_packets,
+        ))
+    }
+
     pub(crate) fn current_peer_endpoint(&self, node_id: &NodeId) -> Option<SocketEndpoint> {
         self.peer_states
             .get(node_id)

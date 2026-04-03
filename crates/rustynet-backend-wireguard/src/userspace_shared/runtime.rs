@@ -17,7 +17,7 @@ use super::engine::{
 };
 use super::handshake::HandshakeTelemetry;
 use super::socket::{AUTHORITATIVE_TRANSPORT_LABEL, AuthoritativeSocket};
-use super::tun::TunDevice;
+use super::tun::{SharedTunLifecycle, TunDevice};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -60,6 +60,7 @@ impl RunningUserspaceRuntime {
         tun_device: TunDevice,
         authoritative_socket: AuthoritativeSocket,
         engine: UserspaceEngine,
+        tun_lifecycle: SharedTunLifecycle,
     ) -> Result<Self, BackendError> {
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -71,15 +72,16 @@ impl RunningUserspaceRuntime {
         let join_handle = thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run_worker(
+                run_worker(WorkerRuntimeParts {
                     context,
                     tun_device,
                     authoritative_socket,
                     engine,
+                    tun_lifecycle,
                     command_rx,
                     ready_tx,
-                    worker_test_state,
-                );
+                    test_state: worker_test_state,
+                });
             })
             .map_err(|err| {
                 BackendError::internal(format!(
@@ -183,33 +185,29 @@ impl RuntimeControl {
         self.request(|reply| RuntimeRequest::Stats { reply })
     }
 
+    pub(crate) fn initiate_peer_handshake(
+        &self,
+        node_id: NodeId,
+        force_resend: bool,
+    ) -> Result<(), BackendError> {
+        self.request(|reply| RuntimeRequest::InitiatePeerHandshake {
+            node_id,
+            force_resend,
+            reply,
+        })
+    }
+
     pub(crate) fn shutdown(&self) -> Result<(), BackendError> {
         self.round_trip_in_flight.store(false, Ordering::SeqCst);
         self.request(|reply| RuntimeRequest::Shutdown { reply })
     }
 
-    pub(crate) fn apply_routes_or_fail_closed(
-        &self,
-        routes: Vec<Route>,
-        error_factory: fn() -> BackendError,
-    ) -> Result<(), BackendError> {
-        self.request(|reply| RuntimeRequest::ApplyRoutes {
-            routes,
-            reply,
-            error_factory,
-        })
+    pub(crate) fn apply_routes(&self, routes: Vec<Route>) -> Result<(), BackendError> {
+        self.request(|reply| RuntimeRequest::ApplyRoutes { routes, reply })
     }
 
-    pub(crate) fn set_exit_mode_or_fail_closed(
-        &self,
-        mode: ExitMode,
-        error_factory: fn() -> BackendError,
-    ) -> Result<(), BackendError> {
-        self.request(|reply| RuntimeRequest::SetExitMode {
-            mode,
-            reply,
-            error_factory,
-        })
+    pub(crate) fn set_exit_mode(&self, mode: ExitMode) -> Result<(), BackendError> {
+        self.request(|reply| RuntimeRequest::SetExitMode { mode, reply })
     }
 
     pub(crate) fn authoritative_round_trip(
@@ -343,15 +341,18 @@ enum RuntimeRequest {
     ApplyRoutes {
         routes: Vec<Route>,
         reply: ReplySender<()>,
-        error_factory: fn() -> BackendError,
     },
     SetExitMode {
         mode: ExitMode,
         reply: ReplySender<()>,
-        error_factory: fn() -> BackendError,
     },
     Stats {
         reply: ReplySender<TunnelStats>,
+    },
+    InitiatePeerHandshake {
+        node_id: NodeId,
+        force_resend: bool,
+        reply: ReplySender<()>,
     },
     AuthoritativeRoundTrip {
         remote_addr: SocketAddr,
@@ -400,11 +401,14 @@ enum RuntimeRequest {
 
 #[derive(Debug)]
 struct RuntimeState {
-    _context: RuntimeContext,
+    context: RuntimeContext,
     _tun_device: TunDevice,
+    tun_lifecycle: SharedTunLifecycle,
     authoritative_socket: AuthoritativeSocket,
     engine: UserspaceEngine,
     peers: BTreeMap<NodeId, PeerConfig>,
+    current_routes: Vec<Route>,
+    current_exit_mode: ExitMode,
     outstanding_round_trip: Option<OutstandingRoundTripState>,
     recorded_authoritative_operations: Vec<RecordedAuthoritativeTransportOperation>,
     recorded_peer_ciphertext_egress: Vec<RecordedPeerCiphertextEgress>,
@@ -470,6 +474,36 @@ impl RuntimeState {
             bytes_rx: engine_stats.bytes_rx,
             using_relay_path: false,
         }
+    }
+
+    fn initiate_peer_handshake(
+        &mut self,
+        node_id: &NodeId,
+        force_resend: bool,
+    ) -> Result<(), BackendError> {
+        let outcome = self.engine.initiate_handshake(
+            node_id,
+            self.authoritative_socket.transport_generation(),
+            force_resend,
+        )?;
+        self.apply_engine_processing_outcome(outcome)
+    }
+
+    fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
+        self.tun_lifecycle.reconcile_routes(
+            &self.context.interface_name,
+            &self.current_routes,
+            &routes,
+        )?;
+        self.current_routes = routes;
+        Ok(())
+    }
+
+    fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
+        self.tun_lifecycle
+            .reconcile_exit_mode(self.current_exit_mode, mode)?;
+        self.current_exit_mode = mode;
+        Ok(())
     }
 
     fn start_authoritative_round_trip(
@@ -700,21 +734,37 @@ struct RuntimeTestState {
     worker_exit_count: Arc<AtomicUsize>,
 }
 
-fn run_worker(
+struct WorkerRuntimeParts {
     context: RuntimeContext,
     tun_device: TunDevice,
     authoritative_socket: AuthoritativeSocket,
     engine: UserspaceEngine,
+    tun_lifecycle: SharedTunLifecycle,
     command_rx: Receiver<RuntimeRequest>,
     ready_tx: ReplySender<AuthoritativeTransportIdentity>,
     test_state: RuntimeTestState,
-) {
+}
+
+fn run_worker(parts: WorkerRuntimeParts) {
+    let WorkerRuntimeParts {
+        context,
+        tun_device,
+        authoritative_socket,
+        engine,
+        tun_lifecycle,
+        command_rx,
+        ready_tx,
+        test_state,
+    } = parts;
     let mut state = RuntimeState {
-        _context: context,
+        context,
         _tun_device: tun_device,
+        tun_lifecycle,
         authoritative_socket,
         engine,
         peers: BTreeMap::new(),
+        current_routes: Vec::new(),
+        current_exit_mode: ExitMode::Off,
         outstanding_round_trip: None,
         recorded_authoritative_operations: Vec::new(),
         recorded_peer_ciphertext_egress: Vec::new(),
@@ -803,24 +853,24 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
             let _ = reply.send(state.remove_peer(&node_id));
             true
         }
-        RuntimeRequest::ApplyRoutes {
-            routes: _routes,
-            reply,
-            error_factory,
-        } => {
-            let _ = reply.send(Err(error_factory()));
+        RuntimeRequest::ApplyRoutes { routes, reply } => {
+            let _ = reply.send(state.apply_routes(routes));
             true
         }
-        RuntimeRequest::SetExitMode {
-            mode: _mode,
-            reply,
-            error_factory,
-        } => {
-            let _ = reply.send(Err(error_factory()));
+        RuntimeRequest::SetExitMode { mode, reply } => {
+            let _ = reply.send(state.set_exit_mode(mode));
             true
         }
         RuntimeRequest::Stats { reply } => {
             let _ = reply.send(Ok(state.stats()));
+            true
+        }
+        RuntimeRequest::InitiatePeerHandshake {
+            node_id,
+            force_resend,
+            reply,
+        } => {
+            let _ = reply.send(state.initiate_peer_handshake(&node_id, force_resend));
             true
         }
         RuntimeRequest::AuthoritativeRoundTrip {
@@ -844,7 +894,7 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
             state.fail_outstanding_round_trip(BackendError::internal(
                 "linux userspace-shared authoritative transport round trip canceled during backend shutdown",
             ));
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(state.set_exit_mode(ExitMode::Off));
             false
         }
         #[cfg(test)]

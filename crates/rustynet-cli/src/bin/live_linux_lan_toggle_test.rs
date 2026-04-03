@@ -158,9 +158,19 @@ fn run() -> Result<(), i32> {
         1
     })?;
 
-    let exit_addr = LiveLabContext::target_address(&exit_host).to_string();
-    let client_addr = LiveLabContext::target_address(&client_host).to_string();
-    let blind_exit_addr = LiveLabContext::target_address(&blind_exit_host).to_string();
+    let exit_addr = LiveLabContext::resolved_target_address(&exit_host).map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    let client_addr = LiveLabContext::resolved_target_address(&client_host).map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    let blind_exit_addr =
+        LiveLabContext::resolved_target_address(&blind_exit_host).map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
 
     let nodes_spec = format!(
         "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex};{client_node_id}|{client_addr}:51820|{client_pub_hex};{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}"

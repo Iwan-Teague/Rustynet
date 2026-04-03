@@ -246,7 +246,10 @@ fn run() -> Result<(), i32> {
             .map(|text| text.trim() == "active")
             .unwrap_or(false)
     {
-        let client_addr = LiveLabContext::target_address(&client_host).to_string();
+        let client_addr = LiveLabContext::resolved_target_address(&client_host).map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
         let dns_port = dns_bind_addr
             .rsplit_once(':')
             .map(|(_, port)| port.to_string())

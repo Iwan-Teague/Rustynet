@@ -13,7 +13,7 @@ use live_lab_support::{
     ensure_pinned_known_hosts_file, ensure_safe_spec, ensure_safe_token, git_head_commit,
     issue_assignment_bundles_from_env, issue_traversal_bundles_from_env,
     load_home_known_hosts_path, no_plaintext_passphrase_check, remote_src_dir, require_command,
-    run_root, scp_to, seed_known_hosts, shell_quote, status, target_address, unix_now,
+    resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, status, unix_now,
     wait_for_daemon_socket, write_assignment_refresh_env, write_file,
 };
 
@@ -90,10 +90,10 @@ fn run() -> Result<(), String> {
         &config.second_client_host,
     )?;
 
-    let final_exit_addr = target_address(&config.final_exit_host).to_string();
-    let client_addr = target_address(&config.client_host).to_string();
-    let entry_addr = target_address(&config.entry_host).to_string();
-    let second_client_addr = target_address(&config.second_client_host).to_string();
+    let final_exit_addr = resolved_target_address(&config.final_exit_host)?;
+    let client_addr = resolved_target_address(&config.client_host)?;
+    let entry_addr = resolved_target_address(&config.entry_host)?;
+    let second_client_addr = resolved_target_address(&config.second_client_host)?;
 
     let nodes_spec = format!(
         "{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{}",

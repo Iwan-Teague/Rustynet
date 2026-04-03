@@ -147,6 +147,11 @@ pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 = TRAVERSAL_DEFAULT_STUN
 pub const DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS: u64 = 30;
 pub const DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 30;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(test, allow(dead_code))]
+const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS: usize = 10;
+#[cfg(any(target_os = "linux", test))]
+const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS: u64 = 100;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
@@ -2284,6 +2289,8 @@ struct DaemonRuntime {
     traversal_probe_handshake_freshness_secs: u64,
     traversal_probe_reprobe_interval_secs: u64,
     local_host_candidates: BTreeMap<String, Vec<IpAddr>>,
+    #[cfg(test)]
+    test_local_host_candidates_snapshot: Option<BTreeMap<String, Vec<IpAddr>>>,
     local_stun_observations: Vec<StunResult>,
     local_stun_candidates: Vec<SocketAddr>,
     transport_socket_identity_blocker: Option<String>,
@@ -2520,6 +2527,8 @@ impl DaemonRuntime {
                 .traversal_probe_reprobe_interval_secs
                 .get(),
             local_host_candidates: BTreeMap::new(),
+            #[cfg(test)]
+            test_local_host_candidates_snapshot: None,
             local_stun_observations: Vec::new(),
             local_stun_candidates: Vec::new(),
             next_stun_refresh_at: if config.traversal_stun_servers.is_empty()
@@ -2965,6 +2974,7 @@ impl DaemonRuntime {
 
         self.verified_traversal_index = VerifiedTraversalIndex::new();
         self.verified_traversal_coordination_index = BTreeMap::new();
+        self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
 
         for bundle_envelope in &envelope.bundles {
             let bundle = &bundle_envelope.bundle;
@@ -3022,6 +3032,7 @@ impl DaemonRuntime {
             Err(err) => {
                 self.traversal_hints = None;
                 self.traversal_hint_error = Some(err.to_string());
+                self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
                 self.traversal_probe_statuses.clear();
                 return;
             }
@@ -3050,6 +3061,7 @@ impl DaemonRuntime {
                 self.traversal_hints = None;
                 self.verified_traversal_index = VerifiedTraversalIndex::new();
                 self.verified_traversal_coordination_index = BTreeMap::new();
+                self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
                 self.traversal_hint_error = None;
                 self.traversal_probe_statuses.clear();
             }
@@ -3058,6 +3070,7 @@ impl DaemonRuntime {
                 self.traversal_hints = None;
                 self.verified_traversal_index = VerifiedTraversalIndex::new();
                 self.verified_traversal_coordination_index = BTreeMap::new();
+                self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
                 self.traversal_hint_error = Some(err.to_string());
                 self.traversal_probe_statuses.clear();
             }
@@ -3315,7 +3328,9 @@ impl DaemonRuntime {
     #[cfg(target_os = "linux")]
     fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
         let current = collect_linux_interface_addrs();
-        self.local_host_candidates = current.clone();
+        if snapshot_has_usable_traversal_host_candidates(&current) {
+            self.local_host_candidates = current.clone();
+        }
         if self._endpoint_monitor.poll_with_addrs(current).is_some() {
             self.maybe_trigger_endpoint_change_refresh();
         }
@@ -3465,6 +3480,32 @@ impl DaemonRuntime {
             .authoritative_transport_identity()
             .map(|identity| sanitize_netcheck_value(&identity.local_addr.to_string()))
             .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn selected_exit_peer_endpoint_summary(&self) -> (String, String) {
+        let Some(selected_exit_node) = self.selected_exit_node.as_deref() else {
+            return ("none".to_string(), "none".to_string());
+        };
+        let node_id = match NodeId::new(selected_exit_node.to_string()) {
+            Ok(node_id) => node_id,
+            Err(err) => {
+                return (
+                    "none".to_string(),
+                    sanitize_netcheck_value(&err.to_string()),
+                );
+            }
+        };
+        match self.controller.current_peer_endpoint(&node_id) {
+            Ok(Some(endpoint)) => (
+                sanitize_netcheck_value(&format!("{}:{}", endpoint.addr, endpoint.port)),
+                "none".to_string(),
+            ),
+            Ok(None) => ("none".to_string(), "none".to_string()),
+            Err(err) => (
+                "none".to_string(),
+                sanitize_netcheck_value(&err.to_string()),
+            ),
+        }
     }
 
     fn relay_session_inactive_state(&self) -> &'static str {
@@ -3699,11 +3740,11 @@ impl DaemonRuntime {
         let mut candidates = Vec::new();
         // Host candidates
         for (iface, addrs) in &self.local_host_candidates {
-            if iface == "lo" || iface.starts_with("rustynet") {
+            if !interface_name_is_usable_for_traversal_host_candidate(iface.as_str()) {
                 continue;
             }
             for ip in addrs {
-                if ip.is_loopback() {
+                if !ip_is_usable_for_traversal_host_candidate(*ip) {
                     continue;
                 }
 
@@ -3731,6 +3772,22 @@ impl DaemonRuntime {
             });
         }
         candidates
+    }
+
+    fn refresh_local_host_candidates_for_traversal(&mut self) {
+        #[cfg(test)]
+        if let Some(snapshot) = self.test_local_host_candidates_snapshot.clone() {
+            self.local_host_candidates = snapshot;
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let current = collect_linux_interface_addrs_for_traversal();
+            if snapshot_has_usable_traversal_host_candidates(&current) {
+                self.local_host_candidates = current;
+            }
+        }
     }
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
@@ -3822,6 +3879,7 @@ impl DaemonRuntime {
                 extra_peers.join(",")
             ));
         }
+        self.refresh_local_host_candidates_for_traversal();
         let local_candidates = self.all_local_candidates();
         let previous_statuses = self.traversal_probe_statuses.clone();
         let mut statuses = BTreeMap::new();
@@ -5026,6 +5084,7 @@ impl DaemonRuntime {
 
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
+        self.poll_endpoint_monitor_and_maybe_refresh();
         self.refresh_traversal_hint_state(false);
         self.maybe_preexpiry_refresh_dns_zone(unix_now(), auto_bundle.as_ref());
         self.maybe_trigger_endpoint_change_refresh();
@@ -5227,6 +5286,8 @@ impl DaemonRuntime {
                 let transport_socket_identity_label = self.transport_socket_identity_label();
                 let transport_socket_identity_local_addr =
                     self.transport_socket_identity_local_addr();
+                let (selected_exit_peer_endpoint, selected_exit_peer_endpoint_error) =
+                    self.selected_exit_peer_endpoint_summary();
                 let path_state = self.runtime_path_state_summary();
                 let path_live_proven = if path_state.live_proven {
                     "true"
@@ -5247,12 +5308,14 @@ impl DaemonRuntime {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string());
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
                     self.controller.generation(),
                     self.selected_exit_node.as_deref().unwrap_or("none"),
+                    selected_exit_peer_endpoint,
+                    selected_exit_peer_endpoint_error,
                     serving_exit_node,
                     if self.lan_access_enabled { "on" } else { "off" },
                     if self.is_restricted() {
@@ -6092,6 +6155,7 @@ impl DaemonRuntime {
             }
         }
 
+        self.poll_endpoint_monitor_and_maybe_refresh();
         self.refresh_traversal_hint_state(false);
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
@@ -6339,6 +6403,70 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
 /// Returns a map of interface-name → Vec<IpAddr> for use with EndpointMonitor.
 /// Loopback and link-local addresses are included as-is; EndpointMonitor
 /// applies its own filtering via the `ignored_prefixes` list.
+fn interface_name_is_usable_for_traversal_host_candidate(interface: &str) -> bool {
+    interface != "lo" && !interface.starts_with(DEFAULT_WG_INTERFACE)
+}
+
+fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(value) => !(value.is_link_local() || value.is_broadcast()),
+        IpAddr::V6(value) => !value.is_unicast_link_local(),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn snapshot_has_usable_traversal_host_candidates(
+    snapshot: &BTreeMap<String, Vec<std::net::IpAddr>>,
+) -> bool {
+    snapshot.iter().any(|(iface, addrs)| {
+        interface_name_is_usable_for_traversal_host_candidate(iface.as_str())
+            && addrs
+                .iter()
+                .copied()
+                .any(ip_is_usable_for_traversal_host_candidate)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn collect_traversal_host_candidate_snapshot_with_retry<Collect, Wait>(
+    mut collect: Collect,
+    mut wait: Wait,
+    attempts: usize,
+) -> BTreeMap<String, Vec<std::net::IpAddr>>
+where
+    Collect: FnMut() -> BTreeMap<String, Vec<std::net::IpAddr>>,
+    Wait: FnMut(Duration),
+{
+    let attempts = attempts.max(1);
+    let mut last_snapshot = BTreeMap::new();
+    for attempt in 0..attempts {
+        let current = collect();
+        let usable = snapshot_has_usable_traversal_host_candidates(&current);
+        last_snapshot = current;
+        if usable {
+            return last_snapshot;
+        }
+        if attempt + 1 < attempts {
+            wait(Duration::from_millis(
+                TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
+            ));
+        }
+    }
+    last_snapshot
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_interface_addrs_for_traversal() -> BTreeMap<String, Vec<std::net::IpAddr>> {
+    collect_traversal_host_candidate_snapshot_with_retry(
+        collect_linux_interface_addrs,
+        sleep,
+        TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS,
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn collect_linux_interface_addrs() -> BTreeMap<String, Vec<std::net::IpAddr>> {
     use std::net::IpAddr;
@@ -10691,15 +10819,17 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::net::{SocketAddr, UdpSocket};
+    use std::net::{IpAddr, SocketAddr, UdpSocket};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use crate::daemon::RestrictionMode;
     use crate::ipc::{
         CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
         REMOTE_OPS_WIRE_PREFIX, RemoteCommandEnvelope, RemoteOpsEnvelopeParseError,
@@ -10726,7 +10856,8 @@ mod tests {
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
         MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
         MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, StateFetcher,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
+        TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TrustEvidenceRecord, TrustPolicy,
+        TrustWatermark, build_dns_response, collect_traversal_host_candidate_snapshot_with_retry,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
         load_traversal_watermark, load_trust_evidence, load_trust_watermark,
@@ -10734,8 +10865,8 @@ mod tests {
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
         run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
-        trust_evidence_payload, unix_now, validate_daemon_config, validate_file_security,
-        zeroize_optional_bytes,
+        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
+        validate_daemon_config, validate_file_security, zeroize_optional_bytes,
     };
     use crate::phase10::{DataplaneState, PathMode, TraversalProbeDecision, TraversalProbeReason};
     use crate::stun_client::StunResult;
@@ -12161,6 +12292,41 @@ mod tests {
         );
     }
 
+    fn write_host_only_traversal_file_with_coordination(
+        path: &Path,
+        verifier_path: &Path,
+        source_node: &str,
+        target_node: &str,
+        nonce: u64,
+        coordination_payload: &str,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[23u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("traversal verifier key should be written");
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(60);
+        let bundle_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id={source_node}\ntarget_node_id={target_node}\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\ncandidate_count=1\ncandidate.0.type=host\ncandidate.0.addr=10.0.0.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\n"
+        );
+        let bundle_signature = signing_key.sign(bundle_payload.as_bytes());
+        let coordination_signature = signing_key.sign(coordination_payload.as_bytes());
+        std::fs::write(
+            path,
+            format!(
+                "{}signature={}\n\n{}signature={}\n",
+                bundle_payload,
+                hex_encode(&bundle_signature.to_bytes()),
+                coordination_payload,
+                hex_encode(&coordination_signature.to_bytes()),
+            ),
+        )
+        .expect("host-only traversal file should be written");
+    }
+
     fn write_traversal_file_with_custom_relay(
         path: &Path,
         verifier_path: &Path,
@@ -12499,6 +12665,91 @@ mod tests {
                     .expect("probe candidate ip should parse"),
             ],
         );
+    }
+
+    fn seed_local_probe_candidate_snapshot(runtime: &mut DaemonRuntime) {
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(
+            "eth-test".to_string(),
+            vec![
+                "192.0.2.10"
+                    .parse()
+                    .expect("probe candidate ip should parse"),
+            ],
+        );
+        runtime.test_local_host_candidates_snapshot = Some(snapshot);
+    }
+
+    fn transient_loopback_only_candidate_snapshot() -> BTreeMap<String, Vec<IpAddr>> {
+        BTreeMap::from([
+            (
+                "lo".to_string(),
+                vec!["127.0.0.1".parse().expect("ipv4 should parse")],
+            ),
+            (
+                "rustynet0".to_string(),
+                vec!["100.109.33.213".parse().expect("ipv4 should parse")],
+            ),
+        ])
+    }
+
+    fn usable_probe_candidate_snapshot() -> BTreeMap<String, Vec<IpAddr>> {
+        BTreeMap::from([(
+            "enp0s1".to_string(),
+            vec!["192.168.64.22".parse().expect("ipv4 should parse")],
+        )])
+    }
+
+    #[test]
+    fn traversal_host_candidate_retry_waits_for_usable_snapshot() {
+        let mut snapshots = vec![
+            transient_loopback_only_candidate_snapshot(),
+            usable_probe_candidate_snapshot(),
+        ]
+        .into_iter();
+        let mut waited = Vec::new();
+
+        let collected = collect_traversal_host_candidate_snapshot_with_retry(
+            || {
+                snapshots
+                    .next()
+                    .unwrap_or_else(usable_probe_candidate_snapshot)
+            },
+            |duration| waited.push(duration),
+            3,
+        );
+
+        assert!(snapshot_has_usable_traversal_host_candidates(&collected));
+        assert_eq!(waited.len(), 1);
+        assert_eq!(
+            waited[0],
+            Duration::from_millis(TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS)
+        );
+        assert_eq!(collected, usable_probe_candidate_snapshot());
+    }
+
+    #[test]
+    fn traversal_host_candidate_retry_returns_last_unusable_snapshot_when_exhausted() {
+        let mut snapshots = vec![
+            transient_loopback_only_candidate_snapshot(),
+            transient_loopback_only_candidate_snapshot(),
+        ]
+        .into_iter();
+        let mut waited = Vec::new();
+
+        let collected = collect_traversal_host_candidate_snapshot_with_retry(
+            || {
+                snapshots
+                    .next()
+                    .unwrap_or_else(transient_loopback_only_candidate_snapshot)
+            },
+            |duration| waited.push(duration),
+            2,
+        );
+
+        assert!(!snapshot_has_usable_traversal_host_candidates(&collected));
+        assert_eq!(waited.len(), 1);
+        assert_eq!(collected, transient_loopback_only_candidate_snapshot());
     }
 
     fn write_traversal_file_set(
@@ -14177,6 +14428,17 @@ mod tests {
                 .message
                 .contains("traversal_probe_next_reprobe_unix=none")
         );
+        assert!(status.message.contains("exit_node=node-exit"));
+        assert!(
+            status
+                .message
+                .contains("selected_exit_peer_endpoint=203.0.113.77:443")
+        );
+        assert!(
+            status
+                .message
+                .contains("selected_exit_peer_endpoint_error=none")
+        );
 
         let refreshed_coordination =
             valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x42);
@@ -15030,6 +15292,206 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_refresh_reuses_loaded_coordination_without_replay_restriction() {
+        let test_dir = secure_test_dir("rustynetd-runtime-refresh-coordination");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x53);
+        write_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            &coordination_payload,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
+        runtime.bootstrap();
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+        assert!(runtime.traversal_hint_error.is_none());
+
+        runtime.refresh_traversal_hint_state(false);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+        assert!(runtime.traversal_hint_error.is_none());
+        assert!(
+            !runtime
+                .last_reconcile_error
+                .as_deref()
+                .unwrap_or("none")
+                .contains("coordination nonce replay detected")
+        );
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        assert!(
+            runtime.traversal_probe_statuses.contains_key(&exit_node),
+            "probe status should remain available after refresh"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_host_only_signed_direct_probe_exhaustion_stays_programmed_without_restricting()
+     {
+        let test_dir = secure_test_dir("rustynetd-runtime-host-only-direct-exhaustion");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let coordination_payload =
+            valid_coordination_payload_for_peer("daemon-local", "node-exit", unix_now(), 0x61);
+        write_host_only_traversal_file_with_coordination(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            &coordination_payload,
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        seed_local_probe_candidate(&mut runtime);
+        runtime.bootstrap();
+
+        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let status = runtime
+            .traversal_probe_statuses
+            .get(&exit_node)
+            .expect("direct programmed status should exist");
+        assert_eq!(status.decision, TraversalProbeDecision::Direct);
+        assert_eq!(
+            status.reason,
+            TraversalProbeReason::DirectProbeExhaustedUnprovenDirect
+        );
+        assert!(status.latest_handshake_unix.is_none());
+        assert_eq!(
+            runtime.controller.peer_path(&exit_node),
+            Some(PathMode::Direct)
+        );
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
+                addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+                port: 51820,
+            })
+        );
+        assert!(runtime.traversal_hint_error.is_none());
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains("path_mode=direct_programmed"));
+        assert!(netcheck.message.contains("path_live_proven=false"));
+        assert!(netcheck.message.contains("traversal_probe_result=direct"));
+        assert!(
+            netcheck
+                .message
+                .contains("traversal_probe_reason=direct_probe_exhausted_unproven_direct")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-periodic-reprobe");
         let state_path = test_dir.join("daemon.state");
@@ -15556,7 +16018,7 @@ mod tests {
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
-        seed_local_probe_candidate(&mut runtime);
+        seed_local_probe_candidate_snapshot(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
 
         let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
@@ -15613,6 +16075,12 @@ mod tests {
                 .message
                 .contains("traversal_probe_reason=fresh_handshake_observed")
         );
+        let direct_status = runtime
+            .traversal_probe_statuses
+            .get(&exit_node)
+            .expect("direct traversal probe status should exist");
+        assert!(direct_status.attempts > 0);
+        assert!(runtime.local_host_candidates.contains_key("eth-test"));
         assert_eq!(
             runtime.controller.managed_peer_endpoint(&exit_node),
             Some(SocketEndpoint {

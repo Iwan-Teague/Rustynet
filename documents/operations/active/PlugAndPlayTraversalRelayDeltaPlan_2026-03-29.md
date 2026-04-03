@@ -1906,6 +1906,118 @@ Residual risks / blockers:
 
 ```text
 Date: 2026-04-02
+Phase / Slice: Linux userspace-shared live-lab delta Phase 1 backend route programming
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Made `linux-wireguard-userspace-shared` `apply_routes(...)` real, kept `set_exit_mode(...)` fail-closed for the next delta phase, and added backend tests for route reconciliation, rollback, invalid-route rejection, and transport-identity preservation.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Moved userspace-shared route reconciliation into the single-owner runtime worker, added runtime-owned current-route state, and replaced the old `apply_routes` placeholder request path with real runtime reconciliation.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs
+    - Added shared TUN lifecycle ownership, helper/direct/backend route reconciliation with rollback, explicit skipping of `RouteKind::ExitNodeDefault` on both add and stale-delete paths, and lower-level route-runner regression coverage.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Marked Delta Phase 1 code-complete and updated the remaining-gap description so only `set_exit_mode(...)` remains as the backend runtime placeholder.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this public evidence entry for the Delta Phase 1 route-programming slice.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd apply_rollback_forces_fail_closed_when_system_step_fails -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+    - backend unit tests: `48` passed
+    - backend conformance tests: `6` passed
+  - `cargo check -p rustynetd`: pass
+  - `cargo test -p rustynetd apply_rollback_forces_fail_closed_when_system_step_fails -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture`: pass
+Security invariants re-verified:
+  - The userspace-shared backend still keeps authoritative UDP socket ownership, userspace engine ownership, and TUN/runtime ownership inside the backend/runtime path.
+  - `apply_routes(...)` now mutates only backend-owned interface route state; default-route, firewall, NAT, DNS-protection, and killswitch logic remain in the existing system layer.
+  - `RouteKind::ExitNodeDefault` is still not treated as backend interface-route authority.
+  - Invalid route state, replace-side failures, and stale-delete failures all fail closed without silently downgrading to the command-only backend.
+  - Route reconciliation does not change authoritative transport identity or transport generation.
+What Delta Phase 1 completed:
+  - `linux-wireguard-userspace-shared` no longer fail-closes on backend `apply_routes(...)`.
+  - Runtime-owned route state is now reconciled and rolled back deterministically through the shared TUN lifecycle.
+  - Existing daemon fail-closed reconciliation semantics remain unchanged under targeted regression tests.
+What remains before the next reduced live-lab rerun:
+  - implement honest `set_exit_mode(...)` for `linux-wireguard-userspace-shared`
+  - keep route/exit-mode state consistent with rollback and shutdown behavior
+  - rerun the reduced five-node helper lab only after Delta Phase 2 lands
+Residual risks / blockers:
+  - Delta Phase 1 is code-complete, but it is not yet live-proven because the reduced live-lab rerun still depends on the missing exit-mode programming slice.
+  - Dependency-policy and evidence blockers from the earlier Phase 7 validation remain unresolved and unchanged.
+  - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
+Date: 2026-04-02
+Phase / Slice: Linux userspace-shared live-lab delta Phase 2 backend exit-mode programming
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Made `linux-wireguard-userspace-shared` `set_exit_mode(...)` real, removed the later-phase placeholder path, updated Linux userspace-shared capabilities to truthfully advertise exit-node and LAN-route support, and added backend tests for full-tunnel apply, off-mode clearing, rollback failure handling, shutdown clearing, and no-downgrade behavior.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs
+    - Replaced the old fail-closed `SetExitMode` placeholder request with real runtime-owned exit-mode reconciliation, added runtime-owned current-exit-mode state, and made worker shutdown explicitly clear backend exit-mode state before teardown.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs
+    - Added backend exit-mode reconcile/rollback for direct, helper-backed, and test TUN lifecycles, including the Linux command-backend parity `ip rule` sequence for table `51820`, test-side exit-mode mutation recording, and lower-level exit-mode regression coverage.
+  - crates/rustynet-backend-wireguard/tests/conformance.rs
+    - Added conformance coverage proving Linux userspace-shared now supports the combined route and exit-mode lifecycle honestly under backend-crate tests.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Marked Delta Phase 2 code-complete and updated the remaining delta so the next step is the reduced five-node rerun rather than another backend placeholder removal.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this public evidence entry for the Delta Phase 2 exit-mode-programming slice.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs crates/rustynet-backend-wireguard/tests/conformance.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd apply_rollback_forces_fail_closed_when_system_step_fails -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check`: pass
+  - `cargo check -p rustynet-backend-wireguard`: pass
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: pass
+    - backend unit tests: `55` passed
+    - backend conformance tests: `7` passed
+  - `cargo check -p rustynetd`: pass
+  - `cargo test -p rustynetd apply_rollback_forces_fail_closed_when_system_step_fails -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`: pass
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`: pass
+Security invariants re-verified:
+  - The userspace-shared backend still keeps authoritative UDP socket ownership, userspace engine ownership, and long-lived TUN/runtime ownership inside the backend/runtime path.
+  - Exit-mode state is now runtime-owned and reconciled through the shared TUN lifecycle; shutdown clears backend exit-mode state deterministically before runtime teardown.
+  - Full-tunnel rule programming mirrors the Linux command backend table `51820` behavior without introducing helper-owned transport authority, a second socket, or a daemon-owned side path.
+  - Exit-mode failures, delete-side failures, and add-side failures all fail closed without silently downgrading to the command-only backend.
+  - Route and exit-mode mutation do not change authoritative transport identity, transport generation, `direct_active` truthfulness, or `relay_active` truthfulness.
+What Delta Phase 2 completed:
+  - `linux-wireguard-userspace-shared` no longer fail-closes on backend `set_exit_mode(...)`.
+  - Linux userspace-shared backend route application and exit-mode programming are now code-complete locally and validated under targeted backend/daemon tests.
+  - Rollback and shutdown now clear backend-owned exit-mode state deterministically through the runtime-owned TUN lifecycle.
+What remains before the next reduced live-lab rerun:
+  - rerun the reduced five-node helper lab on the current committed tree and confirm `enforce_baseline_runtime` now succeeds on all nodes
+  - if that rerun exposes a new fail-closed reconcile blocker, fix that exact blocker rather than reopening the completed route/exit-mode slice
+  - after the reduced rerun is clean, resume the already-documented dependency-policy and evidence blocker cleanup
+Residual risks / blockers:
+  - Delta Phase 2 is code-complete and locally validated, but it is not yet real-host-proven because the reduced five-node rerun has not been repeated against the new exit-mode code.
+  - Dependency-policy blockers from the earlier Phase 7 validation remain unresolved and unchanged.
+  - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
+Date: 2026-04-02
 Phase / Slice: Reduced five-node live-lab reruns on committed `main` after userspace-shared selection/helper fixes
 Files changed:
   - crates/rustynetd/src/daemon.rs
@@ -1972,6 +2084,247 @@ Residual risks / blockers:
   - The repo is still not ready for an honest live-lab completion claim because the production Linux userspace-shared backend remains incomplete for route/exit-mode programming.
   - Dependency-policy blockers from the Phase 7 validation run remain unresolved and still must be fixed before final gate-clean status can be claimed.
   - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
+Date: 2026-04-02
+Phase / Slice: Linux userspace-shared live-lab delta - Rust role-switch host-key candidate alignment and fresh reduced rerun
+Files changed:
+  - crates/rustynet-cli/src/bin/live_lab_bin_support/mod.rs
+    - Replaced raw-host-only pinned `known_hosts` validation with effective SSH target candidate validation (`hostkeyalias`, raw host, resolved hostname, and port-aware bracket form) and added unit coverage for candidate construction.
+  - crates/rustynet-cli/src/bin/live_lab_support/mod.rs
+    - Applied the same effective SSH target candidate validation to the `LiveLabContext`-based live-lab binaries so later live stages do not regress to raw-host-only pinning checks.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Reopened Delta Phase 3 honestly and recorded that the current fresh rerun is now blocked by exit-node restricted-safe / traversal-reconcile instability rather than the old role-switch `known_hosts` precheck.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_lab_bin_support/mod.rs crates/rustynet-cli/src/bin/live_lab_support/mod.rs`
+  - `bash -n scripts/e2e/live_linux_lab_orchestrator.sh`
+  - `cargo test -p rustynet-cli --bin live_linux_role_switch_matrix_test -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+  - `ssh ... debian@debian-headless-1 'sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status'`
+  - `ssh ... debian@debian-headless-1 'sudo -n journalctl -u rustynetd.service -n 80 --no-pager --output=short-iso | tail -n 80'`
+  - `ssh ... debian@debian-headless-1 'sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh && rustynet status'`
+  - `ssh ... debian@debian-headless-1 'for i in 1 2 3 4 5 6; do rustynet status ...; sleep 2; done'`
+Validation and live-lab outcomes:
+  - The Rust live-lab support modules now validate pinned host keys against the effective SSH target rather than the raw host token only, matching the already-hardened shell helper logic.
+  - Targeted CLI tests passed:
+    - `live_linux_role_switch_matrix_test`: 8 passed
+    - `live_linux_managed_dns_test`: 21 passed
+  - `cargo fmt --all -- --check` passed after the support-module edits.
+  - The fresh reduced five-node rerun at `artifacts/live_lab/phase3_worktree_rerun_replayfix` advanced through:
+    - `bootstrap_hosts`
+    - `collect_pubkeys`
+    - `membership_setup`
+    - `distribute_membership_state`
+    - `issue_and_distribute_assignments`
+    - `issue_and_distribute_traversal`
+  - The same rerun failed at `enforce_baseline_runtime`, not at `live_role_switch_matrix`.
+  - The exact failure is now:
+    - `error: daemon is in restricted-safe mode`
+    - triggered by the exit-node `rustynet route advertise 0.0.0.0/0` step after the fresh signed traversal redistribution and `state refresh`
+  - Exit-node status captured immediately after the failure reported:
+    - `restricted_safe_mode=true`
+    - `last_reconcile_error=traversal authority rejected reconcile apply: traversal authority requires valid signed traversal state: traversal authority failed to program peer client-1: traversal probe failed: traversal failed closed: DirectProbeExhaustedFailClosed`
+  - A manual `rustynet state refresh` can transiently report `restricted_safe_mode=false`, but repeated polling shows the daemon falls back into restricted-safe mode and route advertisement remains denied. This is not a stable workaround.
+Security invariants re-verified:
+  - SSH pinning was not weakened; the fix widened lookup candidates to the actual resolved SSH target but continued to require a pinned host key in the pinned `known_hosts` file.
+  - No daemon-owned or helper-owned side socket was introduced.
+  - Restricted-safe semantics remain fail-closed; the daemon still denies route advertisement while restricted instead of accepting an unsafe mutation.
+  - The old route-application and exit-mode placeholder failures remain absent from the current tree.
+What this slice completed:
+  - The Rust live-lab host-key lookup path now matches the secure shell-helper behavior and is locally unit-tested.
+  - The previous role-switch `known_hosts` blocker is no longer the current first blocker on the reduced five-node path.
+What remains blocked:
+  - The next real blocker is stable exit-node signed-state / traversal recovery before `rustynet route advertise 0.0.0.0/0` during `enforce_baseline_runtime`.
+  - The reduced helper flow still has not reached `live_role_switch_matrix` on the current tree, so the host-key candidate fix is not yet live-proven end-to-end.
+  - Repo-level dependency-policy blockers and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-02
+Phase / Slice: Linux userspace-shared live-lab delta - Delta Phase 3 focused validation and reduced five-node rerun
+Files changed:
+  - scripts/e2e/live_linux_lab_orchestrator.sh
+    - Refactored traversal-bundle issuance/distribution into a reusable helper, reissued fresh signed traversal bundles after baseline enforcement, added a second signed-state refresh before exit-route advertisement, and tightened `validate_baseline_runtime` so it explicitly enforces the actual Phase 3 contract instead of relying on weak bare `[[ ... ]]` expressions.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Marked Delta Phase 3 complete for the baseline-runtime slice and recorded that the next blocker moved forward to `live_role_switch_matrix` pinned host-key handling.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this public evidence entry for the completed Delta Phase 3 rerun.
+Commands run:
+  - `bash -n scripts/e2e/live_linux_lab_orchestrator.sh`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+  - `ssh ... debian-headless-{1,2,4} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status'`
+  - `ssh ... debian-headless-{1,2,4} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck'`
+  - `ssh ... debian-headless-{1,2} 'sudo env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh && rustynet status && rustynet netcheck'`
+  - artifact inspection under `artifacts/live_lab/phase3_worktree_rerun_replayfix`
+Validation and live-lab outcomes:
+  - The reduced five-node rerun at `artifacts/live_lab/phase3_worktree_rerun_replayfix` now passes:
+    - `enforce_baseline_runtime`
+    - `validate_baseline_runtime`
+  - The fresh traversal redistribution inside `stage_enforce_baseline_runtime` eliminated the earlier expired-coordination failure and moved the reduced helper flow beyond the old route/exit-mode runtime blocker.
+  - `validate_baseline_runtime.log` proves the exact Delta Phase 3 contract on the live nodes:
+    - `transport_socket_identity_state=authoritative_backend_shared_transport`
+    - `transport_socket_identity_error=none`
+    - `encrypted_key_store=true`
+    - `auto_tunnel_enforce=true`
+    - `membership_active_nodes=5`
+    - client route lookups resolve through `dev rustynet0`
+    - `no-plaintext-passphrase-files`
+    - exit NAT/forward rules include `masquerade` and `iifname "rustynet0"`
+  - The baseline-runtime logs do not contain the old route/exit-mode placeholder failures.
+  - The same rerun now first fails later at `live_role_switch_matrix` with:
+    - `pinned known_hosts file lacks host key for debian-headless-2`
+Security invariants re-verified:
+  - No daemon-owned or helper-owned side socket was introduced.
+  - Signed traversal coordination was refreshed with newly issued signed state rather than by stretching the coordination TTL or weakening traversal validation.
+  - Authoritative transport identity remained backend-owned and unchanged through the live baseline-runtime stages.
+  - The baseline validator now enforces the documented Phase 3 contract explicitly and fail-closed.
+What Delta Phase 3 completed:
+  - Real-host proof that the completed Linux userspace-shared route and exit-mode runtime slices are sufficient for baseline enforcement on the reduced five-node lab.
+  - Honest proof that the previous first blocker is no longer route/exit-mode programming.
+  - Honest narrowing of the next blocker to the later role-switch host-key stage.
+Residual risks / blockers:
+  - The reduced helper flow still does not complete end-to-end because `live_role_switch_matrix` is now blocked by pinned temporary `known_hosts` generation.
+  - Repo-level dependency-policy blockers and live-evidence blockers remain unchanged and still must stay fail-closed.
+  - macOS userspace-shared parity remains out of scope, blocked, and unclaimed.
+```
+
+```text
+Date: 2026-04-02
+Phase / Slice: Linux userspace-shared live-lab delta - host-only signed traversal direct-programmed fallback and fresh reduced rerun
+Files changed:
+  - crates/rustynetd/src/phase10.rs
+    - Added an explicit `DirectProbeExhaustedUnprovenDirect` traversal probe reason and changed the valid-coordination/no-relay direct-probe exhaustion path to keep the signed direct endpoint programmed and unproven instead of failing traversal state closed.
+  - crates/rustynetd/src/daemon.rs
+    - Added a host-only traversal+coordination fixture helper and a daemon regression test proving that host-only signed traversal with exhausted direct probes stays programmed without entering restricted-safe mode.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta document so it now records that baseline runtime and role-switch proof are complete and that the next blocker moved forward to `live_exit_handoff`.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/phase10.rs crates/rustynetd/src/daemon.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynetd`
+  - `cargo test -p rustynetd traversal_probe_keeps_signed_direct_programmed_when_handshake_does_not_advance_and_no_relay_exists -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_host_only_signed_direct_probe_exhaustion_stays_programmed_without_restricting -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_session_endpoint_mismatch_is_not_live -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay -- --nocapture`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_phase3_replayfix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --timeout-secs 7200`
+Validation and live-lab outcomes:
+  - The new phase10 regression passed and now proves that valid signed host-only traversal with coordination and no relay keeps the peer on a signed `direct_programmed` path without fabricating liveness.
+  - The new daemon regression passed and proves the runtime no longer enters restricted-safe mode just because host-only signed direct probes exhaust without a relay fallback.
+  - Existing direct/relay truthfulness regressions remained green, so `direct_active` still requires fresh handshake proof and `relay_active` still requires fresh handshake proof plus relay-session consistency.
+  - The fresh reduced five-node rerun at `artifacts/live_lab/phase3_worktree_rerun_replayfix` now passes:
+    - `enforce_baseline_runtime`
+    - `validate_baseline_runtime`
+    - `live_role_switch_matrix`
+  - Live status on the fresh rerun now shows the intended non-live-safe direct state instead of restricted fail-closed:
+    - `restricted_safe_mode=false`
+    - `path_mode=direct_programmed`
+    - `path_reason=direct_handshake_unproven`
+    - `traversal_probe_reason=direct_probe_exhausted_unproven_direct`
+  - The next blocker moved forward to `live_exit_handoff`, which now fails with:
+    - `error: issue assignment bundle failed: assignment error: requested node endpoint is invalid`
+Security invariants re-verified:
+  - No daemon-owned or helper-owned side socket was introduced.
+  - Exhausted direct probes still do not fabricate handshake freshness or `direct_active`; the path remains programmed and explicitly unproven.
+  - Signed traversal state remains enforced; the fix applies only when the traversal bundle and coordination are valid and the direct candidate is already signed authority state.
+  - Route advertisement is no longer blocked by a false restricted-safe transition in this host-only signed traversal case.
+What this slice completed:
+  - The earlier `DirectProbeExhaustedFailClosed` baseline-runtime blocker is fixed for the reduced Linux live topology.
+  - The previously landed role-switch host-key alignment is now live-proven because `live_role_switch_matrix` passes on the fresh rerun.
+What remains blocked:
+  - The next real blocker is later in the live helper flow: `live_exit_handoff` currently rejects the requested node endpoint while issuing handoff assignments.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-03
+Phase / Slice: Linux userspace-shared live-lab delta - backend-authoritative exit-handoff endpoint proof correction
+Files changed:
+  - crates/rustynetd/src/phase10.rs
+    - Exposed a narrow `Phase10Controller::current_peer_endpoint(...)` accessor so daemon status can read the backend's actual programmed peer endpoint without leaking backend-specific types.
+  - crates/rustynetd/src/daemon.rs
+    - Added parseable `selected_exit_peer_endpoint` and `selected_exit_peer_endpoint_error` fields to `rustynet status`, sourced from the backend's current programmed endpoint for the selected exit peer.
+    - Added a daemon regression assertion proving the selected-exit endpoint field is present on a real programmed-path status response.
+  - crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs
+    - Switched the `exit_b_endpoint_visible` proof from `wg show rustynet0 endpoints` to the daemon's backend-authoritative `selected_exit_peer_endpoint` status field.
+    - Kept raw `wg show` capture only as a debug artifact and added a unit test for deterministic status-field parsing.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the delta document so it now records that the userspace-shared handoff endpoint proof source is patched locally and still awaits a fresh rerun for live evidence.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynetd/src/phase10.rs crates/rustynetd/src/daemon.rs crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `cargo test -p rustynetd daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+Validation outcomes:
+  - The daemon regression passed with the new status-field assertions, so `rustynet status` now exposes a backend-owned selected-exit peer endpoint on a real programmed path.
+  - `live_linux_exit_handoff_test` unit coverage passed, including the new parser coverage and existing handoff helper regressions.
+  - No deploy or live-lab rerun was performed in this slice; this was a code-only proof-source correction.
+Security invariants re-verified:
+  - No daemon-owned or helper-owned side socket was introduced.
+  - The fix does not weaken the handoff proof; it replaces a kernel-only visibility check with a backend-authoritative programmed-endpoint check for `linux-wireguard-userspace-shared`.
+  - Direct/relay truthfulness semantics remain unchanged because the new field reports programmed peer endpoint state only; it does not claim live handshake proof.
+What this slice completed:
+  - The reduced-live-lab handoff check no longer treats empty `wg show rustynet0 endpoints` output as dispositive for the userspace-shared backend.
+  - The next honest step remains a fresh reduced five-node rerun on the current committed tree.
+What remains blocked:
+  - `live_exit_handoff` still needs fresh operational proof on the current committed tree.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-03
+Phase / Slice: Linux userspace-shared live-lab delta - Rust live-lab SSH-target endpoint resolution fix
+Files changed:
+  - crates/rustynet-cli/src/bin/live_lab_bin_support/mod.rs
+    - Added an `ssh -G`-backed target resolver for live-lab binaries that use the lightweight helper module and added unit coverage proving it prefers the effective SSH `hostname` while falling back to the raw target host only when no resolved hostname is present.
+  - crates/rustynet-cli/src/bin/live_lab_support/mod.rs
+    - Added the same `ssh -G`-backed target resolver for `LiveLabContext` users and matching unit coverage.
+  - crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs
+    - Switched signed handoff assignment `NODES_SPEC` construction from raw `target_address(...)` aliases to resolved effective SSH host endpoints.
+  - crates/rustynet-cli/src/bin/live_linux_two_hop_test.rs
+    - Switched signed topology construction to resolved effective SSH host endpoints.
+  - crates/rustynet-cli/src/bin/live_linux_lan_toggle_test.rs
+    - Switched signed topology construction to resolved effective SSH host endpoints.
+  - crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs
+    - Switched signed mesh peer endpoint construction to resolved effective SSH host endpoints.
+  - crates/rustynet-cli/src/bin/live_linux_control_surface_exposure_test.rs
+    - Switched remote DNS probe target selection to the resolved effective SSH host endpoint.
+  - crates/rustynet-cli/src/bin/live_linux_server_ip_bypass_test.rs
+    - Switched default underlay probe bind target selection to the resolved effective SSH host endpoint.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta document so it records that the handoff endpoint-construction bug is now patched locally and that the next required proof is a fresh reduced rerun.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_lab_bin_support/mod.rs crates/rustynet-cli/src/bin/live_lab_support/mod.rs crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs crates/rustynet-cli/src/bin/live_linux_two_hop_test.rs crates/rustynet-cli/src/bin/live_linux_lan_toggle_test.rs crates/rustynet-cli/src/bin/live_linux_control_surface_exposure_test.rs crates/rustynet-cli/src/bin/live_linux_server_ip_bypass_test.rs crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-cli --bins`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture`
+Validation outcomes:
+  - `cargo fmt --all -- --check` passed after formatting the touched CLI files.
+  - `cargo check -p rustynet-cli --bins` passed, so the widened resolver use compiles across the affected live-lab binaries.
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture` passed, including the new `live_lab_bin_support` resolver tests and the existing handoff helper regressions.
+  - `cargo test -p rustynet-cli --bin live_linux_managed_dns_test -- --nocapture` passed, including the new `live_lab_support` resolver tests and the existing managed-DNS helper regressions.
+Security invariants re-verified:
+  - Control-plane assignment and traversal issuance remain fail-closed on invalid endpoints; the strict `SocketAddr` validator in `rustynet-control` was not softened.
+  - No daemon-owned or helper-owned side socket was introduced.
+  - The fix only changes how Rust live-lab helpers derive concrete underlay host endpoints from SSH targets; it does not widen transport authority, weaken signed-bundle validation, or bypass endpoint verification.
+What this slice completed:
+  - The Rust-side live-lab caller bug that built signed topology specs from raw SSH alias tokens is fixed locally.
+  - The previously captured `live_exit_handoff` failure cause (`requested node endpoint is invalid`) is now patched in code rather than documented as an unexplained operational blocker.
+What remains blocked:
+  - A fresh reduced five-node rerun is still required to prove `live_exit_handoff` on the current committed tree and to capture the next blocker honestly if a later stage fails.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
 ```
 
 ```text

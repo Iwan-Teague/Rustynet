@@ -183,6 +183,21 @@ pub trait TunnelBackend: Send + Sync {
 
     fn stats(&self) -> Result<TunnelStats, BackendError>;
 
+    /// Requests that the backend initiate a peer handshake on the currently
+    /// configured transport path for the given peer.
+    ///
+    /// Backends that do not require an explicit handshake trigger may leave the
+    /// default no-op behavior in place. Backends that own their own userspace
+    /// transport should override this when endpoint reconfiguration alone does
+    /// not emit any peer traffic.
+    fn initiate_peer_handshake(
+        &mut self,
+        _node_id: &NodeId,
+        _force_resend: bool,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Returns diagnostics for the backend-owned authoritative shared transport
     /// when the backend can safely originate STUN and relay control traffic on
     /// the same peer-traffic transport identity.

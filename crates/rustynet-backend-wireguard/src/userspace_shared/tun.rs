@@ -2,10 +2,10 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use rustynet_backend_api::{BackendError, RuntimeContext};
+use rustynet_backend_api::{BackendError, ExitMode, Route, RouteKind, RuntimeContext};
 use tun_rs::{DeviceBuilder, SyncDevice};
 
-use crate::linux_command::WireguardCommandRunner;
+use crate::linux_command::{LinuxCommandRunner, WireguardCommandRunner, validate_interface_name};
 
 pub(crate) struct TunDevice {
     _inner: TunDeviceInner,
@@ -37,6 +37,73 @@ enum TunDeviceInner {
     Test(TestTunDeviceHandle),
 }
 
+#[derive(Clone)]
+pub(crate) struct SharedTunLifecycle {
+    inner: Arc<Mutex<Box<dyn TunLifecycle>>>,
+}
+
+impl fmt::Debug for SharedTunLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedTunLifecycle(..)")
+    }
+}
+
+impl SharedTunLifecycle {
+    pub(crate) fn new(inner: Box<dyn TunLifecycle>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    pub(crate) fn prepare_and_open(
+        &self,
+        interface_name: &str,
+        context: &RuntimeContext,
+    ) -> Result<TunDevice, BackendError> {
+        self.with_lock("prepare_and_open", |inner| {
+            inner.prepare_and_open(interface_name, context)
+        })
+    }
+
+    pub(crate) fn reconcile_routes(
+        &self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError> {
+        self.with_lock("reconcile_routes", |inner| {
+            inner.reconcile_routes(interface_name, previous_routes, next_routes)
+        })
+    }
+
+    pub(crate) fn cleanup(&self, interface_name: &str) -> Result<(), BackendError> {
+        self.with_lock("cleanup", |inner| inner.cleanup(interface_name))
+    }
+
+    pub(crate) fn reconcile_exit_mode(
+        &self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError> {
+        self.with_lock("reconcile_exit_mode", |inner| {
+            inner.reconcile_exit_mode(previous_mode, next_mode)
+        })
+    }
+
+    fn with_lock<T>(
+        &self,
+        operation: &str,
+        action: impl FnOnce(&mut dyn TunLifecycle) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let mut guard = self.inner.lock().map_err(|_| {
+            BackendError::internal(format!(
+                "linux userspace-shared TUN lifecycle mutex poisoned during {operation}"
+            ))
+        })?;
+        action(guard.as_mut())
+    }
+}
+
 pub(crate) trait TunLifecycle: fmt::Debug + Send + Sync {
     fn prepare_and_open(
         &mut self,
@@ -44,11 +111,26 @@ pub(crate) trait TunLifecycle: fmt::Debug + Send + Sync {
         context: &RuntimeContext,
     ) -> Result<TunDevice, BackendError>;
 
+    fn reconcile_routes(
+        &mut self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError>;
+
+    fn reconcile_exit_mode(
+        &mut self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError>;
+
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError>;
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DirectTunLifecycle;
+pub(crate) struct DirectTunLifecycle {
+    runner: LinuxCommandRunner,
+}
 
 impl TunLifecycle for DirectTunLifecycle {
     fn prepare_and_open(
@@ -67,6 +149,28 @@ impl TunLifecycle for DirectTunLifecycle {
                 ))
             })?;
         Ok(TunDevice::real(device))
+    }
+
+    fn reconcile_routes(
+        &mut self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError> {
+        reconcile_backend_routes(
+            &mut self.runner,
+            interface_name,
+            previous_routes,
+            next_routes,
+        )
+    }
+
+    fn reconcile_exit_mode(
+        &mut self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError> {
+        reconcile_backend_exit_mode(&mut self.runner, previous_mode, next_mode)
     }
 
     fn cleanup(&mut self, _interface_name: &str) -> Result<(), BackendError> {
@@ -181,6 +285,28 @@ impl TunLifecycle for HelperBackedTunLifecycle {
         result
     }
 
+    fn reconcile_routes(
+        &mut self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError> {
+        reconcile_backend_routes(
+            self.runner.as_mut(),
+            interface_name,
+            previous_routes,
+            next_routes,
+        )
+    }
+
+    fn reconcile_exit_mode(
+        &mut self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError> {
+        reconcile_backend_exit_mode(self.runner.as_mut(), previous_mode, next_mode)
+    }
+
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError> {
         self.remove_interface_if_present(interface_name)
     }
@@ -240,8 +366,75 @@ impl TunLifecycle for TestTunLifecycle {
         }
     }
 
+    fn reconcile_routes(
+        &mut self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError> {
+        validate_interface_name(interface_name)?;
+        validate_route_set(next_routes)?;
+        self.state.record_route_reconcile(interface_name);
+
+        let previous_programmed = backend_programmed_route_cidrs(previous_routes);
+        let next_programmed = backend_programmed_route_cidrs(next_routes);
+        let route_behavior = self.state.route_behavior();
+
+        let result = self.state.apply_route_reconciliation_for_test(
+            &previous_programmed,
+            &next_programmed,
+            &route_behavior,
+            true,
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let rollback_result = self.state.apply_route_reconciliation_for_test(
+                    &next_programmed,
+                    &previous_programmed,
+                    &route_behavior,
+                    false,
+                );
+                match rollback_result {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(combine_route_reconciliation_error(err, rollback_err)),
+                }
+            }
+        }
+    }
+
+    fn reconcile_exit_mode(
+        &mut self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError> {
+        self.state.record_exit_mode_reconcile(next_mode);
+        let exit_mode_behavior = self.state.exit_mode_behavior();
+
+        let result = self
+            .state
+            .apply_exit_mode_plan_for_test(next_mode, &exit_mode_behavior, true);
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let rollback_result = self.state.apply_exit_mode_plan_for_test(
+                    previous_mode,
+                    &exit_mode_behavior,
+                    false,
+                );
+                match rollback_result {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => {
+                        Err(combine_exit_mode_reconciliation_error(err, rollback_err))
+                    }
+                }
+            }
+        }
+    }
+
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError> {
         self.state.record_cleanup(interface_name);
+        self.state.clear_programmed_routes();
         Ok(())
     }
 }
@@ -252,6 +445,35 @@ pub(crate) enum TestTunBehavior {
     Succeed,
     FailBeforeOpen(String),
     FailAfterOpen(String),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TestRouteBehavior {
+    Succeed,
+    FailOnReplace { cidr: String, message: String },
+    FailOnDelete { cidr: String, message: String },
+}
+
+impl Default for TestRouteBehavior {
+    fn default() -> Self {
+        Self::Succeed
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TestExitModeBehavior {
+    Succeed,
+    FailOnDeleteTable { message: String },
+    FailOnDeletePriority { message: String },
+    FailOnAddPriority { message: String },
+}
+
+impl Default for TestExitModeBehavior {
+    fn default() -> Self {
+        Self::Succeed
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -283,6 +505,130 @@ impl TunTestState {
         inner.live_handles = inner.live_handles.saturating_sub(1);
     }
 
+    fn record_route_reconcile(&self, interface_name: &str) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.route_reconcile_calls += 1;
+        inner.last_route_interface_name = Some(interface_name.to_string());
+    }
+
+    fn clear_programmed_routes(&self) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.programmed_route_cidrs.clear();
+    }
+
+    fn record_exit_mode_reconcile(&self, target_mode: ExitMode) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.exit_mode_reconcile_calls += 1;
+        inner.last_exit_mode_target = Some(target_mode);
+    }
+
+    fn route_behavior(&self) -> TestRouteBehavior {
+        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.route_behavior.clone()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_route_behavior(&self, behavior: TestRouteBehavior) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.route_behavior = behavior;
+    }
+
+    fn exit_mode_behavior(&self) -> TestExitModeBehavior {
+        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.exit_mode_behavior.clone()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_exit_mode_behavior(&self, behavior: TestExitModeBehavior) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.exit_mode_behavior = behavior;
+    }
+
+    fn apply_route_reconciliation_for_test(
+        &self,
+        previous_programmed: &[String],
+        next_programmed: &[String],
+        route_behavior: &TestRouteBehavior,
+        failures_enabled: bool,
+    ) -> Result<(), BackendError> {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+
+        for cidr in next_programmed {
+            if failures_enabled {
+                maybe_fail_route_replace(route_behavior, cidr)?;
+            }
+            if !inner
+                .programmed_route_cidrs
+                .iter()
+                .any(|existing| existing == cidr)
+            {
+                inner.programmed_route_cidrs.push(cidr.clone());
+            }
+            inner.route_mutations.push(TunRouteMutation {
+                kind: TunRouteMutationKind::Replace,
+                destination_cidr: cidr.clone(),
+            });
+        }
+
+        for cidr in previous_programmed {
+            if next_programmed.iter().any(|next| next == cidr) {
+                continue;
+            }
+            if failures_enabled {
+                maybe_fail_route_delete(route_behavior, cidr)?;
+            }
+            inner
+                .programmed_route_cidrs
+                .retain(|existing| existing != cidr);
+            inner.route_mutations.push(TunRouteMutation {
+                kind: TunRouteMutationKind::Delete,
+                destination_cidr: cidr.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn apply_exit_mode_plan_for_test(
+        &self,
+        mode: ExitMode,
+        exit_mode_behavior: &TestExitModeBehavior,
+        failures_enabled: bool,
+    ) -> Result<(), BackendError> {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+
+        if failures_enabled {
+            maybe_fail_exit_mode_delete_table(exit_mode_behavior)?;
+        }
+        inner
+            .exit_mode_mutations
+            .push(TunExitModeMutation::DeleteTable);
+
+        if failures_enabled {
+            maybe_fail_exit_mode_delete_priority(exit_mode_behavior)?;
+        }
+        inner
+            .exit_mode_mutations
+            .push(TunExitModeMutation::DeletePriority);
+
+        match mode {
+            ExitMode::Off => {
+                inner.current_exit_mode = ExitMode::Off;
+                Ok(())
+            }
+            ExitMode::FullTunnel => {
+                if failures_enabled {
+                    maybe_fail_exit_mode_add_priority(exit_mode_behavior)?;
+                }
+                inner
+                    .exit_mode_mutations
+                    .push(TunExitModeMutation::AddPriority);
+                inner.current_exit_mode = ExitMode::FullTunnel;
+                Ok(())
+            }
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> TunTestSnapshot {
         let inner = self.inner.lock().expect("tun test state mutex poisoned");
@@ -293,11 +639,19 @@ impl TunTestState {
             last_interface_name: inner.last_interface_name.clone(),
             last_local_cidr: inner.last_local_cidr.clone(),
             last_cleanup_interface_name: inner.last_cleanup_interface_name.clone(),
+            route_reconcile_calls: inner.route_reconcile_calls,
+            last_route_interface_name: inner.last_route_interface_name.clone(),
+            programmed_route_cidrs: inner.programmed_route_cidrs.clone(),
+            route_mutations: inner.route_mutations.clone(),
+            exit_mode_reconcile_calls: inner.exit_mode_reconcile_calls,
+            last_exit_mode_target: inner.last_exit_mode_target,
+            current_exit_mode: inner.current_exit_mode,
+            exit_mode_mutations: inner.exit_mode_mutations.clone(),
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TunTestStateInner {
     prepare_calls: usize,
     cleanup_calls: usize,
@@ -305,6 +659,39 @@ struct TunTestStateInner {
     last_interface_name: Option<String>,
     last_local_cidr: Option<String>,
     last_cleanup_interface_name: Option<String>,
+    route_reconcile_calls: usize,
+    last_route_interface_name: Option<String>,
+    programmed_route_cidrs: Vec<String>,
+    route_mutations: Vec<TunRouteMutation>,
+    route_behavior: TestRouteBehavior,
+    exit_mode_reconcile_calls: usize,
+    last_exit_mode_target: Option<ExitMode>,
+    current_exit_mode: ExitMode,
+    exit_mode_mutations: Vec<TunExitModeMutation>,
+    exit_mode_behavior: TestExitModeBehavior,
+}
+
+impl Default for TunTestStateInner {
+    fn default() -> Self {
+        Self {
+            prepare_calls: 0,
+            cleanup_calls: 0,
+            live_handles: 0,
+            last_interface_name: None,
+            last_local_cidr: None,
+            last_cleanup_interface_name: None,
+            route_reconcile_calls: 0,
+            last_route_interface_name: None,
+            programmed_route_cidrs: Vec::new(),
+            route_mutations: Vec::new(),
+            route_behavior: TestRouteBehavior::default(),
+            exit_mode_reconcile_calls: 0,
+            last_exit_mode_target: None,
+            current_exit_mode: ExitMode::Off,
+            exit_mode_mutations: Vec::new(),
+            exit_mode_behavior: TestExitModeBehavior::default(),
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -316,6 +703,36 @@ pub(crate) struct TunTestSnapshot {
     pub(crate) last_interface_name: Option<String>,
     pub(crate) last_local_cidr: Option<String>,
     pub(crate) last_cleanup_interface_name: Option<String>,
+    pub(crate) route_reconcile_calls: usize,
+    pub(crate) last_route_interface_name: Option<String>,
+    pub(crate) programmed_route_cidrs: Vec<String>,
+    pub(crate) route_mutations: Vec<TunRouteMutation>,
+    pub(crate) exit_mode_reconcile_calls: usize,
+    pub(crate) last_exit_mode_target: Option<ExitMode>,
+    pub(crate) current_exit_mode: ExitMode,
+    pub(crate) exit_mode_mutations: Vec<TunExitModeMutation>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TunRouteMutationKind {
+    Replace,
+    Delete,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TunRouteMutation {
+    pub(crate) kind: TunRouteMutationKind,
+    pub(crate) destination_cidr: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TunExitModeMutation {
+    DeleteTable,
+    DeletePriority,
+    AddPriority,
 }
 
 #[derive(Debug)]
@@ -371,10 +788,436 @@ impl ParsedLocalCidr {
     }
 }
 
+fn reconcile_backend_routes(
+    runner: &mut dyn WireguardCommandRunner,
+    interface_name: &str,
+    previous_routes: &[Route],
+    next_routes: &[Route],
+) -> Result<(), BackendError> {
+    validate_interface_name(interface_name)?;
+    validate_route_set(next_routes)?;
+
+    let forward_result =
+        apply_backend_route_plan(runner, interface_name, previous_routes, next_routes);
+    match forward_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let rollback_result =
+                apply_backend_route_plan(runner, interface_name, next_routes, previous_routes);
+            match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(combine_route_reconciliation_error(err, rollback_err)),
+            }
+        }
+    }
+}
+
+fn apply_backend_route_plan(
+    runner: &mut dyn WireguardCommandRunner,
+    interface_name: &str,
+    previous_routes: &[Route],
+    next_routes: &[Route],
+) -> Result<(), BackendError> {
+    for route in next_routes {
+        if matches!(route.kind, RouteKind::ExitNodeDefault) {
+            continue;
+        }
+        runner.run(
+            "ip",
+            &[
+                "route".to_string(),
+                "replace".to_string(),
+                route.destination_cidr.clone(),
+                "dev".to_string(),
+                interface_name.to_string(),
+            ],
+        )?;
+    }
+
+    for route in previous_routes {
+        if matches!(route.kind, RouteKind::ExitNodeDefault) {
+            continue;
+        }
+        if next_routes.iter().any(|candidate| candidate == route) {
+            continue;
+        }
+        match runner.run(
+            "ip",
+            &[
+                "route".to_string(),
+                "del".to_string(),
+                route.destination_cidr.clone(),
+                "dev".to_string(),
+                interface_name.to_string(),
+            ],
+        ) {
+            Ok(()) => {}
+            Err(err) if is_missing_route_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_route_set(routes: &[Route]) -> Result<(), BackendError> {
+    for route in routes {
+        validate_route_cidr(&route.destination_cidr)?;
+    }
+    Ok(())
+}
+
+fn validate_route_cidr(value: &str) -> Result<(), BackendError> {
+    if value.is_empty() || !value.contains('/') {
+        return Err(BackendError::invalid_input("invalid cidr value"));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == ':' || ch == '/')
+    {
+        return Err(BackendError::invalid_input(
+            "cidr contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
+fn backend_programmed_route_cidrs(routes: &[Route]) -> Vec<String> {
+    routes
+        .iter()
+        .filter(|route| !matches!(route.kind, RouteKind::ExitNodeDefault))
+        .map(|route| route.destination_cidr.clone())
+        .collect()
+}
+
+fn combine_route_reconciliation_error(
+    primary: BackendError,
+    rollback: BackendError,
+) -> BackendError {
+    BackendError::internal(format!(
+        "{}; route rollback failed: {}",
+        primary.message, rollback.message
+    ))
+}
+
+fn reconcile_backend_exit_mode(
+    runner: &mut dyn WireguardCommandRunner,
+    previous_mode: ExitMode,
+    next_mode: ExitMode,
+) -> Result<(), BackendError> {
+    let forward_result = apply_backend_exit_mode_plan(runner, next_mode);
+    match forward_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let rollback_result = apply_backend_exit_mode_plan(runner, previous_mode);
+            match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(combine_exit_mode_reconciliation_error(err, rollback_err)),
+            }
+        }
+    }
+}
+
+fn apply_backend_exit_mode_plan(
+    runner: &mut dyn WireguardCommandRunner,
+    mode: ExitMode,
+) -> Result<(), BackendError> {
+    clear_backend_exit_rules(runner)?;
+    match mode {
+        ExitMode::Off => Ok(()),
+        ExitMode::FullTunnel => runner.run(
+            "ip",
+            &[
+                "rule".to_string(),
+                "add".to_string(),
+                "priority".to_string(),
+                "10000".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ],
+        ),
+    }
+}
+
+fn clear_backend_exit_rules(runner: &mut dyn WireguardCommandRunner) -> Result<(), BackendError> {
+    for _ in 0..64 {
+        match runner.run(
+            "ip",
+            &[
+                "rule".to_string(),
+                "del".to_string(),
+                "table".to_string(),
+                "51820".to_string(),
+            ],
+        ) {
+            Ok(()) => {}
+            Err(err) if is_missing_rule_error(&err) => break,
+            Err(err) => return Err(err),
+        }
+    }
+
+    match runner.run(
+        "ip",
+        &[
+            "rule".to_string(),
+            "del".to_string(),
+            "priority".to_string(),
+            "10000".to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ],
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) if is_missing_rule_error(&err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn combine_exit_mode_reconciliation_error(
+    primary: BackendError,
+    rollback: BackendError,
+) -> BackendError {
+    BackendError::internal(format!(
+        "{}; exit-mode rollback failed: {}",
+        primary.message, rollback.message
+    ))
+}
+
 fn is_missing_interface_error(err: &BackendError) -> bool {
     let message = err.message.to_ascii_lowercase();
     message.contains("cannot find device")
         || message.contains("does not exist")
         || message.contains("no such device")
         || message.contains("cannot find")
+}
+
+fn is_missing_route_error(err: &BackendError) -> bool {
+    let message = err.message.to_ascii_lowercase();
+    message.contains("rtnetlink answers: no such process")
+        || message.contains("no such process")
+        || message.contains("no such file or directory")
+}
+
+fn is_missing_rule_error(err: &BackendError) -> bool {
+    let message = err.message.to_ascii_lowercase();
+    message.contains("rtnetlink answers: no such process")
+        || message.contains("no such process")
+        || message.contains("no such file or directory")
+}
+
+fn maybe_fail_route_replace(behavior: &TestRouteBehavior, cidr: &str) -> Result<(), BackendError> {
+    match behavior {
+        TestRouteBehavior::Succeed => Ok(()),
+        TestRouteBehavior::FailOnReplace {
+            cidr: target_cidr,
+            message,
+        } if target_cidr == cidr => Err(BackendError::internal(message.clone())),
+        TestRouteBehavior::FailOnDelete { .. } => Ok(()),
+        TestRouteBehavior::FailOnReplace { .. } => Ok(()),
+    }
+}
+
+fn maybe_fail_route_delete(behavior: &TestRouteBehavior, cidr: &str) -> Result<(), BackendError> {
+    match behavior {
+        TestRouteBehavior::Succeed => Ok(()),
+        TestRouteBehavior::FailOnDelete {
+            cidr: target_cidr,
+            message,
+        } if target_cidr == cidr => Err(BackendError::internal(message.clone())),
+        TestRouteBehavior::FailOnReplace { .. } => Ok(()),
+        TestRouteBehavior::FailOnDelete { .. } => Ok(()),
+    }
+}
+
+fn maybe_fail_exit_mode_delete_table(behavior: &TestExitModeBehavior) -> Result<(), BackendError> {
+    match behavior {
+        TestExitModeBehavior::Succeed => Ok(()),
+        TestExitModeBehavior::FailOnDeleteTable { message } => {
+            Err(BackendError::internal(message.clone()))
+        }
+        TestExitModeBehavior::FailOnDeletePriority { .. }
+        | TestExitModeBehavior::FailOnAddPriority { .. } => Ok(()),
+    }
+}
+
+fn maybe_fail_exit_mode_delete_priority(
+    behavior: &TestExitModeBehavior,
+) -> Result<(), BackendError> {
+    match behavior {
+        TestExitModeBehavior::Succeed => Ok(()),
+        TestExitModeBehavior::FailOnDeletePriority { message } => {
+            Err(BackendError::internal(message.clone()))
+        }
+        TestExitModeBehavior::FailOnDeleteTable { .. }
+        | TestExitModeBehavior::FailOnAddPriority { .. } => Ok(()),
+    }
+}
+
+fn maybe_fail_exit_mode_add_priority(behavior: &TestExitModeBehavior) -> Result<(), BackendError> {
+    match behavior {
+        TestExitModeBehavior::Succeed => Ok(()),
+        TestExitModeBehavior::FailOnAddPriority { message } => {
+            Err(BackendError::internal(message.clone()))
+        }
+        TestExitModeBehavior::FailOnDeleteTable { .. }
+        | TestExitModeBehavior::FailOnDeletePriority { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustynet_backend_api::{ExitMode, NodeId, Route, RouteKind};
+
+    use super::*;
+    use crate::linux_command::WireguardCommandOutput;
+
+    #[derive(Debug, Default)]
+    struct RecordingRunner {
+        commands: Vec<(String, Vec<String>)>,
+    }
+
+    impl WireguardCommandRunner for RecordingRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            self.commands.push((program.to_string(), args.to_vec()));
+            Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.commands.push((program.to_string(), args.to_vec()));
+            Ok(WireguardCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MissingDeleteTableRunner {
+        commands: Vec<(String, Vec<String>)>,
+    }
+
+    impl WireguardCommandRunner for MissingDeleteTableRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            self.commands.push((program.to_string(), args.to_vec()));
+            let is_delete_table = program == "ip"
+                && args
+                    == ["rule", "del", "table", "51820"]
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>();
+            if is_delete_table {
+                return Err(BackendError::internal(
+                    "privileged helper ip exited with status 2: RTNETLINK answers: No such process",
+                ));
+            }
+            Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.run(program, args)?;
+            Ok(WireguardCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    fn route(destination_cidr: &str, kind: RouteKind) -> Route {
+        Route {
+            destination_cidr: destination_cidr.to_string(),
+            via_node: NodeId::new("phase1-route-node").expect("valid node id"),
+            kind,
+        }
+    }
+
+    #[test]
+    fn reconcile_backend_routes_skips_exit_node_default_on_add_and_delete() {
+        let mut runner = RecordingRunner::default();
+
+        reconcile_backend_routes(
+            &mut runner,
+            "rustynet0",
+            &[
+                route("100.64.20.0/24", RouteKind::Mesh),
+                route("0.0.0.0/0", RouteKind::ExitNodeDefault),
+            ],
+            &[
+                route("100.64.30.0/24", RouteKind::ExitNodeLan),
+                route("0.0.0.0/0", RouteKind::ExitNodeDefault),
+            ],
+        )
+        .expect("route reconciliation should succeed");
+
+        assert_eq!(
+            runner.commands,
+            vec![
+                (
+                    "ip".to_string(),
+                    vec![
+                        "route".to_string(),
+                        "replace".to_string(),
+                        "100.64.30.0/24".to_string(),
+                        "dev".to_string(),
+                        "rustynet0".to_string(),
+                    ],
+                ),
+                (
+                    "ip".to_string(),
+                    vec![
+                        "route".to_string(),
+                        "del".to_string(),
+                        "100.64.20.0/24".to_string(),
+                        "dev".to_string(),
+                        "rustynet0".to_string(),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_backend_exit_mode_full_tunnel_uses_fixed_priority_rule() {
+        let mut runner = MissingDeleteTableRunner::default();
+
+        reconcile_backend_exit_mode(&mut runner, ExitMode::Off, ExitMode::FullTunnel)
+            .expect("exit-mode reconciliation should succeed");
+
+        let delete_priority = vec![
+            "rule".to_string(),
+            "del".to_string(),
+            "priority".to_string(),
+            "10000".to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ];
+        let add_priority = vec![
+            "rule".to_string(),
+            "add".to_string(),
+            "priority".to_string(),
+            "10000".to_string(),
+            "table".to_string(),
+            "51820".to_string(),
+        ];
+
+        assert!(
+            runner
+                .commands
+                .iter()
+                .any(|(program, args)| program == "ip" && args == &delete_priority)
+        );
+        assert!(
+            runner
+                .commands
+                .iter()
+                .any(|(program, args)| program == "ip" && args == &add_priority)
+        );
+    }
 }

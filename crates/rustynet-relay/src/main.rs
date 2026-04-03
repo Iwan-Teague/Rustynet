@@ -39,6 +39,7 @@ mod daemon {
     use std::time::Duration;
 
     use ed25519_dalek::VerifyingKey;
+    use subtle::ConstantTimeEq;
     use tokio::net::UdpSocket;
     use tokio::sync::RwLock;
     use tokio::time::interval;
@@ -417,7 +418,9 @@ mod daemon {
             sockets.retain(|port, (_socket, alloc)| {
                 active_sessions
                     .get(port)
-                    .map(|session_id| *session_id == alloc.session_id)
+                    .map(|session_id| {
+                        bool::from(session_id.as_bytes().ct_eq(alloc.session_id.as_bytes()))
+                    })
                     .unwrap_or(false)
             });
         }

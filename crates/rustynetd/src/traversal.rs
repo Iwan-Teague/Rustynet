@@ -1297,7 +1297,13 @@ impl TraversalEngine {
         };
 
         let mut observed_latest = runtime.latest_handshake_unix()?;
+        let mut waited_for_attempt_delay = Duration::ZERO;
         for (index, pair) in plan.pairs.iter().enumerate() {
+            let scheduled_delay = Duration::from_millis(pair.delay_ms);
+            if scheduled_delay > waited_for_attempt_delay {
+                waiter.wait(scheduled_delay - waited_for_attempt_delay);
+                waited_for_attempt_delay = scheduled_delay;
+            }
             runtime.send_probe(pair.remote.endpoint, pair.round)?;
             let latest = runtime.latest_handshake_unix()?;
             if handshake_advanced(observed_latest, latest)
@@ -2100,6 +2106,93 @@ mod tests {
             }
             _ => panic!("expected relay"),
         }
+
+        #[derive(Clone, Default)]
+        struct SharedTraversalState {
+            waited: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+
+        struct WaitDrivenHandshakeRuntime {
+            state: SharedTraversalState,
+            sent: Vec<(SocketEndpoint, u8)>,
+            observed_handshake_unix: u64,
+        }
+        impl SimultaneousOpenRuntime for WaitDrivenHandshakeRuntime {
+            fn send_probe(
+                &mut self,
+                endpoint: SocketEndpoint,
+                round: u8,
+            ) -> Result<(), TraversalError> {
+                self.sent.push((endpoint, round));
+                Ok(())
+            }
+
+            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
+                Ok(self
+                    .state
+                    .waited
+                    .get()
+                    .then_some(self.observed_handshake_unix))
+            }
+        }
+
+        struct RecordingWaiter {
+            state: SharedTraversalState,
+            waits: Vec<Duration>,
+        }
+        impl SimultaneousOpenWaiter for RecordingWaiter {
+            fn wait(&mut self, duration: Duration) {
+                self.waits.push(duration);
+                if !duration.is_zero() {
+                    self.state.waited.set(true);
+                }
+            }
+        }
+
+        let shared_state = SharedTraversalState::default();
+        let mut delayed_runtime = WaitDrivenHandshakeRuntime {
+            state: shared_state.clone(),
+            sent: Vec::new(),
+            observed_handshake_unix: now,
+        };
+        let mut delayed_waiter = RecordingWaiter {
+            state: shared_state,
+            waits: Vec::new(),
+        };
+        let delayed_result = engine
+            .execute_simultaneous_open(
+                &mut delayed_runtime,
+                &mut delayed_waiter,
+                schedule2,
+                local_candidates.as_slice(),
+                direct_candidates.as_slice(),
+                None,
+                now,
+                120,
+            )
+            .expect("delayed direct probe should succeed");
+
+        match delayed_result.decision {
+            TraversalDecision::Direct { endpoint, reason } => {
+                assert_eq!(endpoint, direct_candidates[0].endpoint);
+                assert_eq!(
+                    reason,
+                    TraversalDecisionReason::SimultaneousOpenHandshakeObserved
+                );
+            }
+            other => panic!("expected delayed direct decision, got {other:?}"),
+        }
+        assert_eq!(delayed_result.attempts, 2);
+        assert_eq!(delayed_runtime.sent.len(), 2);
+        assert_eq!(delayed_runtime.sent[0].1, 0);
+        assert_eq!(delayed_runtime.sent[1].1, 1);
+        assert_eq!(
+            delayed_waiter.waits,
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(engine.config.round_spacing_ms)
+            ]
+        );
     }
 
     // ── A4: Adversarial traversal hardening tests ─────────────────────────

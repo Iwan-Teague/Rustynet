@@ -180,6 +180,34 @@ pub fn target_address(target: &str) -> &str {
         .unwrap_or(target)
 }
 
+fn resolved_target_address_from_ssh_g(target: &str, resolved: &str) -> String {
+    ssh_g_value(resolved, "hostname")
+        .filter(|hostname| !hostname.is_empty() && *hostname != "none")
+        .unwrap_or_else(|| target_address(target))
+        .to_string()
+}
+
+pub fn resolved_target_address(target: &str) -> Result<String, String> {
+    let resolved = Command::new("ssh")
+        .args(["-G", target])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("failed resolving SSH target address for {target}: {err}"))?;
+    if !resolved.status.success() {
+        return Err(format!(
+            "failed resolving SSH target address for {target}: {}",
+            String::from_utf8_lossy(&resolved.stderr).trim()
+        ));
+    }
+    let resolved_text = String::from_utf8_lossy(&resolved.stdout);
+    let host = resolved_target_address_from_ssh_g(target, &resolved_text);
+    if host.is_empty() {
+        Err(format!("resolved SSH target address is empty for {target}"))
+    } else {
+        Ok(host)
+    }
+}
+
 pub fn remote_src_dir(target: &str) -> String {
     match target_user(target) {
         "root" => "/root/Rustynet".to_string(),
@@ -372,24 +400,94 @@ pub fn seed_known_hosts(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn require_pinned_host_entry(pinned_known_hosts: &Path, target: &str) -> Result<(), String> {
-    let host = target_address(target);
-    let status = Command::new("ssh-keygen")
-        .args(["-F", host, "-f"])
-        .arg(pinned_known_hosts)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| format!("failed to run ssh-keygen -F for {host}: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "pinned known_hosts file lacks host key for {host}: {}",
-            pinned_known_hosts.display()
-        ))
+fn known_hosts_lookup_host(host: &str, port: &str) -> Result<String, String> {
+    if host.is_empty() {
+        return Err("known_hosts lookup host must not be empty".to_string());
     }
+    if port.is_empty() || port == "22" {
+        Ok(host.to_string())
+    } else {
+        Ok(format!("[{host}]:{port}"))
+    }
+}
+
+fn ssh_g_value<'a>(resolved: &'a str, key: &str) -> Option<&'a str> {
+    resolved.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some(found_key), Some(value)) if found_key == key => Some(value),
+            _ => None,
+        }
+    })
+}
+
+fn resolved_known_hosts_candidates(target: &str, resolved: &str) -> Result<Vec<String>, String> {
+    let raw_host = target_address(target);
+    let port = ssh_g_value(resolved, "port").unwrap_or("22");
+    let mut lookup_candidates = Vec::new();
+
+    if let Some(hostkeyalias) = ssh_g_value(resolved, "hostkeyalias") {
+        if hostkeyalias != "none" {
+            let lookup_host = known_hosts_lookup_host(hostkeyalias, port)?;
+            lookup_candidates.push(lookup_host);
+        }
+    }
+
+    let raw_lookup = known_hosts_lookup_host(raw_host, port)?;
+    lookup_candidates.push(raw_lookup);
+
+    if let Some(hostname) = ssh_g_value(resolved, "hostname") {
+        let lookup_host = known_hosts_lookup_host(hostname, port)?;
+        if !lookup_candidates.contains(&lookup_host) {
+            lookup_candidates.push(lookup_host);
+        }
+    }
+
+    Ok(lookup_candidates)
+}
+
+pub fn require_pinned_host_entry(pinned_known_hosts: &Path, target: &str) -> Result<(), String> {
+    let resolved = Command::new("ssh")
+        .args(["-G", target])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            format!("failed resolving SSH target for host-key verification {target}: {err}")
+        })?;
+    if !resolved.status.success() {
+        return Err(format!(
+            "failed resolving SSH target for host-key verification {target}: {}",
+            String::from_utf8_lossy(&resolved.stderr).trim()
+        ));
+    }
+
+    let resolved_text = String::from_utf8_lossy(&resolved.stdout);
+    let lookup_candidates = resolved_known_hosts_candidates(target, &resolved_text)?;
+    if lookup_candidates.is_empty() {
+        return Err(format!(
+            "pinned known_hosts verification resolved no lookup candidates for {target}"
+        ));
+    }
+
+    for lookup_host in &lookup_candidates {
+        let status = Command::new("ssh-keygen")
+            .args(["-F", lookup_host, "-f"])
+            .arg(pinned_known_hosts)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|err| format!("failed to run ssh-keygen -F for {lookup_host}: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "pinned known_hosts file lacks host key for {target}; checked {} in {}",
+        lookup_candidates.join(", "),
+        pinned_known_hosts.display()
+    ))
 }
 
 fn ssh_base_command(identity: &Path, known_hosts: &Path, target: &str) -> Command {
@@ -967,4 +1065,77 @@ fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        known_hosts_lookup_host, resolved_known_hosts_candidates,
+        resolved_target_address_from_ssh_g,
+    };
+
+    #[test]
+    fn resolved_known_hosts_candidates_include_alias_raw_and_hostname() {
+        let resolved = "\
+hostkeyalias rusty-lab
+hostname debian-headless-2
+port 2222
+";
+        let candidates =
+            resolved_known_hosts_candidates("debian@192.168.18.65", resolved).expect("candidates");
+        assert_eq!(
+            candidates,
+            vec![
+                "[rusty-lab]:2222".to_string(),
+                "[192.168.18.65]:2222".to_string(),
+                "[debian-headless-2]:2222".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolved_known_hosts_candidates_dedupe_hostname_matches_raw_host() {
+        let resolved = "\
+hostname debian-headless-2
+port 22
+";
+        let candidates = resolved_known_hosts_candidates("debian@debian-headless-2", resolved)
+            .expect("candidates");
+        assert_eq!(candidates, vec!["debian-headless-2".to_string()]);
+    }
+
+    #[test]
+    fn known_hosts_lookup_host_uses_bracket_form_for_non_default_port() {
+        assert_eq!(
+            known_hosts_lookup_host("debian-headless-2", "2200").expect("lookup host"),
+            "[debian-headless-2]:2200"
+        );
+        assert_eq!(
+            known_hosts_lookup_host("debian-headless-2", "22").expect("lookup host"),
+            "debian-headless-2"
+        );
+    }
+
+    #[test]
+    fn resolved_target_address_prefers_ssh_hostname() {
+        let resolved = "\
+hostname 192.168.64.22
+port 22
+";
+        assert_eq!(
+            resolved_target_address_from_ssh_g("debian@debian-headless-1", resolved),
+            "192.168.64.22"
+        );
+    }
+
+    #[test]
+    fn resolved_target_address_falls_back_to_raw_target_host() {
+        let resolved = "\
+port 22
+";
+        assert_eq!(
+            resolved_target_address_from_ssh_g("debian@debian-headless-1", resolved),
+            "debian-headless-1"
+        );
+    }
 }

@@ -100,7 +100,7 @@ fn run() -> Result<(), String> {
     for (node_id, host) in sorted_node_host_pairs(&host_by_node) {
         mesh_peers.push(ManagedPeerRuntime {
             node_id,
-            address: target_address(&host).to_string(),
+            address: LiveLabContext::resolved_target_address(&host)?,
             pubkey_hex: ctx.collect_pubkey_hex(&host)?,
         });
     }
@@ -1983,13 +1983,6 @@ fn require_command(command: &str) -> Result<(), String> {
     } else {
         Err(format!("missing required command: {command}"))
     }
-}
-
-fn target_address(target: &str) -> &str {
-    target
-        .split_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(target)
 }
 
 fn parse_status_field(status: &str, key: &str) -> Option<String> {

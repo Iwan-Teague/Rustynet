@@ -13,6 +13,7 @@ Start with these when you need current status, remaining work, or the public imp
 
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
+- [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)

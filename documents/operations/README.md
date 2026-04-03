@@ -38,6 +38,9 @@ The two primary execution ledgers are:
 Supporting active implementation plan for the remaining production shared-transport delta:
 - [active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 
+Supporting active implementation delta for the remaining Linux live-lab blocker:
+- [active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
+
 ## High-Value Evergreen References
 
 - [BackendAgilityValidation.md](./BackendAgilityValidation.md)

@@ -185,6 +185,42 @@ fn linux_userspace_shared_backend_lifecycle_exposes_authoritative_identity_only_
 }
 
 #[test]
+fn linux_userspace_shared_backend_supports_route_and_exit_mode_lifecycle() {
+    let private_key_path = write_private_key([18; 32]);
+    let listen_port = free_listen_port();
+    let mut backend = LinuxUserspaceSharedBackend::new_for_test(
+        "rustynet0",
+        private_key_path.to_string_lossy(),
+        listen_port,
+    )
+    .expect("backend should construct");
+
+    backend
+        .start(runtime_context())
+        .expect("backend should start successfully");
+    backend
+        .configure_peer(sample_peer("peer-a"))
+        .expect("peer should configure");
+    backend
+        .apply_routes(vec![Route {
+            destination_cidr: "100.64.20.0/24".to_string(),
+            via_node: NodeId::new("peer-a").expect("valid node id"),
+            kind: RouteKind::ExitNodeLan,
+        }])
+        .expect("route apply should succeed");
+    backend
+        .set_exit_mode(ExitMode::FullTunnel)
+        .expect("exit mode switch should succeed");
+
+    let capabilities = backend.capabilities();
+    assert!(capabilities.supports_exit_nodes);
+    assert!(capabilities.supports_lan_routes);
+
+    backend.shutdown().expect("shutdown should succeed");
+    let _ = fs::remove_file(private_key_path);
+}
+
+#[test]
 fn command_only_linux_backend_blocker_remains_unchanged() {
     let backend = LinuxWireguardBackend::new(StubRunner, "rustynet0", "/tmp/wg.key", 51820)
         .expect("backend should construct");

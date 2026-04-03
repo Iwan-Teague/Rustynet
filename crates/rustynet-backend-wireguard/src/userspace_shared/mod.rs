@@ -22,7 +22,10 @@ mod tun;
 use engine::UserspaceEngine;
 use runtime::{RunningUserspaceRuntime, RuntimeControl};
 use socket::AuthoritativeSocket;
-use tun::{DirectTunLifecycle, HelperBackedTunLifecycle, TestTunLifecycle, TunLifecycle};
+use tun::{
+    DirectTunLifecycle, HelperBackedTunLifecycle, SharedTunLifecycle, TestTunLifecycle,
+    TunLifecycle,
+};
 
 pub(crate) const LINUX_USERSPACE_SHARED_BACKEND_MODE: &str = "linux-wireguard-userspace-shared";
 #[allow(dead_code)]
@@ -32,7 +35,7 @@ pub struct LinuxUserspaceSharedBackend {
     interface_name: String,
     private_key_path: PathBuf,
     listen_port: u16,
-    tun_lifecycle: Box<dyn TunLifecycle>,
+    tun_lifecycle: SharedTunLifecycle,
     runtime: Option<RunningUserspaceRuntime>,
 }
 
@@ -98,7 +101,7 @@ impl LinuxUserspaceSharedBackend {
             interface_name,
             private_key_path: PathBuf::from(private_key_path),
             listen_port,
-            tun_lifecycle,
+            tun_lifecycle: SharedTunLifecycle::new(tun_lifecycle),
             runtime: None,
         })
     }
@@ -110,12 +113,6 @@ impl LinuxUserspaceSharedBackend {
             .ok_or_else(|| {
                 BackendError::not_running("linux userspace-shared wireguard backend is not running")
             })
-    }
-
-    fn later_phase_unavailable(action: &str) -> BackendError {
-        BackendError::internal(format!(
-            "linux userspace-shared backend does not yet implement {action}; later production transport-owning phases remain open"
-        ))
     }
 
     fn combine_cleanup_error(primary: BackendError, cleanup: BackendError) -> BackendError {
@@ -232,8 +229,8 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             supports_roaming: false,
-            supports_exit_nodes: false,
-            supports_lan_routes: false,
+            supports_exit_nodes: true,
+            supports_lan_routes: true,
             supports_ipv6: false,
         }
     }
@@ -263,6 +260,7 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
             tun_device,
             socket,
             engine,
+            self.tun_lifecycle.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => return Err(self.cleanup_tun_after_failed_start(err)),
@@ -315,6 +313,15 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
 
     fn stats(&self) -> Result<TunnelStats, BackendError> {
         self.ensure_runtime_control()?.stats()
+    }
+
+    fn initiate_peer_handshake(
+        &mut self,
+        node_id: &NodeId,
+        force_resend: bool,
+    ) -> Result<(), BackendError> {
+        self.ensure_runtime_control()?
+            .initiate_peer_handshake(node_id.clone(), force_resend)
     }
 
     fn authoritative_transport_identity(&self) -> Option<AuthoritativeTransportIdentity> {
@@ -373,18 +380,6 @@ fn validate_cidr(value: &str) -> Result<(), BackendError> {
 }
 
 impl RuntimeControl {
-    fn apply_routes(&self, routes: Vec<Route>) -> Result<(), BackendError> {
-        self.apply_routes_or_fail_closed(routes, || {
-            LinuxUserspaceSharedBackend::later_phase_unavailable("route application")
-        })
-    }
-
-    fn set_exit_mode(&self, mode: ExitMode) -> Result<(), BackendError> {
-        self.set_exit_mode_or_fail_closed(mode, || {
-            LinuxUserspaceSharedBackend::later_phase_unavailable("exit-mode programming")
-        })
-    }
-
     fn authoritative_transport_round_trip(
         &self,
         remote_addr: SocketAddr,
@@ -417,11 +412,15 @@ mod tests {
     use base64::prelude::*;
     use boringtun::x25519::{PublicKey, StaticSecret};
     use rustynet_backend_api::{
-        BackendErrorKind, NodeId, PeerConfig, RuntimeContext, SocketEndpoint, TunnelBackend,
+        BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RouteKind, RuntimeContext,
+        SocketEndpoint, TunnelBackend,
     };
 
     use super::LinuxUserspaceSharedBackend;
-    use super::tun::{TestTunBehavior, TestTunLifecycle};
+    use super::tun::{
+        TestExitModeBehavior, TestRouteBehavior, TestTunBehavior, TestTunLifecycle,
+        TunExitModeMutation, TunRouteMutation, TunRouteMutationKind,
+    };
     use crate::userspace_shared::runtime::RecordedAuthoritativeTransportOperationKind;
 
     fn runtime_context() -> RuntimeContext {
@@ -513,6 +512,14 @@ mod tests {
             },
             public_key,
             allowed_ips: allowed_ips.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    fn route(destination_cidr: &str, kind: RouteKind) -> Route {
+        Route {
+            destination_cidr: destination_cidr.to_string(),
+            via_node: NodeId::new("phase1-route-node").expect("valid node id"),
+            kind,
         }
     }
 
@@ -611,6 +618,14 @@ mod tests {
                 last_interface_name: Some("rustynet0".to_string()),
                 last_local_cidr: Some("100.64.0.1/32".to_string()),
                 last_cleanup_interface_name: None,
+                route_reconcile_calls: 0,
+                last_route_interface_name: None,
+                programmed_route_cidrs: Vec::new(),
+                route_mutations: Vec::new(),
+                exit_mode_reconcile_calls: 0,
+                last_exit_mode_target: None,
+                current_exit_mode: ExitMode::Off,
+                exit_mode_mutations: Vec::new(),
             }
         );
 
@@ -674,6 +689,14 @@ mod tests {
                 last_interface_name: Some("rustynet0".to_string()),
                 last_local_cidr: Some("100.64.0.1/32".to_string()),
                 last_cleanup_interface_name: None,
+                route_reconcile_calls: 0,
+                last_route_interface_name: None,
+                programmed_route_cidrs: Vec::new(),
+                route_mutations: Vec::new(),
+                exit_mode_reconcile_calls: 0,
+                last_exit_mode_target: None,
+                current_exit_mode: ExitMode::Off,
+                exit_mode_mutations: Vec::new(),
             }
         );
 
@@ -706,6 +729,14 @@ mod tests {
                 last_interface_name: Some("rustynet0".to_string()),
                 last_local_cidr: Some("100.64.0.1/32".to_string()),
                 last_cleanup_interface_name: Some("rustynet0".to_string()),
+                route_reconcile_calls: 0,
+                last_route_interface_name: None,
+                programmed_route_cidrs: Vec::new(),
+                route_mutations: Vec::new(),
+                exit_mode_reconcile_calls: 0,
+                last_exit_mode_target: None,
+                current_exit_mode: ExitMode::Off,
+                exit_mode_mutations: Vec::new(),
             }
         );
         assert!(
@@ -741,11 +772,470 @@ mod tests {
                 last_interface_name: Some("rustynet0".to_string()),
                 last_local_cidr: Some("100.64.0.1/32".to_string()),
                 last_cleanup_interface_name: Some("rustynet0".to_string()),
+                route_reconcile_calls: 0,
+                last_route_interface_name: None,
+                programmed_route_cidrs: Vec::new(),
+                route_mutations: Vec::new(),
+                exit_mode_reconcile_calls: 1,
+                last_exit_mode_target: Some(ExitMode::Off),
+                current_exit_mode: ExitMode::Off,
+                exit_mode_mutations: vec![
+                    TunExitModeMutation::DeleteTable,
+                    TunExitModeMutation::DeletePriority,
+                ],
             }
         );
         let rebound = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
             .expect("listen port should be released after shutdown");
         drop(rebound);
+
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_apply_routes_reconciles_non_default_routes_and_preserves_transport_identity()
+     {
+        let private_key_path = write_private_key([40; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let mesh_route = route("100.64.20.0/24", RouteKind::Mesh);
+        let exit_default = route("0.0.0.0/0", RouteKind::ExitNodeDefault);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        let identity_before = backend
+            .authoritative_transport_identity()
+            .expect("identity should exist after start");
+        let generation_before = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+
+        backend
+            .apply_routes(vec![mesh_route.clone(), exit_default])
+            .expect("route reconciliation should succeed");
+
+        let identity_after = backend
+            .authoritative_transport_identity()
+            .expect("identity should remain available after route reconciliation");
+        let generation_after = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+        let snapshot = tun_state.snapshot();
+
+        assert_eq!(identity_before, identity_after);
+        assert_eq!(generation_before, generation_after);
+        assert_eq!(snapshot.route_reconcile_calls, 1);
+        assert_eq!(
+            snapshot.last_route_interface_name,
+            Some("rustynet0".to_string())
+        );
+        assert_eq!(
+            snapshot.programmed_route_cidrs,
+            vec!["100.64.20.0/24".to_string()]
+        );
+        assert_eq!(
+            snapshot.route_mutations,
+            vec![TunRouteMutation {
+                kind: TunRouteMutationKind::Replace,
+                destination_cidr: "100.64.20.0/24".to_string(),
+            }]
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_apply_routes_removes_stale_routes() {
+        let private_key_path = write_private_key([41; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let first_mesh = route("100.64.30.0/24", RouteKind::Mesh);
+        let retained_exit_lan = route("192.168.50.0/24", RouteKind::ExitNodeLan);
+        let replacement_mesh = route("100.64.40.0/24", RouteKind::Mesh);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .apply_routes(vec![first_mesh.clone(), retained_exit_lan.clone()])
+            .expect("initial route apply should succeed");
+        backend
+            .apply_routes(vec![retained_exit_lan.clone(), replacement_mesh.clone()])
+            .expect("route update should succeed");
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.route_reconcile_calls, 2);
+        assert_eq!(
+            snapshot.programmed_route_cidrs,
+            vec!["192.168.50.0/24".to_string(), "100.64.40.0/24".to_string(),]
+        );
+        assert!(
+            snapshot.route_mutations.iter().any(|mutation| {
+                mutation.kind == TunRouteMutationKind::Delete
+                    && mutation.destination_cidr == "100.64.30.0/24"
+            }),
+            "stale backend-programmed routes must be removed during reconciliation"
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_apply_routes_failure_rolls_back_without_runtime_state_drift()
+    {
+        let private_key_path = write_private_key([42; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let stable_route = route("100.64.60.0/24", RouteKind::Mesh);
+        let failing_route = route("100.64.70.0/24", RouteKind::Mesh);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .apply_routes(vec![stable_route.clone()])
+            .expect("initial route apply should succeed");
+
+        tun_state.set_route_behavior(TestRouteBehavior::FailOnReplace {
+            cidr: failing_route.destination_cidr.clone(),
+            message: "phase1 route replace failure".to_string(),
+        });
+        let err = backend
+            .apply_routes(vec![failing_route.clone()])
+            .expect_err("route apply should fail closed when helper route programming fails");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("phase1 route replace failure"));
+
+        let snapshot_after_failure = tun_state.snapshot();
+        assert_eq!(
+            snapshot_after_failure.programmed_route_cidrs,
+            vec!["100.64.60.0/24".to_string()]
+        );
+
+        tun_state.set_route_behavior(TestRouteBehavior::Succeed);
+        backend.apply_routes(vec![failing_route.clone()]).expect(
+            "later route reconciliation should still use the last successful backend state",
+        );
+
+        let snapshot_after_recovery = tun_state.snapshot();
+        assert_eq!(
+            snapshot_after_recovery.programmed_route_cidrs,
+            vec!["100.64.70.0/24".to_string()]
+        );
+        assert!(
+            snapshot_after_recovery
+                .route_mutations
+                .iter()
+                .any(|mutation| {
+                    mutation.kind == TunRouteMutationKind::Delete
+                        && mutation.destination_cidr == "100.64.60.0/24"
+                }),
+            "the backend must retain the previous successful route set until recovery succeeds"
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_apply_routes_delete_failure_rolls_back_without_residue() {
+        let private_key_path = write_private_key([44; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let stale_route = route("100.64.80.0/24", RouteKind::Mesh);
+        let replacement_route = route("100.64.90.0/24", RouteKind::Mesh);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .apply_routes(vec![stale_route.clone()])
+            .expect("initial route apply should succeed");
+
+        tun_state.set_route_behavior(TestRouteBehavior::FailOnDelete {
+            cidr: stale_route.destination_cidr.clone(),
+            message: "phase1 route delete failure".to_string(),
+        });
+        let err = backend
+            .apply_routes(vec![replacement_route.clone()])
+            .expect_err("stale-route deletion failure must fail closed");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("phase1 route delete failure"));
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(
+            snapshot.programmed_route_cidrs,
+            vec!["100.64.80.0/24".to_string()]
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_apply_routes_rejects_invalid_cidr_without_mutation() {
+        let private_key_path = write_private_key([43; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+
+        let err = backend
+            .apply_routes(vec![route("not-a-cidr", RouteKind::Mesh)])
+            .expect_err("invalid route input must fail closed");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.route_reconcile_calls, 0);
+        assert!(snapshot.programmed_route_cidrs.is_empty());
+        assert!(snapshot.route_mutations.is_empty());
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_set_exit_mode_full_tunnel_programs_backend_exit_state() {
+        let private_key_path = write_private_key([45; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        let identity_before = backend
+            .authoritative_transport_identity()
+            .expect("identity should exist after start");
+        let generation_before = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full tunnel exit mode should apply");
+
+        let identity_after = backend
+            .authoritative_transport_identity()
+            .expect("identity should remain available after exit-mode apply");
+        let generation_after = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+        let snapshot = tun_state.snapshot();
+
+        assert_eq!(identity_before, identity_after);
+        assert_eq!(generation_before, generation_after);
+        assert_eq!(snapshot.exit_mode_reconcile_calls, 1);
+        assert_eq!(snapshot.last_exit_mode_target, Some(ExitMode::FullTunnel));
+        assert_eq!(snapshot.current_exit_mode, ExitMode::FullTunnel);
+        assert_eq!(
+            snapshot.exit_mode_mutations,
+            vec![
+                TunExitModeMutation::DeleteTable,
+                TunExitModeMutation::DeletePriority,
+                TunExitModeMutation::AddPriority,
+            ]
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_set_exit_mode_off_clears_full_tunnel_state() {
+        let private_key_path = write_private_key([46; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full tunnel exit mode should apply");
+        backend
+            .set_exit_mode(ExitMode::Off)
+            .expect("turning exit mode off should succeed");
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.exit_mode_reconcile_calls, 2);
+        assert_eq!(snapshot.last_exit_mode_target, Some(ExitMode::Off));
+        assert_eq!(snapshot.current_exit_mode, ExitMode::Off);
+        assert_eq!(
+            snapshot.exit_mode_mutations,
+            vec![
+                TunExitModeMutation::DeleteTable,
+                TunExitModeMutation::DeletePriority,
+                TunExitModeMutation::AddPriority,
+                TunExitModeMutation::DeleteTable,
+                TunExitModeMutation::DeletePriority,
+            ]
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_set_exit_mode_add_failure_rolls_back_to_off() {
+        let private_key_path = write_private_key([47; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+
+        tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnAddPriority {
+            message: "phase2 exit add failure".to_string(),
+        });
+        let err = backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect_err("exit-mode add failure must fail closed");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("phase2 exit add failure"));
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.current_exit_mode, ExitMode::Off);
+        assert_eq!(snapshot.last_exit_mode_target, Some(ExitMode::FullTunnel));
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_set_exit_mode_delete_failure_rolls_back_to_previous_mode() {
+        let private_key_path = write_private_key([48; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full tunnel exit mode should apply");
+
+        tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnDeletePriority {
+            message: "phase2 exit delete failure".to_string(),
+        });
+        let err = backend
+            .set_exit_mode(ExitMode::Off)
+            .expect_err("exit-mode delete failure must fail closed");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("phase2 exit delete failure"));
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.current_exit_mode, ExitMode::FullTunnel);
+        assert_eq!(snapshot.last_exit_mode_target, Some(ExitMode::Off));
+
+        tun_state.set_exit_mode_behavior(TestExitModeBehavior::Succeed);
+        backend
+            .set_exit_mode(ExitMode::Off)
+            .expect("exit mode should clear once helper failures are removed");
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_set_exit_mode_delete_table_failure_rolls_back_to_previous_mode()
+     {
+        let private_key_path = write_private_key([50; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full tunnel exit mode should apply");
+
+        tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnDeleteTable {
+            message: "phase2 exit delete-table failure".to_string(),
+        });
+        let err = backend
+            .set_exit_mode(ExitMode::Off)
+            .expect_err("exit-mode delete-table failure must fail closed");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(err.message.contains("phase2 exit delete-table failure"));
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.current_exit_mode, ExitMode::FullTunnel);
+
+        tun_state.set_exit_mode_behavior(TestExitModeBehavior::Succeed);
+        backend
+            .set_exit_mode(ExitMode::Off)
+            .expect("exit mode should clear once helper failures are removed");
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_shutdown_clears_exit_mode_state() {
+        let private_key_path = write_private_key([49; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full tunnel exit mode should apply");
+        backend.shutdown().expect("shutdown should succeed");
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.current_exit_mode, ExitMode::Off);
+        assert_eq!(snapshot.last_exit_mode_target, Some(ExitMode::Off));
+        assert!(
+            snapshot.exit_mode_mutations.ends_with(&[
+                TunExitModeMutation::DeleteTable,
+                TunExitModeMutation::DeletePriority,
+            ]),
+            "shutdown must actively clear full-tunnel backend state before cleanup"
+        );
 
         let _ = fs::remove_file(private_key_path);
     }
@@ -1604,6 +2094,111 @@ mod tests {
         assert!(right_stats.bytes_rx >= plaintext_packet.len() as u64);
         assert!(!left_stats.using_relay_path);
         assert!(!right_stats.using_relay_path);
+
+        left_backend
+            .shutdown()
+            .expect("left shutdown should succeed");
+        right_backend
+            .shutdown()
+            .expect("right shutdown should succeed");
+        let _ = fs::remove_file(left_private_key_path);
+        let _ = fs::remove_file(right_private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_initiate_peer_handshake_uses_authoritative_socket() {
+        let left_private_key = [28; 32];
+        let right_private_key = [29; 32];
+        let left_private_key_path = write_private_key(left_private_key);
+        let right_private_key_path = write_private_key(right_private_key);
+        let left_port = free_listen_port();
+        let right_port = free_listen_port();
+        let left_peer_node = NodeId::new("peer-right").expect("valid node id");
+        let right_peer_node = NodeId::new("peer-left").expect("valid node id");
+        let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet0",
+            left_private_key_path.to_string_lossy(),
+            left_port,
+        )
+        .expect("left backend should construct");
+        let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet1",
+            right_private_key_path.to_string_lossy(),
+            right_port,
+        )
+        .expect("right backend should construct");
+        left_backend
+            .start(runtime_context())
+            .expect("left backend should start");
+        right_backend
+            .start(runtime_context())
+            .expect("right backend should start");
+
+        left_backend
+            .configure_peer(peer_config(
+                "peer-right",
+                backend_loopback_addr(right_port),
+                peer_public_key(right_private_key),
+                vec!["100.64.2.0/24"],
+            ))
+            .expect("left peer configure should succeed");
+        right_backend
+            .configure_peer(peer_config(
+                "peer-left",
+                backend_loopback_addr(left_port),
+                peer_public_key(left_private_key),
+                vec!["100.64.1.0/24"],
+            ))
+            .expect("right peer configure should succeed");
+
+        let left_generation = left_backend
+            .transport_generation_for_test()
+            .expect("left generation query should succeed")
+            .expect("left generation should exist");
+        let right_generation = right_backend
+            .transport_generation_for_test()
+            .expect("right generation query should succeed")
+            .expect("right generation should exist");
+
+        left_backend
+            .initiate_peer_handshake(&left_peer_node, false)
+            .expect("left handshake initiation should succeed");
+
+        let left_egress = wait_for(Duration::from_secs(2), || {
+            let records = left_backend
+                .recorded_peer_ciphertext_egress_for_test()
+                .expect("left peer egress query should succeed");
+            (!records.is_empty()).then_some(records)
+        });
+        let right_ingress = wait_for(Duration::from_secs(2), || {
+            let records = right_backend
+                .recorded_peer_ciphertext_ingress_for_test()
+                .expect("right peer ingress query should succeed");
+            (!records.is_empty()).then_some(records)
+        });
+        let left_handshake = wait_for(Duration::from_secs(2), || {
+            left_backend
+                .peer_latest_handshake_unix(&left_peer_node)
+                .expect("left handshake query should succeed")
+        });
+        let right_handshake = wait_for(Duration::from_secs(2), || {
+            right_backend
+                .peer_latest_handshake_unix(&right_peer_node)
+                .expect("right handshake query should succeed")
+        });
+
+        assert_eq!(left_egress[0].transport_generation, left_generation);
+        assert_eq!(right_ingress[0].transport_generation, right_generation);
+        assert_eq!(
+            left_egress[0].remote_addr,
+            SocketAddr::from(([127, 0, 0, 1], right_port))
+        );
+        assert_eq!(
+            right_ingress[0].remote_addr,
+            SocketAddr::from(([127, 0, 0, 1], left_port))
+        );
+        assert!(left_handshake > 0);
+        assert!(right_handshake > 0);
 
         left_backend
             .shutdown()

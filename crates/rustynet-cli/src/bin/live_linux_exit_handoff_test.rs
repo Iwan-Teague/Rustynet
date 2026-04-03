@@ -15,9 +15,9 @@ use live_lab_support::{
     Logger, append_env_assignment, capture_root, create_workspace, enforce_host,
     ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit,
     issue_assignment_bundles_from_env, issue_traversal_bundles_from_env,
-    load_home_known_hosts_path, read_file, remote_src_dir, require_command, run_root, scp_to,
-    seed_known_hosts, shell_quote, status, target_address, unix_now, wait_for_daemon_socket,
-    write_file,
+    load_home_known_hosts_path, read_file, remote_src_dir, require_command,
+    resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, status, unix_now,
+    wait_for_daemon_socket, write_file,
 };
 
 const DNS_ZONE_NAME: &str = "rustynet";
@@ -27,6 +27,7 @@ const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
 const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.manifest";
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
+const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedDnsRefreshTarget {
@@ -109,9 +110,9 @@ fn run() -> Result<(), String> {
         &config.client_host,
     )?;
 
-    let exit_a_addr = target_address(&config.exit_a_host).to_string();
-    let exit_b_addr = target_address(&config.exit_b_host).to_string();
-    let client_addr = target_address(&config.client_host).to_string();
+    let exit_a_addr = resolved_target_address(&config.exit_a_host)?;
+    let exit_b_addr = resolved_target_address(&config.exit_b_host)?;
+    let client_addr = resolved_target_address(&config.client_host)?;
 
     let nodes_spec = format!(
         "{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{}",
@@ -509,7 +510,7 @@ fn run() -> Result<(), String> {
             &config.client_host,
             "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
         )?;
-        let endpoints = capture_root(
+        let wg_endpoints = capture_root(
             &config.ssh_identity_file,
             &work_known_hosts,
             &config.client_host,
@@ -528,13 +529,13 @@ fn run() -> Result<(), String> {
         append_monitor_line(
             &monitor_path,
             &format!(
-                "{}|iter={}|ping_rc={}|route={}|status={}|endpoints={}",
+                "{}|iter={}|ping_rc={}|route={}|status={}|wg_endpoints={}",
                 ts,
                 i,
                 ping_rc,
                 route_line.replace('\n', " "),
                 client_status.replace('\n', " "),
-                endpoints.replace('\n', " ")
+                wg_endpoints.replace('\n', " ")
             ),
         )?;
         if i == config.switch_iteration {
@@ -609,12 +610,16 @@ fn run() -> Result<(), String> {
         &config.client_host,
         "ip -4 route get 1.1.1.1 || true",
     )?;
-    let client_endpoints_final = capture_root(
+    let client_wg_endpoints_final = capture_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.client_host,
         "wg show rustynet0 endpoints || true",
     )?;
+    let selected_exit_peer_endpoint_final =
+        status_field(&client_status_final, "selected_exit_peer_endpoint").unwrap_or("none");
+    let selected_exit_peer_endpoint_error =
+        status_field(&client_status_final, "selected_exit_peer_endpoint_error").unwrap_or("none");
     let cleanup_dns_refresh_cmd = format!(
         "rm -f {} {} {} {}",
         shell_quote(dns_passphrase_remote.as_str()),
@@ -659,8 +664,10 @@ fn run() -> Result<(), String> {
     logger.block(&(exit_b_status_final.clone() + "\n"))?;
     logger.line("[exit-handoff] final client route")?;
     logger.block(&(client_route_final.clone() + "\n"))?;
-    logger.line("[exit-handoff] final client endpoints")?;
-    logger.block(&(client_endpoints_final.clone() + "\n"))?;
+    logger.line("[exit-handoff] final client selected exit peer endpoint")?;
+    logger.block(&(selected_exit_peer_endpoint_final.to_string() + "\n"))?;
+    logger.line("[exit-handoff] final client wg endpoints (debug only)")?;
+    logger.block(&(client_wg_endpoints_final.clone() + "\n"))?;
 
     let monitor_text = read_file(&monitor_path)?;
     let route_leak_count = monitor_text
@@ -703,8 +710,8 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
-    let check_exit_b_endpoint_visible = if client_endpoints_final
-        .contains(&format!("{exit_b_addr}:51820"))
+    let check_exit_b_endpoint_visible = if selected_exit_peer_endpoint_error == "none"
+        && selected_exit_peer_endpoint_final == format!("{exit_b_addr}:51820")
         && client_status_final.contains(&format!("exit_node={}", config.exit_b_node_id))
     {
         "pass"
@@ -881,11 +888,8 @@ impl Config {
         if config.traversal_ttl_secs == 0 || config.traversal_ttl_secs > 120 {
             return Err("traversal ttl seconds must be in the range 1..=120".to_string());
         }
-        config.traversal_refresh_interval_secs = if config.traversal_ttl_secs <= 30 {
-            10
-        } else {
-            config.traversal_ttl_secs / 2
-        };
+        config.traversal_refresh_interval_secs =
+            traversal_refresh_interval_secs(config.traversal_ttl_secs);
         for (label, value) in [
             ("exit-a-host", config.exit_a_host.as_str()),
             ("exit-b-host", config.exit_b_host.as_str()),
@@ -899,6 +903,18 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+fn traversal_refresh_interval_secs(traversal_ttl_secs: u64) -> u64 {
+    let coordination_ttl_secs = traversal_ttl_secs.min(MAX_TRAVERSAL_COORDINATION_TTL_SECS);
+    std::cmp::max(1, coordination_ttl_secs / 2)
+}
+
+fn status_field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    status
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -973,7 +989,19 @@ fn refresh_traversal_bundles(
         traversal_pub_local,
         client_traversal_local,
     )?;
+    refresh_signed_state(identity, known_hosts, target)?;
+    refresh_signed_state(identity, known_hosts, exit_b_host)?;
+    refresh_signed_state(identity, known_hosts, client_host)?;
     Ok(())
+}
+
+fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1391,7 +1419,7 @@ mod tests {
             switch_iteration: 20,
             monitor_iterations: 55,
             traversal_ttl_secs: 120,
-            traversal_refresh_interval_secs: 60,
+            traversal_refresh_interval_secs: 15,
             report_path: PathBuf::from("report.json"),
             log_path: PathBuf::from("handoff.log"),
             monitor_log: PathBuf::from("handoff-monitor.log"),
@@ -1472,5 +1500,27 @@ peer.1.endpoint=192.168.128.26:51820
         assert!(filtered.contains("record.0.target_node_id=exit-1"));
         assert!(filtered.contains("record.1.target_node_id=client-1"));
         assert!(!filtered.contains("client-9"));
+    }
+
+    #[test]
+    fn traversal_refresh_interval_is_capped_by_coordination_ttl() {
+        assert_eq!(super::traversal_refresh_interval_secs(120), 15);
+        assert_eq!(super::traversal_refresh_interval_secs(30), 15);
+        assert_eq!(super::traversal_refresh_interval_secs(20), 10);
+        assert_eq!(super::traversal_refresh_interval_secs(1), 1);
+    }
+
+    #[test]
+    fn status_field_extracts_selected_exit_peer_endpoint() {
+        let status = "node_id=client-1 exit_node=client-2 selected_exit_peer_endpoint=192.168.64.26:51820 selected_exit_peer_endpoint_error=none";
+        assert_eq!(
+            super::status_field(status, "selected_exit_peer_endpoint"),
+            Some("192.168.64.26:51820")
+        );
+        assert_eq!(
+            super::status_field(status, "selected_exit_peer_endpoint_error"),
+            Some("none")
+        );
+        assert_eq!(super::status_field(status, "missing"), None);
     }
 }

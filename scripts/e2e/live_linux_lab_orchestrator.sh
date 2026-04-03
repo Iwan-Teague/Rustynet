@@ -2098,7 +2098,8 @@ distribute_assignment_worker() {
   live_lab_install_assignment_refresh_env "$target" "$refresh_env"
 }
 
-stage_issue_and_distribute_traversal() {
+issue_and_distribute_traversal_snapshot() {
+  local stage_name="$1"
   local exit_target env_path verifier_local
   build_onehop_specs
   # shellcheck disable=SC1090
@@ -2113,7 +2114,11 @@ stage_issue_and_distribute_traversal() {
 
   verifier_local="$STATE_DIR/traversal.pub"
   live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$verifier_local" || return 1
-  run_parallel_node_stage issue_and_distribute_traversal distribute_traversal_worker
+  run_parallel_node_stage "$stage_name" distribute_traversal_worker
+}
+
+stage_issue_and_distribute_traversal() {
+  issue_and_distribute_traversal_snapshot issue_and_distribute_traversal
 }
 
 distribute_traversal_worker() {
@@ -2134,6 +2139,9 @@ distribute_traversal_worker() {
 
 stage_enforce_baseline_runtime() {
   run_parallel_node_stage enforce_baseline_runtime enforce_runtime_worker
+  run_parallel_node_stage refresh_runtime_after_enforce refresh_runtime_state_worker
+  issue_and_distribute_traversal_snapshot refresh_traversal_after_enforce || return 1
+  run_parallel_node_stage refresh_runtime_after_traversal refresh_signed_state_worker
   live_lab_retry_root "$(node_target_for_label exit)" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2 || return 1
   sleep 5
 }
@@ -2146,6 +2154,27 @@ enforce_runtime_worker() {
   printf '[runtime-enforce] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
   live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
   live_lab_wait_for_daemon_socket "$target"
+}
+
+refresh_runtime_state_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local _role="$4"
+  printf '[runtime-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
+  live_lab_run_root "$target" "root rustynet ops force-local-assignment-refresh-now"
+  live_lab_wait_for_daemon_socket "$target"
+  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh" 5 2
+}
+
+refresh_signed_state_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local _role="$4"
+  printf '[signed-state-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
+  live_lab_wait_for_daemon_socket "$target"
+  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh" 5 2
 }
 
 stage_validate_baseline_runtime() {
@@ -2161,27 +2190,28 @@ validate_runtime_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  local status route_check no_plaintext expected_membership_nodes exit_node_id
+  local status route_check no_plaintext expected_membership_nodes exit_node_id status_label
   status="$(live_lab_status "$target")"
   printf '[status] %s %s\n%s\n' "$node_id" "$target" "$status"
   expected_membership_nodes="$(node_count)"
   exit_node_id="$(node_id_for_label exit)"
-  [[ "$status" != *"state=FailClosed"* ]]
-  [[ "$status" != *"restricted_safe_mode=true"* ]]
-  [[ "$status" == *"bootstrap_error=none"* ]]
-  [[ "$status" == *"last_reconcile_error=none"* ]]
-  [[ "$status" == *"encrypted_key_store=true"* ]]
-  [[ "$status" == *"auto_tunnel_enforce=true"* ]]
-  [[ "$status" == *"membership_active_nodes=${expected_membership_nodes}"* ]]
+  status_label="baseline status (${node_id})"
+  assert_text_contains "$status" "$status_label" "transport_socket_identity_state=authoritative_backend_shared_transport"
+  assert_text_contains "$status" "$status_label" "transport_socket_identity_error=none"
+  assert_text_contains "$status" "$status_label" "encrypted_key_store=true"
+  assert_text_contains "$status" "$status_label" "auto_tunnel_enforce=true"
+  assert_text_contains "$status" "$status_label" "membership_active_nodes=${expected_membership_nodes}"
+  assert_text_absent "$status" "$status_label" "does not yet implement route application"
+  assert_text_absent "$status" "$status_label" "does not yet implement exit mode"
   if [[ "$role" == "client" ]]; then
-    [[ "$status" == *"exit_node=${exit_node_id}"* ]]
+    assert_text_contains "$status" "$status_label" "exit_node=${exit_node_id}"
     route_check="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true")"
     printf '[route] %s %s\n%s\n' "$node_id" "$target" "$route_check"
-    grep -Fq 'dev rustynet0' <<<"$route_check"
+    assert_text_contains "$route_check" "route check (${node_id})" "dev rustynet0"
   fi
   no_plaintext="$(live_lab_no_plaintext_passphrase_check "$target")"
   printf '[plaintext-check] %s %s\n%s\n' "$node_id" "$target" "$no_plaintext"
-  grep -Fq 'no-plaintext-passphrase-files' <<<"$no_plaintext"
+  assert_text_contains "$no_plaintext" "plaintext check (${node_id})" "no-plaintext-passphrase-files"
 }
 
 current_run_git_commit() {
@@ -2428,6 +2458,26 @@ assert_log_contains_pattern() {
   fi
   if ! rg -n -- "$pattern" "$log_path" >/dev/null 2>&1; then
     printf '%s log missing required pattern (%s): %s\n' "$label" "$pattern" "$log_path" >&2
+    return 1
+  fi
+}
+
+assert_text_contains() {
+  local text="$1"
+  local label="$2"
+  local pattern="$3"
+  if [[ "$text" != *"$pattern"* ]]; then
+    printf '%s missing required text (%s)\n' "$label" "$pattern" >&2
+    return 1
+  fi
+}
+
+assert_text_absent() {
+  local text="$1"
+  local label="$2"
+  local pattern="$3"
+  if [[ "$text" == *"$pattern"* ]]; then
+    printf '%s contains forbidden text (%s)\n' "$label" "$pattern" >&2
     return 1
   fi
 }

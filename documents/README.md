@@ -60,6 +60,7 @@ The active-work folder contains the current implementation and hardening plans.
 - [operations/active/README.md](./operations/active/README.md)
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
+- [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./operations/active/MagicDnsSignedZoneSchema_2026-03-09.md)
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
