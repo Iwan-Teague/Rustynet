@@ -2724,6 +2724,19 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(self.backend.current_peer_endpoint(node_id)?)
     }
 
+    pub fn current_peer_endpoints(
+        &self,
+    ) -> Result<Vec<(NodeId, Option<SocketEndpoint>)>, Phase10Error> {
+        let mut endpoints = Vec::with_capacity(self.managed_peers.len());
+        for node_id in self.managed_peers.keys() {
+            endpoints.push((
+                node_id.clone(),
+                self.backend.current_peer_endpoint(node_id)?,
+            ));
+        }
+        Ok(endpoints)
+    }
+
     pub fn managed_peer_latest_handshake_unix(
         &mut self,
         node_id: &NodeId,

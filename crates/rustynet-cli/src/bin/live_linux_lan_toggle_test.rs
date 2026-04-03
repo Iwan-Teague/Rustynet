@@ -4,7 +4,7 @@ mod live_lab_support;
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
     LiveLabContext, Logger, ensure_dir_secure, repo_root, write_secure_json, write_secure_text,
@@ -15,6 +15,7 @@ const LAN_TEST_INTERFACE: &str = "rnlan0";
 const LAN_TEST_GATEWAY_IP: &str = "192.168.1.1/24";
 const LAN_TEST_PROBE_IP: &str = "192.168.1.1";
 const LAN_TEST_CIDR: &str = "192.168.1.0/24";
+const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 
 fn main() {
     let code = match run() {
@@ -290,72 +291,31 @@ fn run() -> Result<(), i32> {
         &traversal_env,
         &[("NODES_SPEC", &nodes_spec), ("ALLOW_SPEC", &allow_spec)],
     )?;
-    logger
-        .line("Issuing signed traversal bundles for LAN-toggle topology")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    issue_traversal_bundles_from_env(
-        &ctx,
-        &exit_host,
-        &traversal_env,
-        "/tmp/rn_issue_lan_traversal.env",
-    )?;
-
     let traversal_pub_local = ctx.work_dir.join("traversal.pub");
     let exit_traversal_local = ctx.work_dir.join("traversal-exit");
     let client_traversal_local = ctx.work_dir.join("traversal-client");
     let blind_exit_traversal_local = ctx.work_dir.join("traversal-blind-exit");
-    capture_remote_file(
-        &ctx,
-        &exit_host,
-        "/run/rustynet/traversal-issue/rn-traversal.pub",
-        &traversal_pub_local,
-    )?;
-    capture_remote_file(
-        &ctx,
-        &exit_host,
-        &format!("/run/rustynet/traversal-issue/rn-traversal-{exit_node_id}.traversal"),
-        &exit_traversal_local,
-    )?;
-    capture_remote_file(
-        &ctx,
-        &exit_host,
-        &format!("/run/rustynet/traversal-issue/rn-traversal-{client_node_id}.traversal"),
-        &client_traversal_local,
-    )?;
-    capture_remote_file(
-        &ctx,
-        &exit_host,
-        &format!("/run/rustynet/traversal-issue/rn-traversal-{blind_exit_node_id}.traversal"),
-        &blind_exit_traversal_local,
-    )?;
-
+    let traversal_refresh = TraversalRefreshConfig {
+        signer_host: exit_host.as_str(),
+        exit_host: exit_host.as_str(),
+        client_host: client_host.as_str(),
+        blind_exit_host: blind_exit_host.as_str(),
+        traversal_env: traversal_env.as_path(),
+        traversal_pub_local: traversal_pub_local.as_path(),
+        exit_traversal_local: exit_traversal_local.as_path(),
+        client_traversal_local: client_traversal_local.as_path(),
+        blind_exit_traversal_local: blind_exit_traversal_local.as_path(),
+        exit_node_id: exit_node_id.as_str(),
+        client_node_id: client_node_id.as_str(),
+        blind_exit_node_id: blind_exit_node_id.as_str(),
+    };
     logger
-        .line("Distributing signed traversal bundles")
+        .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")
         .map_err(|err| {
             eprintln!("{err}");
             1
         })?;
-    install_traversal_bundle(
-        &ctx,
-        &exit_host,
-        &traversal_pub_local,
-        &exit_traversal_local,
-    )?;
-    install_traversal_bundle(
-        &ctx,
-        &client_host,
-        &traversal_pub_local,
-        &client_traversal_local,
-    )?;
-    install_traversal_bundle(
-        &ctx,
-        &blind_exit_host,
-        &traversal_pub_local,
-        &blind_exit_traversal_local,
-    )?;
+    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
 
     logger.line("Enforcing runtime roles").map_err(|err| {
         eprintln!("{err}");
@@ -443,17 +403,53 @@ fn run() -> Result<(), i32> {
             1
         })?;
 
+    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    let mut last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
-    let lan_off_state = wait_for_lan_access_state(&ctx, &client_host, false, 45);
-    let lan_off_ping_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 45);
+    let lan_off_state = wait_for_lan_access_state(
+        &ctx,
+        &logger,
+        &traversal_refresh,
+        &mut last_traversal_refresh_unix,
+        &client_host,
+        false,
+        45,
+    )?;
+    let lan_off_ping_status = wait_for_lan_probe_state(
+        &ctx,
+        &logger,
+        &traversal_refresh,
+        &mut last_traversal_refresh_unix,
+        &client_host,
+        "blocked",
+        45,
+    )?;
     let client_status_off = ctx
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
+    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, true, LAN_TEST_CIDR)?;
-    let lan_on_state = wait_for_lan_access_state(&ctx, &client_host, true, 60);
+    let lan_on_state = wait_for_lan_access_state(
+        &ctx,
+        &logger,
+        &traversal_refresh,
+        &mut last_traversal_refresh_unix,
+        &client_host,
+        true,
+        60,
+    )?;
     let lan_on_ping_status = if lan_on_state {
-        wait_for_lan_probe_state(&ctx, &client_host, "reachable", 45)
+        wait_for_lan_probe_state(
+            &ctx,
+            &logger,
+            &traversal_refresh,
+            &mut last_traversal_refresh_unix,
+            &client_host,
+            "reachable",
+            45,
+        )?
     } else {
         false
     };
@@ -467,13 +463,32 @@ fn run() -> Result<(), i32> {
         )
         .unwrap_or_default();
 
+    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
-    let lan_off_again_state = wait_for_lan_access_state(&ctx, &client_host, false, 45);
-    let lan_off_again_status = wait_for_lan_probe_state(&ctx, &client_host, "blocked", 45);
+    let lan_off_again_state = wait_for_lan_access_state(
+        &ctx,
+        &logger,
+        &traversal_refresh,
+        &mut last_traversal_refresh_unix,
+        &client_host,
+        false,
+        45,
+    )?;
+    let lan_off_again_status = wait_for_lan_probe_state(
+        &ctx,
+        &logger,
+        &traversal_refresh,
+        &mut last_traversal_refresh_unix,
+        &client_host,
+        "blocked",
+        45,
+    )?;
     let client_status_off_final = ctx
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
+    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
     let blind_exit_denied_status =
         if apply_lan_access_expect_denied(&ctx, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
@@ -670,23 +685,27 @@ fn apply_lan_access(
 
 fn wait_for_lan_probe_state(
     ctx: &LiveLabContext,
+    logger: &Logger,
+    refresh_config: &TraversalRefreshConfig<'_>,
+    last_traversal_refresh_unix: &mut u64,
     target: &str,
     desired_state: &str,
     attempts: u32,
-) -> bool {
+) -> Result<bool, i32> {
     for _ in 0..attempts {
+        maybe_refresh_traversal_bundles(ctx, logger, refresh_config, last_traversal_refresh_unix)?;
         let reachable = ctx
             .run(target, &["ping", "-c", "1", "-W", "1", LAN_TEST_PROBE_IP])
             .is_ok();
         if desired_state == "reachable" && reachable {
-            return true;
+            return Ok(true);
         }
         if desired_state == "blocked" && !reachable {
-            return true;
+            return Ok(true);
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1));
     }
-    false
+    Ok(false)
 }
 
 fn apply_lan_access_expect_denied(
@@ -769,24 +788,28 @@ fn summarize_command_output(output: &Output) -> String {
 
 fn wait_for_lan_access_state(
     ctx: &LiveLabContext,
+    logger: &Logger,
+    refresh_config: &TraversalRefreshConfig<'_>,
+    last_traversal_refresh_unix: &mut u64,
     target: &str,
     expected_enabled: bool,
     attempts: u32,
-) -> bool {
+) -> Result<bool, i32> {
     let expected = if expected_enabled {
         "lan_access=on"
     } else {
         "lan_access=off"
     };
     for _ in 0..attempts {
+        maybe_refresh_traversal_bundles(ctx, logger, refresh_config, last_traversal_refresh_unix)?;
         if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"])
             && status.contains(expected)
         {
-            return true;
+            return Ok(true);
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1));
     }
-    false
+    Ok(false)
 }
 
 fn no_plaintext_passphrase_check(ctx: &LiveLabContext, target: &str) -> Result<String, i32> {
@@ -1048,6 +1071,133 @@ fn install_traversal_bundle(
     Ok(())
 }
 
+struct TraversalRefreshConfig<'a> {
+    signer_host: &'a str,
+    exit_host: &'a str,
+    client_host: &'a str,
+    blind_exit_host: &'a str,
+    traversal_env: &'a Path,
+    traversal_pub_local: &'a Path,
+    exit_traversal_local: &'a Path,
+    client_traversal_local: &'a Path,
+    blind_exit_traversal_local: &'a Path,
+    exit_node_id: &'a str,
+    client_node_id: &'a str,
+    blind_exit_node_id: &'a str,
+}
+
+fn refresh_traversal_bundles(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    config: &TraversalRefreshConfig<'_>,
+) -> Result<(), i32> {
+    logger
+        .line("Refreshing signed traversal bundles for LAN-toggle participants")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    issue_traversal_bundles_from_env(
+        ctx,
+        config.signer_host,
+        config.traversal_env,
+        "/tmp/rn_issue_lan_traversal.env",
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        "/run/rustynet/traversal-issue/rn-traversal.pub",
+        config.traversal_pub_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.exit_node_id
+        ),
+        config.exit_traversal_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.client_node_id
+        ),
+        config.client_traversal_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.blind_exit_node_id
+        ),
+        config.blind_exit_traversal_local,
+    )?;
+    install_traversal_bundle(
+        ctx,
+        config.exit_host,
+        config.traversal_pub_local,
+        config.exit_traversal_local,
+    )?;
+    install_traversal_bundle(
+        ctx,
+        config.client_host,
+        config.traversal_pub_local,
+        config.client_traversal_local,
+    )?;
+    install_traversal_bundle(
+        ctx,
+        config.blind_exit_host,
+        config.traversal_pub_local,
+        config.blind_exit_traversal_local,
+    )?;
+    refresh_signed_state(ctx, config.exit_host)?;
+    refresh_signed_state(ctx, config.client_host)?;
+    refresh_signed_state(ctx, config.blind_exit_host)?;
+    Ok(())
+}
+
+fn maybe_refresh_traversal_bundles(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    config: &TraversalRefreshConfig<'_>,
+    last_traversal_refresh_unix: &mut u64,
+) -> Result<(), i32> {
+    let now = unix_now();
+    if now.saturating_sub(*last_traversal_refresh_unix)
+        >= traversal_refresh_interval_secs(MAX_TRAVERSAL_COORDINATION_TTL_SECS)
+    {
+        refresh_traversal_bundles(ctx, logger, config)?;
+        *last_traversal_refresh_unix = unix_now();
+    }
+    Ok(())
+}
+
+fn traversal_refresh_interval_secs(coordination_ttl_secs: u64) -> u64 {
+    let bounded_ttl_secs = coordination_ttl_secs.clamp(1, MAX_TRAVERSAL_COORDINATION_TTL_SECS);
+    std::cmp::max(1, bounded_ttl_secs / 2)
+}
+
+fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+    ctx.run_root(
+        target,
+        &[
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "rustynet",
+            "state",
+            "refresh",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })
+}
+
 fn issue_assignment_bundles_from_env(
     ctx: &LiveLabContext,
     target: &str,
@@ -1204,4 +1354,29 @@ fn now_unix() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn traversal_refresh_interval_is_half_coordination_ttl() {
+        assert_eq!(super::traversal_refresh_interval_secs(30), 15);
+        assert_eq!(super::traversal_refresh_interval_secs(20), 10);
+        assert_eq!(super::traversal_refresh_interval_secs(1), 1);
+    }
+
+    #[test]
+    fn traversal_refresh_interval_caps_large_ttl_values() {
+        assert_eq!(
+            super::traversal_refresh_interval_secs(120),
+            super::MAX_TRAVERSAL_COORDINATION_TTL_SECS / 2
+        );
+    }
 }

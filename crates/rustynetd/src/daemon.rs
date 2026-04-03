@@ -3508,6 +3508,33 @@ impl DaemonRuntime {
         }
     }
 
+    fn managed_peer_endpoints_summary(&self) -> (String, String) {
+        match self.controller.current_peer_endpoints() {
+            Ok(endpoints) => {
+                if endpoints.is_empty() {
+                    return ("none".to_string(), "none".to_string());
+                }
+                let summary = endpoints
+                    .into_iter()
+                    .map(|(node_id, endpoint)| match endpoint {
+                        Some(endpoint) => format!(
+                            "{node_id}/{addr}:{port}",
+                            addr = endpoint.addr,
+                            port = endpoint.port
+                        ),
+                        None => format!("{node_id}/none"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("+");
+                (sanitize_netcheck_value(&summary), "none".to_string())
+            }
+            Err(err) => (
+                "none".to_string(),
+                sanitize_netcheck_value(&err.to_string()),
+            ),
+        }
+    }
+
     fn relay_session_inactive_state(&self) -> &'static str {
         if self.relay_client.is_some() {
             if self.transport_socket_identity_blocker.is_some() {
@@ -5288,6 +5315,8 @@ impl DaemonRuntime {
                     self.transport_socket_identity_local_addr();
                 let (selected_exit_peer_endpoint, selected_exit_peer_endpoint_error) =
                     self.selected_exit_peer_endpoint_summary();
+                let (managed_peer_endpoints, managed_peer_endpoints_error) =
+                    self.managed_peer_endpoints_summary();
                 let path_state = self.runtime_path_state_summary();
                 let path_live_proven = if path_state.live_proven {
                     "true"
@@ -5308,7 +5337,7 @@ impl DaemonRuntime {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string());
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -5316,6 +5345,8 @@ impl DaemonRuntime {
                     self.selected_exit_node.as_deref().unwrap_or("none"),
                     selected_exit_peer_endpoint,
                     selected_exit_peer_endpoint_error,
+                    managed_peer_endpoints,
+                    managed_peer_endpoints_error,
                     serving_exit_node,
                     if self.lan_access_enabled { "on" } else { "off" },
                     if self.is_restricted() {
@@ -17180,6 +17211,10 @@ mod tests {
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("restricted_safe_mode=false"));
+        assert!(status.message.contains("managed_peer_endpoints_error=none"));
+        assert!(status.message.contains(
+            "managed_peer_endpoints=node-exit/203.0.113.77:443+node-relay/203.0.113.78:443"
+        ));
         assert!(status.message.contains("traversal_peer_count=2"));
         assert!(status.message.contains("traversal_probe_peer_count=2"));
         assert!(status.message.contains("traversal_probe_relay_peers=2"));

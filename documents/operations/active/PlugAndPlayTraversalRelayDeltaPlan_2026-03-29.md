@@ -2328,6 +2328,53 @@ What remains blocked:
 ```
 
 ```text
+Date: 2026-04-03
+Phase / Slice: Linux userspace-shared live-lab delta - LAN-toggle traversal refresh proof and fresh five-node rerun
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_lan_toggle_test.rs
+    - Replaced the one-shot traversal issue/install logic with a shared refresh helper that reissues signed traversal bundles, redistributes them to all three LAN-toggle participants, and forces signed-state reload on each host.
+    - Added periodic refresh during the LAN-toggle wait loops so the stage no longer outlives the signed traversal coordination window and fail-closes spuriously on expired coordination.
+    - Added unit coverage for the coordination refresh interval calculation.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the current truth so the delta document now records that `live_exit_handoff` and `live_two_hop` are live-proven on the current working tree and that the first blocker has moved to real LAN dataplane reachability during `lan_access=on`.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_lan_toggle_test.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-cli --bin live_linux_lan_toggle_test`
+  - `cargo test -p rustynet-cli --bin live_linux_lan_toggle_test -- --nocapture`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile --inventory documents/operations/active/vm_lab_inventory.json --output profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight --inventory documents/operations/active/vm_lab_inventory.json --all --known-hosts-file /Users/iwanteague/.ssh/known_hosts --require-same-network --require-command git --require-command cargo --require-rustynet-installed`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node_20260403_lantogglefix.env --skip-gates --skip-soak --skip-cross-network --source-mode working-tree --report-dir artifacts/live_lab/20260403T212500Z_lantogglefix --timeout-secs 7200`
+Validation and live-lab outcomes:
+  - Targeted CLI formatting, check, and unit tests passed after the LAN-toggle refresh patch.
+  - The fresh reduced five-node rerun at `artifacts/live_lab/20260403T212500Z_lantogglefix` now passes:
+    - `live_exit_handoff`
+    - `live_two_hop`
+  - The old `live_lan_toggle` traversal-expiry failure is removed:
+    - client status during `lan_access=on` stays `restricted_safe_mode=false`
+    - the client no longer reports `coordination record is expired`
+    - the client route to `192.168.1.1` remains via `rustynet0`
+  - The rerun still fails at `live_lan_toggle`, but only on `lan_on_allows`:
+    - `lan_access=on` is set
+    - the client remains on a healthy signed `direct_programmed` path
+    - the route to the synthetic LAN probe is installed via `rustynet0`
+    - the actual LAN probe never becomes reachable
+Security invariants re-verified:
+  - No daemon-owned or helper-owned side socket was introduced.
+  - The LAN-toggle fix did not weaken traversal expiry enforcement; it keeps the stage on the existing hardened path of reissued signed traversal bundles plus explicit daemon signed-state refresh.
+  - The rerun still does not fabricate handshake liveness or `direct_active`; the path remains explicitly programmed and unproven.
+  - Fail-closed behavior remains intact for blind-exit LAN coupling denial.
+What this slice completed:
+  - The later-stage `live_two_hop` proof bug is now live-proven clean on the current working tree.
+  - The `live_lan_toggle` traversal-coordination-expiry failure is fixed under real helper execution.
+What remains blocked:
+  - The current first live blocker is now narrower and later: `live_lan_toggle` still fails `lan_on_allows` because end-to-end LAN probe reachability is missing even though route selection and signed-state health remain correct.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
 Date: 2026-03-30
 Phase / Slice: Final closeout honesty pass
 Files changed:

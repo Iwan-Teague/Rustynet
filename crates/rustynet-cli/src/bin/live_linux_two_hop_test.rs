@@ -531,12 +531,16 @@ fn run() -> Result<(), String> {
         &config.second_client_host,
         "ip -4 route get 1.1.1.1 || true",
     )?;
-    let entry_endpoints = capture_root(
+    let entry_wg_endpoints = capture_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.entry_host,
         "wg show rustynet0 endpoints || true",
     )?;
+    let entry_peer_endpoints =
+        status_field(&entry_status, "managed_peer_endpoints").unwrap_or_else(|| "none".to_string());
+    let entry_peer_endpoints_error = status_field(&entry_status, "managed_peer_endpoints_error")
+        .unwrap_or_else(|| "none".to_string());
     let client_plaintext_check = no_plaintext_passphrase_check(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -565,8 +569,10 @@ fn run() -> Result<(), String> {
     logger.block(&(client_route.clone() + "\n"))?;
     logger.line("[two-hop] second client route")?;
     logger.block(&(second_client_route.clone() + "\n"))?;
-    logger.line("[two-hop] entry endpoints")?;
-    logger.block(&(entry_endpoints.clone() + "\n"))?;
+    logger.line("[two-hop] entry managed peer endpoints (backend-authoritative)")?;
+    logger.block(&(entry_peer_endpoints.clone() + "\n"))?;
+    logger.line("[two-hop] entry wg endpoints (debug only)")?;
+    logger.block(&(entry_wg_endpoints.clone() + "\n"))?;
 
     let check_client_exit_is_entry = if client_status
         .contains(&format!("exit_node={}", config.entry_node_id))
@@ -602,9 +608,19 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
-    let check_entry_peer_visibility = if entry_endpoints.contains(&format!("{client_addr}:51820"))
-        && entry_endpoints.contains(&format!("{final_exit_addr}:51820"))
-    {
+    let check_entry_peer_visibility = if entry_peer_endpoints_error == "none"
+        && peer_endpoint_summary_contains(
+            &entry_peer_endpoints,
+            &config.client_node_id,
+            &client_addr,
+            51820,
+        )
+        && peer_endpoint_summary_contains(
+            &entry_peer_endpoints,
+            &config.final_exit_node_id,
+            &final_exit_addr,
+            51820,
+        ) {
         "pass"
     } else {
         "fail"
@@ -881,6 +897,18 @@ fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Strin
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn status_field(status_line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    status_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
+}
+
+fn peer_endpoint_summary_contains(summary: &str, node_id: &str, addr: &str, port: u16) -> bool {
+    let expected = format!("{node_id}/{addr}:{port}");
+    summary.split('+').any(|entry| entry == expected)
+}
+
 fn print_usage() {
     eprintln!(
         "usage: live_linux_two_hop_test --ssh-identity-file <path> [options]\n\noptions:\n  --final-exit-host <user@host>\n  --client-host <user@host>\n  --entry-host <user@host>\n  --second-client-host <user@host>\n  --final-exit-node-id <id>\n  --client-node-id <id>\n  --entry-node-id <id>\n  --second-client-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>"
@@ -901,4 +929,43 @@ fn utc_now_string() -> String {
         }
     }
     "1970-01-01T00:00:00Z".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_field_extracts_managed_peer_endpoints() {
+        let status = "node_id=client-2 managed_peer_endpoints=client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820 managed_peer_endpoints_error=none";
+        assert_eq!(
+            super::status_field(status, "managed_peer_endpoints"),
+            Some("client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820".to_string())
+        );
+        assert_eq!(
+            super::status_field(status, "managed_peer_endpoints_error"),
+            Some("none".to_string())
+        );
+    }
+
+    #[test]
+    fn peer_endpoint_summary_contains_expected_endpoint() {
+        let summary = "client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820";
+        assert!(super::peer_endpoint_summary_contains(
+            summary,
+            "client-1",
+            "192.168.64.24",
+            51820
+        ));
+        assert!(super::peer_endpoint_summary_contains(
+            summary,
+            "exit-1",
+            "192.168.64.22",
+            51820
+        ));
+        assert!(!super::peer_endpoint_summary_contains(
+            summary,
+            "client-4",
+            "192.168.64.25",
+            51820
+        ));
+    }
 }
