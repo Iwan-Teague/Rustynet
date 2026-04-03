@@ -2230,6 +2230,189 @@ mod tests {
     }
 
     #[test]
+    fn linux_userspace_shared_backend_unmatched_tun_plaintext_packet_is_dropped_without_worker_exit()
+     {
+        let left_private_key = [33; 32];
+        let right_private_key = [34; 32];
+        let left_private_key_path = write_private_key(left_private_key);
+        let right_private_key_path = write_private_key(right_private_key);
+        let left_port = free_listen_port();
+        let right_port = free_listen_port();
+        let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet0",
+            left_private_key_path.to_string_lossy(),
+            left_port,
+        )
+        .expect("left backend should construct");
+        let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet1",
+            right_private_key_path.to_string_lossy(),
+            right_port,
+        )
+        .expect("right backend should construct");
+        left_backend
+            .start(runtime_context())
+            .expect("left backend should start");
+        right_backend
+            .start(RuntimeContext {
+                local_node: NodeId::new("phase4-right").expect("valid node id"),
+                interface_name: "rustynet1".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.1.1/32".to_string(),
+            })
+            .expect("right backend should start");
+
+        left_backend
+            .configure_peer(peer_config(
+                "peer-right",
+                backend_loopback_addr(right_port),
+                peer_public_key(right_private_key),
+                vec!["100.64.2.0/24"],
+            ))
+            .expect("left peer configure should succeed");
+        right_backend
+            .configure_peer(peer_config(
+                "peer-left",
+                backend_loopback_addr(left_port),
+                peer_public_key(left_private_key),
+                vec!["100.64.1.0/24"],
+            ))
+            .expect("right peer configure should succeed");
+
+        let ignored_plaintext = build_ipv4_udp_packet(
+            Ipv4Addr::new(100, 64, 1, 10),
+            Ipv4Addr::new(198, 51, 100, 25),
+            b"phase7-ignored-unmatched",
+        );
+        let valid_plaintext = build_ipv4_udp_packet(
+            Ipv4Addr::new(100, 64, 1, 10),
+            Ipv4Addr::new(100, 64, 2, 20),
+            b"phase7-valid-after-unmatched",
+        );
+        left_backend
+            .queue_tun_plaintext_packet_for_test(ignored_plaintext)
+            .expect("ignored plaintext queue should succeed");
+        left_backend
+            .queue_tun_plaintext_packet_for_test(valid_plaintext.clone())
+            .expect("valid plaintext queue should succeed");
+
+        let delivered_packets = wait_for(Duration::from_secs(2), || {
+            let packets = right_backend
+                .recorded_tun_outbound_packets_for_test()
+                .expect("right outbound packet query should succeed");
+            (packets.len() == 1).then_some(packets)
+        });
+
+        assert_eq!(delivered_packets, vec![valid_plaintext]);
+        assert_eq!(left_backend.worker_exit_count_for_test(), Some(0));
+        assert_eq!(
+            left_backend
+                .stats()
+                .expect("left stats should succeed")
+                .peer_count,
+            1
+        );
+
+        left_backend
+            .shutdown()
+            .expect("left shutdown should succeed");
+        right_backend
+            .shutdown()
+            .expect("right shutdown should succeed");
+        let _ = fs::remove_file(left_private_key_path);
+        let _ = fs::remove_file(right_private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_malformed_tun_plaintext_packet_is_dropped_without_worker_exit()
+     {
+        let left_private_key = [35; 32];
+        let right_private_key = [36; 32];
+        let left_private_key_path = write_private_key(left_private_key);
+        let right_private_key_path = write_private_key(right_private_key);
+        let left_port = free_listen_port();
+        let right_port = free_listen_port();
+        let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet0",
+            left_private_key_path.to_string_lossy(),
+            left_port,
+        )
+        .expect("left backend should construct");
+        let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet1",
+            right_private_key_path.to_string_lossy(),
+            right_port,
+        )
+        .expect("right backend should construct");
+        left_backend
+            .start(runtime_context())
+            .expect("left backend should start");
+        right_backend
+            .start(RuntimeContext {
+                local_node: NodeId::new("phase4-right").expect("valid node id"),
+                interface_name: "rustynet1".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_string(),
+                local_cidr: "100.64.1.1/32".to_string(),
+            })
+            .expect("right backend should start");
+
+        left_backend
+            .configure_peer(peer_config(
+                "peer-right",
+                backend_loopback_addr(right_port),
+                peer_public_key(right_private_key),
+                vec!["100.64.2.0/24"],
+            ))
+            .expect("left peer configure should succeed");
+        right_backend
+            .configure_peer(peer_config(
+                "peer-left",
+                backend_loopback_addr(left_port),
+                peer_public_key(left_private_key),
+                vec!["100.64.1.0/24"],
+            ))
+            .expect("right peer configure should succeed");
+
+        let valid_plaintext = build_ipv4_udp_packet(
+            Ipv4Addr::new(100, 64, 1, 10),
+            Ipv4Addr::new(100, 64, 2, 21),
+            b"phase7-valid-after-malformed",
+        );
+        left_backend
+            .queue_tun_plaintext_packet_for_test(vec![0xde, 0xad, 0xbe, 0xef])
+            .expect("malformed plaintext queue should succeed");
+        left_backend
+            .queue_tun_plaintext_packet_for_test(valid_plaintext.clone())
+            .expect("valid plaintext queue should succeed");
+
+        let delivered_packets = wait_for(Duration::from_secs(2), || {
+            let packets = right_backend
+                .recorded_tun_outbound_packets_for_test()
+                .expect("right outbound packet query should succeed");
+            (packets.len() == 1).then_some(packets)
+        });
+
+        assert_eq!(delivered_packets, vec![valid_plaintext]);
+        assert_eq!(left_backend.worker_exit_count_for_test(), Some(0));
+        assert_eq!(
+            left_backend
+                .stats()
+                .expect("left stats should succeed")
+                .peer_count,
+            1
+        );
+
+        left_backend
+            .shutdown()
+            .expect("left shutdown should succeed");
+        right_backend
+            .shutdown()
+            .expect("right shutdown should succeed");
+        let _ = fs::remove_file(left_private_key_path);
+        let _ = fs::remove_file(right_private_key_path);
+    }
+
+    #[test]
     fn linux_userspace_shared_backend_stun_round_trip_does_not_advance_peer_handshake() {
         let local_private_key = write_private_key([28; 32]);
         let listen_port = free_listen_port();

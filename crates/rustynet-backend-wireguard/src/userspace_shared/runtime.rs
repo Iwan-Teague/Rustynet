@@ -7,8 +7,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rustynet_backend_api::{
-    AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendError, ExitMode, NodeId,
-    PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelStats,
+    AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendError, BackendErrorKind,
+    ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelStats,
 };
 
 use super::engine::{
@@ -657,10 +657,14 @@ impl RuntimeState {
 
     fn poll_tun_device(&mut self) -> Result<(), BackendError> {
         while let Some(packet) = self.tun_device.recv_packet()? {
-            let outcome = self.engine.inject_plaintext_packet(
-                &packet,
-                self.authoritative_socket.transport_generation(),
-            )?;
+            let outcome = match self
+                .engine
+                .inject_plaintext_packet(&packet, self.authoritative_socket.transport_generation())
+            {
+                Ok(outcome) => outcome,
+                Err(err) if should_drop_tun_plaintext_packet_error(&err) => continue,
+                Err(err) => return Err(err),
+            };
             self.apply_engine_processing_outcome(outcome)?;
         }
         Ok(())
@@ -767,6 +771,15 @@ impl RuntimeState {
         }
         Ok(())
     }
+}
+
+fn should_drop_tun_plaintext_packet_error(err: &BackendError) -> bool {
+    err.kind == BackendErrorKind::InvalidInput
+        && matches!(
+            err.message.as_str(),
+            "plaintext packet does not contain a valid IPv4/IPv6 destination address"
+                | "no configured peer allowed IP matches the plaintext packet destination"
+        )
 }
 
 #[derive(Debug)]
