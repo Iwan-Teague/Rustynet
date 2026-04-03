@@ -99,6 +99,19 @@ Operational meaning:
 - `ops vm-lab-issue-and-distribute-state` issues signed assignment/traversal state on an authority VM and installs it onto the selected topology nodes
 - `ops vm-lab-run-suite` wraps the existing hardened live/cross-network lab scripts using inventory/topology metadata
 - `ops vm-lab-write-live-lab-profile` renders a non-interactive profile for `scripts/e2e/live_linux_lab_orchestrator.sh`
+- `ops vm-lab-iterate-live-lab` is the narrow reduced-live-lab iteration wrapper:
+  - runs only typed local validation steps (`fmt`, `check`, `check-bin`, `test`, `test-bin`)
+  - writes the live-lab profile
+  - runs preflight
+  - launches the reduced live-lab orchestrator
+  - waits for completion and prints the first failed stage plus key report/log paths
+  - supports explicit provenance guards:
+    - `--require-clean-tree`
+    - `--require-local-head`
+  - does **not** accept arbitrary shell commands
+- `ops vm-lab-validate-live-lab-profile` validates a generated live-lab profile and can assert expected backend/source-mode plus five-node topology completeness
+- `ops vm-lab-diagnose-live-lab-failure` reads a report/profile pair, captures `vm-lab-status`, and optionally collects the standard per-node artifact bundle for the configured live-lab targets
+- `ops vm-lab-diff-live-lab-runs` compares two live-lab report directories and prints the first divergent stage plus changed stage outcomes
 - `ops vm-lab-run-live-lab` launches the existing live-lab orchestrator from a generated profile
 - remote or same-network VMs hosted on another machine should be recorded as SSH-reachable entries without a `controller`
 - `network_group` is optional metadata for same-network validation; if you use `--require-same-network`, every selected inventory-backed node must declare the same `network_group`
@@ -161,6 +174,44 @@ cargo run -q -p rustynet-cli -- \
   --aux-vm debian-headless-4 \
   --extra-vm debian-headless-5 \
   --require-same-network
+
+cargo run -q -p rustynet-cli -- \
+  ops vm-lab-validate-live-lab-profile \
+  --profile profiles/live_lab/generated_vm_lab.env \
+  --expected-backend linux-wireguard-userspace-shared \
+  --expected-source-mode local-head \
+  --require-five-node
+
+cargo run -q -p rustynet-cli -- \
+  ops vm-lab-iterate-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 \
+  --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts \
+  --exit-vm debian-headless-1 \
+  --client-vm debian-headless-2 \
+  --entry-vm debian-headless-3 \
+  --aux-vm debian-headless-4 \
+  --extra-vm debian-headless-5 \
+  --require-same-network \
+  --backend linux-wireguard-userspace-shared \
+  --require-clean-tree \
+  --require-local-head \
+  --validation-step fmt \
+  --validation-step check:rustynet-cli \
+  --validation-step test-bin:rustynet-cli:live_linux_lan_toggle_test \
+  --collect-failure-diagnostics
+
+cargo run -q -p rustynet-cli -- \
+  ops vm-lab-diagnose-live-lab-failure \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --profile profiles/live_lab/generated_vm_lab.env \
+  --report-dir artifacts/live_lab/iteration_123 \
+  --collect-artifacts
+
+cargo run -q -p rustynet-cli -- \
+  ops vm-lab-diff-live-lab-runs \
+  --old-report-dir artifacts/live_lab/iteration_122 \
+  --new-report-dir artifacts/live_lab/iteration_123
 
 cargo run -q -p rustynet-cli -- \
   ops vm-lab-run-live-lab \

@@ -26,6 +26,19 @@ The following repository state is already true and must not be regressed.
 - The backend owns the authoritative UDP socket, userspace WireGuard engine state, TUN runtime state, authoritative control operations, and handshake telemetry.
 - Shared-transport proof for peer ciphertext, STUN, and relay control already exists in local simulated tests.
 - The daemon/helper/start/install surfaces now preserve the explicit userspace-shared backend mode instead of silently rewriting it away.
+- `rustynet-cli` now has a narrow typed reduced-live-lab iteration helper:
+  - `ops vm-lab-iterate-live-lab`
+  - it only accepts typed local validation steps (`fmt`, `check`, `check-bin`, `test`, `test-bin`)
+  - it writes the live-lab profile, runs preflight, launches the standard reduced five-node live-lab orchestrator, waits for completion, and prints the first failed stage plus key report/log paths
+  - it supports strict provenance guards:
+    - `--require-clean-tree`
+    - `--require-local-head`
+  - it does **not** accept arbitrary shell commands or widen the operator surface beyond the existing `vm-lab-write-live-lab-profile`, `vm-lab-preflight`, and `vm-lab-run-live-lab` flow
+- `rustynet-cli` now also has narrow live-lab support helpers:
+  - `ops vm-lab-validate-live-lab-profile`
+  - `ops vm-lab-diagnose-live-lab-failure`
+  - `ops vm-lab-diff-live-lab-runs`
+  - these helpers are deterministic and artifact/profile-driven; they do not add a generic remote shell surface
 - Runtime WireGuard key preparation for the userspace-shared backend is fixed.
 - The privileged helper now exposes `/dev/net/tun` so helper-assisted Linux TUN creation no longer fails on missing device access.
 - The Rust live-lab binaries now resolve pinned `known_hosts` lookup candidates from the effective SSH target (`hostkeyalias`, raw host, resolved hostname, and port-aware bracket form) instead of checking only the raw host token.
@@ -198,9 +211,23 @@ The latest fresh rerun now fails at the end of `enforce_baseline_runtime`:
 
 #### Required helper flow
 Keep using the built-in helper flow rather than ad hoc SSH orchestration:
+- preferred narrow wrapper for reduced five-node iteration:
+  - `ops vm-lab-iterate-live-lab`
 - `ops vm-lab-write-live-lab-profile`
 - `ops vm-lab-preflight`
 - `ops vm-lab-run-live-lab`
+
+The new wrapper is the standard path for iterative reduced-lab debugging because it:
+- keeps validation typed and local
+- preserves the existing generated-profile and orchestrator path
+- waits for completion and prints deterministic failure pointers
+- avoids broadening the live-lab execution surface to generic command execution
+- keeps provenance explicit when `--require-clean-tree` and `--require-local-head` are used
+
+The supporting helper set around the wrapper is now:
+- `ops vm-lab-validate-live-lab-profile` before a run when profile correctness or backend/source provenance is in doubt
+- `ops vm-lab-diagnose-live-lab-failure` after a red run to capture `vm-lab-status` and optional artifact collection for the configured live-lab targets
+- `ops vm-lab-diff-live-lab-runs` to show the first divergent stage when a patch moves the blocker forward
 
 Required backend selection for this slice:
 - `RUSTYNET_BACKEND=linux-wireguard-userspace-shared`
@@ -392,6 +419,15 @@ Use this order so failures are local and explainable:
 - targeted `cargo test -p rustynetd ... -- --nocapture` only for directly affected userspace-shared/helper/runtime tests
 
 ### 7.2 Reduced live-lab rerun
+- preferred one-command iteration helper:
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --require-clean-tree --require-local-head --validation-step fmt --validation-step check:rustynetd --validation-step check:rustynet-cli --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --validation-step test-bin:rustynet-cli:live_linux_two_hop_test --validation-step test-bin:rustynet-cli:live_linux_lan_toggle_test --collect-failure-diagnostics`
+- optional pre-run profile validation:
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-validate-live-lab-profile --profile profiles/live_lab/generated_vm_lab_iteration_<id>.env --expected-backend linux-wireguard-userspace-shared --expected-source-mode local-head --require-five-node`
+- post-failure diagnostic capture:
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-diagnose-live-lab-failure --inventory documents/operations/active/vm_lab_inventory.json --profile profiles/live_lab/generated_vm_lab_iteration_<id>.env --report-dir artifacts/live_lab/iteration_<id> --collect-artifacts`
+- run-to-run blocker comparison:
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-diff-live-lab-runs --old-report-dir artifacts/live_lab/<old> --new-report-dir artifacts/live_lab/<new>`
+- underlying built-in flow that the helper wraps:
 - `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile ... --backend linux-wireguard-userspace-shared --source-mode local-head --repo-ref HEAD`
 - `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight ...`
 - `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node.env --skip-gates --skip-soak --skip-cross-network`

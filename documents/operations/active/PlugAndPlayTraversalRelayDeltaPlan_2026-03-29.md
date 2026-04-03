@@ -2399,6 +2399,122 @@ Residual risks / blockers:
   - Phase A transport-socket identity work remains incomplete and still limits end-to-end plug-and-play completion claims.
 ```
 
+```text
+Date: 2026-04-03
+Phase / Slice: Reduced live-lab iteration helper for narrow typed validation plus standard five-node orchestrator execution
+Files changed:
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Added `ops vm-lab-iterate-live-lab` execution support, typed validation-step parsing, default live-lab profile/report roots, deterministic run summary extraction, and backend-internal tests for validation parsing plus report summarization.
+  - crates/rustynet-cli/src/main.rs
+    - Added the `vm-lab-iterate-live-lab` CLI command, argument parsing, help text, dispatch wiring, and parse coverage.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active live-lab delta to make the new helper the standard reduced-rerun wrapper while keeping the underlying profile/preflight/run flow explicit.
+  - documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md
+    - Added the helper to the VM-lab operator command map and example usage.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/vm_lab/mod.rs crates/rustynet-cli/src/main.rs`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo test -p rustynet-cli --bin rustynet-cli -- --nocapture`
+Validation outcomes:
+  - The new helper parses only typed validation specs:
+    - `fmt`
+    - `check:<package>`
+    - `check-bin:<package>:<bin>`
+    - `test:<package>[:filter]`
+    - `test-bin:<package>:<bin>[:filter]`
+  - Generic shell-like validation strings are rejected fail-closed by parser tests.
+  - The helper reuses the existing `vm-lab-write-live-lab-profile`, `vm-lab-preflight`, and `vm-lab-run-live-lab` execution surfaces instead of introducing a second orchestration path.
+  - The helper produces deterministic summary output with:
+    - generated profile path
+    - report directory
+    - overall status
+    - first failed stage
+    - key report path
+    - key log path
+    - likely failure reason
+    - optional failed-log tail
+  - The final targeted CLI validation passed:
+    - `cargo fmt --all -- --check`
+    - `cargo check -p rustynet-cli --bin rustynet-cli`
+    - `cargo test -p rustynet-cli --bin rustynet-cli -- --nocapture`
+Security invariants re-verified:
+  - No arbitrary shell, REPL, or generic command surface was added to the public assistant/operator path.
+  - The helper keeps the reduced live-lab loop on the existing hardened profile/preflight/orchestrator flow rather than inventing a parallel deployment path.
+  - Same-network preflight enforcement remains inventory-backed when VM aliases are used; the helper does not silently weaken that contract by flattening every target into raw SSH form.
+  - The helper does not deploy, retry automatically, or weaken fail-closed behavior on run failure; it only summarizes the first failed stage deterministically.
+What this slice completed:
+  - Operators and follow-on agents now have a single narrow command for the normal reduced five-node debug loop:
+    - run typed local validation
+    - generate the profile
+    - run preflight
+    - execute the reduced live-lab
+    - surface the first actionable failure artifact
+  - The reduced live-lab workflow is now less error-prone without broadening the execution surface.
+What remains blocked:
+  - This helper does not resolve the current live runtime blocker by itself; the first failing live stage still needs to be fixed honestly on the current tree.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-03
+Phase / Slice: Additional reduced live-lab operator helpers for profile validation, failure diagnosis, run comparison, and provenance guards
+Files changed:
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Added `vm-lab-validate-live-lab-profile`, `vm-lab-diagnose-live-lab-failure`, and `vm-lab-diff-live-lab-runs`.
+    - Added strict `vm-lab-iterate-live-lab` provenance guards:
+      - `--require-clean-tree`
+      - `--require-local-head`
+    - Added live-lab profile parsing, stage-record parsing, diff rendering, and focused unit coverage.
+  - crates/rustynet-cli/src/main.rs
+    - Added CLI parsing, dispatch, help text, and parse coverage for the new helpers and iteration guard flags.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta document so the new helpers are the documented iterative reduced-live-lab support surface.
+  - documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md
+    - Added the new helpers to the VM-lab command map and example operator flow.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/vm_lab/mod.rs crates/rustynet-cli/src/main.rs`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo fmt --all -- --check`
+  - `cargo test -p rustynet-cli --bin rustynet-cli -- --nocapture`
+  - `cargo clippy -p rustynet-cli --bin rustynet-cli -- -D warnings`
+Validation outcomes:
+  - The new profile validator parses the generated live-lab env format deterministically, enforces required keys, and can assert backend/source-mode plus five-node completeness.
+  - The failure-diagnosis helper now:
+    - reads the profile and report directory
+    - resolves the first failed stage or an explicitly requested stage
+    - writes a deterministic `vm_lab_status.json`
+    - optionally collects the standard per-node artifact bundle for the configured live-lab targets
+  - The run-diff helper compares two live-lab report directories and prints the first divergent stage plus changed stage status/rc pairs.
+  - `vm-lab-iterate-live-lab` can now fail before a wasted run when:
+    - the git worktree is dirty and `--require-clean-tree` is set
+    - the requested run is not `local-head` / `HEAD` while `--require-local-head` is set
+  - The final focused CLI validation passed:
+    - `cargo check -p rustynet-cli --bin rustynet-cli`
+    - `cargo fmt --all -- --check`
+    - `cargo test -p rustynet-cli --bin rustynet-cli -- --nocapture`
+    - `cargo clippy -p rustynet-cli --bin rustynet-cli -- -D warnings`
+Security invariants re-verified:
+  - No arbitrary shell or generic remote command surface was added.
+  - Failure diagnosis reuses the existing hardened `vm-lab-status` and `vm-lab-collect-artifacts` paths instead of inventing a second remote execution mechanism.
+  - The new helpers are artifact/profile-driven and deterministic; they do not retry, downgrade, or mutate runtime state beyond the existing explicit artifact-collection path.
+  - Provenance guards now give operators a typed way to insist on clean-tree local committed-HEAD runs instead of relying on manual command construction.
+What this slice completed:
+  - The normal reduced five-node debug loop now has supporting typed helper coverage for:
+    - profile validation
+    - single-command iteration
+    - deterministic failure diagnosis
+    - run-to-run regression comparison
+  - Follow-on agents no longer need to rebuild the same ad hoc report/profile inspection commands repeatedly.
+What remains blocked:
+  - These helpers improve operator correctness and speed, but they do not resolve the current live runtime blocker by themselves.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
 ## 19. Definition of Done for This Document
 This delta is complete only when all are true:
 - direct path uses correct measured candidates,

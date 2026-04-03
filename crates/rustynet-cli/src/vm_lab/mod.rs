@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::env_file::format_env_assignment;
+use crate::env_file::{format_env_assignment, parse_env_value};
 use base64::prelude::*;
 use serde_json::{Value, json};
 use tar::Builder;
@@ -31,6 +31,8 @@ const DEFAULT_LIVE_LAB_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
+const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
+const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
 const DEFAULT_PRECHECK_COMMANDS: &[&str] = &["git", "cargo", "systemctl"];
 const POLL_INTERVAL_MILLIS: u64 = 100;
 
@@ -140,6 +142,88 @@ pub struct VmLabRunLiveLabConfig {
     pub repo_ref: Option<String>,
     pub report_dir: Option<PathBuf>,
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmLabIterationValidationStep {
+    FmtCheck,
+    CargoCheckPackage {
+        package: String,
+    },
+    CargoCheckBin {
+        package: String,
+        bin: String,
+    },
+    CargoTestPackage {
+        package: String,
+        filter: Option<String>,
+    },
+    CargoTestBin {
+        package: String,
+        bin: String,
+        filter: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabIterateLiveLabConfig {
+    pub inventory_path: PathBuf,
+    pub profile_output_path: Option<PathBuf>,
+    pub exit_vm: Option<String>,
+    pub exit_target: Option<String>,
+    pub client_vm: Option<String>,
+    pub client_target: Option<String>,
+    pub entry_vm: Option<String>,
+    pub entry_target: Option<String>,
+    pub aux_vm: Option<String>,
+    pub aux_target: Option<String>,
+    pub extra_vm: Option<String>,
+    pub extra_target: Option<String>,
+    pub fifth_client_vm: Option<String>,
+    pub fifth_client_target: Option<String>,
+    pub require_same_network: bool,
+    pub ssh_identity_file: PathBuf,
+    pub ssh_known_hosts_file: Option<PathBuf>,
+    pub ssh_allow_cidrs: Option<String>,
+    pub network_id: Option<String>,
+    pub traversal_ttl_secs: Option<u64>,
+    pub backend: Option<String>,
+    pub source_mode: Option<String>,
+    pub repo_ref: Option<String>,
+    pub report_dir: Option<PathBuf>,
+    pub script_path: PathBuf,
+    pub dry_run: bool,
+    pub timeout_secs: u64,
+    pub require_clean_tree: bool,
+    pub require_local_head: bool,
+    pub validation_steps: Vec<VmLabIterationValidationStep>,
+    pub collect_failure_diagnostics: bool,
+    pub failed_log_tail_lines: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabValidateLiveLabProfileConfig {
+    pub profile_path: PathBuf,
+    pub expected_backend: Option<String>,
+    pub expected_source_mode: Option<String>,
+    pub require_five_node: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDiagnoseLiveLabFailureConfig {
+    pub inventory_path: PathBuf,
+    pub profile_path: PathBuf,
+    pub report_dir: PathBuf,
+    pub stage: Option<String>,
+    pub output_dir: Option<PathBuf>,
+    pub collect_artifacts: bool,
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDiffLiveLabRunsConfig {
+    pub old_report_dir: PathBuf,
+    pub new_report_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,52 +464,44 @@ pub fn default_utmctl_path() -> PathBuf {
     PathBuf::from(DEFAULT_UTMCTL_PATH)
 }
 
-pub fn default_inventory_path() -> PathBuf {
+fn workspace_root_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_VM_LAB_INVENTORY_PATH)
+        .to_path_buf()
+}
+
+pub fn default_inventory_path() -> PathBuf {
+    workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
 }
 
 pub fn default_live_lab_orchestrator_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_LIVE_LAB_ORCHESTRATOR_PATH)
+    workspace_root_path().join(DEFAULT_LIVE_LAB_ORCHESTRATOR_PATH)
 }
 
 pub fn default_cross_network_direct_script_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT)
+    workspace_root_path().join(DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT)
 }
 
 pub fn default_cross_network_relay_script_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_CROSS_NETWORK_RELAY_SCRIPT)
+    workspace_root_path().join(DEFAULT_CROSS_NETWORK_RELAY_SCRIPT)
 }
 
 pub fn default_cross_network_failback_script_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT)
+    workspace_root_path().join(DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT)
 }
 
 pub fn default_artifact_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .join(DEFAULT_ARTIFACT_ROOT)
+    workspace_root_path().join(DEFAULT_ARTIFACT_ROOT)
+}
+
+pub fn default_live_lab_profile_root() -> PathBuf {
+    workspace_root_path().join(DEFAULT_LIVE_LAB_PROFILE_ROOT)
+}
+
+pub fn default_live_lab_report_root() -> PathBuf {
+    workspace_root_path().join(DEFAULT_LIVE_LAB_REPORT_ROOT)
 }
 
 pub fn default_known_hosts_path() -> PathBuf {
@@ -433,6 +509,89 @@ pub fn default_known_hosts_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
         .join(".ssh/known_hosts")
+}
+
+impl VmLabIterationValidationStep {
+    fn label(&self) -> String {
+        match self {
+            Self::FmtCheck => "fmt".to_string(),
+            Self::CargoCheckPackage { package } => format!("check:{package}"),
+            Self::CargoCheckBin { package, bin } => format!("check-bin:{package}:{bin}"),
+            Self::CargoTestPackage { package, filter } => match filter {
+                Some(filter) => format!("test:{package}:{filter}"),
+                None => format!("test:{package}"),
+            },
+            Self::CargoTestBin {
+                package,
+                bin,
+                filter,
+            } => match filter {
+                Some(filter) => format!("test-bin:{package}:{bin}:{filter}"),
+                None => format!("test-bin:{package}:{bin}"),
+            },
+        }
+    }
+}
+
+pub fn parse_vm_lab_iteration_validation_step_spec(
+    value: &str,
+) -> Result<VmLabIterationValidationStep, String> {
+    ensure_no_control_chars("validation step", value)?;
+    let parts = value.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["fmt"] => Ok(VmLabIterationValidationStep::FmtCheck),
+        ["check", package] => {
+            ensure_no_control_chars("validation package", package)?;
+            Ok(VmLabIterationValidationStep::CargoCheckPackage {
+                package: (*package).to_string(),
+            })
+        }
+        ["check-bin", package, bin] => {
+            ensure_no_control_chars("validation package", package)?;
+            ensure_no_control_chars("validation binary", bin)?;
+            Ok(VmLabIterationValidationStep::CargoCheckBin {
+                package: (*package).to_string(),
+                bin: (*bin).to_string(),
+            })
+        }
+        ["test", package] => {
+            ensure_no_control_chars("validation package", package)?;
+            Ok(VmLabIterationValidationStep::CargoTestPackage {
+                package: (*package).to_string(),
+                filter: None,
+            })
+        }
+        ["test", package, filter] => {
+            ensure_no_control_chars("validation package", package)?;
+            ensure_no_control_chars("validation test filter", filter)?;
+            Ok(VmLabIterationValidationStep::CargoTestPackage {
+                package: (*package).to_string(),
+                filter: Some((*filter).to_string()),
+            })
+        }
+        ["test-bin", package, bin] => {
+            ensure_no_control_chars("validation package", package)?;
+            ensure_no_control_chars("validation binary", bin)?;
+            Ok(VmLabIterationValidationStep::CargoTestBin {
+                package: (*package).to_string(),
+                bin: (*bin).to_string(),
+                filter: None,
+            })
+        }
+        ["test-bin", package, bin, filter] => {
+            ensure_no_control_chars("validation package", package)?;
+            ensure_no_control_chars("validation binary", bin)?;
+            ensure_no_control_chars("validation test filter", filter)?;
+            Ok(VmLabIterationValidationStep::CargoTestBin {
+                package: (*package).to_string(),
+                bin: (*bin).to_string(),
+                filter: Some((*filter).to_string()),
+            })
+        }
+        _ => Err(format!(
+            "unsupported validation step: {value} (expected fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter])"
+        )),
+    }
 }
 
 pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String> {
@@ -1009,6 +1168,927 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         config.script_path.display(),
         config.profile_path.display()
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabStageSummary {
+    overall_status: String,
+    first_failed_stage: Option<String>,
+    key_report_path: PathBuf,
+    key_log_path: Option<PathBuf>,
+    likely_reason: Option<String>,
+    failed_log_tail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabStageRecord {
+    name: String,
+    severity: String,
+    status: String,
+    rc: String,
+    log_path: PathBuf,
+    description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabProfile {
+    values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabProfileTarget {
+    role: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IterationPreflightSelection {
+    vm_aliases: Vec<String>,
+    raw_targets: Vec<String>,
+}
+
+pub fn execute_ops_vm_lab_iterate_live_lab(
+    config: VmLabIterateLiveLabConfig,
+) -> Result<String, String> {
+    if config.validation_steps.is_empty() {
+        return Err(
+            "specify at least one --validation-step for vm-lab-iterate-live-lab".to_string(),
+        );
+    }
+
+    let dirty_worktree = if config.require_clean_tree || config.require_local_head {
+        Some(git_worktree_is_dirty()?)
+    } else {
+        None
+    };
+    let (resolved_source_mode, resolved_repo_ref) = resolve_iteration_source_selection(
+        config.source_mode.as_deref(),
+        config.repo_ref.as_deref(),
+        config.require_clean_tree,
+        config.require_local_head,
+        dirty_worktree.unwrap_or(false),
+    )?;
+
+    let profile_output_path = config
+        .profile_output_path
+        .clone()
+        .unwrap_or_else(default_live_lab_iteration_profile_path);
+    let report_dir = config
+        .report_dir
+        .clone()
+        .unwrap_or_else(default_live_lab_iteration_report_dir);
+    let script_path = config.script_path.clone();
+    let timeout_secs = config.timeout_secs;
+
+    for step in &config.validation_steps {
+        execute_vm_lab_iteration_validation_step(step, timeout_secs)?;
+    }
+
+    let profile_result =
+        execute_ops_vm_lab_write_live_lab_profile(VmLabWriteLiveLabProfileConfig {
+            inventory_path: config.inventory_path.clone(),
+            output_path: profile_output_path.clone(),
+            exit_vm: config.exit_vm.clone(),
+            exit_target: config.exit_target.clone(),
+            client_vm: config.client_vm.clone(),
+            client_target: config.client_target.clone(),
+            entry_vm: config.entry_vm.clone(),
+            entry_target: config.entry_target.clone(),
+            aux_vm: config.aux_vm.clone(),
+            aux_target: config.aux_target.clone(),
+            extra_vm: config.extra_vm.clone(),
+            extra_target: config.extra_target.clone(),
+            fifth_client_vm: config.fifth_client_vm.clone(),
+            fifth_client_target: config.fifth_client_target.clone(),
+            require_same_network: config.require_same_network,
+            ssh_identity_file: config.ssh_identity_file.clone(),
+            ssh_known_hosts_file: config.ssh_known_hosts_file.clone(),
+            ssh_allow_cidrs: config.ssh_allow_cidrs.clone(),
+            network_id: config.network_id.clone(),
+            traversal_ttl_secs: config.traversal_ttl_secs,
+            cross_network_nat_profiles: None,
+            cross_network_required_nat_profiles: None,
+            cross_network_impairment_profile: None,
+            backend: Some(
+                config
+                    .backend
+                    .clone()
+                    .unwrap_or_else(|| "linux-wireguard-userspace-shared".to_string()),
+            ),
+            source_mode: Some(resolved_source_mode.clone()),
+            repo_ref: resolved_repo_ref.clone(),
+            report_dir: Some(report_dir.clone()),
+        })?;
+
+    let preflight_selection = collect_iteration_preflight_selection(&config)?;
+    execute_ops_vm_lab_preflight(VmLabPreflightConfig {
+        inventory_path: config.inventory_path.clone(),
+        vm_aliases: preflight_selection.vm_aliases,
+        raw_targets: preflight_selection.raw_targets,
+        select_all: false,
+        known_hosts_path: config.ssh_known_hosts_file.clone(),
+        require_same_network: config.require_same_network,
+        require_commands: vec!["git".to_string(), "cargo".to_string()],
+        min_free_kib: 1_048_576,
+        require_rustynet_installed: true,
+        timeout_secs,
+    })?;
+
+    let live_lab_result = execute_ops_vm_lab_run_live_lab(VmLabRunLiveLabConfig {
+        profile_path: profile_output_path.clone(),
+        script_path,
+        dry_run: config.dry_run,
+        skip_gates: true,
+        skip_soak: true,
+        skip_cross_network: true,
+        source_mode: Some(resolved_source_mode),
+        repo_ref: resolved_repo_ref,
+        report_dir: Some(report_dir.clone()),
+        timeout_secs,
+    });
+
+    let summary = summarize_live_lab_report(
+        report_dir.as_path(),
+        config.collect_failure_diagnostics,
+        config.failed_log_tail_lines,
+    )?;
+    let summary_text = render_live_lab_iteration_summary(
+        profile_output_path.as_path(),
+        report_dir.as_path(),
+        profile_result.as_str(),
+        &summary,
+    );
+
+    match live_lab_result {
+        Ok(_) => Ok(summary_text),
+        Err(err) => Err(format!("{summary_text}\nrun_error={err}")),
+    }
+}
+
+pub fn execute_ops_vm_lab_validate_live_lab_profile(
+    config: VmLabValidateLiveLabProfileConfig,
+) -> Result<String, String> {
+    let profile = load_live_lab_profile(config.profile_path.as_path())?;
+    ensure_local_regular_file_path(
+        Path::new(profile.required("SSH_IDENTITY_FILE")?.as_str()),
+        "SSH identity file",
+    )?;
+    if let Some(path) = profile.optional("SSH_KNOWN_HOSTS_FILE") {
+        ensure_local_regular_file_path(Path::new(path.as_str()), "SSH known_hosts file")?;
+    }
+    let source_mode = profile.optional("SOURCE_MODE");
+    let backend = profile.optional("RUSTYNET_BACKEND");
+    if let Some(expected_backend) = config.expected_backend.as_deref()
+        && backend.as_deref() != Some(expected_backend)
+    {
+        return Err(format!(
+            "live-lab profile backend mismatch: expected {expected_backend}, got {}",
+            backend.as_deref().unwrap_or("none")
+        ));
+    }
+    if let Some(expected_source_mode) = config.expected_source_mode.as_deref()
+        && source_mode.as_deref() != Some(expected_source_mode)
+    {
+        return Err(format!(
+            "live-lab profile source mode mismatch: expected {expected_source_mode}, got {}",
+            source_mode.as_deref().unwrap_or("none")
+        ));
+    }
+    if let Some(mode) = source_mode.as_deref() {
+        validate_live_lab_source_mode(mode)?;
+        if mode == "ref" && profile.optional("REPO_REF").is_none() {
+            return Err("live-lab profile SOURCE_MODE=ref requires REPO_REF".to_string());
+        }
+    }
+    if config.require_five_node {
+        for key in ["ENTRY_TARGET", "AUX_TARGET", "EXTRA_TARGET"] {
+            if profile.optional(key).is_none() {
+                return Err(format!(
+                    "live-lab profile must define {key} for the reduced five-node topology"
+                ));
+            }
+        }
+    }
+
+    let targets = profile.configured_targets()?;
+    let mut lines = vec![
+        format!("profile_path={}", config.profile_path.display()),
+        format!("target_count={}", targets.len()),
+        format!("backend={}", backend.as_deref().unwrap_or("none")),
+        format!("source_mode={}", source_mode.as_deref().unwrap_or("none")),
+        format!(
+            "repo_ref={}",
+            profile.optional("REPO_REF").as_deref().unwrap_or("none")
+        ),
+        format!(
+            "report_dir={}",
+            profile.optional("REPORT_DIR").as_deref().unwrap_or("none")
+        ),
+    ];
+    for target in &targets {
+        lines.push(format!("target.{}={}", target.role, target.target));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
+    config: VmLabDiagnoseLiveLabFailureConfig,
+) -> Result<String, String> {
+    let profile = load_live_lab_profile(config.profile_path.as_path())?;
+    let summary = summarize_live_lab_report(config.report_dir.as_path(), false, 1)?;
+    let stage = if let Some(stage) = config.stage.as_deref() {
+        stage.to_string()
+    } else {
+        summary
+            .first_failed_stage
+            .clone()
+            .ok_or_else(|| "live-lab report does not contain a failed stage".to_string())?
+    };
+    let stage_records = parse_live_lab_stage_records(config.report_dir.as_path())?;
+    let stage_record = stage_records
+        .iter()
+        .find(|record| record.name == stage)
+        .ok_or_else(|| {
+            format!(
+                "stage {stage} is not present in {}",
+                config.report_dir.display()
+            )
+        })?;
+    let diagnostics_dir = config.output_dir.clone().unwrap_or_else(|| {
+        config
+            .report_dir
+            .join("diagnostics")
+            .join(sanitize_label_for_path(stage.as_str()))
+    });
+    fs::create_dir_all(diagnostics_dir.as_path()).map_err(|err| {
+        format!(
+            "create diagnostics dir failed ({}): {err}",
+            diagnostics_dir.display()
+        )
+    })?;
+
+    let targets = profile.configured_targets()?;
+    let raw_targets = targets
+        .iter()
+        .map(|target| target.target.clone())
+        .collect::<Vec<_>>();
+    let status_output = execute_ops_vm_lab_status(VmLabStatusConfig {
+        inventory_path: config.inventory_path.clone(),
+        vm_aliases: Vec::new(),
+        raw_targets: raw_targets.clone(),
+        select_all: false,
+        ssh_user: None,
+        timeout_secs: config.timeout_secs,
+    })?;
+    let status_path = diagnostics_dir.join("vm_lab_status.json");
+    fs::write(status_path.as_path(), status_output.as_bytes()).map_err(|err| {
+        format!(
+            "write vm-lab status output failed ({}): {err}",
+            status_path.display()
+        )
+    })?;
+
+    let artifacts_dir = if config.collect_artifacts {
+        let artifacts_dir = diagnostics_dir.join("artifacts");
+        execute_ops_vm_lab_collect_artifacts(VmLabCollectArtifactsConfig {
+            inventory_path: config.inventory_path.clone(),
+            vm_aliases: Vec::new(),
+            raw_targets,
+            select_all: false,
+            ssh_user: None,
+            output_dir: artifacts_dir.clone(),
+            timeout_secs: config.timeout_secs,
+        })?;
+        Some(artifacts_dir)
+    } else {
+        None
+    };
+
+    let targets_json = targets
+        .iter()
+        .map(|target| {
+            json!({
+                "role": target.role,
+                "target": target.target,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary_json = json!({
+        "report_dir": config.report_dir,
+        "profile_path": config.profile_path,
+        "stage": stage,
+        "stage_description": stage_record.description,
+        "key_report_path": summary.key_report_path.clone(),
+        "key_log_path": summary.key_log_path.clone(),
+        "likely_reason": summary.likely_reason.clone(),
+        "target_count": targets.len(),
+        "targets": targets_json,
+        "status_output_path": status_path.clone(),
+        "artifacts_dir": artifacts_dir.clone(),
+    });
+    let summary_path = diagnostics_dir.join("diagnostics_summary.json");
+    fs::write(
+        summary_path.as_path(),
+        serde_json::to_vec_pretty(&summary_json)
+            .map_err(|err| format!("serialize live-lab diagnostics summary failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write diagnostics summary failed ({}): {err}",
+            summary_path.display()
+        )
+    })?;
+
+    let mut lines = vec![
+        format!("report_dir={}", config.report_dir.display()),
+        format!("profile_path={}", config.profile_path.display()),
+        format!("stage={}", stage_record.name),
+        format!("stage_description={}", stage_record.description),
+        format!("key_report_path={}", summary.key_report_path.display()),
+        format!(
+            "key_log_path={}",
+            summary
+                .key_log_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        format!("diagnostics_dir={}", diagnostics_dir.display()),
+        format!("status_output_path={}", status_path.display()),
+        format!(
+            "artifacts_dir={}",
+            artifacts_dir
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        format!("target_count={}", targets.len()),
+    ];
+    for target in targets {
+        lines.push(format!("target.{}={}", target.role, target.target));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub fn execute_ops_vm_lab_diff_live_lab_runs(
+    config: VmLabDiffLiveLabRunsConfig,
+) -> Result<String, String> {
+    let old_summary = summarize_live_lab_report(config.old_report_dir.as_path(), false, 1)?;
+    let new_summary = summarize_live_lab_report(config.new_report_dir.as_path(), false, 1)?;
+    let old_records = parse_live_lab_stage_records(config.old_report_dir.as_path())?;
+    let new_records = parse_live_lab_stage_records(config.new_report_dir.as_path())?;
+    let old_map = old_records
+        .iter()
+        .map(|record| (record.name.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let new_map = new_records
+        .iter()
+        .map(|record| (record.name.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let ordered_names = old_records
+        .iter()
+        .map(|record| record.name.clone())
+        .chain(
+            new_records
+                .iter()
+                .map(|record| record.name.clone())
+                .filter(|name| !old_map.contains_key(name)),
+        )
+        .collect::<Vec<_>>();
+
+    let mut first_divergent_stage = None;
+    let mut changes = Vec::new();
+    for name in ordered_names {
+        let old_status = old_map.get(&name).map(|record| record.status.as_str());
+        let new_status = new_map.get(&name).map(|record| record.status.as_str());
+        let old_rc = old_map.get(&name).map(|record| record.rc.as_str());
+        let new_rc = new_map.get(&name).map(|record| record.rc.as_str());
+        if old_status != new_status || old_rc != new_rc {
+            if first_divergent_stage.is_none() {
+                first_divergent_stage = Some(name.clone());
+            }
+            changes.push(format!(
+                "{}:{}:{} -> {}:{}",
+                name,
+                old_status.unwrap_or("missing"),
+                old_rc.unwrap_or("missing"),
+                new_status.unwrap_or("missing"),
+                new_rc.unwrap_or("missing")
+            ));
+        }
+    }
+
+    let mut lines = vec![
+        format!("old_report_dir={}", config.old_report_dir.display()),
+        format!("new_report_dir={}", config.new_report_dir.display()),
+        format!("old_overall_status={}", old_summary.overall_status),
+        format!("new_overall_status={}", new_summary.overall_status),
+        format!(
+            "old_first_failed_stage={}",
+            old_summary.first_failed_stage.as_deref().unwrap_or("none")
+        ),
+        format!(
+            "new_first_failed_stage={}",
+            new_summary.first_failed_stage.as_deref().unwrap_or("none")
+        ),
+        format!(
+            "first_divergent_stage={}",
+            first_divergent_stage.as_deref().unwrap_or("none")
+        ),
+        format!("changed_stage_count={}", changes.len()),
+    ];
+    if let Some(reason) = old_summary.likely_reason.as_deref() {
+        lines.push(format!("old_likely_reason={reason}"));
+    }
+    if let Some(reason) = new_summary.likely_reason.as_deref() {
+        lines.push(format!("new_likely_reason={reason}"));
+    }
+    for change in changes {
+        lines.push(format!("stage_change={change}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn resolve_iteration_source_selection(
+    configured_source_mode: Option<&str>,
+    configured_repo_ref: Option<&str>,
+    require_clean_tree: bool,
+    require_local_head: bool,
+    dirty_worktree: bool,
+) -> Result<(String, Option<String>), String> {
+    if (require_clean_tree || require_local_head) && dirty_worktree {
+        return Err("git worktree must be clean for this live-lab iteration".to_string());
+    }
+    if require_local_head {
+        if let Some(source_mode) = configured_source_mode
+            && source_mode != "local-head"
+        {
+            return Err(format!(
+                "--require-local-head is incompatible with --source-mode {source_mode}"
+            ));
+        }
+        if let Some(repo_ref) = configured_repo_ref
+            && repo_ref != "HEAD"
+        {
+            return Err(format!(
+                "--require-local-head is incompatible with --repo-ref {repo_ref} (expected HEAD)"
+            ));
+        }
+        return Ok(("local-head".to_string(), Some("HEAD".to_string())));
+    }
+    Ok((
+        configured_source_mode.unwrap_or("working-tree").to_string(),
+        configured_repo_ref.map(str::to_string),
+    ))
+}
+
+fn git_worktree_is_dirty() -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["status", "--short"]);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed with status {}",
+            status_code(output.status)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git status returned non-UTF-8 output: {err}"))?;
+    Ok(!stdout.trim().is_empty())
+}
+
+impl LiveLabProfile {
+    fn required(&self, key: &str) -> Result<String, String> {
+        self.values
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("live-lab profile is missing required key {key}"))
+    }
+
+    fn optional(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned()
+    }
+
+    fn configured_targets(&self) -> Result<Vec<LiveLabProfileTarget>, String> {
+        let mut targets = vec![
+            LiveLabProfileTarget {
+                role: "exit".to_string(),
+                target: self.required("EXIT_TARGET")?,
+            },
+            LiveLabProfileTarget {
+                role: "client".to_string(),
+                target: self.required("CLIENT_TARGET")?,
+            },
+        ];
+        for (key, role) in [
+            ("ENTRY_TARGET", "entry"),
+            ("AUX_TARGET", "aux"),
+            ("EXTRA_TARGET", "extra"),
+            ("FIFTH_CLIENT_TARGET", "fifth_client"),
+        ] {
+            if let Some(target) = self.optional(key) {
+                targets.push(LiveLabProfileTarget {
+                    role: role.to_string(),
+                    target,
+                });
+            }
+        }
+        Ok(targets)
+    }
+}
+
+fn load_live_lab_profile(path: &Path) -> Result<LiveLabProfile, String> {
+    ensure_local_regular_file_path(path, "live-lab profile")?;
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read live-lab profile failed ({}): {err}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for (index, raw_line) in body.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, raw_value) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "invalid live-lab profile line {} in {}: expected KEY=VALUE",
+                index + 1,
+                path.display()
+            )
+        })?;
+        let key = key.trim();
+        ensure_live_lab_profile_key(key)?;
+        if values.contains_key(key) {
+            return Err(format!(
+                "duplicate live-lab profile key {} in {}",
+                key,
+                path.display()
+            ));
+        }
+        let value = parse_env_value(raw_value).map_err(|err| {
+            format!(
+                "invalid live-lab profile value for {} in {}: {}",
+                key,
+                path.display(),
+                err
+            )
+        })?;
+        values.insert(key.to_string(), value);
+    }
+    let profile = LiveLabProfile { values };
+    ensure_ssh_target("EXIT_TARGET", profile.required("EXIT_TARGET")?.as_str())?;
+    ensure_ssh_target("CLIENT_TARGET", profile.required("CLIENT_TARGET")?.as_str())?;
+    let _ = profile.required("SSH_IDENTITY_FILE")?;
+    Ok(profile)
+}
+
+fn ensure_live_lab_profile_key(key: &str) -> Result<(), String> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(format!("invalid live-lab profile key: {key}"));
+    }
+    Ok(())
+}
+
+fn validate_live_lab_source_mode(value: &str) -> Result<(), String> {
+    match value {
+        "working-tree" | "local-head" | "origin-main" | "ref" => Ok(()),
+        _ => Err(format!(
+            "unsupported live-lab profile source mode: {value} (expected working-tree|local-head|origin-main|ref)"
+        )),
+    }
+}
+
+fn parse_live_lab_stage_records(report_dir: &Path) -> Result<Vec<LiveLabStageRecord>, String> {
+    let report_dir = if report_dir.is_absolute() {
+        report_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolve current directory failed: {err}"))?
+            .join(report_dir)
+    };
+    let stages_path = report_dir.join("state/stages.tsv");
+    let stages_body = fs::read_to_string(&stages_path).map_err(|err| {
+        format!(
+            "read live-lab stages failed ({}): {err}",
+            stages_path.display()
+        )
+    })?;
+    let mut records = Vec::new();
+    for line in stages_body.lines().filter(|line| !line.trim().is_empty()) {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() < 6 {
+            continue;
+        }
+        records.push(LiveLabStageRecord {
+            name: columns[0].to_string(),
+            severity: columns[1].to_string(),
+            status: columns[2].to_string(),
+            rc: columns[3].to_string(),
+            log_path: resolve_report_relative_path(columns[4], report_dir.as_path())?,
+            description: columns[5].to_string(),
+        });
+    }
+    Ok(records)
+}
+
+fn execute_vm_lab_iteration_validation_step(
+    step: &VmLabIterationValidationStep,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let timeout = timeout_or_default(timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    let mut command = Command::new("cargo");
+    command.current_dir(workspace_root_path());
+    match step {
+        VmLabIterationValidationStep::FmtCheck => {
+            command.args(["fmt", "--all", "--", "--check"]);
+        }
+        VmLabIterationValidationStep::CargoCheckPackage { package } => {
+            command.args(["check", "-p", package.as_str()]);
+        }
+        VmLabIterationValidationStep::CargoCheckBin { package, bin } => {
+            command.args(["check", "-p", package.as_str(), "--bin", bin.as_str()]);
+        }
+        VmLabIterationValidationStep::CargoTestPackage { package, filter } => {
+            command.args(["test", "-p", package.as_str()]);
+            if let Some(filter) = filter.as_deref() {
+                command.arg(filter);
+            }
+            command.args(["--", "--nocapture"]);
+        }
+        VmLabIterationValidationStep::CargoTestBin {
+            package,
+            bin,
+            filter,
+        } => {
+            command.args(["test", "-p", package.as_str(), "--bin", bin.as_str()]);
+            if let Some(filter) = filter.as_deref() {
+                command.arg(filter);
+            }
+            command.args(["--", "--nocapture"]);
+        }
+    }
+    let step_label = step.label();
+    let status = run_status_with_timeout_passthrough(&mut command, timeout)
+        .map_err(|err| format!("validation step {step_label} failed: {err}"))?;
+    ensure_success_status(status, &format!("validation step {step_label}"))
+}
+
+fn collect_iteration_preflight_selection(
+    config: &VmLabIterateLiveLabConfig,
+) -> Result<IterationPreflightSelection, String> {
+    let mut seen = HashSet::new();
+    let mut vm_aliases = Vec::new();
+    let mut raw_targets = Vec::new();
+
+    let mut push_role = |role_label: &str,
+                         alias: Option<&String>,
+                         raw_target: Option<&String>|
+     -> Result<(), String> {
+        match (alias, raw_target) {
+            (Some(alias), None) => {
+                resolve_role_target_from_inventory(
+                    config.inventory_path.as_path(),
+                    role_label,
+                    alias.as_str(),
+                )?;
+                if seen.insert(format!("vm:{alias}")) {
+                    vm_aliases.push(alias.clone());
+                }
+            }
+            (None, Some(raw_target)) => {
+                let target = resolve_role_target_from_raw(role_label, raw_target.as_str())?;
+                if seen.insert(format!("target:{}", target.normalized_target)) {
+                    raw_targets.push(target.normalized_target);
+                }
+            }
+            (None, None) => {}
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "{role_label} target must use either --{role_label}-vm or --{role_label}-target, not both"
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    push_role("exit", config.exit_vm.as_ref(), config.exit_target.as_ref())?;
+    push_role(
+        "client",
+        config.client_vm.as_ref(),
+        config.client_target.as_ref(),
+    )?;
+    push_role(
+        "entry",
+        config.entry_vm.as_ref(),
+        config.entry_target.as_ref(),
+    )?;
+    push_role("aux", config.aux_vm.as_ref(), config.aux_target.as_ref())?;
+    push_role(
+        "extra",
+        config.extra_vm.as_ref(),
+        config.extra_target.as_ref(),
+    )?;
+    push_role(
+        "fifth_client",
+        config.fifth_client_vm.as_ref(),
+        config.fifth_client_target.as_ref(),
+    )?;
+
+    if vm_aliases.is_empty() && raw_targets.is_empty() {
+        return Err("live-lab iteration requires at least exit and client targets".to_string());
+    }
+    Ok(IterationPreflightSelection {
+        vm_aliases,
+        raw_targets,
+    })
+}
+
+fn default_live_lab_iteration_profile_path() -> PathBuf {
+    default_live_lab_profile_root().join(format!(
+        "generated_vm_lab_iteration_{}.env",
+        unique_suffix()
+    ))
+}
+
+fn default_live_lab_iteration_report_dir() -> PathBuf {
+    default_live_lab_report_root().join(format!("iteration_{}", unique_suffix()))
+}
+
+fn summarize_live_lab_report(
+    report_dir: &Path,
+    collect_failure_diagnostics: bool,
+    failed_log_tail_lines: usize,
+) -> Result<LiveLabStageSummary, String> {
+    let report_dir = if report_dir.is_absolute() {
+        report_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolve current directory failed: {err}"))?
+            .join(report_dir)
+    };
+    let stages_path = report_dir.join("state/stages.tsv");
+    let failure_digest_path = report_dir.join("failure_digest.md");
+    let stages_body = fs::read_to_string(&stages_path).map_err(|err| {
+        format!(
+            "read live-lab stages failed ({}): {err}",
+            stages_path.display()
+        )
+    })?;
+    let mut first_failed_stage = None;
+    let mut key_log_path = None;
+    for line in stages_body.lines().filter(|line| !line.trim().is_empty()) {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() < 5 {
+            continue;
+        }
+        if columns[2] == "fail" {
+            first_failed_stage = Some(columns[0].to_string());
+            key_log_path = Some(resolve_report_relative_path(
+                columns[4],
+                report_dir.as_path(),
+            )?);
+            break;
+        }
+    }
+    let likely_reason = key_log_path
+        .as_deref()
+        .map(extract_iteration_likely_reason)
+        .filter(|reason| !reason.is_empty());
+    let failed_log_tail = if collect_failure_diagnostics {
+        key_log_path
+            .as_deref()
+            .map(|path| tail_log_lines(path, failed_log_tail_lines))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(LiveLabStageSummary {
+        overall_status: if first_failed_stage.is_some() {
+            "fail".to_string()
+        } else {
+            "pass".to_string()
+        },
+        first_failed_stage,
+        key_report_path: failure_digest_path,
+        key_log_path,
+        likely_reason,
+        failed_log_tail,
+    })
+}
+
+fn resolve_report_relative_path(value: &str, report_dir: &Path) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("resolve current directory failed: {err}"))?;
+    let cwd_joined = cwd.join(path);
+    if cwd_joined.exists() {
+        Ok(cwd_joined)
+    } else {
+        Ok(report_dir.join(path))
+    }
+}
+
+fn extract_iteration_likely_reason(log_path: &Path) -> String {
+    let Ok(body) = fs::read_to_string(log_path) else {
+        return "see full log".to_string();
+    };
+    let mut candidates = Vec::new();
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("[stage:")
+            && (line.contains("] START") || line.contains("] PASS") || line.contains("] FAIL"))
+        {
+            continue;
+        }
+        if line.starts_with("[parallel:") || line.starts_with("----- ") {
+            continue;
+        }
+        candidates.push(line.to_string());
+    }
+    if candidates.is_empty() {
+        return "see full log".to_string();
+    }
+    for line in candidates.iter().rev() {
+        let lowered = line.to_ascii_lowercase();
+        if lowered.contains("error:")
+            || lowered.contains("fail")
+            || lowered.contains("timed out")
+            || lowered.contains("timeout")
+            || lowered.contains("permission denied")
+            || lowered.contains("missing")
+            || lowered.contains("invalid")
+            || lowered.contains("mismatch")
+            || lowered.contains("does not exist")
+            || lowered.contains("no such")
+            || lowered.contains("unreachable")
+        {
+            return line.clone();
+        }
+    }
+    candidates
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "see full log".to_string())
+}
+
+fn tail_log_lines(path: &Path, max_lines: usize) -> Result<String, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read failed log tail failed ({}): {err}", path.display()))?;
+    let lines = body
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines.max(1));
+    Ok(lines[start..].join("\n"))
+}
+
+fn render_live_lab_iteration_summary(
+    profile_output_path: &Path,
+    report_dir: &Path,
+    profile_result: &str,
+    summary: &LiveLabStageSummary,
+) -> String {
+    let mut lines = vec![
+        format!("profile_result={profile_result}"),
+        format!("profile_path={}", profile_output_path.display()),
+        format!("report_dir={}", report_dir.display()),
+        format!("overall_status={}", summary.overall_status),
+        format!(
+            "first_failed_stage={}",
+            summary.first_failed_stage.as_deref().unwrap_or("none")
+        ),
+        format!("key_report_path={}", summary.key_report_path.display()),
+        format!(
+            "key_log_path={}",
+            summary
+                .key_log_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    ];
+    if let Some(reason) = summary.likely_reason.as_deref() {
+        lines.push(format!("likely_reason={reason}"));
+    }
+    if let Some(tail) = summary.failed_log_tail.as_deref() {
+        lines.push("diagnostic_log_tail<<EOF".to_string());
+        lines.push(tail.to_string());
+        lines.push("EOF".to_string());
+    }
+    lines.join("\n")
 }
 
 pub fn execute_ops_vm_lab_check_known_hosts(
@@ -4184,16 +5264,23 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
 #[cfg(test)]
 mod tests {
     use super::{
-        VmLabWriteLiveLabProfileConfig, build_assignment_refresh_env,
-        build_local_source_extract_script, build_remote_argv_script, build_repo_sync_script,
-        build_suite_command, build_vendored_cargo_config, build_vm_lab_topology,
-        default_inventory_path, default_live_lab_orchestrator_path, default_utmctl_path,
-        ensure_inventory_entries_share_network, execute_ops_vm_lab_write_live_lab_profile,
-        load_inventory, local_utm_process_present_in_ps_output, parse_vm_lab_topology,
-        privileged_rustynet_cli_script, resolve_remote_targets, resolve_repo_sync_source,
-        resolve_start_targets,
+        LiveLabProfile, LiveLabStageSummary, VmLabIterationValidationStep,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
+        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
+        build_repo_sync_script, build_suite_command, build_vendored_cargo_config,
+        build_vm_lab_topology, default_inventory_path, default_live_lab_iteration_profile_path,
+        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
+        default_utmctl_path, ensure_inventory_entries_share_network,
+        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_validate_live_lab_profile,
+        execute_ops_vm_lab_write_live_lab_profile, load_inventory, load_live_lab_profile,
+        local_utm_process_present_in_ps_output, parse_live_lab_stage_records,
+        parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
+        privileged_rustynet_cli_script, render_live_lab_iteration_summary,
+        resolve_iteration_source_selection, resolve_remote_targets, resolve_repo_sync_source,
+        resolve_start_targets, summarize_live_lab_report,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4214,6 +5301,39 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    fn write_temp_report_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-live-lab-report-{unique}.dir"));
+        fs::create_dir_all(dir.join("state")).expect("state dir should exist");
+        fs::create_dir_all(dir.join("logs")).expect("logs dir should exist");
+        dir
+    }
+
+    fn write_temp_live_lab_profile(body: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-live-lab-profile-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let identity = dir.join("id_ed25519");
+        fs::write(&identity, "dummy-key").expect("identity file should write");
+        let known_hosts = dir.join("known_hosts");
+        fs::write(&known_hosts, "example ssh-ed25519 AAAA\n").expect("known hosts should write");
+        let profile_path = dir.join("profile.env");
+        let rendered = body
+            .replace("$IDENTITY_FILE", identity.display().to_string().as_str())
+            .replace(
+                "$KNOWN_HOSTS_FILE",
+                known_hosts.display().to_string().as_str(),
+            );
+        fs::write(&profile_path, rendered).expect("profile should write");
+        profile_path
     }
 
     #[test]
@@ -4567,6 +5687,348 @@ directory = "vendor"
         assert!(body.contains("RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\""));
         assert!(body.contains("SOURCE_MODE=\"local-head\""));
         cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn parse_validation_step_supports_fmt_and_package_specs() {
+        assert_eq!(
+            parse_vm_lab_iteration_validation_step_spec("fmt").expect("fmt should parse"),
+            VmLabIterationValidationStep::FmtCheck
+        );
+        assert_eq!(
+            parse_vm_lab_iteration_validation_step_spec("check:rustynetd")
+                .expect("check package should parse"),
+            VmLabIterationValidationStep::CargoCheckPackage {
+                package: "rustynetd".to_string()
+            }
+        );
+        assert_eq!(
+            parse_vm_lab_iteration_validation_step_spec(
+                "test-bin:rustynet-cli:live_linux_lan_toggle_test:lan_toggle"
+            )
+            .expect("test bin should parse"),
+            VmLabIterationValidationStep::CargoTestBin {
+                package: "rustynet-cli".to_string(),
+                bin: "live_linux_lan_toggle_test".to_string(),
+                filter: Some("lan_toggle".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_validation_step_rejects_unsupported_specs() {
+        let err = parse_vm_lab_iteration_validation_step_spec("cargo test -p rustynetd")
+            .expect_err("generic shell-like specs must fail");
+        assert!(err.contains("unsupported validation step"));
+    }
+
+    #[test]
+    fn iteration_default_paths_target_live_lab_roots() {
+        let profile_path = default_live_lab_iteration_profile_path();
+        let report_dir = default_live_lab_iteration_report_dir();
+        assert!(
+            profile_path
+                .display()
+                .to_string()
+                .contains("profiles/live_lab/")
+        );
+        assert!(profile_path.display().to_string().ends_with(".env"));
+        assert!(
+            report_dir
+                .display()
+                .to_string()
+                .contains("artifacts/live_lab/")
+        );
+        assert!(report_dir.display().to_string().contains("iteration_"));
+    }
+
+    #[test]
+    fn summarize_live_lab_report_extracts_first_failed_stage_and_log_tail() {
+        let report_dir = write_temp_report_dir();
+        let log_path = report_dir.join("logs/enforce_baseline_runtime.log");
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
+enforce_baseline_runtime\thard\tfail\t1\t{}/logs/enforce_baseline_runtime.log\tenforce baseline runtime\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n",
+                report_dir.display(),
+                report_dir.display()
+            ),
+        )
+        .expect("stages should write");
+        fs::write(
+            &log_path,
+            "[stage:enforce_baseline_runtime] START\nstatus okay\nerror: daemon is in restricted-safe mode\nfinal detail\n",
+        )
+        .expect("log should write");
+        fs::write(report_dir.join("failure_digest.md"), "# digest\n").expect("digest should write");
+
+        let summary =
+            summarize_live_lab_report(report_dir.as_path(), true, 2).expect("summary should build");
+        assert_eq!(summary.overall_status, "fail");
+        assert_eq!(
+            summary.first_failed_stage.as_deref(),
+            Some("enforce_baseline_runtime")
+        );
+        assert_eq!(summary.key_log_path.as_deref(), Some(log_path.as_path()));
+        assert_eq!(
+            summary.likely_reason.as_deref(),
+            Some("error: daemon is in restricted-safe mode")
+        );
+        assert_eq!(
+            summary.failed_log_tail.as_deref(),
+            Some("error: daemon is in restricted-safe mode\nfinal detail")
+        );
+
+        let rendered = render_live_lab_iteration_summary(
+            Path::new("/tmp/profile.env"),
+            report_dir.as_path(),
+            "wrote live-lab profile=/tmp/profile.env",
+            &summary,
+        );
+        assert!(rendered.contains("first_failed_stage=enforce_baseline_runtime"));
+        assert!(rendered.contains("key_report_path="));
+        assert!(rendered.contains("diagnostic_log_tail<<EOF"));
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn summarize_live_lab_report_handles_success_without_failed_stage() {
+        let report_dir = write_temp_report_dir();
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n",
+                report_dir.display()
+            ),
+        )
+        .expect("stages should write");
+        fs::write(report_dir.join("failure_digest.md"), "# digest\n").expect("digest should write");
+
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 5)
+            .expect("summary should build");
+        assert_eq!(
+            summary,
+            LiveLabStageSummary {
+                overall_status: "pass".to_string(),
+                first_failed_stage: None,
+                key_report_path: report_dir.join("failure_digest.md"),
+                key_log_path: None,
+                likely_reason: None,
+                failed_log_tail: None,
+            }
+        );
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn live_lab_profile_loader_parses_targets_and_metadata() {
+        let profile_path = write_temp_live_lab_profile(
+            "# Generated by test\n\
+EXIT_TARGET=\"debian@exit-host\"\n\
+CLIENT_TARGET=\"debian@client-host\"\n\
+ENTRY_TARGET=\"debian@entry-host\"\n\
+AUX_TARGET=\"debian@aux-host\"\n\
+EXTRA_TARGET=\"debian@extra-host\"\n\
+SSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n\
+SSH_KNOWN_HOSTS_FILE=\"$KNOWN_HOSTS_FILE\"\n\
+RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\"\n\
+SOURCE_MODE=\"working-tree\"\n\
+REPORT_DIR=\"artifacts/live_lab/test\"\n",
+        );
+
+        let profile = load_live_lab_profile(profile_path.as_path()).expect("profile should parse");
+        assert_eq!(
+            profile,
+            LiveLabProfile {
+                values: BTreeMap::from([
+                    ("AUX_TARGET".to_string(), "debian@aux-host".to_string()),
+                    (
+                        "CLIENT_TARGET".to_string(),
+                        "debian@client-host".to_string()
+                    ),
+                    ("ENTRY_TARGET".to_string(), "debian@entry-host".to_string()),
+                    ("EXIT_TARGET".to_string(), "debian@exit-host".to_string()),
+                    ("EXTRA_TARGET".to_string(), "debian@extra-host".to_string()),
+                    (
+                        "REPORT_DIR".to_string(),
+                        "artifacts/live_lab/test".to_string()
+                    ),
+                    (
+                        "RUSTYNET_BACKEND".to_string(),
+                        "linux-wireguard-userspace-shared".to_string()
+                    ),
+                    ("SOURCE_MODE".to_string(), "working-tree".to_string()),
+                    (
+                        "SSH_IDENTITY_FILE".to_string(),
+                        profile_path
+                            .parent()
+                            .expect("profile parent should exist")
+                            .join("id_ed25519")
+                            .display()
+                            .to_string()
+                    ),
+                    (
+                        "SSH_KNOWN_HOSTS_FILE".to_string(),
+                        profile_path
+                            .parent()
+                            .expect("profile parent should exist")
+                            .join("known_hosts")
+                            .display()
+                            .to_string()
+                    ),
+                ]),
+            }
+        );
+        let targets = profile.configured_targets().expect("targets should render");
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].role, "exit");
+        assert_eq!(targets[1].role, "client");
+
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+    }
+
+    #[test]
+    fn live_lab_profile_loader_rejects_duplicate_keys() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"debian@exit-host\"\n\
+CLIENT_TARGET=\"debian@client-host\"\n\
+SSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n\
+EXIT_TARGET=\"debian@other-exit\"\n",
+        );
+        let err = load_live_lab_profile(profile_path.as_path()).expect_err("duplicates must fail");
+        assert!(err.contains("duplicate live-lab profile key EXIT_TARGET"));
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+    }
+
+    #[test]
+    fn validate_live_lab_profile_enforces_five_node_and_backend() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"debian@exit-host\"\n\
+CLIENT_TARGET=\"debian@client-host\"\n\
+ENTRY_TARGET=\"debian@entry-host\"\n\
+AUX_TARGET=\"debian@aux-host\"\n\
+EXTRA_TARGET=\"debian@extra-host\"\n\
+SSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n\
+SSH_KNOWN_HOSTS_FILE=\"$KNOWN_HOSTS_FILE\"\n\
+RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\"\n\
+SOURCE_MODE=\"local-head\"\n\
+REPO_REF=\"HEAD\"\n",
+        );
+        let summary =
+            execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+                profile_path: profile_path.clone(),
+                expected_backend: Some("linux-wireguard-userspace-shared".to_string()),
+                expected_source_mode: Some("local-head".to_string()),
+                require_five_node: true,
+            })
+            .expect("validation should pass");
+        assert!(summary.contains("target.entry=debian@entry-host"));
+        assert!(summary.contains("target.extra=debian@extra-host"));
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+    }
+
+    #[test]
+    fn parse_live_lab_stage_records_preserves_stage_order_and_status() {
+        let report_dir = write_temp_report_dir();
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
+live_two_hop\thard\tfail\t1\t{}/logs/live_two_hop.log\trun live two-hop validation\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n",
+                report_dir.display(),
+                report_dir.display()
+            ),
+        )
+        .expect("stages should write");
+        let stages =
+            parse_live_lab_stage_records(report_dir.as_path()).expect("stages should parse");
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[1].name, "live_two_hop");
+        assert_eq!(stages[1].status, "fail");
+        assert!(
+            stages[1]
+                .log_path
+                .display()
+                .to_string()
+                .ends_with("live_two_hop.log")
+        );
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn diff_live_lab_runs_reports_first_divergent_stage() {
+        let old_report_dir = write_temp_report_dir();
+        let new_report_dir = write_temp_report_dir();
+        fs::write(
+            old_report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
+live_two_hop\thard\tfail\t1\t{}/logs/live_two_hop.log\trun live two-hop validation\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n",
+                old_report_dir.display(),
+                old_report_dir.display()
+            ),
+        )
+        .expect("old stages should write");
+        fs::write(
+            new_report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
+live_two_hop\thard\tpass\t0\t{}/logs/live_two_hop.log\trun live two-hop validation\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n\
+live_lan_toggle\thard\tfail\t1\t{}/logs/live_lan_toggle.log\trun LAN access toggle validation\t2026-04-03T20:12:00Z\t2026-04-03T20:12:05Z\n",
+                new_report_dir.display(),
+                new_report_dir.display(),
+                new_report_dir.display()
+            ),
+        )
+        .expect("new stages should write");
+        fs::write(old_report_dir.join("failure_digest.md"), "# digest\n")
+            .expect("old digest should write");
+        fs::write(new_report_dir.join("failure_digest.md"), "# digest\n")
+            .expect("new digest should write");
+        fs::write(
+            old_report_dir.join("logs/live_two_hop.log"),
+            "error: old failure\n",
+        )
+        .expect("old log should write");
+        fs::write(
+            new_report_dir.join("logs/live_lan_toggle.log"),
+            "error: new failure\n",
+        )
+        .expect("new log should write");
+
+        let diff = execute_ops_vm_lab_diff_live_lab_runs(super::VmLabDiffLiveLabRunsConfig {
+            old_report_dir: old_report_dir.clone(),
+            new_report_dir: new_report_dir.clone(),
+        })
+        .expect("diff should pass");
+        assert!(diff.contains("first_divergent_stage=live_two_hop"));
+        assert!(diff.contains("stage_change=live_two_hop:fail:1 -> pass:0"));
+        assert!(diff.contains("new_first_failed_stage=live_lan_toggle"));
+
+        let _ = fs::remove_dir_all(old_report_dir);
+        let _ = fs::remove_dir_all(new_report_dir);
+    }
+
+    #[test]
+    fn resolve_iteration_source_selection_enforces_local_head_and_clean_tree() {
+        let resolved = resolve_iteration_source_selection(None, None, false, true, false)
+            .expect("local-head guard should resolve");
+        assert_eq!(
+            resolved,
+            ("local-head".to_string(), Some("HEAD".to_string()))
+        );
+
+        let err =
+            resolve_iteration_source_selection(Some("working-tree"), None, false, true, false)
+                .expect_err("non-local-head source mode must fail");
+        assert!(err.contains("--require-local-head"));
+
+        let err = resolve_iteration_source_selection(None, None, true, false, true)
+            .expect_err("dirty tree must fail");
+        assert!(err.contains("git worktree must be clean"));
     }
 
     #[test]
