@@ -286,6 +286,21 @@ impl RuntimeControl {
     }
 
     #[cfg(test)]
+    pub(crate) fn queue_tun_plaintext_packet_for_test(
+        &self,
+        packet: Vec<u8>,
+    ) -> Result<(), BackendError> {
+        self.request(|reply| RuntimeRequest::DebugQueueTunPlaintextPacket { packet, reply })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_tun_outbound_packets_for_test(
+        &self,
+    ) -> Result<Vec<Vec<u8>>, BackendError> {
+        self.request(|reply| RuntimeRequest::DebugRecordedTunOutboundPackets { reply })
+    }
+
+    #[cfg(test)]
     pub(crate) fn worker_exit_count_for_test(&self) -> usize {
         self.test_state.worker_exit_count.load(Ordering::SeqCst)
     }
@@ -397,12 +412,21 @@ enum RuntimeRequest {
     DebugRecordedTunnelPlaintextPackets {
         reply: ReplySender<Vec<RecordedTunnelPlaintextPacket>>,
     },
+    #[cfg(test)]
+    DebugQueueTunPlaintextPacket {
+        packet: Vec<u8>,
+        reply: ReplySender<()>,
+    },
+    #[cfg(test)]
+    DebugRecordedTunOutboundPackets {
+        reply: ReplySender<Vec<Vec<u8>>>,
+    },
 }
 
 #[derive(Debug)]
 struct RuntimeState {
     context: RuntimeContext,
-    _tun_device: TunDevice,
+    tun_device: TunDevice,
     tun_lifecycle: SharedTunLifecycle,
     authoritative_socket: AuthoritativeSocket,
     engine: UserspaceEngine,
@@ -631,6 +655,17 @@ impl RuntimeState {
         Ok(())
     }
 
+    fn poll_tun_device(&mut self) -> Result<(), BackendError> {
+        while let Some(packet) = self.tun_device.recv_packet()? {
+            let outcome = self.engine.inject_plaintext_packet(
+                &packet,
+                self.authoritative_socket.transport_generation(),
+            )?;
+            self.apply_engine_processing_outcome(outcome)?;
+        }
+        Ok(())
+    }
+
     fn expire_timed_out_round_trip(&mut self) {
         let Some(outstanding) = self.outstanding_round_trip.as_ref() else {
             return;
@@ -696,6 +731,16 @@ impl RuntimeState {
         self.apply_engine_processing_outcome(outcome)
     }
 
+    #[cfg(test)]
+    fn queue_tun_plaintext_packet_for_test(&mut self, packet: Vec<u8>) -> Result<(), BackendError> {
+        self.tun_device.queue_inbound_packet_for_test(packet)
+    }
+
+    #[cfg(test)]
+    fn recorded_tun_outbound_packets(&self) -> Result<Vec<Vec<u8>>, BackendError> {
+        self.tun_device.recorded_outbound_packets_for_test()
+    }
+
     fn apply_engine_processing_outcome(
         &mut self,
         outcome: super::engine::EngineProcessingOutcome,
@@ -712,6 +757,9 @@ impl RuntimeState {
                 });
             self.authoritative_socket
                 .send_to(packet.remote_addr, &packet.payload)?;
+        }
+        for packet in outcome.tunnel_plaintext_packets {
+            self.tun_device.send_packet(&packet)?;
         }
         if let Some((node_id, observed_unix)) = outcome.authenticated_handshake {
             self.handshake_telemetry
@@ -758,7 +806,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
     } = parts;
     let mut state = RuntimeState {
         context,
-        _tun_device: tun_device,
+        tun_device,
         tun_lifecycle,
         authoritative_socket,
         engine,
@@ -815,6 +863,10 @@ fn run_worker(parts: WorkerRuntimeParts) {
         }
 
         if let Err(err) = state.poll_authoritative_socket() {
+            state.fail_outstanding_round_trip(err);
+            break;
+        }
+        if let Err(err) = state.poll_tun_device() {
             state.fail_outstanding_round_trip(err);
             break;
         }
@@ -930,6 +982,16 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
         #[cfg(test)]
         RuntimeRequest::DebugRecordedTunnelPlaintextPackets { reply } => {
             let _ = reply.send(Ok(state.recorded_tunnel_plaintext_packets()));
+            true
+        }
+        #[cfg(test)]
+        RuntimeRequest::DebugQueueTunPlaintextPacket { packet, reply } => {
+            let _ = reply.send(state.queue_tun_plaintext_packet_for_test(packet));
+            true
+        }
+        #[cfg(test)]
+        RuntimeRequest::DebugRecordedTunOutboundPackets { reply } => {
+            let _ = reply.send(state.recorded_tun_outbound_packets());
             true
         }
     }

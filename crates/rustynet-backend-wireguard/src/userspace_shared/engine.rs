@@ -39,6 +39,7 @@ pub(crate) struct OutboundCiphertextPacket {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct EngineProcessingOutcome {
     pub(crate) outbound_ciphertext_packets: Vec<OutboundCiphertextPacket>,
+    pub(crate) tunnel_plaintext_packets: Vec<Vec<u8>>,
     pub(crate) authenticated_handshake: Option<(NodeId, u64)>,
 }
 
@@ -434,6 +435,7 @@ fn handle_single_tunn_result(
                 transport_generation,
             };
             recorded_tunnel_plaintext_packets.push(recorded_packet);
+            outcome.tunnel_plaintext_packets.push(packet.to_vec());
         }
         TunnResult::WriteToTunnelV6(packet, _src_addr) => {
             let recorded_packet = RecordedTunnelPlaintextPacket {
@@ -442,6 +444,7 @@ fn handle_single_tunn_result(
                 transport_generation,
             };
             recorded_tunnel_plaintext_packets.push(recorded_packet);
+            outcome.tunnel_plaintext_packets.push(packet.to_vec());
         }
     }
 
@@ -469,6 +472,9 @@ fn merge_engine_processing_outcomes(
     current
         .outbound_ciphertext_packets
         .extend(next.outbound_ciphertext_packets);
+    current
+        .tunnel_plaintext_packets
+        .extend(next.tunnel_plaintext_packets);
     match (
         &current.authenticated_handshake,
         next.authenticated_handshake,

@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::fmt;
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +29,76 @@ impl TunDevice {
     pub(crate) fn test_handle(state: TunTestState) -> Self {
         Self {
             _inner: TunDeviceInner::Test(TestTunDeviceHandle::new(state)),
+        }
+    }
+
+    pub(crate) fn recv_packet(&self) -> Result<Option<Vec<u8>>, BackendError> {
+        match &self._inner {
+            TunDeviceInner::Real(device) => {
+                let mut buffer = vec![0u8; 65_535];
+                match device.recv(&mut buffer) {
+                    Ok(len) => {
+                        buffer.truncate(len);
+                        Ok(Some(buffer))
+                    }
+                    Err(err)
+                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(err) => Err(BackendError::internal(format!(
+                        "linux userspace-shared TUN receive failed: {err}"
+                    ))),
+                }
+            }
+            TunDeviceInner::Test(handle) => Ok(handle.dequeue_inbound_packet()),
+        }
+    }
+
+    pub(crate) fn send_packet(&self, packet: &[u8]) -> Result<(), BackendError> {
+        match &self._inner {
+            TunDeviceInner::Real(device) => {
+                let written = device.send(packet).map_err(|err| {
+                    BackendError::internal(format!("linux userspace-shared TUN send failed: {err}"))
+                })?;
+                if written != packet.len() {
+                    return Err(BackendError::internal(format!(
+                        "linux userspace-shared TUN send truncated packet: wrote {written} of {} bytes",
+                        packet.len()
+                    )));
+                }
+                Ok(())
+            }
+            TunDeviceInner::Test(handle) => {
+                handle.record_outbound_packet(packet.to_vec());
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_inbound_packet_for_test(
+        &self,
+        packet: Vec<u8>,
+    ) -> Result<(), BackendError> {
+        match &self._inner {
+            TunDeviceInner::Real(_) => Err(BackendError::internal(
+                "real TUN device does not support test packet injection",
+            )),
+            TunDeviceInner::Test(handle) => {
+                handle.queue_inbound_packet(packet);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_outbound_packets_for_test(&self) -> Result<Vec<Vec<u8>>, BackendError> {
+        match &self._inner {
+            TunDeviceInner::Real(_) => Err(BackendError::internal(
+                "real TUN device does not expose recorded outbound packets",
+            )),
+            TunDeviceInner::Test(handle) => Ok(handle.recorded_outbound_packets()),
         }
     }
 }
@@ -148,6 +220,11 @@ impl TunLifecycle for DirectTunLifecycle {
                     "linux userspace-shared TUN create/open failed for {interface_name}: {err}"
                 ))
             })?;
+        device.set_nonblocking(true).map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared TUN nonblocking setup failed for {interface_name}: {err}"
+            ))
+        })?;
         Ok(TunDevice::real(device))
     }
 
@@ -275,6 +352,11 @@ impl TunLifecycle for HelperBackedTunLifecycle {
                         "linux userspace-shared TUN open failed for {interface_name}: {err}"
                     ))
                 })?;
+            device.set_nonblocking(true).map_err(|err| {
+                BackendError::internal(format!(
+                    "linux userspace-shared TUN nonblocking setup failed for {interface_name}: {err}"
+                ))
+            })?;
             Ok(TunDevice::real(device))
         })();
 
@@ -516,6 +598,30 @@ impl TunTestState {
         inner.programmed_route_cidrs.clear();
     }
 
+    #[allow(dead_code)]
+    fn queue_inbound_packet(&self, packet: Vec<u8>) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.queued_inbound_packets.push_back(packet);
+    }
+
+    #[allow(dead_code)]
+    fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.queued_inbound_packets.pop_front()
+    }
+
+    #[allow(dead_code)]
+    fn record_outbound_packet(&self, packet: Vec<u8>) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.recorded_outbound_packets.push(packet);
+    }
+
+    #[allow(dead_code)]
+    fn recorded_outbound_packets(&self) -> Vec<Vec<u8>> {
+        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.recorded_outbound_packets.clone()
+    }
+
     fn record_exit_mode_reconcile(&self, target_mode: ExitMode) {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.exit_mode_reconcile_calls += 1;
@@ -669,6 +775,8 @@ struct TunTestStateInner {
     current_exit_mode: ExitMode,
     exit_mode_mutations: Vec<TunExitModeMutation>,
     exit_mode_behavior: TestExitModeBehavior,
+    queued_inbound_packets: VecDeque<Vec<u8>>,
+    recorded_outbound_packets: Vec<Vec<u8>>,
 }
 
 impl Default for TunTestStateInner {
@@ -690,6 +798,8 @@ impl Default for TunTestStateInner {
             current_exit_mode: ExitMode::Off,
             exit_mode_mutations: Vec::new(),
             exit_mode_behavior: TestExitModeBehavior::default(),
+            queued_inbound_packets: VecDeque::new(),
+            recorded_outbound_packets: Vec::new(),
         }
     }
 }
@@ -744,6 +854,26 @@ impl TestTunDeviceHandle {
     fn new(state: TunTestState) -> Self {
         state.increment_live_handles();
         Self { state }
+    }
+
+    #[allow(dead_code)]
+    fn queue_inbound_packet(&self, packet: Vec<u8>) {
+        self.state.queue_inbound_packet(packet);
+    }
+
+    #[allow(dead_code)]
+    fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
+        self.state.dequeue_inbound_packet()
+    }
+
+    #[allow(dead_code)]
+    fn record_outbound_packet(&self, packet: Vec<u8>) {
+        self.state.record_outbound_packet(packet);
+    }
+
+    #[allow(dead_code)]
+    fn recorded_outbound_packets(&self) -> Vec<Vec<u8>> {
+        self.state.recorded_outbound_packets()
     }
 }
 

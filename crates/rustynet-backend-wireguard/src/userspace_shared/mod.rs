@@ -219,6 +219,24 @@ impl LinuxUserspaceSharedBackend {
             .control()
             .recorded_tunnel_plaintext_packets_for_test()
     }
+
+    #[cfg(test)]
+    fn queue_tun_plaintext_packet_for_test(&self, packet: Vec<u8>) -> Result<(), BackendError> {
+        let runtime = self.runtime.as_ref().ok_or_else(|| {
+            BackendError::not_running("linux userspace-shared wireguard backend is not running")
+        })?;
+        runtime
+            .control()
+            .queue_tun_plaintext_packet_for_test(packet)
+    }
+
+    #[cfg(test)]
+    fn recorded_tun_outbound_packets_for_test(&self) -> Result<Vec<Vec<u8>>, BackendError> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+        runtime.control().recorded_tun_outbound_packets_for_test()
+    }
 }
 
 impl TunnelBackend for LinuxUserspaceSharedBackend {
@@ -1668,13 +1686,14 @@ mod tests {
             .expect("right generation should exist");
         assert_ne!(left_generation, right_generation);
 
+        let simulated_plaintext = build_ipv4_udp_packet(
+            Ipv4Addr::new(100, 64, 1, 10),
+            Ipv4Addr::new(100, 64, 2, 20),
+            b"phase6-simulated-proof",
+        );
         left_backend
-            .inject_plaintext_packet_for_test(build_ipv4_udp_packet(
-                Ipv4Addr::new(100, 64, 1, 10),
-                Ipv4Addr::new(100, 64, 2, 20),
-                b"phase6-simulated-proof",
-            ))
-            .expect("plaintext injection should succeed");
+            .queue_tun_plaintext_packet_for_test(simulated_plaintext.clone())
+            .expect("test TUN plaintext queue should succeed");
 
         let left_peer_egress = wait_for(Duration::from_secs(2), || {
             let records = left_backend
@@ -1684,8 +1703,8 @@ mod tests {
         });
         let right_plaintext_packets = wait_for(Duration::from_secs(2), || {
             let packets = right_backend
-                .recorded_tunnel_plaintext_packets_for_test()
-                .expect("right tunnel packet query should succeed");
+                .recorded_tun_outbound_packets_for_test()
+                .expect("right test TUN outbound packet query should succeed");
             (!packets.is_empty()).then_some(packets)
         });
 
@@ -1722,10 +1741,10 @@ mod tests {
             == backend_loopback_addr(right_port)
             && record.local_addr == left_identity_addr
             && record.transport_generation == left_generation));
-        assert!(
-            right_plaintext_packets
-                .iter()
-                .all(|packet| packet.transport_generation == right_generation)
+        assert_eq!(
+            right_plaintext_packets,
+            vec![simulated_plaintext],
+            "the receiving backend must write the decrypted packet to its owned TUN device"
         );
         assert_eq!(authoritative_operations.len(), 3);
         assert_eq!(
