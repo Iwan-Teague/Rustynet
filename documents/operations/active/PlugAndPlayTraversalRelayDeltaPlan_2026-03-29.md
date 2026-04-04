@@ -2515,6 +2515,151 @@ What remains blocked:
   - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
 ```
 
+```text
+Date: 2026-04-04
+Phase / Slice: Linux userspace-shared live-lab delta - exit handoff traversal refresh cadence correction
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs
+    - Removed repeated managed-DNS bundle reissuance from the handoff monitor loop and pre-switch path because the stage already starts from a fresh valid DNS bundle and does not need to spend traversal-coordination budget on DNS work.
+    - Replaced completion-time traversal refresh tracking with deadline-based traversal refresh scheduling so the handoff monitor no longer drifts past the 30-second coordination window when refresh work itself takes non-trivial time.
+    - Added unit coverage for the new refresh-deadline helpers.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta document so the current committed-tree blocker is again recorded as `live_exit_handoff` `no_restricted_safe_mode`, and so the new handoff cadence fix is marked as locally validated but not yet live-proven.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `cargo check -p rustynet-cli --bin live_linux_exit_handoff_test`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+Validation outcomes:
+  - The handoff binary compiles cleanly after the cadence change.
+  - `live_linux_exit_handoff_test` unit coverage passed, including the new refresh-deadline tests and the existing endpoint/proof helper coverage.
+  - `cargo fmt --all -- --check` passed on the modified tree.
+  - No deploy and no fresh five-node rerun were performed in this slice; the fix is code-only and still awaits live proof on the current committed tree.
+Security invariants re-verified:
+  - The handoff stage still starts from freshly issued signed traversal and DNS state and still checks route leak, reconvergence, backend-authoritative selected-exit endpoint visibility, exit NAT, and managed-DNS validity fail-closed.
+  - No daemon-owned or helper-owned side socket was introduced.
+  - The change does not weaken restricted-safe-mode proof semantics; it reduces avoidable orchestration drift so traversal freshness remains ahead of expiry under the existing strict authority checks.
+What this slice completed:
+  - The handoff runner no longer couples short-lived traversal-coordination refresh to repeated managed-DNS issuance during the monitor window.
+  - Traversal refresh cadence is now anchored to refresh deadlines instead of drifting with refresh completion time.
+What remains blocked:
+  - `live_exit_handoff` still requires a fresh reduced five-node rerun on the current committed tree to prove that transient `restricted_safe_mode=true` during handoff is gone.
+  - After handoff is clear, later reduced-live-lab stages still need fresh committed-tree proof.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-04
+Phase / Slice: Live-lab restart readiness guard for the reduced five-node helper loop
+Files changed:
+  - crates/rustynet-cli/src/main.rs
+    - `force-local-assignment-refresh-now` now waits for the daemon to report a runtime-ready, non-restricted status after restart before returning to the caller.
+    - Added a small pure predicate for the readiness check plus unit coverage for the status-text interpretation.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Recorded the new restart-readiness guard in the active delta note so the helper behavior stays synchronized with the code.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/main.rs`
+  - `cargo check -p rustynet-cli --bin rustynet-cli`
+  - `cargo test -p rustynet-cli --bin rustynet-cli daemon_runtime_ready_status_requires_non_restricted_non_failed_state -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+Validation outcomes:
+  - The new readiness predicate is unit-tested and only accepts daemon status text when:
+    - `restricted_safe_mode=false`
+    - `state` is not `FailClosed`
+    - `bootstrap_error=none`
+    - `last_reconcile_error=none`
+  - `force-local-assignment-refresh-now` now waits for that status before handing control back to the live-lab orchestrator, which avoids racing ahead while the daemon is still recovering from a restart.
+  - The live handoff binary tests still pass after the helper-side change.
+Security invariants re-verified:
+  - The helper still fails closed on readiness timeouts.
+  - The helper does not weaken restricted-safe mode or skip daemon recovery checks.
+  - No generic shell, REPL, or remote execution surface was introduced.
+What this slice completed:
+  - The helper restart path is now gated on daemon readiness instead of only on Unix socket presence.
+  - The code path is ready for the next reduced five-node rerun without relying on a transiently-started daemon.
+What remains blocked:
+  - This readiness gate is necessary but not sufficient to clear the live lab. The next fresh five-node rerun still has to prove the restricted-safe regression is gone.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-04
+Phase / Slice: Linux userspace-shared live-lab delta - role-switch converged-runtime wait hardening
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_role_switch_matrix_test.rs
+    - Tightened the role-switch stage wait predicate so it does not record baseline, temporary-role, or restored-role status from a transient daemon state that has the expected `node_role` but is still `FailClosed` or otherwise unreconciled.
+    - Added a pure readiness helper that requires:
+      - matching `node_role`
+      - `restricted_safe_mode=false`
+      - `state != FailClosed`
+      - `bootstrap_error=none`
+      - `last_reconcile_error=none`
+    - Added unit coverage for the new predicate.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the current-truth sections so the latest committed-tree first blocker is recorded honestly as `live_role_switch_matrix` on `mint.post_switch_reconcile`, not the older `live_exit_handoff` failure.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_role_switch_matrix_test.rs`
+  - `cargo check -p rustynet-cli --bin live_linux_role_switch_matrix_test`
+  - `cargo test -p rustynet-cli --bin live_linux_role_switch_matrix_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+Validation outcomes:
+  - The role-switch stage binary compiles cleanly after the wait-predicate hardening.
+  - `live_linux_role_switch_matrix_test` unit coverage passed, including the new converged-runtime wait tests.
+  - `cargo fmt --all -- --check` passed on the modified tree.
+  - No five-node live-lab rerun was performed in this slice; the fix is code-only and still awaits fresh live proof.
+Security invariants re-verified:
+  - The stage remains fail-closed and strict; it now requires more proof before sampling success, not less.
+  - No restricted-safe, fail-closed, or reconcile-error window is treated as acceptable steady state.
+  - No helper-owned or daemon-owned alternate datapath or transport authority was introduced.
+What this slice completed:
+  - The role-switch proof no longer conflates role assignment completion with runtime reconciliation completion.
+  - The `mint`-host false negative seen in `artifacts/live_lab/iteration_1775302140218194000` is now addressed in code at the proof layer that sampled it.
+What remains blocked:
+  - `live_role_switch_matrix` still requires a fresh reduced five-node rerun on the current committed tree to prove that the transient `node_role=client` / `state=FailClosed` sampling bug is gone.
+  - After role-switch is clear, later reduced-live-lab stages still need fresh committed-tree proof.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-04
+Phase / Slice: Linux userspace-shared live-lab delta - exit handoff post-switch traversal-refresh hardening
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs
+    - Kept the deadline-based traversal refresh cadence active for the full handoff monitor window instead of stopping refresh once the client switches to the new exit.
+    - Preserved the earlier removal of repeated managed-DNS refresh work so the stage does not spend coordination budget on unrelated bundle issuance.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated current truth so the latest committed-tree first blocker is again recorded honestly as `live_exit_handoff` `no_restricted_safe_mode`, with the post-switch traversal-expiry cause and local fix called out explicitly.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs`
+  - `cargo check -p rustynet-cli --bin live_linux_exit_handoff_test`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+Validation outcomes:
+  - The handoff binary compiles cleanly after restoring post-switch traversal refresh.
+  - `live_linux_exit_handoff_test` unit coverage passed on the modified file.
+  - `cargo fmt --all -- --check` passed on the modified tree.
+  - No five-node live-lab rerun was performed in this slice; the fix is code-only and still awaits fresh live proof.
+Security invariants re-verified:
+  - The handoff stage still fails closed on any transient `restricted_safe_mode=true`; the proof contract was not weakened.
+  - The change does not introduce a second transport authority, side socket, or unmanaged helper path.
+  - Signed traversal refresh remains bounded and explicit; the fix only keeps coordination freshness ahead of expiry during the existing monitor window.
+What this slice completed:
+  - The handoff runner no longer allows the post-switch half of the monitor window to outlive the signed traversal coordination budget.
+What remains blocked:
+  - `live_exit_handoff` still requires a fresh reduced five-node rerun on the current committed tree to prove that transient `restricted_safe_mode=true` during handoff is gone.
+  - After handoff is clear, later reduced-live-lab stages still need fresh committed-tree proof.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
 ## 19. Definition of Done for This Document
 This delta is complete only when all are true:
 - direct path uses correct measured candidates,

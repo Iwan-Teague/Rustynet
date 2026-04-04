@@ -8946,7 +8946,61 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
     run_systemctl_action("restart", "rustynetd.service")?;
     wait_for_socket_path(socket_path.as_path(), Duration::from_secs(20))?;
+    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(30))?;
     Ok(())
+}
+
+fn wait_for_runtime_ready_after_restart(
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_observation: String;
+    loop {
+        let status_output = Command::new(PINNED_RUNTIME_RUSTYNET_BIN)
+            .env("RUSTYNET_DAEMON_SOCKET", socket_path)
+            .arg("status")
+            .output()
+            .map_err(|err| format!("invoke rustynet status failed: {err}"))?;
+        let stdout = String::from_utf8_lossy(&status_output.stdout)
+            .trim()
+            .to_string();
+        if status_output.status.success() && daemon_runtime_ready_from_status_text(&stdout) {
+            return Ok(());
+        }
+        last_observation = if !stdout.is_empty() {
+            stdout
+        } else {
+            command_failure_detail(&status_output)
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "daemon did not become runtime-ready after restart: {}",
+                last_observation
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn daemon_runtime_ready_from_status_text(status_text: &str) -> bool {
+    fn field_value<'a>(status_text: &'a str, key: &str) -> Option<&'a str> {
+        status_text.split_whitespace().find_map(|field| {
+            field
+                .strip_prefix(key)
+                .and_then(|value| value.strip_prefix('='))
+        })
+    }
+
+    matches!(
+        field_value(status_text, "restricted_safe_mode"),
+        Some("false")
+    ) && !matches!(field_value(status_text, "state"), Some("FailClosed"))
+        && matches!(field_value(status_text, "bootstrap_error"), Some("none"))
+        && matches!(
+            field_value(status_text, "last_reconcile_error"),
+            Some("none")
+        )
 }
 
 fn run_systemctl_action(action: &str, unit: &str) -> Result<(), String> {
@@ -13610,6 +13664,19 @@ mod tests {
         assert_eq!(mode, 0o640, "destination mode should match requested mode");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn daemon_runtime_ready_status_requires_non_restricted_non_failed_state() {
+        assert!(super::daemon_runtime_ready_from_status_text(
+            "node_id=daemon-local state=DataplaneApplied restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none"
+        ));
+        assert!(!super::daemon_runtime_ready_from_status_text(
+            "node_id=daemon-local state=FailClosed restricted_safe_mode=true bootstrap_error=error last_reconcile_error=error"
+        ));
+        assert!(!super::daemon_runtime_ready_from_status_text(
+            "node_id=daemon-local state=DataplaneApplied restricted_safe_mode=false bootstrap_error=none last_reconcile_error=backend error"
+        ));
     }
 
     #[test]

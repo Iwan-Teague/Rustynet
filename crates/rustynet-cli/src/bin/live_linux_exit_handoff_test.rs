@@ -463,10 +463,11 @@ fn run() -> Result<(), String> {
     let monitor_path = config.monitor_log.clone();
     write_file(&monitor_path, "")?;
     let mut switch_ts = 0u64;
-    let mut last_traversal_refresh_ts = unix_now();
+    let mut next_traversal_refresh_ts =
+        next_refresh_deadline(unix_now(), config.traversal_refresh_interval_secs);
     for i in 1..=config.monitor_iterations {
         let ts = unix_now();
-        if ts.saturating_sub(last_traversal_refresh_ts) >= config.traversal_refresh_interval_secs {
+        if ts >= next_traversal_refresh_ts {
             logger.line(
                 "[exit-handoff] refreshing signed traversal bundles during handoff monitor",
             )?;
@@ -485,19 +486,11 @@ fn run() -> Result<(), String> {
                 &config.exit_b_node_id,
                 &config.client_node_id,
             )?;
-            logger.line("[exit-handoff] refreshing managed DNS bundle during handoff monitor")?;
-            refresh_dns_bundles(
-                &config.ssh_identity_file,
-                &work_known_hosts,
-                &config.exit_a_host,
-                &nodes_spec,
-                &allow_spec,
-                dns_passphrase_remote.as_str(),
-                &dns_verifier_local,
-                &dns_records_by_node,
-                &dns_refresh_targets,
-            )?;
-            last_traversal_refresh_ts = unix_now();
+            next_traversal_refresh_ts = advance_periodic_refresh_deadline(
+                next_traversal_refresh_ts,
+                config.traversal_refresh_interval_secs,
+                unix_now(),
+            );
         }
         let client_status = status(
             &config.ssh_identity_file,
@@ -555,19 +548,8 @@ fn run() -> Result<(), String> {
                 &config.exit_b_node_id,
                 &config.client_node_id,
             )?;
-            logger.line("[exit-handoff] refreshing managed DNS bundle before exit switch")?;
-            refresh_dns_bundles(
-                &config.ssh_identity_file,
-                &work_known_hosts,
-                &config.exit_a_host,
-                &nodes_spec,
-                &allow_spec,
-                dns_passphrase_remote.as_str(),
-                &dns_verifier_local,
-                &dns_records_by_node,
-                &dns_refresh_targets,
-            )?;
-            last_traversal_refresh_ts = unix_now();
+            next_traversal_refresh_ts =
+                next_refresh_deadline(unix_now(), config.traversal_refresh_interval_secs);
             switch_ts = ts;
             logger.line(
                 format!(
@@ -908,6 +890,23 @@ impl Config {
 fn traversal_refresh_interval_secs(traversal_ttl_secs: u64) -> u64 {
     let coordination_ttl_secs = traversal_ttl_secs.min(MAX_TRAVERSAL_COORDINATION_TTL_SECS);
     std::cmp::max(1, coordination_ttl_secs / 2)
+}
+
+fn next_refresh_deadline(now: u64, interval_secs: u64) -> u64 {
+    now.saturating_add(std::cmp::max(1, interval_secs))
+}
+
+fn advance_periodic_refresh_deadline(previous_deadline: u64, interval_secs: u64, now: u64) -> u64 {
+    let interval_secs = std::cmp::max(1, interval_secs);
+    let mut next_deadline = previous_deadline.saturating_add(interval_secs);
+    while next_deadline <= now {
+        let advanced = next_deadline.saturating_add(interval_secs);
+        if advanced == next_deadline {
+            break;
+        }
+        next_deadline = advanced;
+    }
+    next_deadline
 }
 
 fn status_field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
@@ -1508,6 +1507,18 @@ peer.1.endpoint=192.168.128.26:51820
         assert_eq!(super::traversal_refresh_interval_secs(30), 15);
         assert_eq!(super::traversal_refresh_interval_secs(20), 10);
         assert_eq!(super::traversal_refresh_interval_secs(1), 1);
+    }
+
+    #[test]
+    fn next_refresh_deadline_uses_interval_from_current_time() {
+        assert_eq!(super::next_refresh_deadline(100, 15), 115);
+        assert_eq!(super::next_refresh_deadline(100, 0), 101);
+    }
+
+    #[test]
+    fn advance_periodic_refresh_deadline_keeps_schedule_from_due_time() {
+        assert_eq!(super::advance_periodic_refresh_deadline(115, 15, 122), 130);
+        assert_eq!(super::advance_periodic_refresh_deadline(115, 15, 145), 160);
     }
 
     #[test]

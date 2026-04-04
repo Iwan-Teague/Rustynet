@@ -423,8 +423,9 @@ fn wait_for_role(
     let mut last = String::new();
     for _ in 0..40 {
         last = status(identity, known_hosts, host)?;
-        if field_value(&read_last_matching_line(&last, "node_id="), "node_role") == role {
-            return Ok(read_last_matching_line(&last, "node_id="));
+        let status_line = read_last_matching_line(&last, "node_id=");
+        if role_runtime_ready(&status_line, role) {
+            return Ok(status_line);
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
@@ -432,6 +433,14 @@ fn wait_for_role(
         "timed out waiting for {host} to reach role {role}: {}",
         read_last_matching_line(&last, "node_id=")
     ))
+}
+
+fn role_runtime_ready(status_line: &str, role: &str) -> bool {
+    field_value(status_line, "node_role") == role
+        && field_value(status_line, "restricted_safe_mode") == "false"
+        && field_value(status_line, "state") != "FailClosed"
+        && field_value(status_line, "bootstrap_error") == "none"
+        && field_value(status_line, "last_reconcile_error") == "none"
 }
 
 fn route_via_rustynet0(identity: &Path, known_hosts: &Path, host: &str) -> Result<bool, String> {
@@ -529,4 +538,31 @@ fn utc_now_string() -> String {
         }
     }
     "1970-01-01T00:00:00Z".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_runtime_ready;
+
+    #[test]
+    fn role_runtime_ready_requires_converged_runtime_state() {
+        let good = "node_id=client-1 node_role=client state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none";
+        assert!(role_runtime_ready(good, "client"));
+
+        let fail_closed = "node_id=client-1 node_role=client state=FailClosed restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none";
+        assert!(!role_runtime_ready(fail_closed, "client"));
+
+        let restricted = "node_id=client-1 node_role=client state=ExitActive restricted_safe_mode=true bootstrap_error=none last_reconcile_error=none";
+        assert!(!role_runtime_ready(restricted, "client"));
+
+        let reconcile_error = "node_id=client-1 node_role=client state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=backend_error";
+        assert!(!role_runtime_ready(reconcile_error, "client"));
+    }
+
+    #[test]
+    fn role_runtime_ready_requires_matching_role() {
+        let status = "node_id=client-1 node_role=admin state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none";
+        assert!(role_runtime_ready(status, "admin"));
+        assert!(!role_runtime_ready(status, "client"));
+    }
 }
