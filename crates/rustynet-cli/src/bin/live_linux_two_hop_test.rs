@@ -47,8 +47,8 @@ fn run() -> Result<(), String> {
     }
 
     validate_identity(&config.ssh_identity_file)?;
-    let pinned_known_hosts = match config.pinned_known_hosts_file {
-        Some(path) => path,
+    let pinned_known_hosts = match &config.pinned_known_hosts_file {
+        Some(path) => path.clone(),
         None => load_home_known_hosts_path()?,
     };
     ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
@@ -496,51 +496,114 @@ fn run() -> Result<(), String> {
         &config.entry_host,
         "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
     )?;
-
-    std::thread::sleep(std::time::Duration::from_secs(6));
-
-    let client_status = status(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.client_host,
-    )?;
-    let entry_status = status(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.entry_host,
-    )?;
-    let final_exit_status = status(
+    refresh_signed_state(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.final_exit_host,
     )?;
-    let second_client_status = status(
-        &config.ssh_identity_file,
-        &work_known_hosts,
-        &config.second_client_host,
-    )?;
-    let client_route = capture_root(
+    refresh_signed_state(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.client_host,
-        "ip -4 route get 1.1.1.1 || true",
     )?;
-    let second_client_route = capture_root(
+    refresh_signed_state(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+    )?;
+    refresh_signed_state(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.second_client_host,
-        "ip -4 route get 1.1.1.1 || true",
     )?;
+
+    let mut client_status = String::new();
+    let mut entry_status = String::new();
+    let mut final_exit_status = String::new();
+    let mut second_client_status = String::new();
+    let mut client_route = String::new();
+    let mut second_client_route = String::new();
+    for attempt in 0..=20 {
+        client_status = status(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.client_host,
+        )?;
+        entry_status = status(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.entry_host,
+        )?;
+        final_exit_status = status(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.final_exit_host,
+        )?;
+        second_client_status = status(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.second_client_host,
+        )?;
+        client_route = capture_root(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.client_host,
+            "ip -4 route get 1.1.1.1 || true",
+        )?;
+        second_client_route = capture_root(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.second_client_host,
+            "ip -4 route get 1.1.1.1 || true",
+        )?;
+        if two_hop_runtime_ready(
+            &config,
+            &client_status,
+            &entry_status,
+            &final_exit_status,
+            &second_client_status,
+            &client_route,
+            &second_client_route,
+        ) {
+            break;
+        }
+        if attempt < 20 {
+            if attempt % 5 == 4 {
+                refresh_signed_state(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    &config.final_exit_host,
+                )?;
+                refresh_signed_state(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    &config.client_host,
+                )?;
+                refresh_signed_state(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    &config.entry_host,
+                )?;
+                refresh_signed_state(
+                    &config.ssh_identity_file,
+                    &work_known_hosts,
+                    &config.second_client_host,
+                )?;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
     let entry_wg_endpoints = capture_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.entry_host,
         "wg show rustynet0 endpoints || true",
     )?;
-    let entry_peer_endpoints =
+    let entry_managed_peer_endpoints =
         status_field(&entry_status, "managed_peer_endpoints").unwrap_or_else(|| "none".to_string());
-    let entry_peer_endpoints_error = status_field(&entry_status, "managed_peer_endpoints_error")
-        .unwrap_or_else(|| "none".to_string());
+    let entry_managed_peer_endpoints_error =
+        status_field(&entry_status, "managed_peer_endpoints_error")
+            .unwrap_or_else(|| "none".to_string());
     let client_plaintext_check = no_plaintext_passphrase_check(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -570,7 +633,7 @@ fn run() -> Result<(), String> {
     logger.line("[two-hop] second client route")?;
     logger.block(&(second_client_route.clone() + "\n"))?;
     logger.line("[two-hop] entry managed peer endpoints (backend-authoritative)")?;
-    logger.block(&(entry_peer_endpoints.clone() + "\n"))?;
+    logger.block(&(entry_managed_peer_endpoints.clone() + "\n"))?;
     logger.line("[two-hop] entry wg endpoints (debug only)")?;
     logger.block(&(entry_wg_endpoints.clone() + "\n"))?;
 
@@ -608,19 +671,14 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
-    let check_entry_peer_visibility = if entry_peer_endpoints_error == "none"
-        && peer_endpoint_summary_contains(
-            &entry_peer_endpoints,
-            &config.client_node_id,
-            &client_addr,
-            51820,
-        )
-        && peer_endpoint_summary_contains(
-            &entry_peer_endpoints,
-            &config.final_exit_node_id,
-            &final_exit_addr,
-            51820,
-        ) {
+    let check_entry_managed_peer_endpoints_visible = if managed_peer_endpoints_include(
+        &entry_managed_peer_endpoints,
+        &entry_managed_peer_endpoints_error,
+        &[
+            (&config.client_node_id, client_addr.as_str(), 51820),
+            (&config.final_exit_node_id, final_exit_addr.as_str(), 51820),
+        ],
+    ) {
         "pass"
     } else {
         "fail"
@@ -642,7 +700,7 @@ fn run() -> Result<(), String> {
         check_final_exit_serves,
         check_client_route_rustynet,
         check_second_client_route_rustynet,
-        check_entry_peer_visibility,
+        check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
     ]
     .into_iter()
@@ -658,7 +716,7 @@ fn run() -> Result<(), String> {
     });
 
     let report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
+        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\"\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
         captured_at_utc,
         captured_at_unix,
         git_commit,
@@ -673,7 +731,8 @@ fn run() -> Result<(), String> {
         check_final_exit_serves,
         check_client_route_rustynet,
         check_second_client_route_rustynet,
-        check_entry_peer_visibility,
+        check_entry_managed_peer_endpoints_visible,
+        check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
         config.log_path.display(),
     );
@@ -904,9 +963,49 @@ fn status_field(status_line: &str, key: &str) -> Option<String> {
         .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
 }
 
+fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+    )
+}
+
+fn two_hop_runtime_ready(
+    config: &Config,
+    client_status: &str,
+    entry_status: &str,
+    final_exit_status: &str,
+    second_client_status: &str,
+    client_route: &str,
+    second_client_route: &str,
+) -> bool {
+    client_status.contains(&format!("exit_node={}", config.entry_node_id))
+        && client_status.contains("state=ExitActive")
+        && entry_status.contains(&format!("exit_node={}", config.final_exit_node_id))
+        && entry_status.contains("serving_exit_node=true")
+        && final_exit_status.contains("serving_exit_node=true")
+        && second_client_status.contains(&format!("exit_node={}", config.final_exit_node_id))
+        && second_client_status.contains("state=ExitActive")
+        && client_route.contains("dev rustynet0")
+        && second_client_route.contains("dev rustynet0")
+}
+
 fn peer_endpoint_summary_contains(summary: &str, node_id: &str, addr: &str, port: u16) -> bool {
     let expected = format!("{node_id}/{addr}:{port}");
     summary.split('+').any(|entry| entry == expected)
+}
+
+fn managed_peer_endpoints_include(
+    summary: &str,
+    error: &str,
+    expected_endpoints: &[(&str, &str, u16)],
+) -> bool {
+    error == "none"
+        && expected_endpoints.iter().all(|(node_id, addr, port)| {
+            peer_endpoint_summary_contains(summary, node_id, addr, *port)
+        })
 }
 
 fn print_usage() {
@@ -966,6 +1065,74 @@ mod tests {
             "client-4",
             "192.168.64.25",
             51820
+        ));
+    }
+
+    #[test]
+    fn managed_peer_endpoints_include_requires_none_error_and_all_expected_endpoints() {
+        let summary = "client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820";
+        assert!(super::managed_peer_endpoints_include(
+            summary,
+            "none",
+            &[
+                ("client-1", "192.168.64.24", 51820),
+                ("exit-1", "192.168.64.22", 51820)
+            ]
+        ));
+        assert!(!super::managed_peer_endpoints_include(
+            summary,
+            "backend_unavailable",
+            &[
+                ("client-1", "192.168.64.24", 51820),
+                ("exit-1", "192.168.64.22", 51820)
+            ]
+        ));
+        assert!(!super::managed_peer_endpoints_include(
+            summary,
+            "none",
+            &[
+                ("client-1", "192.168.64.24", 51820),
+                ("client-4", "192.168.64.25", 51820)
+            ]
+        ));
+    }
+
+    #[test]
+    fn two_hop_runtime_ready_requires_expected_exit_chain_and_routes() {
+        let config = super::Config {
+            ssh_identity_file: std::path::PathBuf::from("/tmp/key"),
+            final_exit_host: "debian@192.168.64.22".to_string(),
+            client_host: "debian@192.168.64.24".to_string(),
+            entry_host: "debian@192.168.64.26".to_string(),
+            second_client_host: "debian@192.168.64.29".to_string(),
+            final_exit_node_id: "exit-1".to_string(),
+            client_node_id: "client-1".to_string(),
+            entry_node_id: "client-2".to_string(),
+            second_client_node_id: "client-4".to_string(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            report_path: std::path::PathBuf::from("/tmp/report.json"),
+            log_path: std::path::PathBuf::from("/tmp/report.log"),
+            pinned_known_hosts_file: None,
+            git_commit: None,
+        };
+
+        assert!(super::two_hop_runtime_ready(
+            &config,
+            "node_role=client state=ExitActive exit_node=client-2",
+            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true",
+            "node_role=admin state=ExitActive serving_exit_node=true",
+            "node_role=client state=ExitActive exit_node=exit-1",
+            "1.1.1.1 dev rustynet0",
+            "1.1.1.1 dev rustynet0",
+        ));
+        assert!(!super::two_hop_runtime_ready(
+            &config,
+            "node_role=client state=ExitActive exit_node=client-2",
+            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true",
+            "node_role=admin state=ExitActive serving_exit_node=true",
+            "node_role=client state=ExitActive exit_node=exit-1",
+            "1.1.1.1 dev rustynet0",
+            "1.1.1.1 via 192.168.64.1 dev enp0s1",
         ));
     }
 }

@@ -2660,6 +2660,117 @@ What remains blocked:
   - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
 ```
 
+```text
+Date: 2026-04-04
+Phase / Slice: Linux userspace-shared backend worker recovery after fatal runtime-thread loss
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Added backend-owned shadow state for runtime context, configured peers, backend routes, and exit mode so the userspace-shared backend can reconstruct its single runtime worker without downgrading or widening ownership.
+    - Added a narrow runtime-recovery path that:
+      - detects `linux userspace-shared runtime worker is unavailable`
+      - tears down stale runtime state
+      - reopens the backend-owned runtime
+      - replays configured peers, backend routes, and exit mode
+      - retries the mutating operation once
+    - Added regressions that simulate fatal worker loss before `configure_peer(...)` and `apply_routes(...)` and prove the backend recovers without losing prior configured state.
+  - crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs
+    - Added a test-only fatal receive-error hook so backend tests can force the runtime worker to exit through the real TUN polling path instead of synthetic bookkeeping.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta note so the current live blocker is recorded honestly as a userspace runtime-worker restart/replay failure during `live_exit_handoff`, not the older traversal-expiry proof issue.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs`
+  - `cargo check -p rustynet-backend-wireguard`
+  - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynetd`
+Validation outcomes:
+  - The backend crate compiles cleanly with runtime recovery wired into the userspace-shared backend.
+  - The new worker-loss regressions passed:
+    - recovery before `configure_peer(...)`
+    - recovery before backend route reconcile
+  - Existing userspace-shared backend unit and conformance tests remained green, including authoritative transport identity, route, exit-mode, and handshake truthfulness coverage.
+  - `cargo check -p rustynetd` passed, confirming no daemon compile fallout from the backend-only recovery change.
+  - No live-lab rerun was performed in this slice; the fix is code-only and still awaits committed-tree live proof.
+Security invariants re-verified:
+  - No fallback backend, daemon-owned side socket, or helper-owned datapath was introduced.
+  - The backend still fails closed if worker shutdown, replacement-runtime start, or desired-state replay fails.
+  - Runtime recovery keeps the single-owner model intact by rebuilding the same backend-owned worker and replaying runtime-owned state rather than widening authority.
+  - Command-only Linux and macOS backends remain unchanged and blocked.
+What this slice completed:
+  - The userspace-shared backend can now recover from fatal runtime-worker loss observed as `linux userspace-shared runtime worker is unavailable` during a subsequent mutating call.
+  - The live-lab blocker is narrowed from unexplained backend liveness loss to a code path with local regression coverage and targeted compile/test proof.
+What remains blocked:
+  - `live_exit_handoff` still requires a fresh reduced five-node rerun on the current committed tree to prove that forced local assignment refresh no longer leaves the client backend fail-closed with a dead userspace runtime worker.
+  - After handoff is clear, later reduced-live-lab stages still need fresh committed-tree proof.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-04-04
+Phase / Slice: Reduced five-node live-lab rerun - runtime recovery and full reduced-path proof on current working tree
+Files changed:
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta to record the successful reduced five-node rerun and to mark the reduced live-lab proof path complete on the current working tree.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --profile-output /Users/iwanteague/Desktop/Rustynet/profiles/live_lab/generated_vm_lab_20260404_runtime_recovery.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree --report-dir /Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260404_runtime_recovery --validation-step fmt --validation-step check:rustynet-backend-wireguard --validation-step check:rustynetd --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --collect-failure-diagnostics`
+Validation outcomes:
+  - `overall_status=pass`
+  - `first_failed_stage=none`
+  - `bootstrap_hosts`, `collect_pubkeys`, `membership_setup`, `distribute_membership_state`, `issue_and_distribute_assignments`, `issue_and_distribute_traversal`, `enforce_baseline_runtime`, `validate_baseline_runtime`, `live_role_switch_matrix`, `live_exit_handoff`, `live_two_hop`, `live_lan_toggle`, `live_managed_dns`, and `fresh_install_os_matrix_report` all passed on the same reduced five-node rerun.
+  - The helper intentionally skipped `local_full_gate_suite`, `extended_soak`, and `cross_network_*` stages in this reduced-lab pass.
+Security invariants re-verified:
+  - No fallback backend, daemon-owned side socket, or helper-owned transport authority was introduced.
+  - The shared-transport backend still owns the authoritative transport path and recovery remains fail-closed.
+  - The reduced five-node proof path was completed without weakening any runtime or evidence gate.
+What this slice completed:
+  - The current working tree now live-proves the reduced five-node Linux userspace-shared backend path end-to-end.
+  - The live-lab blockers previously narrowed to `live_exit_handoff`, `live_two_hop`, `live_lan_toggle`, and `live_managed_dns` are no longer present on the reduced rerun.
+  - The active delta document now records the reduced live-lab proof path as complete and moves the remaining work to repo-level gates and evidence cleanup.
+What remains blocked:
+  - `cargo audit --deny warnings`
+  - `cargo deny check bans licenses sources advisories`
+  - fresh-install evidence regeneration for current `HEAD`
+  - canonical live cross-network reports for current `HEAD`
+```
+
+```text
+Date: 2026-04-04
+Phase / Slice: Two-hop proof-source clarification - keep endpoint visibility backend-authoritative
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_two_hop_test.rs
+    - Clarified the two-hop entry endpoint-visibility proof so it is explicitly sourced from backend-authoritative `managed_peer_endpoints` plus `managed_peer_endpoints_error`.
+    - Kept `wg show rustynet0 endpoints` as debug-only output in the log.
+    - Added explicit `proof_sources` metadata to the two-hop report and a compatibility alias check field so downstream validators do not break.
+    - Added unit coverage for the new helper that requires `managed_peer_endpoints_error=none` and all expected peer endpoints.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated current truth so the stricter five-node rerun now records `live_two_hop` `second_client_route_via_rustynet0` as the current blocker, while the endpoint-visibility proof remains backend-authoritative and green.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `rustfmt --edition 2024 crates/rustynet-cli/src/bin/live_linux_two_hop_test.rs`
+  - `cargo check -p rustynet-cli --bin live_linux_two_hop_test`
+  - `cargo test -p rustynet-cli --bin live_linux_two_hop_test -- --nocapture`
+  - `cargo fmt --all -- --check`
+Validation outcomes:
+  - The two-hop binary compiles cleanly after the proof-source clarification.
+  - `live_linux_two_hop_test` unit coverage passed on the modified file, including the new managed-peer-endpoint visibility helper.
+  - No five-node live-lab rerun was performed in this slice by design.
+Security invariants re-verified:
+  - The endpoint-visibility proof still uses backend-authoritative daemon status rather than kernel `wg` endpoint visibility.
+  - The change does not introduce a second transport authority, side socket, helper-owned datapath, or proof downgrade.
+  - `wg show rustynet0 endpoints` remains debug-only and non-authoritative for the userspace-shared backend path.
+What this slice completed:
+  - The two-hop stage now states its proof source explicitly in code, logs, and report output without weakening the check.
+What remains blocked:
+  - The stricter five-node local-gates rerun is still blocked at `live_two_hop` on `second_client_route_via_rustynet0`.
+  - After that is fixed, the later reduced-live-lab stages and local gate bundle still need to be rerun on the current tree.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
 ## 19. Definition of Done for This Document
 This delta is complete only when all are true:
 - direct path uses correct measured candidates,

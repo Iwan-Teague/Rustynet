@@ -51,7 +51,12 @@ impl TunDevice {
                     ))),
                 }
             }
-            TunDeviceInner::Test(handle) => Ok(handle.dequeue_inbound_packet()),
+            TunDeviceInner::Test(handle) => {
+                if let Some(message) = handle.state.take_next_recv_error() {
+                    return Err(BackendError::internal(message));
+                }
+                Ok(handle.dequeue_inbound_packet())
+            }
         }
     }
 
@@ -577,6 +582,12 @@ impl TunTestState {
         inner.last_cleanup_interface_name = Some(interface_name.to_string());
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_next_recv_error(&self, message: impl Into<String>) {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.next_recv_error = Some(message.into());
+    }
+
     fn increment_live_handles(&self) {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.live_handles += 1;
@@ -608,6 +619,12 @@ impl TunTestState {
     fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.queued_inbound_packets.pop_front()
+    }
+
+    #[allow(dead_code)]
+    fn take_next_recv_error(&self) -> Option<String> {
+        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        inner.next_recv_error.take()
     }
 
     #[allow(dead_code)]
@@ -777,6 +794,7 @@ struct TunTestStateInner {
     exit_mode_behavior: TestExitModeBehavior,
     queued_inbound_packets: VecDeque<Vec<u8>>,
     recorded_outbound_packets: Vec<Vec<u8>>,
+    next_recv_error: Option<String>,
 }
 
 impl Default for TunTestStateInner {
@@ -800,6 +818,7 @@ impl Default for TunTestStateInner {
             exit_mode_behavior: TestExitModeBehavior::default(),
             queued_inbound_packets: VecDeque::new(),
             recorded_outbound_packets: Vec::new(),
+            next_recv_error: None,
         }
     }
 }

@@ -5,7 +5,7 @@ mod live_lab_support;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
@@ -1550,6 +1550,13 @@ struct InvalidBundleCaseResult {
     passed: bool,
 }
 
+#[derive(Debug, Clone)]
+struct RemoteDnsQueryCapture {
+    payload: String,
+    command_failed: bool,
+    failure_reason: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exercise_invalid_bundle_case(
     ctx: &LiveLabContext,
@@ -1608,8 +1615,22 @@ fn exercise_invalid_bundle_case(
             "--no-pager",
         ],
     )?;
-    let direct_query =
-        remote_dns_query_capture(ctx, &config.client_host, config, &config.managed_fqdn())?;
+    let direct_query = remote_dns_query_capture_allow_failure(
+        ctx,
+        &config.client_host,
+        config,
+        &config.managed_fqdn(),
+    )?;
+    let direct_query_log = if direct_query.payload.trim().is_empty() && direct_query.command_failed
+    {
+        format!(
+            "{{\"error\":\"query command failed closed\",\"failure_reason\":{}}}",
+            serde_json::to_string(&direct_query.failure_reason)
+                .map_err(|err| format!("serialize DNS query failure reason failed: {err}"))?
+        )
+    } else {
+        direct_query.payload.clone()
+    };
 
     logger.block(
         format!("[managed-dns] {case_label} dns inspect").as_str(),
@@ -1625,14 +1646,18 @@ fn exercise_invalid_bundle_case(
     )?;
     logger.block(
         format!("[managed-dns] {case_label} loopback DNS query").as_str(),
-        &direct_query,
+        &direct_query_log,
     )?;
 
     let passed = managed_dns_invalid_state_observed(
         dns_inspect.as_str(),
         rustynetd_journal.as_str(),
         expected_reason_fragments,
-    ) && dns_query_failed_closed(root_dir, direct_query.as_str())?;
+    ) && dns_query_failed_closed(
+        root_dir,
+        direct_query.payload.as_str(),
+        direct_query.command_failed,
+    )?;
 
     Ok(InvalidBundleCaseResult { passed })
 }
@@ -1730,7 +1755,14 @@ fn normalize_reason_text(value: &str) -> String {
     value.to_ascii_lowercase().replace('_', " ")
 }
 
-fn dns_query_failed_closed(root_dir: &Path, direct_query: &str) -> Result<bool, String> {
+fn dns_query_failed_closed(
+    root_dir: &Path,
+    direct_query: &str,
+    command_failed: bool,
+) -> Result<bool, String> {
+    if direct_query.trim().is_empty() {
+        return Ok(command_failed);
+    }
     let rcode = json_field(root_dir, direct_query, "rcode")?;
     let error = json_field(root_dir, direct_query, "error")?;
     Ok(rcode != "0" || !error.trim().is_empty())
@@ -1797,6 +1829,51 @@ fn remote_dns_query_capture(
             "3000",
         ],
     )
+}
+
+fn remote_dns_query_capture_allow_failure(
+    ctx: &LiveLabContext,
+    host: &str,
+    config: &Config,
+    qname: &str,
+) -> Result<RemoteDnsQueryCapture, String> {
+    let output = ctx.run_root_allow_failure(
+        host,
+        &[
+            "rustynet",
+            "ops",
+            "e2e-dns-query",
+            "--server",
+            &config.dns_server(),
+            "--port",
+            &config.dns_port(),
+            "--qname",
+            qname,
+            "--timeout-ms",
+            "3000",
+        ],
+    )?;
+    Ok(RemoteDnsQueryCapture {
+        payload: String::from_utf8_lossy(&output.stdout).into_owned(),
+        command_failed: !output.status.success(),
+        failure_reason: render_remote_output(&output),
+    })
+}
+
+fn render_remote_output(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    if !stderr.is_empty() && !stdout.is_empty() {
+        format!("{stderr} (stdout: {stdout})")
+    } else if !stderr.is_empty() {
+        stderr.to_string()
+    } else if !stdout.is_empty() {
+        format!("stdout: {stdout}")
+    } else {
+        "remote command exited non-zero without output".to_string()
+    }
 }
 
 fn json_field(root_dir: &Path, payload: &str, field: &str) -> Result<String, String> {
@@ -2003,14 +2080,14 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, managed_dns_distribution_targets,
-        managed_dns_invalid_state_observed, managed_dns_replay_records,
-        parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
-        rewrite_bundle_line_value, rewrite_bundle_signature, sorted_node_host_pairs,
-        validate_targets,
+        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, dns_query_failed_closed,
+        managed_dns_distribution_targets, managed_dns_invalid_state_observed,
+        managed_dns_replay_records, parse_assignment_authority_scope, parse_managed_peer_spec,
+        parse_status_field, rewrite_bundle_line_value, rewrite_bundle_signature,
+        sorted_node_host_pairs, validate_targets,
     };
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn base_config() -> Config {
         Config {
@@ -2257,5 +2334,21 @@ signature=abcd
             "rustynetd startup warning: dns zone preflight skipped invalid managed DNS bundle: dns zone bundle replay detected",
             &["replay detected"]
         ));
+    }
+
+    #[test]
+    fn dns_query_failed_closed_accepts_empty_payload_when_command_failed() {
+        assert!(
+            dns_query_failed_closed(Path::new("/tmp"), "", true)
+                .expect("empty failed query should be accepted as fail-closed")
+        );
+    }
+
+    #[test]
+    fn dns_query_failed_closed_rejects_empty_payload_without_command_failure() {
+        assert!(
+            !dns_query_failed_closed(Path::new("/tmp"), "", false)
+                .expect("empty successful query should not be treated as fail-closed")
+        );
     }
 }

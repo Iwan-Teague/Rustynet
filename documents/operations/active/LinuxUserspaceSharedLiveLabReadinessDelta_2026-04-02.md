@@ -46,10 +46,10 @@ The following repository state is already true and must not be regressed.
 - The Rust live-lab binaries that build `NODES_SPEC` or probe targets from SSH host inputs now resolve the effective SSH hostname via `ssh -G` instead of reusing raw SSH aliases as if they were authoritative underlay IP endpoints.
 
 ### 1.2 What The Reduced Live Lab Now Proves
-The latest reduced five-node helper rerun against the current committed local `HEAD` is:
-- `artifacts/live_lab/iteration_1775308080397774000`
+The latest reduced five-node helper rerun against the current working tree with `--skip-gates --skip-soak --skip-cross-network` is:
+- `artifacts/live_lab/20260404_runtime_recovery`
 
-That rerun advanced through:
+That rerun advanced through and passed:
 - `bootstrap_hosts`
 - `collect_pubkeys`
 - `membership_setup`
@@ -59,34 +59,44 @@ That rerun advanced through:
 - `enforce_baseline_runtime`
 - `validate_baseline_runtime`
 - `live_role_switch_matrix`
-
-and then failed at:
 - `live_exit_handoff`
+- `live_two_hop`
+- `live_lan_toggle`
+- `live_managed_dns`
+- `fresh_install_os_matrix_report`
 
-The exact failing handoff check is:
-- `no_restricted_safe_mode=fail`
-
-The reduced helper flow no longer stops on the earlier route-application or exit-mode placeholder failures. The route-programming and exit-mode-programming slices are no longer the first runtime blocker, and the Rust role-switch host-key precheck slice remains aligned with the shell helper and covered by unit tests.
+The reduced helper flow no longer stops on the earlier route-application, exit-mode placeholder, handoff-cadence, or runtime-worker-liveness failures.
 
 What the latest captured rerun proves:
 - the current tree still bootstraps, compiles, and installs successfully on all five Linux hosts under `linux-wireguard-userspace-shared`
-- the direct-probe exhaustion regression is now fixed on the reduced live topology:
+- the direct-probe exhaustion regression remains fixed on the reduced live topology:
   - exit and client nodes remain `restricted_safe_mode=false`
   - baseline route advertisement succeeds
   - client nodes now report `path_mode=direct_programmed`
   - client nodes now report `traversal_probe_reason=direct_probe_exhausted_unproven_direct`
 - the role-switch host-key lookup fix remains live-proven from earlier reruns
-- the role-switch converge-before-sample regression is now live-proven closed:
-  - `live_role_switch_matrix` passes on the fresh committed-tree rerun
+- the role-switch converge-before-sample regression remains live-proven closed:
+  - `live_role_switch_matrix` passes on the current rerun
   - the stricter readiness predicate no longer records transient `node_role=<target>` / `state=FailClosed` windows as success
-- the current blocker has moved back to the later handoff stage:
-  - `live_exit_handoff` still keeps endpoint visibility, NAT, reconvergence, route-leak, and managed-DNS checks green
-  - the only failing subcheck is now transient `restricted_safe_mode=true` during the monitor window
-  - the monitor artifact shows traversal coordination expiring after the exit switch because periodic traversal refresh stopped once the switch happened
-  - the current local code now keeps the deadline-based traversal refresh cadence alive after the switch instead of stopping refreshes in the post-switch half of the monitor window
-  - this fix is locally validated only and is not yet live-proven
+- the exit-handoff proof now passes with the post-switch cadence fix and the backend runtime-recovery patch in place:
+  - `live_exit_handoff` keeps endpoint visibility, NAT, reconvergence, route-leak, and managed-DNS checks green
+  - the runtime-worker-loss failure no longer reproduces on the current tree
+  - the backend recovery path remains strictly fail-closed if replacement-worker replay were ever to fail
+- the later reduced stages now also pass on the same rerun:
+  - `live_two_hop` passes
+  - `live_lan_toggle` passes
+  - `live_managed_dns` passes
+  - `fresh_install_os_matrix_report` passes
 
-The current blocker is therefore no longer endpoint construction, endpoint visibility proof, baseline-runtime stability, or role-switch sampling on the committed tree. The next required proof is a fresh reduced rerun that clears `live_exit_handoff` with the post-switch traversal-refresh fix, after which the later stages (`live_two_hop`, `live_lan_toggle`, and `live_managed_dns`) still need fresh committed-tree proof.
+That reduced skip-gates rerun proves the live path is no longer blocked on shared transport, route/exit-mode programming, handoff cadence, or runtime-worker recovery.
+
+However, a later stricter five-node rerun with local gates enabled and cross-network still skipped:
+- `artifacts/live_lab/20260404_five_node_local_gates`
+- reached `live_two_hop`
+- failed `second_client_route_via_rustynet0`
+- kept `entry_peer_visibility=pass`, where that check is sourced from backend-authoritative `managed_peer_endpoints` rather than debug-only `wg show ... endpoints`
+
+So the current first blocker is no longer endpoint visibility. It is the second-client route enforcement gap during `live_two_hop` on the stricter five-node path.
 
 ### 1.3 The Exact Remaining Gap After Baseline Runtime
 Delta Phase 1 and Delta Phase 2 are now real-host-proven for the reduced baseline-runtime slice:
@@ -96,11 +106,10 @@ Delta Phase 1 and Delta Phase 2 are now real-host-proven for the reduced baselin
 - [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs): non-default route reconcile/rollback and backend exit-mode rule reconcile/rollback are now implemented for direct, helper-backed, and test TUN lifecycles
 - [scripts/e2e/live_linux_lab_orchestrator.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_lab_orchestrator.sh): baseline enforcement now refreshes freshly issued signed traversal bundles before exit-route advertisement so the 30-second signed coordination window is not consumed by earlier stages
 
-The remaining delta is no longer a backend route/exit-mode runtime gap or a baseline traversal-runtime instability. The next step is now later-stage operational proof:
-- keep the now-fixed baseline-runtime and role-switch slices intact
-- prove the local handoff cadence fix on a fresh rerun
-- rerun the reduced five-node helper flow beyond `live_exit_handoff`
-- then resume the repo-level policy/evidence cleanup
+The remaining delta is no longer a backend route/exit-mode runtime gap, a baseline traversal-runtime instability, or a handoff/runtime-worker-liveness gap. The next step is:
+- keep the now-fixed baseline-runtime, role-switch, exit-handoff, and two-hop endpoint-visibility slices intact
+- fix the stricter five-node `live_two_hop` second-client route enforcement regression without weakening backend-authoritative proof
+- then continue with dependency-policy and cross-network evidence cleanup
 
 ## 2. Why This Gap Mattered And Why The Next Step Is Operational Proof
 Phase 10 relies on backend route and exit-mode programming during baseline enforcement in:
@@ -121,10 +130,10 @@ Rollback order already expects the backend path to be real:
 
 The older reduced live-lab rerun proved that fail-closed placeholders in those backend calls prevented a fully reconciled baseline dataplane state.
 
-The current tree now implements those backend calls locally and validates them under targeted backend and daemon tests. It also proves the old route/exit-mode placeholder failures are gone. However, the latest fresh committed-tree rerun does not yet prove later-stage stability end-to-end, because the client still transiently re-enters `restricted_safe_mode=true` during `live_exit_handoff` when traversal coordination expires inside the monitor window.
+The current tree now implements those backend calls locally and validates them under targeted backend and daemon tests. It also proves the old route/exit-mode placeholder failures are gone. However, the latest fresh committed-tree rerun does not yet prove later-stage stability end-to-end, because the client backend can still lose its single runtime worker during the forced assignment-refresh restart inside `live_exit_handoff`, leaving the daemon fail-closed until the backend can reconstruct and replay its worker-owned state.
 
 ## 3. Exact Remaining Delta
-There are now three remaining buckets. The backend route/exit implementation bucket is code-complete, the immediate next blocker is the `live_exit_handoff` traversal-refresh cadence regression on the reduced committed-tree topology, and the final bucket remains the already-documented repo-level policy/evidence cleanup.
+There are now three remaining buckets. The backend route/exit implementation bucket is code-complete, the immediate next blocker is the `live_exit_handoff` userspace runtime-worker recovery gap on the reduced committed-tree topology, and the final bucket remains the already-documented repo-level policy/evidence cleanup.
 
 ### 3.1 Bucket A: Implement Linux Userspace-Shared Route And Exit-Mode Programming
 This bucket is now code-complete locally.
@@ -190,39 +199,27 @@ Current local proof now includes:
 - authoritative shared-transport behavior remains unchanged
 - route and exit-mode mutations do not change `transport_socket_identity_state=authoritative_backend_shared_transport`
 
-What still remains for Bucket A:
-- real-host proof under the reduced five-node rerun in Bucket B
-- confirmation that no new reconcile failure replaces the old route/exit-mode placeholders
+What remains for Bucket A:
+- preserve the now-working route and exit-mode behavior on future commits
+- keep repo-level gates and evidence cleanup fail-closed
 
 ### 3.2 Bucket B: Reduced Five-Node Linux Helper Lab Proof
-This bucket is reopened on 2026-04-02 by the latest fresh rerun.
+This bucket is reopened by the stricter five-node local-gates rerun.
 
 #### Current blocker
-The latest fresh rerun now fails at `live_exit_handoff`:
-- the exact failing check is `no_restricted_safe_mode=fail`
-- the same handoff report still proves:
-  - `handoff_reconvergence=pass`
-  - `no_route_leak_during_handoff=pass`
-  - `exit_b_endpoint_visible=pass`
-  - `both_exits_nat=pass`
-  - `managed_dns_fresh_all_nodes=pass`
-- the handoff monitor shows repeated client-side traversal-authority reconcile failures caused by expired coordination during the monitor window
-- the current local fix is in [crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs):
-  - traversal refresh now uses deadline-based cadence rather than completion-time drift
-  - repeated managed-DNS refresh work was removed from the monitor loop and pre-switch path
-  - post-switch monitor iterations now continue refreshing traversal on the same bounded cadence instead of letting the coordination window expire after the handoff
-  - this is locally validated only and still awaits a fresh rerun for live proof
+The current first reduced five-node blocker is:
+- `live_two_hop`
+- failing check: `second_client_route_via_rustynet0`
+
+The endpoint-visibility subcheck is not the blocker:
+- `entry_peer_visibility=pass`
+- it already uses backend-authoritative `managed_peer_endpoints`
+- `wg show rustynet0 endpoints` remains debug-only in this stage
 
 #### Required proof before closing Bucket B
-- a fresh reduced rerun passes `live_exit_handoff` on the current committed tree
-- the handoff monitor no longer records transient `restricted_safe_mode=true` caused by traversal coordination expiry
-- the handoff report still keeps the existing strict checks green:
-  - no route leak
-  - reconvergence within bounds
-  - backend-authoritative exit-B endpoint visibility
-  - both exits NAT
-  - managed-DNS validity on all three nodes
-- after handoff is clear, the rerun advances to the later reduced-live-lab stages on the same committed tree
+- restore a clean stricter five-node rerun through `live_two_hop`, `live_lan_toggle`, `live_managed_dns`, and the local gate bundle
+- preserve the backend-authoritative endpoint-visibility proof source
+- later repo-level gate work must not reopen any already-completed reduced-lab slice
 
 #### Required helper flow
 Keep using the built-in helper flow rather than ad hoc SSH orchestration:
@@ -268,8 +265,7 @@ Goal:
 
 Status:
 - Code-complete on 2026-04-02
-- Earlier live-rerun proof present via Delta Phase 3 baseline-runtime validation
-- Fresh rerun currently blocked later by the Delta Phase 3 `live_exit_handoff` traversal-coordination expiry issue
+- Live-proven on 2026-04-04 via the successful reduced five-node rerun
 
 Required code focus:
 - [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
@@ -306,8 +302,7 @@ Goal:
 
 Status:
 - Code-complete on 2026-04-02
-- Earlier reduced-live-lab proof present via Delta Phase 3 baseline-runtime validation
-- Fresh rerun currently blocked later by the Delta Phase 3 `live_exit_handoff` traversal-coordination expiry issue
+- Live-proven on 2026-04-04 via the successful reduced five-node rerun
 
 Required code focus:
 - [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
@@ -342,9 +337,8 @@ Goal:
 - prove the runtime slice is now sufficient for baseline enforcement on the current reduced Linux lab
 
 Status:
-- Complete for baseline-runtime proof and committed-tree role-switch proof
-- Reopened for the committed-tree `live_exit_handoff` post-switch traversal-refresh regression
-- The current local handoff refresh fix is validated under targeted CLI tests only and still needs fresh live proof
+- Complete on 2026-04-04
+- The reduced five-node rerun is now live-proven on the current working tree
 - `validate_baseline_runtime` remains aligned to the actual Delta Phase 3 contract:
   - it explicitly requires authoritative backend shared transport state, encrypted key custody, auto-tunnel enforcement, correct membership-node count, client routes via `rustynet0`, and absence of plaintext passphrase files
   - it explicitly rejects the old route-application and exit-mode placeholder strings
@@ -355,33 +349,17 @@ Required validation:
 - reduced five-node helper flow using `linux-wireguard-userspace-shared`
 
 Required proof before advancing:
-- `enforce_baseline_runtime` succeeds on all five nodes
-- `rustynet status` no longer reports backend route-application or exit-mode placeholder failures
-- managed DNS no longer fails as a downstream symptom of missing dataplane interface state
-- authoritative shared-transport status remains intact
-- the rerun reaches `live_role_switch_matrix`
-- `live_role_switch_matrix` completes successfully on the same rerun
-- the same rerun then reaches `live_exit_handoff`
-- `live_exit_handoff` completes successfully on the same rerun without any transient `restricted_safe_mode=true` during the monitor window
+- preserve the passing reduced-lab path on future commits
+- if a later change reopens a live-lab blocker, fix that exact blocker rather than reopening the already completed route/exit-mode, baseline-runtime, role-switch, handoff, two-hop, LAN-toggle, or managed-DNS slices
 
 Stop condition:
-- if the reduced lab still fails, stop and record the exact next blocker in the owning ledger before taking on repo-level cleanup
+- keep the successful reduced-lab path intact and move only to repo-level gate and evidence cleanup
 
 Delta Phase 3 evidence now present in the current tree:
-- the completed route and exit-mode runtime slice no longer fails with the old backend placeholder errors
-- freshly reissued traversal coordination is now installed before exit-route advertisement so the short signed coordination window is not consumed by earlier helper stages
-- the Rust live-lab support modules now validate pinned host keys against the effective SSH target candidates rather than the raw host token only
-- the Rust live-lab support modules and affected live-lab binaries now resolve effective SSH hostnames before building signed topology specs or probe targets, so raw SSH aliases are no longer treated as authoritative underlay endpoints
-- the former exit-node restricted-safe / traversal-reconcile instability is fixed:
-  - exit and client nodes now stay out of restricted-safe mode during the post-traversal baseline refresh
-  - host-only signed traversal with exhausted direct probes now remains `direct_programmed` and unproven instead of poisoning traversal state
-- the former role-switch `known_hosts` precheck slice remains live-proven from earlier reruns
-- the backend-authoritative exit-B endpoint proof remains live-proven from the earlier working-tree rerun
-- the current committed-tree blocker is now later in the late-stage flow:
-  - `live_role_switch_matrix` is live-proven green on the fresh rerun
-  - `live_exit_handoff` still fails only because traversal coordination can expire during the post-switch half of the monitor window
-  - the current local fix keeps the bounded traversal-refresh cadence alive after the switch instead of stopping refresh once `exit_node=<exit_b>` is selected
-  - a fresh rerun is still required before reopening `live_two_hop`, `live_lan_toggle`, or `live_managed_dns`
+- the reduced five-node rerun now passes end-to-end on the current working tree
+- `live_exit_handoff`, `live_two_hop`, `live_lan_toggle`, and `live_managed_dns` all pass on the same rerun
+- `fresh_install_os_matrix_report` passes on the same rerun
+- the runtime-worker recovery path remains strictly fail-closed if replacement-worker replay were ever to fail
 
 ### 4.4 Delta Phase 4: Repo-Level Cleanup After Runtime Success
 Goal:
@@ -416,10 +394,11 @@ Follow this order for the remaining work:
 
 1. Preserve the now-proven route, exit-mode, and traversal-refresh timing slices in [mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs), [runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs), [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs), and [live_linux_lab_orchestrator.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_lab_orchestrator.sh).
 2. Preserve the now-landed Rust live-lab endpoint resolver fix so signed topology specs continue using effective SSH-resolved underlay hosts instead of raw aliases.
-3. Re-run the reduced five-node helper lab on the current committed tree through `live_exit_handoff` with the local handoff cadence fix.
-4. If `live_exit_handoff` passes, continue through the later reduced-live-lab stages and capture the first new blocker honestly.
-5. If `live_exit_handoff` still fails, capture the exact next blocker instead of reopening the already-completed route/exit-mode, baseline traversal-refresh, or proof-source slices.
-6. After the helper flow is clean again, resume the dependency-policy cleanup and evidence-regeneration buckets.
+3. Preserve the current backend-local runtime recovery path so a dead userspace-shared worker is rebuilt from runtime-owned desired state instead of leaving the daemon permanently fail-closed after restart.
+4. Re-run the reduced five-node helper lab on the current committed tree through `live_exit_handoff` with the local backend recovery fix.
+5. If `live_exit_handoff` passes, continue through the later reduced-live-lab stages and capture the first new blocker honestly.
+6. If `live_exit_handoff` still fails, capture the exact next blocker instead of reopening the already-completed route/exit-mode, baseline traversal-refresh, role-switch, or proof-source slices.
+7. After the helper flow is clean again, resume the dependency-policy cleanup and evidence-regeneration buckets.
 
 ## 7. Validation Order For The Remaining Delta
 Use this order so failures are local and explainable:
@@ -562,9 +541,9 @@ This narrower target is complete only when all are true:
 - no second-socket authority, no helper-owned transport authority, and no silent downgrade were introduced.
 
 Current status:
-- route application and exit-mode programming are now code-complete locally
+- route application and exit-mode programming are code-complete locally
 - targeted backend/runtime proof is present
-- the next missing proof is the reduced five-node helper rerun itself
+- the reduced five-node helper rerun is now complete and passing on the current working tree
 
 ### 9.2 Reduced Live-Lab Runtime Proof Complete
 This narrower operational target is complete only when all are true:
@@ -572,16 +551,14 @@ This narrower operational target is complete only when all are true:
 - the reduced five-node helper lab reaches and completes `enforce_baseline_runtime` on all nodes.
 - `validate_baseline_runtime` completes on all nodes.
 - `live_role_switch_matrix` completes on the same rerun.
+- `live_exit_handoff`, `live_two_hop`, `live_lan_toggle`, `live_managed_dns`, and `fresh_install_os_matrix_report` complete on the same rerun.
 - no new reconcile blocker replaces the old route/exit-mode placeholder failures.
 
 Current status:
-- complete for the baseline-runtime slice
-- complete for the baseline-runtime slice and the committed-tree `live_role_switch_matrix` slice
-- the last captured reduced-live-lab blocker is `live_exit_handoff`
-- the specific handoff proof bug behind that captured failure is now patched locally:
-  - the stage keeps deadline-based traversal refresh active after the exit switch instead of letting the post-switch monitor window outlive coordination freshness
-  - the stage still treats any transient `restricted_safe_mode=true` as a hard failure
-- a fresh rerun is still required before claiming `live_exit_handoff` is clear and before reopening `live_two_hop`, `live_lan_toggle`, or `live_managed_dns`
+- complete for the reduced skip-gates five-node proof path on the current working tree
+- reopened for the stricter five-node local-gates path at `live_two_hop`
+- the current first failing check there is `second_client_route_via_rustynet0`
+- the two-hop endpoint-visibility proof remains green and backend-authoritative
 
 ### 9.3 Ready For An Honest Repo-Level Pre-Live-Lab Claim
 This broader target is complete only when all are true:
@@ -600,10 +577,10 @@ This document does **not** claim:
 ## 10. Current Bottom Line
 The Linux production transport-owning backend is no longer blocked on shared transport, TUN ownership, helper selection, or lab-profile propagation.
 
-The remaining live-lab delta is now narrower and more concrete:
-- keep the now-fixed baseline-runtime slice intact on the current committed tree
-- rerun `live_exit_handoff` on the current committed tree now that the stage keeps post-switch traversal refresh active for the full monitor window
-- if that rerun passes, resume `live_two_hop`, `live_lan_toggle`, and `live_managed_dns` with the already-landed endpoint, role-switch, and cadence fixes preserved
-- if that rerun exposes a new blocker, document and fix that exact blocker instead of reopening the already completed route/exit-mode, baseline-runtime, or role-switch slices
+The reduced live-lab delta is not fully closed on the stricter five-node path:
+- keep the now-fixed baseline-runtime slice intact on future commits
+- keep the backend-authoritative two-hop endpoint-visibility proof intact
+- fix the current `live_two_hop` second-client route enforcement blocker
+- only after that resume repo-level gate and evidence cleanup
 
-After that, the remaining blockers are policy-and-evidence work, not another broad backend architecture phase.
+The remaining blockers are now narrower than before, but they are not yet policy-and-evidence-only on the stricter five-node path.

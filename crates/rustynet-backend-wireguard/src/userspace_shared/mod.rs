@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,6 +38,10 @@ pub struct LinuxUserspaceSharedBackend {
     listen_port: u16,
     tun_lifecycle: SharedTunLifecycle,
     runtime: Option<RunningUserspaceRuntime>,
+    runtime_context: Option<RuntimeContext>,
+    desired_peers: BTreeMap<NodeId, PeerConfig>,
+    desired_routes: Vec<Route>,
+    desired_exit_mode: ExitMode,
 }
 
 impl LinuxUserspaceSharedBackend {
@@ -103,6 +108,10 @@ impl LinuxUserspaceSharedBackend {
             listen_port,
             tun_lifecycle: SharedTunLifecycle::new(tun_lifecycle),
             runtime: None,
+            runtime_context: None,
+            desired_peers: BTreeMap::new(),
+            desired_routes: Vec::new(),
+            desired_exit_mode: ExitMode::Off,
         })
     }
 
@@ -113,6 +122,116 @@ impl LinuxUserspaceSharedBackend {
             .ok_or_else(|| {
                 BackendError::not_running("linux userspace-shared wireguard backend is not running")
             })
+    }
+
+    fn is_runtime_worker_unavailable(err: &BackendError) -> bool {
+        err.kind == rustynet_backend_api::BackendErrorKind::Internal
+            && matches!(
+                err.message.as_str(),
+                "linux userspace-shared runtime worker is unavailable"
+                    | "linux userspace-shared runtime worker dropped a reply"
+            )
+    }
+
+    fn start_runtime(
+        &mut self,
+        context: RuntimeContext,
+    ) -> Result<RunningUserspaceRuntime, BackendError> {
+        let engine =
+            UserspaceEngine::from_private_key_file(Path::new(self.private_key_path.as_path()))?;
+        let tun_device = self
+            .tun_lifecycle
+            .prepare_and_open(&self.interface_name, &context)?;
+        let socket = match AuthoritativeSocket::bind(self.listen_port) {
+            Ok(socket) => socket,
+            Err(err) => {
+                drop(tun_device);
+                return Err(self.cleanup_tun_after_failed_start(err));
+            }
+        };
+        match RunningUserspaceRuntime::start(
+            &self.interface_name,
+            context,
+            tun_device,
+            socket,
+            engine,
+            self.tun_lifecycle.clone(),
+        ) {
+            Ok(runtime) => Ok(runtime),
+            Err(err) => Err(self.cleanup_tun_after_failed_start(err)),
+        }
+    }
+
+    fn recover_runtime_after_worker_exit(&mut self) -> Result<(), BackendError> {
+        let context = self.runtime_context.clone().ok_or_else(|| {
+            BackendError::not_running("linux userspace-shared wireguard backend is not running")
+        })?;
+        let previous_runtime = self.runtime.take().ok_or_else(|| {
+            BackendError::not_running("linux userspace-shared wireguard backend is not running")
+        })?;
+
+        if let Err(err) = previous_runtime.shutdown()
+            && !Self::is_runtime_worker_unavailable(&err)
+        {
+            return Err(BackendError::internal(format!(
+                "linux userspace-shared runtime recovery failed while shutting down stale runtime: {err}"
+            )));
+        }
+
+        self.tun_lifecycle.cleanup(&self.interface_name)?;
+        let runtime = self.start_runtime(context.clone()).map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared runtime recovery failed while starting replacement runtime: {err}"
+            ))
+        })?;
+        self.runtime = Some(runtime);
+        self.runtime_context = Some(context);
+
+        let replay_result = (|| -> Result<(), BackendError> {
+            for peer in self.desired_peers.values().cloned() {
+                self.ensure_runtime_control()?.configure_peer(peer)?;
+            }
+            if !self.desired_routes.is_empty() {
+                self.ensure_runtime_control()?
+                    .apply_routes(self.desired_routes.clone())?;
+            }
+            if self.desired_exit_mode != ExitMode::Off {
+                self.ensure_runtime_control()?
+                    .set_exit_mode(self.desired_exit_mode)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = replay_result {
+            if let Some(runtime) = self.runtime.take() {
+                let _ = runtime.shutdown();
+            }
+            let _ = self.tun_lifecycle.cleanup(&self.interface_name);
+            return Err(BackendError::internal(format!(
+                "linux userspace-shared runtime recovery failed while replaying desired state: {err}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn with_runtime_recovery<T>(
+        &mut self,
+        operation: impl Fn(&RuntimeControl) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        let first_result = {
+            let control = self.ensure_runtime_control()?;
+            operation(control)
+        };
+        match first_result {
+            Ok(value) => Ok(value),
+            Err(err) if Self::is_runtime_worker_unavailable(&err) => {
+                self.recover_runtime_after_worker_exit()?;
+                let control = self.ensure_runtime_control()?;
+                operation(control)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn combine_cleanup_error(primary: BackendError, cleanup: BackendError) -> BackendError {
@@ -259,29 +378,16 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
                 "linux userspace-shared wireguard backend already started",
             ));
         }
-
-        let engine =
-            UserspaceEngine::from_private_key_file(Path::new(self.private_key_path.as_path()))?;
-        let tun_device = self
-            .tun_lifecycle
-            .prepare_and_open(&self.interface_name, &context)?;
-        let socket = match AuthoritativeSocket::bind(self.listen_port) {
-            Ok(socket) => socket,
-            Err(err) => {
-                drop(tun_device);
-                return Err(self.cleanup_tun_after_failed_start(err));
-            }
-        };
-        let runtime = match RunningUserspaceRuntime::start(
-            &self.interface_name,
-            context,
-            tun_device,
-            socket,
-            engine,
-            self.tun_lifecycle.clone(),
-        ) {
+        self.runtime_context = Some(context.clone());
+        self.desired_peers.clear();
+        self.desired_routes.clear();
+        self.desired_exit_mode = ExitMode::Off;
+        let runtime = match self.start_runtime(context) {
             Ok(runtime) => runtime,
-            Err(err) => return Err(self.cleanup_tun_after_failed_start(err)),
+            Err(err) => {
+                self.runtime_context = None;
+                return Err(err);
+            }
         };
         self.runtime = Some(runtime);
         Ok(())
@@ -289,7 +395,10 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         Self::validate_peer(&peer)?;
-        self.ensure_runtime_control()?.configure_peer(peer)
+        let node_id = peer.node_id.clone();
+        self.with_runtime_recovery(|control| control.configure_peer(peer.clone()))?;
+        self.desired_peers.insert(node_id, peer);
+        Ok(())
     }
 
     fn update_peer_endpoint(
@@ -297,8 +406,17 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         node_id: &NodeId,
         endpoint: SocketEndpoint,
     ) -> Result<(), BackendError> {
-        self.ensure_runtime_control()?
-            .update_peer_endpoint(node_id.clone(), endpoint)
+        let mut updated_peer = self
+            .desired_peers
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        self.with_runtime_recovery(|control| {
+            control.update_peer_endpoint(node_id.clone(), endpoint)
+        })?;
+        updated_peer.endpoint = endpoint;
+        self.desired_peers.insert(node_id.clone(), updated_peer);
+        Ok(())
     }
 
     fn current_peer_endpoint(
@@ -313,20 +431,28 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         &mut self,
         node_id: &NodeId,
     ) -> Result<Option<u64>, BackendError> {
-        self.ensure_runtime_control()?
-            .peer_latest_handshake_unix(node_id.clone())
+        self.with_runtime_recovery(|control| control.peer_latest_handshake_unix(node_id.clone()))
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
-        self.ensure_runtime_control()?.remove_peer(node_id.clone())
+        if !self.desired_peers.contains_key(node_id) {
+            return Err(BackendError::invalid_input("peer is not configured"));
+        }
+        self.with_runtime_recovery(|control| control.remove_peer(node_id.clone()))?;
+        self.desired_peers.remove(node_id);
+        Ok(())
     }
 
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
-        self.ensure_runtime_control()?.apply_routes(routes)
+        self.with_runtime_recovery(|control| control.apply_routes(routes.clone()))?;
+        self.desired_routes = routes;
+        Ok(())
     }
 
     fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
-        self.ensure_runtime_control()?.set_exit_mode(mode)
+        self.with_runtime_recovery(|control| control.set_exit_mode(mode))?;
+        self.desired_exit_mode = mode;
+        Ok(())
     }
 
     fn stats(&self) -> Result<TunnelStats, BackendError> {
@@ -338,8 +464,9 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         node_id: &NodeId,
         force_resend: bool,
     ) -> Result<(), BackendError> {
-        self.ensure_runtime_control()?
-            .initiate_peer_handshake(node_id.clone(), force_resend)
+        self.with_runtime_recovery(|control| {
+            control.initiate_peer_handshake(node_id.clone(), force_resend)
+        })
     }
 
     fn authoritative_transport_identity(&self) -> Option<AuthoritativeTransportIdentity> {
@@ -373,6 +500,10 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         })?;
         let runtime_result = runtime.shutdown();
         let cleanup_result = self.tun_lifecycle.cleanup(&self.interface_name);
+        self.runtime_context = None;
+        self.desired_peers.clear();
+        self.desired_routes.clear();
+        self.desired_exit_mode = ExitMode::Off;
         match (runtime_result, cleanup_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(err), Ok(())) => Err(err),
@@ -807,6 +938,104 @@ mod tests {
             .expect("listen port should be released after shutdown");
         drop(rebound);
 
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_recovers_dead_worker_before_configure_peer() {
+        let private_key_path = write_private_key([13; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let peer_one = peer_config(
+            "peer-one",
+            backend_loopback_addr(41001),
+            peer_public_key([1; 32]),
+            vec!["100.64.11.0/24"],
+        );
+        let peer_two = peer_config(
+            "peer-two",
+            backend_loopback_addr(41002),
+            peer_public_key([2; 32]),
+            vec!["100.64.12.0/24"],
+        );
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .configure_peer(peer_one.clone())
+            .expect("first peer configure should succeed");
+
+        tun_state.set_next_recv_error("phase10 simulated TUN receive failure");
+        wait_for(Duration::from_secs(1), || {
+            (backend.current_peer_endpoint(&peer_one.node_id).is_err()).then_some(())
+        });
+
+        backend
+            .configure_peer(peer_two.clone())
+            .expect("backend should recover and configure the new peer");
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.prepare_calls, 2);
+        assert_eq!(snapshot.cleanup_calls, 1);
+        assert_eq!(snapshot.live_handles, 1);
+        assert_eq!(
+            backend
+                .current_peer_endpoint(&peer_one.node_id)
+                .expect("recovered backend should expose first peer endpoint"),
+            Some(peer_one.endpoint)
+        );
+        assert_eq!(
+            backend
+                .current_peer_endpoint(&peer_two.node_id)
+                .expect("recovered backend should expose second peer endpoint"),
+            Some(peer_two.endpoint)
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_recovers_dead_worker_before_route_reconcile() {
+        let private_key_path = write_private_key([14; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let mesh_route = route("100.64.130.0/24", RouteKind::Mesh);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        tun_state.set_next_recv_error("phase10 simulated TUN receive failure before route apply");
+        wait_for(Duration::from_secs(1), || {
+            backend
+                .transport_generation_for_test()
+                .ok()
+                .flatten()
+                .and_then(|_| backend.worker_local_addr_for_test().err())
+                .map(|_| ())
+        });
+
+        backend
+            .apply_routes(vec![mesh_route.clone()])
+            .expect("backend should recover and replay routes");
+
+        let snapshot = tun_state.snapshot();
+        assert_eq!(snapshot.prepare_calls, 2);
+        assert_eq!(snapshot.cleanup_calls, 1);
+        assert_eq!(snapshot.live_handles, 1);
+        assert_eq!(
+            snapshot.programmed_route_cidrs,
+            vec![mesh_route.destination_cidr]
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
         let _ = fs::remove_file(private_key_path);
     }
 
