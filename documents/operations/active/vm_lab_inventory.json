@@ -5,6 +5,7 @@
       "alias": "debian-headless-1",
       "ssh_target": "debian-headless-1",
       "ssh_user": "debian",
+      "ssh_password": "tempo",
       "os": "Debian/Linux",
       "last_known_ip": "192.168.64.22",
       "parent_device": "iwan's MacBook Air",
@@ -26,6 +27,7 @@
       "alias": "debian-headless-2",
       "ssh_target": "debian-headless-2",
       "ssh_user": "debian",
+      "ssh_password": "tempo",
       "os": "Debian/Linux",
       "last_known_ip": "192.168.64.24",
       "parent_device": "iwan's MacBook Air",
@@ -47,6 +49,7 @@
       "alias": "debian-headless-3",
       "ssh_target": "debian-headless-3",
       "ssh_user": "debian",
+      "ssh_password": "tempo",
       "os": "Debian/Linux",
       "last_known_ip": "192.168.64.26",
       "parent_device": "iwan's MacBook Air",
@@ -68,6 +71,7 @@
       "alias": "debian-headless-4",
       "ssh_target": "debian-headless-4",
       "ssh_user": "debian",
+      "ssh_password": "tempo",
       "os": "Debian/Linux",
       "last_known_ip": "192.168.64.28",
       "parent_device": "iwan's MacBook Air",
@@ -89,6 +93,7 @@
       "alias": "debian-headless-5",
       "ssh_target": "debian-headless-5",
       "ssh_user": "debian",
+      "ssh_password": "tempo",
       "os": "Debian/Linux",
       "last_known_ip": "192.168.64.29",
       "parent_device": "iwan's MacBook Air",
@@ -105,6 +110,19 @@
         "utm_name": "headless debian 5",
         "bundle_path": "/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/headless debian 5.utm"
       }
+    },
+    {
+      "alias": "debian-lan-11",
+      "ssh_target": "debian-lan-11",
+      "ssh_user": "debian",
+      "ssh_password": "tempo",
+      "include_in_all": false,
+      "os": "Debian/Linux",
+      "last_known_ip": "192.168.0.11",
+      "parent_device": "Debian device on 192.168.0.0/24",
+      "last_known_network": "192.168.0.0/24",
+      "network_group": "lan-192.168.0.0/24",
+      "rustynet_src_dir": "/home/debian/Rustynet"
     }
   ]
 }

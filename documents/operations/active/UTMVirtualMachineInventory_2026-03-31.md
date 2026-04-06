@@ -72,6 +72,8 @@ Entry model:
 - `alias`: stable operator label such as `debian-headless-1`
 - `ssh_target`: SSH alias, hostname, or `user@host` target that is reachable from this Mac
 - `ssh_user`: optional default SSH username override
+- `ssh_password`: optional bootstrap-only password used to refresh SSH keys or recover access
+- `include_in_all`: optional boolean that excludes recovery-only rows from `--all` selection when set to `false`
 - `node_id`: Rustynet node identity used for topology/state issuance
 - `lab_role`: orchestration role such as `exit`, `client`, `relay`, `aux`, or `extra`
 - `mesh_ip`: last-known intended Rustynet mesh IP for topology/state records
@@ -114,6 +116,8 @@ Operational meaning:
 - `ops vm-lab-diff-live-lab-runs` compares two live-lab report directories and prints the first divergent stage plus changed stage outcomes
 - `ops vm-lab-run-live-lab` launches the existing live-lab orchestrator from a generated profile
 - remote or same-network VMs hosted on another machine should be recorded as SSH-reachable entries without a `controller`
+- if you keep a bootstrap password in inventory, treat it as sensitive recovery metadata and do not log it or echo it in helper output
+- if you keep a recovery-only host in inventory, set `include_in_all=false` so bulk lab selection does not treat it as a UTM lab member
 - `network_group` is optional metadata for same-network validation; if you use `--require-same-network`, every selected inventory-backed node must declare the same `network_group`
 - suite runners that claim cross-network behavior require distinct `network_group` / `last_known_network` values for the relevant suite roles; same-network metadata is not silently treated as cross-network proof
 

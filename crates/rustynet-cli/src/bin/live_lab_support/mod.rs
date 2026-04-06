@@ -501,6 +501,50 @@ impl LiveLabContext {
         self.capture_allow_failure(target, &full_args)
     }
 
+    pub fn capture_root_allow_failure_with_retry(
+        &self,
+        target: &str,
+        args: &[&str],
+        attempts: u32,
+        sleep_secs: u64,
+    ) -> Result<String, String> {
+        let mut last_err = None;
+        for attempt in 1..=attempts {
+            match self.capture_root_allow_failure(target, args) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < attempts {
+                        sleep(Duration::from_secs(sleep_secs));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "retry exhausted".to_string()))
+    }
+
+    pub fn run_root_allow_failure_with_retry(
+        &self,
+        target: &str,
+        args: &[&str],
+        attempts: u32,
+        sleep_secs: u64,
+    ) -> Result<Output, String> {
+        let mut last_err = None;
+        for attempt in 1..=attempts {
+            match self.run_root_allow_failure(target, args) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt < attempts {
+                        sleep(Duration::from_secs(sleep_secs));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "retry exhausted".to_string()))
+    }
+
     pub fn retry_root(
         &self,
         target: &str,

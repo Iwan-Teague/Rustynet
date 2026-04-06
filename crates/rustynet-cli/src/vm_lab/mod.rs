@@ -359,6 +359,8 @@ struct VmInventoryEntry {
     alias: String,
     ssh_target: String,
     ssh_user: Option<String>,
+    ssh_password: Option<String>,
+    include_in_all: Option<bool>,
     os: Option<String>,
     last_known_ip: Option<String>,
     parent_device: Option<String>,
@@ -3105,6 +3107,7 @@ fn select_inventory_entries(
     let requested = if select_all {
         inventory
             .iter()
+            .filter(|entry| entry.include_in_all.unwrap_or(true))
             .map(|entry| entry.alias.clone())
             .collect::<Vec<_>>()
     } else {
@@ -3255,6 +3258,11 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     if let Some(user) = ssh_user.as_deref() {
         ensure_ssh_user(user)?;
     }
+    let ssh_password = optional_string_field(object, "ssh_password")?;
+    if let Some(value) = ssh_password.as_deref() {
+        ensure_no_control_chars("ssh_password", value)?;
+    }
+    let include_in_all = optional_bool_field(object, "include_in_all")?;
     let os = optional_string_field(object, "os")?;
     if let Some(value) = os.as_deref() {
         ensure_no_control_chars("os", value)?;
@@ -3301,6 +3309,8 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
         alias,
         ssh_target,
         ssh_user,
+        ssh_password,
+        include_in_all,
         os,
         last_known_ip,
         parent_device,
@@ -5267,7 +5277,7 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabProfile, LiveLabStageSummary, VmLabIterationValidationStep,
+        LiveLabProfile, LiveLabStageSummary, VmInventoryEntry, VmLabIterationValidationStep,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
         build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_repo_sync_script, build_suite_command, build_vendored_cargo_config,
@@ -5280,7 +5290,7 @@ mod tests {
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         privileged_rustynet_cli_script, render_live_lab_iteration_summary,
         resolve_iteration_source_selection, resolve_remote_targets, resolve_repo_sync_source,
-        resolve_start_targets, summarize_live_lab_report,
+        resolve_start_targets, select_inventory_entries, summarize_live_lab_report,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -5398,6 +5408,7 @@ mod tests {
         let inventory = load_inventory(path.as_path()).expect("inventory should load");
         assert_eq!(inventory.len(), 2);
         assert_eq!(inventory[0].alias, "debian-headless-1");
+        assert_eq!(inventory[0].ssh_password.as_deref(), None);
         assert_eq!(
             inventory[0].network_group.as_deref(),
             Some("utm-shared-192.168.64.0/24")
@@ -5410,8 +5421,8 @@ mod tests {
     fn load_inventory_parses_role_and_capability_metadata() {
         let path = write_temp_inventory(
             r#"{
-  "version": 1,
-  "entries": [
+                "version": 1,
+                "entries": [
     {
       "alias": "exit-vm",
       "ssh_target": "exit-host",
@@ -5432,11 +5443,82 @@ mod tests {
         assert_eq!(inventory[0].mesh_ip.as_deref(), Some("100.64.0.1"));
         assert_eq!(inventory[0].exit_capable, Some(true));
         assert_eq!(inventory[0].relay_capable, Some(false));
+        assert_eq!(inventory[0].ssh_password.as_deref(), None);
         assert_eq!(
             inventory[0].rustynet_src_dir.as_deref(),
             Some("/home/debian/Rustynet")
         );
         cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn load_inventory_parses_ssh_password_metadata() {
+        let path = write_temp_inventory(
+            r#"{
+                "version": 1,
+                "entries": [
+                    {
+                        "alias": "debian-headless-1",
+                        "ssh_target": "debian-headless-1",
+                        "ssh_user": "debian",
+                        "ssh_password": "tempo",
+                        "os": "Debian/Linux"
+                    }
+                ]
+            }"#,
+        );
+        let inventory = load_inventory(path.as_path()).expect("inventory should load");
+        assert_eq!(inventory[0].ssh_user.as_deref(), Some("debian"));
+        assert_eq!(inventory[0].ssh_password.as_deref(), Some("tempo"));
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn select_inventory_entries_skips_all_excluded_rows() {
+        let inventory = vec![
+            VmInventoryEntry {
+                alias: "debian-headless-1".to_string(),
+                ssh_target: "debian-headless-1".to_string(),
+                ssh_user: Some("debian".to_string()),
+                ssh_password: None,
+                include_in_all: Some(true),
+                os: None,
+                last_known_ip: None,
+                parent_device: None,
+                last_known_network: None,
+                network_group: None,
+                node_id: None,
+                lab_role: None,
+                mesh_ip: None,
+                exit_capable: None,
+                relay_capable: None,
+                rustynet_src_dir: None,
+                controller: None,
+            },
+            VmInventoryEntry {
+                alias: "debian-lan-11".to_string(),
+                ssh_target: "debian-lan-11".to_string(),
+                ssh_user: Some("debian".to_string()),
+                ssh_password: Some("tempo".to_string()),
+                include_in_all: Some(false),
+                os: None,
+                last_known_ip: None,
+                parent_device: None,
+                last_known_network: None,
+                network_group: None,
+                node_id: None,
+                lab_role: None,
+                mesh_ip: None,
+                exit_capable: None,
+                relay_capable: None,
+                rustynet_src_dir: None,
+                controller: None,
+            },
+        ];
+        let selected = select_inventory_entries(inventory.as_slice(), &[], true)
+            .expect("selection should succeed");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].alias, "debian-headless-1");
     }
 
     #[test]
