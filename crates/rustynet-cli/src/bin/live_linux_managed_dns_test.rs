@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
@@ -27,6 +28,8 @@ const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.manifest";
 const TRAVERSAL_ENV_REMOTE: &str = "/tmp/rn_issue_dns_traversal.env";
 const TRAVERSAL_PUB_REMOTE: &str = "/run/rustynet/traversal-issue/rn-traversal.pub";
 const REPLAY_PROBE_ALIAS: &str = "gatewayreplay";
+const SOAK_SSH_RETRY_ATTEMPTS: u32 = 10;
+const SOAK_SSH_RETRY_SLEEP_SECS: u64 = 3;
 
 fn main() {
     let code = match run() {
@@ -405,16 +408,8 @@ fn run() -> Result<(), String> {
     )?;
     restart_managed_dns_stack(&ctx, &config.client_host)?;
 
-    let dns_inspect_valid = ctx.capture_root(
-        &config.client_host,
-        &[
-            "env",
-            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
-            "dns",
-            "inspect",
-        ],
-    )?;
+    let dns_inspect_valid =
+        wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
     let resolvectl_status_valid = ctx.capture_root_allow_failure(
         &config.client_host,
         &["resolvectl", "status", &config.dns_interface],
@@ -610,16 +605,8 @@ fn run() -> Result<(), String> {
         &verifier_local,
         &valid_bundle_local,
     )?;
-    let dns_inspect_restored = ctx.capture_root(
-        &config.client_host,
-        &[
-            "env",
-            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
-            "dns",
-            "inspect",
-        ],
-    )?;
+    let dns_inspect_restored =
+        wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
 
     for (node_id, host) in managed_dns_distribution_targets(&host_by_node, &config.client_host) {
         logger.line(
@@ -1063,56 +1050,63 @@ fn install_dns_bundle_with_options(
     bundle_local: &Path,
     clear_watermark: bool,
 ) -> Result<(), String> {
-    ctx.scp_to(verifier_local, client_host, "/tmp/rn-dns-zone.pub")?;
-    ctx.scp_to(bundle_local, client_host, "/tmp/rn-dns-zone.bundle")?;
-    ctx.run_root(
-        client_host,
-        &[
-            "install",
-            "-m",
-            "0644",
-            "-o",
-            "root",
-            "-g",
-            "root",
-            "/tmp/rn-dns-zone.pub",
-            "/etc/rustynet/dns-zone.pub",
-        ],
-    )?;
-    ctx.run_root(
-        client_host,
-        &[
-            "install",
-            "-m",
-            "0640",
-            "-o",
-            "root",
-            "-g",
-            "rustynetd",
-            "/tmp/rn-dns-zone.bundle",
-            "/var/lib/rustynet/rustynetd.dns-zone",
-        ],
-    )?;
-    ctx.run_root(
-        client_host,
-        if clear_watermark {
-            &[
-                "rm",
-                "-f",
-                "/var/lib/rustynet/rustynetd.dns-zone.watermark",
-                "/tmp/rn-dns-zone.pub",
-                "/tmp/rn-dns-zone.bundle",
-            ]
-        } else {
-            &[
-                "rm",
-                "-f",
-                "/tmp/rn-dns-zone.pub",
-                "/tmp/rn-dns-zone.bundle",
-            ]
+    retry_remote_step(
+        &format!("install managed DNS bundle on {client_host}"),
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
+        || {
+            ctx.scp_to(verifier_local, client_host, "/tmp/rn-dns-zone.pub")?;
+            ctx.scp_to(bundle_local, client_host, "/tmp/rn-dns-zone.bundle")?;
+            ctx.run_root(
+                client_host,
+                &[
+                    "install",
+                    "-m",
+                    "0644",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "/tmp/rn-dns-zone.pub",
+                    "/etc/rustynet/dns-zone.pub",
+                ],
+            )?;
+            ctx.run_root(
+                client_host,
+                &[
+                    "install",
+                    "-m",
+                    "0640",
+                    "-o",
+                    "root",
+                    "-g",
+                    "rustynetd",
+                    "/tmp/rn-dns-zone.bundle",
+                    "/var/lib/rustynet/rustynetd.dns-zone",
+                ],
+            )?;
+            ctx.run_root(
+                client_host,
+                if clear_watermark {
+                    &[
+                        "rm",
+                        "-f",
+                        "/var/lib/rustynet/rustynetd.dns-zone.watermark",
+                        "/tmp/rn-dns-zone.pub",
+                        "/tmp/rn-dns-zone.bundle",
+                    ]
+                } else {
+                    &[
+                        "rm",
+                        "-f",
+                        "/tmp/rn-dns-zone.pub",
+                        "/tmp/rn-dns-zone.bundle",
+                    ]
+                },
+            )?;
+            Ok(())
         },
-    )?;
-    Ok(())
+    )
 }
 
 fn refresh_traversal_bundles(
@@ -1123,45 +1117,52 @@ fn refresh_traversal_bundles(
     nodes_spec: &str,
     allow_spec: &str,
 ) -> Result<(), String> {
-    let traversal_env = workspace.join("rn_issue_dns_traversal.env");
-    write_env_file(
-        &traversal_env,
-        &[("NODES_SPEC", nodes_spec), ("ALLOW_SPEC", allow_spec)],
-    )?;
-    let remote_env_path = TRAVERSAL_ENV_REMOTE;
-    ctx.scp_to(&traversal_env, &config.signer_host, remote_env_path)?;
-    ctx.run_root(
-        &config.signer_host,
-        &[
-            "rustynet",
-            "ops",
-            "e2e-issue-traversal-bundles-from-env",
-            "--env-file",
-            remote_env_path,
-        ],
-    )?;
-    ctx.run_root_allow_failure(&config.signer_host, &["rm", "-f", remote_env_path])?;
+    retry_remote_step(
+        &format!("refresh traversal bundles from {}", config.signer_host),
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
+        || {
+            let traversal_env = workspace.join("rn_issue_dns_traversal.env");
+            write_env_file(
+                &traversal_env,
+                &[("NODES_SPEC", nodes_spec), ("ALLOW_SPEC", allow_spec)],
+            )?;
+            let remote_env_path = TRAVERSAL_ENV_REMOTE;
+            ctx.scp_to(&traversal_env, &config.signer_host, remote_env_path)?;
+            ctx.run_root(
+                &config.signer_host,
+                &[
+                    "rustynet",
+                    "ops",
+                    "e2e-issue-traversal-bundles-from-env",
+                    "--env-file",
+                    remote_env_path,
+                ],
+            )?;
+            ctx.run_root_allow_failure(&config.signer_host, &["rm", "-f", remote_env_path])?;
 
-    let traversal_pub_local = workspace.join("traversal.pub");
-    capture_remote_text(
-        ctx,
-        &config.signer_host,
-        TRAVERSAL_PUB_REMOTE,
-        &traversal_pub_local,
-    )?;
-    for (node_id, host) in sorted_node_host_pairs(host_by_node) {
-        let traversal_remote = traversal_bundle_remote_path(node_id.as_str());
-        let traversal_local = workspace.join(format!("traversal-{node_id}.bundle"));
-        capture_remote_text(
-            ctx,
-            &config.signer_host,
-            traversal_remote.as_str(),
-            &traversal_local,
-        )?;
-        install_traversal_bundle(ctx, &host, &traversal_pub_local, &traversal_local)?;
-    }
-    ctx.run_root_allow_failure(&config.signer_host, &["rm", "-rf", TRAVERSAL_ISSUE_DIR])?;
-    Ok(())
+            let traversal_pub_local = workspace.join("traversal.pub");
+            capture_remote_text(
+                ctx,
+                &config.signer_host,
+                TRAVERSAL_PUB_REMOTE,
+                &traversal_pub_local,
+            )?;
+            for (node_id, host) in sorted_node_host_pairs(host_by_node) {
+                let traversal_remote = traversal_bundle_remote_path(node_id.as_str());
+                let traversal_local = workspace.join(format!("traversal-{node_id}.bundle"));
+                capture_remote_text(
+                    ctx,
+                    &config.signer_host,
+                    traversal_remote.as_str(),
+                    &traversal_local,
+                )?;
+                install_traversal_bundle(ctx, &host, &traversal_pub_local, &traversal_local)?;
+            }
+            ctx.run_root_allow_failure(&config.signer_host, &["rm", "-rf", TRAVERSAL_ISSUE_DIR])?;
+            Ok(())
+        },
+    )
 }
 
 fn sorted_node_host_pairs(host_by_node: &HashMap<String, String>) -> Vec<(String, String)> {
@@ -1304,6 +1305,7 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         15,
         2,
     )?;
+    wait_for_dns_inspect_state(ctx, client_host, Some("valid"), 20, 2)?;
     Ok(())
 }
 
@@ -1588,23 +1590,14 @@ fn exercise_invalid_bundle_case(
         clear_watermark,
     )?;
     refresh_traversal_bundles(ctx, config, workspace, host_by_node, nodes_spec, allow_spec)?;
-    restart_managed_dns_stack_allow_invalid_dns(ctx, &config.client_host)?;
-
-    let dns_inspect = ctx.capture_root_allow_failure(
-        &config.client_host,
-        &[
-            "env",
-            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
-            "dns",
-            "inspect",
-        ],
-    )?;
-    let rustynetd_state = ctx.capture_root_allow_failure(
+    let dns_inspect = restart_managed_dns_stack_allow_invalid_dns(ctx, &config.client_host)?;
+    let rustynetd_state = ctx.capture_root_allow_failure_with_retry(
         &config.client_host,
         &["systemctl", "is-active", "rustynetd.service"],
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
     )?;
-    let rustynetd_journal = ctx.capture_root_allow_failure(
+    let rustynetd_journal = ctx.capture_root_allow_failure_with_retry(
         &config.client_host,
         &[
             "journalctl",
@@ -1614,6 +1607,8 @@ fn exercise_invalid_bundle_case(
             "40",
             "--no-pager",
         ],
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
     )?;
     let direct_query = remote_dns_query_capture_allow_failure(
         ctx,
@@ -1665,7 +1660,7 @@ fn exercise_invalid_bundle_case(
 fn restart_managed_dns_stack_allow_invalid_dns(
     ctx: &LiveLabContext,
     client_host: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     ctx.run_root_allow_failure(
         client_host,
         &[
@@ -1707,7 +1702,8 @@ fn restart_managed_dns_stack_allow_invalid_dns(
         client_host,
         &["systemctl", "restart", "rustynetd-managed-dns.service"],
     )?;
-    Ok(())
+    ctx.wait_for_daemon_socket(client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
+    wait_for_dns_inspect_state(ctx, client_host, None, 20, 2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1721,9 +1717,107 @@ fn restore_valid_bundle_after_invalid_case(
     verifier_local: &Path,
     valid_bundle_local: &Path,
 ) -> Result<(), String> {
-    install_dns_bundle(ctx, &config.client_host, verifier_local, valid_bundle_local)?;
-    refresh_traversal_bundles(ctx, config, workspace, host_by_node, nodes_spec, allow_spec)?;
-    restart_managed_dns_stack(ctx, &config.client_host)
+    retry_remote_step(
+        &format!("restore valid managed DNS bundle on {}", config.client_host),
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
+        || {
+            install_dns_bundle(ctx, &config.client_host, verifier_local, valid_bundle_local)?;
+            refresh_traversal_bundles(
+                ctx,
+                config,
+                workspace,
+                host_by_node,
+                nodes_spec,
+                allow_spec,
+            )?;
+            restart_managed_dns_stack(ctx, &config.client_host)
+        },
+    )
+}
+
+fn retry_remote_step<T, F>(
+    label: &str,
+    attempts: u32,
+    sleep_secs: u64,
+    mut operation: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, String>,
+{
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    sleep(std::time::Duration::from_secs(sleep_secs));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "{label} failed after {attempts} attempts: {}",
+        last_err.unwrap_or_else(|| "retry exhausted".to_string())
+    ))
+}
+
+fn wait_for_dns_inspect_state(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    expected_state: Option<&str>,
+    attempts: u32,
+    sleep_secs: u64,
+) -> Result<String, String> {
+    let mut last_output = None;
+    for attempt in 1..=attempts {
+        let output = ctx.capture_root_allow_failure_with_retry(
+            client_host,
+            &[
+                "env",
+                "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+                "rustynet",
+                "dns",
+                "inspect",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        )?;
+        if dns_inspect_readback_ready(output.as_str())
+            && dns_inspect_matches_expected_state(output.as_str(), expected_state)
+        {
+            return Ok(output);
+        }
+        last_output = Some(output);
+        if attempt < attempts {
+            sleep(std::time::Duration::from_secs(sleep_secs));
+        }
+    }
+    Err(format!(
+        "managed DNS inspect did not converge on {client_host}: {}",
+        last_output
+            .map(|output| output.trim().to_string())
+            .filter(|output| !output.is_empty())
+            .unwrap_or_else(|| "empty output".to_string())
+    ))
+}
+
+fn dns_inspect_readback_ready(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = normalize_reason_text(trimmed);
+    !normalized.contains("daemon unreachable")
+        && !normalized.contains("inspect daemon socket failed")
+}
+
+fn dns_inspect_matches_expected_state(output: &str, expected_state: Option<&str>) -> bool {
+    match expected_state {
+        Some(state) => output.contains(&format!("dns inspect: state={state}")),
+        None => output.contains("dns inspect: state="),
+    }
 }
 
 fn managed_dns_invalid_state_observed(
@@ -1837,7 +1931,7 @@ fn remote_dns_query_capture_allow_failure(
     config: &Config,
     qname: &str,
 ) -> Result<RemoteDnsQueryCapture, String> {
-    let output = ctx.run_root_allow_failure(
+    let output = ctx.run_root_allow_failure_with_retry(
         host,
         &[
             "rustynet",
@@ -1852,6 +1946,8 @@ fn remote_dns_query_capture_allow_failure(
             "--timeout-ms",
             "3000",
         ],
+        SOAK_SSH_RETRY_ATTEMPTS,
+        SOAK_SSH_RETRY_SLEEP_SECS,
     )?;
     Ok(RemoteDnsQueryCapture {
         payload: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -2080,11 +2176,12 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, dns_query_failed_closed,
-        managed_dns_distribution_targets, managed_dns_invalid_state_observed,
-        managed_dns_replay_records, parse_assignment_authority_scope, parse_managed_peer_spec,
-        parse_status_field, rewrite_bundle_line_value, rewrite_bundle_signature,
-        sorted_node_host_pairs, validate_targets,
+        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, dns_inspect_matches_expected_state,
+        dns_inspect_readback_ready, dns_query_failed_closed, managed_dns_distribution_targets,
+        managed_dns_invalid_state_observed, managed_dns_replay_records,
+        parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
+        rewrite_bundle_line_value, rewrite_bundle_signature, sorted_node_host_pairs,
+        validate_targets,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2350,5 +2447,35 @@ signature=abcd
             !dns_query_failed_closed(Path::new("/tmp"), "", false)
                 .expect("empty successful query should not be treated as fail-closed")
         );
+    }
+
+    #[test]
+    fn dns_inspect_readback_ready_rejects_daemon_unreachable_output() {
+        assert!(!dns_inspect_readback_ready(
+            "daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn dns_inspect_readback_ready_accepts_invalid_state_output() {
+        assert!(dns_inspect_readback_ready(
+            "dns inspect: state=invalid error=dns zone bundle replay detected"
+        ));
+    }
+
+    #[test]
+    fn dns_inspect_matches_expected_state_enforces_requested_state() {
+        assert!(dns_inspect_matches_expected_state(
+            "dns inspect: state=valid zone_name=rustynet",
+            Some("valid")
+        ));
+        assert!(!dns_inspect_matches_expected_state(
+            "dns inspect: state=invalid error=signature verification failed",
+            Some("valid")
+        ));
+        assert!(dns_inspect_matches_expected_state(
+            "dns inspect: state=invalid error=signature verification failed",
+            None
+        ));
     }
 }
