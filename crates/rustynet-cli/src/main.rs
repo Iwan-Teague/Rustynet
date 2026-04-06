@@ -75,6 +75,7 @@ use zeroize::{Zeroize, Zeroizing};
 const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 90;
 const LOCAL_TRAVERSAL_REFRESH_TTL_SECS: u64 = 120;
+const LOCAL_TRAVERSAL_CONVERGENCE_REFRESH_INTERVAL_SECS: u64 = 10;
 const PINNED_RUNTIME_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
 const DNS_ZONE_RECORDS_MANIFEST_MAX_BYTES: usize = 256 * 1024;
 const DNS_ZONE_RECORDS_MANIFEST_MAX_LINES: usize = 16_384;
@@ -1920,6 +1921,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
                     dry_run: parser.has_flag("--dry-run"),
                     timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                    skip_gates: parser.has_flag("--skip-gates"),
+                    skip_soak: parser.has_flag("--skip-soak"),
+                    skip_cross_network: parser.has_flag("--skip-cross-network"),
                     require_clean_tree: parser.has_flag("--require-clean-tree"),
                     require_local_head: parser.has_flag("--require-local-head"),
                     validation_steps,
@@ -7849,6 +7853,22 @@ fn execute_ops_apply_role_coupling(
         return Err(format!("forced local assignment refresh failed: {err}"));
     }
 
+    if target_role == "client"
+        && let Some(expected_exit_node) = preferred_exit_node_id.as_deref()
+    {
+        let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+        if let Err(err) = wait_for_client_exit_route_convergence(
+            socket_path.as_path(),
+            assignment_refresh_env_path.as_path(),
+            expected_exit_node,
+            Duration::from_secs(30),
+        ) {
+            return Err(format!(
+                "client exit route convergence failed after role coupling: {err}"
+            ));
+        }
+    }
+
     if target_role == "admin"
         && enable_exit_advertise
         && let Err(err) =
@@ -9636,6 +9656,55 @@ fn wait_for_daemon_status_field(
     ))
 }
 
+fn route_uses_rustynet0(route_line: &str) -> bool {
+    route_line.contains("dev rustynet0")
+}
+
+fn wait_for_client_exit_route_convergence(
+    socket_path: &Path,
+    assignment_refresh_env_path: &Path,
+    expected_exit_node: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut next_refresh_at =
+        Instant::now() + Duration::from_secs(LOCAL_TRAVERSAL_CONVERGENCE_REFRESH_INTERVAL_SECS);
+    let mut last_status = String::new();
+    let mut last_route = String::new();
+    while start.elapsed() <= timeout {
+        if Instant::now() >= next_refresh_at {
+            refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path)?;
+            if socket_exists_and_is_socket(socket_path, "daemon socket")? {
+                let _ =
+                    send_command_with_socket(IpcCommand::StateRefresh, socket_path.to_path_buf());
+            }
+            next_refresh_at = Instant::now()
+                + Duration::from_secs(LOCAL_TRAVERSAL_CONVERGENCE_REFRESH_INTERVAL_SECS);
+        }
+        let status = send_command_with_socket(IpcCommand::Status, socket_path.to_path_buf())?;
+        if status.ok {
+            last_status = status.message.clone();
+            let route_output = run_command_capture("ip", &["-4", "route", "get", "1.1.1.1"])?;
+            last_route = String::from_utf8_lossy(&route_output.stdout)
+                .trim()
+                .to_string();
+            if status_field(status.message.as_str(), "exit_node").as_deref()
+                == Some(expected_exit_node)
+                && daemon_runtime_ready_from_status_text(status.message.as_str())
+                && route_output.status.success()
+                && route_uses_rustynet0(last_route.as_str())
+            {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!(
+        "timed out waiting for client exit route convergence to {expected_exit_node}: status={} route={}",
+        last_status, last_route
+    ))
+}
+
 fn apply_lan_blackhole_routes(
     lan_routes: &[String],
     install_blackhole: bool,
@@ -11112,7 +11181,7 @@ fn help_text() -> String {
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
-        "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
+        "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
         "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",
         "  ops vm-lab-preflight [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>] [--require-same-network] [--require-command <name>]... [--require-commands <name[,name...]>] [--min-free-kib <kib>] [--require-rustynet-installed] [--timeout-secs <secs>]",
@@ -12977,6 +13046,7 @@ mod tests {
             "check:rustynetd".to_string(),
             "--validation-step".to_string(),
             "test-bin:rustynet-cli:live_linux_lan_toggle_test".to_string(),
+            "--skip-cross-network".to_string(),
             "--require-clean-tree".to_string(),
             "--require-local-head".to_string(),
             "--collect-failure-diagnostics".to_string(),
@@ -12984,6 +13054,7 @@ mod tests {
         assert!(format!("{vm_lab_iteration:?}").contains("VmLabIterateLiveLab"));
         assert!(format!("{vm_lab_iteration:?}").contains("CargoCheckPackage"));
         assert!(format!("{vm_lab_iteration:?}").contains("CargoTestBin"));
+        assert!(format!("{vm_lab_iteration:?}").contains("skip_cross_network: true"));
 
         let vm_lab_live_lab = parse_command(&[
             "ops".to_string(),
@@ -13677,6 +13748,27 @@ mod tests {
         assert!(!super::daemon_runtime_ready_from_status_text(
             "node_id=daemon-local state=DataplaneApplied restricted_safe_mode=false bootstrap_error=none last_reconcile_error=backend error"
         ));
+    }
+
+    #[test]
+    fn route_uses_rustynet0_requires_tunnel_device() {
+        assert!(super::route_uses_rustynet0(
+            "1.1.1.1 dev rustynet0 table 51820 src 100.68.223.117 uid 0"
+        ));
+        assert!(!super::route_uses_rustynet0(
+            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0"
+        ));
+    }
+
+    #[test]
+    fn status_field_extracts_exit_node() {
+        let status =
+            "node_id=client-1 state=ExitActive exit_node=client-2 restricted_safe_mode=false";
+        assert_eq!(
+            super::status_field(status, "exit_node").as_deref(),
+            Some("client-2")
+        );
+        assert_eq!(super::status_field(status, "missing"), None);
     }
 
     #[test]

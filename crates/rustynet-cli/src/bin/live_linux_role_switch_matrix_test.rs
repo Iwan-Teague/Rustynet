@@ -6,6 +6,7 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use live_lab_bin_support as live_lab_support;
 
@@ -14,6 +15,8 @@ use live_lab_support::{
     read_last_matching_line, remote_src_dir, require_command, run_cargo_ops, shell_quote,
     ssh_status, status, unix_now, wait_for_daemon_socket, write_file,
 };
+
+const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
 fn main() {
     if let Err(err) = run() {
@@ -321,7 +324,11 @@ fn process_host(
         node_id,
         ssh_allow_cidrs,
     )?;
-    let after_restore = wait_for_role(identity, known_hosts, host, "client")?;
+    let after_restore = if baseline_exit.is_empty() || baseline_exit == "none" {
+        wait_for_role(identity, known_hosts, host, "client")?
+    } else {
+        wait_for_client_exit_route_convergence(identity, known_hosts, host, &baseline_exit)?
+    };
 
     if field_value(&after_temp, "node_role") == temp_role
         && field_value(&after_restore, "node_role") == "client"
@@ -335,8 +342,7 @@ fn process_host(
             && field_value(&after_temp, "lan_access") == "off"
             && !baseline_exit.is_empty()
             && baseline_exit != "none"
-            && field_value(&after_restore, "exit_node") == baseline_exit
-            && route_via_rustynet0(identity, known_hosts, host)?
+            && client_exit_route_converged(&after_restore, &baseline_exit)
         {
             post_switch_reconcile = "pass";
         }
@@ -344,8 +350,7 @@ fn process_host(
         && baseline_exit != "none"
         && field_value(&after_temp, "serving_exit_node") == "false"
         && field_value(&after_temp, "exit_node") == baseline_exit
-        && field_value(&after_restore, "exit_node") == baseline_exit
-        && route_via_rustynet0(identity, known_hosts, host)?
+        && client_exit_route_converged(&after_restore, &baseline_exit)
     {
         post_switch_reconcile = "pass";
     }
@@ -443,14 +448,51 @@ fn role_runtime_ready(status_line: &str, role: &str) -> bool {
         && field_value(status_line, "last_reconcile_error") == "none"
 }
 
-fn route_via_rustynet0(identity: &Path, known_hosts: &Path, host: &str) -> Result<bool, String> {
-    let route = capture_root(
-        identity,
-        known_hosts,
-        host,
-        "ip -4 route get 1.1.1.1 || true",
-    )?;
-    Ok(route.contains("dev rustynet0"))
+fn client_exit_route_converged(status_line: &str, expected_exit: &str) -> bool {
+    role_runtime_ready(status_line, "client")
+        && field_value(status_line, "exit_node") == expected_exit
+        && route_uses_rustynet0(status_line)
+}
+
+fn route_uses_rustynet0(route: &str) -> bool {
+    route.contains("dev rustynet0")
+}
+
+fn wait_for_client_exit_route_convergence(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    expected_exit: &str,
+) -> Result<String, String> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS);
+    let mut last_status = String::new();
+    let mut last_route = String::new();
+    while start.elapsed() <= timeout {
+        last_status = status(identity, known_hosts, host)?;
+        let status_line = read_last_matching_line(&last_status, "node_id=");
+        let route = capture_root(
+            identity,
+            known_hosts,
+            host,
+            "ip -4 route get 1.1.1.1 || true",
+        )?;
+        last_route = route.trim().to_string();
+        let combined = if last_route.is_empty() {
+            status_line.clone()
+        } else {
+            format!("{status_line} route={}", sanitize_line(&last_route))
+        };
+        if client_exit_route_converged(&combined, expected_exit) {
+            return Ok(combined);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Err(format!(
+        "timed out waiting for {host} to restore client route convergence via rustynet0 for exit {expected_exit}: status={} route={}",
+        read_last_matching_line(&last_status, "node_id="),
+        sanitize_line(&last_route)
+    ))
 }
 
 fn route_advertise_denied(identity: &Path, known_hosts: &Path, host: &str) -> Result<bool, String> {
@@ -542,7 +584,7 @@ fn utc_now_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::role_runtime_ready;
+    use super::{client_exit_route_converged, role_runtime_ready, route_uses_rustynet0};
 
     #[test]
     fn role_runtime_ready_requires_converged_runtime_state() {
@@ -564,5 +606,27 @@ mod tests {
         let status = "node_id=client-1 node_role=admin state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none";
         assert!(role_runtime_ready(status, "admin"));
         assert!(!role_runtime_ready(status, "client"));
+    }
+
+    #[test]
+    fn route_uses_rustynet0_requires_tunnel_device() {
+        assert!(route_uses_rustynet0(
+            "1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0"
+        ));
+        assert!(!route_uses_rustynet0(
+            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0"
+        ));
+    }
+
+    #[test]
+    fn client_exit_route_converged_requires_ready_client_exit_and_route() {
+        let good = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0";
+        assert!(client_exit_route_converged(good, "exit-1"));
+
+        let wrong_exit = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-2 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0";
+        assert!(!client_exit_route_converged(wrong_exit, "exit-1"));
+
+        let underlay_route = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0";
+        assert!(!client_exit_route_converged(underlay_route, "exit-1"));
     }
 }

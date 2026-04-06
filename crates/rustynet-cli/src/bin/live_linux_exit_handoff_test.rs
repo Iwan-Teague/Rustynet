@@ -28,6 +28,7 @@ const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.manifest
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
+const HANDOFF_PRE_MONITOR_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedDnsRefreshTarget {
@@ -378,17 +379,27 @@ fn run() -> Result<(), String> {
         &config.exit_a_host,
         mkdir_dns_issue_dir_cmd.as_str(),
     )?;
-    logger.line("[exit-handoff] refreshing managed DNS bundle before monitor")?;
-    refresh_dns_bundles(
+    logger.line("[exit-handoff] refreshing signed handoff coordination before monitor")?;
+    refresh_handoff_coordination(
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.exit_a_host,
-        &nodes_spec,
-        &allow_spec,
-        dns_passphrase_remote.as_str(),
+        &config.exit_b_host,
+        &config.client_host,
+        &traversal_env,
+        &traversal_pub_local,
+        &exit_a_traversal_local,
+        &exit_b_traversal_local,
+        &client_traversal_local,
+        &config.exit_a_node_id,
+        &config.exit_b_node_id,
+        &config.client_node_id,
         &dns_verifier_local,
         &dns_records_by_node,
         &dns_refresh_targets,
+        dns_passphrase_remote.as_str(),
+        &nodes_spec,
+        &allow_spec,
     )?;
 
     logger.line("[exit-handoff] enforcing runtime roles")?;
@@ -458,20 +469,35 @@ fn run() -> Result<(), String> {
         "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
     )?;
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    wait_for_handoff_monitor_prereqs(
+        &mut logger,
+        &config,
+        &work_known_hosts,
+        &traversal_env,
+        &traversal_pub_local,
+        &exit_a_traversal_local,
+        &exit_b_traversal_local,
+        &client_traversal_local,
+        &dns_verifier_local,
+        &dns_records_by_node,
+        &dns_refresh_targets,
+        dns_passphrase_remote.as_str(),
+        &nodes_spec,
+        &allow_spec,
+    )?;
 
     let monitor_path = config.monitor_log.clone();
     write_file(&monitor_path, "")?;
     let mut switch_ts = 0u64;
-    let mut next_traversal_refresh_ts =
+    let mut next_coordination_refresh_ts =
         next_refresh_deadline(unix_now(), config.traversal_refresh_interval_secs);
     for i in 1..=config.monitor_iterations {
         let ts = unix_now();
-        if ts >= next_traversal_refresh_ts {
+        if ts >= next_coordination_refresh_ts {
             logger.line(
-                "[exit-handoff] refreshing signed traversal bundles during handoff monitor",
+                "[exit-handoff] refreshing signed handoff coordination during handoff monitor",
             )?;
-            refresh_traversal_bundles(
+            refresh_handoff_coordination(
                 &config.ssh_identity_file,
                 &work_known_hosts,
                 &config.exit_a_host,
@@ -485,9 +511,15 @@ fn run() -> Result<(), String> {
                 &config.exit_a_node_id,
                 &config.exit_b_node_id,
                 &config.client_node_id,
+                &dns_verifier_local,
+                &dns_records_by_node,
+                &dns_refresh_targets,
+                dns_passphrase_remote.as_str(),
+                &nodes_spec,
+                &allow_spec,
             )?;
-            next_traversal_refresh_ts = advance_periodic_refresh_deadline(
-                next_traversal_refresh_ts,
+            next_coordination_refresh_ts = advance_periodic_refresh_deadline(
+                next_coordination_refresh_ts,
                 config.traversal_refresh_interval_secs,
                 unix_now(),
             );
@@ -532,8 +564,9 @@ fn run() -> Result<(), String> {
             ),
         )?;
         if i == config.switch_iteration {
-            logger.line("[exit-handoff] refreshing signed traversal bundles before exit switch")?;
-            refresh_traversal_bundles(
+            logger
+                .line("[exit-handoff] refreshing signed handoff coordination before exit switch")?;
+            refresh_handoff_coordination(
                 &config.ssh_identity_file,
                 &work_known_hosts,
                 &config.exit_a_host,
@@ -547,8 +580,14 @@ fn run() -> Result<(), String> {
                 &config.exit_a_node_id,
                 &config.exit_b_node_id,
                 &config.client_node_id,
+                &dns_verifier_local,
+                &dns_records_by_node,
+                &dns_refresh_targets,
+                dns_passphrase_remote.as_str(),
+                &nodes_spec,
+                &allow_spec,
             )?;
-            next_traversal_refresh_ts =
+            next_coordination_refresh_ts =
                 next_refresh_deadline(unix_now(), config.traversal_refresh_interval_secs);
             switch_ts = ts;
             logger.line(
@@ -1004,6 +1043,60 @@ fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Re
 }
 
 #[allow(clippy::too_many_arguments)]
+fn refresh_handoff_coordination(
+    identity: &Path,
+    known_hosts: &Path,
+    signer_host: &str,
+    exit_b_host: &str,
+    client_host: &str,
+    traversal_env: &Path,
+    traversal_pub_local: &Path,
+    exit_a_traversal_local: &Path,
+    exit_b_traversal_local: &Path,
+    client_traversal_local: &Path,
+    exit_a_node_id: &str,
+    exit_b_node_id: &str,
+    client_node_id: &str,
+    verifier_local: &Path,
+    records_by_node: &HashMap<String, String>,
+    refresh_targets: &[ManagedDnsRefreshTarget],
+    passphrase_remote: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+) -> Result<(), String> {
+    refresh_traversal_bundles(
+        identity,
+        known_hosts,
+        signer_host,
+        exit_b_host,
+        client_host,
+        traversal_env,
+        traversal_pub_local,
+        exit_a_traversal_local,
+        exit_b_traversal_local,
+        client_traversal_local,
+        exit_a_node_id,
+        exit_b_node_id,
+        client_node_id,
+    )?;
+    refresh_dns_bundles(
+        identity,
+        known_hosts,
+        signer_host,
+        nodes_spec,
+        allow_spec,
+        passphrase_remote,
+        verifier_local,
+        records_by_node,
+        refresh_targets,
+    )?;
+    for target in refresh_targets {
+        refresh_signed_state(identity, known_hosts, target.host.as_str())?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn refresh_dns_bundles(
     identity: &Path,
     known_hosts: &Path,
@@ -1107,6 +1200,119 @@ fn managed_dns_state_is_valid(status: &str) -> bool {
     status.contains("dns_zone_state=valid")
         && status.contains("dns_zone_error=none")
         && status.contains("dns_alarm_state=ok")
+}
+
+fn route_uses_rustynet0(route: &str) -> bool {
+    route.contains("dev rustynet0")
+}
+
+fn handoff_monitor_prereqs_ready(
+    client_status: &str,
+    exit_a_status: &str,
+    exit_b_status: &str,
+    client_route: &str,
+    exit_a_node_id: &str,
+) -> bool {
+    status_field(client_status, "exit_node") == Some(exit_a_node_id)
+        && route_uses_rustynet0(client_route)
+        && managed_dns_state_is_valid(client_status)
+        && managed_dns_state_is_valid(exit_a_status)
+        && managed_dns_state_is_valid(exit_b_status)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_handoff_monitor_prereqs(
+    logger: &mut Logger,
+    config: &Config,
+    known_hosts: &Path,
+    traversal_env: &Path,
+    traversal_pub_local: &Path,
+    exit_a_traversal_local: &Path,
+    exit_b_traversal_local: &Path,
+    client_traversal_local: &Path,
+    dns_verifier_local: &Path,
+    dns_records_by_node: &HashMap<String, String>,
+    dns_refresh_targets: &[ManagedDnsRefreshTarget],
+    dns_passphrase_remote: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+) -> Result<(), String> {
+    logger.line(
+        "[exit-handoff] waiting for baseline exit route and managed DNS freshness before monitor",
+    )?;
+    let start_ts = unix_now();
+    let mut next_coordination_refresh_ts =
+        next_refresh_deadline(start_ts, config.traversal_refresh_interval_secs);
+    let mut last_client_status = String::new();
+    let mut last_exit_a_status = String::new();
+    let mut last_exit_b_status = String::new();
+    let mut last_client_route = String::new();
+
+    while unix_now().saturating_sub(start_ts) < HANDOFF_PRE_MONITOR_TIMEOUT_SECS {
+        let ts = unix_now();
+        if ts >= next_coordination_refresh_ts {
+            logger.line(
+                "[exit-handoff] refreshing signed handoff coordination during pre-monitor convergence",
+            )?;
+            refresh_handoff_coordination(
+                &config.ssh_identity_file,
+                known_hosts,
+                &config.exit_a_host,
+                &config.exit_b_host,
+                &config.client_host,
+                traversal_env,
+                traversal_pub_local,
+                exit_a_traversal_local,
+                exit_b_traversal_local,
+                client_traversal_local,
+                &config.exit_a_node_id,
+                &config.exit_b_node_id,
+                &config.client_node_id,
+                dns_verifier_local,
+                dns_records_by_node,
+                dns_refresh_targets,
+                dns_passphrase_remote,
+                nodes_spec,
+                allow_spec,
+            )?;
+            next_coordination_refresh_ts = advance_periodic_refresh_deadline(
+                next_coordination_refresh_ts,
+                config.traversal_refresh_interval_secs,
+                unix_now(),
+            );
+        }
+
+        last_client_status = status(&config.ssh_identity_file, known_hosts, &config.client_host)?;
+        last_exit_a_status = status(&config.ssh_identity_file, known_hosts, &config.exit_a_host)?;
+        last_exit_b_status = status(&config.ssh_identity_file, known_hosts, &config.exit_b_host)?;
+        last_client_route = capture_root(
+            &config.ssh_identity_file,
+            known_hosts,
+            &config.client_host,
+            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
+        )?;
+
+        if handoff_monitor_prereqs_ready(
+            &last_client_status,
+            &last_exit_a_status,
+            &last_exit_b_status,
+            &last_client_route,
+            &config.exit_a_node_id,
+        ) {
+            return Ok(());
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Err(format!(
+        "exit handoff baseline did not converge before monitor within {}s: client_route={} client_status={} exit_a_status={} exit_b_status={}",
+        HANDOFF_PRE_MONITOR_TIMEOUT_SECS,
+        last_client_route.replace('\n', " "),
+        last_client_status.replace('\n', " "),
+        last_exit_a_status.replace('\n', " "),
+        last_exit_b_status.replace('\n', " "),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1400,8 +1606,9 @@ fn utc_now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, managed_dns_base_records, managed_dns_records_manifest_for_scope,
-        managed_dns_refresh_targets, managed_dns_state_is_valid, parse_assignment_authority_scope,
+        Config, handoff_monitor_prereqs_ready, managed_dns_base_records,
+        managed_dns_records_manifest_for_scope, managed_dns_refresh_targets,
+        managed_dns_state_is_valid, parse_assignment_authority_scope, route_uses_rustynet0,
     };
     use std::path::{Path, PathBuf};
 
@@ -1533,5 +1740,52 @@ peer.1.endpoint=192.168.128.26:51820
             Some("none")
         );
         assert_eq!(super::status_field(status, "missing"), None);
+    }
+
+    #[test]
+    fn route_uses_rustynet0_requires_tunnel_device() {
+        assert!(route_uses_rustynet0(
+            "1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10 uid 0"
+        ));
+        assert!(!route_uses_rustynet0(
+            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0"
+        ));
+    }
+
+    #[test]
+    fn handoff_monitor_prereqs_require_exit_a_route_and_fresh_dns() {
+        let client_status =
+            "exit_node=exit-1 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
+        let exit_a_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
+        let exit_b_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
+        let route = "1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10 uid 0";
+        assert!(handoff_monitor_prereqs_ready(
+            client_status,
+            exit_a_status,
+            exit_b_status,
+            route,
+            "exit-1",
+        ));
+        assert!(!handoff_monitor_prereqs_ready(
+            client_status,
+            exit_a_status,
+            exit_b_status,
+            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0",
+            "exit-1",
+        ));
+        assert!(!handoff_monitor_prereqs_ready(
+            "exit_node=exit-1 dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error",
+            exit_a_status,
+            exit_b_status,
+            route,
+            "exit-1",
+        ));
+        assert!(!handoff_monitor_prereqs_ready(
+            "exit_node=client-2 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            exit_a_status,
+            exit_b_status,
+            route,
+            "exit-1",
+        ));
     }
 }
