@@ -29,6 +29,7 @@ const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const HANDOFF_PRE_MONITOR_TIMEOUT_SECS: u64 = 60;
+const HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManagedDnsRefreshTarget {
@@ -517,6 +518,16 @@ fn run() -> Result<(), String> {
                 dns_passphrase_remote.as_str(),
                 &nodes_spec,
                 &allow_spec,
+            )?;
+            wait_for_handoff_monitor_expected_exit(
+                &mut logger,
+                &config,
+                &work_known_hosts,
+                if switch_ts == 0 {
+                    &config.exit_a_node_id
+                } else {
+                    &config.exit_b_node_id
+                },
             )?;
             next_coordination_refresh_ts = advance_periodic_refresh_deadline(
                 next_coordination_refresh_ts,
@@ -1202,6 +1213,13 @@ fn managed_dns_state_is_valid(status: &str) -> bool {
         && status.contains("dns_alarm_state=ok")
 }
 
+fn handoff_runtime_ready(status: &str) -> bool {
+    status_field(status, "restricted_safe_mode").as_deref() == Some("false")
+        && status_field(status, "bootstrap_error").as_deref() == Some("none")
+        && status_field(status, "last_reconcile_error").as_deref() == Some("none")
+        && status_field(status, "state").as_deref() != Some("FailClosed")
+}
+
 fn route_uses_rustynet0(route: &str) -> bool {
     route.contains("dev rustynet0")
 }
@@ -1215,9 +1233,64 @@ fn handoff_monitor_prereqs_ready(
 ) -> bool {
     status_field(client_status, "exit_node") == Some(exit_a_node_id)
         && route_uses_rustynet0(client_route)
+        && handoff_runtime_ready(client_status)
         && managed_dns_state_is_valid(client_status)
         && managed_dns_state_is_valid(exit_a_status)
         && managed_dns_state_is_valid(exit_b_status)
+}
+
+fn wait_for_handoff_monitor_expected_exit(
+    logger: &mut Logger,
+    config: &Config,
+    known_hosts: &Path,
+    expected_exit_node_id: &str,
+) -> Result<(), String> {
+    logger.line(
+        format!(
+            "[exit-handoff] waiting for protected-route convergence after coordination refresh on {}",
+            expected_exit_node_id
+        )
+        .as_str(),
+    )?;
+    let start_ts = unix_now();
+    let mut last_client_status = String::new();
+    let mut last_exit_a_status = String::new();
+    let mut last_exit_b_status = String::new();
+    let mut last_client_route = String::new();
+
+    while unix_now().saturating_sub(start_ts) < HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS {
+        last_client_status = status(&config.ssh_identity_file, known_hosts, &config.client_host)?;
+        last_exit_a_status = status(&config.ssh_identity_file, known_hosts, &config.exit_a_host)?;
+        last_exit_b_status = status(&config.ssh_identity_file, known_hosts, &config.exit_b_host)?;
+        last_client_route = capture_root(
+            &config.ssh_identity_file,
+            known_hosts,
+            &config.client_host,
+            "ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true",
+        )?;
+
+        if handoff_monitor_prereqs_ready(
+            &last_client_status,
+            &last_exit_a_status,
+            &last_exit_b_status,
+            &last_client_route,
+            expected_exit_node_id,
+        ) {
+            return Ok(());
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Err(format!(
+        "exit handoff protected-route convergence did not recover after coordination refresh within {}s for {}: client_route={} client_status={} exit_a_status={} exit_b_status={}",
+        HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS,
+        expected_exit_node_id,
+        last_client_route.replace('\n', " "),
+        last_client_status.replace('\n', " "),
+        last_exit_a_status.replace('\n', " "),
+        last_exit_b_status.replace('\n', " "),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1606,7 +1679,7 @@ fn utc_now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, handoff_monitor_prereqs_ready, managed_dns_base_records,
+        Config, handoff_monitor_prereqs_ready, handoff_runtime_ready, managed_dns_base_records,
         managed_dns_records_manifest_for_scope, managed_dns_refresh_targets,
         managed_dns_state_is_valid, parse_assignment_authority_scope, route_uses_rustynet0,
     };
@@ -1668,6 +1741,25 @@ mod tests {
         ));
         assert!(!managed_dns_state_is_valid(
             "dns_zone_state=valid dns_zone_error=none dns_alarm_state=error"
+        ));
+    }
+
+    #[test]
+    fn handoff_runtime_ready_requires_non_restricted_non_failclosed_state() {
+        assert!(handoff_runtime_ready(
+            "state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none"
+        ));
+        assert!(!handoff_runtime_ready(
+            "state=ExitActive restricted_safe_mode=true bootstrap_error=none last_reconcile_error=none"
+        ));
+        assert!(!handoff_runtime_ready(
+            "state=FailClosed restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none"
+        ));
+        assert!(!handoff_runtime_ready(
+            "state=ExitActive restricted_safe_mode=false bootstrap_error=traversal_sync_failed last_reconcile_error=none"
+        ));
+        assert!(!handoff_runtime_ready(
+            "state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=route_apply_failed"
         ));
     }
 
@@ -1754,8 +1846,7 @@ peer.1.endpoint=192.168.128.26:51820
 
     #[test]
     fn handoff_monitor_prereqs_require_exit_a_route_and_fresh_dns() {
-        let client_status =
-            "exit_node=exit-1 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
+        let client_status = "exit_node=exit-1 state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
         let exit_a_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
         let exit_b_status = "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok";
         let route = "1.1.1.1 dev rustynet0 table 51820 src 100.64.0.10 uid 0";
@@ -1774,14 +1865,21 @@ peer.1.endpoint=192.168.128.26:51820
             "exit-1",
         ));
         assert!(!handoff_monitor_prereqs_ready(
-            "exit_node=exit-1 dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error",
+            "exit_node=exit-1 state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error",
             exit_a_status,
             exit_b_status,
             route,
             "exit-1",
         ));
         assert!(!handoff_monitor_prereqs_ready(
-            "exit_node=client-2 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "exit_node=client-2 state=ExitActive restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            exit_a_status,
+            exit_b_status,
+            route,
+            "exit-1",
+        ));
+        assert!(!handoff_monitor_prereqs_ready(
+            "exit_node=exit-1 state=FailClosed restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
             exit_a_status,
             exit_b_status,
             route,
