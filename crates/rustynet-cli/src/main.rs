@@ -8995,8 +8995,7 @@ fn wait_for_runtime_ready_after_restart(
         };
         if Instant::now() >= deadline {
             return Err(format!(
-                "daemon did not become runtime-ready after restart: {}",
-                last_observation
+                "daemon did not become runtime-ready after restart: {last_observation}"
             ));
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -9688,8 +9687,8 @@ fn wait_for_client_exit_route_convergence(
             last_route = String::from_utf8_lossy(&route_output.stdout)
                 .trim()
                 .to_string();
-            if status_field(status.message.as_str(), "exit_node").as_deref()
-                == Some(expected_exit_node)
+            if status_field(status.message.as_str(), "exit_node")
+                == Some(expected_exit_node.to_string())
                 && daemon_runtime_ready_from_status_text(status.message.as_str())
                 && route_output.status.success()
                 && route_uses_rustynet0(last_route.as_str())
@@ -9700,8 +9699,7 @@ fn wait_for_client_exit_route_convergence(
         std::thread::sleep(Duration::from_secs(1));
     }
     Err(format!(
-        "timed out waiting for client exit route convergence to {expected_exit_node}: status={} route={}",
-        last_status, last_route
+        "timed out waiting for client exit route convergence to {expected_exit_node}: status={last_status} route={last_route}"
     ))
 }
 

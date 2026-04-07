@@ -3805,7 +3805,6 @@ impl DaemonRuntime {
         #[cfg(test)]
         if let Some(snapshot) = self.test_local_host_candidates_snapshot.clone() {
             self.local_host_candidates = snapshot;
-            return;
         }
 
         #[cfg(target_os = "linux")]

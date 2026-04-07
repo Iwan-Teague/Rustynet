@@ -1214,10 +1214,10 @@ fn managed_dns_state_is_valid(status: &str) -> bool {
 }
 
 fn handoff_runtime_ready(status: &str) -> bool {
-    status_field(status, "restricted_safe_mode").as_deref() == Some("false")
-        && status_field(status, "bootstrap_error").as_deref() == Some("none")
-        && status_field(status, "last_reconcile_error").as_deref() == Some("none")
-        && status_field(status, "state").as_deref() != Some("FailClosed")
+    status_field(status, "restricted_safe_mode") == Some("false")
+        && status_field(status, "bootstrap_error") == Some("none")
+        && status_field(status, "last_reconcile_error") == Some("none")
+        && status_field(status, "state") != Some("FailClosed")
 }
 
 fn route_uses_rustynet0(route: &str) -> bool {
