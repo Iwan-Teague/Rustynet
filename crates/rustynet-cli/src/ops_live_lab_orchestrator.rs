@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +29,21 @@ pub struct CheckLocalFileModeConfig {
 pub struct WriteCrossNetworkForensicsManifestConfig {
     pub stage: String,
     pub collected_at_utc: String,
+    pub stage_dir: PathBuf,
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLabStageArtifactIndexConfig {
+    pub stage_name: String,
+    pub stage_dir: PathBuf,
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateCrossNetworkForensicsBundleConfig {
+    pub nodes_tsv: PathBuf,
+    pub stage_name: String,
     pub stage_dir: PathBuf,
     pub output: PathBuf,
 }
@@ -478,6 +494,94 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn collected_at_utc_now() -> String {
+    Command::new("date")
+        .arg("-u")
+        .arg("+%FT%TZ")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("unix:{}", unix_now()))
+}
+
+fn sha256_hex_for_file(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("read file failed ({}): {err}", path.display()))?;
+    let digest = Sha256::digest(bytes.as_slice());
+    Ok(format!("{digest:x}"))
+}
+
+fn walk_stage_files_recursive(
+    root: &Path,
+    current: &Path,
+    excluded_output: Option<&Path>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|err| format!("read directory failed ({}): {err}", current.display()))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let resolved = resolve_path(path.as_path())?;
+        if excluded_output == Some(resolved.as_path()) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("read file type failed ({}): {err}", entry.path().display()))?;
+        if file_type.is_dir() {
+            walk_stage_files_recursive(root, resolved.as_path(), excluded_output, files)?;
+            continue;
+        }
+        if file_type.is_file() {
+            if !resolved.starts_with(root) {
+                return Err(format!(
+                    "stage artifact escaped stage root: {} not under {}",
+                    resolved.display(),
+                    root.display()
+                ));
+            }
+            files.push(resolved);
+            continue;
+        }
+        if file_type.is_symlink() {
+            return Err(format!(
+                "stage artifact must not be a symlink: {}",
+                resolved.display()
+            ));
+        }
+        return Err(format!(
+            "unsupported stage artifact type: {}",
+            resolved.display()
+        ));
+    }
+    Ok(())
+}
+
+fn expected_forensics_node_files() -> &'static [&'static str] {
+    &[
+        "service_snapshot.txt",
+        "network_snapshot.txt",
+        "route_policy.txt",
+        "dns_state.txt",
+        "time_snapshot.txt",
+        "process_snapshot.txt",
+        "socket_snapshot.txt",
+        "permissions_snapshot.txt",
+        "firewall.txt",
+        "dns_zone.txt",
+        "signed_state.txt",
+        "secret_hygiene.txt",
+        "node_snapshot.txt",
+        "node_identity.txt",
+    ]
+}
+
 fn parse_pass_fail(value: &str, label: &str) -> Result<String, String> {
     let normalized = value.trim();
     if normalized == CHECK_PASS || normalized == CHECK_FAIL {
@@ -911,12 +1015,261 @@ pub fn execute_ops_write_cross_network_forensics_manifest(
     Ok(output.display().to_string())
 }
 
+pub fn execute_ops_write_live_lab_stage_artifact_index(
+    config: WriteLiveLabStageArtifactIndexConfig,
+) -> Result<String, String> {
+    let stage_name = config.stage_name.trim();
+    if stage_name.is_empty() {
+        return Err("stage-name is required".to_string());
+    }
+
+    let stage_dir = resolve_path(config.stage_dir.as_path())?;
+    let output = resolve_path(config.output.as_path())?;
+    if !stage_dir.is_dir() {
+        return Err(format!(
+            "stage-dir must be an existing directory: {}",
+            stage_dir.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    walk_stage_files_recursive(
+        stage_dir.as_path(),
+        stage_dir.as_path(),
+        Some(output.as_path()),
+        &mut files,
+    )?;
+
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+    for path in files {
+        let metadata = fs::metadata(path.as_path())
+            .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "stage artifact must be a regular file: {}",
+                path.display()
+            ));
+        }
+        let relative_path = path
+            .strip_prefix(stage_dir.as_path())
+            .unwrap_or(path.as_path())
+            .display()
+            .to_string();
+        let size_bytes = metadata.len();
+        total_bytes = total_bytes.saturating_add(size_bytes);
+        entries.push(json!({
+            "relative_path": relative_path,
+            "size_bytes": size_bytes,
+            "sha256": sha256_hex_for_file(path.as_path())?,
+        }));
+    }
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_lab_stage_artifact_index",
+        "stage_name": stage_name,
+        "stage_dir": stage_dir.display().to_string(),
+        "collected_at_utc": collected_at_utc_now(),
+        "file_count": entries.len(),
+        "total_bytes": total_bytes,
+        "files": entries,
+    });
+    write_json_pretty(output.as_path(), &payload)?;
+    Ok(output.display().to_string())
+}
+
 pub fn execute_ops_sha256_file(config: Sha256FileConfig) -> Result<String, String> {
     let path = resolve_path(config.path.as_path())?;
     let bytes = fs::read(path.as_path())
         .map_err(|err| format!("read file failed ({}): {err}", path.display()))?;
     let digest = Sha256::digest(bytes.as_slice());
     Ok(format!("{digest:x}"))
+}
+
+pub fn execute_ops_validate_cross_network_forensics_bundle(
+    config: ValidateCrossNetworkForensicsBundleConfig,
+) -> Result<String, String> {
+    let stage_name = config.stage_name.trim();
+    if stage_name.is_empty() {
+        return Err("stage-name is required".to_string());
+    }
+
+    let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+    let stage_dir = resolve_path(config.stage_dir.as_path())?;
+    let output = resolve_path(config.output.as_path())?;
+    if !stage_dir.is_dir() {
+        return Err(format!(
+            "stage-dir must be an existing directory: {}",
+            stage_dir.display()
+        ));
+    }
+
+    let rows = read_tsv_rows(nodes_tsv.as_path())?;
+    if rows.is_empty() {
+        return Err(format!(
+            "nodes-tsv must contain at least one row: {}",
+            nodes_tsv.display()
+        ));
+    }
+
+    let required_stage_files = ["manifest.json", "route_matrix.txt", "cluster_snapshot.txt"];
+    let mut missing_files = Vec::new();
+    let mut empty_files = Vec::new();
+    let mut invalid_files = Vec::new();
+    let mut nodes = Vec::new();
+
+    for file_name in required_stage_files {
+        let path = stage_dir.join(file_name);
+        if !path.exists() {
+            missing_files.push(path.display().to_string());
+            continue;
+        }
+        let metadata = fs::metadata(path.as_path())
+            .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+        if metadata.len() == 0 {
+            empty_files.push(path.display().to_string());
+        }
+    }
+
+    let manifest_path = stage_dir.join("manifest.json");
+    if manifest_path.exists() {
+        let body = fs::read_to_string(manifest_path.as_path())
+            .map_err(|err| format!("read JSON failed ({}): {err}", manifest_path.display()))?;
+        if body.trim().is_empty() {
+            empty_files.push(manifest_path.display().to_string());
+        } else {
+            match serde_json::from_str::<Value>(body.as_str()) {
+                Ok(manifest) => {
+                    let manifest_mode = manifest
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let manifest_stage = manifest
+                        .get("stage")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let manifest_bundle_dir = manifest
+                        .get("bundle_dir")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let manifest_nodes = manifest
+                        .get("nodes")
+                        .and_then(Value::as_array)
+                        .map(|nodes| nodes.len())
+                        .unwrap_or_default();
+                    if manifest_mode != "cross_network_failure_forensics" {
+                        invalid_files.push(format!(
+                            "{}: unexpected mode {manifest_mode:?}",
+                            manifest_path.display()
+                        ));
+                    }
+                    if manifest_stage != stage_name {
+                        invalid_files.push(format!(
+                            "{}: unexpected stage {manifest_stage:?}",
+                            manifest_path.display()
+                        ));
+                    }
+                    if manifest_bundle_dir != stage_dir.display().to_string() {
+                        invalid_files.push(format!(
+                            "{}: unexpected bundle_dir {manifest_bundle_dir:?}",
+                            manifest_path.display()
+                        ));
+                    }
+                    if manifest_nodes != rows.len() {
+                        invalid_files.push(format!(
+                            "{}: manifest node count {manifest_nodes} does not match topology node count {}",
+                            manifest_path.display(),
+                            rows.len()
+                        ));
+                    }
+                }
+                Err(err) => {
+                    invalid_files.push(format!(
+                        "{}: parse JSON failed: {err}",
+                        manifest_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    for row in rows {
+        if row.len() != 4 {
+            return Err(format!(
+                "nodes-tsv rows must contain 4 columns: {}",
+                nodes_tsv.display()
+            ));
+        }
+
+        let label = row[0].clone();
+        let target = row[1].clone();
+        let node_id = row[2].clone();
+        let role = row[3].clone();
+        let node_dir = stage_dir.join(label.as_str());
+        let mut node_missing_files = Vec::new();
+        let mut node_empty_files = Vec::new();
+
+        for file_name in expected_forensics_node_files() {
+            let path = node_dir.join(file_name);
+            let relative_path = path
+                .strip_prefix(stage_dir.as_path())
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+            if !path.exists() {
+                node_missing_files.push(relative_path.clone());
+                missing_files.push(relative_path);
+                continue;
+            }
+            let metadata = fs::metadata(path.as_path())
+                .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+            if metadata.len() == 0 {
+                node_empty_files.push(relative_path.clone());
+                empty_files.push(relative_path);
+            }
+        }
+
+        nodes.push(json!({
+            "label": label,
+            "target": target,
+            "node_id": node_id,
+            "role": role,
+            "node_dir": node_dir.display().to_string(),
+            "missing_files": node_missing_files,
+            "empty_files": node_empty_files,
+        }));
+    }
+
+    let bundle_status =
+        if missing_files.is_empty() && empty_files.is_empty() && invalid_files.is_empty() {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        };
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "cross_network_forensics_bundle_validation",
+        "stage_name": stage_name,
+        "stage_dir": stage_dir.display().to_string(),
+        "collected_at_utc": collected_at_utc_now(),
+        "bundle_status": bundle_status,
+        "node_count": nodes.len(),
+        "required_stage_files": required_stage_files,
+        "required_node_files": expected_forensics_node_files(),
+        "missing_file_count": missing_files.len(),
+        "empty_file_count": empty_files.len(),
+        "invalid_file_count": invalid_files.len(),
+        "missing_files": missing_files,
+        "empty_files": empty_files,
+        "invalid_files": invalid_files,
+        "nodes": nodes,
+    });
+    write_json_pretty(output.as_path(), &payload)?;
+    if bundle_status != CHECK_PASS {
+        return Err("cross-network forensics bundle validation failed".to_string());
+    }
+    Ok(output.display().to_string())
 }
 
 pub fn execute_ops_write_cross_network_preflight_report(
@@ -1083,6 +1436,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
     let stages_tsv = resolve_path(config.stages_tsv.as_path())?;
     let summary_json = resolve_path(config.summary_json.as_path())?;
     let summary_md = resolve_path(config.summary_md.as_path())?;
+    let report_dir = resolve_path(Path::new(config.report_dir.as_str()))?;
 
     let node_rows = read_tsv_rows(nodes_tsv.as_path())?;
     let stage_rows = read_tsv_rows(stages_tsv.as_path())?;
@@ -1104,9 +1458,21 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         .into_iter()
         .filter(|row| row.len() == 8)
         .map(|row| {
+            let stage_name = row[0].clone();
             let rc = row[3].parse::<i64>().unwrap_or(1);
+            let worker_results =
+                read_parallel_stage_results(report_dir.as_path(), stage_name.as_str());
+            let failed_worker_count = worker_results
+                .iter()
+                .filter(|worker| worker.rc != 0)
+                .count() as u64;
+            let primary_failure_reason = worker_results
+                .iter()
+                .find(|worker| worker.rc != 0)
+                .map(|worker| worker.primary_failure_reason.clone())
+                .unwrap_or_default();
             json!({
-                "stage": row[0],
+                "stage": stage_name,
                 "severity": row[1],
                 "status": row[2],
                 "rc": rc,
@@ -1114,6 +1480,27 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
                 "message": row[5],
                 "started_at": row[6],
                 "finished_at": row[7],
+                "failed_worker_count": failed_worker_count,
+                "primary_failure_reason": primary_failure_reason,
+                "worker_results": worker_results
+                    .into_iter()
+                    .map(|worker: LiveLabWorkerResult| {
+                        json!({
+                            "label": worker.label,
+                            "target": worker.target,
+                            "node_id": worker.node_id,
+                            "role": worker.role,
+                            "rc": worker.rc,
+                            "started_at": worker.started_at,
+                            "finished_at": worker.finished_at,
+                            "log_path": worker.log_path,
+                            "snapshot_path": worker.snapshot_path,
+                            "route_policy_path": worker.route_policy_path,
+                            "dns_state_path": worker.dns_state_path,
+                            "primary_failure_reason": worker.primary_failure_reason,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -1122,7 +1509,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         "schema_version": 1,
         "run_id": config.run_id,
         "network_id": config.network_id,
-        "report_dir": config.report_dir,
+        "report_dir": report_dir.display().to_string(),
         "overall_status": config.overall_status,
         "started_at_local": config.started_at_local,
         "started_at_utc": config.started_at_utc,
@@ -1259,6 +1646,42 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
                     .and_then(Value::as_str)
                     .unwrap_or("stage detail unavailable")
             ));
+            if let Some(worker_results) = stage.get("worker_results").and_then(Value::as_array)
+                && !worker_results.is_empty()
+            {
+                lines.push(format!(
+                    "  workers: {}/{} failed",
+                    stage
+                        .get("failed_worker_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    worker_results.len()
+                ));
+                if let Some(first_failed) = worker_results
+                    .iter()
+                    .find(|worker| worker.get("rc").and_then(Value::as_i64).unwrap_or(0) != 0)
+                {
+                    lines.push(format!(
+                        "  first_failed_node: `{}` reason={}",
+                        first_failed
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        first_failed
+                            .get("primary_failure_reason")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("see worker log")
+                    ));
+                    if let Some(snapshot_path) = first_failed
+                        .get("snapshot_path")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
+                        lines.push(format!("  snapshot: `{snapshot_path}`"));
+                    }
+                }
+            }
         }
     }
     ensure_parent_dir(summary_md.as_path())?;
@@ -2489,24 +2912,30 @@ mod tests {
     use super::{
         CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
         RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
-        UpdateRoleSwitchHostResultConfig, WriteActiveNetworkRoguePathHijackReportConfig,
-        WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLinuxControlSurfaceReportConfig,
-        WriteLiveLinuxEndpointHijackReportConfig, WriteLiveLinuxRebootRecoveryReportConfig,
+        UpdateRoleSwitchHostResultConfig, ValidateCrossNetworkForensicsBundleConfig,
+        WriteActiveNetworkRoguePathHijackReportConfig,
+        WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLabStageArtifactIndexConfig,
+        WriteLiveLinuxControlSurfaceReportConfig, WriteLiveLinuxEndpointHijackReportConfig,
+        WriteLiveLinuxLabRunSummaryConfig, WriteLiveLinuxRebootRecoveryReportConfig,
         WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
         WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
         count_no_leak_tunnel_packets, dns_query_bind_addr, execute_ops_check_local_file_mode,
         execute_ops_extract_managed_dns_expected_ip, execute_ops_rewrite_assignment_mesh_cidr,
         execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
+        execute_ops_validate_cross_network_forensics_bundle,
         execute_ops_write_active_network_rogue_path_hijack_report,
         execute_ops_write_active_network_signed_state_tamper_report,
+        execute_ops_write_live_lab_stage_artifact_index,
         execute_ops_write_live_linux_control_surface_report,
         execute_ops_write_live_linux_endpoint_hijack_report,
+        execute_ops_write_live_linux_lab_run_summary,
         execute_ops_write_live_linux_reboot_recovery_report,
         execute_ops_write_live_linux_server_ip_bypass_report,
         execute_ops_write_real_wireguard_exitnode_e2e_report,
         execute_ops_write_role_switch_matrix_report, redact_forensics_payload,
     };
+    use serde_json::Value;
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
     use std::os::unix::fs::PermissionsExt;
@@ -2643,6 +3072,81 @@ mod tests {
         );
 
         let _ = fs::remove_file(observations_path.as_path());
+    }
+
+    #[test]
+    fn live_lab_run_summary_includes_parallel_worker_results() {
+        let report_dir = temp_path("live-lab-summary");
+        let state_dir = report_dir.join("state");
+        fs::create_dir_all(state_dir.join("parallel-validate_baseline_runtime"))
+            .expect("parallel stage dir");
+        fs::write(
+            state_dir.join("nodes.tsv"),
+            "client\tdebian@client\tclient-1\tclient\n",
+        )
+        .expect("nodes write");
+        fs::write(
+            state_dir.join("stages.tsv"),
+            "validate_baseline_runtime\thard\tfail\t1\t/tmp/stage.log\tbaseline validation failed\t2026-04-08T10:00:00Z\t2026-04-08T10:00:10Z\n",
+        )
+        .expect("stages write");
+        fs::write(
+            state_dir.join("parallel-validate_baseline_runtime/results.tsv"),
+            "validate_baseline_runtime\tclient\tdebian@client\tclient-1\tclient\t1\t2026-04-08T10:00:00Z\t2026-04-08T10:00:10Z\t/tmp/client.log\t/tmp/snapshot.txt\t/tmp/route.txt\t/tmp/dns.txt\troute missing\n",
+        )
+        .expect("results write");
+
+        let summary_json = report_dir.join("run_summary.json");
+        let summary_md = report_dir.join("run_summary.md");
+        execute_ops_write_live_linux_lab_run_summary(WriteLiveLinuxLabRunSummaryConfig {
+            nodes_tsv: state_dir.join("nodes.tsv"),
+            stages_tsv: state_dir.join("stages.tsv"),
+            summary_json: summary_json.clone(),
+            summary_md: summary_md.clone(),
+            run_id: "run-1".to_string(),
+            network_id: "net-1".to_string(),
+            report_dir: report_dir.display().to_string(),
+            overall_status: "fail".to_string(),
+            started_at_local: "2026-04-08 11:00:00 UTC".to_string(),
+            started_at_utc: "2026-04-08T10:00:00Z".to_string(),
+            started_at_unix: 1,
+            finished_at_local: "2026-04-08 11:00:10 UTC".to_string(),
+            finished_at_utc: "2026-04-08T10:00:10Z".to_string(),
+            finished_at_unix: 11,
+            elapsed_secs: 10,
+            elapsed_human: "00m 10s".to_string(),
+        })
+        .expect("summary should write");
+
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(summary_json).expect("summary json"))
+                .expect("summary json parses");
+        let stages = payload
+            .get("stages")
+            .and_then(Value::as_array)
+            .expect("stages array present");
+        assert_eq!(stages.len(), 1);
+        assert_eq!(
+            stages[0].get("failed_worker_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        let worker_results = stages[0]
+            .get("worker_results")
+            .and_then(Value::as_array)
+            .expect("worker results present");
+        assert_eq!(worker_results.len(), 1);
+        assert_eq!(
+            worker_results[0]
+                .get("snapshot_path")
+                .and_then(Value::as_str),
+            Some("/tmp/snapshot.txt")
+        );
+
+        let markdown = fs::read_to_string(summary_md).expect("summary md");
+        assert!(markdown.contains("workers: 1/1 failed"));
+        assert!(markdown.contains("snapshot: `/tmp/snapshot.txt`"));
+
+        let _ = fs::remove_dir_all(report_dir);
     }
 
     #[test]
@@ -3005,5 +3509,178 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         assert!(body.contains("\"mode\": \"active_network_rogue_path_hijack\""));
         assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
         let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn live_lab_stage_artifact_index_writes_recursive_file_index() {
+        let stage_dir = temp_path("stage-artifact-index");
+        let nested_dir = stage_dir.join("nested");
+        fs::create_dir_all(&nested_dir).expect("nested dir");
+        fs::write(stage_dir.join("alpha.txt"), "alpha").expect("alpha write");
+        fs::write(nested_dir.join("beta.txt"), "beta").expect("beta write");
+        fs::write(stage_dir.join("artifact_index.json"), "stale output").expect("stale write");
+
+        let output = stage_dir.join("artifact_index.json");
+        execute_ops_write_live_lab_stage_artifact_index(WriteLiveLabStageArtifactIndexConfig {
+            stage_name: "cross_network_direct_remote_exit".to_string(),
+            stage_dir: stage_dir.clone(),
+            output: output.clone(),
+        })
+        .expect("artifact index should write");
+
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(output.as_path()).expect("artifact json"))
+                .expect("artifact json parses");
+        assert_eq!(
+            payload.get("mode").and_then(Value::as_str),
+            Some("live_lab_stage_artifact_index")
+        );
+        assert_eq!(payload.get("file_count").and_then(Value::as_u64), Some(2));
+        let files = payload
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("files array");
+        assert_eq!(files.len(), 2);
+        let relative_paths = files
+            .iter()
+            .filter_map(|entry| entry.get("relative_path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(relative_paths.contains(&"alpha.txt"));
+        assert!(relative_paths.contains(&"nested/beta.txt"));
+
+        let _ = fs::remove_dir_all(stage_dir);
+    }
+
+    #[test]
+    fn validate_cross_network_forensics_bundle_accepts_complete_bundle() {
+        let stage_dir = temp_path("bundle-validation-pass");
+        let node_dir = stage_dir.join("client");
+        fs::create_dir_all(&node_dir).expect("node dir");
+        fs::create_dir_all(stage_dir.join("nested")).expect("nested dir");
+        fs::write(stage_dir.join("manifest.json"), r#"{"schema_version":1,"mode":"cross_network_failure_forensics","stage":"cross_network_direct_remote_exit","collected_at_utc":"2026-04-08T10:00:00Z","bundle_dir":"PLACEHOLDER","nodes":[{"label":"client","files":["client/service_snapshot.txt"]}]}"#).expect("manifest write");
+        fs::write(
+            stage_dir.join("route_matrix.txt"),
+            "route_matrix_status=pass\n",
+        )
+        .expect("route matrix");
+        fs::write(
+            stage_dir.join("cluster_snapshot.txt"),
+            "cluster_snapshot_status=pass\n",
+        )
+        .expect("cluster snapshot");
+
+        for file_name in super::expected_forensics_node_files() {
+            fs::write(node_dir.join(file_name), format!("{file_name}\n")).expect("node artifact");
+        }
+
+        let manifest_path = stage_dir.join("manifest.json");
+        let manifest_body = fs::read_to_string(manifest_path.as_path()).expect("manifest read");
+        let stage_dir_text = stage_dir.display().to_string();
+        let manifest_body = manifest_body.replace("PLACEHOLDER", stage_dir_text.as_str());
+        fs::write(manifest_path.as_path(), manifest_body).expect("manifest rewrite");
+
+        fs::write(
+            stage_dir.join("nodes.tsv"),
+            "client\tdebian@client\tclient-1\tclient\n",
+        )
+        .expect("nodes write");
+
+        let output = stage_dir.join("bundle_validation.json");
+        execute_ops_validate_cross_network_forensics_bundle(
+            ValidateCrossNetworkForensicsBundleConfig {
+                nodes_tsv: stage_dir.join("nodes.tsv"),
+                stage_name: "cross_network_direct_remote_exit".to_string(),
+                stage_dir: stage_dir.clone(),
+                output: output.clone(),
+            },
+        )
+        .expect("bundle validation should pass");
+
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(output.as_path()).expect("validation json"))
+                .expect("validation json parses");
+        assert_eq!(
+            payload.get("bundle_status").and_then(Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            payload.get("missing_file_count").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            payload.get("empty_file_count").and_then(Value::as_u64),
+            Some(0)
+        );
+
+        let _ = fs::remove_dir_all(stage_dir);
+    }
+
+    #[test]
+    fn validate_cross_network_forensics_bundle_rejects_missing_artifacts() {
+        let stage_dir = temp_path("bundle-validation-fail");
+        let node_dir = stage_dir.join("client");
+        fs::create_dir_all(&node_dir).expect("node dir");
+        fs::write(
+            stage_dir.join("manifest.json"),
+            r#"{"schema_version":1,"mode":"cross_network_failure_forensics","stage":"cross_network_direct_remote_exit","collected_at_utc":"2026-04-08T10:00:00Z","bundle_dir":"PLACEHOLDER","nodes":[{"label":"client","files":["client/service_snapshot.txt"]}]}"#,
+        )
+        .expect("manifest write");
+        fs::write(
+            stage_dir.join("route_matrix.txt"),
+            "route_matrix_status=pass\n",
+        )
+        .expect("route matrix");
+        fs::write(
+            stage_dir.join("cluster_snapshot.txt"),
+            "cluster_snapshot_status=pass\n",
+        )
+        .expect("cluster snapshot");
+        for file_name in super::expected_forensics_node_files() {
+            if *file_name == "socket_snapshot.txt" {
+                continue;
+            }
+            fs::write(node_dir.join(file_name), format!("{file_name}\n")).expect("node artifact");
+        }
+
+        let manifest_path = stage_dir.join("manifest.json");
+        let manifest_body = fs::read_to_string(manifest_path.as_path()).expect("manifest read");
+        let stage_dir_text = stage_dir.display().to_string();
+        let manifest_body = manifest_body.replace("PLACEHOLDER", stage_dir_text.as_str());
+        fs::write(manifest_path.as_path(), manifest_body).expect("manifest rewrite");
+
+        fs::write(
+            stage_dir.join("nodes.tsv"),
+            "client\tdebian@client\tclient-1\tclient\n",
+        )
+        .expect("nodes write");
+
+        let output = stage_dir.join("bundle_validation.json");
+        let err = execute_ops_validate_cross_network_forensics_bundle(
+            ValidateCrossNetworkForensicsBundleConfig {
+                nodes_tsv: stage_dir.join("nodes.tsv"),
+                stage_name: "cross_network_direct_remote_exit".to_string(),
+                stage_dir: stage_dir.clone(),
+                output: output.clone(),
+            },
+        )
+        .expect_err("bundle validation should fail");
+        assert!(err.contains("bundle validation failed"));
+
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(output.as_path()).expect("validation json"))
+                .expect("validation json parses");
+        assert_eq!(
+            payload.get("bundle_status").and_then(Value::as_str),
+            Some("fail")
+        );
+        assert!(
+            payload
+                .get("missing_file_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                > 0
+        );
+
+        let _ = fs::remove_dir_all(stage_dir);
     }
 }

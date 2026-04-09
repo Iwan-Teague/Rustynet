@@ -1520,6 +1520,12 @@ fn install_assignment_bundle(
         identity,
         known_hosts,
         target,
+        "install -d -m 0755 -o root -g root /etc/rustynet",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
         "install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
     )
 }
@@ -1544,6 +1550,12 @@ fn install_dns_bundle(
         bundle_local,
         target,
         "/tmp/rn-dns-zone.bundle",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -d -m 0755 -o root -g root /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -1586,6 +1598,12 @@ fn install_assignment_refresh_env(
         identity,
         known_hosts,
         target,
+        "install -d -m 0755 -o root -g root /etc/rustynet",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
         "install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && rm -f /tmp/rn-assignment-refresh.env",
     )
 }
@@ -1610,6 +1628,12 @@ fn install_traversal_bundle(
         traversal_bundle_local,
         target,
         "/tmp/rn-traversal.bundle",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -d -m 0755 -o root -g root /etc/rustynet",
     )?;
     run_root(
         identity,

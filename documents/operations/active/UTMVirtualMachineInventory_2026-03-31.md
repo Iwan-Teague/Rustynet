@@ -1,10 +1,10 @@
 # UTM Virtual Machine Inventory
 
 Last updated:
-`2026-03-31T17:13:34Z`
+`2026-04-07T16:20:45Z`
 
 Repository root:
-`/Users/iwanteague/Desktop/Rustynet`
+`/Users/iwan/Desktop/Rustynet`
 
 Purpose:
 - keep a last-known local record of the UTM Debian headless lab VMs on this Mac,
@@ -12,7 +12,7 @@ Purpose:
 - record current SSH operator key material by path and fingerprint,
 - avoid storing private key contents in the document.
 - provide a human-readable companion to the machine-readable inventory at
-  `/Users/iwanteague/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
+  `/Users/iwan/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
   used by `rustynet-cli ops vm-lab-*`.
 
 ## Parent Device
@@ -26,7 +26,7 @@ Purpose:
 - Last known parent IP on active interface: `192.168.0.20/24`
 - Last known parent network SSID: unavailable from non-privileged local queries on this host
 - UTM bundle root:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents`
 
 ## SSH Operator Key
 
@@ -47,24 +47,22 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJt+TYbMCSyKvPfiT0SunCF/2r6VjFPnBNsMGEv+fIfZ
 
 Security note:
 - The private key contents are intentionally not duplicated into this document.
-- This pass did not generate a new private key because an existing dedicated lab key is already present on the host.
+- This pass rehydrated the documented lab key path from a freshly generated local copy because the file was missing on disk.
 - If you want a fresh per-lab or per-VM keypair, generate it separately and update this inventory with the new path and fingerprint.
 
 ## Inventory Notes
 
 - All five VMs are UTM `QEMU` guests.
 - All five are configured as `aarch64` Debian/Linux guests with `2048 MB` memory.
-- All five currently have two NICs:
-  - NIC 0: `Mode=Shared`
-  - NIC 1: `Mode=Host`
-- No live guest-agent or live SSH reachability verification was performed in this pass.
-- The per-VM last-known IPs below are **inferred** from local `~/.ssh/known_hosts.old` history and UTM naming/order, not live-confirmed from inside the guests.
-- One extra UTM-style historical IP, `192.168.64.18`, exists in `known_hosts.old` but could not be confidently tied to one of the five current VM bundles during this pass.
+- UTM currently reports one shared network interface per VM in the configuration record.
+- Live guest-agent verification was performed with UTM `query ip` on `2026-04-07`; live SSH reachability was rechecked in this pass over the IPv4 SSH endpoints because they were the stable SSH form on this host.
+- The per-VM IPv4s below are live-confirmed from the running guests, not inferred from hostname history.
+- One extra UTM-style historical IP, `192.168.64.18`, still exists in older host-key history but could not be tied to the current five bundles during this pass.
 
 ## Machine-Readable Inventory Model
 
 The companion inventory file at
-`/Users/iwanteague/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
+`/Users/iwan/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
 is now the operator-facing source for `rustynet-cli ops vm-lab-*`.
 
 Entry model:
@@ -170,8 +168,8 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-write-live-lab-profile \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --output profiles/live_lab/generated_vm_lab.env \
-  --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 \
-  --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --exit-vm debian-headless-1 \
   --client-vm debian-headless-2 \
   --entry-vm debian-headless-3 \
@@ -189,8 +187,8 @@ cargo run -q -p rustynet-cli -- \
 cargo run -q -p rustynet-cli -- \
   ops vm-lab-iterate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
-  --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 \
-  --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --ssh-known-hosts-file ~/.ssh/known_hosts \
   --exit-vm debian-headless-1 \
   --client-vm debian-headless-2 \
   --entry-vm debian-headless-3 \
@@ -226,7 +224,7 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-preflight \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --all \
-  --known-hosts-file /Users/iwanteague/.ssh/known_hosts \
+  --known-hosts-file ~/.ssh/known_hosts \
   --require-command git \
   --require-command cargo \
   --require-rustynet-installed
@@ -252,7 +250,7 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-run-suite \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --suite full-live-lab \
-  --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --all \
   --dry-run
 ```
@@ -267,117 +265,141 @@ cargo run -q -p rustynet-cli -- \
 
 ### VM 1
 
-- Display name: `debian headless 1`
+- Display name: `debian-headless-1`
 - Bundle path:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 1.utm`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-1.utm`
 - UTM UUID: `40F90934-537F-484D-B9CC-D8012202DE0F`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
 - Architecture: `aarch64`
 - Memory: `2048 MB`
 - Network adapters:
-  - Shared NIC MAC: `86:73:E8:2E:A6:BE`
-  - Host NIC MAC: `02:64:00:00:00:22`
-- Last-known guest IP: `192.168.64.22`
-- Last-known IP confidence: `inferred from historical SSH host-key sequence`
+  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
+- Last-known guest IP: `192.168.64.3`
+- Live IPs from UTM query:
+  - `192.168.64.3`
+  - `fd21:69d4:6afd:fa50:3cae:a9ff:fe5a:6182`
+  - `fd21:69d4:6afd:fa50:9a08:e072:9844:b7ad`
+  - `fe80::6023:d956:36c2:c94e`
+- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
 - Suggested Rustynet node ID: `exit-1`
 - Suggested lab role: `exit`
 - Suggested mesh IP: `100.64.0.1`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 <vm-user>@192.168.64.22`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.3`
 
 ### VM 2
 
-- Display name: `debian headless 2`
+- Display name: `debian-headless-2`
 - Bundle path:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 2.utm`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-2.utm`
 - UTM UUID: `7BD5A6C3-4138-4394-936A-A61F6A4480AE`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
 - Architecture: `aarch64`
 - Memory: `2048 MB`
 - Network adapters:
-  - Shared NIC MAC: `12:9B:9F:C5:73:F5`
-  - Host NIC MAC: `02:64:00:00:00:24`
-- Last-known guest IP: `192.168.64.24`
-- Last-known IP confidence: `inferred from historical SSH host-key sequence`
+  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
+- Last-known guest IP: `192.168.64.4`
+- Live IPs from UTM query:
+  - `192.168.64.4`
+  - `fd21:69d4:6afd:fa50:4344:bf8a:e4ff:3154`
+  - `fe80::a419:949:1c4a:4d9f`
+- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
 - Suggested Rustynet node ID: `client-1`
 - Suggested lab role: `client`
 - Suggested mesh IP: `100.64.0.2`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 <vm-user>@192.168.64.24`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.4`
 
 ### VM 3
 
-- Display name: `debian headless 3`
+- Display name: `debian-headless-3`
 - Bundle path:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/debian headless 3.utm`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-3.utm`
 - UTM UUID: `58123566-1DAC-4B6F-8BA3-A6BFB561B439`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
 - Architecture: `aarch64`
 - Memory: `2048 MB`
 - Network adapters:
-  - Shared NIC MAC: `72:F5:0A:38:C7:89`
-  - Host NIC MAC: `02:64:00:00:00:26`
-- Last-known guest IP: `192.168.64.26`
-- Last-known IP confidence: `inferred from historical SSH host-key sequence`
+  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
+- Last-known guest IP: `192.168.64.5`
+- Live IPs from UTM query:
+  - `192.168.64.5`
+  - `fd21:69d4:6afd:fa50:6259:ad04:5665:deda`
+  - `fe80::bec8:79f7:a83d:ddc`
+- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
 - Suggested Rustynet node ID: `relay-1`
 - Suggested lab role: `relay`
 - Suggested mesh IP: `100.64.0.3`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 <vm-user>@192.168.64.26`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.5`
 
 ### VM 4
 
-- Display name: `headless debian 4`
+- Display name: `debian-headless-4`
 - Bundle path:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/headless debian 4.utm`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-4.utm`
 - UTM UUID: `80C0AC91-4384-4FB0-A44F-3F3E94892F28`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
 - Architecture: `aarch64`
 - Memory: `2048 MB`
 - Network adapters:
-  - Shared NIC MAC: `BA:23:29:BE:FA:33`
-  - Host NIC MAC: `02:64:00:00:00:28`
-- Last-known guest IP: `192.168.64.28`
-- Last-known IP confidence: `inferred from historical SSH host-key sequence`
+  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
+- Last-known guest IP: `192.168.64.6`
+- Live IPs from UTM query:
+  - `192.168.64.6`
+  - `fd21:69d4:6afd:fa50:dc8c:2918:43ca:d40d`
+  - `fe80::cadd:6589:4e14:8590`
+- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
 - Suggested Rustynet node ID: `aux-1`
 - Suggested lab role: `aux`
 - Suggested mesh IP: `100.64.0.4`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 <vm-user>@192.168.64.28`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.6`
 
 ### VM 5
 
-- Display name: `headless debian 5`
+- Display name: `debian-headless-5`
 - Bundle path:
-  `/Users/iwanteague/Library/Containers/com.utmapp.UTM/Data/Documents/headless debian 5.utm`
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-5.utm`
 - UTM UUID: `72E7F328-6080-4A22-80A7-F601DCA592B0`
 - Guest OS family: `Debian/Linux`
 - Backend: `QEMU`
 - Architecture: `aarch64`
 - Memory: `2048 MB`
 - Network adapters:
-  - Shared NIC MAC: `BA:23:29:BE:FA:35`
-  - Host NIC MAC: `02:64:00:00:00:30`
-- Last-known guest IP: `192.168.64.29`
-- Last-known IP confidence: `inferred from historical SSH host-key sequence`
+  - Shared NIC MAC: `3E:AE:A9:5A:61:82`
+- Last-known guest IP: `192.168.64.7`
+- Live IPs from UTM query:
+  - `192.168.64.7`
+  - `fd21:69d4:6afd:fa50:f0c2:96e5:4c55:6a59`
+  - `fe80::a42a:e764:39c7:4f33`
+- Last-known IP confidence: `live-confirmed via UTM query ip on 2026-04-07T16:20:45Z`
 - Suggested Rustynet node ID: `extra-1`
 - Suggested lab role: `extra`
 - Suggested mesh IP: `100.64.0.5`
 - SSH operator key: `~/.ssh/rustynet_lab_ed25519`
 - Suggested connect template:
-  `ssh -i ~/.ssh/rustynet_lab_ed25519 <vm-user>@192.168.64.29`
+  `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.7`
 
 ## Historical IP Evidence Used In This Pass
 
-Observed UTM-style guest IPs in `~/.ssh/known_hosts.old`:
+Current live guest IPs from UTM `query ip`:
+
+- `192.168.64.3`
+- `192.168.64.4`
+- `192.168.64.5`
+- `192.168.64.6`
+- `192.168.64.7`
+
+Historical UTM-style guest IPs retained from older host-key history:
 
 - `192.168.64.18`
 - `192.168.64.22`
@@ -387,13 +409,14 @@ Observed UTM-style guest IPs in `~/.ssh/known_hosts.old`:
 - `192.168.64.29`
 
 Interpretation:
-- `192.168.64.22`, `192.168.64.24`, `192.168.64.26`, `192.168.64.28`, and `192.168.64.29` are the currently observed shared-network guest addresses inferred from the live ARP table and the recorded per-VM NIC MAC addresses.
+- `192.168.64.3`, `192.168.64.4`, `192.168.64.5`, `192.168.64.6`, and `192.168.64.7` are the current live guest IPv4 addresses confirmed by UTM on `2026-04-07`.
+- `192.168.64.22`, `192.168.64.24`, `192.168.64.26`, `192.168.64.28`, and `192.168.64.29` are stale historical snapshot addresses and should not be used for current lab runs.
 - `192.168.64.18` remains an unmatched historical UTM-style guest address from SSH host-key history.
 
 ## Recommended Next Steps
 
-1. Live-verify each guest from the UTM console or by SSH while the VM is running.
-2. Confirm the actual guest username for each Debian VM and replace `<vm-user>` in the templates.
+1. Refresh this inventory whenever the UTM live query output changes or the VMs are reimaged.
+2. If the Debian login user changes from `debian`, update the connect templates and lab profiles accordingly.
 3. If desired, create a dedicated SSH config stanza per VM using the existing lab key.
 4. If desired, generate a fresh dedicated keypair for this UTM VM set and update this inventory with:
    - private key path

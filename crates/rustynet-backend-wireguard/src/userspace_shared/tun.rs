@@ -535,32 +535,34 @@ pub(crate) enum TestTunBehavior {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum TestRouteBehavior {
+    #[default]
     Succeed,
-    FailOnReplace { cidr: String, message: String },
-    FailOnDelete { cidr: String, message: String },
-}
-
-impl Default for TestRouteBehavior {
-    fn default() -> Self {
-        Self::Succeed
-    }
+    FailOnReplace {
+        cidr: String,
+        message: String,
+    },
+    FailOnDelete {
+        cidr: String,
+        message: String,
+    },
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum TestExitModeBehavior {
+    #[default]
     Succeed,
-    FailOnDeleteTable { message: String },
-    FailOnDeletePriority { message: String },
-    FailOnAddPriority { message: String },
-}
-
-impl Default for TestExitModeBehavior {
-    fn default() -> Self {
-        Self::Succeed
-    }
+    FailOnDeleteTable {
+        message: String,
+    },
+    FailOnDeletePriority {
+        message: String,
+    },
+    FailOnAddPriority {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -110,27 +110,6 @@ impl ManagementCidr {
 
     fn is_ipv6(self) -> bool {
         matches!(self.address, IpAddr::V6(_))
-    }
-
-    fn probe_ip(self) -> IpAddr {
-        match self.address {
-            IpAddr::V4(value) => {
-                if self.prefix == 32 {
-                    IpAddr::V4(value)
-                } else if self.prefix < 31 {
-                    IpAddr::V4(Ipv4Addr::from(u32::from(value).saturating_add(1)))
-                } else {
-                    IpAddr::V4(value)
-                }
-            }
-            IpAddr::V6(value) => {
-                if self.prefix == 128 {
-                    IpAddr::V6(value)
-                } else {
-                    IpAddr::V6(Ipv6Addr::from(u128::from(value).saturating_add(1)))
-                }
-            }
-        }
     }
 }
 
@@ -748,9 +727,10 @@ impl LinuxCommandSystem {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
-            let probe_ip = cidr.probe_ip();
-            let route_interface = self.resolve_route_interface_for_ip(probe_ip)?;
-            let args = Self::management_bypass_route_args(cidr, route_interface.as_str());
+            // Management SSH must stay on the underlay interface. Resolving the
+            // current FIB here can return the tunnel once exit-mode policy
+            // routing is already active, which black-holes the control plane.
+            let args = Self::management_bypass_route_args(cidr, self.egress_interface.as_str());
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
             result.map_err(|err| {
@@ -5014,6 +4994,50 @@ mod tests {
                 "table".to_string(),
                 "51820".to_string(),
             ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fail_closed_management_allow_routes_use_underlay_egress_interface() {
+        let socket_path = phase10_test_socket_path("m");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            true,
+            vec![
+                "192.168.18.0/24"
+                    .parse::<ManagementCidr>()
+                    .expect("management cidr should parse"),
+            ],
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::apply_routes(&mut system, &[]).expect("route apply should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("ip route replace 192.168.18.0/24 dev enp0s9 table 51820")),
+            "management bypass route must use the configured underlay egress interface"
+        );
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("192.168.18.0/24 dev rustynet0 table 51820")),
+            "management bypass route must not be re-routed through the tunnel interface"
         );
     }
 

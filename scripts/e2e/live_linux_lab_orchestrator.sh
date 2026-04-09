@@ -108,12 +108,12 @@ options:
   --source-mode <mode>           Source mode: working-tree | local-head | origin-main
   --use-origin-main              Fetch and archive latest committed origin/main
   --use-local-head               Archive local committed HEAD (default)
-  --exit-target <user@ip|ip>     Primary exit node target
-  --client-target <user@ip|ip>   Primary client node target
-  --entry-target <user@ip|ip>    Entry relay / alternate exit target
-  --aux-target <user@ip|ip>      Auxiliary client / blind-exit target
-  --extra-target <user@ip|ip>    Optional extra client target
-  --fifth-client-target <user@ip|ip>
+  --exit-target <user@host|host>     Primary exit node target
+  --client-target <user@host|host>   Primary client node target
+  --entry-target <user@host|host>    Entry relay / alternate exit target
+  --aux-target <user@host|host>      Auxiliary client / blind-exit target
+  --extra-target <user@host|host>    Optional extra client target
+  --fifth-client-target <user@host|host>
                                 Optional fifth client target for six-node live labs
   --ssh-identity-file <path>     SSH private key for key-based authentication
   --ssh-password-file <path>     Deprecated alias of --ssh-identity-file
@@ -451,6 +451,13 @@ validate_target_host() {
       return 1
     fi
     return 0
+  fi
+  if [[ "$host" == *:* ]]; then
+    if [[ "$host" =~ ^[0-9A-Fa-f:]+$ ]]; then
+      return 0
+    fi
+    printf 'invalid IPv6 address for %s target: %s\n' "$label" "$host" >&2
+    return 1
   fi
   if [[ ! "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
     printf 'invalid host syntax for %s target: %s\n' "$label" "$host" >&2
@@ -1144,7 +1151,7 @@ capture_forensics_root() {
   } > "$output_path"
 }
 
-collect_cross_network_failure_forensics() {
+live_lab_collect_forensics_bundle() {
   local stage_name="$1"
   local collected_at stage_dir node_dir label target node_id role manifest_path
   collected_at="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1156,15 +1163,128 @@ collect_cross_network_failure_forensics() {
     node_dir="$stage_dir/${label}"
     mkdir -p "$node_dir"
 
-    capture_forensics_root "$target" "root date -u +%Y-%m-%dT%H:%M:%SZ || true; root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status || true" "$node_dir/status.txt" || true
-    capture_forensics_user "$target" "ip -4 route show table main || true; ip -4 route show table 51820 || true; ip -4 route get 1.1.1.1 || true" "$node_dir/routes.txt" || true
-    capture_forensics_user "$target" "ip -br addr || true; ip -br link || true" "$node_dir/interfaces.txt" || true
-    capture_forensics_root "$target" "root wg show rustynet0 endpoints || true" "$node_dir/wg_endpoints.txt" || true
-    capture_forensics_root "$target" "root nft list ruleset || true" "$node_dir/nft_ruleset.txt" || true
-    capture_forensics_root "$target" "root ss -tulpn || true" "$node_dir/ss_tulpn.txt" || true
-    capture_forensics_root "$target" "root ls -l /run/rustynet || true; root test -S /run/rustynet/rustynetd.sock && echo daemon_socket_present || echo daemon_socket_missing" "$node_dir/daemon_socket.txt" || true
-    capture_forensics_root "$target" "root systemctl status rustynetd.service rustynetd-privileged-helper.service --no-pager -l || true" "$node_dir/systemd_status.txt" || true
-    capture_forensics_root "$target" "root journalctl -u rustynetd.service -u rustynetd-privileged-helper.service -n 250 --no-pager --output=short-iso || true" "$node_dir/journal_tail.txt" || true
+    local service_snapshot service_rc network_snapshot network_rc route_policy route_policy_rc
+    local dns_state dns_state_rc time_snapshot time_rc process_snapshot process_rc
+    local socket_snapshot socket_rc permissions_snapshot permissions_rc
+    local firewall_snapshot firewall_rc dns_zone_snapshot dns_zone_rc signed_state_snapshot signed_state_rc
+    local secret_hygiene secret_rc node_snapshot node_rc
+    set +e
+    service_snapshot="$(live_lab_collect_service_snapshot "$target" 2>&1)"
+    service_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$service_rc"
+      printf '%s\n' "$service_snapshot"
+    } > "$node_dir/service_snapshot.txt"
+
+    set +e
+    network_snapshot="$(live_lab_collect_network_snapshot "$target" 2>&1)"
+    network_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$network_rc"
+      printf '%s\n' "$network_snapshot"
+    } > "$node_dir/network_snapshot.txt"
+
+    set +e
+    route_policy="$(live_lab_collect_route_policy "$target" 2>&1)"
+    route_policy_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$route_policy_rc"
+      printf '%s\n' "$route_policy"
+    } > "$node_dir/route_policy.txt"
+
+    set +e
+    dns_state="$(live_lab_collect_dns_snapshot "$target" 2>&1)"
+    dns_state_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$dns_state_rc"
+      printf '%s\n' "$dns_state"
+    } > "$node_dir/dns_state.txt"
+
+    set +e
+    time_snapshot="$(live_lab_collect_time_snapshot "$target" "$node_id" "$role" 2>&1)"
+    time_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$time_rc"
+      printf '%s\n' "$time_snapshot"
+    } > "$node_dir/time_snapshot.txt"
+
+    set +e
+    process_snapshot="$(live_lab_collect_process_snapshot "$target" "$node_id" "$role" 2>&1)"
+    process_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$process_rc"
+      printf '%s\n' "$process_snapshot"
+    } > "$node_dir/process_snapshot.txt"
+
+    set +e
+    socket_snapshot="$(live_lab_collect_socket_snapshot "$target" "$node_id" "$role" 2>&1)"
+    socket_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$socket_rc"
+      printf '%s\n' "$socket_snapshot"
+    } > "$node_dir/socket_snapshot.txt"
+
+    set +e
+    permissions_snapshot="$(live_lab_collect_permissions_snapshot "$target" "$node_id" "$role" 2>&1)"
+    permissions_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$permissions_rc"
+      printf '%s\n' "$permissions_snapshot"
+    } > "$node_dir/permissions_snapshot.txt"
+
+    set +e
+    firewall_snapshot="$(live_lab_collect_firewall_snapshot "$target" "$node_id" "$role" 2>&1)"
+    firewall_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$firewall_rc"
+      printf '%s\n' "$firewall_snapshot"
+    } > "$node_dir/firewall.txt"
+
+    set +e
+    dns_zone_snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" 2>&1)"
+    dns_zone_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$dns_zone_rc"
+      printf '%s\n' "$dns_zone_snapshot"
+    } > "$node_dir/dns_zone.txt"
+
+    set +e
+    signed_state_snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" 2>&1)"
+    signed_state_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$signed_state_rc"
+      printf '%s\n' "$signed_state_snapshot"
+    } > "$node_dir/signed_state.txt"
+
+    set +e
+    secret_hygiene="$(live_lab_collect_secret_hygiene "$target" 2>&1)"
+    secret_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$secret_rc"
+      printf '%s\n' "$secret_hygiene"
+    } > "$node_dir/secret_hygiene.txt"
+
+    set +e
+    node_snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$role" 2>&1)"
+    node_rc=$?
+    set -e
+    {
+      printf 'capture_rc=%s\n' "$node_rc"
+      printf '%s\n' "$node_snapshot"
+    } > "$node_dir/node_snapshot.txt"
+
     {
       printf 'label=%s\n' "$label"
       printf 'target=%s\n' "$target"
@@ -1173,6 +1293,26 @@ collect_cross_network_failure_forensics() {
     } > "$node_dir/node_identity.txt"
   done < "$NODES_TSV"
 
+  local route_matrix_snapshot route_matrix_rc
+  set +e
+  route_matrix_snapshot="$(live_lab_collect_route_matrix_snapshot "$stage_name" 2>&1)"
+  route_matrix_rc=$?
+  set -e
+  {
+    printf 'capture_rc=%s\n' "$route_matrix_rc"
+    printf '%s\n' "$route_matrix_snapshot"
+  } > "$stage_dir/route_matrix.txt"
+
+  local cluster_snapshot cluster_rc
+  set +e
+  cluster_snapshot="$(live_lab_collect_cluster_snapshot "$stage_name" 2>&1)"
+  cluster_rc=$?
+  set -e
+  {
+    printf 'capture_rc=%s\n' "$cluster_rc"
+    printf '%s\n' "$cluster_snapshot"
+  } > "$stage_dir/cluster_snapshot.txt"
+
   manifest_path="$stage_dir/manifest.json"
   cargo run --quiet -p rustynet-cli -- ops write-cross-network-forensics-manifest \
     --stage "$stage_name" \
@@ -1180,7 +1320,162 @@ collect_cross_network_failure_forensics() {
     --stage-dir "$stage_dir" \
     --output "$manifest_path" >/dev/null
 
+  local artifact_index_path bundle_validation_path helper_output helper_rc
+  bundle_validation_path="$stage_dir/bundle_validation.json"
+  set +e
+  helper_output="$(live_lab_assert_forensics_bundle_complete "$stage_name" "$stage_dir" "$bundle_validation_path" 2>&1)"
+  helper_rc=$?
+  set -e
+  if [[ "$helper_rc" -ne 0 ]]; then
+    printf '[forensics:%s] warning: failed to validate bundle completeness: %s\n' "$stage_name" "$helper_output" >&2
+  fi
+
+  artifact_index_path="$stage_dir/artifact_index.json"
+  set +e
+  helper_output="$(live_lab_collect_stage_artifact_index "$stage_name" "$stage_dir" "$artifact_index_path" 2>&1)"
+  helper_rc=$?
+  set -e
+  if [[ "$helper_rc" -ne 0 ]]; then
+    printf '[forensics:%s] warning: failed to write artifact index: %s\n' "$stage_name" "$helper_output" >&2
+  fi
+
   printf '%s' "$stage_dir"
+}
+
+collect_cross_network_failure_forensics() {
+  local stage_name="$1"
+  live_lab_collect_forensics_bundle "$stage_name"
+}
+
+live_lab_collect_stage_artifact_index() {
+  local stage_name="$1"
+  local stage_dir="$2"
+  local output_path="${3:-$stage_dir/artifact_index.json}"
+  cargo run --quiet -p rustynet-cli -- ops write-live-lab-stage-artifact-index \
+    --stage-name "$stage_name" \
+    --stage-dir "$stage_dir" \
+    --output "$output_path"
+}
+
+live_lab_assert_forensics_bundle_complete() {
+  local stage_name="$1"
+  local stage_dir="$2"
+  local output_path="${3:-$stage_dir/bundle_validation.json}"
+  cargo run --quiet -p rustynet-cli -- ops validate-cross-network-forensics-bundle \
+    --stage-name "$stage_name" \
+    --nodes-tsv "$NODES_TSV" \
+    --stage-dir "$stage_dir" \
+    --output "$output_path"
+}
+
+live_lab_collect_cluster_snapshot() {
+  local stage_name="${1:-cluster_snapshot}"
+  local collected_at label target node_id role
+  local peer_inventory peer_rc signed_state signed_rc firewall firewall_rc cluster_status="pass"
+
+  collected_at="$(date -u +%FT%TZ)"
+  {
+    printf '__RNLAB_CLUSTER_BEGIN__\n'
+    printf 'cluster_snapshot_version=1\n'
+    printf 'cluster_stage_name=%s\n' "$stage_name"
+    printf 'cluster_collected_at_utc=%s\n' "$collected_at"
+    printf 'cluster_node_count=%s\n' "$(node_count)"
+    while IFS=$'\t' read -r label target node_id role; do
+      [[ -n "$target" ]] || continue
+      printf 'cluster_node_begin\n'
+      printf 'label=%s\n' "$label"
+      printf 'target=%s\n' "$target"
+      printf 'node_id=%s\n' "$node_id"
+      printf 'role=%s\n' "$role"
+
+      set +e
+      peer_inventory="$(live_lab_collect_peer_inventory_snapshot "$target" "$node_id" "$role" 2>&1)"
+      peer_rc=$?
+      signed_state="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" 2>&1)"
+      signed_rc=$?
+      firewall="$(live_lab_collect_firewall_snapshot "$target" "$node_id" "$role" 2>&1)"
+      firewall_rc=$?
+      set -e
+
+      if [[ "$peer_rc" -ne 0 || "$signed_rc" -ne 0 || "$firewall_rc" -ne 0 ]]; then
+        cluster_status="fail"
+      fi
+
+      printf 'peer_inventory_capture_rc=%s\n' "$peer_rc"
+      printf '%s\n' "$peer_inventory"
+      printf 'signed_state_capture_rc=%s\n' "$signed_rc"
+      printf '%s\n' "$signed_state"
+      printf 'firewall_capture_rc=%s\n' "$firewall_rc"
+      printf '%s\n' "$firewall"
+      printf 'cluster_node_end\n'
+    done < "$NODES_TSV"
+    printf 'cluster_snapshot_status=%s\n' "$cluster_status"
+    printf '__RNLAB_CLUSTER_END__\n'
+  }
+}
+
+live_lab_collect_route_matrix_snapshot() {
+  local stage_name="${1:-route_matrix}"
+  local collected_at source_label source_target source_node_id source_role
+  local dest_label dest_target dest_node_id dest_role
+  local route_policy_snapshot route_policy_rc
+  local source_status_snapshot source_status_rc
+  local source_default_route_snapshot source_default_route_rc
+  local matrix_status="pass"
+
+  collected_at="$(date -u +%FT%TZ)"
+  {
+    printf '__RNLAB_ROUTE_MATRIX_BEGIN__\n'
+    printf 'route_matrix_version=2\n'
+    printf 'route_matrix_stage_name=%s\n' "$stage_name"
+    printf 'route_matrix_collected_at_utc=%s\n' "$collected_at"
+    printf 'route_matrix_node_count=%s\n' "$(node_count)"
+    while IFS=$'\t' read -r source_label source_target source_node_id source_role; do
+      [[ -n "$source_target" ]] || continue
+      printf 'source_node_begin\n'
+      printf 'source_label=%s\n' "$source_label"
+      printf 'source_target=%s\n' "$source_target"
+      printf 'source_node_id=%s\n' "$source_node_id"
+      printf 'source_role=%s\n' "$source_role"
+      set +e
+      source_status_snapshot="$(live_lab_collect_service_snapshot "$source_target" 2>&1)"
+      source_status_rc=$?
+      source_default_route_snapshot="$(live_lab_collect_route_policy "$source_target" "1.1.1.1" 2>&1)"
+      source_default_route_rc=$?
+      set -e
+      if [[ "$source_status_rc" -ne 0 || "$source_default_route_rc" -ne 0 ]]; then
+        matrix_status="fail"
+      fi
+      printf 'source_status_capture_rc=%s\n' "$source_status_rc"
+      printf '%s\n' "$source_status_snapshot"
+      printf 'source_default_route_capture_rc=%s\n' "$source_default_route_rc"
+      printf '%s\n' "$source_default_route_snapshot"
+      while IFS=$'\t' read -r dest_label dest_target dest_node_id dest_role; do
+        [[ -n "$dest_target" ]] || continue
+        printf 'pair_begin\n'
+        printf 'destination_label=%s\n' "$dest_label"
+        printf 'destination_target=%s\n' "$dest_target"
+        printf 'destination_node_id=%s\n' "$dest_node_id"
+        printf 'destination_role=%s\n' "$dest_role"
+        set +e
+        route_policy_snapshot="$(live_lab_collect_route_policy "$source_target" "$(live_lab_resolved_target_address "$dest_target")" 2>&1)"
+        route_policy_rc=$?
+        set -e
+        if [[ "$route_policy_rc" -ne 0 ]]; then
+          matrix_status="fail"
+        fi
+        printf 'route_policy_capture_rc=%s\n' "$route_policy_rc"
+        printf '%s\n' "$route_policy_snapshot"
+        printf 'pair_end\n'
+      done < "$NODES_TSV"
+      printf 'source_node_end\n'
+    done < "$NODES_TSV"
+    printf 'route_matrix_status=%s\n' "$matrix_status"
+    printf '__RNLAB_ROUTE_MATRIX_END__\n'
+    if [[ "$matrix_status" != "pass" ]]; then
+      exit 1
+    fi
+  }
 }
 
 run_stage() {
@@ -1233,6 +1528,105 @@ parallel_stage_dir() {
   printf '%s/parallel-%s' "$STATE_DIR" "$stage_name"
 }
 
+stage_worker_artifact_dir() {
+  local label="$1"
+  if [[ -z "${LIVE_LAB_STAGE_DIR:-}" ]]; then
+    printf 'LIVE_LAB_STAGE_DIR is not set for stage worker artifact capture\n' >&2
+    return 1
+  fi
+  printf '%s/evidence/%s' "$LIVE_LAB_STAGE_DIR" "$label"
+}
+
+stage_worker_artifact_path() {
+  local label="$1"
+  local artifact_name="$2"
+  local artifact_dir
+  artifact_dir="$(stage_worker_artifact_dir "$label")" || return 1
+  mkdir -p "$artifact_dir"
+  printf '%s/%s' "$artifact_dir" "$artifact_name"
+}
+
+stage_worker_write_artifact() {
+  local label="$1"
+  local artifact_name="$2"
+  local content="$3"
+  local artifact_path
+  artifact_path="$(stage_worker_artifact_path "$label" "$artifact_name")" || return 1
+  printf '%s\n' "$content" > "$artifact_path"
+  printf '%s' "$artifact_path"
+}
+
+live_lab_extract_primary_failure_reason() {
+  local log_path="$1"
+  if [[ ! -f "$log_path" ]]; then
+    printf 'log file missing'
+    return 0
+  fi
+  awk '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    /^\[stage:/ && ($0 ~ /] START/ || $0 ~ /] PASS/ || $0 ~ /] FAIL/) { next }
+    /^\[parallel:/ { next }
+    /^----- / { next }
+    {
+      line = trim($0)
+      gsub(/\r/, "", line)
+      if (line == "") {
+        next
+      }
+      lines[++count] = line
+    }
+    END {
+      if (count == 0) {
+        print "see full log"
+        exit
+      }
+      for (i = count; i >= 1; i--) {
+        lower = tolower(lines[i])
+        if (lower ~ /error:|fail|timed out|timeout|permission denied|missing|invalid|mismatch|does not exist|no such|unreachable/) {
+          print lines[i]
+          exit
+        }
+      }
+      print lines[count]
+    }
+  ' "$log_path" | head -n 1 | tr '\t\r\n' '   '
+}
+
+live_lab_emit_stage_result() {
+  local output_tsv="$1"
+  local stage_name="$2"
+  local label="$3"
+  local target="$4"
+  local node_id="$5"
+  local role="$6"
+  local rc="$7"
+  local started_at="$8"
+  local finished_at="$9"
+  local log_path="${10}"
+  local snapshot_path="${11:-}"
+  local route_policy_path="${12:-}"
+  local dns_state_path="${13:-}"
+  local primary_failure_reason="${14:-}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$stage_name" \
+    "$label" \
+    "$target" \
+    "$node_id" \
+    "$role" \
+    "$rc" \
+    "$started_at" \
+    "$finished_at" \
+    "$log_path" \
+    "$snapshot_path" \
+    "$route_policy_path" \
+    "$dns_state_path" \
+    "$(sanitize_text "$primary_failure_reason")" >> "$output_tsv"
+}
+
 parallel_stage_scope_matches() {
   local scope="$1"
   local label="$2"
@@ -1254,7 +1648,9 @@ run_parallel_node_stage() {
   local worker_fn="$2"
   local scope="${3:-all}"
   local stage_dir workers_tsv results_tsv worker_count=0 failed=0
-  local label target node_id role pid log_path rc
+  local label target node_id role pid log_path rc started_at finished_at
+  local snapshot_path route_policy_path dns_state_path primary_failure_reason
+  local -x LIVE_LAB_STAGE_NAME="$stage_name"
 
   case "$scope" in
     all|non_exit)
@@ -1266,6 +1662,7 @@ run_parallel_node_stage() {
   esac
 
   stage_dir="$(parallel_stage_dir "$stage_name")"
+  local -x LIVE_LAB_STAGE_DIR="$stage_dir"
   workers_tsv="${stage_dir}/workers.tsv"
   results_tsv="${stage_dir}/results.tsv"
   rm -rf "$stage_dir"
@@ -1278,13 +1675,15 @@ run_parallel_node_stage() {
       continue
     fi
     log_path="${stage_dir}/${label}.log"
+    started_at="$(date -u +%FT%TZ)"
     (
       set -euo pipefail
       live_lab_prepare_worker_known_hosts "${stage_name}.${label}"
       "$worker_fn" "$label" "$target" "$node_id" "$role"
     ) >"$log_path" 2>&1 &
     pid=$!
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$role" "$pid" "$log_path" >> "$workers_tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$label" "$target" "$node_id" "$role" "$pid" "$log_path" "$started_at" >> "$workers_tsv"
     worker_count=$((worker_count + 1))
   done < "$NODES_TSV"
 
@@ -1293,19 +1692,121 @@ run_parallel_node_stage() {
     return 0
   fi
 
-  while IFS=$'\t' read -r label target node_id role pid log_path; do
+  while IFS=$'\t' read -r label target node_id role pid log_path started_at; do
     if wait "$pid"; then
       rc=0
     else
       rc=$?
       failed=1
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$role" "$rc" "$log_path" >> "$results_tsv"
+    finished_at="$(date -u +%FT%TZ)"
+    snapshot_path="${stage_dir}/evidence/${label}/snapshot.txt"
+    route_policy_path="${stage_dir}/evidence/${label}/route_policy.txt"
+    dns_state_path="${stage_dir}/evidence/${label}/dns_state.txt"
+    [[ -f "$snapshot_path" ]] || snapshot_path=""
+    [[ -f "$route_policy_path" ]] || route_policy_path=""
+    [[ -f "$dns_state_path" ]] || dns_state_path=""
+    primary_failure_reason=""
+    if [[ "$rc" -ne 0 ]]; then
+      primary_failure_reason="$(live_lab_extract_primary_failure_reason "$log_path")"
+    fi
+    live_lab_emit_stage_result \
+      "$results_tsv" \
+      "$stage_name" \
+      "$label" \
+      "$target" \
+      "$node_id" \
+      "$role" \
+      "$rc" \
+      "$started_at" \
+      "$finished_at" \
+      "$log_path" \
+      "$snapshot_path" \
+      "$route_policy_path" \
+      "$dns_state_path" \
+      "$primary_failure_reason"
     printf '[parallel:%s] %s %s rc=%s\n' "$stage_name" "$label" "$target" "$rc"
     printf -- '----- %s/%s (%s %s) BEGIN -----\n' "$stage_name" "$label" "$node_id" "$role"
     cat "$log_path"
     printf -- '\n----- %s/%s END -----\n' "$stage_name" "$label"
   done < "$workers_tsv"
+
+  [[ "$failed" -eq 0 ]]
+}
+
+run_serial_node_stage() {
+  local stage_name="$1"
+  local worker_fn="$2"
+  local scope="${3:-all}"
+  local stage_dir workers_tsv results_tsv failed=0
+  local label target node_id role log_path rc started_at finished_at
+  local snapshot_path route_policy_path dns_state_path primary_failure_reason
+  local -x LIVE_LAB_STAGE_NAME="$stage_name"
+
+  case "$scope" in
+    all|non_exit)
+      ;;
+    *)
+      printf 'unsupported serial scope: %s\n' "$scope" >&2
+      return 1
+      ;;
+  esac
+
+  stage_dir="$(parallel_stage_dir "$stage_name")"
+  local -x LIVE_LAB_STAGE_DIR="$stage_dir"
+  workers_tsv="${stage_dir}/workers.tsv"
+  results_tsv="${stage_dir}/results.tsv"
+  rm -rf "$stage_dir"
+  mkdir -p "$stage_dir"
+  : > "$workers_tsv"
+  : > "$results_tsv"
+
+  while IFS=$'\t' read -r label target node_id role; do
+    if ! parallel_stage_scope_matches "$scope" "$label"; then
+      continue
+    fi
+    log_path="${stage_dir}/${label}.log"
+    started_at="$(date -u +%FT%TZ)"
+    (
+      set -euo pipefail
+      live_lab_prepare_worker_known_hosts "${stage_name}.${label}"
+      "$worker_fn" "$label" "$target" "$node_id" "$role"
+    ) >"$log_path" 2>&1
+    rc=$?
+    finished_at="$(date -u +%FT%TZ)"
+    snapshot_path="${stage_dir}/evidence/${label}/snapshot.txt"
+    route_policy_path="${stage_dir}/evidence/${label}/route_policy.txt"
+    dns_state_path="${stage_dir}/evidence/${label}/dns_state.txt"
+    [[ -f "$snapshot_path" ]] || snapshot_path=""
+    [[ -f "$route_policy_path" ]] || route_policy_path=""
+    [[ -f "$dns_state_path" ]] || dns_state_path=""
+    primary_failure_reason=""
+    if [[ "$rc" -ne 0 ]]; then
+      primary_failure_reason="$(live_lab_extract_primary_failure_reason "$log_path")"
+    fi
+    live_lab_emit_stage_result \
+      "$results_tsv" \
+      "$stage_name" \
+      "$label" \
+      "$target" \
+      "$node_id" \
+      "$role" \
+      "$rc" \
+      "$started_at" \
+      "$finished_at" \
+      "$log_path" \
+      "$snapshot_path" \
+      "$route_policy_path" \
+      "$dns_state_path" \
+      "$primary_failure_reason"
+    printf '[serial:%s] %s %s rc=%s\n' "$stage_name" "$label" "$target" "$rc"
+    printf -- '----- %s/%s (%s %s) BEGIN -----\n' "$stage_name" "$label" "$node_id" "$role"
+    cat "$log_path"
+    printf -- '\n----- %s/%s END -----\n' "$stage_name" "$label"
+    if [[ "$rc" -ne 0 ]]; then
+      failed=1
+    fi
+  done < "$NODES_TSV"
 
   [[ "$failed" -eq 0 ]]
 }
@@ -1381,8 +1882,10 @@ run_root pkill -f '/tmp/rn_bootstrap.env' >/dev/null 2>&1 || true
 run_root pkill -f 'rn-sudo-verify' >/dev/null 2>&1 || true
 run_root pkill -f 'sudo -A -p .* -k true' >/dev/null 2>&1 || true
 run_root pkill -f 'sudo -S -p .* -k true' >/dev/null 2>&1 || true
+run_root pkill -f 'apt-get install' >/dev/null 2>&1 || true
 run_root pkill -f 'apt-get update' >/dev/null 2>&1 || true
 run_root pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
+run_root pkill -f 'dpkg' >/dev/null 2>&1 || true
 run_root pkill -f 'dnf install -y' >/dev/null 2>&1 || true
 run_root pkill -f 'cargo build --release -p rustynetd -p rustynet-cli' >/dev/null 2>&1 || true
 
@@ -1614,12 +2117,11 @@ run_apt_update_hardened() {
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
-    -o Acquire::http::Timeout=20
-    -o Acquire::https::Timeout=20
+    -o Acquire::ForceIPv4=true
+    -o Acquire::http::Timeout=60
+    -o Acquire::https::Timeout=60
+    -o Dpkg::Use-Pty=0
   )
-  if [[ -z "$(ip -6 route show default 2>/dev/null | head -n 1)" ]]; then
-    apt_network_opts+=(-o Acquire::ForceIPv4=true)
-  fi
   for attempt in $(seq 1 3); do
     wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
     apt_log="$(mktemp /tmp/rn-apt-update.XXXXXX.log)"
@@ -1650,18 +2152,17 @@ run_apt_install_hardened() {
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
-    -o Acquire::http::Timeout=20
-    -o Acquire::https::Timeout=20
+    -o Acquire::ForceIPv4=true
+    -o Acquire::http::Timeout=60
+    -o Acquire::https::Timeout=60
+    -o Dpkg::Use-Pty=0
   )
-  if [[ -z "$(ip -6 route show default 2>/dev/null | head -n 1)" ]]; then
-    apt_network_opts+=(-o Acquire::ForceIPv4=true)
-  fi
   if [[ "$#" -eq 0 ]]; then
     echo "run_apt_install_hardened requires package names" >&2
     return 2
   fi
   for attempt in $(seq 1 3); do
-    if run_root_timed 2400 env DEBIAN_FRONTEND=noninteractive apt-get \
+    if run_root_timed 5400 env DEBIAN_FRONTEND=noninteractive apt-get \
       "${apt_network_opts[@]}" \
       install -y --no-install-recommends "$@"; then
       return 0
@@ -1777,7 +2278,7 @@ wait_for_bootstrap_rustup_endpoint() {
   local endpoint="https://static.rust-lang.org/dist/channel-rust-${channel}.toml.sha256"
   local attempt
   for attempt in $(seq 1 8); do
-    if run_local_timed 60 curl --fail --silent --show-error --head "${endpoint}" >/dev/null 2>&1; then
+    if run_local_timed 60 curl --ipv4 --fail --silent --show-error --head "${endpoint}" >/dev/null 2>&1; then
       return 0
     fi
     repair_bootstrap_dns_state
@@ -1793,7 +2294,10 @@ install_rust_toolchain_hardened() {
   local attempt
   wait_for_bootstrap_rustup_endpoint "${channel}" || return 1
   for attempt in $(seq 1 3); do
-    if run_local_timed 1800 rustup toolchain install "${channel}" --profile minimal --component rustfmt --component clippy; then
+    if run_local_timed 3600 env \
+      RUSTUP_DOWNLOAD_TIMEOUT=600 \
+      RUSTUP_CONCURRENT_DOWNLOADS=1 \
+      rustup toolchain install "${channel}" --profile minimal; then
       return 0
     fi
     if [[ "${attempt}" -lt 3 ]]; then
@@ -1857,13 +2361,17 @@ EOF_BOOTSTRAP
 }
 
 prime_remote_access() {
-  run_parallel_node_stage prime_remote_access prime_remote_access_worker
+  run_serial_node_stage prime_remote_access prime_remote_access_worker
 }
 
 prime_remote_access_worker() {
   local label="$1"
   local target="$2"
   printf '[prime-remote] %s %s\n' "$label" "$target"
+  # Prime the connection only after SSH is actually accepting sessions.
+  # Freshly restarted guests can lag behind the control plane, and this stage
+  # should wait rather than failing closed on a transient boot delay.
+  ssh_wait_for_host "$target" 120 5 || return 1
   live_lab_push_sudo_password "$target"
 }
 
@@ -1919,13 +2427,14 @@ stage_prepare_source_archive() {
 }
 
 stage_cleanup_hosts() {
-  run_parallel_node_stage cleanup_hosts cleanup_host_worker
+  run_serial_node_stage cleanup_hosts cleanup_host_worker
 }
 
 cleanup_host_worker() {
   local label="$1"
   local target="$2"
   printf '[cleanup] %s %s\n' "$label" "$target"
+  ssh_wait_for_host "$target" 120 5 || return 1
   live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh"
   live_lab_ssh "$target" "chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh"
 }
@@ -1940,6 +2449,8 @@ bootstrap_host_worker() {
   local node_id="$3"
   local role="$4"
   local env_path
+  local attempt max_attempts=12 sleep_secs=10
+  ssh_wait_for_host "$target" || return 1
   live_lab_push_sudo_password "$target"
   env_path="$STATE_DIR/bootstrap-${label}.env"
   cat > "$env_path" <<EOF_ENV
@@ -1953,10 +2464,21 @@ EOF_ENV
     printf 'RUSTYNET_BACKEND=%s\n' "${RUSTYNET_BACKEND}" >> "$env_path"
   fi
   printf '[bootstrap] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
-  live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh"
-  live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env"
-  live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "/tmp/rn_source.tar.gz"
-  live_lab_ssh "$target" "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env"
+  for attempt in $(seq 1 "$max_attempts"); do
+    if live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh" &&
+      live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env" &&
+      live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "/tmp/rn_source.tar.gz" &&
+      live_lab_ssh "$target" "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env" &&
+      live_lab_wait_for_daemon_socket "$target" &&
+      live_lab_run_root "$target" "root test -x /usr/local/bin/rustynet && root test -x /usr/local/bin/rustynetd && root test -f /var/lib/rustynet/keys/wireguard.pub && root getent group rustynetd >/dev/null 2>&1"
+    then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+  return 1
 }
 
 stage_collect_pubkeys() {
@@ -1982,7 +2504,13 @@ collect_pubkey_worker() {
   local stage_dir result_path
   stage_dir="$(parallel_stage_dir collect_pubkeys)"
   result_path="${stage_dir}/pubkey-${label}.tsv"
-  pub_hex="$(live_lab_collect_pubkey_hex "$target")"
+  if ! pub_hex="$(live_lab_collect_pubkey_hex "$target")"; then
+    return 1
+  fi
+  if [[ -z "$pub_hex" ]]; then
+    echo "failed to collect wireguard pubkey for ${target}" >&2
+    return 1
+  fi
   printf '%s\t%s\t%s\t%s\n' "$label" "$target" "$node_id" "$pub_hex" > "$result_path"
   printf '[pubkey] %s %s %s\n' "$label" "$target" "$pub_hex"
 }
@@ -2055,7 +2583,7 @@ distribute_membership_worker() {
   printf '[membership-distribute] %s %s\n' "$label" "$target"
   live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "/tmp/rn-membership.snapshot"
   live_lab_scp_to "$STATE_DIR/membership.log" "$target" "/tmp/rn-membership.log"
-  live_lab_run_root "$target" "root install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
+  live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
 }
 
 stage_issue_and_distribute_assignments() {
@@ -2131,10 +2659,11 @@ distribute_traversal_worker() {
   exit_target="$EXIT_TARGET"
   bundle_local="$STATE_DIR/traversal-${node_id}.bundle"
   printf '[traversal-distribute] %s %s\n' "$node_id" "$target"
+  live_lab_ensure_rustynetd_group "$target" || return 1
   live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" > "$bundle_local"
   live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
   live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
-  live_lab_run_root "$target" "root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+  live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
 }
 
 stage_enforce_baseline_runtime() {
@@ -2178,11 +2707,273 @@ refresh_signed_state_worker() {
 }
 
 stage_validate_baseline_runtime() {
-  local nft_rules
+  local nft_rules stage_dir route_matrix_snapshot route_matrix_rc
   run_parallel_node_stage validate_baseline_runtime validate_runtime_worker
+  stage_dir="$(parallel_stage_dir validate_baseline_runtime)"
+  set +e
+  route_matrix_snapshot="$(live_lab_wait_for_route_matrix_convergence "$(node_id_for_label exit)" 2 20 3 validate_baseline_runtime 2>&1)"
+  route_matrix_rc=$?
+  set -e
+  {
+    printf 'capture_rc=%s\n' "$route_matrix_rc"
+    printf '%s\n' "$route_matrix_snapshot"
+  } > "$stage_dir/route_matrix.txt"
+  [[ "$route_matrix_rc" -eq 0 ]] || return "$route_matrix_rc"
   nft_rules="$(live_lab_capture_root "$(node_target_for_label exit)" "root nft list ruleset || true")" || return 1
   printf '[exit-nft]\n%s\n' "$nft_rules"
   grep -Eq 'masquerade|rustynet' <<<"$nft_rules" || return 1
+}
+
+live_lab_wait_for_node_convergence() {
+  local target="$1"
+  local node_id="$2"
+  local role="$3"
+  local expected_membership_nodes="$4"
+  local exit_node_id="$5"
+  local attempts="${6:-60}"
+  local sleep_secs="${7:-10}"
+  local attempt snapshot
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$role")" || snapshot=""
+    if [[ -n "$snapshot" ]] && live_lab_assert_runtime_spec \
+      "$snapshot" \
+      "$node_id" \
+      "$target" \
+      "$role" \
+      "$expected_membership_nodes" \
+      "$exit_node_id" >/dev/null 2>&1; then
+      printf '%s' "$snapshot"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+
+  snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$role")" || snapshot=""
+  printf '%s' "$snapshot"
+  return 1
+}
+
+live_lab_route_matrix_matches_expected_topology() {
+  local snapshot="$1"
+  local expected_exit_node_id="$2"
+  awk -v expected_exit="$expected_exit_node_id" '
+    function after(prefix) {
+      return substr($0, length(prefix) + 1)
+    }
+    function reset_source() {
+      source_id = ""
+      source_status_rc = ""
+      source_default_route_rc = ""
+      source_default_route_get_rc = ""
+      status_state = ""
+      status_exit_node = ""
+      status_serving_exit_node = ""
+      status_restricted_safe_mode = ""
+      status_bootstrap_error = ""
+      status_last_reconcile_error = ""
+      default_route_device = ""
+      default_route_table = ""
+      pair_count = 0
+    }
+    function finalize_pair() {
+      if (!in_pair) {
+        return
+      }
+      pair_count++
+      if (pair_destination_node_id == "" || pair_capture_rc != "0" || pair_route_get_rc != "0") {
+        fail = 1
+      }
+      in_pair = 0
+      pair_destination_node_id = ""
+      pair_capture_rc = ""
+      pair_route_get_rc = ""
+      next_route_context = ""
+    }
+    function finalize_source() {
+      if (!in_source) {
+        return
+      }
+      finalize_pair()
+      source_count++
+      if (source_id == "" || source_status_rc != "0" || source_default_route_rc != "0" || source_default_route_get_rc != "0") {
+        fail = 1
+      }
+      if (status_restricted_safe_mode != "false" || status_bootstrap_error != "none" || status_last_reconcile_error != "none") {
+        fail = 1
+      }
+      if (status_state == "" || status_state == "FailClosed") {
+        fail = 1
+      }
+      if (pair_count != expected_node_count + 0) {
+        fail = 1
+      }
+      if (source_id == expected_exit) {
+        exit_seen = 1
+        if (status_serving_exit_node != "true") {
+          fail = 1
+        }
+      } else {
+        if (status_exit_node != expected_exit) {
+          fail = 1
+        }
+        if (default_route_device != "rustynet0" || default_route_table != "51820") {
+          fail = 1
+        }
+      }
+      in_source = 0
+      in_status = 0
+      in_route_policy = 0
+      route_context = ""
+      next_route_context = ""
+    }
+    /^route_matrix_node_count=/ {
+      expected_node_count = after("route_matrix_node_count=")
+      next
+    }
+    /^route_matrix_status=/ {
+      overall_status = after("route_matrix_status=")
+      next
+    }
+    /^source_node_begin$/ {
+      finalize_source()
+      in_source = 1
+      reset_source()
+      next
+    }
+    /^source_node_end$/ {
+      finalize_source()
+      next
+    }
+    /^pair_begin$/ {
+      finalize_pair()
+      in_pair = 1
+      next
+    }
+    /^pair_end$/ {
+      finalize_pair()
+      next
+    }
+    /^source_node_id=/ && in_source && !in_pair {
+      source_id = after("source_node_id=")
+      next
+    }
+    /^source_status_capture_rc=/ && in_source {
+      source_status_rc = after("source_status_capture_rc=")
+      next
+    }
+    /^source_default_route_capture_rc=/ && in_source {
+      source_default_route_rc = after("source_default_route_capture_rc=")
+      next_route_context = "source_default"
+      next
+    }
+    /^route_policy_capture_rc=/ && in_pair {
+      pair_capture_rc = after("route_policy_capture_rc=")
+      next_route_context = "pair"
+      next
+    }
+    /^destination_node_id=/ && in_pair {
+      pair_destination_node_id = after("destination_node_id=")
+      next
+    }
+    /^__RNLAB_STATUS_BEGIN__$/ && in_source {
+      in_status = 1
+      next
+    }
+    /^__RNLAB_STATUS_END__$/ && in_source {
+      in_status = 0
+      next
+    }
+    /^__RNLAB_ROUTE_POLICY_BEGIN__$/ && in_source {
+      in_route_policy = 1
+      route_context = next_route_context
+      next_route_context = ""
+      next
+    }
+    /^__RNLAB_ROUTE_POLICY_END__$/ && in_source {
+      in_route_policy = 0
+      route_context = ""
+      next
+    }
+    in_status && /^state=/ {
+      status_state = after("state=")
+      next
+    }
+    in_status && /^exit_node=/ {
+      status_exit_node = after("exit_node=")
+      next
+    }
+    in_status && /^serving_exit_node=/ {
+      status_serving_exit_node = after("serving_exit_node=")
+      next
+    }
+    in_status && /^restricted_safe_mode=/ {
+      status_restricted_safe_mode = after("restricted_safe_mode=")
+      next
+    }
+    in_status && /^bootstrap_error=/ {
+      status_bootstrap_error = after("bootstrap_error=")
+      next
+    }
+    in_status && /^last_reconcile_error=/ {
+      status_last_reconcile_error = after("last_reconcile_error=")
+      next
+    }
+    in_route_policy && route_context == "source_default" && /^route_get_rc=/ {
+      source_default_route_get_rc = after("route_get_rc=")
+      next
+    }
+    in_route_policy && route_context == "source_default" && /^actual_route_device=/ {
+      default_route_device = after("actual_route_device=")
+      next
+    }
+    in_route_policy && route_context == "source_default" && /^actual_route_table=/ {
+      default_route_table = after("actual_route_table=")
+      next
+    }
+    in_route_policy && route_context == "pair" && /^route_get_rc=/ {
+      pair_route_get_rc = after("route_get_rc=")
+      next
+    }
+    END {
+      finalize_source()
+      if (expected_node_count == "" || source_count != expected_node_count + 0 || !exit_seen || overall_status != "pass" || fail) {
+        exit 1
+      }
+    }
+  ' <<<"$snapshot"
+}
+
+live_lab_wait_for_route_matrix_convergence() {
+  local expected_exit_node_id="$1"
+  local consecutive_polls="${2:-2}"
+  local attempts="${3:-20}"
+  local sleep_secs="${4:-3}"
+  local stage_name="${5:-route_matrix_convergence}"
+  local attempt snapshot
+  local matched_polls=0
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    snapshot="$(live_lab_collect_route_matrix_snapshot "$stage_name" 2>&1)" || snapshot="${snapshot:-}"
+    if [[ -n "$snapshot" ]] && live_lab_route_matrix_matches_expected_topology "$snapshot" "$expected_exit_node_id" >/dev/null 2>&1; then
+      matched_polls=$((matched_polls + 1))
+      if (( matched_polls >= consecutive_polls )); then
+        printf '%s' "$snapshot"
+        return 0
+      fi
+    else
+      matched_polls=0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+
+  snapshot="$(live_lab_collect_route_matrix_snapshot "$stage_name" 2>&1)" || snapshot="${snapshot:-}"
+  printf '%s' "$snapshot"
+  return 1
 }
 
 validate_runtime_worker() {
@@ -2190,28 +2981,41 @@ validate_runtime_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  local status route_check no_plaintext expected_membership_nodes exit_node_id status_label
-  status="$(live_lab_status "$target")"
-  printf '[status] %s %s\n%s\n' "$node_id" "$target" "$status"
+  local expected_membership_nodes exit_node_id snapshot wait_rc
+  local route_policy route_policy_rc dns_snapshot dns_snapshot_rc expected_next_hop
+
   expected_membership_nodes="$(node_count)"
   exit_node_id="$(node_id_for_label exit)"
-  status_label="baseline status (${node_id})"
-  assert_text_contains "$status" "$status_label" "transport_socket_identity_state=authoritative_backend_shared_transport"
-  assert_text_contains "$status" "$status_label" "transport_socket_identity_error=none"
-  assert_text_contains "$status" "$status_label" "encrypted_key_store=true"
-  assert_text_contains "$status" "$status_label" "auto_tunnel_enforce=true"
-  assert_text_contains "$status" "$status_label" "membership_active_nodes=${expected_membership_nodes}"
-  assert_text_absent "$status" "$status_label" "does not yet implement route application"
-  assert_text_absent "$status" "$status_label" "does not yet implement exit mode"
+  expected_next_hop=""
   if [[ "$role" == "client" ]]; then
-    assert_text_contains "$status" "$status_label" "exit_node=${exit_node_id}"
-    route_check="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true")"
-    printf '[route] %s %s\n%s\n' "$node_id" "$target" "$route_check"
-    assert_text_contains "$route_check" "route check (${node_id})" "dev rustynet0"
+    expected_next_hop="direct:rustynet0"
   fi
-  no_plaintext="$(live_lab_no_plaintext_passphrase_check "$target")"
-  printf '[plaintext-check] %s %s\n%s\n' "$node_id" "$target" "$no_plaintext"
-  assert_text_contains "$no_plaintext" "plaintext check (${node_id})" "no-plaintext-passphrase-files"
+  set +e
+  snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id")"
+  wait_rc=$?
+  route_policy="$(live_lab_collect_route_policy "$target" "1.1.1.1" "$expected_next_hop" 2>&1)"
+  route_policy_rc=$?
+  dns_snapshot="$(live_lab_collect_dns_snapshot "$target" 2>&1)"
+  dns_snapshot_rc=$?
+  set -e
+  if [[ -n "${LIVE_LAB_STAGE_DIR:-}" ]]; then
+    stage_worker_write_artifact "$_label" "snapshot.txt" "$(printf 'capture_rc=%s\n%s\n' "$wait_rc" "$snapshot")" >/dev/null || return 1
+    stage_worker_write_artifact "$_label" "route_policy.txt" "$(printf 'capture_rc=%s\n%s\n' "$route_policy_rc" "$route_policy")" >/dev/null || return 1
+    stage_worker_write_artifact "$_label" "dns_state.txt" "$(printf 'capture_rc=%s\n%s\n' "$dns_snapshot_rc" "$dns_snapshot")" >/dev/null || return 1
+  fi
+  printf '[snapshot] %s %s\n%s\n' "$node_id" "$target" "$snapshot"
+  printf '[route-policy] %s %s\n%s\n' "$node_id" "$target" "$route_policy"
+  printf '[dns-state] %s %s\n%s\n' "$node_id" "$target" "$dns_snapshot"
+  [[ "$route_policy_rc" -eq 0 ]] || return "$route_policy_rc"
+  [[ "$dns_snapshot_rc" -eq 0 ]] || return "$dns_snapshot_rc"
+  live_lab_assert_runtime_spec \
+    "$snapshot" \
+    "$node_id" \
+    "$target" \
+    "$role" \
+    "$expected_membership_nodes" \
+    "$exit_node_id"
+  return "$wait_rc"
 }
 
 current_run_git_commit() {
@@ -2479,6 +3283,886 @@ assert_text_absent() {
   if [[ "$text" == *"$pattern"* ]]; then
     printf '%s contains forbidden text (%s)\n' "$label" "$pattern" >&2
     return 1
+  fi
+}
+
+snapshot_section_text() {
+  local snapshot="$1"
+  local section_name="$2"
+  awk -v begin="__RNLAB_${section_name}_BEGIN__" -v end="__RNLAB_${section_name}_END__" '
+    $0 == begin {
+      capture = 1
+      next
+    }
+    $0 == end {
+      capture = 0
+      next
+    }
+    capture {
+      print
+    }
+  ' <<<"$snapshot"
+}
+
+snapshot_section_or_self_text() {
+  local snapshot="$1"
+  local section_name="$2"
+  local section
+  section="$(snapshot_section_text "$snapshot" "$section_name")"
+  if [[ -n "$section" ]]; then
+    printf '%s' "$section"
+    return 0
+  fi
+  printf '%s' "$snapshot"
+}
+
+snapshot_named_block_text() {
+  local snapshot="$1"
+  local block_name="$2"
+  awk -v begin="${block_name}_begin" -v end="${block_name}_end" '
+    $0 == begin {
+      capture = 1
+      next
+    }
+    $0 == end {
+      capture = 0
+      next
+    }
+    capture {
+      print
+    }
+  ' <<<"$snapshot"
+}
+
+snapshot_field_value() {
+  local snapshot="$1"
+  local key="$2"
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      print substr($0, length(key) + 2)
+      exit
+    }
+  ' <<<"$snapshot"
+}
+
+snapshot_keyed_block_text() {
+  local snapshot="$1"
+  local begin_marker="$2"
+  local end_marker="$3"
+  local selector_key="$4"
+  local selector_value="$5"
+  awk \
+    -v begin="$begin_marker" \
+    -v end="$end_marker" \
+    -v selector_key="$selector_key" \
+    -v selector_value="$selector_value" '
+      $0 == begin {
+        capture = 1
+        matches = 0
+        block = ""
+        next
+      }
+      $0 == end {
+        if (capture && matches) {
+          printf "%s", block
+          exit
+        }
+        capture = 0
+        matches = 0
+        block = ""
+        next
+      }
+      capture {
+        block = block $0 ORS
+        if (index($0, selector_key "=") == 1 && substr($0, length(selector_key) + 2) == selector_value) {
+          matches = 1
+        }
+      }
+    ' <<<"$snapshot"
+}
+
+permissions_fact_text() {
+  local snapshot="$1"
+  local path="$2"
+  snapshot_keyed_block_text "$snapshot" "permissions_fact_begin" "permissions_fact_end" "path" "$path"
+}
+
+socket_fact_text() {
+  local snapshot="$1"
+  local fact_name="$2"
+  snapshot_keyed_block_text "$snapshot" "socket_fact_begin" "socket_fact_end" "name" "$fact_name"
+}
+
+mode_world_digit() {
+  local mode="$1"
+  if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    return 1
+  fi
+  printf '%s' "$((10#$mode % 10))"
+}
+
+assert_mode_not_world_accessible() {
+  local mode="$1"
+  local label="$2"
+  local path="$3"
+  local world_digit
+  world_digit="$(mode_world_digit "$mode")" || {
+    printf '%s has invalid mode for %s: %s\n' "$label" "$path" "${mode:-missing}" >&2
+    return 1
+  }
+  if [[ "$world_digit" != "0" ]]; then
+    printf '%s has world-accessible mode for %s: %s\n' "$label" "$path" "$mode" >&2
+    return 1
+  fi
+}
+
+permissions_fact_require() {
+  local permissions_snapshot="$1"
+  local path="$2"
+  local label="$3"
+  local mode_pattern="$4"
+  local owner_pattern="$5"
+  local group_pattern="$6"
+  local type_pattern="$7"
+  local fact present mode owner group kind
+
+  fact="$(permissions_fact_text "$permissions_snapshot" "$path")"
+  if [[ -z "$fact" ]]; then
+    printf '%s missing permissions fact for %s\n' "$label" "$path" >&2
+    return 1
+  fi
+  present="$(snapshot_field_value "$fact" "present")"
+  mode="$(snapshot_field_value "$fact" "mode")"
+  owner="$(snapshot_field_value "$fact" "owner")"
+  group="$(snapshot_field_value "$fact" "group")"
+  kind="$(snapshot_field_value "$fact" "type")"
+  if [[ "$present" != "1" ]]; then
+    printf '%s missing required path %s\n' "$label" "$path" >&2
+    return 1
+  fi
+  if ! [[ "$mode" =~ $mode_pattern ]]; then
+    printf '%s unexpected mode for %s: %s\n' "$label" "$path" "${mode:-missing}" >&2
+    return 1
+  fi
+  if ! [[ "$owner" =~ $owner_pattern ]]; then
+    printf '%s unexpected owner for %s: %s\n' "$label" "$path" "${owner:-missing}" >&2
+    return 1
+  fi
+  if ! [[ "$group" =~ $group_pattern ]]; then
+    printf '%s unexpected group for %s: %s\n' "$label" "$path" "${group:-missing}" >&2
+    return 1
+  fi
+  if ! [[ "$kind" =~ $type_pattern ]]; then
+    printf '%s unexpected type for %s: %s\n' "$label" "$path" "${kind:-missing}" >&2
+    return 1
+  fi
+}
+
+permissions_fact_require_if_present() {
+  local permissions_snapshot="$1"
+  local path="$2"
+  local label="$3"
+  local mode_pattern="$4"
+  local owner_pattern="$5"
+  local group_pattern="$6"
+  local type_pattern="$7"
+  local fact present
+
+  fact="$(permissions_fact_text "$permissions_snapshot" "$path")"
+  if [[ -z "$fact" ]]; then
+    printf '%s missing permissions fact for %s\n' "$label" "$path" >&2
+    return 1
+  fi
+  present="$(snapshot_field_value "$fact" "present")"
+  if [[ "$present" == "0" ]]; then
+    return 0
+  fi
+  permissions_fact_require "$permissions_snapshot" "$path" "$label" "$mode_pattern" "$owner_pattern" "$group_pattern" "$type_pattern"
+}
+
+permissions_fact_require_absent() {
+  local permissions_snapshot="$1"
+  local path="$2"
+  local label="$3"
+  local fact present
+
+  fact="$(permissions_fact_text "$permissions_snapshot" "$path")"
+  if [[ -z "$fact" ]]; then
+    printf '%s missing permissions fact for %s\n' "$label" "$path" >&2
+    return 1
+  fi
+  present="$(snapshot_field_value "$fact" "present")"
+  if [[ "$present" != "0" ]]; then
+    printf '%s expected plaintext path to be absent: %s\n' "$label" "$path" >&2
+    return 1
+  fi
+}
+
+live_lab_assert_time_sync() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local time_snapshot time_label
+  local reference_unix max_clock_skew_secs remote_unix_now clock_skew_secs
+  local sync_evidence_present sync_source_kind time_sync_observability system_clock_synchronized timedatectl_available
+
+  time_label="time sync (${node_id})"
+  if [[ "$snapshot" == *"time_target="* ]]; then
+    assert_text_contains "$snapshot" "time snapshot (${node_id})" "time_target=${target}"
+  fi
+  if [[ "$snapshot" == *"time_node_id="* ]]; then
+    assert_text_contains "$snapshot" "time snapshot (${node_id})" "time_node_id=${node_id}"
+  fi
+  time_snapshot="$(snapshot_section_or_self_text "$snapshot" "RNLAB_TIME")"
+  assert_text_contains "$time_snapshot" "$time_label" "time_snapshot_version=2"
+
+  reference_unix="$(snapshot_field_value "$time_snapshot" "reference_unix")"
+  max_clock_skew_secs="$(snapshot_field_value "$time_snapshot" "max_clock_skew_secs")"
+  remote_unix_now="$(snapshot_field_value "$time_snapshot" "remote_unix_now")"
+  clock_skew_secs="$(snapshot_field_value "$time_snapshot" "clock_skew_secs")"
+  sync_evidence_present="$(snapshot_field_value "$time_snapshot" "sync_evidence_present")"
+  sync_source_kind="$(snapshot_field_value "$time_snapshot" "sync_source_kind")"
+  time_sync_observability="$(snapshot_field_value "$time_snapshot" "time_sync_observability")"
+  system_clock_synchronized="$(snapshot_field_value "$time_snapshot" "system_clock_synchronized")"
+  timedatectl_available="$(snapshot_field_value "$time_snapshot" "timedatectl_available")"
+
+  if [[ ! "$reference_unix" =~ ^[0-9]+$ || ! "$max_clock_skew_secs" =~ ^[0-9]+$ || ! "$remote_unix_now" =~ ^[0-9]+$ || ! "$clock_skew_secs" =~ ^[0-9]+$ ]]; then
+    printf '%s missing numeric skew evidence\n' "$time_label" >&2
+    return 1
+  fi
+  if (( clock_skew_secs > max_clock_skew_secs )); then
+    printf '%s exceeds skew bound: skew=%s max=%s\n' "$time_label" "$clock_skew_secs" "$max_clock_skew_secs" >&2
+    return 1
+  fi
+  if [[ "$sync_evidence_present" != "1" ]]; then
+    printf '%s missing credible synchronization source evidence\n' "$time_label" >&2
+    return 1
+  fi
+  if [[ -z "$sync_source_kind" || "$sync_source_kind" == "none" ]]; then
+    printf '%s missing synchronization source classification\n' "$time_label" >&2
+    return 1
+  fi
+  if [[ "$time_sync_observability" != "full" ]]; then
+    printf '%s missing full time-sync observability\n' "$time_label" >&2
+    return 1
+  fi
+  if [[ "$timedatectl_available" == "1" && "$system_clock_synchronized" != "yes" ]]; then
+    printf '%s expected timedatectl synchronized=yes, got %s\n' "$time_label" "${system_clock_synchronized:-missing}" >&2
+    return 1
+  fi
+}
+
+live_lab_assert_process_health() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local process_snapshot process_label
+  local daemon_process_count helper_process_count managed_dns_process_count systemd_resolved_process_count
+  local unexpected_rustynetd_process_count rustynetd_active_state rustynetd_sub_state rustynetd_main_pid
+  local helper_active_state helper_sub_state helper_main_pid managed_dns_active_state managed_dns_sub_state
+  local systemd_resolved_active_state
+
+  process_label="process health (${node_id})"
+  if [[ "$snapshot" == *"process_target="* ]]; then
+    assert_text_contains "$snapshot" "process snapshot (${node_id})" "process_target=${target}"
+  fi
+  if [[ "$snapshot" == *"process_node_id="* ]]; then
+    assert_text_contains "$snapshot" "process snapshot (${node_id})" "process_node_id=${node_id}"
+  fi
+  process_snapshot="$(snapshot_section_or_self_text "$snapshot" "RNLAB_PROCESS")"
+  assert_text_contains "$process_snapshot" "$process_label" "process_snapshot_version=2"
+
+  daemon_process_count="$(snapshot_field_value "$process_snapshot" "daemon_process_count")"
+  helper_process_count="$(snapshot_field_value "$process_snapshot" "helper_process_count")"
+  managed_dns_process_count="$(snapshot_field_value "$process_snapshot" "managed_dns_process_count")"
+  systemd_resolved_process_count="$(snapshot_field_value "$process_snapshot" "systemd_resolved_process_count")"
+  unexpected_rustynetd_process_count="$(snapshot_field_value "$process_snapshot" "unexpected_rustynetd_process_count")"
+  rustynetd_active_state="$(snapshot_field_value "$process_snapshot" "rustynetd_active_state")"
+  rustynetd_sub_state="$(snapshot_field_value "$process_snapshot" "rustynetd_sub_state")"
+  rustynetd_main_pid="$(snapshot_field_value "$process_snapshot" "rustynetd_main_pid")"
+  helper_active_state="$(snapshot_field_value "$process_snapshot" "helper_active_state")"
+  helper_sub_state="$(snapshot_field_value "$process_snapshot" "helper_sub_state")"
+  helper_main_pid="$(snapshot_field_value "$process_snapshot" "helper_main_pid")"
+  managed_dns_active_state="$(snapshot_field_value "$process_snapshot" "managed_dns_active_state")"
+  managed_dns_sub_state="$(snapshot_field_value "$process_snapshot" "managed_dns_sub_state")"
+  systemd_resolved_active_state="$(snapshot_field_value "$process_snapshot" "systemd_resolved_active_state")"
+
+  if [[ "$daemon_process_count" != "1" || "$helper_process_count" != "1" || "$unexpected_rustynetd_process_count" != "0" ]]; then
+    printf '%s unexpected daemon/helper process counts\n' "$process_label" >&2
+    return 1
+  fi
+  if [[ ! "$rustynetd_main_pid" =~ ^[1-9][0-9]*$ || ! "$helper_main_pid" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s missing active main PID evidence\n' "$process_label" >&2
+    return 1
+  fi
+  if [[ "$rustynetd_active_state" != "active" || "$rustynetd_sub_state" != "running" ]]; then
+    printf '%s rustynetd.service not active/running\n' "$process_label" >&2
+    return 1
+  fi
+  if [[ "$helper_active_state" != "active" || "$helper_sub_state" != "running" ]]; then
+    printf '%s rustynetd-privileged-helper.service not active/running\n' "$process_label" >&2
+    return 1
+  fi
+  if [[ "$managed_dns_active_state" != "active" || ( "$managed_dns_sub_state" != "exited" && "$managed_dns_sub_state" != "running" ) ]]; then
+    printf '%s rustynetd-managed-dns.service not active/exited\n' "$process_label" >&2
+    return 1
+  fi
+  if [[ "$managed_dns_process_count" != "0" ]]; then
+    printf '%s unexpected persistent managed-DNS process count: %s\n' "$process_label" "${managed_dns_process_count:-missing}" >&2
+    return 1
+  fi
+  if [[ "$systemd_resolved_active_state" != "active" || ! "$systemd_resolved_process_count" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s systemd-resolved is not active with a live process\n' "$process_label" >&2
+    return 1
+  fi
+}
+
+live_lab_assert_socket_health() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local _role="$4"
+  local socket_snapshot socket_label
+  local daemon_socket_present helper_socket_present daemon_unix_listener_count helper_unix_listener_count
+  local wireguard_udp_listener_count dns_udp_loopback_listener_count dns_udp_nonloopback_listener_count
+  local dns_tcp_listener_count unexpected_runtime_socket_count
+  local daemon_fact helper_fact runtime_dir_fact
+  local daemon_mode daemon_owner helper_mode helper_owner runtime_dir_mode runtime_dir_owner
+
+  socket_label="socket health (${node_id})"
+  if [[ "$snapshot" == *"socket_target="* ]]; then
+    assert_text_contains "$snapshot" "socket snapshot (${node_id})" "socket_target=${target}"
+  fi
+  if [[ "$snapshot" == *"socket_node_id="* ]]; then
+    assert_text_contains "$snapshot" "socket snapshot (${node_id})" "socket_node_id=${node_id}"
+  fi
+  socket_snapshot="$(snapshot_section_or_self_text "$snapshot" "RNLAB_SOCKET")"
+  assert_text_contains "$socket_snapshot" "$socket_label" "socket_snapshot_version=2"
+
+  daemon_socket_present="$(snapshot_field_value "$socket_snapshot" "daemon_socket_present")"
+  helper_socket_present="$(snapshot_field_value "$socket_snapshot" "helper_socket_present")"
+  daemon_unix_listener_count="$(snapshot_field_value "$socket_snapshot" "daemon_unix_listener_count")"
+  helper_unix_listener_count="$(snapshot_field_value "$socket_snapshot" "helper_unix_listener_count")"
+  wireguard_udp_listener_count="$(snapshot_field_value "$socket_snapshot" "wireguard_udp_listener_count")"
+  dns_udp_loopback_listener_count="$(snapshot_field_value "$socket_snapshot" "dns_udp_loopback_listener_count")"
+  dns_udp_nonloopback_listener_count="$(snapshot_field_value "$socket_snapshot" "dns_udp_nonloopback_listener_count")"
+  dns_tcp_listener_count="$(snapshot_field_value "$socket_snapshot" "dns_tcp_listener_count")"
+  unexpected_runtime_socket_count="$(snapshot_field_value "$socket_snapshot" "unexpected_runtime_socket_count")"
+
+  if [[ "$daemon_socket_present" != "1" || "$helper_socket_present" != "1" ]]; then
+    printf '%s missing daemon/helper socket paths\n' "$socket_label" >&2
+    return 1
+  fi
+  if [[ "$daemon_unix_listener_count" != "1" || "$helper_unix_listener_count" != "1" ]]; then
+    printf '%s missing bound daemon/helper UNIX listeners\n' "$socket_label" >&2
+    return 1
+  fi
+  if [[ "$wireguard_udp_listener_count" != "1" || "$dns_udp_loopback_listener_count" != "1" ]]; then
+    printf '%s missing required WireGuard or loopback DNS listeners\n' "$socket_label" >&2
+    return 1
+  fi
+  if [[ "$dns_udp_nonloopback_listener_count" != "0" || "$dns_tcp_listener_count" != "0" || "$unexpected_runtime_socket_count" != "0" ]]; then
+    printf '%s found unexpected listener exposure\n' "$socket_label" >&2
+    return 1
+  fi
+
+  daemon_fact="$(socket_fact_text "$socket_snapshot" "daemon_socket")"
+  helper_fact="$(socket_fact_text "$socket_snapshot" "helper_socket")"
+  runtime_dir_fact="$(socket_fact_text "$socket_snapshot" "runtime_dir")"
+  daemon_mode="$(snapshot_field_value "$daemon_fact" "mode")"
+  daemon_owner="$(snapshot_field_value "$daemon_fact" "owner")"
+  helper_mode="$(snapshot_field_value "$helper_fact" "mode")"
+  helper_owner="$(snapshot_field_value "$helper_fact" "owner")"
+  runtime_dir_mode="$(snapshot_field_value "$runtime_dir_fact" "mode")"
+  runtime_dir_owner="$(snapshot_field_value "$runtime_dir_fact" "owner")"
+
+  if [[ "$(snapshot_field_value "$daemon_fact" "present")" != "1" || "$(snapshot_field_value "$daemon_fact" "type")" != "socket" ]]; then
+    printf '%s daemon socket stat evidence is missing\n' "$socket_label" >&2
+    return 1
+  fi
+  if [[ "$(snapshot_field_value "$helper_fact" "present")" != "1" || "$(snapshot_field_value "$helper_fact" "type")" != "socket" ]]; then
+    printf '%s helper socket stat evidence is missing\n' "$socket_label" >&2
+    return 1
+  fi
+  if [[ "$(snapshot_field_value "$runtime_dir_fact" "present")" != "1" || "$(snapshot_field_value "$runtime_dir_fact" "type")" != "directory" ]]; then
+    printf '%s runtime directory stat evidence is missing\n' "$socket_label" >&2
+    return 1
+  fi
+  assert_mode_not_world_accessible "$daemon_mode" "$socket_label" "/run/rustynet/rustynetd.sock" || return 1
+  assert_mode_not_world_accessible "$helper_mode" "$socket_label" "/run/rustynet/rustynetd-privileged.sock" || return 1
+  assert_mode_not_world_accessible "$runtime_dir_mode" "$socket_label" "/run/rustynet" || return 1
+  if ! [[ "$daemon_owner" =~ ^(root|rustynetd)$ ]]; then
+    printf '%s unexpected daemon socket owner: %s\n' "$socket_label" "${daemon_owner:-missing}" >&2
+    return 1
+  fi
+  if [[ "$helper_owner" != "root" ]]; then
+    printf '%s unexpected helper socket owner: %s\n' "$socket_label" "${helper_owner:-missing}" >&2
+    return 1
+  fi
+  if ! [[ "$runtime_dir_owner" =~ ^(root|rustynetd)$ ]]; then
+    printf '%s unexpected runtime directory owner: %s\n' "$socket_label" "${runtime_dir_owner:-missing}" >&2
+    return 1
+  fi
+}
+
+live_lab_assert_permissions_hardening() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local _role="$4"
+  local permissions_snapshot permissions_label
+  local etc_fact state_fact run_fact
+
+  permissions_label="permissions hardening (${node_id})"
+  if [[ "$snapshot" == *"permissions_target="* ]]; then
+    assert_text_contains "$snapshot" "permissions snapshot (${node_id})" "permissions_target=${target}"
+  fi
+  if [[ "$snapshot" == *"permissions_node_id="* ]]; then
+    assert_text_contains "$snapshot" "permissions snapshot (${node_id})" "permissions_node_id=${node_id}"
+  fi
+  permissions_snapshot="$(snapshot_section_or_self_text "$snapshot" "RNLAB_PERMISSIONS")"
+  assert_text_contains "$permissions_snapshot" "$permissions_label" "permissions_snapshot_version=2"
+  assert_text_contains "$permissions_snapshot" "$permissions_label" "permissions_snapshot_status=pass"
+
+  etc_fact="$(permissions_fact_text "$permissions_snapshot" "/etc/rustynet")"
+  state_fact="$(permissions_fact_text "$permissions_snapshot" "/var/lib/rustynet")"
+  run_fact="$(permissions_fact_text "$permissions_snapshot" "/run/rustynet")"
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/credentials" "$permissions_label" '^700$' '^root$' '^root$' '^directory$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/credentials/wg_key_passphrase.cred" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/credentials/signing_key_passphrase.cred" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/keys/wireguard.key.enc" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/run/rustynet/wireguard.key" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/keys/wireguard.pub" "$permissions_label" '^644$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.snapshot" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.log" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.watermark" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/assignment.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/traversal.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/trust-evidence.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/dns-zone.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/etc/rustynet/assignment-refresh.env" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.assignment" "$permissions_label" '^640$' '^root$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.traversal" "$permissions_label" '^640$' '^root$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.trust" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.dns-zone" "$permissions_label" '^640$' '^root$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.assignment.watermark" "$permissions_label" '^(600|640)$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.traversal.watermark" "$permissions_label" '^(600|640)$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.trust.watermark" "$permissions_label" '^(600|640)$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/rustynetd.dns-zone.watermark" "$permissions_label" '^(600|640)$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
+  permissions_fact_require_if_present "$permissions_snapshot" "/etc/rustynet/assignment.signing.secret" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require_if_present "$permissions_snapshot" "/etc/rustynet/trust-evidence.key" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require_absent "$permissions_snapshot" "/var/lib/rustynet/keys/wireguard.passphrase" "$permissions_label" || return 1
+  permissions_fact_require_absent "$permissions_snapshot" "/etc/rustynet/wireguard.passphrase" "$permissions_label" || return 1
+  permissions_fact_require_absent "$permissions_snapshot" "/etc/rustynet/signing_key_passphrase" "$permissions_label" || return 1
+
+  if [[ "$(snapshot_field_value "$etc_fact" "present")" != "1" || "$(snapshot_field_value "$etc_fact" "type")" != "directory" ]]; then
+    printf '%s missing /etc/rustynet directory evidence\n' "$permissions_label" >&2
+    return 1
+  fi
+  if [[ "$(snapshot_field_value "$state_fact" "present")" != "1" || "$(snapshot_field_value "$state_fact" "type")" != "directory" ]]; then
+    printf '%s missing /var/lib/rustynet directory evidence\n' "$permissions_label" >&2
+    return 1
+  fi
+  if [[ "$(snapshot_field_value "$run_fact" "present")" != "1" || "$(snapshot_field_value "$run_fact" "type")" != "directory" ]]; then
+    printf '%s missing /run/rustynet directory evidence\n' "$permissions_label" >&2
+    return 1
+  fi
+  if [[ "$(snapshot_field_value "$etc_fact" "owner")" != "root" || ! "$(snapshot_field_value "$etc_fact" "group")" =~ ^(root|rustynetd)$ ]]; then
+    printf '%s unexpected /etc/rustynet ownership\n' "$permissions_label" >&2
+    return 1
+  fi
+  if ! [[ "$(snapshot_field_value "$state_fact" "owner")" =~ ^(root|rustynetd)$ ]]; then
+    printf '%s unexpected /var/lib/rustynet owner\n' "$permissions_label" >&2
+    return 1
+  fi
+  if ! [[ "$(snapshot_field_value "$run_fact" "owner")" =~ ^(root|rustynetd)$ ]]; then
+    printf '%s unexpected /run/rustynet owner\n' "$permissions_label" >&2
+    return 1
+  fi
+  assert_mode_not_world_accessible "$(snapshot_field_value "$etc_fact" "mode")" "$permissions_label" "/etc/rustynet" || return 1
+  assert_mode_not_world_accessible "$(snapshot_field_value "$state_fact" "mode")" "$permissions_label" "/var/lib/rustynet" || return 1
+  assert_mode_not_world_accessible "$(snapshot_field_value "$run_fact" "mode")" "$permissions_label" "/run/rustynet" || return 1
+}
+
+live_lab_assert_dns_health() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local dns_state dns_label
+  local resolv_conf_target systemd_resolved_service managed_dns_service resolvectl_available probe_count
+
+  dns_label="dns health (${node_id})"
+  if [[ "$snapshot" == *"dns_state_target="* ]]; then
+    assert_text_contains "$snapshot" "dns snapshot (${node_id})" "dns_state_target=${target}"
+  fi
+  if [[ "$snapshot" == *"dns_state_collected_at_utc="* ]]; then
+    assert_text_contains "$snapshot" "dns snapshot (${node_id})" "dns_state_collected_at_utc="
+  fi
+
+  dns_state="$(snapshot_section_or_self_text "$snapshot" "RNLAB_DNS_STATE")"
+  assert_text_contains "$dns_state" "$dns_label" "dns_state_version=1"
+  assert_text_contains "$dns_state" "$dns_label" "resolv_conf_begin"
+  assert_text_contains "$dns_state" "$dns_label" "resolvectl_status_begin"
+  assert_text_contains "$dns_state" "$dns_label" "systemd_resolved_service=active"
+  assert_text_contains "$dns_state" "$dns_label" "managed_dns_service=active"
+  assert_text_contains "$dns_state" "$dns_label" "resolvectl_available=1"
+
+  resolv_conf_target="$(snapshot_field_value "$dns_state" "resolv_conf_target")"
+  systemd_resolved_service="$(snapshot_field_value "$dns_state" "systemd_resolved_service")"
+  managed_dns_service="$(snapshot_field_value "$dns_state" "managed_dns_service")"
+  resolvectl_available="$(snapshot_field_value "$dns_state" "resolvectl_available")"
+  probe_count="$(snapshot_field_value "$dns_state" "probe_count")"
+
+  if [[ -z "$resolv_conf_target" ]]; then
+    printf '%s missing resolv_conf_target\n' "$dns_label" >&2
+    return 1
+  fi
+  if [[ "$systemd_resolved_service" != "active" ]]; then
+    printf '%s expected systemd-resolved active, got %s\n' "$dns_label" "${systemd_resolved_service:-missing}" >&2
+    return 1
+  fi
+  if [[ "$managed_dns_service" != "active" ]]; then
+    printf '%s expected rustynetd-managed-dns active, got %s\n' "$dns_label" "${managed_dns_service:-missing}" >&2
+    return 1
+  fi
+  if [[ "$resolvectl_available" != "1" ]]; then
+    printf '%s expected resolvectl availability, got %s\n' "$dns_label" "${resolvectl_available:-missing}" >&2
+    return 1
+  fi
+  if [[ ! "$probe_count" =~ ^[0-9]+$ ]] || (( probe_count < 1 )); then
+    printf '%s expected at least one DNS probe, got %s\n' "$dns_label" "${probe_count:-missing}" >&2
+    return 1
+  fi
+}
+
+live_lab_wait_for_dns_convergence() {
+  local target="$1"
+  local node_id="$2"
+  local attempts="${3:-20}"
+  local sleep_secs="${4:-3}"
+  local attempt snapshot
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    snapshot="$(live_lab_collect_dns_snapshot "$target")" || snapshot=""
+    if [[ -n "$snapshot" ]] && live_lab_assert_dns_health \
+      "$snapshot" \
+      "$node_id" \
+      "$target" >/dev/null 2>&1; then
+      printf '%s' "$snapshot"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+
+  snapshot="$(live_lab_collect_dns_snapshot "$target")" || snapshot=""
+  printf '%s' "$snapshot"
+  return 1
+}
+
+live_lab_assert_signed_state_health() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local signed_state signed_label netcheck_text
+
+  signed_label="signed state (${node_id})"
+  if [[ "$snapshot" == *"signed_state_target="* ]]; then
+    assert_text_contains "$snapshot" "signed state snapshot (${node_id})" "signed_state_target=${target}"
+  fi
+  if [[ "$snapshot" == *"signed_state_node_id="* ]]; then
+    assert_text_contains "$snapshot" "signed state snapshot (${node_id})" "signed_state_node_id=${node_id}"
+  fi
+  if [[ "$snapshot" == *"signed_state_collected_at_utc="* ]]; then
+    assert_text_contains "$snapshot" "signed state snapshot (${node_id})" "signed_state_collected_at_utc="
+  fi
+
+  signed_state="$(snapshot_section_or_self_text "$snapshot" "RNLAB_SIGNED_STATE")"
+  assert_text_contains "$signed_state" "$signed_label" "signed_state_snapshot_version=1"
+  assert_text_contains "$signed_state" "$signed_label" "signed_state_node_id=${node_id}"
+  assert_text_contains "$signed_state" "$signed_label" "artifact_chain_result=pass"
+  assert_text_contains "$signed_state" "$signed_label" "signed_state_health=pass"
+  assert_text_contains "$signed_state" "$signed_label" "signed_artifact_chain_status=pass"
+  assert_text_contains "$signed_state" "$signed_label" "signed_artifact_chain_ok"
+  assert_text_contains "$signed_state" "$signed_label" "netcheck_rc=0"
+  assert_text_contains "$signed_state" "$signed_label" "assignment_verify_rc=0"
+  assert_text_contains "$signed_state" "$signed_label" "traversal_verify_rc=0"
+  assert_text_contains "$signed_state" "$signed_label" "trust_verify_rc=0"
+  assert_text_contains "$signed_state" "$signed_label" "dns_zone_verify_rc=0"
+
+  netcheck_text="$(snapshot_named_block_text "$signed_state" "netcheck")"
+  assert_text_contains "$netcheck_text" "$signed_label" "traversal_error=none"
+  assert_text_absent "$netcheck_text" "$signed_label" "traversal_alarm_state=critical"
+  assert_text_absent "$netcheck_text" "$signed_label" "traversal_alarm_state=error"
+  assert_text_absent "$netcheck_text" "$signed_label" "traversal_alarm_state=missing"
+  assert_text_absent "$netcheck_text" "$signed_label" "dns_alarm_state=critical"
+  assert_text_absent "$netcheck_text" "$signed_label" "dns_alarm_state=error"
+  assert_text_absent "$netcheck_text" "$signed_label" "dns_alarm_state=missing"
+}
+
+live_lab_wait_for_signed_state_convergence() {
+  local target="$1"
+  local node_id="$2"
+  local role="${3:-}"
+  local zone_name="${4:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
+  local max_age_secs="${5:-${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}}"
+  local max_clock_skew_secs="${6:-${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}}"
+  local attempts="${7:-20}"
+  local sleep_secs="${8:-3}"
+  local attempt snapshot
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")" || snapshot=""
+    if [[ -n "$snapshot" ]] && live_lab_assert_signed_state_health \
+      "$snapshot" \
+      "$node_id" \
+      "$target" >/dev/null 2>&1; then
+      printf '%s' "$snapshot"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+
+  snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")" || snapshot=""
+  printf '%s' "$snapshot"
+  return 1
+}
+
+live_lab_assert_dns_zone_health() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local dns_zone dns_label status_text inspect_text
+  local status_rc dns_inspect_rc dns_zone_verify_rc
+  local dns_zone_bundle_present dns_zone_verifier_present dns_zone_watermark_present
+
+  dns_label="dns zone (${node_id})"
+  if [[ "$snapshot" == *"dns_zone_target="* ]]; then
+    assert_text_contains "$snapshot" "dns zone snapshot (${node_id})" "dns_zone_target=${target}"
+  fi
+  if [[ "$snapshot" == *"dns_zone_node_id="* ]]; then
+    assert_text_contains "$snapshot" "dns zone snapshot (${node_id})" "dns_zone_node_id=${node_id}"
+  fi
+  if [[ "$snapshot" == *"dns_zone_collected_at_utc="* ]]; then
+    assert_text_contains "$snapshot" "dns zone snapshot (${node_id})" "dns_zone_collected_at_utc="
+  fi
+
+  dns_zone="$(snapshot_section_or_self_text "$snapshot" "RNLAB_DNS_ZONE")"
+  assert_text_contains "$dns_zone" "$dns_label" "dns_zone_snapshot_version=1"
+  assert_text_contains "$dns_zone" "$dns_label" "dns_zone_node_id=${node_id}"
+  assert_text_contains "$dns_zone" "$dns_label" "dns_zone_bundle_present=1"
+  assert_text_contains "$dns_zone" "$dns_label" "dns_zone_verifier_present=1"
+  assert_text_contains "$dns_zone" "$dns_label" "dns_zone_watermark_present=1"
+
+  status_rc="$(snapshot_field_value "$dns_zone" "status_rc")"
+  dns_inspect_rc="$(snapshot_field_value "$dns_zone" "dns_inspect_rc")"
+  dns_zone_verify_rc="$(snapshot_field_value "$dns_zone" "dns_zone_verify_rc")"
+  dns_zone_bundle_present="$(snapshot_field_value "$dns_zone" "dns_zone_bundle_present")"
+  dns_zone_verifier_present="$(snapshot_field_value "$dns_zone" "dns_zone_verifier_present")"
+  dns_zone_watermark_present="$(snapshot_field_value "$dns_zone" "dns_zone_watermark_present")"
+
+  if [[ "$status_rc" != "0" ]]; then
+    printf '%s expected rustynet status rc=0, got %s\n' "$dns_label" "${status_rc:-missing}" >&2
+    return 1
+  fi
+  if [[ "$dns_inspect_rc" != "0" ]]; then
+    printf '%s expected dns inspect rc=0, got %s\n' "$dns_label" "${dns_inspect_rc:-missing}" >&2
+    return 1
+  fi
+  if [[ "$dns_zone_verify_rc" != "0" ]]; then
+    printf '%s expected dns zone verify rc=0, got %s\n' "$dns_label" "${dns_zone_verify_rc:-missing}" >&2
+    return 1
+  fi
+  if [[ "$dns_zone_bundle_present" != "1" || "$dns_zone_verifier_present" != "1" || "$dns_zone_watermark_present" != "1" ]]; then
+    printf '%s expected bundle, verifier, and watermark presence\n' "$dns_label" >&2
+    return 1
+  fi
+
+  status_text="$(snapshot_named_block_text "$dns_zone" "status")"
+  inspect_text="$(snapshot_named_block_text "$dns_zone" "dns_inspect")"
+  assert_text_contains "$status_text" "$dns_label" "node_id=${node_id}"
+  assert_text_contains "$status_text" "$dns_label" "dns_zone_state=valid"
+  assert_text_contains "$status_text" "$dns_label" "dns_zone_error=none"
+  assert_text_contains "$status_text" "$dns_label" "dns_alarm_state=ok"
+  assert_text_contains "$inspect_text" "$dns_label" "dns inspect: state=valid"
+}
+
+live_lab_wait_for_dns_zone_convergence() {
+  local target="$1"
+  local node_id="$2"
+  local zone_name="${3:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
+  local attempts="${4:-20}"
+  local sleep_secs="${5:-3}"
+  local attempt snapshot
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name")" || snapshot=""
+    if [[ -n "$snapshot" ]] && live_lab_assert_dns_zone_health \
+      "$snapshot" \
+      "$node_id" \
+      "$target" >/dev/null 2>&1; then
+      printf '%s' "$snapshot"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+
+  snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name")" || snapshot=""
+  printf '%s' "$snapshot"
+  return 1
+}
+
+live_lab_assert_firewall_policy() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local role="$4"
+  local firewall firewall_label firewall_ruleset
+  local nft_tables_rc nft_ruleset_rc
+
+  firewall_label="firewall policy (${node_id})"
+  if [[ "$snapshot" == *"firewall_target="* ]]; then
+    assert_text_contains "$snapshot" "firewall snapshot (${node_id})" "firewall_target=${target}"
+  fi
+  if [[ "$snapshot" == *"firewall_node_id="* ]]; then
+    assert_text_contains "$snapshot" "firewall snapshot (${node_id})" "firewall_node_id=${node_id}"
+  fi
+  if [[ -n "$role" && "$snapshot" == *"firewall_role="* ]]; then
+    assert_text_contains "$snapshot" "firewall snapshot (${node_id})" "firewall_role=${role}"
+  fi
+
+  firewall="$(snapshot_section_or_self_text "$snapshot" "RNLAB_FIREWALL")"
+  assert_text_contains "$firewall" "$firewall_label" "firewall_snapshot_version=1"
+  assert_text_contains "$firewall" "$firewall_label" "firewall_health=pass"
+  assert_text_contains "$firewall" "$firewall_label" "firewall_status=pass"
+
+  nft_tables_rc="$(snapshot_field_value "$firewall" "nft_tables_rc")"
+  nft_ruleset_rc="$(snapshot_field_value "$firewall" "nft_ruleset_rc")"
+  if [[ "$nft_tables_rc" != "0" ]]; then
+    printf '%s expected nft list tables rc=0, got %s\n' "$firewall_label" "${nft_tables_rc:-missing}" >&2
+    return 1
+  fi
+  if [[ "$nft_ruleset_rc" != "0" ]]; then
+    printf '%s expected nft list ruleset rc=0, got %s\n' "$firewall_label" "${nft_ruleset_rc:-missing}" >&2
+    return 1
+  fi
+
+  firewall_ruleset="$(snapshot_named_block_text "$firewall" "nft_ruleset")"
+  if [[ -z "$(printf '%s' "$firewall_ruleset" | tr -d '[:space:]')" ]]; then
+    printf '%s missing nft ruleset output\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'table[[:space:]]+inet[[:space:]]+rustynet_g[0-9]+' <<<"$firewall_ruleset"; then
+    printf '%s missing rustynet inet firewall table\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'chain[[:space:]]+killswitch' <<<"$firewall_ruleset"; then
+    printf '%s missing killswitch chain\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'hook[[:space:]]+output' <<<"$firewall_ruleset"; then
+    printf '%s missing output hook\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'policy[[:space:]]+drop' <<<"$firewall_ruleset"; then
+    printf '%s missing drop policy\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'udp[[:space:]]+dport[[:space:]]+53.*oifname[[:space:]]+!=[[:space:]]+"?rustynet0"?[[:space:]]+drop' <<<"$firewall_ruleset"; then
+    printf '%s missing UDP DNS fail-closed rule\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'tcp[[:space:]]+dport[[:space:]]+53.*oifname[[:space:]]+!=[[:space:]]+"?rustynet0"?[[:space:]]+drop' <<<"$firewall_ruleset"; then
+    printf '%s missing TCP DNS fail-closed rule\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'udp[[:space:]]+dport[[:space:]]+53[[:space:]]+accept' <<<"$firewall_ruleset"; then
+    printf '%s missing UDP DNS allow rule\n' "$firewall_label" >&2
+    return 1
+  fi
+  if ! grep -Eq 'tcp[[:space:]]+dport[[:space:]]+53[[:space:]]+accept' <<<"$firewall_ruleset"; then
+    printf '%s missing TCP DNS allow rule\n' "$firewall_label" >&2
+    return 1
+  fi
+
+  if [[ "$role" == "exit" || "$role" == "admin" ]]; then
+    if ! grep -Eq 'table[[:space:]]+ip[[:space:]]+rustynet_nat_g[0-9]+' <<<"$firewall_ruleset"; then
+      printf '%s missing rustynet NAT table for exit role\n' "$firewall_label" >&2
+      return 1
+    fi
+    if ! grep -Eq 'chain[[:space:]]+forward' <<<"$firewall_ruleset"; then
+      printf '%s missing forward chain for exit role\n' "$firewall_label" >&2
+      return 1
+    fi
+    if ! grep -Eq 'iifname[[:space:]]+"?rustynet0"?[[:space:]]+oifname[[:space:]]+[^ ]+[[:space:]]+accept' <<<"$firewall_ruleset"; then
+      printf '%s missing rustynet forward accept rule for exit role\n' "$firewall_label" >&2
+      return 1
+    fi
+    if ! grep -Eq 'chain[[:space:]]+postrouting' <<<"$firewall_ruleset"; then
+      printf '%s missing postrouting chain for exit role\n' "$firewall_label" >&2
+      return 1
+    fi
+    if ! grep -Eq 'masquerade' <<<"$firewall_ruleset"; then
+      printf '%s missing masquerade rule for exit role\n' "$firewall_label" >&2
+      return 1
+    fi
+  fi
+}
+
+live_lab_assert_runtime_spec() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local role="$4"
+  local expected_membership_nodes="$5"
+  local exit_node_id="$6"
+  local status route_check secret_hygiene
+  local status_label route_label hygiene_label
+
+  status_label="baseline status (${node_id})"
+  route_label="route check (${node_id})"
+  hygiene_label="plaintext check (${node_id})"
+
+  assert_text_contains "$snapshot" "runtime snapshot (${node_id})" "node_snapshot_version=1"
+  assert_text_contains "$snapshot" "runtime snapshot (${node_id})" "target=${target}"
+  assert_text_contains "$snapshot" "runtime snapshot (${node_id})" "node_id=${node_id}"
+  assert_text_contains "$snapshot" "runtime snapshot (${node_id})" "role=${role}"
+
+  status="$(snapshot_section_text "$snapshot" "RNLAB_STATUS")"
+  route_check="$(snapshot_section_text "$snapshot" "RNLAB_ROUTE_POLICY")"
+  secret_hygiene="$(snapshot_section_text "$snapshot" "RNLAB_SECRET_HYGIENE")"
+
+  assert_text_contains "$status" "$status_label" "transport_socket_identity_state=authoritative_backend_shared_transport"
+  assert_text_contains "$status" "$status_label" "transport_socket_identity_error=none"
+  assert_text_contains "$status" "$status_label" "encrypted_key_store=true"
+  assert_text_contains "$status" "$status_label" "auto_tunnel_enforce=true"
+  assert_text_contains "$status" "$status_label" "membership_active_nodes=${expected_membership_nodes}"
+  assert_text_absent "$status" "$status_label" "does not yet implement route application"
+  assert_text_absent "$status" "$status_label" "does not yet implement exit mode"
+
+  assert_text_contains "$route_check" "$route_label" "route_policy_version=1"
+  live_lab_assert_time_sync "$snapshot" "$node_id" "$target"
+  live_lab_assert_process_health "$snapshot" "$node_id" "$target" "$role"
+  live_lab_assert_socket_health "$snapshot" "$node_id" "$target" "$role"
+  live_lab_assert_permissions_hardening "$snapshot" "$node_id" "$target" "$role"
+  live_lab_assert_dns_health "$snapshot" "$node_id" "$target"
+  live_lab_assert_dns_zone_health "$snapshot" "$node_id" "$target"
+  live_lab_assert_signed_state_health "$snapshot" "$node_id" "$target"
+  live_lab_assert_firewall_policy "$snapshot" "$node_id" "$target" "$role"
+
+  assert_text_contains "$secret_hygiene" "$hygiene_label" "daemon_socket=present"
+  assert_text_contains "$secret_hygiene" "$hygiene_label" "result=no-plaintext-passphrase-files"
+
+  if [[ "$role" == "client" ]]; then
+    assert_text_contains "$status" "$status_label" "exit_node=${exit_node_id}"
+    assert_text_contains "$route_check" "$route_label" "actual_route_device=rustynet0"
+    assert_text_contains "$route_check" "$route_label" "actual_route_table=51820"
+    assert_text_contains "$route_check" "$route_label" "expected_next_hop_match=pass"
   fi
 }
 
@@ -2830,39 +4514,6 @@ stage_run_cross_network_node_network_switch() {
   run_cross_network_stage_with_impairment node_switch "${cmd[@]}"
 }
 
-cross_network_verify_signed_artifact_chain() {
-  local target="$1"
-  local node_id="$2"
-  live_lab_capture_root "$target" "
-set -euo pipefail
-root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet assignment verify \
-  --bundle /var/lib/rustynet/rustynetd.assignment \
-  --verifier-key /etc/rustynet/assignment.pub \
-  --watermark /var/lib/rustynet/rustynetd.assignment.watermark \
-  --expected-node-id '${node_id}' \
-  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
-  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
-root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet traversal verify \
-  --bundle /var/lib/rustynet/rustynetd.traversal \
-  --verifier-key /etc/rustynet/traversal.pub \
-  --watermark /var/lib/rustynet/rustynetd.traversal.watermark \
-  --expected-source-node-id '${node_id}' \
-  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
-  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
-root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet trust verify \
-  --evidence /var/lib/rustynet/rustynetd.trust \
-  --verifier-key /etc/rustynet/trust-evidence.pub \
-  --watermark /var/lib/rustynet/rustynetd.trust.watermark \
-  --max-age-secs '${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS}' \
-  --max-clock-skew-secs '${CROSS_NETWORK_MAX_TIME_SKEW_SECS}'
-root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns zone verify \
-  --bundle /var/lib/rustynet/rustynetd.dns-zone \
-  --verifier-key /etc/rustynet/dns-zone.pub \
-  --expected-zone-name rustynet
-echo signed_artifact_chain_ok
-"
-}
-
 cross_network_preflight_worker() {
   local label="$1"
   local target="$2"
@@ -2873,7 +4524,15 @@ cross_network_preflight_worker() {
   local cmd
   local required_user_cmds=(rustynet rustynetd wg systemctl ss ip nft journalctl)
   local required_root_cmds=(wg systemctl ss ip nft journalctl)
-  local signed_state_snapshot route_snapshot endpoint_snapshot
+  local time_snapshot time_rc time_path time_section
+  local process_snapshot process_rc process_path
+  local socket_snapshot socket_rc socket_path
+  local permissions_snapshot permissions_rc permissions_path
+  local signed_state_snapshot signed_state_rc signed_state_path route_snapshot endpoint_snapshot
+  local route_policy_snapshot route_policy_rc route_policy_path
+  local dns_state_snapshot dns_state_rc dns_state_path
+  local dns_zone_snapshot dns_zone_rc dns_zone_path
+  local node_snapshot node_snapshot_rc
   local global_ipv4 hostname_resolution_snapshot plaintext_snapshot
   local remote_src discovery_script_path discovery_remote_path discovery_local_path discovery_validation_path
   local discovery_hash
@@ -2884,25 +4543,61 @@ cross_network_preflight_worker() {
 
   live_lab_push_sudo_password "$target"
   live_lab_wait_for_daemon_socket "$target"
+  set +e
+  dns_state_snapshot="$(live_lab_wait_for_dns_convergence "$target" "$node_id")"
+  dns_state_rc=$?
+  set -e
+  dns_state_path="$(stage_worker_write_artifact "$label" "dns_state.txt" "$(printf 'capture_rc=%s\n%s\n' "$dns_state_rc" "$dns_state_snapshot")")" || return 1
+  if [[ "$dns_state_rc" -ne 0 ]]; then
+    printf 'dns health did not converge for %s (%s)\n' "$label" "$target" >&2
+    return "$dns_state_rc"
+  fi
   local_unix="${CROSS_NETWORK_PREFLIGHT_REFERENCE_UNIX:-0}"
   if [[ ! "$local_unix" =~ ^[0-9]+$ ]] || (( local_unix <= 0 )); then
     printf 'invalid preflight local unix reference for %s (%s): %s\n' "$label" "$target" "$local_unix" >&2
     return 1
   fi
-  remote_unix="$(live_lab_capture "$target" "date -u +%s" | tr -d '[:space:]')"
-  if [[ ! "$remote_unix" =~ ^[0-9]+$ ]]; then
-    printf 'unable to read remote unix timestamp for %s (%s)\n' "$label" "$target" >&2
+  set +e
+  time_snapshot="$(live_lab_collect_time_snapshot "$target" "$node_id" "$_role" "$local_unix" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" 2>&1)"
+  time_rc=$?
+  set -e
+  time_path="$(stage_worker_write_artifact "$label" "time.txt" "$(printf 'capture_rc=%s\n%s\n' "$time_rc" "$time_snapshot")")" || return 1
+  if [[ "$time_rc" -ne 0 ]]; then
+    printf 'time snapshot capture failed for %s (%s)\n' "$label" "$target" >&2
+    return "$time_rc"
+  fi
+  live_lab_assert_time_sync "$time_snapshot" "$node_id" "$target" || return 1
+  time_section="$(snapshot_section_or_self_text "$time_snapshot" "RNLAB_TIME")"
+  remote_unix="$(snapshot_field_value "$time_section" "remote_unix_now")"
+  skew="$(snapshot_field_value "$time_section" "clock_skew_secs")"
+  if [[ ! "$remote_unix" =~ ^[0-9]+$ || ! "$skew" =~ ^[0-9]+$ ]]; then
+    printf 'time snapshot missing parsed skew data for %s (%s)\n' "$label" "$target" >&2
     return 1
   fi
-  if (( local_unix >= remote_unix )); then
-    skew=$((local_unix - remote_unix))
-  else
-    skew=$((remote_unix - local_unix))
-  fi
-  if (( skew > CROSS_NETWORK_MAX_TIME_SKEW_SECS )); then
-    printf 'clock skew too large for %s (%s): skew=%ss max=%ss\n' "$label" "$target" "$skew" "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >&2
-    return 1
-  fi
+
+  set +e
+  process_snapshot="$(live_lab_collect_process_snapshot "$target" "$node_id" "$_role" 2>&1)"
+  process_rc=$?
+  set -e
+  process_path="$(stage_worker_write_artifact "$label" "process.txt" "$(printf 'capture_rc=%s\n%s\n' "$process_rc" "$process_snapshot")")" || return 1
+  [[ "$process_rc" -eq 0 ]] || return "$process_rc"
+  live_lab_assert_process_health "$process_snapshot" "$node_id" "$target" "$_role" || return 1
+
+  set +e
+  socket_snapshot="$(live_lab_collect_socket_snapshot "$target" "$node_id" "$_role" 2>&1)"
+  socket_rc=$?
+  set -e
+  socket_path="$(stage_worker_write_artifact "$label" "socket.txt" "$(printf 'capture_rc=%s\n%s\n' "$socket_rc" "$socket_snapshot")")" || return 1
+  [[ "$socket_rc" -eq 0 ]] || return "$socket_rc"
+  live_lab_assert_socket_health "$socket_snapshot" "$node_id" "$target" "$_role" || return 1
+
+  set +e
+  permissions_snapshot="$(live_lab_collect_permissions_snapshot "$target" "$node_id" "$_role" 2>&1)"
+  permissions_rc=$?
+  set -e
+  permissions_path="$(stage_worker_write_artifact "$label" "permissions.txt" "$(printf 'capture_rc=%s\n%s\n' "$permissions_rc" "$permissions_snapshot")")" || return 1
+  [[ "$permissions_rc" -eq 0 ]] || return "$permissions_rc"
+  live_lab_assert_permissions_hardening "$permissions_snapshot" "$node_id" "$target" "$_role" || return 1
 
   if [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" != "none" ]]; then
     required_user_cmds+=(tc)
@@ -2950,10 +4645,24 @@ cross_network_preflight_worker() {
     return 1
   fi
 
-  signed_state_snapshot="$(cross_network_verify_signed_artifact_chain "$target" "$node_id")"
-  if [[ "$signed_state_snapshot" != *"signed_artifact_chain_ok"* ]]; then
-    printf 'signed artifact chain verification failed on %s (%s)\n' "$label" "$target" >&2
-    return 1
+  set +e
+  dns_zone_snapshot="$(live_lab_wait_for_dns_zone_convergence "$target" "$node_id")"
+  dns_zone_rc=$?
+  set -e
+  dns_zone_path="$(stage_worker_write_artifact "$label" "dns_zone.txt" "$(printf 'capture_rc=%s\n%s\n' "$dns_zone_rc" "$dns_zone_snapshot")")" || return 1
+  if [[ "$dns_zone_rc" -ne 0 ]]; then
+    printf 'dns zone health did not converge for %s (%s)\n' "$label" "$target" >&2
+    return "$dns_zone_rc"
+  fi
+
+  set +e
+  signed_state_snapshot="$(live_lab_wait_for_signed_state_convergence "$target" "$node_id" "$_role")"
+  signed_state_rc=$?
+  set -e
+  signed_state_path="$(stage_worker_write_artifact "$label" "signed_state.txt" "$(printf 'capture_rc=%s\n%s\n' "$signed_state_rc" "$signed_state_snapshot")")" || return 1
+  if [[ "$signed_state_rc" -ne 0 ]]; then
+    printf 'signed state did not converge for %s (%s)\n' "$label" "$target" >&2
+    return "$signed_state_rc"
   fi
 
   live_lab_run_root "$target" "root test -S /run/rustynet/rustynetd.sock"
@@ -2980,7 +4689,24 @@ cross_network_preflight_worker() {
     --output "$discovery_validation_path"
   discovery_hash="$(cargo run --quiet -p rustynet-cli -- ops sha256-file --path "$discovery_local_path")"
 
-  route_snapshot="$(live_lab_capture "$target" "ip -4 route get 1.1.1.1 || true" || true)"
+  set +e
+  route_policy_snapshot="$(live_lab_collect_route_policy "$target" 2>&1)"
+  route_policy_rc=$?
+  set -e
+  [[ "$route_policy_rc" -eq 0 ]] || return "$route_policy_rc"
+  [[ "$dns_state_rc" -eq 0 ]] || return "$dns_state_rc"
+  set +e
+  node_snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$_role" 2>&1)"
+  node_snapshot_rc=$?
+  set -e
+  [[ "$node_snapshot_rc" -eq 0 ]] || return "$node_snapshot_rc"
+  stage_worker_write_artifact "$label" "snapshot.txt" "$(printf 'capture_rc=%s\n%s\n' "$node_snapshot_rc" "$node_snapshot")" >/dev/null || return 1
+  route_policy_path="$(stage_worker_write_artifact "$label" "route_policy.txt" "$(printf 'capture_rc=%s\n%s\n' "$route_policy_rc" "$route_policy_snapshot")")" || return 1
+  route_snapshot="$(awk '
+    /route_get_begin/ { capture=1; next }
+    /route_get_end/ { capture=0; next }
+    capture { print }
+  ' <<<"$route_policy_snapshot" | tr -s ' ' | tr '\n' ';')"
   endpoint_snapshot="$(live_lab_capture_root "$target" "root wg show rustynet0 endpoints || true" || true)"
 
   printf 'label=%s\n' "$label" >> "$capability_path"
@@ -2990,6 +4716,10 @@ cross_network_preflight_worker() {
   printf 'remote_unix=%s\n' "$remote_unix" >> "$capability_path"
   printf 'clock_skew_secs=%s\n' "$skew" >> "$capability_path"
   printf 'max_clock_skew_secs=%s\n' "$CROSS_NETWORK_MAX_TIME_SKEW_SECS" >> "$capability_path"
+  printf 'time_path=%s\n' "$time_path" >> "$capability_path"
+  printf 'process_path=%s\n' "$process_path" >> "$capability_path"
+  printf 'socket_path=%s\n' "$socket_path" >> "$capability_path"
+  printf 'permissions_path=%s\n' "$permissions_path" >> "$capability_path"
   printf 'signed_artifact_max_age_secs=%s\n' "$CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS" >> "$capability_path"
   printf 'discovery_bundle_max_age_secs=%s\n' "$CROSS_NETWORK_DISCOVERY_MAX_AGE_SECS" >> "$capability_path"
   printf 'global_ipv4=%s\n' "$global_ipv4" >> "$capability_path"
@@ -2997,9 +4727,14 @@ cross_network_preflight_worker() {
   printf 'discovery_bundle_sha256=%s\n' "$discovery_hash" >> "$capability_path"
   printf 'discovery_validation_report=%s\n' "$discovery_validation_path" >> "$capability_path"
   printf 'hostname_resolution_snapshot=%s\n' "$(printf '%s' "$hostname_resolution_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'dns_zone_snapshot=%s\n' "$(printf '%s' "$dns_zone_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'dns_zone_path=%s\n' "$dns_zone_path" >> "$capability_path"
   printf 'signed_state_snapshot=%s\n' "$(printf '%s' "$signed_state_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'signed_state_path=%s\n' "$signed_state_path" >> "$capability_path"
   printf 'plaintext_snapshot=%s\n' "$(printf '%s' "$plaintext_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
   printf 'route_snapshot=%s\n' "$(printf '%s' "$route_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
+  printf 'route_policy_path=%s\n' "$route_policy_path" >> "$capability_path"
+  printf 'dns_state_path=%s\n' "$dns_state_path" >> "$capability_path"
   printf 'endpoint_snapshot=%s\n' "$(printf '%s' "$endpoint_snapshot" | tr -s ' ' | tr '\n' ';')" >> "$capability_path"
 }
 
@@ -3092,15 +4827,33 @@ stage_generate_fresh_install_os_matrix_report() {
 
 ssh_wait_for_host() {
   local target="$1"
-  local attempts="${2:-36}"
+  # Freshly restarted UTM guests can take several minutes before SSH is ready.
+  # Keep the wait bounded, but long enough to cover a cold boot without
+  # treating transient startup lag as a hard failure.
+  local attempts="${2:-240}"
   local sleep_secs="${3:-5}"
   local attempt
+  local rc
+  local last_error=""
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if live_lab_ssh "$target" "true" 15 >/dev/null 2>&1; then
+    if last_error="$(live_lab_ssh "$target" "true" 15 2>&1)"; then
       return 0
+    else
+      rc=$?
     fi
-    sleep "$sleep_secs"
+    if [[ "$rc" -ne 255 ]]; then
+      if [[ -n "$last_error" ]]; then
+        printf '%s\n' "$last_error" >&2
+      fi
+      return "$rc"
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
   done
+  if [[ -n "$last_error" ]]; then
+    printf '%s\n' "$last_error" >&2
+  fi
   return 1
 }
 
@@ -3552,29 +5305,29 @@ parse_args() {
 
 prompt_missing_inputs() {
   if [[ -z "$EXIT_TARGET" ]]; then
-    EXIT_TARGET="$(prompt_value 'Primary exit node (user@ip or ip)')"
+    EXIT_TARGET="$(prompt_value 'Primary exit node (user@host or host)')"
   fi
   if [[ -z "$CLIENT_TARGET" ]]; then
-    CLIENT_TARGET="$(prompt_value 'Primary client node (user@ip or ip)')"
+    CLIENT_TARGET="$(prompt_value 'Primary client node (user@host or host)')"
   fi
   if [[ -z "$ENTRY_TARGET" ]]; then
     if [[ "$ENTRY_TARGET_DECLARED" -eq 0 ]]; then
-      ENTRY_TARGET="$(prompt_value 'Entry relay / alternate exit node (user@ip or ip, blank to skip advanced tests)')"
+      ENTRY_TARGET="$(prompt_value 'Entry relay / alternate exit node (user@host or host, blank to skip advanced tests)')"
     fi
   fi
   if [[ -z "$AUX_TARGET" ]]; then
     if [[ "$AUX_TARGET_DECLARED" -eq 0 ]]; then
-      AUX_TARGET="$(prompt_value 'Auxiliary client / blind-exit node (user@ip or ip, blank to skip advanced tests)')"
+      AUX_TARGET="$(prompt_value 'Auxiliary client / blind-exit node (user@host or host, blank to skip advanced tests)')"
     fi
   fi
   if [[ -z "$EXTRA_TARGET" ]]; then
     if [[ "$EXTRA_TARGET_DECLARED" -eq 0 ]]; then
-      EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@ip or ip, blank if none)')"
+      EXTRA_TARGET="$(prompt_value 'Optional extra client node (user@host or host, blank if none)')"
     fi
   fi
   if [[ -z "$FIFTH_CLIENT_TARGET" ]]; then
     if [[ "$FIFTH_CLIENT_TARGET_DECLARED" -eq 0 ]]; then
-      FIFTH_CLIENT_TARGET="$(prompt_value 'Optional fifth client node for six-node labs (user@ip or ip, blank if none)')"
+      FIFTH_CLIENT_TARGET="$(prompt_value 'Optional fifth client node for six-node labs (user@host or host, blank if none)')"
     fi
   fi
 }
@@ -3890,7 +5643,7 @@ main() {
   if cross_network_stages_applicable; then
     local nat_profile nat_idx stage_suffix profile_report profile_log
     set +e
-    run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, cryptographic signed-state verification, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
+    run_stage hard cross_network_preflight 'verify cross-network validator prerequisites (time skew, DNS health, cryptographic signed-state verification, daemon health, discovery bundle validation, required binaries/services)' stage_run_cross_network_preflight
     stage_rc=$?
     if [[ "$stage_rc" -ne 0 && "$cross_network_stage_rc" -eq 0 ]]; then
       cross_network_stage_rc="$stage_rc"

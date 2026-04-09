@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use serde_json::json;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,17 +17,6 @@ pub struct GenerateLiveLinuxLabFailureDigestConfig {
     pub overall_status: String,
     pub output_json: PathBuf,
     pub output_md: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerResult {
-    label: String,
-    target: String,
-    node_id: String,
-    role: String,
-    rc: i64,
-    log_path: String,
-    likely_reason: String,
 }
 
 fn stage_text(stage_name: &str, status: &str) -> Option<&'static str> {
@@ -322,32 +312,18 @@ fn extract_stage_reason(stage_name: &str, report_dir: &Path, log_path: &Path) ->
     extract_likely_reason(log_path)
 }
 
-fn read_parallel_results(report_dir: &Path, stage_name: &str) -> Vec<WorkerResult> {
-    let results_path = report_dir
-        .join("state")
-        .join(format!("parallel-{stage_name}"))
-        .join("results.tsv");
-    let mut results = Vec::new();
-    for row in read_tsv(&results_path) {
-        if row.len() != 6 {
-            continue;
-        }
-        let rc = row[4].parse::<i64>().unwrap_or(1);
-        let log_path = row[5].clone();
-        results.push(WorkerResult {
-            label: row[0].clone(),
-            target: row[1].clone(),
-            node_id: row[2].clone(),
-            role: row[3].clone(),
-            rc,
-            likely_reason: extract_likely_reason(Path::new(log_path.as_str())),
-            log_path,
-        });
+fn worker_likely_reason(worker: &LiveLabWorkerResult) -> String {
+    if !worker.primary_failure_reason.trim().is_empty() {
+        return worker.primary_failure_reason.clone();
     }
-    results
+    extract_likely_reason(Path::new(worker.log_path.as_str()))
 }
 
-fn stage_sentence(stage_name: &str, status: &str, worker_results: &[WorkerResult]) -> String {
+fn stage_sentence(
+    stage_name: &str,
+    status: &str,
+    worker_results: &[LiveLabWorkerResult],
+) -> String {
     if status == "pass" {
         return stage_text(stage_name, "pass")
             .unwrap_or("stage passed")
@@ -403,7 +379,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         let message = row[5].clone();
         let started_at = row[6].clone();
         let finished_at = row[7].clone();
-        let worker_results = read_parallel_results(report_dir.as_path(), stage_name.as_str());
+        let worker_results = read_parallel_stage_results(report_dir.as_path(), stage_name.as_str());
         let failed_workers = worker_results
             .iter()
             .filter(|item| item.rc != 0)
@@ -414,8 +390,14 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
                     "node_id": item.node_id,
                     "role": item.role,
                     "rc": item.rc,
+                    "started_at": item.started_at,
+                    "finished_at": item.finished_at,
                     "log_path": item.log_path,
-                    "likely_reason": item.likely_reason,
+                    "snapshot_path": item.snapshot_path,
+                    "route_policy_path": item.route_policy_path,
+                    "dns_state_path": item.dns_state_path,
+                    "primary_failure_reason": item.primary_failure_reason,
+                    "likely_reason": worker_likely_reason(item),
                 })
             })
             .collect::<Vec<_>>();
@@ -425,7 +407,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
             Path::new(log_path.as_str()),
         );
         if let Some(first_failed) = worker_results.iter().find(|item| item.rc != 0) {
-            likely_reason = first_failed.likely_reason.clone();
+            likely_reason = worker_likely_reason(first_failed);
         }
         let condensed_result =
             stage_sentence(stage_name.as_str(), status.as_str(), &worker_results);
@@ -439,6 +421,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
             "finished_at": finished_at,
             "log_path": log_path,
             "condensed_result": condensed_result,
+            "primary_failure_reason": likely_reason,
             "likely_reason": likely_reason,
             "failed_workers": failed_workers,
         });
@@ -572,7 +555,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
             lines.extend([String::new(), "### Failed Nodes".to_string(), String::new()]);
             for worker in failed_workers {
                 lines.push(format!(
-                    "- `{}` `{}` (`{}`): rc={} reason={} log=`{}`",
+                    "- `{}` `{}` (`{}`): rc={} reason={} log=`{}` snapshot=`{}`",
                     worker
                         .get("label")
                         .and_then(|v| v.as_str())
@@ -594,6 +577,11 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
                         .get("log_path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown"),
+                    worker
+                        .get("snapshot_path")
+                        .and_then(|v| v.as_str())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("n/a"),
                 ));
             }
         }

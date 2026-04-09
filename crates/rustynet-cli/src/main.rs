@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod env_file;
+mod live_lab_results;
 mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
@@ -380,8 +381,14 @@ enum OpsCommand {
     WriteCrossNetworkForensicsManifest {
         config: ops_live_lab_orchestrator::WriteCrossNetworkForensicsManifestConfig,
     },
+    WriteLiveLabStageArtifactIndex {
+        config: ops_live_lab_orchestrator::WriteLiveLabStageArtifactIndexConfig,
+    },
     Sha256File {
         config: ops_live_lab_orchestrator::Sha256FileConfig,
+    },
+    ValidateCrossNetworkForensicsBundle {
+        config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig,
     },
     WriteCrossNetworkPreflightReport {
         config: ops_live_lab_orchestrator::WriteCrossNetworkPreflightReportConfig,
@@ -1238,11 +1245,28 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "write-live-lab-stage-artifact-index" => Ok(OpsCommand::WriteLiveLabStageArtifactIndex {
+            config: ops_live_lab_orchestrator::WriteLiveLabStageArtifactIndexConfig {
+                stage_name: parser.required("--stage-name")?,
+                stage_dir: parser.required_path("--stage-dir")?,
+                output: parser.required_path("--output")?,
+            },
+        }),
         "sha256-file" => Ok(OpsCommand::Sha256File {
             config: ops_live_lab_orchestrator::Sha256FileConfig {
                 path: parser.required_path("--path")?,
             },
         }),
+        "validate-cross-network-forensics-bundle" => {
+            Ok(OpsCommand::ValidateCrossNetworkForensicsBundle {
+                config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig {
+                    stage_name: parser.required("--stage-name")?,
+                    nodes_tsv: parser.required_path("--nodes-tsv")?,
+                    stage_dir: parser.required_path("--stage-dir")?,
+                    output: parser.required_path("--output")?,
+                },
+            })
+        }
         "write-cross-network-preflight-report" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -3845,8 +3869,14 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::WriteCrossNetworkForensicsManifest { config } => {
             ops_live_lab_orchestrator::execute_ops_write_cross_network_forensics_manifest(config)
         }
+        OpsCommand::WriteLiveLabStageArtifactIndex { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_lab_stage_artifact_index(config)
+        }
         OpsCommand::Sha256File { config } => {
             ops_live_lab_orchestrator::execute_ops_sha256_file(config)
+        }
+        OpsCommand::ValidateCrossNetworkForensicsBundle { config } => {
+            ops_live_lab_orchestrator::execute_ops_validate_cross_network_forensics_bundle(config)
         }
         OpsCommand::WriteCrossNetworkPreflightReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_cross_network_preflight_report(config)
@@ -11944,6 +11974,22 @@ mod tests {
                 .contains("WriteCrossNetworkForensicsManifest")
         );
 
+        let write_live_lab_stage_artifact_index = parse_command(&[
+            "ops".to_string(),
+            "write-live-lab-stage-artifact-index".to_string(),
+            "--stage-name".to_string(),
+            "cross_network_direct_remote_exit".to_string(),
+            "--stage-dir".to_string(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_string(),
+            "--output".to_string(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit/artifact_index.json"
+                .to_string(),
+        ]);
+        assert!(
+            format!("{write_live_lab_stage_artifact_index:?}")
+                .contains("WriteLiveLabStageArtifactIndex")
+        );
+
         let sha256_file = parse_command(&[
             "ops".to_string(),
             "sha256-file".to_string(),
@@ -11951,6 +11997,24 @@ mod tests {
             "artifacts/phase10/discovery-a.json".to_string(),
         ]);
         assert!(format!("{sha256_file:?}").contains("Sha256File"));
+
+        let validate_cross_network_forensics_bundle = parse_command(&[
+            "ops".to_string(),
+            "validate-cross-network-forensics-bundle".to_string(),
+            "--stage-name".to_string(),
+            "cross_network_direct_remote_exit".to_string(),
+            "--nodes-tsv".to_string(),
+            "artifacts/live_lab/state/nodes.tsv".to_string(),
+            "--stage-dir".to_string(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_string(),
+            "--output".to_string(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit/bundle_validation.json"
+                .to_string(),
+        ]);
+        assert!(
+            format!("{validate_cross_network_forensics_bundle:?}")
+                .contains("ValidateCrossNetworkForensicsBundle")
+        );
 
         let write_cross_network_preflight_report = parse_command(&[
             "ops".to_string(),

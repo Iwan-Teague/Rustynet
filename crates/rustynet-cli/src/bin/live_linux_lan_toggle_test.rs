@@ -929,6 +929,24 @@ fn install_assignment_bundle(
         target,
         &[
             "install",
+            "-d",
+            "-m",
+            "0755",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "/etc/rustynet",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(
+        target,
+        &[
+            "install",
             "-m",
             "0644",
             "-o",
@@ -988,6 +1006,24 @@ fn install_assignment_refresh_env(
         target,
         &[
             "install",
+            "-d",
+            "-m",
+            "0755",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "/etc/rustynet",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(
+        target,
+        &[
+            "install",
             "-m",
             "0600",
             "-o",
@@ -1022,6 +1058,24 @@ fn install_traversal_bundle(
             eprintln!("{err}");
             1
         })?;
+    ctx.run_root(
+        target,
+        &[
+            "install",
+            "-d",
+            "-m",
+            "0755",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "/etc/rustynet",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
     ctx.run_root(
         target,
         &[

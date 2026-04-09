@@ -202,6 +202,35 @@ pub fn execute_ops_e2e_bootstrap_host(
     }
     let backend_mode = e2e_backend_mode_from_env()?;
 
+    let daemon_binary = format!("{}/target/release/rustynetd", src_dir.display());
+    run_status(
+        "install",
+        &[
+            "-m",
+            "0755",
+            daemon_binary.as_str(),
+            "/usr/local/bin/rustynetd",
+        ],
+        &[],
+        "installing rustynetd failed during e2e bootstrap",
+    )?;
+    let cli_binary = format!("{}/target/release/rustynet-cli", src_dir.display());
+    run_status(
+        "install",
+        &["-m", "0755", cli_binary.as_str(), "/usr/local/bin/rustynet"],
+        &[],
+        "installing rustynet CLI failed during e2e bootstrap",
+    )?;
+    ensure_system_group("rustynetd")?;
+    ensure_executable_file(
+        Path::new("/usr/local/bin/rustynetd"),
+        "installed rustynetd binary",
+    )?;
+    ensure_executable_file(
+        Path::new("/usr/local/bin/rustynet"),
+        "installed rustynet CLI",
+    )?;
+
     if !skip_apt {
         install_linux_e2e_prerequisites()?;
         let required_toolchain = ensure_pinned_rust_toolchain(src_dir.as_path())?;
@@ -225,35 +254,6 @@ pub fn execute_ops_e2e_bootstrap_host(
                 "remote release build failed during e2e bootstrap with toolchain {required_toolchain}"
             )
             .as_str(),
-        )?;
-
-        let daemon_binary = format!("{}/target/release/rustynetd", src_dir.display());
-        run_status(
-            "install",
-            &[
-                "-m",
-                "0755",
-                daemon_binary.as_str(),
-                "/usr/local/bin/rustynetd",
-            ],
-            &[],
-            "installing rustynetd failed during e2e bootstrap",
-        )?;
-        let cli_binary = format!("{}/target/release/rustynet-cli", src_dir.display());
-        run_status(
-            "install",
-            &["-m", "0755", cli_binary.as_str(), "/usr/local/bin/rustynet"],
-            &[],
-            "installing rustynet CLI failed during e2e bootstrap",
-        )?;
-    } else {
-        ensure_executable_file(
-            Path::new("/usr/local/bin/rustynetd"),
-            "installed rustynetd binary",
-        )?;
-        ensure_executable_file(
-            Path::new("/usr/local/bin/rustynet"),
-            "installed rustynet CLI",
         )?;
     }
 
@@ -3191,6 +3191,25 @@ fn run_allow_failure(program: &str, args: &[&str], envs: &[(&str, &str)]) {
     let _ = command.output();
 }
 
+fn ensure_system_group(group_name: &str) -> Result<(), String> {
+    if run_status(
+        "getent",
+        &["group", group_name],
+        &[],
+        "probing system group failed",
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    run_status(
+        "groupadd",
+        &["--system", group_name],
+        &[],
+        format!("creating system group {group_name} failed").as_str(),
+    )
+}
+
 fn capture_stdout(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -4093,8 +4112,18 @@ repair_local_dns_resolution() {
 }
 
 install_prereqs() {
-  apt-get update
-  apt-get install -y --no-install-recommends \
+  local attempt
+  local -a apt_network_opts=(
+    -o Acquire::Retries=3
+    -o Acquire::ForceIPv4=true
+    -o Acquire::http::Timeout=60
+    -o Acquire::https::Timeout=60
+    -o Dpkg::Use-Pty=0
+  )
+  for attempt in 1 2 3; do
+    DEBIAN_FRONTEND=noninteractive apt-get update "${apt_network_opts[@]}"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      "${apt_network_opts[@]}" \
     ca-certificates \
     curl \
     git \
@@ -4108,7 +4137,18 @@ install_prereqs() {
     wireguard-tools \
     openssl \
     systemd-resolved \
-    rustup
+    rustup; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
+      DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+      repair_local_dns_resolution
+      sleep 2
+    fi
+  done
+  echo "[bootstrap] apt-get install failed after retries" >&2
+  return 1
 }
 
 clear_residual_rustynet_state() {
@@ -4118,6 +4158,10 @@ clear_residual_rustynet_state() {
   done
   pkill -f 'rustynetd daemon' >/dev/null 2>&1 || true
   pkill -f 'rustynetd privileged-helper' >/dev/null 2>&1 || true
+  pkill -f 'apt-get install' >/dev/null 2>&1 || true
+  pkill -f 'apt-get update' >/dev/null 2>&1 || true
+  pkill -f '/usr/lib/apt/methods/' >/dev/null 2>&1 || true
+  pkill -f 'dpkg' >/dev/null 2>&1 || true
   ip link delete rustynet0 >/dev/null 2>&1 || true
   for _ in 1 2 3; do
     nft list tables 2>/dev/null | while read -r kind family table; do
@@ -4156,12 +4200,36 @@ fi
 
 export PATH="/root/.cargo/bin:${PATH}"
 rustup set profile minimal
-if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo --version >/dev/null 2>&1; then
-  rustup toolchain install "${RUST_TOOLCHAIN_CHANNEL}" --profile minimal --component rustfmt --component clippy
+toolchain_dir="${HOME}/.rustup/toolchains/${RUST_TOOLCHAIN_CHANNEL}"
+toolchain_rustc="${toolchain_dir}/bin/rustc"
+toolchain_cargo="${toolchain_dir}/bin/cargo"
+if [[ ! -x "${toolchain_rustc}" || ! -x "${toolchain_cargo}" ]]; then
+  for attempt in 1 2 3; do
+    if env \
+      RUSTUP_DOWNLOAD_TIMEOUT=600 \
+      RUSTUP_CONCURRENT_DOWNLOADS=1 \
+      rustup toolchain install "${RUST_TOOLCHAIN_CHANNEL}" --profile minimal; then
+      break
+    fi
+    if [[ "${attempt}" -lt 3 ]]; then
+      echo "[bootstrap] rustup install attempt ${attempt} failed; retrying after DNS repair" >&2
+      repair_local_dns_resolution
+      sleep 2
+    fi
+  done
+  if [[ ! -x "${toolchain_rustc}" || ! -x "${toolchain_cargo}" ]]; then
+    echo "[bootstrap] rustup toolchain install failed after retries for ${RUST_TOOLCHAIN_CHANNEL}" >&2
+    exit 1
+  fi
 fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
-rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --manifest-path "${SRC_DIR}/Cargo.toml" -p rustynetd -p rustynet-cli
+if ! "${toolchain_rustc}" --version >/dev/null 2>&1 || ! "${toolchain_cargo}" --version >/dev/null 2>&1; then
+  echo "[bootstrap] installed Rust toolchain binaries failed verification for ${RUST_TOOLCHAIN_CHANNEL}" >&2
+  exit 1
+fi
+
+"${toolchain_cargo}" build --release --manifest-path "${SRC_DIR}/Cargo.toml" -p rustynetd -p rustynet-cli
 install -m 0755 "${SRC_DIR}/target/release/rustynetd" /usr/local/bin/rustynetd
 install -m 0755 "${SRC_DIR}/target/release/rustynet-cli" /usr/local/bin/rustynet
 getent group rustynetd >/dev/null 2>&1 || groupadd --system rustynetd

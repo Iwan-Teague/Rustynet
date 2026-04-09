@@ -1061,6 +1061,20 @@ fn install_dns_bundle_with_options(
                 client_host,
                 &[
                     "install",
+                    "-d",
+                    "-m",
+                    "0755",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "/etc/rustynet",
+                ],
+            )?;
+            ctx.run_root(
+                client_host,
+                &[
+                    "install",
                     "-m",
                     "0644",
                     "-o",
@@ -1196,6 +1210,20 @@ fn install_traversal_bundle(
 ) -> Result<(), String> {
     ctx.scp_to(traversal_pub_local, host, "/tmp/rn-traversal.pub")?;
     ctx.scp_to(traversal_bundle_local, host, "/tmp/rn-traversal.bundle")?;
+    ctx.run_root(
+        host,
+        &[
+            "install",
+            "-d",
+            "-m",
+            "0755",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "/etc/rustynet",
+        ],
+    )?;
     ctx.run_root(
         host,
         &[

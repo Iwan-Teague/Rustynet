@@ -3519,15 +3519,13 @@ fn prepare_local_source_archive(
     let extras = prepare_local_source_bundle_extras(source_dir, timeout)?;
     if let Err(git_err) =
         write_git_worktree_archive(source_dir, archive_path.as_path(), timeout, extras.as_ref())
-    {
-        if let Err(raw_err) =
+        && let Err(raw_err) =
             write_raw_directory_archive(source_dir, archive_path.as_path(), extras.as_ref())
-        {
-            let _ = fs::remove_file(archive_path.as_path());
-            return Err(format!(
-                "local source archive failed via git-managed path ({git_err}); raw directory fallback also failed ({raw_err})"
-            ));
-        }
+    {
+        let _ = fs::remove_file(archive_path.as_path());
+        return Err(format!(
+            "local source archive failed via git-managed path ({git_err}); raw directory fallback also failed ({raw_err})"
+        ));
     }
     Ok(LocalSourceArchive { path: archive_path })
 }

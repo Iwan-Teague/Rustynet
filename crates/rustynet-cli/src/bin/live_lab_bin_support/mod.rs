@@ -426,11 +426,11 @@ fn resolved_known_hosts_candidates(target: &str, resolved: &str) -> Result<Vec<S
     let port = ssh_g_value(resolved, "port").unwrap_or("22");
     let mut lookup_candidates = Vec::new();
 
-    if let Some(hostkeyalias) = ssh_g_value(resolved, "hostkeyalias") {
-        if hostkeyalias != "none" {
-            let lookup_host = known_hosts_lookup_host(hostkeyalias, port)?;
-            lookup_candidates.push(lookup_host);
-        }
+    if let Some(hostkeyalias) = ssh_g_value(resolved, "hostkeyalias")
+        && hostkeyalias != "none"
+    {
+        let lookup_host = known_hosts_lookup_host(hostkeyalias, port)?;
+        lookup_candidates.push(lookup_host);
     }
 
     let raw_lookup = known_hosts_lookup_host(raw_host, port)?;
