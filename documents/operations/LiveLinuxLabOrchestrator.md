@@ -2,6 +2,8 @@
 
 Script: `scripts/e2e/live_linux_lab_orchestrator.sh`
 
+Function reference: [`scripts/e2e/README.md`](../../scripts/e2e/README.md)
+
 ## Purpose
 
 This script automates the live Linux lab workflow that was previously being run manually:
@@ -21,6 +23,39 @@ This script automates the live Linux lab workflow that was previously being run 
 Companion documents:
 - cross-network prerequisites checklist: `documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`
 - cross-network incident response playbook: `documents/operations/CrossNetworkRemoteExitIncidentPlaybook.md`
+
+## Quick Discovery
+
+If you are on a local machine with UTM-backed lab VMs, start by discovering the
+available bundles and reading the compact summary:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
+```
+
+Use the full discovery report when you need the underlying bundle, live IP, SSH,
+and readiness details:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
+```
+
+The summary command is the quickest way to confirm whether the local lab is
+ready to feed into `ops vm-lab-write-live-lab-profile` and the main live-lab
+setup wrapper.
+
+If discovery shows live IPs but `ready=false` or `ssh_port_status=closed`, the
+guest IPs are known but the host-to-guest SSH path is still not usable. Use the
+local restart wrapper and wait for readiness before continuing:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-restart \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --all \
+  --wait-ready \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts
+```
 
 ## Target topology
 
@@ -91,6 +126,8 @@ The following stages now execute one worker per target in parallel:
 - `enforce_baseline_runtime`
 - `validate_baseline_runtime`
 
+The high-level setup flow is grouped by `stage_run_fresh_bootstrap_and_network_setup`, which sequences source packaging, an explicit SSH reachability gate, remote access priming, cleanup, bootstrap, pubkey collection, membership setup, membership distribution, assignment issuance, traversal issuance, baseline enforcement, and baseline validation as one composed orchestration helper.
+
 Security and determinism constraints for parallel work:
 
 - each worker gets its own `known_hosts` file inside the live-lab work directory, seeded from the operator-supplied pinned host-key file
@@ -100,7 +137,7 @@ Security and determinism constraints for parallel work:
 
 This keeps the expensive host-local work concurrent without introducing shared-state races in SSH host-key tracking or signed-control-plane mutation. TOFU host-key acceptance is intentionally disabled.
 
-The baseline validation path now also collects a standardized per-node service snapshot, network snapshot, route-policy snapshot, DNS-state snapshot, time snapshot, process snapshot, socket snapshot, permissions snapshot, firewall snapshot, DNS-zone snapshot, signed-state snapshot, node snapshot, and secret-hygiene report before it evaluates the final runtime assertions. It also waits for a converged route-matrix snapshot so default-route ownership and pairwise route-policy capture have to stabilize before the stage passes. The cross-network preflight now reuses the same route-policy, DNS-state, time, process, socket, permissions, DNS-zone, and signed-state helpers before it gathers the rest of its evidence. The failure forensics bundle also emits per-node time, process, socket, and permissions snapshots plus a cluster route-matrix artifact, alongside the cluster snapshot that aggregates peer inventory, signed-state, and firewall evidence across the topology. That gives retries one canonical view of:
+The baseline validation path now also collects a standardized per-node service snapshot, network snapshot, route-policy snapshot, DNS-state snapshot, time snapshot, process snapshot, socket snapshot, permissions snapshot, firewall snapshot, DNS-zone snapshot, signed-state snapshot, node snapshot, and secret-hygiene report before it evaluates the final runtime assertions. The cross-network preflight now reuses the same route-policy, DNS-state, time, process, socket, permissions, DNS-zone, and signed-state helpers before it gathers the rest of its evidence. The failure forensics bundle also emits per-node time, process, socket, and permissions snapshots plus a cluster route-matrix artifact, alongside the cluster snapshot that aggregates peer inventory, signed-state, and firewall evidence across the topology. That gives retries one canonical view of:
 
 - `rustynet status`
 - systemd and daemon-socket health

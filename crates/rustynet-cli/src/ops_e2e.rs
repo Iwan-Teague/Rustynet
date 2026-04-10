@@ -13,14 +13,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nix::unistd::Uid;
 use rand::{RngCore, rngs::OsRng};
 use rustynet_control::{
-    AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
-    EndpointHintCandidateType, NodeMetadata, SignedTraversalCoordinationRecord,
-    TraversalCoordinationRecord,
+    AutoTunnelBundleRequest, ControlPlaneCore, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
+    EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType, NodeMetadata,
+    SignedDnsZoneBundleRequest, SignedTraversalCoordinationRecord, TraversalCoordinationRecord,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
 
 use crate::{env_file::format_env_assignment, unix_now};
+
+const MEMBERSHIP_STATE_OWNER: &str = "rustynetd";
+const MEMBERSHIP_STATE_GROUP: &str = "rustynetd";
+const MEMBERSHIP_STATE_MODE: &str = "0600";
+const MEMBERSHIP_STATE_OWNER_GROUP: &str = "rustynetd:rustynetd";
+const ROOT_OWNER_GROUP: &str = "root:root";
+const MEMBERSHIP_STATE_PATHS: [&str; 3] = [
+    "/var/lib/rustynet/membership.snapshot",
+    "/var/lib/rustynet/membership.log",
+    "/var/lib/rustynet/membership.watermark",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebianTwoNodeE2eConfig {
@@ -57,6 +68,12 @@ pub struct E2eIssueAssignmentBundlesFromEnvConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct E2eIssueTraversalBundlesFromEnvConfig {
+    pub env_file: PathBuf,
+    pub issue_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eIssueDnsZoneBundlesFromEnvConfig {
     pub env_file: PathBuf,
     pub issue_dir: PathBuf,
 }
@@ -667,6 +684,7 @@ pub fn execute_ops_e2e_membership_add(
             "decrypting signing passphrase credential failed",
         )?;
         set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
+        set_membership_state_permissions_local(ROOT_OWNER_GROUP)?;
 
         run_status(
             "rustynet",
@@ -725,9 +743,19 @@ pub fn execute_ops_e2e_membership_add(
         )?;
         Ok(())
     })();
+    let restore_result = set_membership_state_permissions_local(MEMBERSHIP_STATE_OWNER_GROUP);
     secure_remove_file(Path::new(passphrase_path.as_str()));
     let _ = fs::remove_dir_all(work_dir);
-    result?;
+    match (result, restore_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(err), Ok(())) => return Err(err),
+        (Ok(()), Err(restore_err)) => return Err(restore_err),
+        (Err(err), Err(restore_err)) => {
+            return Err(format!(
+                "{err}; membership ownership restore failed: {restore_err}"
+            ));
+        }
+    }
 
     Ok(format!(
         "e2e membership add complete: client_node_id={client_node_id}",
@@ -1008,6 +1036,12 @@ struct IssuedTraversalArtifacts {
     aggregate_bundles: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
+struct IssuedDnsZoneBundle {
+    subject_node_id: String,
+    wire: String,
+}
+
 pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     config: E2eIssueAssignmentBundlesFromEnvConfig,
 ) -> Result<String, String> {
@@ -1249,6 +1283,115 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         "e2e traversal bundle issuance complete: env_file={} issue_dir={}",
         config.env_file.display(),
         config.issue_dir.display()
+    ))
+}
+
+pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
+    config: E2eIssueDnsZoneBundlesFromEnvConfig,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    let env_values = load_simple_env_file(config.env_file.as_path(), "dns zone env file")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "dns zone env file")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "dns zone env file")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let zone_name = env_values
+        .get("DNS_ZONE_NAME")
+        .cloned()
+        .unwrap_or_else(|| "rustynet".to_string());
+    ensure_safe_token("dns-zone-name", zone_name.as_str())?;
+    let ttl_secs = env_values
+        .get("DNS_ZONE_TTL_SECS")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|err| format!("invalid DNS_ZONE_TTL_SECS in dns zone env file: {err}"))
+        })
+        .transpose()?
+        .unwrap_or(300);
+    if ttl_secs == 0 || ttl_secs > 300 {
+        return Err(format!(
+            "DNS_ZONE_TTL_SECS must be a positive integer <= 300 (got: {ttl_secs})"
+        ));
+    }
+
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    if nodes.is_empty() {
+        return Err("dns zone issue requires at least one node in NODES_SPEC".to_string());
+    }
+    let known_node_ids = nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
+    for pair in &allow_pairs {
+        if !known_node_ids.contains(pair.target_node_id.as_str()) {
+            return Err(format!(
+                "target node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.target_node_id
+            ));
+        }
+        if !known_node_ids.contains(pair.source_node_id.as_str()) {
+            return Err(format!(
+                "source node {} from ALLOW_SPEC is missing in NODES_SPEC",
+                pair.source_node_id
+            ));
+        }
+    }
+    prepare_clean_issue_dir(config.issue_dir.as_path(), "dns zone issue dir")?;
+
+    let verifier_key_output = config.issue_dir.join("rn-dns-zone.pub");
+    let passphrase_path = materialize_signing_passphrase_temp("rustynet-dns-zone-passphrase")?;
+    let result = (|| -> Result<(), String> {
+        ensure_regular_file(
+            Path::new("/etc/rustynet/membership.owner.key"),
+            "membership owner signing key",
+        )?;
+        let signing_secret = crate::load_assignment_signing_secret(
+            Path::new("/etc/rustynet/membership.owner.key"),
+            Path::new(passphrase_path.as_str()),
+        )?;
+        let (verifier_key_hex, bundles) = issue_dns_zone_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            zone_name.as_str(),
+            ttl_secs,
+        )?;
+        for bundle in &bundles {
+            let output_path = config
+                .issue_dir
+                .join(format!("rn-dns-zone-{}.dns-zone", bundle.subject_node_id));
+            fs::write(output_path.as_path(), bundle.wire.as_bytes()).map_err(|err| {
+                format!(
+                    "write dns zone bundle failed ({}): {err}",
+                    output_path.display()
+                )
+            })?;
+            set_unix_mode(output_path.as_path(), 0o600)?;
+        }
+        fs::write(
+            verifier_key_output.as_path(),
+            format!("{verifier_key_hex}\n").as_bytes(),
+        )
+        .map_err(|err| {
+            format!(
+                "write dns zone verifier key failed ({}): {err}",
+                verifier_key_output.display()
+            )
+        })?;
+        set_unix_mode(verifier_key_output.as_path(), 0o600)?;
+        Ok(())
+    })();
+    secure_remove_file(Path::new(passphrase_path.as_str()));
+    result?;
+
+    Ok(format!(
+        "e2e dns zone bundle issuance complete: env_file={} issue_dir={} zone_name={} ttl_secs={}",
+        config.env_file.display(),
+        config.issue_dir.display(),
+        zone_name,
+        ttl_secs
     ))
 }
 
@@ -1544,6 +1687,90 @@ fn issue_traversal_bundle_artifacts(
     })
 }
 
+fn issue_dns_zone_bundle_artifacts(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+    zone_name: &str,
+    ttl_secs: u64,
+) -> Result<(String, Vec<IssuedDnsZoneBundle>), String> {
+    let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
+    let generated_at_unix = unix_now();
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut visible_targets_by_subject = BTreeMap::<String, BTreeSet<String>>::new();
+    for node in nodes {
+        visible_targets_by_subject
+            .entry(node.node_id.clone())
+            .or_default()
+            .insert(node.node_id.clone());
+    }
+    for pair in allow_pairs {
+        visible_targets_by_subject
+            .entry(pair.source_node_id.clone())
+            .or_default()
+            .insert(pair.target_node_id.clone());
+    }
+
+    let bundles = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, subject)| {
+            let visible_targets = visible_targets_by_subject
+                .get(subject.node_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut only_self = BTreeSet::new();
+                    only_self.insert(subject.node_id.clone());
+                    only_self
+                });
+            let records = visible_targets
+                .into_iter()
+                .map(|target_node_id| {
+                    let target = nodes_by_id.get(&target_node_id).ok_or_else(|| {
+                        format!(
+                            "dns zone target {} is missing from NODES_SPEC",
+                            target_node_id
+                        )
+                    })?;
+                    Ok(DnsRecordRequest {
+                        label: target.node_id.clone(),
+                        target_node_id,
+                        ttl_secs,
+                        rr_type: DnsRecordType::A,
+                        target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                        aliases: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let bundle = core
+                .signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
+                    zone_name: zone_name.to_string(),
+                    subject_node_id: subject.node_id.clone(),
+                    generated_at_unix,
+                    ttl_secs,
+                    nonce: crate::generate_assignment_nonce().saturating_add(index as u64),
+                    records,
+                })
+                .map_err(|err| format!("issue dns zone bundle failed: {err}"))?;
+            if !core.verify_signed_dns_zone_bundle(&bundle) {
+                return Err(format!(
+                    "self-verify failed for dns zone bundle subject {}",
+                    subject.node_id
+                ));
+            }
+            Ok(IssuedDnsZoneBundle {
+                subject_node_id: subject.node_id.clone(),
+                wire: ControlPlaneCore::signed_dns_zone_bundle_to_wire(&bundle),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok((core.dns_zone_verifier_key_hex(), bundles))
+}
+
 fn traversal_nonce(now_unix: u64, offset: u64) -> u64 {
     now_unix
         .saturating_mul(1_000)
@@ -1796,9 +2023,9 @@ pub fn execute_ops_run_debian_two_node_e2e(
         sudo_password.as_str(),
         workspace.membership_snapshot_local.as_path(),
         "/var/lib/rustynet/membership.snapshot",
-        "root",
-        "root",
-        "0600",
+        MEMBERSHIP_STATE_OWNER,
+        MEMBERSHIP_STATE_GROUP,
+        MEMBERSHIP_STATE_MODE,
     )?;
     copy_local_file_to_remote(
         ssh_opts.as_slice(),
@@ -1807,9 +2034,9 @@ pub fn execute_ops_run_debian_two_node_e2e(
         sudo_password.as_str(),
         workspace.membership_log_local.as_path(),
         "/var/lib/rustynet/membership.log",
-        "root",
-        "root",
-        "0600",
+        MEMBERSHIP_STATE_OWNER,
+        MEMBERSHIP_STATE_GROUP,
+        MEMBERSHIP_STATE_MODE,
     )?;
     run_remote_program_checked(
         ssh_opts.as_slice(),
@@ -4484,7 +4711,7 @@ fn normalize_membership_permissions(
         sudo,
         "chown",
         &[
-            "root:root",
+            "rustynetd:rustynetd",
             "/var/lib/rustynet/membership.snapshot",
             "/var/lib/rustynet/membership.log",
         ],
@@ -4496,12 +4723,48 @@ fn normalize_membership_permissions(
         sudo,
         "chmod",
         &[
-            "0600",
+            MEMBERSHIP_STATE_MODE,
             "/var/lib/rustynet/membership.snapshot",
             "/var/lib/rustynet/membership.log",
         ],
         &[],
     )?;
+    Ok(())
+}
+
+fn set_membership_state_permissions_local(owner_group: &str) -> Result<(), String> {
+    let existing_paths = MEMBERSHIP_STATE_PATHS
+        .iter()
+        .copied()
+        .filter(|path| Path::new(path).exists())
+        .collect::<Vec<_>>();
+    if existing_paths.is_empty() {
+        return Ok(());
+    }
+
+    let output = Command::new("chown")
+        .arg(owner_group)
+        .args(existing_paths.iter().copied())
+        .output()
+        .map_err(|err| format!("membership state chown spawn failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = match (stdout.is_empty(), stderr.is_empty()) {
+            (true, true) => "no stdout/stderr output".to_string(),
+            (true, false) => format!("stderr={stderr}"),
+            (false, true) => format!("stdout={stdout}"),
+            (false, false) => format!("stdout={stdout}; stderr={stderr}"),
+        };
+        return Err(format!(
+            "membership state chown failed: status={} {detail}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    for path in existing_paths {
+        set_unix_mode(Path::new(path), 0o600)?;
+    }
     Ok(())
 }
 
@@ -4790,10 +5053,10 @@ mod tests {
     use super::{
         AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, assignment_verifier_key_hex, decode_base64,
         decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
-        issue_assignment_bundle_artifacts, issue_traversal_bundle_artifacts,
-        issue_two_node_traversal_artifacts, parse_generic_allow_specs,
-        parse_generic_assignment_specs, parse_generic_nodes, traversal_verifier_key_hex,
-        write_assignment_refresh_env,
+        issue_assignment_bundle_artifacts, issue_dns_zone_bundle_artifacts,
+        issue_traversal_bundle_artifacts, issue_two_node_traversal_artifacts,
+        parse_generic_allow_specs, parse_generic_assignment_specs, parse_generic_nodes,
+        traversal_verifier_key_hex, write_assignment_refresh_env,
     };
     use rustynet_control::ControlPlaneCore;
     use rustynet_policy::PolicySet;
@@ -4923,6 +5186,50 @@ mod tests {
             ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
                 .endpoint_hint_verifier_key_hex()
         );
+    }
+
+    #[test]
+    fn generic_dns_zone_bundle_artifacts_scope_records_per_subject() {
+        let nodes = parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100;\
+client-2|192.168.64.25:51820|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("nodes should parse");
+        let allow_pairs = parse_generic_allow_specs(
+            "client-1|exit-1;exit-1|client-1;client-2|exit-1;exit-1|client-2",
+        )
+        .expect("allow pairs");
+
+        let (verifier_key_hex, bundles) = issue_dns_zone_bundle_artifacts(
+            &[23u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            "rustynet",
+            300,
+        )
+        .expect("dns zone bundles should issue");
+
+        assert!(!verifier_key_hex.is_empty());
+        assert_eq!(bundles.len(), 3);
+        let exit_bundle = bundles
+            .iter()
+            .find(|bundle| bundle.subject_node_id == "exit-1")
+            .expect("exit bundle");
+        let client_one_bundle = bundles
+            .iter()
+            .find(|bundle| bundle.subject_node_id == "client-1")
+            .expect("client-1 bundle");
+
+        assert!(exit_bundle.wire.contains("subject_node_id=exit-1"));
+        assert!(exit_bundle.wire.contains("label=exit-1"));
+        assert!(exit_bundle.wire.contains("label=client-1"));
+        assert!(exit_bundle.wire.contains("label=client-2"));
+
+        assert!(client_one_bundle.wire.contains("subject_node_id=client-1"));
+        assert!(client_one_bundle.wire.contains("label=client-1"));
+        assert!(client_one_bundle.wire.contains("label=exit-1"));
+        assert!(!client_one_bundle.wire.contains("label=client-2"));
     }
 
     #[test]

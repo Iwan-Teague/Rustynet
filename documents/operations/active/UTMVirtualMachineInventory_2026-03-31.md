@@ -87,7 +87,9 @@ Operational meaning:
 
 - `ops vm-lab-start` only works for entries with a local `controller`
 - `ops vm-lab-stop` and `ops vm-lab-restart` can stop/restart those local-controller VMs
+- `ops vm-lab-restart --wait-ready` is the preferred recovery path when UTM discovery still shows live IPs but `ready=false` or `ssh_port_status=closed`; it now waits for process presence, live IP resolution, SSH port-open state, and SSH auth readiness before returning
 - `ops vm-lab-sync-repo`, `ops vm-lab-run`, and `ops vm-lab-bootstrap` work for any inventory entry with a valid `ssh_target`
+- remote SSH-backed `ops vm-lab-*` commands now accept explicit `--ssh-identity-file` and `--known-hosts-file` inputs so the lab fleet can be driven reproducibly even when the operator key is not wired through ambient `~/.ssh/config`
 - `ops vm-lab-sync-bootstrap` combines repo sync plus bootstrap/run across a selected VM set
 - `ops vm-lab-bootstrap-phase` provides Rustynet-specific idempotent phases:
   `sync-source`, `build-release`, `install-release`, `restart-runtime`, `verify-runtime`, or `all`
@@ -140,6 +142,8 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-sync-repo \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --vm remote-debian-1 \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
   --repo-url git@github.com:iwanteague/Rustyfin.git \
   --dest-dir /home/debian/Rustyfin \
   --branch main
@@ -224,6 +228,7 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-preflight \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --all \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --known-hosts-file ~/.ssh/known_hosts \
   --require-command git \
   --require-command cargo \
@@ -241,6 +246,8 @@ cargo run -q -p rustynet-cli -- \
   ops vm-lab-bootstrap-phase \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --phase all \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
   --repo-url git@github.com:iwanteague/Rustynet.git \
   --dest-dir /home/debian/Rustynet \
   --all \

@@ -11,7 +11,7 @@ Start with these, depending on what you are doing:
 
 - active implementation status: [active/README.md](./active/README.md)
 - service and runtime operation: [ProductionRunbook.md](./ProductionRunbook.md)
-- live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md) and [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md)
+- live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md), and the script-local function map at [scripts/e2e/README.md](../../scripts/e2e/README.md)
 - release-readiness and support posture: [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md) and [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
 - phase10 exit-node and dataplane behavior: [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
 - security and compliance mapping: [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md), [ComplianceControlMap.md](./ComplianceControlMap.md), and [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)

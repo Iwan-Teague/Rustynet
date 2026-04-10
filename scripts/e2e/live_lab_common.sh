@@ -44,6 +44,12 @@ live_lab_init() {
     live_lab_require_command "$cmd"
   done
 
+  LIVE_LAB_UTMCTL_PATH="${LIVE_LAB_UTMCTL_PATH:-/Applications/UTM.app/Contents/MacOS/utmctl}"
+  export LIVE_LAB_UTMCTL_PATH
+  if live_lab_has_utm_transport; then
+    live_lab_require_utmctl
+  fi
+
   LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-${HOME}/.ssh/known_hosts}"
   export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE
   live_lab_require_known_hosts_file "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE"
@@ -176,6 +182,239 @@ live_lab_target_address() {
   printf '%s' "${target#*@}"
 }
 
+live_lab_target_home() {
+  local user
+  user="$(live_lab_target_user "$1")"
+  if [[ "$user" == "root" ]]; then
+    printf '/root'
+    return 0
+  fi
+  printf '/home/%s' "$user"
+}
+
+live_lab_target_utm_name() {
+  local target="$1"
+  if [[ -n "${EXIT_TARGET:-}" && "$target" == "$EXIT_TARGET" ]]; then
+    printf '%s' "${EXIT_UTM_NAME:-}"
+    return 0
+  fi
+  if [[ -n "${CLIENT_TARGET:-}" && "$target" == "$CLIENT_TARGET" ]]; then
+    printf '%s' "${CLIENT_UTM_NAME:-}"
+    return 0
+  fi
+  if [[ -n "${ENTRY_TARGET:-}" && "$target" == "$ENTRY_TARGET" ]]; then
+    printf '%s' "${ENTRY_UTM_NAME:-}"
+    return 0
+  fi
+  if [[ -n "${AUX_TARGET:-}" && "$target" == "$AUX_TARGET" ]]; then
+    printf '%s' "${AUX_UTM_NAME:-}"
+    return 0
+  fi
+  if [[ -n "${EXTRA_TARGET:-}" && "$target" == "$EXTRA_TARGET" ]]; then
+    printf '%s' "${EXTRA_UTM_NAME:-}"
+    return 0
+  fi
+  if [[ -n "${FIFTH_CLIENT_TARGET:-}" && "$target" == "$FIFTH_CLIENT_TARGET" ]]; then
+    printf '%s' "${FIFTH_CLIENT_UTM_NAME:-}"
+    return 0
+  fi
+  return 1
+}
+
+live_lab_target_uses_utm_transport() {
+  local utm_name
+  utm_name="$(live_lab_target_utm_name "$1" 2>/dev/null || true)"
+  [[ -n "$utm_name" ]]
+}
+
+live_lab_has_utm_transport() {
+  [[ -n "${EXIT_UTM_NAME:-}${CLIENT_UTM_NAME:-}${ENTRY_UTM_NAME:-}${AUX_UTM_NAME:-}${EXTRA_UTM_NAME:-}${FIFTH_CLIENT_UTM_NAME:-}" ]]
+}
+
+live_lab_require_utmctl() {
+  if [[ ! -x "$LIVE_LAB_UTMCTL_PATH" ]]; then
+    echo "missing executable UTM control tool: $LIVE_LAB_UTMCTL_PATH" >&2
+    exit 1
+  fi
+}
+
+# UTM guest-agent operations abort under concurrent host-side calls on this Mac,
+# so serialize every utmctl file/exec invocation across live-lab workers.
+live_lab_utm_lock_dir() {
+  printf '%s/utmctl.lock' "$LIVE_LAB_WORK_DIR"
+}
+
+live_lab_utm_lock_acquire() {
+  local wait_secs="${1:-10800}"
+  local lock_dir pid_file owner_pid waited_secs=0
+  lock_dir="$(live_lab_utm_lock_dir)"
+  pid_file="${lock_dir}/pid"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    owner_pid=""
+    if [[ -f "$pid_file" ]]; then
+      owner_pid="$(cat "$pid_file" 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+    if (( waited_secs >= wait_secs )); then
+      echo "timed out waiting for serialized utmctl access" >&2
+      return 1
+    fi
+    sleep 1
+    waited_secs=$((waited_secs + 1))
+  done
+  printf '%s\n' "$$" > "$pid_file"
+}
+
+live_lab_utm_lock_release() {
+  local lock_dir
+  lock_dir="$(live_lab_utm_lock_dir)"
+  rm -rf "$lock_dir" 2>/dev/null || true
+}
+
+live_lab_utm_run_locked() {
+  local lock_wait_secs="${1:-10800}"
+  shift
+  local rc
+  live_lab_utm_lock_acquire "$lock_wait_secs" || return 1
+  if "$@"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  live_lab_utm_lock_release
+  return "$rc"
+}
+
+live_lab_utm_run_locked_stdin() {
+  local stdin_file="$1"
+  local lock_wait_secs="${2:-10800}"
+  shift 2
+  local rc
+  live_lab_utm_lock_acquire "$lock_wait_secs" || return 1
+  if "$@" < "$stdin_file"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  live_lab_utm_lock_release
+  return "$rc"
+}
+
+live_lab_wait_for_background_command() {
+  local pid="$1"
+  local timeout_secs="${2:-60}"
+  local waited_secs=0
+  local rc
+  if [[ ! "$timeout_secs" =~ ^[0-9]+$ ]] || (( timeout_secs < 1 )); then
+    timeout_secs=1
+  fi
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited_secs >= timeout_secs )); then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited_secs=$((waited_secs + 1))
+  done
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  return "$rc"
+}
+
+live_lab_utm_run_locked_timeout() {
+  local lock_wait_secs="${1:-10800}"
+  local command_timeout_secs="${2:-60}"
+  shift 2
+  local rc pid
+  live_lab_utm_lock_acquire "$lock_wait_secs" || return 1
+  "$@" &
+  pid=$!
+  if live_lab_wait_for_background_command "$pid" "$command_timeout_secs"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  live_lab_utm_lock_release
+  return "$rc"
+}
+
+live_lab_utm_run_locked_stdin_timeout() {
+  local stdin_file="$1"
+  local lock_wait_secs="${2:-10800}"
+  local command_timeout_secs="${3:-60}"
+  shift 3
+  local rc pid
+  live_lab_utm_lock_acquire "$lock_wait_secs" || return 1
+  "$@" < "$stdin_file" &
+  pid=$!
+  if live_lab_wait_for_background_command "$pid" "$command_timeout_secs"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  live_lab_utm_lock_release
+  return "$rc"
+}
+
+live_lab_utm_cleanup_exec_files() {
+  local utm_name="$1"
+  local remote_script="$2"
+  local remote_wrapper="$3"
+  local remote_output="$4"
+  local remote_rc="$5"
+  live_lab_utm_run_locked_timeout 10800 20 \
+    "$LIVE_LAB_UTMCTL_PATH" exec "$utm_name" --cmd /bin/bash -lc "rm -f $(printf '%q' "$remote_script") $(printf '%q' "$remote_wrapper") $(printf '%q' "$remote_output") $(printf '%q' "$remote_rc")" \
+    >/dev/null 2>&1 || true
+}
+
+live_lab_utm_cleanup_run_files() {
+  local utm_name="$1"
+  local remote_script="$2"
+  local remote_wrapper="$3"
+  live_lab_utm_run_locked_timeout 10800 20 \
+    "$LIVE_LAB_UTMCTL_PATH" exec "$utm_name" --cmd /bin/bash -lc "rm -f $(printf '%q' "$remote_script") $(printf '%q' "$remote_wrapper")" \
+    >/dev/null 2>&1 || true
+}
+
+live_lab_utm_push_raw() {
+  local src="$1"
+  local target="$2"
+  local dst="$3"
+  local timeout_secs="${4:-60}"
+  local utm_name attempt rc
+  utm_name="$(live_lab_target_utm_name "$target")" || {
+    echo "missing UTM mapping for target: $target" >&2
+    return 1
+  }
+  local push_args=(
+    "$LIVE_LAB_UTMCTL_PATH"
+    file
+    push
+    "$utm_name"
+    "$dst"
+  )
+  for attempt in 1 2 3; do
+    if live_lab_utm_run_locked_stdin_timeout "$src" 10800 "$timeout_secs" "${push_args[@]}"; then
+      return 0
+    else
+      rc=$?
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      sleep 2
+    fi
+  done
+  live_lab_utm_run_locked_stdin_timeout "$src" 10800 "$timeout_secs" "${push_args[@]}"
+}
+
 live_lab_resolved_target_address() {
   local target="$1"
   local resolved hostname
@@ -189,6 +428,377 @@ live_lab_resolved_target_address() {
     return 0
   fi
   live_lab_target_address "$target"
+}
+
+live_lab_utm_exec_as_user() {
+  local target="$1"
+  local user="$2"
+  local home="$3"
+  local command="$4"
+  local timeout_secs="${5:-10800}"
+  local utm_name attempt rc local_script local_wrapper
+  local remote_base remote_script remote_wrapper remote_output remote_rc
+  local local_output_capture local_rc_capture wrapper_rc
+  local pull_attempt rc_contents output_attempt max_rc_attempts
+  utm_name="$(live_lab_target_utm_name "$target")" || {
+    echo "missing UTM mapping for target: $target" >&2
+    return 1
+  }
+  local_script="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-exec.XXXXXX")" || return 1
+  local_wrapper="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-wrapper.XXXXXX")" || {
+    rm -f "$local_script"
+    return 1
+  }
+  local_output_capture="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-output.XXXXXX")" || {
+    rm -f "$local_script" "$local_wrapper"
+    return 1
+  }
+  local_rc_capture="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-rc.XXXXXX")" || {
+    rm -f "$local_script" "$local_wrapper" "$local_output_capture"
+    return 1
+  }
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' "$command"
+  } > "$local_script"
+  chmod 700 "$local_script"
+cat > "$local_wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 5 ]]; then
+  echo "usage: rn-utm-wrapper.sh <user> <home> <command-script> <output-path> <rc-path>" >&2
+  exit 2
+fi
+
+user="$1"
+home="$2"
+command_script="$3"
+output_path="$4"
+rc_path="$5"
+rc=0
+
+if [[ "$user" == "root" ]]; then
+  chmod 700 "$command_script"
+  if /usr/bin/env HOME="$home" USER=root LOGNAME=root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    /bin/bash "$command_script" >"$output_path" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+else
+  chmod 755 "$command_script"
+  if runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    /bin/bash "$command_script" >"$output_path" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+fi
+
+printf '%s\n' "$rc" > "$rc_path"
+sync "$output_path" "$rc_path" >/dev/null 2>&1 || sync >/dev/null 2>&1 || true
+exit 0
+EOF
+  chmod 700 "$local_wrapper"
+  remote_base="/var/tmp/rn-utm-exec.$$.${RANDOM}"
+  remote_script="${remote_base}.sh"
+  remote_wrapper="${remote_base}.wrapper.sh"
+  remote_output="${remote_base}.out"
+  remote_rc="${remote_base}.rc"
+  if ! live_lab_utm_push_raw "$local_script" "$target" "$remote_script" 60; then
+    rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+    return 1
+  fi
+  if ! live_lab_utm_push_raw "$local_wrapper" "$target" "$remote_wrapper" 60; then
+    rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+    live_lab_utm_cleanup_exec_files "$utm_name" "$remote_script" "$remote_wrapper" "$remote_output" "$remote_rc"
+    return 1
+  fi
+  local -a exec_args
+  exec_args=(
+    "$LIVE_LAB_UTMCTL_PATH"
+    exec
+    "$utm_name"
+    --cmd
+    /bin/bash
+    "$remote_wrapper"
+    "$user"
+    "$home"
+    "$remote_script"
+    "$remote_output"
+    "$remote_rc"
+  )
+  wrapper_rc=1
+  for attempt in 1 2 3; do
+    if live_lab_utm_run_locked_timeout 10800 "$((timeout_secs + 30))" "${exec_args[@]}"; then
+      wrapper_rc=0
+      break
+    else
+      rc=$?
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      live_lab_utm_cleanup_exec_files "$utm_name" "$remote_script" "$remote_wrapper" "$remote_output" "$remote_rc"
+      sleep 2
+      if ! live_lab_utm_push_raw "$local_script" "$target" "$remote_script" 60; then
+        rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+        return "$rc"
+      fi
+      if ! live_lab_utm_push_raw "$local_wrapper" "$target" "$remote_wrapper" 60; then
+        rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+        return "$rc"
+      fi
+    fi
+  done
+  if [[ "$wrapper_rc" -ne 0 ]]; then
+    live_lab_utm_cleanup_exec_files "$utm_name" "$remote_script" "$remote_wrapper" "$remote_output" "$remote_rc"
+    rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+    return "$rc"
+  fi
+  max_rc_attempts="$timeout_secs"
+  if [[ ! "$max_rc_attempts" =~ ^[0-9]+$ ]] || (( max_rc_attempts < 10 )); then
+    max_rc_attempts=10
+  fi
+  rc_contents=""
+  for ((pull_attempt=1; pull_attempt<=max_rc_attempts; pull_attempt++)); do
+    : > "$local_rc_capture"
+    live_lab_utm_pull "$target" "$remote_rc" "$local_rc_capture" >/dev/null 2>&1 || true
+    rc_contents="$(tr -d '\r\n' < "$local_rc_capture" 2>/dev/null || true)"
+    if [[ "$rc_contents" =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    if (( pull_attempt < max_rc_attempts )); then
+      sleep 1
+    fi
+  done
+  if [[ ! "$rc_contents" =~ ^[0-9]+$ ]]; then
+    echo "invalid UTM command exit status for ${target}" >&2
+    if [[ -n "$rc_contents" ]]; then
+      printf '%s\n' "$rc_contents" >&2
+    fi
+    live_lab_utm_cleanup_exec_files "$utm_name" "$remote_script" "$remote_wrapper" "$remote_output" "$remote_rc"
+    rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+    return 1
+  fi
+  for output_attempt in 1 2 3 4 5; do
+    : > "$local_output_capture"
+    live_lab_utm_pull "$target" "$remote_output" "$local_output_capture" >/dev/null 2>&1 || true
+    if ! grep -q '^Error from event:' "$local_output_capture" 2>/dev/null; then
+      break
+    fi
+    if [[ "$output_attempt" -lt 5 ]]; then
+      sleep 1
+    fi
+  done
+  cat "$local_output_capture"
+  rc="$rc_contents"
+  live_lab_utm_cleanup_exec_files "$utm_name" "$remote_script" "$remote_wrapper" "$remote_output" "$remote_rc"
+  rm -f "$local_script" "$local_wrapper" "$local_output_capture" "$local_rc_capture"
+  return "$rc"
+}
+
+live_lab_utm_run_as_user() {
+  local target="$1"
+  local user="$2"
+  local home="$3"
+  local command="$4"
+  local utm_name attempt rc local_script local_wrapper
+  local remote_base remote_script remote_wrapper
+  utm_name="$(live_lab_target_utm_name "$target")" || {
+    echo "missing UTM mapping for target: $target" >&2
+    return 1
+  }
+  local_script="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-run.XXXXXX")" || return 1
+  local_wrapper="$(mktemp "${LIVE_LAB_WORK_DIR}/utm-run-wrapper.XXXXXX")" || {
+    rm -f "$local_script"
+    return 1
+  }
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' "$command"
+  } > "$local_script"
+  chmod 700 "$local_script"
+  cat > "$local_wrapper" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: rn-utm-run-wrapper.sh <user> <home> <command-script>" >&2
+  exit 2
+fi
+
+user="$1"
+home="$2"
+command_script="$3"
+
+if [[ "$user" == "root" ]]; then
+  chmod 700 "$command_script"
+exec /usr/bin/env HOME="$home" USER=root LOGNAME=root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+  /bin/bash "$command_script"
+fi
+
+chmod 755 "$command_script"
+exec runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+  /bin/bash "$command_script"
+EOF
+  chmod 700 "$local_wrapper"
+  remote_base="/var/tmp/rn-utm-run.$$.${RANDOM}"
+  remote_script="${remote_base}.sh"
+  remote_wrapper="${remote_base}.wrapper.sh"
+  if ! live_lab_utm_push_raw "$local_script" "$target" "$remote_script" 60; then
+    rm -f "$local_script" "$local_wrapper"
+    return 1
+  fi
+  if ! live_lab_utm_push_raw "$local_wrapper" "$target" "$remote_wrapper" 60; then
+    rm -f "$local_script" "$local_wrapper"
+    live_lab_utm_cleanup_run_files "$utm_name" "$remote_script" "$remote_wrapper"
+    return 1
+  fi
+  local -a exec_args
+  exec_args=(
+    "$LIVE_LAB_UTMCTL_PATH"
+    exec
+    "$utm_name"
+    --cmd
+    /bin/bash
+    "$remote_wrapper"
+    "$user"
+    "$home"
+    "$remote_script"
+  )
+  rc=1
+  for attempt in 1 2 3; do
+    if live_lab_utm_run_locked_timeout 10800 90 "${exec_args[@]}"; then
+      rc=0
+      break
+    else
+      rc=$?
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      live_lab_utm_cleanup_run_files "$utm_name" "$remote_script" "$remote_wrapper"
+      sleep 1
+      if ! live_lab_utm_push_raw "$local_script" "$target" "$remote_script" 60; then
+        rm -f "$local_script" "$local_wrapper"
+        return "$rc"
+      fi
+      if ! live_lab_utm_push_raw "$local_wrapper" "$target" "$remote_wrapper" 60; then
+        rm -f "$local_script" "$local_wrapper"
+        return "$rc"
+      fi
+    fi
+  done
+  live_lab_utm_cleanup_run_files "$utm_name" "$remote_script" "$remote_wrapper"
+  rm -f "$local_script" "$local_wrapper"
+  return "$rc"
+}
+
+live_lab_utm_exec() {
+  local target="$1"
+  local command="$2"
+  local timeout_secs="${3:-10800}"
+  local user home
+  user="$(live_lab_target_user "$target")"
+  home="$(live_lab_target_home "$target")"
+  live_lab_utm_exec_as_user "$target" "$user" "$home" "$command" "$timeout_secs"
+}
+
+live_lab_utm_exec_root() {
+  local target="$1"
+  local command="$2"
+  local timeout_secs="${3:-10800}"
+  live_lab_utm_exec_as_user "$target" "root" "/root" "$command" "$timeout_secs"
+}
+
+live_lab_utm_run() {
+  local target="$1"
+  local command="$2"
+  local user home
+  user="$(live_lab_target_user "$target")"
+  home="$(live_lab_target_home "$target")"
+  live_lab_utm_run_as_user "$target" "$user" "$home" "$command"
+}
+
+live_lab_utm_run_root() {
+  local target="$1"
+  local command="$2"
+  live_lab_utm_run_as_user "$target" "root" "/root" "$command"
+}
+
+live_lab_utm_push() {
+  local src="$1"
+  local target="$2"
+  local dst="$3"
+  local utm_name attempt rc user quoted_user quoted_dst
+  utm_name="$(live_lab_target_utm_name "$target")" || {
+    echo "missing UTM mapping for target: $target" >&2
+    return 1
+  }
+  user="$(live_lab_target_user "$target")"
+  quoted_user="$(printf '%q' "$user")"
+  quoted_dst="$(printf '%q' "$dst")"
+  local push_args=(
+    "$LIVE_LAB_UTMCTL_PATH"
+    file
+    push
+    "$utm_name"
+    "$dst"
+  )
+  for attempt in 1 2 3; do
+    if live_lab_utm_run_locked_stdin "$src" 10800 "${push_args[@]}"; then
+      if [[ "$user" != "root" ]]; then
+        live_lab_utm_run_locked_timeout 10800 20 \
+          "$LIVE_LAB_UTMCTL_PATH" exec "$utm_name" --cmd /bin/bash -lc "chown ${quoted_user}:${quoted_user} ${quoted_dst}" \
+          >/dev/null || return 1
+      fi
+      return 0
+    else
+      rc=$?
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      sleep 2
+    fi
+  done
+  if ! live_lab_utm_run_locked_stdin "$src" 10800 "${push_args[@]}"; then
+    return $?
+  fi
+  if [[ "$user" != "root" ]]; then
+    live_lab_utm_run_locked_timeout 10800 20 \
+      "$LIVE_LAB_UTMCTL_PATH" exec "$utm_name" --cmd /bin/bash -lc "chown ${quoted_user}:${quoted_user} ${quoted_dst}" \
+      >/dev/null || return 1
+  fi
+}
+
+live_lab_utm_pull() {
+  local target="$1"
+  local src="$2"
+  local dst="$3"
+  local utm_name attempt rc
+  utm_name="$(live_lab_target_utm_name "$target")" || {
+    echo "missing UTM mapping for target: $target" >&2
+    return 1
+  }
+  local pull_args=(
+    "$LIVE_LAB_UTMCTL_PATH"
+    file
+    pull
+    "$utm_name"
+    "$src"
+  )
+  for attempt in 1 2 3; do
+    if live_lab_utm_run_locked 10800 "${pull_args[@]}" > "$dst"; then
+      return 0
+    else
+      rc=$?
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      sleep 2
+    fi
+  done
+  live_lab_utm_run_locked 10800 "${pull_args[@]}" > "$dst"
 }
 
 live_lab_remote_src_dir() {
@@ -206,6 +816,10 @@ live_lab_ssh() {
   local target="$1"
   local command="$2"
   local timeout="${3:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_exec "$target" "$command" "$timeout"
+    return $?
+  fi
   local ssh_args=(
     ssh
     -n
@@ -243,6 +857,10 @@ live_lab_scp_to() {
   local target="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_push "$src" "$target" "$dst"
+    return $?
+  fi
   local scp_args=(
     scp
     -q
@@ -280,6 +898,10 @@ live_lab_scp_from() {
   local src="$2"
   local dst="$3"
   local timeout="${4:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_pull "$target" "$src" "$dst"
+    return $?
+  fi
   local scp_args=(
     scp
     -q
@@ -316,8 +938,17 @@ live_lab_capture() {
   local target="$1"
   local body="$2"
   local timeout="${3:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_exec "$target" "$body" "$timeout"
+    return $?
+  fi
   local raw
   raw="$(live_lab_ssh "$target" "printf '__CAP_BEGIN__\\n'; { ${body}; }; printf '\\n__CAP_END__\\n'" "$timeout")"
+  live_lab_extract_capture_output "$raw"
+}
+
+live_lab_extract_capture_output() {
+  local raw="$1"
   printf '%s\n' "$raw" | awk '
     /__CAP_BEGIN__/ {
       capture=1
@@ -350,8 +981,16 @@ live_lab_rootify() {
   printf 'root(){ sudo -n env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin "$@"; }; set -euo pipefail; %s' "$body"
 }
 
+live_lab_rootify_direct() {
+  local body="$1"
+  printf 'root(){ env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin "$@"; }; set -euo pipefail; %s' "$body"
+}
+
 live_lab_verify_sudo() {
   local target="$1"
+  if live_lab_target_uses_utm_transport "$target"; then
+    return 0
+  fi
   local hostname_precheck_cmd
   local verify_cmd
   hostname_precheck_cmd="current_hostname=\$(hostname); if ! grep -Eq \"(^|[[:space:]])\${current_hostname}([[:space:]]|$)\" /etc/hosts; then printf 'local hostname %s is missing from /etc/hosts\\n' \"\$current_hostname\"; exit 1; fi"
@@ -380,6 +1019,16 @@ live_lab_retry_verify_sudo() {
 
 live_lab_push_sudo_password() {
   local target="$1"
+  if live_lab_target_uses_utm_transport "$target"; then
+    local existing
+    for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
+      if [[ "$existing" == "$target" ]]; then
+        return 0
+      fi
+    done
+    LIVE_LAB_REMOTE_CLEANUP_TARGETS+=("$target")
+    return 0
+  fi
   local existing
   for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
     if [[ "$existing" == "$target" ]]; then
@@ -394,6 +1043,10 @@ live_lab_push_sudo_password() {
 live_lab_run_root() {
   local target="$1"
   local body="$2"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"
+    return $?
+  fi
   live_lab_push_sudo_password "$target" || return 1
   live_lab_ssh "$target" "$(live_lab_rootify "$body")"
 }
@@ -418,6 +1071,10 @@ live_lab_retry_root() {
 live_lab_capture_root() {
   local target="$1"
   local body="$2"
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"
+    return $?
+  fi
   live_lab_push_sudo_password "$target" || return 1
   live_lab_capture "$target" "$(live_lab_rootify "$body")"
 }
@@ -430,7 +1087,13 @@ live_lab_base64_to_hex() {
 live_lab_collect_pubkey_hex() {
   local target="$1"
   local pub_b64
-  pub_b64="$(live_lab_capture_root "$target" "root cat /var/lib/rustynet/keys/wireguard.pub | tr -d '[:space:]'")"
+  if live_lab_target_uses_utm_transport "$target"; then
+    pub_b64="$(live_lab_utm_exec_root "$target" "cat /var/lib/rustynet/keys/wireguard.pub | tr -d '[:space:]'; printf '\n'")" || return 1
+    pub_b64="${pub_b64//$'\r'/}"
+    pub_b64="${pub_b64//$'\n'/}"
+  else
+    pub_b64="$(live_lab_capture_root "$target" "root cat /var/lib/rustynet/keys/wireguard.pub | tr -d '[:space:]'")"
+  fi
   local pub_hex
   pub_hex="$(live_lab_base64_to_hex "$pub_b64")"
   if [[ ! "$pub_hex" =~ ^[0-9a-f]{64}$ ]]; then
@@ -438,6 +1101,19 @@ live_lab_collect_pubkey_hex() {
     return 1
   fi
   printf '%s' "$pub_hex"
+}
+
+live_lab_fetch_root_file_to_local() {
+  local target="$1"
+  local remote_path="$2"
+  local local_path="$3"
+  local quoted_remote_path
+  if live_lab_target_uses_utm_transport "$target"; then
+    live_lab_scp_from "$target" "$remote_path" "$local_path"
+    return $?
+  fi
+  quoted_remote_path="$(printf '%q' "$remote_path")"
+  live_lab_capture_root "$target" "root cat ${quoted_remote_path}" > "$local_path"
 }
 
 live_lab_quote_env_value() {
@@ -496,6 +1172,16 @@ live_lab_install_assignment_refresh_env() {
   live_lab_run_root "$target" "root mkdir -p /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
 }
 
+live_lab_install_dns_zone_bundle() {
+  local target="$1"
+  local dns_zone_pub_local="$2"
+  local dns_zone_bundle_local="$3"
+  live_lab_ensure_rustynetd_group "$target" || return 1
+  live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
+  live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
+  live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
+}
+
 live_lab_ensure_rustynetd_group() {
   local target="$1"
   live_lab_run_root "$target" "if ! root getent group rustynetd >/dev/null 2>&1; then root groupadd --system rustynetd; fi" || return 1
@@ -519,6 +1205,18 @@ live_lab_issue_traversal_bundles_from_env() {
   local remote_env_path="${3:-/tmp/rn-e2e-traversal.env}"
   live_lab_scp_to "$env_local" "$target" "$remote_env_path" || return 1
   if ! live_lab_run_root "$target" "root rustynet ops e2e-issue-traversal-bundles-from-env --env-file '${remote_env_path}'"; then
+    live_lab_run_root "$target" "root rm -f '${remote_env_path}'" >/dev/null 2>&1 || true
+    return 1
+  fi
+  live_lab_run_root "$target" "root rm -f '${remote_env_path}'" || return 1
+}
+
+live_lab_issue_dns_zone_bundles_from_env() {
+  local target="$1"
+  local env_local="$2"
+  local remote_env_path="${3:-/tmp/rn-e2e-dns-zone.env}"
+  live_lab_scp_to "$env_local" "$target" "$remote_env_path" || return 1
+  if ! live_lab_run_root "$target" "root rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file '${remote_env_path}'"; then
     live_lab_run_root "$target" "root rm -f '${remote_env_path}'" >/dev/null 2>&1 || true
     return 1
   fi
@@ -584,11 +1282,17 @@ live_lab_shell_quote() {
   printf '%q' "$1"
 }
 
-live_lab_service_snapshot_body() {
+live_lab_status_snapshot_body() {
   cat <<'EOF'
 printf '__RNLAB_STATUS_BEGIN__\n'
 root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status || true
 printf '__RNLAB_STATUS_END__\n'
+EOF
+}
+
+live_lab_service_snapshot_body() {
+  live_lab_status_snapshot_body
+  cat <<'EOF'
 printf '__RNLAB_SYSTEMD_BEGIN__\n'
 root systemctl status rustynetd.service rustynetd-privileged-helper.service rustynetd-managed-dns.service --no-pager -l || true
 printf '__RNLAB_SYSTEMD_END__\n'
@@ -1252,7 +1956,7 @@ unit_property() {
 daemon_matches="$(grep -E '(^|[[:space:]])rustynetd([[:space:]]|/).* daemon([[:space:]]|$)' <<<"$ps_output" || true)"
 helper_matches="$(grep -E '(^|[[:space:]])rustynetd([[:space:]]|/).* privileged-helper([[:space:]]|$)' <<<"$ps_output" || true)"
 managed_dns_matches="$(grep -E 'rustynetd-managed-dns' <<<"$ps_output" || true)"
-resolved_matches="$(grep -E '(^|[[:space:]])systemd-resolved([[:space:]]|$)' <<<"$ps_output" || true)"
+resolved_matches="$(grep -E '(^|[[:space:]])systemd-resolve(d)?([[:space:]]|$)' <<<"$ps_output" || true)"
 all_rustynetd_matches="$(grep -E '(^|[[:space:]])rustynetd([[:space:]]|$)' <<<"$ps_output" || true)"
 daemon_process_count="$(printf '%s\n' "$daemon_matches" | count_matches)"
 helper_process_count="$(printf '%s\n' "$helper_matches" | count_matches)"
@@ -1768,6 +2472,30 @@ live_lab_collect_node_snapshot() {
     "$(live_lab_firewall_snapshot_body)" \
     "$(live_lab_dns_zone_snapshot_body "$node_id")" \
     "$(live_lab_signed_state_snapshot_body "$node_id")" \
+    "$(live_lab_secret_hygiene_snapshot_body)")"
+  snapshot="$(live_lab_capture_root "$target" "$body")" || return 1
+  {
+    printf 'node_snapshot_version=1\n'
+    printf 'target=%s\n' "$target"
+    printf 'node_id=%s\n' "$node_id"
+    printf 'role=%s\n' "$role"
+    printf 'collected_at_utc=%s\n' "$(date -u +%FT%TZ)"
+    printf '%s\n' "$snapshot"
+  }
+}
+
+live_lab_collect_runtime_validation_snapshot() {
+  local target="$1"
+  local node_id="$2"
+  local role="$3"
+  local body snapshot
+  local expected_next_hop=""
+  if [[ "$role" == "client" ]]; then
+    expected_next_hop="direct:rustynet0"
+  fi
+  body="$(printf '%s\n%s\n' \
+    "$(live_lab_status_snapshot_body)" \
+    "$(live_lab_route_policy_snapshot_body "1.1.1.1" "$expected_next_hop")" \
     "$(live_lab_secret_hygiene_snapshot_body)")"
   snapshot="$(live_lab_capture_root "$target" "$body")" || return 1
   {

@@ -9,11 +9,240 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::unistd::Uid;
 use serde_json::Value;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
+const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
+const UTM_FILE_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug, Clone)]
+struct UtmTransport {
+    utm_name: String,
+    user: String,
+    home: String,
+}
+
+fn target_home(target: &str) -> String {
+    match LiveLabContext::target_user(target) {
+        "root" => "/root".to_string(),
+        user => format!("/home/{user}"),
+    }
+}
+
+fn env_var_nonempty(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
+    for (target_key, utm_key) in [
+        ("EXIT_TARGET", "EXIT_UTM_NAME"),
+        ("CLIENT_TARGET", "CLIENT_UTM_NAME"),
+        ("ENTRY_TARGET", "ENTRY_UTM_NAME"),
+        ("AUX_TARGET", "AUX_UTM_NAME"),
+        ("EXTRA_TARGET", "EXTRA_UTM_NAME"),
+        ("FIFTH_CLIENT_TARGET", "FIFTH_CLIENT_UTM_NAME"),
+    ] {
+        let Some(mapped_target) = env_var_nonempty(target_key) else {
+            continue;
+        };
+        if mapped_target != target {
+            continue;
+        }
+        let Some(utm_name) = env_var_nonempty(utm_key) else {
+            continue;
+        };
+        return Some(UtmTransport {
+            utm_name,
+            user: LiveLabContext::target_user(target).to_string(),
+            home: target_home(target),
+        });
+    }
+    None
+}
+
+fn utmctl_path() -> PathBuf {
+    env::var_os("LIVE_LAB_UTMCTL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Applications/UTM.app/Contents/MacOS/utmctl"))
+}
+
+fn run_status_with_timeout(command: &mut Command, timeout: Duration) -> Result<ExitStatus, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("spawn failed: {err}"))?;
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("wait failed: {err}"))?
+        {
+            return Ok(status);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {} seconds", timeout.as_secs()));
+        }
+        sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MILLIS));
+    }
+}
+
+fn run_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("spawn failed: {err}"))?;
+    let started_at = Instant::now();
+    loop {
+        if let Some(_status) = child
+            .try_wait()
+            .map_err(|err| format!("wait failed: {err}"))?
+        {
+            return child
+                .wait_with_output()
+                .map_err(|err| format!("wait_with_output failed: {err}"));
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {} seconds", timeout.as_secs()));
+        }
+        sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MILLIS));
+    }
+}
+
+fn utm_guest_shell_command(transport: &UtmTransport, command: &str) -> String {
+    let quoted_command = shell_single_quote(command);
+    if transport.user == "root" {
+        format!("exec /bin/bash -lc {quoted_command}")
+    } else {
+        let quoted_user = shell_single_quote(&transport.user);
+        let quoted_home = shell_single_quote(&transport.home);
+        format!(
+            "exec runuser -u {quoted_user} -- env HOME={quoted_home} USER={quoted_user} LOGNAME={quoted_user} PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -lc {quoted_command}"
+        )
+    }
+}
+
+fn utm_exec_status(transport: &UtmTransport, command: &str) -> Result<ExitStatus, String> {
+    let utmctl = utmctl_path();
+    if !utmctl.is_file() {
+        return Err(format!(
+            "missing executable UTM control tool: {}",
+            utmctl.display()
+        ));
+    }
+    let mut utm = Command::new(&utmctl);
+    utm.args([
+        "exec",
+        transport.utm_name.as_str(),
+        "--cmd",
+        "/bin/bash",
+        "-lc",
+    ]);
+    utm.arg(utm_guest_shell_command(transport, command));
+    run_status_with_timeout(&mut utm, Duration::from_secs(UTM_EXEC_TIMEOUT_SECS)).map_err(|err| {
+        format!(
+            "failed to run utm exec against {}: {err}",
+            transport.utm_name
+        )
+    })
+}
+
+fn utm_exec_output(transport: &UtmTransport, command: &str) -> Result<Output, String> {
+    let utmctl = utmctl_path();
+    if !utmctl.is_file() {
+        return Err(format!(
+            "missing executable UTM control tool: {}",
+            utmctl.display()
+        ));
+    }
+    let mut utm = Command::new(&utmctl);
+    utm.args([
+        "exec",
+        transport.utm_name.as_str(),
+        "--cmd",
+        "/bin/bash",
+        "-lc",
+    ]);
+    utm.arg(utm_guest_shell_command(transport, command));
+    run_output_with_timeout(&mut utm, Duration::from_secs(UTM_EXEC_TIMEOUT_SECS)).map_err(|err| {
+        format!(
+            "failed to run utm exec against {}: {err}",
+            transport.utm_name
+        )
+    })
+}
+
+fn utm_exec_root_status(transport: &UtmTransport, command: &str) -> Result<ExitStatus, String> {
+    let root_transport = UtmTransport {
+        utm_name: transport.utm_name.clone(),
+        user: "root".to_string(),
+        home: "/root".to_string(),
+    };
+    utm_exec_status(&root_transport, command)
+}
+
+fn utm_file_push(transport: &UtmTransport, src: &Path, dst: &str) -> Result<(), String> {
+    let utmctl = utmctl_path();
+    if !utmctl.is_file() {
+        return Err(format!(
+            "missing executable UTM control tool: {}",
+            utmctl.display()
+        ));
+    }
+    let stdin = fs::File::open(src)
+        .map_err(|err| format!("failed to open {} for UTM push: {err}", src.display()))?;
+    let mut utm = Command::new(&utmctl);
+    utm.args(["file", "push", transport.utm_name.as_str(), dst]);
+    utm.stdin(Stdio::from(stdin));
+    let status = run_status_with_timeout(&mut utm, Duration::from_secs(UTM_FILE_TIMEOUT_SECS))
+        .map_err(|err| {
+            format!(
+                "failed to push {} to {}:{}: {err}",
+                src.display(),
+                transport.utm_name,
+                dst
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "push {} to {}:{} failed with status {}",
+            src.display(),
+            transport.utm_name,
+            dst,
+            status_code(status)
+        ));
+    }
+    if transport.user != "root" {
+        let chown_cmd = format!(
+            "chown {}:{} {}",
+            shell_single_quote(&transport.user),
+            shell_single_quote(&transport.user),
+            shell_single_quote(dst)
+        );
+        let status = utm_exec_root_status(transport, &chown_cmd)?;
+        if !status.success() {
+            return Err(format!(
+                "UTM chown failed for {}:{} with status {}",
+                transport.utm_name,
+                dst,
+                status_code(status)
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub fn repo_root() -> Result<PathBuf, String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -287,6 +516,9 @@ impl LiveLabContext {
     }
 
     pub fn resolved_target_address(target: &str) -> Result<String, String> {
+        if utm_transport_for_target(target).is_some() {
+            return Ok(Self::target_address(target).to_string());
+        }
         let resolved = Command::new("ssh")
             .args(["-G", target])
             .stdin(Stdio::null())
@@ -316,6 +548,9 @@ impl LiveLabContext {
     }
 
     fn require_pinned_host_entry(&self, target: &str) -> Result<(), String> {
+        if utm_transport_for_target(target).is_some() {
+            return Ok(());
+        }
         let resolved = Command::new("ssh")
             .args(["-G", target])
             .stdin(Stdio::null())
@@ -393,6 +628,17 @@ impl LiveLabContext {
     }
 
     fn run_ssh(&self, target: &str, args: &[&str], allow_failure: bool) -> Result<Output, String> {
+        if let Some(transport) = utm_transport_for_target(target) {
+            let remote_command = render_remote_argv(args)?;
+            let output = utm_exec_output(&transport, remote_command.as_str())?;
+            if !allow_failure && !output.status.success() {
+                return Err(format!(
+                    "remote command failed on {target}: {}",
+                    render_failure_output(&output)
+                ));
+            }
+            return Ok(output);
+        }
         self.require_pinned_host_entry(target)?;
         let remote_command = render_remote_argv(args)?;
         let mut command = self.ssh_command(target);
@@ -439,6 +685,9 @@ impl LiveLabContext {
     }
 
     pub fn scp_to(&self, src: &Path, target: &str, dst: &str) -> Result<(), String> {
+        if let Some(transport) = utm_transport_for_target(target) {
+            return utm_file_push(&transport, src, dst);
+        }
         self.require_pinned_host_entry(target)?;
         let status = Command::new("scp")
             .arg("-q")
@@ -691,8 +940,9 @@ fn create_unique_work_dir(prefix: &str) -> Result<PathBuf, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("system clock before epoch: {err}"))?
         .as_nanos();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     for salt in 0u32..1000 {
-        let candidate = base.join(format!("{prefix}.{pid}.{timestamp}.{salt}"));
+        let candidate = base.join(format!("{prefix}.{pid}.{timestamp}.{counter}.{salt}"));
         match fs::create_dir(&candidate) {
             Ok(()) => {
                 fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
@@ -880,6 +1130,16 @@ pub fn run_remote_shell(
     target: &str,
     shell_command: &str,
 ) -> Result<Output, String> {
+    if let Some(transport) = utm_transport_for_target(target) {
+        let output = utm_exec_output(&transport, shell_command)?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        return Err(format!(
+            "remote shell command failed on {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     let mut command = ctx.ssh_command(target);
     command
         .args(["sh", "-lc"])

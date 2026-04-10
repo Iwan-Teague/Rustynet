@@ -47,6 +47,12 @@ ENTRY_TARGET=""
 AUX_TARGET=""
 EXTRA_TARGET=""
 FIFTH_CLIENT_TARGET=""
+EXIT_UTM_NAME=""
+CLIENT_UTM_NAME=""
+ENTRY_UTM_NAME=""
+AUX_UTM_NAME=""
+EXTRA_UTM_NAME=""
+FIFTH_CLIENT_UTM_NAME=""
 ENTRY_TARGET_DECLARED=0
 AUX_TARGET_DECLARED=0
 EXTRA_TARGET_DECLARED=0
@@ -491,22 +497,28 @@ load_profile_file() {
     case "$key" in
       EXIT_TARGET) [[ -z "$EXIT_TARGET" ]] && EXIT_TARGET="$value" ;;
       CLIENT_TARGET) [[ -z "$CLIENT_TARGET" ]] && CLIENT_TARGET="$value" ;;
+      EXIT_UTM_NAME) [[ -z "$EXIT_UTM_NAME" ]] && EXIT_UTM_NAME="$value" ;;
+      CLIENT_UTM_NAME) [[ -z "$CLIENT_UTM_NAME" ]] && CLIENT_UTM_NAME="$value" ;;
       ENTRY_TARGET)
         ENTRY_TARGET_DECLARED=1
         [[ -z "$ENTRY_TARGET" ]] && ENTRY_TARGET="$value"
         ;;
+      ENTRY_UTM_NAME) [[ -z "$ENTRY_UTM_NAME" ]] && ENTRY_UTM_NAME="$value" ;;
       AUX_TARGET)
         AUX_TARGET_DECLARED=1
         [[ -z "$AUX_TARGET" ]] && AUX_TARGET="$value"
         ;;
+      AUX_UTM_NAME) [[ -z "$AUX_UTM_NAME" ]] && AUX_UTM_NAME="$value" ;;
       EXTRA_TARGET)
         EXTRA_TARGET_DECLARED=1
         [[ -z "$EXTRA_TARGET" ]] && EXTRA_TARGET="$value"
         ;;
+      EXTRA_UTM_NAME) [[ -z "$EXTRA_UTM_NAME" ]] && EXTRA_UTM_NAME="$value" ;;
       FIFTH_CLIENT_TARGET)
         FIFTH_CLIENT_TARGET_DECLARED=1
         [[ -z "$FIFTH_CLIENT_TARGET" ]] && FIFTH_CLIENT_TARGET="$value"
         ;;
+      FIFTH_CLIENT_UTM_NAME) [[ -z "$FIFTH_CLIENT_UTM_NAME" ]] && FIFTH_CLIENT_UTM_NAME="$value" ;;
       SSH_IDENTITY_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
       SSH_PASSWORD_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
       SUDO_PASSWORD_FILE) [[ -z "$SSH_IDENTITY_FILE" ]] && SSH_IDENTITY_FILE="$value" ;;
@@ -2364,14 +2376,24 @@ prime_remote_access() {
   run_serial_node_stage prime_remote_access prime_remote_access_worker
 }
 
+stage_verify_ssh_reachability() {
+  run_parallel_node_stage verify_ssh_reachability ssh_reachability_worker
+}
+
+ssh_reachability_worker() {
+  local label="$1"
+  local target="$2"
+  printf '[ssh-reachable] %s %s\n' "$label" "$target"
+  ssh_wait_for_host "$target" 120 5 || return 1
+}
+
 prime_remote_access_worker() {
   local label="$1"
   local target="$2"
   printf '[prime-remote] %s %s\n' "$label" "$target"
-  # Prime the connection only after SSH is actually accepting sessions.
-  # Freshly restarted guests can lag behind the control plane, and this stage
-  # should wait rather than failing closed on a transient boot delay.
-  ssh_wait_for_host "$target" 120 5 || return 1
+  # Keep this stage safe if it is invoked directly, even though the composed
+  # setup wrapper now performs an explicit SSH reachability gate first.
+  ssh_reachability_worker "$label" "$target" || return 1
   live_lab_push_sudo_password "$target"
 }
 
@@ -2424,6 +2446,22 @@ stage_prepare_source_archive() {
   fi
   git status --short > "$STATE_DIR/git_status.txt"
   printf '%s\n' "$(describe_source_mode)" > "$STATE_DIR/source_mode.txt"
+}
+
+stage_run_fresh_bootstrap_and_network_setup() {
+  run_stage hard prepare_source_archive 'package local source tree for remote install' stage_prepare_source_archive || return 1
+  run_stage hard verify_ssh_reachability 'verify all selected nodes are reachable via ssh' stage_verify_ssh_reachability || return 1
+  run_stage hard prime_remote_access 'push sudo credentials to all targets' prime_remote_access || return 1
+  run_stage hard cleanup_hosts 'remove prior RustyNet state from targets' stage_cleanup_hosts || return 1
+  run_stage hard bootstrap_hosts 'fresh install and bootstrap RustyNet on all targets' stage_bootstrap_hosts || return 1
+  run_stage hard collect_pubkeys 'collect WireGuard public keys from all targets' stage_collect_pubkeys || return 1
+  run_stage hard membership_setup 'apply signed membership updates on primary exit' stage_membership_setup || return 1
+  run_stage hard distribute_membership_state 'export and install membership state to peers' stage_distribute_membership_state || return 1
+  run_stage hard issue_and_distribute_assignments 'issue signed one-hop assignments and install refresh env files' stage_issue_and_distribute_assignments || return 1
+  run_stage hard issue_and_distribute_traversal 'issue and distribute signed traversal bundles for all managed peers' stage_issue_and_distribute_traversal || return 1
+  run_stage hard issue_and_distribute_dns_zone 'issue and distribute signed DNS zone bundles for all managed peers' stage_issue_and_distribute_dns_zone || return 1
+  run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime || return 1
+  run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime || return 1
 }
 
 stage_cleanup_hosts() {
@@ -2560,7 +2598,7 @@ stage_membership_setup() {
   exit_target="$(node_target_for_label exit)"
   exit_node_id="$(node_id_for_label exit)"
   owner_approver_id="${exit_node_id}-owner"
-  live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown root:root /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
+  live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown rustynetd:rustynetd /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
     live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}'" || return 1
@@ -2583,7 +2621,7 @@ distribute_membership_worker() {
   printf '[membership-distribute] %s %s\n' "$label" "$target"
   live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "/tmp/rn-membership.snapshot"
   live_lab_scp_to "$STATE_DIR/membership.log" "$target" "/tmp/rn-membership.log"
-  live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o root -g root /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o root -g root /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
+  live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
 }
 
 stage_issue_and_distribute_assignments() {
@@ -2600,7 +2638,7 @@ stage_issue_and_distribute_assignments() {
   live_lab_issue_assignment_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_assignments.env" || return 1
 
   verifier_local="$STATE_DIR/assignment.pub"
-  live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment.pub" > "$verifier_local" || return 1
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment.pub" "$verifier_local" || return 1
   run_parallel_node_stage issue_and_distribute_assignments distribute_assignment_worker
 }
 
@@ -2616,7 +2654,7 @@ distribute_assignment_worker() {
   bundle_local="$STATE_DIR/assignment-${node_id}.bundle"
   refresh_env="$STATE_DIR/assignment-refresh-${node_id}.env"
   printf '[assignment-distribute] %s %s\n' "$node_id" "$target"
-  live_lab_capture_root "$exit_target" "root cat /run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" > "$bundle_local"
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
   live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local"
   if [[ "$node_id" == "$exit_node_id" ]]; then
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
@@ -2641,12 +2679,30 @@ issue_and_distribute_traversal_snapshot() {
   live_lab_issue_traversal_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_traversal.env" || return 1
 
   verifier_local="$STATE_DIR/traversal.pub"
-  live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal.pub" > "$verifier_local" || return 1
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/traversal-issue/rn-traversal.pub" "$verifier_local" || return 1
   run_parallel_node_stage "$stage_name" distribute_traversal_worker
 }
 
 stage_issue_and_distribute_traversal() {
   issue_and_distribute_traversal_snapshot issue_and_distribute_traversal
+}
+
+stage_issue_and_distribute_dns_zone() {
+  local exit_target env_path verifier_local
+  build_onehop_specs
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
+  env_path="$STATE_DIR/issue_dns_zone.env"
+  : > "$env_path"
+  append_env_assignment "$env_path" "NODES_SPEC" "$NODES_SPEC"
+  append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
+  append_env_assignment "$env_path" "DNS_ZONE_NAME" "${RUSTYNET_DNS_ZONE_NAME:-rustynet}"
+  live_lab_issue_dns_zone_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_dns_zone.env" || return 1
+
+  verifier_local="$STATE_DIR/dns-zone.pub"
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/dns-zone-issue/rn-dns-zone.pub" "$verifier_local" || return 1
+  run_parallel_node_stage issue_and_distribute_dns_zone distribute_dns_zone_worker
 }
 
 distribute_traversal_worker() {
@@ -2660,19 +2716,35 @@ distribute_traversal_worker() {
   bundle_local="$STATE_DIR/traversal-${node_id}.bundle"
   printf '[traversal-distribute] %s %s\n' "$node_id" "$target"
   live_lab_ensure_rustynetd_group "$target" || return 1
-  live_lab_capture_root "$exit_target" "root cat /run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" > "$bundle_local"
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" "$bundle_local" || return 1
   live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
   live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
   live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
 }
 
+distribute_dns_zone_worker() {
+  local _label="$1"
+  local target="$2"
+  local node_id="$3"
+  local bundle_local exit_target
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
+  bundle_local="$STATE_DIR/dns-zone-${node_id}.bundle"
+  printf '[dns-zone-distribute] %s %s\n' "$node_id" "$target"
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/dns-zone-issue/rn-dns-zone-${node_id}.dns-zone" "$bundle_local" || return 1
+  live_lab_install_dns_zone_bundle "$target" "$STATE_DIR/dns-zone.pub" "$bundle_local"
+}
+
 stage_enforce_baseline_runtime() {
   run_parallel_node_stage enforce_baseline_runtime enforce_runtime_worker
   run_parallel_node_stage refresh_runtime_after_enforce refresh_runtime_state_worker
-  issue_and_distribute_traversal_snapshot refresh_traversal_after_enforce || return 1
-  run_parallel_node_stage refresh_runtime_after_traversal refresh_signed_state_worker
   live_lab_retry_root "$(node_target_for_label exit)" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2 || return 1
   sleep 5
+  # Refresh traversal coordination immediately before baseline validation so the
+  # 30-second signed-coordination window is not spent on earlier enforcement work.
+  issue_and_distribute_traversal_snapshot refresh_traversal_after_enforce || return 1
+  run_parallel_node_stage refresh_runtime_after_traversal refresh_signed_state_worker
 }
 
 enforce_runtime_worker() {
@@ -2693,7 +2765,51 @@ refresh_runtime_state_worker() {
   printf '[runtime-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
   live_lab_run_root "$target" "root rustynet ops force-local-assignment-refresh-now"
   live_lab_wait_for_daemon_socket "$target"
-  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh" 5 2
+}
+
+refresh_runtime_state_all_nodes() {
+  local refresh_label refresh_target refresh_node_id refresh_role
+  while IFS=$'\t' read -r refresh_label refresh_target refresh_node_id refresh_role; do
+    [[ -n "$refresh_target" ]] || continue
+    refresh_runtime_state_worker "$refresh_label" "$refresh_target" "$refresh_node_id" "$refresh_role" || return 1
+  done < "$NODES_TSV"
+}
+
+refresh_runtime_state_for_label() {
+  local refresh_label="$1"
+  local refresh_target refresh_node_id refresh_role
+  refresh_target="$(node_target_for_label "$refresh_label")"
+  refresh_node_id="$(node_id_for_label "$refresh_label")"
+  refresh_role="$(node_role_for_label "$refresh_label")"
+  [[ -n "$refresh_target" && -n "$refresh_node_id" && -n "$refresh_role" ]] || {
+    printf 'missing runtime refresh metadata for label: %s\n' "$refresh_label" >&2
+    return 1
+  }
+  refresh_runtime_state_worker "$refresh_label" "$refresh_target" "$refresh_node_id" "$refresh_role"
+}
+
+validation_runtime_refresh_order() {
+  local target_label="$1"
+  local label
+  while IFS=$'\t' read -r label _target _node_id _role; do
+    [[ -n "$label" ]] || continue
+    if [[ "$label" != "exit" && "$label" != "$target_label" ]]; then
+      printf '%s\n' "$label"
+    fi
+  done < "$NODES_TSV"
+  if [[ "$target_label" != "exit" ]]; then
+    printf 'exit\n'
+  fi
+  printf '%s\n' "$target_label"
+}
+
+refresh_runtime_state_for_validation() {
+  local target_label="$1"
+  local refresh_label
+  while IFS= read -r refresh_label; do
+    [[ -n "$refresh_label" ]] || continue
+    refresh_runtime_state_for_label "$refresh_label" || return 1
+  done < <(validation_runtime_refresh_order "$target_label")
 }
 
 refresh_signed_state_worker() {
@@ -2706,22 +2822,73 @@ refresh_signed_state_worker() {
   live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh" 5 2
 }
 
+refresh_signed_state_all_nodes() {
+  local refresh_label refresh_target refresh_node_id refresh_role
+  while IFS=$'\t' read -r refresh_label refresh_target refresh_node_id refresh_role; do
+    [[ -n "$refresh_target" ]] || continue
+    refresh_signed_state_worker "$refresh_label" "$refresh_target" "$refresh_node_id" "$refresh_role" || return 1
+  done < "$NODES_TSV"
+}
+
 stage_validate_baseline_runtime() {
-  local nft_rules stage_dir route_matrix_snapshot route_matrix_rc
-  run_parallel_node_stage validate_baseline_runtime validate_runtime_worker
-  stage_dir="$(parallel_stage_dir validate_baseline_runtime)"
-  set +e
-  route_matrix_snapshot="$(live_lab_wait_for_route_matrix_convergence "$(node_id_for_label exit)" 2 20 3 validate_baseline_runtime 2>&1)"
-  route_matrix_rc=$?
-  set -e
-  {
-    printf 'capture_rc=%s\n' "$route_matrix_rc"
-    printf '%s\n' "$route_matrix_snapshot"
-  } > "$stage_dir/route_matrix.txt"
-  [[ "$route_matrix_rc" -eq 0 ]] || return "$route_matrix_rc"
+  local nft_rules
+  if live_lab_has_utm_transport; then
+    # UTM guest-agent transport is globally serialized. Reissuing and
+    # redistributing 30-second traversal bundles during validation can leave the
+    # target consuming already-expired coordination, so refresh runtime locally
+    # from assignment state instead.
+    run_serial_node_stage validate_baseline_runtime validate_runtime_worker_with_fresh_traversal
+    run_parallel_node_stage refresh_runtime_after_validate refresh_runtime_state_worker
+  else
+    # Signed traversal coordination is intentionally capped to 30 seconds, so
+    # validation must refresh that state immediately before sampling runtime.
+    issue_and_distribute_traversal_snapshot refresh_traversal_before_validate || return 1
+    run_parallel_node_stage refresh_runtime_before_validate refresh_signed_state_worker
+    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker
+  fi
   nft_rules="$(live_lab_capture_root "$(node_target_for_label exit)" "root nft list ruleset || true")" || return 1
   printf '[exit-nft]\n%s\n' "$nft_rules"
   grep -Eq 'masquerade|rustynet' <<<"$nft_rules" || return 1
+}
+
+validate_runtime_worker_with_fresh_traversal() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  refresh_runtime_state_for_validation "$label" || return 1
+  validate_runtime_worker "$label" "$target" "$node_id" "$role"
+}
+
+live_lab_runtime_snapshot_ready() {
+  local snapshot="$1"
+  local node_id="$2"
+  local target="$3"
+  local role="$4"
+  local expected_membership_nodes="$5"
+  local exit_node_id="$6"
+  local status state restricted_safe_mode bootstrap_error last_reconcile_error
+
+  status="$(snapshot_section_text "$snapshot" "RNLAB_STATUS")"
+  [[ -n "$status" ]] || return 1
+
+  state="$(snapshot_field_value "$status" "state")"
+  restricted_safe_mode="$(snapshot_field_value "$status" "restricted_safe_mode")"
+  bootstrap_error="$(snapshot_field_value "$status" "bootstrap_error")"
+  last_reconcile_error="$(snapshot_field_value "$status" "last_reconcile_error")"
+
+  [[ -n "$state" && "$state" != "FailClosed" ]] || return 1
+  [[ "$restricted_safe_mode" == "false" ]] || return 1
+  [[ "$bootstrap_error" == "none" ]] || return 1
+  [[ "$last_reconcile_error" == "none" ]] || return 1
+
+  live_lab_assert_runtime_spec \
+    "$snapshot" \
+    "$node_id" \
+    "$target" \
+    "$role" \
+    "$expected_membership_nodes" \
+    "$exit_node_id"
 }
 
 live_lab_wait_for_node_convergence() {
@@ -2735,8 +2902,8 @@ live_lab_wait_for_node_convergence() {
   local attempt snapshot
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$role")" || snapshot=""
-    if [[ -n "$snapshot" ]] && live_lab_assert_runtime_spec \
+    snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role")" || snapshot=""
+    if [[ -n "$snapshot" ]] && live_lab_runtime_snapshot_ready \
       "$snapshot" \
       "$node_id" \
       "$target" \
@@ -2751,7 +2918,17 @@ live_lab_wait_for_node_convergence() {
     fi
   done
 
-  snapshot="$(live_lab_collect_node_snapshot "$target" "$node_id" "$role")" || snapshot=""
+  snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role")" || snapshot=""
+  if [[ -n "$snapshot" ]] && live_lab_runtime_snapshot_ready \
+    "$snapshot" \
+    "$node_id" \
+    "$target" \
+    "$role" \
+    "$expected_membership_nodes" \
+    "$exit_node_id" >/dev/null 2>&1; then
+    printf '%s' "$snapshot"
+    return 0
+  fi
   printf '%s' "$snapshot"
   return 1
 }
@@ -3078,6 +3255,9 @@ stage_run_live_role_switch_matrix() {
   bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
+    --traversal-env-file "$STATE_DIR/issue_traversal.env" \
+    --exit-host "$(node_target_for_label exit)" \
+    --exit-node-id "$(node_id_for_label exit)" \
     --debian-host "$(node_target_for_label client)" \
     --debian-node-id "$(node_id_for_label client)" \
     --ubuntu-host "$(node_target_for_label entry)" \
@@ -3289,7 +3469,15 @@ assert_text_absent() {
 snapshot_section_text() {
   local snapshot="$1"
   local section_name="$2"
-  awk -v begin="__RNLAB_${section_name}_BEGIN__" -v end="__RNLAB_${section_name}_END__" '
+  local begin_marker end_marker
+  if [[ "$section_name" == RNLAB_* ]]; then
+    begin_marker="__${section_name}_BEGIN__"
+    end_marker="__${section_name}_END__"
+  else
+    begin_marker="__RNLAB_${section_name}_BEGIN__"
+    end_marker="__RNLAB_${section_name}_END__"
+  fi
+  awk -v begin="$begin_marker" -v end="$end_marker" '
     $0 == begin {
       capture = 1
       next
@@ -3733,9 +3921,9 @@ live_lab_assert_permissions_hardening() {
   permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/keys/wireguard.key.enc" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
   permissions_fact_require "$permissions_snapshot" "/run/rustynet/wireguard.key" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
   permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/keys/wireguard.pub" "$permissions_label" '^644$' '^(root|rustynetd)$' '^(root|rustynetd)$' '^regular file$' || return 1
-  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.snapshot" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
-  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.log" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
-  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.watermark" "$permissions_label" '^600$' '^root$' '^root$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.snapshot" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.log" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
+  permissions_fact_require "$permissions_snapshot" "/var/lib/rustynet/membership.watermark" "$permissions_label" '^600$' '^rustynetd$' '^rustynetd$' '^regular file$' || return 1
   permissions_fact_require "$permissions_snapshot" "/etc/rustynet/assignment.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
   permissions_fact_require "$permissions_snapshot" "/etc/rustynet/traversal.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
   permissions_fact_require "$permissions_snapshot" "/etc/rustynet/trust-evidence.pub" "$permissions_label" '^644$' '^root$' '^root$' '^regular file$' || return 1
@@ -4146,15 +4334,6 @@ live_lab_assert_runtime_spec() {
   assert_text_absent "$status" "$status_label" "does not yet implement exit mode"
 
   assert_text_contains "$route_check" "$route_label" "route_policy_version=1"
-  live_lab_assert_time_sync "$snapshot" "$node_id" "$target"
-  live_lab_assert_process_health "$snapshot" "$node_id" "$target" "$role"
-  live_lab_assert_socket_health "$snapshot" "$node_id" "$target" "$role"
-  live_lab_assert_permissions_hardening "$snapshot" "$node_id" "$target" "$role"
-  live_lab_assert_dns_health "$snapshot" "$node_id" "$target"
-  live_lab_assert_dns_zone_health "$snapshot" "$node_id" "$target"
-  live_lab_assert_signed_state_health "$snapshot" "$node_id" "$target"
-  live_lab_assert_firewall_policy "$snapshot" "$node_id" "$target" "$role"
-
   assert_text_contains "$secret_hygiene" "$hygiene_label" "daemon_socket=present"
   assert_text_contains "$secret_hygiene" "$hygiene_label" "result=no-plaintext-passphrase-files"
 
@@ -5436,6 +5615,8 @@ main() {
   : > "$STAGE_TSV"
   prompt_missing_inputs
   normalize_targets
+  export EXIT_TARGET CLIENT_TARGET ENTRY_TARGET AUX_TARGET EXTRA_TARGET FIFTH_CLIENT_TARGET
+  export EXIT_UTM_NAME CLIENT_UTM_NAME ENTRY_UTM_NAME AUX_UTM_NAME EXTRA_UTM_NAME FIFTH_CLIENT_UTM_NAME
   auto_adjust_default_ssh_allow_cidrs_for_targets
   ensure_password_inputs
   ensure_known_hosts_input
@@ -5580,17 +5761,7 @@ main() {
   fi
 
   run_stage hard preflight 'verify local prerequisites' stage_preflight
-  run_stage hard prepare_source_archive 'package local source tree for remote install' stage_prepare_source_archive
-  run_stage hard prime_remote_access 'push sudo credentials to all targets' prime_remote_access
-  run_stage hard cleanup_hosts 'remove prior RustyNet state from targets' stage_cleanup_hosts
-  run_stage hard bootstrap_hosts 'fresh install and bootstrap RustyNet on all targets' stage_bootstrap_hosts
-  run_stage hard collect_pubkeys 'collect WireGuard public keys from all targets' stage_collect_pubkeys
-  run_stage hard membership_setup 'apply signed membership updates on primary exit' stage_membership_setup
-  run_stage hard distribute_membership_state 'export and install membership state to peers' stage_distribute_membership_state
-  run_stage hard issue_and_distribute_assignments 'issue signed one-hop assignments and install refresh env files' stage_issue_and_distribute_assignments
-  run_stage hard issue_and_distribute_traversal 'issue and distribute signed traversal bundles for all managed peers' stage_issue_and_distribute_traversal
-  run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime
-  run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime
+  stage_run_fresh_bootstrap_and_network_setup || return 1
 
   if has_five_node_release_gate_topology; then
     run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix

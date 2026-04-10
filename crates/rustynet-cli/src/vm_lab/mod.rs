@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::env_file::{format_env_assignment, parse_env_value};
+use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use base64::prelude::*;
 use serde_json::{Value, json};
 use tar::Builder;
@@ -30,6 +32,8 @@ const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_LIVE_LAB_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
@@ -39,6 +43,15 @@ const POLL_INTERVAL_MILLIS: u64 = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabListConfig {
     pub inventory_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDiscoverLocalUtmConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub utm_documents_root: Option<PathBuf>,
+    pub utmctl_path: Option<PathBuf>,
+    pub ssh_port: u16,
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +75,8 @@ pub struct VmLabSyncRepoConfig {
     pub branch: String,
     pub remote: String,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -75,6 +90,8 @@ pub struct VmLabExecConfig {
     pub program: String,
     pub argv: Vec<String>,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub sudo: bool,
     pub timeout_secs: u64,
 }
@@ -95,6 +112,8 @@ pub struct VmLabSyncBootstrapConfig {
     pub program: String,
     pub argv: Vec<String>,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub sudo: bool,
     pub timeout_secs: u64,
 }
@@ -243,6 +262,8 @@ pub struct VmLabBootstrapPhaseConfig {
     pub branch: String,
     pub remote: String,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -252,6 +273,7 @@ pub struct VmLabPreflightConfig {
     pub vm_aliases: Vec<String>,
     pub raw_targets: Vec<String>,
     pub select_all: bool,
+    pub ssh_identity_file: Option<PathBuf>,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
     pub require_commands: Vec<String>,
@@ -276,6 +298,8 @@ pub struct VmLabStatusConfig {
     pub raw_targets: Vec<String>,
     pub select_all: bool,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -296,7 +320,12 @@ pub struct VmLabRestartConfig {
     pub select_all: bool,
     pub utmctl_path: PathBuf,
     pub service: Option<String>,
+    pub wait_ready: bool,
+    pub ssh_port: u16,
+    pub ready_timeout_secs: u64,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -307,6 +336,8 @@ pub struct VmLabCollectArtifactsConfig {
     pub raw_targets: Vec<String>,
     pub select_all: bool,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub output_dir: PathBuf,
     pub timeout_secs: u64,
 }
@@ -327,6 +358,8 @@ pub struct VmLabIssueDistributeStateConfig {
     pub topology_path: PathBuf,
     pub authority_vm: String,
     pub ssh_user: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
     pub timeout_secs: u64,
 }
 
@@ -380,6 +413,7 @@ struct RemoteTarget {
     label: String,
     ssh_target: String,
     ssh_user: Option<String>,
+    controller: Option<VmController>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +421,19 @@ struct StartTarget {
     alias: String,
     utm_name: String,
     bundle_path: PathBuf,
+    ssh_user: Option<String>,
+    last_known_ip: Option<String>,
+    mesh_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalUtmReadyState {
+    alias: String,
+    utm_name: String,
+    process_present: bool,
+    live_ip: Option<String>,
+    ssh_port_status: String,
+    ssh_auth_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +441,7 @@ struct RoleTarget {
     label: String,
     normalized_target: String,
     network_group: Option<String>,
+    utm_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +562,13 @@ pub fn default_known_hosts_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
         .join(".ssh/known_hosts")
+}
+
+fn default_utm_documents_root() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required to discover local UTM documents".to_string())?;
+    Ok(home.join("Library/Containers/com.utmapp.UTM/Data/Documents"))
 }
 
 impl VmLabIterationValidationStep {
@@ -657,6 +712,378 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
     Ok(lines.join("\n"))
 }
 
+pub fn execute_ops_vm_lab_discover_local_utm(
+    config: VmLabDiscoverLocalUtmConfig,
+) -> Result<String, String> {
+    let documents_root = match config.utm_documents_root.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_utm_documents_root()?,
+    };
+    if !documents_root.is_dir() {
+        return Err(format!(
+            "UTM documents root must be an existing directory: {}",
+            documents_root.display()
+        ));
+    }
+
+    let discovered_bundle_paths = discover_local_utm_bundle_paths(documents_root.as_path())?;
+    if discovered_bundle_paths.is_empty() {
+        return Err(format!(
+            "no UTM bundle directories found under {}",
+            documents_root.display()
+        ));
+    }
+
+    let utmctl_path = config
+        .utmctl_path
+        .as_deref()
+        .map(resolve_path)
+        .transpose()?
+        .unwrap_or_else(default_utmctl_path);
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS);
+    let ssh_port = if config.ssh_port == 0 {
+        22
+    } else {
+        config.ssh_port
+    };
+
+    let (inventory, inventory_error) = match config.inventory_path.as_deref() {
+        Some(path) if path.exists() => match load_inventory(path) {
+            Ok(entries) => (entries, None),
+            Err(err) => (Vec::new(), Some(err)),
+        },
+        Some(path) => (
+            Vec::new(),
+            Some(format!("inventory path does not exist: {}", path.display())),
+        ),
+        None => (Vec::new(), None),
+    };
+
+    let mut entries = Vec::new();
+    let mut matched_inventory_count = 0usize;
+    let mut process_present_count = 0usize;
+    let mut live_ip_count = 0usize;
+    let mut ssh_port_open_count = 0usize;
+    let mut ready_count = 0usize;
+
+    for bundle_path in discovered_bundle_paths {
+        let utm_name = bundle_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "discovered UTM bundle has no valid UTF-8 bundle name: {}",
+                    bundle_path.display()
+                )
+            })?
+            .to_string();
+        let inventory_match = inventory.iter().find(|entry| {
+            matches_local_utm_inventory_entry(entry, bundle_path.as_path(), utm_name.as_str())
+        });
+        let process_present =
+            local_utm_process_present(bundle_path.as_path(), timeout).unwrap_or(false);
+        if process_present {
+            process_present_count += 1;
+        }
+
+        let mut discovery_notes = Vec::new();
+        let mut live_ip_source = "unavailable".to_string();
+        let mut live_ip = None;
+        let mut ssh_target_source = "unavailable".to_string();
+        let mut ssh_target = None;
+        let mut ssh_user = None;
+        let mut inventory_alias = None;
+        let mut inventory_node_id = None;
+        let mut inventory_lab_role = None;
+        let mut inventory_ssh_target = None;
+        let mut inventory_ssh_user = None;
+        let mut inventory_last_known_ip = None;
+        let mut inventory_mesh_ip = None;
+        let mut inventory_controller_bundle_path = None;
+        let mut inventory_controller_utm_name = None;
+
+        if let Some(entry) = inventory_match {
+            matched_inventory_count += 1;
+            inventory_alias = Some(entry.alias.clone());
+            inventory_node_id = entry.node_id.clone();
+            inventory_lab_role = entry.lab_role.clone();
+            inventory_ssh_target = Some(entry.ssh_target.clone());
+            inventory_ssh_user = entry.ssh_user.clone();
+            inventory_last_known_ip = entry.last_known_ip.clone();
+            inventory_mesh_ip = entry.mesh_ip.clone();
+            if let Some(VmController::LocalUtm {
+                utm_name: entry_utm_name,
+                bundle_path: entry_bundle_path,
+            }) = entry.controller.as_ref()
+            {
+                inventory_controller_bundle_path = Some(entry_bundle_path.display().to_string());
+                inventory_controller_utm_name = Some(entry_utm_name.clone());
+            }
+            let resolved_target =
+                resolved_inventory_ssh_target_with_utmctl(entry, utmctl_path.as_path());
+            ssh_target = Some(resolved_target.clone());
+            ssh_target_source = "inventory".to_string();
+            ssh_user = entry.ssh_user.clone();
+            if let Some(ip) = resolve_local_utm_live_host(entry, utmctl_path.as_path()) {
+                live_ip_source = "utmctl".to_string();
+                live_ip = Some(ip);
+            } else if let Some(ip) = entry.last_known_ip.as_deref() {
+                live_ip_source = "inventory.last_known_ip".to_string();
+                live_ip = Some(ip.to_string());
+                discovery_notes
+                    .push("utmctl-ip-address-unavailable-using-inventory-fallback".to_string());
+            }
+        } else {
+            if let Some(ip) = resolve_local_utm_live_host_by_name(
+                utm_name.as_str(),
+                None,
+                None,
+                utmctl_path.as_path(),
+            ) {
+                live_ip_source = "utmctl".to_string();
+                live_ip = Some(ip);
+            }
+            if let Some(ip) = live_ip.clone() {
+                ssh_target_source = "default-debian-guess".to_string();
+                ssh_user = Some("debian".to_string());
+                ssh_target = Some(rewrite_ssh_target_host("debian@", ip.as_str()));
+            }
+        }
+
+        if live_ip.is_some() {
+            live_ip_count += 1;
+        }
+
+        let mut ssh_port_status = "skipped".to_string();
+        let mut ssh_port_error = None;
+        if let Some(ip) = live_ip.as_deref() {
+            match probe_tcp_port_status(ip, ssh_port, timeout) {
+                Ok((status, error)) => {
+                    if status == "open" {
+                        ssh_port_open_count += 1;
+                    }
+                    ssh_port_status = status;
+                    ssh_port_error = error;
+                }
+                Err(err) => {
+                    ssh_port_status = "unknown".to_string();
+                    ssh_port_error = Some(err);
+                }
+            }
+        }
+
+        let ready = process_present && live_ip.is_some() && ssh_port_status == "open";
+        if ready {
+            ready_count += 1;
+        }
+
+        entries.push(json!({
+            "alias": inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
+            "bundle_path": bundle_path.display().to_string(),
+            "utm_name": utm_name,
+            "controller": {
+                "type": "local_utm",
+                "bundle_path": bundle_path.display().to_string(),
+            },
+            "inventory_match": inventory_match.is_some(),
+            "inventory_alias": inventory_alias,
+            "inventory_node_id": inventory_node_id,
+            "inventory_lab_role": inventory_lab_role,
+            "inventory_ssh_target": inventory_ssh_target,
+            "inventory_ssh_user": inventory_ssh_user,
+            "inventory_last_known_ip": inventory_last_known_ip,
+            "inventory_mesh_ip": inventory_mesh_ip,
+            "inventory_controller_bundle_path": inventory_controller_bundle_path,
+            "inventory_controller_utm_name": inventory_controller_utm_name,
+            "live_ip": live_ip,
+            "live_ip_source": live_ip_source,
+            "ssh_target": ssh_target,
+            "ssh_target_source": ssh_target_source,
+            "ssh_user": ssh_user,
+            "ssh_port": ssh_port,
+            "ssh_port_status": ssh_port_status,
+            "ssh_port_error": ssh_port_error,
+            "utm_process_present": process_present,
+            "ready": ready,
+            "notes": discovery_notes,
+        }));
+    }
+
+    let overall_status = if ready_count == entries.len() {
+        "complete"
+    } else {
+        "partial"
+    };
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "vm_lab_local_utm_discovery",
+        "collected_at_utc": collected_at_utc_now(),
+        "utm_documents_root": documents_root.display().to_string(),
+        "inventory_path": config
+            .inventory_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        "utmctl_path": utmctl_path.display().to_string(),
+        "ssh_port": ssh_port,
+        "summary": {
+            "status": overall_status,
+            "bundle_count": entries.len(),
+            "inventory_matched_count": matched_inventory_count,
+            "process_present_count": process_present_count,
+            "live_ip_count": live_ip_count,
+            "ssh_port_open_count": ssh_port_open_count,
+            "ready_count": ready_count,
+        },
+        "inventory_error": inventory_error,
+        "entries": entries,
+    });
+    serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("serialize local UTM discovery report failed: {err}"))
+}
+
+pub fn execute_ops_vm_lab_discover_local_utm_summary(
+    config: VmLabDiscoverLocalUtmConfig,
+) -> Result<String, String> {
+    let report = execute_ops_vm_lab_discover_local_utm(config)?;
+    let report: Value = serde_json::from_str(report.as_str())
+        .map_err(|err| format!("parse local UTM discovery report failed: {err}"))?;
+    render_local_utm_discovery_summary(
+        report
+            .as_object()
+            .ok_or_else(|| "local UTM discovery report must be a JSON object".to_string())?,
+    )
+}
+
+fn render_local_utm_discovery_summary(
+    report: &serde_json::Map<String, Value>,
+) -> Result<String, String> {
+    let summary = report
+        .get("summary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "local UTM discovery report is missing summary data".to_string())?;
+    let entries = report
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "local UTM discovery report is missing entries data".to_string())?;
+
+    let summary_string = |key: &str| -> Result<String, String> {
+        summary
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| format!("local UTM discovery summary is missing string field: {key}"))
+    };
+    let summary_u64 = |key: &str| -> Result<u64, String> {
+        summary
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("local UTM discovery summary is missing numeric field: {key}"))
+    };
+    let report_string = |key: &str| -> Option<String> {
+        report
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    };
+    let entry_string = |entry: &Value, key: &str| -> Option<String> {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    };
+
+    let mut lines = vec![
+        format!("discovery_summary.status={}", summary_string("status")?),
+        format!(
+            "discovery_summary.bundle_count={}",
+            summary_u64("bundle_count")?
+        ),
+        format!(
+            "discovery_summary.inventory_matched_count={}",
+            summary_u64("inventory_matched_count")?
+        ),
+        format!(
+            "discovery_summary.live_ip_count={}",
+            summary_u64("live_ip_count")?
+        ),
+        format!(
+            "discovery_summary.ssh_port_open_count={}",
+            summary_u64("ssh_port_open_count")?
+        ),
+        format!(
+            "discovery_summary.ready_count={}",
+            summary_u64("ready_count")?
+        ),
+    ];
+
+    if let Some(value) = report_string("utm_documents_root") {
+        lines.push(format!("discovery_summary.utm_documents_root={value}"));
+    }
+    if let Some(value) = report_string("inventory_path") {
+        lines.push(format!("discovery_summary.inventory_path={value}"));
+    }
+    if let Some(value) = report_string("utmctl_path") {
+        lines.push(format!("discovery_summary.utmctl_path={value}"));
+    }
+    if let Some(value) = report.get("inventory_error").and_then(Value::as_str) {
+        if !value.trim().is_empty() {
+            lines.push(format!("discovery_summary.inventory_error={value}"));
+        }
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let prefix = format!("node[{index}]");
+        lines.push(format!(
+            "{prefix}.alias={}",
+            entry_string(entry, "alias").unwrap_or_else(|| "<unknown>".to_string())
+        ));
+        if let Some(value) = entry_string(entry, "inventory_alias") {
+            lines.push(format!("{prefix}.inventory_alias={value}"));
+        }
+        if let Some(value) = entry_string(entry, "inventory_node_id") {
+            lines.push(format!("{prefix}.node_id={value}"));
+        }
+        if let Some(value) = entry_string(entry, "inventory_lab_role") {
+            lines.push(format!("{prefix}.role={value}"));
+        }
+        if let Some(value) = entry_string(entry, "inventory_ssh_target") {
+            lines.push(format!("{prefix}.inventory_ssh_target={value}"));
+        }
+        if let Some(value) = entry_string(entry, "inventory_last_known_ip") {
+            lines.push(format!("{prefix}.inventory_last_known_ip={value}"));
+        }
+        if let Some(value) = entry_string(entry, "inventory_mesh_ip") {
+            lines.push(format!("{prefix}.inventory_mesh_ip={value}"));
+        }
+        if let Some(value) = entry_string(entry, "live_ip") {
+            lines.push(format!("{prefix}.live_ip={value}"));
+        }
+        if let Some(value) = entry_string(entry, "ssh_target") {
+            lines.push(format!("{prefix}.ssh_target={value}"));
+        }
+        if let Some(value) = entry_string(entry, "ssh_port_status") {
+            lines.push(format!("{prefix}.ssh_port_status={value}"));
+        }
+        lines.push(format!(
+            "{prefix}.ready={}",
+            entry.get("ready").and_then(Value::as_bool).unwrap_or(false)
+        ));
+        if let Some(notes) = entry.get("notes").and_then(Value::as_array) {
+            let notes = notes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            if !notes.is_empty() {
+                lines.push(format!("{prefix}.notes={}", notes.join(", ")));
+            }
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
 pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, String> {
     let targets = resolve_start_targets(
         config.inventory_path.as_path(),
@@ -703,6 +1130,14 @@ pub fn execute_ops_vm_lab_sync_repo(config: VmLabSyncRepoConfig) -> Result<Strin
     if let Some(ssh_user) = config.ssh_user.as_deref() {
         ensure_no_control_chars("SSH user", ssh_user)?;
     }
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_SYNC_TIMEOUT_SECS);
     let source = resolve_repo_sync_source(
         config.repo_url.as_deref(),
@@ -713,6 +1148,8 @@ pub fn execute_ops_vm_lab_sync_repo(config: VmLabSyncRepoConfig) -> Result<Strin
     let results = sync_repo_targets(
         &targets,
         config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
         source,
         config.dest_dir.as_str(),
         timeout,
@@ -738,6 +1175,14 @@ pub fn execute_ops_vm_lab_run(
     if let Some(ssh_user) = config.ssh_user.as_deref() {
         ensure_no_control_chars("SSH user", ssh_user)?;
     }
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
     let remote_script = build_remote_argv_script(
         config.workdir.as_str(),
@@ -747,10 +1192,12 @@ pub fn execute_ops_vm_lab_run(
     )?;
     let mut results = Vec::new();
     for target in &targets {
-        let effective_user = config.ssh_user.as_deref().or(target.ssh_user.as_deref());
-        let status = run_remote_shell_command(
-            target.ssh_target.as_str(),
+        let effective_user = config.ssh_user.as_deref();
+        let status = run_remote_shell_command_for_target(
+            target,
             effective_user,
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             remote_script.as_str(),
             timeout,
         )
@@ -771,7 +1218,9 @@ pub fn execute_ops_vm_lab_run(
             config.program,
             config.sudo,
             target.ssh_target,
-            effective_user.unwrap_or("<ssh-default>"),
+            effective_user
+                .or(target.ssh_user.as_deref())
+                .unwrap_or("<ssh-default>"),
         ));
     }
     Ok(results.join("\n"))
@@ -800,6 +1249,8 @@ pub fn execute_ops_vm_lab_sync_bootstrap(
         branch: config.branch.clone(),
         remote: config.remote.clone(),
         ssh_user: config.ssh_user.clone(),
+        ssh_identity_file: config.ssh_identity_file.clone(),
+        known_hosts_path: config.known_hosts_path.clone(),
         timeout_secs: config.timeout_secs,
     })?;
 
@@ -813,6 +1264,8 @@ pub fn execute_ops_vm_lab_sync_bootstrap(
             program: config.program,
             argv: config.argv,
             ssh_user: config.ssh_user,
+            ssh_identity_file: config.ssh_identity_file,
+            known_hosts_path: config.known_hosts_path,
             sudo: config.sudo,
             timeout_secs: config.timeout_secs,
         },
@@ -857,6 +1310,8 @@ fn resolve_repo_sync_source(
 fn sync_repo_targets(
     targets: &[RemoteTarget],
     ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     source: RepoSyncSource,
     dest_dir: &str,
     timeout: Duration,
@@ -876,10 +1331,11 @@ fn sync_repo_targets(
                 remote.as_str(),
             )?;
             for target in targets {
-                let effective_user = ssh_user_override.or(target.ssh_user.as_deref());
-                let status = run_remote_shell_command(
-                    target.ssh_target.as_str(),
-                    effective_user,
+                let status = run_remote_shell_command_for_target(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
                     repo_sync_script.as_str(),
                     timeout,
                 )
@@ -898,18 +1354,21 @@ fn sync_repo_targets(
                     branch,
                     dest_dir,
                     target.ssh_target,
-                    effective_user.unwrap_or("<ssh-default>"),
+                    ssh_user_override
+                        .or(target.ssh_user.as_deref())
+                        .unwrap_or("<ssh-default>"),
                 ));
             }
         }
         RepoSyncSource::LocalSource { source_dir } => {
             let archive = prepare_local_source_archive(source_dir.as_path(), timeout)?;
             for target in targets {
-                let effective_user = ssh_user_override.or(target.ssh_user.as_deref());
                 sync_local_source_archive_to_target(
                     archive.path.as_path(),
-                    target.ssh_target.as_str(),
-                    effective_user,
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
                     dest_dir,
                     timeout,
                 )
@@ -920,7 +1379,9 @@ fn sync_repo_targets(
                     source_dir.display(),
                     dest_dir,
                     target.ssh_target,
-                    effective_user.unwrap_or("<ssh-default>"),
+                    ssh_user_override
+                        .or(target.ssh_user.as_deref())
+                        .unwrap_or("<ssh-default>"),
                 ));
             }
         }
@@ -1018,29 +1479,55 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
             config.ssh_identity_file.display().to_string().as_str(),
         )?,
     ];
+    if let Some(utm_name) = exit_target.utm_name.as_deref() {
+        lines.push(format_env_assignment("EXIT_UTM_NAME", utm_name)?);
+    }
+    if let Some(utm_name) = client_target.utm_name.as_deref() {
+        lines.push(format_env_assignment("CLIENT_UTM_NAME", utm_name)?);
+    }
     if let Some(target) = entry_target {
         lines.push(format_env_assignment(
             "ENTRY_TARGET",
             target.normalized_target.as_str(),
         )?);
+        if let Some(utm_name) = target.utm_name.as_deref() {
+            lines.push(format_env_assignment("ENTRY_UTM_NAME", utm_name)?);
+        }
     }
     if let Some(target) = aux_target {
         lines.push(format_env_assignment(
             "AUX_TARGET",
             target.normalized_target.as_str(),
         )?);
+        if let Some(utm_name) = target.utm_name.as_deref() {
+            lines.push(format_env_assignment("AUX_UTM_NAME", utm_name)?);
+        }
     }
     if let Some(target) = extra_target {
         lines.push(format_env_assignment(
             "EXTRA_TARGET",
             target.normalized_target.as_str(),
         )?);
+        if let Some(utm_name) = target.utm_name.as_deref() {
+            lines.push(format_env_assignment("EXTRA_UTM_NAME", utm_name)?);
+        }
     }
-    if let Some(target) = fifth_client_target {
-        lines.push(format_env_assignment(
-            "FIFTH_CLIENT_TARGET",
-            target.normalized_target.as_str(),
-        )?);
+    match fifth_client_target {
+        Some(target) => {
+            lines.push(format_env_assignment(
+                "FIFTH_CLIENT_TARGET",
+                target.normalized_target.as_str(),
+            )?);
+            if let Some(utm_name) = target.utm_name.as_deref() {
+                lines.push(format_env_assignment("FIFTH_CLIENT_UTM_NAME", utm_name)?);
+            }
+        }
+        None => {
+            // Keep five-node profiles explicitly non-interactive by declaring the
+            // optional sixth-node slots as intentionally empty.
+            lines.push(format_env_assignment("FIFTH_CLIENT_TARGET", "")?);
+            lines.push(format_env_assignment("FIFTH_CLIENT_UTM_NAME", "")?);
+        }
     }
     if let Some(path) = config.ssh_known_hosts_file.as_deref() {
         lines.push(format_env_assignment(
@@ -1204,6 +1691,44 @@ struct LiveLabProfile {
 struct LiveLabProfileTarget {
     role: String,
     target: String,
+    utm_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedLiveLabTarget {
+    role: String,
+    profile_target: String,
+    remote_target: RemoteTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabStageLocalBundle {
+    report_context_dir: PathBuf,
+    copied_paths: Vec<PathBuf>,
+    worker_results: Vec<LiveLabWorkerResult>,
+    worker_results_json_path: Option<PathBuf>,
+    worker_results_markdown_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabStageRemoteProbeSummary {
+    remote_probe_dir: Option<PathBuf>,
+    notes: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabStageForensicsBundle {
+    strategy: String,
+    report_context_dir: PathBuf,
+    summary_json_path: PathBuf,
+    review_markdown_path: PathBuf,
+    remote_probe_dir: Option<PathBuf>,
+    copied_paths: Vec<PathBuf>,
+    worker_results_json_path: Option<PathBuf>,
+    worker_results_markdown_path: Option<PathBuf>,
+    notes: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1291,6 +1816,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
         vm_aliases: preflight_selection.vm_aliases,
         raw_targets: preflight_selection.raw_targets,
         select_all: false,
+        ssh_identity_file: Some(config.ssh_identity_file.clone()),
         known_hosts_path: config.ssh_known_hosts_file.clone(),
         require_same_network: config.require_same_network,
         require_commands: vec!["git".to_string(), "cargo".to_string()],
@@ -1399,8 +1925,9 @@ pub fn execute_ops_vm_lab_validate_live_lab_profile(
 pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
     config: VmLabDiagnoseLiveLabFailureConfig,
 ) -> Result<String, String> {
+    let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
     let profile = load_live_lab_profile(config.profile_path.as_path())?;
-    let summary = summarize_live_lab_report(config.report_dir.as_path(), false, 1)?;
+    let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let stage = if let Some(stage) = config.stage.as_deref() {
         stage.to_string()
     } else {
@@ -1409,19 +1936,15 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
             .clone()
             .ok_or_else(|| "live-lab report does not contain a failed stage".to_string())?
     };
-    let stage_records = parse_live_lab_stage_records(config.report_dir.as_path())?;
+    let stage_records = parse_live_lab_stage_records(report_dir.as_path())?;
     let stage_record = stage_records
         .iter()
         .find(|record| record.name == stage)
-        .ok_or_else(|| {
-            format!(
-                "stage {stage} is not present in {}",
-                config.report_dir.display()
-            )
-        })?;
+        .cloned()
+        .or_else(|| infer_live_lab_stage_record(report_dir.as_path(), stage.as_str()).ok())
+        .ok_or_else(|| format!("stage {stage} is not present in {}", report_dir.display()))?;
     let diagnostics_dir = config.output_dir.clone().unwrap_or_else(|| {
-        config
-            .report_dir
+        report_dir
             .join("diagnostics")
             .join(sanitize_label_for_path(stage.as_str()))
     });
@@ -1432,19 +1955,31 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
         )
     })?;
 
-    let targets = profile.configured_targets()?;
-    let raw_targets = targets
+    let targets = resolve_live_lab_profile_targets(config.inventory_path.as_path(), &profile)?;
+    let ssh_identity_file = profile.optional("SSH_IDENTITY_FILE").map(PathBuf::from);
+    let ssh_known_hosts_file = profile.optional("SSH_KNOWN_HOSTS_FILE").map(PathBuf::from);
+    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_COLLECT_TIMEOUT_SECS);
+    let mut warnings = Vec::new();
+    let status_targets = targets
         .iter()
-        .map(|target| target.target.clone())
+        .map(|target| target.remote_target.clone())
         .collect::<Vec<_>>();
-    let status_output = execute_ops_vm_lab_status(VmLabStatusConfig {
-        inventory_path: config.inventory_path.clone(),
-        vm_aliases: Vec::new(),
-        raw_targets: raw_targets.clone(),
-        select_all: false,
-        ssh_user: None,
-        timeout_secs: config.timeout_secs,
-    })?;
+    let status_output = match execute_vm_lab_status_for_targets(
+        status_targets.as_slice(),
+        None,
+        ssh_identity_file.as_deref(),
+        ssh_known_hosts_file.as_deref(),
+        timeout,
+    ) {
+        Ok(output) => output,
+        Err(output) => {
+            warnings.push(
+                "vm-lab-status reported probe failures; inspect vm_lab_status.json for partial results"
+                    .to_string(),
+            );
+            output
+        }
+    };
     let status_path = diagnostics_dir.join("vm_lab_status.json");
     fs::write(status_path.as_path(), status_output.as_bytes()).map_err(|err| {
         format!(
@@ -1455,26 +1990,53 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
 
     let artifacts_dir = if config.collect_artifacts {
         let artifacts_dir = diagnostics_dir.join("artifacts");
-        execute_ops_vm_lab_collect_artifacts(VmLabCollectArtifactsConfig {
-            inventory_path: config.inventory_path.clone(),
-            vm_aliases: Vec::new(),
-            raw_targets,
-            select_all: false,
-            ssh_user: None,
-            output_dir: artifacts_dir.clone(),
-            timeout_secs: config.timeout_secs,
-        })?;
+        if let Err(err) = execute_vm_lab_collect_artifacts_for_targets(
+            status_targets.as_slice(),
+            None,
+            ssh_identity_file.as_deref(),
+            ssh_known_hosts_file.as_deref(),
+            artifacts_dir.as_path(),
+            timeout,
+        ) {
+            warnings.push(
+                "artifact collection reported probe failures; inspect artifacts/collection_error.txt for details"
+                    .to_string(),
+            );
+            fs::create_dir_all(artifacts_dir.as_path()).map_err(|create_err| {
+                format!(
+                    "create artifact diagnostics dir failed ({}): {create_err}",
+                    artifacts_dir.display()
+                )
+            })?;
+            let error_path = artifacts_dir.join("collection_error.txt");
+            fs::write(error_path.as_path(), err.as_bytes()).map_err(|write_err| {
+                format!(
+                    "write artifact collection error failed ({}): {write_err}",
+                    error_path.display()
+                )
+            })?;
+        }
         Some(artifacts_dir)
     } else {
         None
     };
+    let stage_forensics = collect_live_lab_stage_forensics(
+        report_dir.as_path(),
+        &stage_record,
+        &summary,
+        diagnostics_dir.as_path(),
+        targets.as_slice(),
+        timeout,
+    )?;
+    warnings.extend(stage_forensics.warnings.iter().cloned());
 
     let targets_json = targets
         .iter()
         .map(|target| {
             json!({
                 "role": target.role,
-                "target": target.target,
+                "target": target.profile_target,
+                "ssh_target": target.remote_target.ssh_target,
             })
         })
         .collect::<Vec<_>>();
@@ -1490,6 +2052,18 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
         "targets": targets_json,
         "status_output_path": status_path.clone(),
         "artifacts_dir": artifacts_dir.clone(),
+        "warnings": warnings.clone(),
+        "stage_forensics": {
+            "strategy": stage_forensics.strategy.clone(),
+            "report_context_dir": stage_forensics.report_context_dir.clone(),
+            "summary_json_path": stage_forensics.summary_json_path.clone(),
+            "review_markdown_path": stage_forensics.review_markdown_path.clone(),
+            "remote_probe_dir": stage_forensics.remote_probe_dir.clone(),
+            "worker_results_json_path": stage_forensics.worker_results_json_path.clone(),
+            "worker_results_markdown_path": stage_forensics.worker_results_markdown_path.clone(),
+            "copied_paths": stage_forensics.copied_paths.clone(),
+            "notes": stage_forensics.notes.clone(),
+        },
     });
     let summary_path = diagnostics_dir.join("diagnostics_summary.json");
     fs::write(
@@ -1505,7 +2079,7 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
     })?;
 
     let mut lines = vec![
-        format!("report_dir={}", config.report_dir.display()),
+        format!("report_dir={}", report_dir.display()),
         format!("profile_path={}", config.profile_path.display()),
         format!("stage={}", stage_record.name),
         format!("stage_description={}", stage_record.description),
@@ -1521,6 +2095,22 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
         format!("diagnostics_dir={}", diagnostics_dir.display()),
         format!("status_output_path={}", status_path.display()),
         format!(
+            "stage_forensics_strategy={}",
+            stage_forensics.strategy.as_str()
+        ),
+        format!(
+            "stage_forensics_summary_path={}",
+            stage_forensics.summary_json_path.display()
+        ),
+        format!(
+            "stage_forensics_review_path={}",
+            stage_forensics.review_markdown_path.display()
+        ),
+        format!(
+            "stage_forensics_report_context_dir={}",
+            stage_forensics.report_context_dir.display()
+        ),
+        format!(
             "artifacts_dir={}",
             artifacts_dir
                 .as_deref()
@@ -1529,10 +2119,720 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
         ),
         format!("target_count={}", targets.len()),
     ];
+    if let Some(remote_probe_dir) = stage_forensics.remote_probe_dir.as_deref() {
+        lines.push(format!(
+            "stage_forensics_remote_probe_dir={}",
+            remote_probe_dir.display()
+        ));
+    }
     for target in targets {
-        lines.push(format!("target.{}={}", target.role, target.target));
+        lines.push(format!("target.{}={}", target.role, target.profile_target));
+    }
+    for warning in warnings {
+        lines.push(format!("warning={warning}"));
     }
     Ok(lines.join("\n"))
+}
+
+fn infer_live_lab_stage_record(
+    report_dir: &Path,
+    stage: &str,
+) -> Result<LiveLabStageRecord, String> {
+    let log_path = report_dir.join("logs").join(format!("{stage}.log"));
+    let parallel_stage_dir = report_dir.join("state").join(format!("parallel-{stage}"));
+    if !log_path.is_file() && !parallel_stage_dir.is_dir() {
+        return Err(format!(
+            "stage {stage} is not present in {}",
+            report_dir.display()
+        ));
+    }
+
+    let description_prefix = format!("[stage:{stage}] START ");
+    let description = fs::read_to_string(log_path.as_path())
+        .ok()
+        .and_then(|body| {
+            body.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix(description_prefix.as_str())
+                    .map(|value| value.trim().to_string())
+            })
+        })
+        .unwrap_or_else(|| stage.replace('_', " "));
+
+    Ok(LiveLabStageRecord {
+        name: stage.to_string(),
+        severity: "unknown".to_string(),
+        status: "incomplete".to_string(),
+        rc: String::new(),
+        log_path,
+        description,
+    })
+}
+
+fn collect_live_lab_stage_forensics(
+    report_dir: &Path,
+    stage_record: &LiveLabStageRecord,
+    summary: &LiveLabStageSummary,
+    diagnostics_dir: &Path,
+    targets: &[ResolvedLiveLabTarget],
+    timeout: Duration,
+) -> Result<LiveLabStageForensicsBundle, String> {
+    let strategy = live_lab_stage_forensics_strategy(stage_record.name.as_str()).to_string();
+    let local_bundle =
+        collect_live_lab_stage_local_bundle(report_dir, stage_record, summary, diagnostics_dir)?;
+    let mut notes = live_lab_stage_forensics_notes(stage_record.name.as_str());
+    let mut warnings = Vec::new();
+    let remote_probe = match stage_record.name.as_str() {
+        "validate_baseline_runtime" => {
+            collect_validate_baseline_runtime_remote_probe(diagnostics_dir, targets, timeout)?
+        }
+        _ => LiveLabStageRemoteProbeSummary {
+            remote_probe_dir: None,
+            notes: Vec::new(),
+            warnings: Vec::new(),
+        },
+    };
+    notes.extend(remote_probe.notes.iter().cloned());
+    warnings.extend(remote_probe.warnings.iter().cloned());
+
+    let review_markdown_path = diagnostics_dir.join("stage_forensics_review.md");
+    let review_markdown = render_live_lab_stage_forensics_review(
+        report_dir,
+        stage_record,
+        summary,
+        strategy.as_str(),
+        &local_bundle,
+        remote_probe.remote_probe_dir.as_deref(),
+        notes.as_slice(),
+        warnings.as_slice(),
+    );
+    fs::write(review_markdown_path.as_path(), review_markdown.as_bytes()).map_err(|err| {
+        format!(
+            "write stage forensics review failed ({}): {err}",
+            review_markdown_path.display()
+        )
+    })?;
+
+    let summary_json_path = diagnostics_dir.join("stage_forensics_summary.json");
+    let summary_json = json!({
+        "stage": stage_record.name,
+        "strategy": strategy.clone(),
+        "report_context_dir": local_bundle.report_context_dir.clone(),
+        "copied_paths": local_bundle.copied_paths.clone(),
+        "worker_result_count": local_bundle.worker_results.len(),
+        "failed_worker_count": local_bundle.worker_results.iter().filter(|result| result.rc != 0).count(),
+        "worker_results_json_path": local_bundle.worker_results_json_path.clone(),
+        "worker_results_markdown_path": local_bundle.worker_results_markdown_path.clone(),
+        "remote_probe_dir": remote_probe.remote_probe_dir.clone(),
+        "notes": notes.clone(),
+        "warnings": warnings.clone(),
+        "review_markdown_path": review_markdown_path.clone(),
+    });
+    fs::write(
+        summary_json_path.as_path(),
+        serde_json::to_vec_pretty(&summary_json)
+            .map_err(|err| format!("serialize stage forensics summary failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write stage forensics summary failed ({}): {err}",
+            summary_json_path.display()
+        )
+    })?;
+
+    let mut copied_paths = local_bundle.copied_paths.clone();
+    copied_paths.push(summary_json_path.clone());
+    copied_paths.push(review_markdown_path.clone());
+
+    Ok(LiveLabStageForensicsBundle {
+        strategy,
+        report_context_dir: local_bundle.report_context_dir,
+        summary_json_path,
+        review_markdown_path,
+        remote_probe_dir: remote_probe.remote_probe_dir,
+        copied_paths,
+        worker_results_json_path: local_bundle.worker_results_json_path,
+        worker_results_markdown_path: local_bundle.worker_results_markdown_path,
+        notes,
+        warnings,
+    })
+}
+
+fn collect_live_lab_stage_local_bundle(
+    report_dir: &Path,
+    stage_record: &LiveLabStageRecord,
+    summary: &LiveLabStageSummary,
+    diagnostics_dir: &Path,
+) -> Result<LiveLabStageLocalBundle, String> {
+    let report_context_dir = diagnostics_dir.join("report_context");
+    fs::create_dir_all(report_context_dir.as_path()).map_err(|err| {
+        format!(
+            "create stage report context dir failed ({}): {err}",
+            report_context_dir.display()
+        )
+    })?;
+
+    let mut copied_paths = Vec::new();
+    let mut seen_sources = HashSet::new();
+    copy_stage_bundle_file(
+        summary.key_report_path.as_path(),
+        report_context_dir.join("failure_digest.md").as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+    copy_stage_bundle_file(
+        report_dir.join("failure_digest.json").as_path(),
+        report_context_dir.join("failure_digest.json").as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+    copy_stage_bundle_file(
+        report_dir.join("run_summary.md").as_path(),
+        report_context_dir.join("run_summary.md").as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+    copy_stage_bundle_file(
+        report_dir.join("run_summary.json").as_path(),
+        report_context_dir.join("run_summary.json").as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+    copy_stage_bundle_file(
+        report_dir.join("state/stages.tsv").as_path(),
+        report_context_dir.join("state/stages.tsv").as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+    copy_stage_bundle_file(
+        stage_record.log_path.as_path(),
+        report_context_dir
+            .join("logs")
+            .join(
+                stage_record
+                    .log_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("stage.log")),
+            )
+            .as_path(),
+        &mut seen_sources,
+        &mut copied_paths,
+    )?;
+
+    let parallel_stage_dir = report_dir
+        .join("state")
+        .join(format!("parallel-{}", stage_record.name));
+    let copied_parallel_dir = report_context_dir
+        .join("state")
+        .join(format!("parallel-{}", stage_record.name));
+    if parallel_stage_dir.is_dir() {
+        copy_stage_bundle_dir(
+            parallel_stage_dir.as_path(),
+            copied_parallel_dir.as_path(),
+            &mut seen_sources,
+            &mut copied_paths,
+        )?;
+    }
+
+    let worker_results = read_parallel_stage_results(report_dir, stage_record.name.as_str());
+    let (worker_results_json_path, worker_results_markdown_path) = if worker_results.is_empty() {
+        (None, None)
+    } else {
+        let json_path = diagnostics_dir.join("stage_worker_results.json");
+        let markdown_path = diagnostics_dir.join("stage_worker_results.md");
+        write_live_lab_worker_results_summary(
+            worker_results.as_slice(),
+            json_path.as_path(),
+            markdown_path.as_path(),
+        )?;
+        copied_paths.push(json_path.clone());
+        copied_paths.push(markdown_path.clone());
+        (Some(json_path), Some(markdown_path))
+    };
+
+    Ok(LiveLabStageLocalBundle {
+        report_context_dir,
+        copied_paths,
+        worker_results,
+        worker_results_json_path,
+        worker_results_markdown_path,
+    })
+}
+
+fn write_live_lab_worker_results_summary(
+    worker_results: &[LiveLabWorkerResult],
+    json_path: &Path,
+    markdown_path: &Path,
+) -> Result<(), String> {
+    let results_json = worker_results
+        .iter()
+        .map(|result| {
+            json!({
+                "stage_name": result.stage_name,
+                "label": result.label,
+                "target": result.target,
+                "node_id": result.node_id,
+                "role": result.role,
+                "rc": result.rc,
+                "started_at": result.started_at,
+                "finished_at": result.finished_at,
+                "log_path": result.log_path,
+                "snapshot_path": result.snapshot_path,
+                "route_policy_path": result.route_policy_path,
+                "dns_state_path": result.dns_state_path,
+                "primary_failure_reason": result.primary_failure_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary_json = json!({
+        "worker_count": worker_results.len(),
+        "failed_worker_count": worker_results.iter().filter(|result| result.rc != 0).count(),
+        "results": results_json,
+    });
+    fs::write(
+        json_path,
+        serde_json::to_vec_pretty(&summary_json)
+            .map_err(|err| format!("serialize worker results summary failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write worker results summary failed ({}): {err}",
+            json_path.display()
+        )
+    })?;
+
+    let mut lines = vec![
+        "# Live-Lab Worker Results".to_string(),
+        String::new(),
+        format!("- worker_count={}", worker_results.len()),
+        format!(
+            "- failed_worker_count={}",
+            worker_results
+                .iter()
+                .filter(|result| result.rc != 0)
+                .count()
+        ),
+    ];
+    for result in worker_results {
+        let reason = if result.primary_failure_reason.trim().is_empty() {
+            "none"
+        } else {
+            result.primary_failure_reason.as_str()
+        };
+        lines.push(format!(
+            "- label={} role={} node_id={} rc={} reason={} log_path={} snapshot_path={} route_policy_path={} dns_state_path={}",
+            result.label,
+            result.role,
+            result.node_id,
+            result.rc,
+            reason,
+            result.log_path,
+            result.snapshot_path,
+            result.route_policy_path,
+            result.dns_state_path
+        ));
+    }
+    fs::write(markdown_path, lines.join("\n").as_bytes()).map_err(|err| {
+        format!(
+            "write worker results markdown failed ({}): {err}",
+            markdown_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn collect_validate_baseline_runtime_remote_probe(
+    diagnostics_dir: &Path,
+    targets: &[ResolvedLiveLabTarget],
+    timeout: Duration,
+) -> Result<LiveLabStageRemoteProbeSummary, String> {
+    let remote_probe_dir = diagnostics_dir.join("remote_validate_baseline_runtime");
+    fs::create_dir_all(remote_probe_dir.as_path()).map_err(|err| {
+        format!(
+            "create baseline remote probe dir failed ({}): {err}",
+            remote_probe_dir.display()
+        )
+    })?;
+
+    let rustynet_status_script = privileged_rustynet_cli_script("status");
+    let rustynet_netcheck_script = privileged_rustynet_cli_script("netcheck");
+    let sections = [
+        ("hostname", "hostname"),
+        (
+            "service_active",
+            "if command -v systemctl >/dev/null 2>&1; then systemctl is-active rustynetd.service 2>&1; else echo systemctl-unavailable; fi",
+        ),
+        ("rustynet_status", rustynet_status_script.as_str()),
+        ("rustynet_netcheck", rustynet_netcheck_script.as_str()),
+        (
+            "daemon_socket",
+            "if [ -S /run/rustynet/rustynetd.sock ]; then echo daemon_socket=present; else echo daemon_socket=missing; fi",
+        ),
+        (
+            "route_get_1_1_1_1",
+            "if command -v ip >/dev/null 2>&1; then ip -4 route get 1.1.1.1 2>&1; else echo ip-unavailable; fi",
+        ),
+        (
+            "plaintext_passphrase_check",
+            "if test ! -e /var/lib/rustynet/keys/wireguard.passphrase && test ! -e /etc/rustynet/wireguard.passphrase && test ! -e /etc/rustynet/signing_key_passphrase; then echo no-plaintext-passphrase-files; else echo plaintext-passphrase-files-present; fi",
+        ),
+        (
+            "plaintext_passphrase_paths",
+            "for path in /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase /etc/rustynet/signing_key_passphrase; do if [ -e \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
+        ),
+        (
+            "runtime_state_paths",
+            "for path in /run/rustynet/rustynetd.sock /var/lib/rustynet/rustynetd.assignment /var/lib/rustynet/rustynetd.traversal /var/lib/rustynet/rustynetd.dns-zone /var/lib/rustynet/rustynetd.trust; do if [ -e \"$path\" ] || [ -S \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
+        ),
+        (
+            "time_state",
+            "if command -v timedatectl >/dev/null 2>&1; then timedatectl status 2>&1; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi",
+        ),
+        (
+            "journalctl_rustynetd_tail",
+            "if command -v journalctl >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n journalctl -u rustynetd.service --no-pager -n 80 2>&1; else journalctl -u rustynetd.service --no-pager -n 80 2>&1; fi; else echo journalctl-unavailable; fi",
+        ),
+    ];
+    let capture_script = build_section_capture_script(sections.as_slice());
+    let mut warnings = Vec::new();
+    let mut results = Vec::new();
+
+    for target in targets {
+        let target_dir = remote_probe_dir.join(sanitize_label_for_path(target.role.as_str()));
+        fs::create_dir_all(target_dir.as_path()).map_err(|err| {
+            format!(
+                "create baseline target probe dir failed ({}): {err}",
+                target_dir.display()
+            )
+        })?;
+        match capture_remote_shell_command_for_target(
+            &target.remote_target,
+            None,
+            None,
+            None,
+            capture_script.as_str(),
+            timeout,
+        ) {
+            Ok(output) => {
+                let sections = parse_section_capture(output.as_str());
+                for (name, body) in &sections {
+                    fs::write(target_dir.join(format!("{name}.txt")), body.as_bytes()).map_err(
+                        |err| {
+                            format!(
+                                "write baseline stage probe failed ({} {}): {err}",
+                                target.role, name
+                            )
+                        },
+                    )?;
+                }
+                let metadata_path = target_dir.join("metadata.json");
+                let metadata = json!({
+                    "role": target.role,
+                    "target": target.profile_target,
+                    "ssh_target": target.remote_target.ssh_target,
+                    "sections": sections.keys().cloned().collect::<Vec<_>>(),
+                });
+                fs::write(
+                    metadata_path.as_path(),
+                    serde_json::to_vec_pretty(&metadata).map_err(|err| {
+                        format!("serialize baseline probe metadata failed: {err}")
+                    })?,
+                )
+                .map_err(|err| {
+                    format!(
+                        "write baseline probe metadata failed ({}): {err}",
+                        metadata_path.display()
+                    )
+                })?;
+                results.push(json!({
+                    "role": target.role,
+                    "target": target.profile_target,
+                    "ssh_target": target.remote_target.ssh_target,
+                    "target_dir": target_dir,
+                    "error": Value::Null,
+                }));
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "baseline runtime probe failed for {} ({}): {err}",
+                    target.role, target.profile_target
+                ));
+                let error_path = target_dir.join("error.txt");
+                fs::write(error_path.as_path(), err.as_bytes()).map_err(|write_err| {
+                    format!(
+                        "write baseline probe error failed ({}): {write_err}",
+                        error_path.display()
+                    )
+                })?;
+                results.push(json!({
+                    "role": target.role,
+                    "target": target.profile_target,
+                    "ssh_target": target.remote_target.ssh_target,
+                    "target_dir": target_dir,
+                    "error": err,
+                }));
+            }
+        }
+    }
+
+    let summary_path = remote_probe_dir.join("summary.json");
+    fs::write(
+        summary_path.as_path(),
+        serde_json::to_vec_pretty(&json!({
+            "target_count": targets.len(),
+            "failed_probes": warnings.len(),
+            "results": results,
+        }))
+        .map_err(|err| format!("serialize baseline remote probe summary failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write baseline remote probe summary failed ({}): {err}",
+            summary_path.display()
+        )
+    })?;
+
+    Ok(LiveLabStageRemoteProbeSummary {
+        remote_probe_dir: Some(remote_probe_dir),
+        notes: vec![
+            "Baseline runtime forensics include focused remote probes for rustynet status, daemon socket presence, route selection, plaintext-passphrase absence, runtime state files, time state, and the last 80 journal lines from rustynetd.".to_string(),
+        ],
+        warnings,
+    })
+}
+
+fn render_live_lab_stage_forensics_review(
+    report_dir: &Path,
+    stage_record: &LiveLabStageRecord,
+    summary: &LiveLabStageSummary,
+    strategy: &str,
+    local_bundle: &LiveLabStageLocalBundle,
+    remote_probe_dir: Option<&Path>,
+    notes: &[String],
+    warnings: &[String],
+) -> String {
+    let mut lines = vec![
+        "# Live-Lab Stage Forensics".to_string(),
+        String::new(),
+        format!("- report_dir={}", report_dir.display()),
+        format!("- stage={}", stage_record.name),
+        format!("- stage_description={}", stage_record.description),
+        format!("- stage_strategy={strategy}"),
+        format!("- stage_status={}", stage_record.status),
+        format!("- stage_rc={}", stage_record.rc),
+        format!("- key_report_path={}", summary.key_report_path.display()),
+        format!("- stage_log_path={}", stage_record.log_path.display()),
+        format!(
+            "- report_context_dir={}",
+            local_bundle.report_context_dir.display()
+        ),
+        format!("- copied_path_count={}", local_bundle.copied_paths.len()),
+    ];
+    if let Some(reason) = summary.likely_reason.as_deref() {
+        lines.push(format!("- likely_reason={reason}"));
+    }
+    if let Some(key_log_path) = summary.key_log_path.as_deref() {
+        lines.push(format!("- key_log_path={}", key_log_path.display()));
+    }
+    if let Some(remote_probe_dir) = remote_probe_dir {
+        lines.push(format!("- remote_probe_dir={}", remote_probe_dir.display()));
+    }
+    if let Some(path) = local_bundle.worker_results_json_path.as_deref() {
+        lines.push(format!("- worker_results_json_path={}", path.display()));
+    }
+    if let Some(path) = local_bundle.worker_results_markdown_path.as_deref() {
+        lines.push(format!("- worker_results_markdown_path={}", path.display()));
+    }
+
+    if !notes.is_empty() {
+        lines.push(String::new());
+        lines.push("## Notes".to_string());
+        for note in notes {
+            lines.push(format!("- {note}"));
+        }
+    }
+
+    if !warnings.is_empty() {
+        lines.push(String::new());
+        lines.push("## Warnings".to_string());
+        for warning in warnings {
+            lines.push(format!("- {warning}"));
+        }
+    }
+
+    if !local_bundle.worker_results.is_empty() {
+        lines.push(String::new());
+        lines.push("## Worker Results".to_string());
+        for result in &local_bundle.worker_results {
+            let reason = if result.primary_failure_reason.trim().is_empty() {
+                "none"
+            } else {
+                result.primary_failure_reason.as_str()
+            };
+            lines.push(format!(
+                "- label={} role={} node_id={} rc={} reason={} log_path={} snapshot_path={} route_policy_path={} dns_state_path={}",
+                result.label,
+                result.role,
+                result.node_id,
+                result.rc,
+                reason,
+                result.log_path,
+                result.snapshot_path,
+                result.route_policy_path,
+                result.dns_state_path
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("## Copied Report Context".to_string());
+    for path in &local_bundle.copied_paths {
+        lines.push(format!("- {}", path.display()));
+    }
+
+    lines.join("\n")
+}
+
+fn live_lab_stage_forensics_strategy(stage_name: &str) -> &'static str {
+    match stage_name {
+        "validate_baseline_runtime" => "validate-baseline-runtime",
+        _ => "generic-stage-context",
+    }
+}
+
+fn live_lab_stage_forensics_notes(stage_name: &str) -> Vec<String> {
+    match stage_name {
+        "validate_baseline_runtime" => vec![
+            "Expected rustynet status fields: transport_socket_identity_state=authoritative_backend_shared_transport, transport_socket_identity_error=none, encrypted_key_store=true, auto_tunnel_enforce=true, membership_active_nodes=5.".to_string(),
+            "Expected client routing on non-exit nodes: exit_node=exit-1 and `ip -4 route get 1.1.1.1` selects `dev rustynet0`.".to_string(),
+            "Expected plaintext-passphrase hygiene result: no-plaintext-passphrase-files.".to_string(),
+        ],
+        _ => vec![
+            "The report_context bundle includes the report summary, the failing stage log, and any parallel-stage evidence copied from the original report directory.".to_string(),
+        ],
+    }
+}
+
+fn copy_stage_bundle_file(
+    source: &Path,
+    destination: &Path,
+    seen_sources: &mut HashSet<PathBuf>,
+    copied_paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !source.exists() || !source.is_file() {
+        return Ok(());
+    }
+    if !seen_sources.insert(source.to_path_buf()) {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create stage bundle dir failed ({}): {err}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::copy(source, destination).map_err(|err| {
+        format!(
+            "copy stage bundle file failed ({} -> {}): {err}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    copied_paths.push(destination.to_path_buf());
+    Ok(())
+}
+
+fn copy_stage_bundle_dir(
+    source: &Path,
+    destination: &Path,
+    seen_sources: &mut HashSet<PathBuf>,
+    copied_paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !source.exists() || !source.is_dir() {
+        return Ok(());
+    }
+    if !seen_sources.insert(source.to_path_buf()) {
+        return Ok(());
+    }
+    copy_dir_recursive(source, destination)?;
+    copied_paths.push(destination.to_path_buf());
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|err| {
+        format!(
+            "create copied directory failed ({}): {err}",
+            destination.display()
+        )
+    })?;
+    for entry in fs::read_dir(source)
+        .map_err(|err| format!("read directory failed ({}): {err}", source.display()))?
+    {
+        let entry = entry
+            .map_err(|err| format!("read directory entry failed ({}): {err}", source.display()))?;
+        let entry_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("read file type failed ({}): {err}", entry_path.display()))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(entry_path.as_path(), destination_path.as_path())?;
+        } else if file_type.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "create copied file parent failed ({}): {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::copy(entry_path.as_path(), destination_path.as_path()).map_err(|err| {
+                format!(
+                    "copy directory entry failed ({} -> {}): {err}",
+                    entry_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("resolve current directory failed: {err}"))
+            .map(|cwd| cwd.join(path))
+    }
+}
+
+fn resolve_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    resolve_path(path)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn collected_at_utc_now() -> String {
+    Command::new("date")
+        .arg("-u")
+        .arg("+%FT%TZ")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| format!("unix:{}", unix_now()))
 }
 
 pub fn execute_ops_vm_lab_diff_live_lab_runs(
@@ -1683,22 +2983,37 @@ impl LiveLabProfile {
             LiveLabProfileTarget {
                 role: "exit".to_string(),
                 target: self.required("EXIT_TARGET")?,
+                utm_name: self
+                    .optional("EXIT_UTM_NAME")
+                    .filter(|value| !value.trim().is_empty()),
             },
             LiveLabProfileTarget {
                 role: "client".to_string(),
                 target: self.required("CLIENT_TARGET")?,
+                utm_name: self
+                    .optional("CLIENT_UTM_NAME")
+                    .filter(|value| !value.trim().is_empty()),
             },
         ];
-        for (key, role) in [
-            ("ENTRY_TARGET", "entry"),
-            ("AUX_TARGET", "aux"),
-            ("EXTRA_TARGET", "extra"),
-            ("FIFTH_CLIENT_TARGET", "fifth_client"),
+        for (key, utm_key, role) in [
+            ("ENTRY_TARGET", "ENTRY_UTM_NAME", "entry"),
+            ("AUX_TARGET", "AUX_UTM_NAME", "aux"),
+            ("EXTRA_TARGET", "EXTRA_UTM_NAME", "extra"),
+            (
+                "FIFTH_CLIENT_TARGET",
+                "FIFTH_CLIENT_UTM_NAME",
+                "fifth_client",
+            ),
         ] {
-            if let Some(target) = self.optional(key) {
+            if let Some(target) = self.optional(key)
+                && !target.trim().is_empty()
+            {
                 targets.push(LiveLabProfileTarget {
                     role: role.to_string(),
                     target,
+                    utm_name: self
+                        .optional(utm_key)
+                        .filter(|value| !value.trim().is_empty()),
                 });
             }
         }
@@ -1747,6 +3062,77 @@ fn load_live_lab_profile(path: &Path) -> Result<LiveLabProfile, String> {
     ensure_ssh_target("CLIENT_TARGET", profile.required("CLIENT_TARGET")?.as_str())?;
     let _ = profile.required("SSH_IDENTITY_FILE")?;
     Ok(profile)
+}
+
+fn resolve_live_lab_profile_targets(
+    inventory_path: &Path,
+    profile: &LiveLabProfile,
+) -> Result<Vec<ResolvedLiveLabTarget>, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let mut resolved = Vec::new();
+    for target in profile.configured_targets()? {
+        let remote_target = resolve_live_lab_profile_remote_target(inventory.as_slice(), &target)?;
+        resolved.push(ResolvedLiveLabTarget {
+            role: target.role.clone(),
+            profile_target: target.target.clone(),
+            remote_target,
+        });
+    }
+    Ok(resolved)
+}
+
+fn resolve_live_lab_profile_remote_target(
+    inventory: &[VmInventoryEntry],
+    profile_target: &LiveLabProfileTarget,
+) -> Result<RemoteTarget, String> {
+    if let Some(utm_name) = profile_target.utm_name.as_deref() {
+        let entry = inventory
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.controller.as_ref(),
+                    Some(VmController::LocalUtm {
+                        utm_name: entry_utm_name,
+                        ..
+                    }) if entry_utm_name == utm_name
+                )
+            })
+            .ok_or_else(|| {
+                format!(
+                    "live-lab profile target {} references UTM controller {} that is not present in inventory",
+                    profile_target.role, utm_name
+                )
+            })?;
+        let mut remote_target = remote_target_from_inventory_entry(entry, None);
+        remote_target.label = profile_target.role.clone();
+        if remote_target.ssh_user.is_none() {
+            remote_target.ssh_user =
+                ssh_target_user(profile_target.target.as_str()).map(str::to_string);
+        }
+        return Ok(remote_target);
+    }
+
+    if let Some(entry) = inventory.iter().find(|entry| {
+        resolved_inventory_ssh_target(entry) == profile_target.target
+            || normalized_ssh_target(
+                entry.ssh_target.as_str(),
+                entry.ssh_user.as_deref(),
+                profile_target.role.as_str(),
+            )
+            .map(|candidate| candidate == profile_target.target)
+            .unwrap_or(false)
+    }) {
+        let mut remote_target = remote_target_from_inventory_entry(entry, None);
+        remote_target.label = profile_target.role.clone();
+        return Ok(remote_target);
+    }
+
+    Ok(RemoteTarget {
+        label: profile_target.role.clone(),
+        ssh_target: profile_target.target.clone(),
+        ssh_user: ssh_target_user(profile_target.target.as_str()).map(str::to_string),
+        controller: None,
+    })
 }
 
 fn ensure_live_lab_profile_key(key: &str) -> Result<(), String> {
@@ -2159,6 +3545,14 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
             known_hosts_path: path.to_path_buf(),
         })?;
     }
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
 
     let targets = resolve_remote_targets(
         config.inventory_path.as_path(),
@@ -2183,9 +3577,11 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
 
     for target in &targets {
         let effective_user = target.ssh_user.as_deref();
-        match capture_remote_shell_command(
-            target.ssh_target.as_str(),
-            effective_user,
+        match capture_remote_shell_command_for_target(
+            target,
+            None,
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             build_preflight_script(
                 required_commands.as_slice(),
                 config.min_free_kib,
@@ -2283,6 +3679,30 @@ pub fn execute_ops_vm_lab_status(config: VmLabStatusConfig) -> Result<String, St
         config.raw_targets.as_slice(),
     )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_PREFLIGHT_TIMEOUT_SECS);
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
+    execute_vm_lab_status_for_targets(
+        targets.as_slice(),
+        config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )
+}
+
+fn execute_vm_lab_status_for_targets(
+    targets: &[RemoteTarget],
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut results = Vec::new();
     let mut failures = 0usize;
     let rustynet_status_script = privileged_rustynet_cli_script("status");
@@ -2306,11 +3726,13 @@ pub fn execute_ops_vm_lab_status(config: VmLabStatusConfig) -> Result<String, St
     ];
     let capture_script = build_section_capture_script(sections.as_slice());
 
-    for target in &targets {
-        let effective_user = config.ssh_user.as_deref().or(target.ssh_user.as_deref());
-        match capture_remote_shell_command(
-            target.ssh_target.as_str(),
-            effective_user,
+    for target in targets {
+        let effective_user = ssh_user_override.or(target.ssh_user.as_deref());
+        match capture_remote_shell_command_for_target(
+            target,
+            ssh_user_override,
+            ssh_identity_file,
+            known_hosts_path,
             capture_script.as_str(),
             timeout,
         ) {
@@ -2387,6 +3809,12 @@ pub fn execute_ops_vm_lab_stop(config: VmLabStopConfig) -> Result<String, String
 pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, String> {
     if let Some(service) = config.service.as_deref() {
         ensure_no_control_chars("service", service)?;
+        if config.wait_ready {
+            return Err(
+                "--wait-ready is only supported for local UTM VM restarts, not --service restarts"
+                    .to_string(),
+            );
+        }
         return execute_ops_vm_lab_run(
             VmLabExecConfig {
                 inventory_path: config.inventory_path,
@@ -2397,6 +3825,8 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                 program: "systemctl".to_string(),
                 argv: vec!["restart".to_string(), service.to_string()],
                 ssh_user: config.ssh_user,
+                ssh_identity_file: config.ssh_identity_file,
+                known_hosts_path: config.known_hosts_path,
                 sudo: true,
                 timeout_secs: config.timeout_secs,
             },
@@ -2404,21 +3834,57 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
         );
     }
 
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
+    let inventory_path = config.inventory_path.clone();
+    let utmctl_path = config.utmctl_path.clone();
+    let ready_targets = if config.wait_ready {
+        Some(resolve_start_targets(
+            inventory_path.as_path(),
+            config.vm_aliases.as_slice(),
+            config.select_all,
+        )?)
+    } else {
+        None
+    };
     let stop_result = execute_ops_vm_lab_stop(VmLabStopConfig {
-        inventory_path: config.inventory_path.clone(),
+        inventory_path: inventory_path.clone(),
         vm_aliases: config.vm_aliases.clone(),
         select_all: config.select_all,
-        utmctl_path: config.utmctl_path.clone(),
+        utmctl_path: utmctl_path.clone(),
         timeout_secs: config.timeout_secs,
     })?;
     let start_result = execute_ops_vm_lab_start(VmLabStartConfig {
-        inventory_path: config.inventory_path,
+        inventory_path,
         vm_aliases: config.vm_aliases,
         select_all: config.select_all,
-        utmctl_path: config.utmctl_path,
+        utmctl_path: utmctl_path.clone(),
         timeout_secs: config.timeout_secs,
     })?;
-    Ok(format!("{stop_result}\n{start_result}"))
+    if !config.wait_ready {
+        return Ok(format!("{stop_result}\n{start_result}"));
+    }
+
+    let ready_report = wait_for_local_utm_targets_ready(
+        ready_targets
+            .as_deref()
+            .expect("wait-ready path precomputes restart targets"),
+        utmctl_path.as_path(),
+        config.ssh_port,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout_or_default(
+            config.ready_timeout_secs,
+            DEFAULT_RESTART_READY_TIMEOUT_SECS,
+        ),
+    )?;
+    Ok(format!("{stop_result}\n{start_result}\n{ready_report}"))
 }
 
 pub fn execute_ops_vm_lab_collect_artifacts(
@@ -2431,6 +3897,14 @@ pub fn execute_ops_vm_lab_collect_artifacts(
         config.raw_targets.as_slice(),
     )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_COLLECT_TIMEOUT_SECS);
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
     let output_root = config.output_dir;
     fs::create_dir_all(output_root.as_path()).map_err(|err| {
         format!(
@@ -2438,6 +3912,24 @@ pub fn execute_ops_vm_lab_collect_artifacts(
             output_root.display()
         )
     })?;
+    execute_vm_lab_collect_artifacts_for_targets(
+        targets.as_slice(),
+        config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        output_root.as_path(),
+        timeout,
+    )
+}
+
+fn execute_vm_lab_collect_artifacts_for_targets(
+    targets: &[RemoteTarget],
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    output_root: &Path,
+    timeout: Duration,
+) -> Result<String, String> {
     let rustynet_status_script = privileged_rustynet_cli_script("status");
     let rustynet_netcheck_script = privileged_rustynet_cli_script("netcheck");
     let sections = [
@@ -2477,8 +3969,8 @@ pub fn execute_ops_vm_lab_collect_artifacts(
     let mut lines = Vec::new();
     let mut failures = Vec::new();
 
-    for target in &targets {
-        let effective_user = config.ssh_user.as_deref().or(target.ssh_user.as_deref());
+    for target in targets {
+        let effective_user = ssh_user_override.or(target.ssh_user.as_deref());
         let target_dir = output_root.join(sanitize_label_for_path(target.label.as_str()));
         fs::create_dir_all(target_dir.as_path()).map_err(|err| {
             format!(
@@ -2486,9 +3978,11 @@ pub fn execute_ops_vm_lab_collect_artifacts(
                 target_dir.display()
             )
         })?;
-        match capture_remote_shell_command(
-            target.ssh_target.as_str(),
-            effective_user,
+        match capture_remote_shell_command_for_target(
+            target,
+            ssh_user_override,
+            ssh_identity_file,
+            known_hosts_path,
             capture_script.as_str(),
             timeout,
         ) {
@@ -2585,6 +4079,14 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
     let topology = load_vm_lab_topology(config.topology_path.as_path())?;
     let inventory = load_inventory(config.inventory_path.as_path())?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
     let authority_entry = inventory
         .iter()
         .find(|entry| entry.alias == config.authority_vm)
@@ -2595,11 +4097,8 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
                 config.authority_vm
             )
         })?;
-    let authority_target = RemoteTarget {
-        label: authority_entry.alias.clone(),
-        ssh_target: authority_entry.ssh_target.clone(),
-        ssh_user: config.ssh_user.clone().or(authority_entry.ssh_user.clone()),
-    };
+    let authority_target =
+        remote_target_from_inventory_entry(&authority_entry, config.ssh_user.as_deref());
 
     let artifact_dir =
         std::env::temp_dir().join(format!("rustynet-vm-lab-state-{}", unique_suffix()));
@@ -2615,6 +4114,8 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
         inventory.as_slice(),
         timeout,
         config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
     )?;
     let allow_spec = build_allow_spec(topology.nodes.values().collect::<Vec<_>>().as_slice());
     let assignments_spec = build_assignments_spec(&topology)?;
@@ -2640,10 +4141,12 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
     let remote_assignment_env = format!("/tmp/rn-vm-lab-assignment-{}.env", unique_suffix());
     let remote_traversal_env = format!("/tmp/rn-vm-lab-traversal-{}.env", unique_suffix());
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            &authority_target,
+            config.ssh_user.as_deref(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             assignment_env_path.as_path(),
-            authority_target.ssh_target.as_str(),
-            authority_target.ssh_user.as_deref(),
             remote_assignment_env.as_str(),
             timeout,
         )
@@ -2651,10 +4154,12 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
         "copy assignment env to authority",
     )?;
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            &authority_target,
+            config.ssh_user.as_deref(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             traversal_env_path.as_path(),
-            authority_target.ssh_target.as_str(),
-            authority_target.ssh_user.as_deref(),
             remote_traversal_env.as_str(),
             timeout,
         )
@@ -2672,9 +4177,11 @@ $SUDO rm -f {assignment_env} {traversal_env}",
         assignment_env = shell_quote(remote_assignment_env.as_str()),
         traversal_env = shell_quote(remote_traversal_env.as_str()),
     );
-    let issue_status = run_remote_shell_command(
-        authority_target.ssh_target.as_str(),
-        authority_target.ssh_user.as_deref(),
+    let issue_status = run_remote_shell_command_for_target(
+        &authority_target,
+        config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
         authority_issue_script.as_str(),
         timeout,
     )
@@ -2689,15 +4196,19 @@ $SUDO rm -f {assignment_env} {traversal_env}",
     let assignment_pub_local = artifact_dir.join("rn-assignment.pub");
     let traversal_pub_local = artifact_dir.join("rn-traversal.pub");
     capture_remote_file_to_local(
-        authority_target.ssh_target.as_str(),
-        authority_target.ssh_user.as_deref(),
+        &authority_target,
+        config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
         "/run/rustynet/assignment-issue/rn-assignment.pub",
         assignment_pub_local.as_path(),
         timeout,
     )?;
     capture_remote_file_to_local(
-        authority_target.ssh_target.as_str(),
-        authority_target.ssh_user.as_deref(),
+        &authority_target,
+        config.ssh_user.as_deref(),
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
         "/run/rustynet/traversal-issue/rn-traversal.pub",
         traversal_pub_local.as_path(),
         timeout,
@@ -2715,17 +4226,16 @@ $SUDO rm -f {assignment_env} {traversal_env}",
             .find(|entry| entry.alias == node.alias)
             .cloned()
             .ok_or_else(|| format!("topology node missing from inventory: {}", node.alias))?;
-        let target = RemoteTarget {
-            label: inventory_entry.alias.clone(),
-            ssh_target: inventory_entry.ssh_target.clone(),
-            ssh_user: config.ssh_user.clone().or(inventory_entry.ssh_user.clone()),
-        };
+        let target =
+            remote_target_from_inventory_entry(&inventory_entry, config.ssh_user.as_deref());
         let assignment_local =
             artifact_dir.join(format!("rn-assignment-{}.assignment", node.node_id));
         let traversal_local = artifact_dir.join(format!("rn-traversal-{}.traversal", node.node_id));
         capture_remote_file_to_local(
-            authority_target.ssh_target.as_str(),
-            authority_target.ssh_user.as_deref(),
+            &authority_target,
+            config.ssh_user.as_deref(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             format!(
                 "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
                 node.node_id
@@ -2735,8 +4245,10 @@ $SUDO rm -f {assignment_env} {traversal_env}",
             timeout,
         )?;
         capture_remote_file_to_local(
-            authority_target.ssh_target.as_str(),
-            authority_target.ssh_user.as_deref(),
+            &authority_target,
+            config.ssh_user.as_deref(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             format!(
                 "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
                 node.node_id
@@ -2770,6 +4282,8 @@ $SUDO rm -f {assignment_env} {traversal_env}",
             traversal_pub_local.as_path(),
             traversal_local.as_path(),
             refresh_env_path.as_path(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             timeout,
         )?;
         lines.push(format!(
@@ -2847,6 +4361,14 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
     }
     let phase = normalized_bootstrap_phase(config.phase.as_str())?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
     let targets = resolve_remote_targets(
         config.inventory_path.as_path(),
         config.vm_aliases.as_slice(),
@@ -2892,6 +4414,8 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
         lines.extend(sync_repo_targets(
             &targets,
             config.ssh_user.as_deref(),
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
             sync_source,
             sync_dest_dir.as_str(),
             timeout,
@@ -2919,6 +4443,8 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
         let effective_user = config.ssh_user.as_deref().or(target.ssh_user.as_deref());
         let context = BootstrapPhaseContext {
             ssh_user: effective_user,
+            ssh_identity_file: config.ssh_identity_file.as_deref(),
+            known_hosts_path: config.known_hosts_path.as_deref(),
             workdir: workdir.as_str(),
             repo_url: config.repo_url.as_deref(),
             branch: config.branch.as_str(),
@@ -2960,10 +4486,127 @@ fn resolve_start_targets(
                 alias: entry.alias,
                 utm_name,
                 bundle_path,
+                ssh_user: entry.ssh_user,
+                last_known_ip: entry.last_known_ip,
+                mesh_ip: entry.mesh_ip,
             }),
         }
     }
     Ok(results)
+}
+
+fn wait_for_local_utm_targets_ready(
+    targets: &[StartTarget],
+    utmctl_path: &Path,
+    ssh_port: u16,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let started_at = Instant::now();
+    let ssh_port = if ssh_port == 0 { 22 } else { ssh_port };
+    let probe_timeout = Duration::from_secs(5).min(timeout);
+
+    loop {
+        let states = targets
+            .iter()
+            .map(|target| {
+                observe_local_utm_target_ready(
+                    target,
+                    utmctl_path,
+                    ssh_port,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    probe_timeout,
+                )
+            })
+            .collect::<Vec<_>>();
+        if states.iter().all(local_utm_ready_state_is_ready) {
+            return Ok(render_local_utm_ready_states(states.as_slice()));
+        }
+        if started_at.elapsed() >= timeout {
+            return Err(format!(
+                "timed out waiting for restarted local UTM VMs to become ready\n{}",
+                render_local_utm_ready_states(states.as_slice())
+            ));
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn observe_local_utm_target_ready(
+    target: &StartTarget,
+    utmctl_path: &Path,
+    ssh_port: u16,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    timeout: Duration,
+) -> LocalUtmReadyState {
+    let process_present =
+        local_utm_process_present(target.bundle_path.as_path(), timeout).unwrap_or(false);
+    let live_ip = resolve_local_utm_live_host_by_name(
+        target.utm_name.as_str(),
+        target.last_known_ip.as_deref(),
+        target.mesh_ip.as_deref(),
+        utmctl_path,
+    );
+    let ssh_port_status = match live_ip.as_deref() {
+        Some(ip) => probe_tcp_port_status(ip, ssh_port, timeout)
+            .map(|(status, _)| status)
+            .unwrap_or_else(|_| "unknown".to_string()),
+        None => "unavailable".to_string(),
+    };
+    let ssh_auth_status = match (live_ip.as_deref(), target.ssh_user.as_deref()) {
+        (None, _) => "skipped-no-live-ip".to_string(),
+        (_, None) => "skipped-no-ssh-user".to_string(),
+        (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_string(),
+        (Some(ip), Some(ssh_user)) => {
+            match run_remote_shell_command(
+                ip,
+                Some(ssh_user),
+                ssh_identity_file,
+                known_hosts_path,
+                "true",
+                timeout,
+            ) {
+                Ok(status) if status.success() => "ok".to_string(),
+                Ok(status) => format!("failed-exit-{}", status_code(status)),
+                Err(err) => format!("error:{err}"),
+            }
+        }
+    };
+    LocalUtmReadyState {
+        alias: target.alias.clone(),
+        utm_name: target.utm_name.clone(),
+        process_present,
+        live_ip,
+        ssh_port_status,
+        ssh_auth_status,
+    }
+}
+
+fn local_utm_ready_state_is_ready(state: &LocalUtmReadyState) -> bool {
+    state.process_present
+        && state.live_ip.is_some()
+        && state.ssh_port_status == "open"
+        && matches!(state.ssh_auth_status.as_str(), "ok" | "skipped-no-ssh-user")
+}
+
+fn render_local_utm_ready_states(states: &[LocalUtmReadyState]) -> String {
+    states
+        .iter()
+        .map(|state| {
+            format!(
+                "{} ready process_present={} live_ip={} ssh_port_status={} ssh_auth_status={}",
+                state.alias,
+                state.process_present,
+                state.live_ip.as_deref().unwrap_or("unavailable"),
+                state.ssh_port_status,
+                state.ssh_auth_status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn resolve_remote_targets(
@@ -2984,11 +4627,7 @@ fn resolve_remote_targets(
                 entry.ssh_target
             );
             if seen.insert(key) {
-                resolved.push(RemoteTarget {
-                    label: entry.alias,
-                    ssh_target: entry.ssh_target,
-                    ssh_user: entry.ssh_user,
-                });
+                resolved.push(remote_target_from_inventory_entry(&entry, None));
             }
         }
     }
@@ -3001,6 +4640,7 @@ fn resolve_remote_targets(
                 label: raw_target.clone(),
                 ssh_target: raw_target.clone(),
                 ssh_user: None,
+                controller: None,
             });
         }
     }
@@ -3055,8 +4695,9 @@ fn resolve_role_target_from_inventory(
         .into_iter()
         .find(|entry| entry.alias == alias)
         .ok_or_else(|| format!("unknown VM alias for {role_label} target: {alias}"))?;
+    let resolved_target = resolved_inventory_ssh_target(&entry);
     let normalized_target = normalized_ssh_target(
-        entry.ssh_target.as_str(),
+        resolved_target.as_str(),
         entry.ssh_user.as_deref(),
         role_label,
     )?;
@@ -3064,6 +4705,9 @@ fn resolve_role_target_from_inventory(
         label: entry.alias,
         normalized_target,
         network_group: entry.network_group,
+        utm_name: entry
+            .controller
+            .map(|VmController::LocalUtm { utm_name, .. }| utm_name),
     })
 }
 
@@ -3078,6 +4722,7 @@ fn resolve_role_target_from_raw(role_label: &str, raw_target: &str) -> Result<Ro
         label: raw_target.to_string(),
         normalized_target: raw_target.to_string(),
         network_group: None,
+        utm_name: None,
     })
 }
 
@@ -3097,6 +4742,242 @@ fn normalized_ssh_target(
     })?;
     ensure_ssh_user(ssh_user)?;
     Ok(format!("{ssh_user}@{ssh_target}"))
+}
+
+fn remote_target_from_inventory_entry(
+    entry: &VmInventoryEntry,
+    ssh_user_override: Option<&str>,
+) -> RemoteTarget {
+    RemoteTarget {
+        label: entry.alias.clone(),
+        ssh_target: resolved_inventory_ssh_target(entry),
+        ssh_user: ssh_user_override
+            .map(ToString::to_string)
+            .or_else(|| entry.ssh_user.clone()),
+        controller: entry.controller.clone(),
+    }
+}
+
+fn resolved_inventory_ssh_target(entry: &VmInventoryEntry) -> String {
+    resolved_inventory_ssh_target_with_utmctl(entry, default_utmctl_path().as_path())
+}
+
+fn resolved_inventory_ssh_target_with_utmctl(
+    entry: &VmInventoryEntry,
+    utmctl_path: &Path,
+) -> String {
+    resolve_local_utm_live_host(entry, utmctl_path)
+        .map(|host| rewrite_ssh_target_host(entry.ssh_target.as_str(), host.as_str()))
+        .unwrap_or_else(|| entry.ssh_target.clone())
+}
+
+fn resolve_local_utm_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
+    let utm_name = match entry.controller.as_ref()? {
+        VmController::LocalUtm { utm_name, .. } => utm_name,
+    };
+    resolve_local_utm_live_host_by_name(
+        utm_name.as_str(),
+        entry.last_known_ip.as_deref(),
+        entry.mesh_ip.as_deref(),
+        utmctl_path,
+    )
+}
+
+fn resolve_local_utm_live_host_by_name(
+    utm_name: &str,
+    last_known_ip: Option<&str>,
+    mesh_ip: Option<&str>,
+    utmctl_path: &Path,
+) -> Option<String> {
+    if !utmctl_path.is_file() {
+        return None;
+    }
+    let mut command = Command::new(utmctl_path);
+    command.arg("ip-address").arg(utm_name);
+    let output = run_output_with_timeout(
+        &mut command,
+        Duration::from_secs(DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS),
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    select_live_ssh_host_from_utm_output(stdout.as_str(), last_known_ip, mesh_ip)
+}
+
+fn matches_local_utm_inventory_entry(
+    entry: &VmInventoryEntry,
+    bundle_path: &Path,
+    utm_name: &str,
+) -> bool {
+    let Some(VmController::LocalUtm {
+        utm_name: inventory_utm_name,
+        bundle_path: inventory_bundle_path,
+    }) = entry.controller.as_ref()
+    else {
+        return false;
+    };
+    if inventory_utm_name == utm_name {
+        return true;
+    }
+    match (
+        fs::canonicalize(bundle_path),
+        fs::canonicalize(inventory_bundle_path.as_path()),
+    ) {
+        (Ok(observed), Ok(expected)) => observed == expected,
+        _ => false,
+    }
+}
+
+fn probe_tcp_port_status(
+    ip: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(String, Option<String>), String> {
+    let parsed_ip = ip
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|err| format!("invalid SSH probe IP {ip:?}: {err}"))?;
+    let socket = SocketAddr::new(parsed_ip, port);
+    match TcpStream::connect_timeout(&socket, timeout) {
+        Ok(_) => Ok(("open".to_string(), None)),
+        Err(err) => Ok(("closed".to_string(), Some(format!("{err}")))),
+    }
+}
+
+fn discover_local_utm_bundle_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut bundles = Vec::new();
+    discover_local_utm_bundle_paths_recursive(root, &mut bundles)?;
+    bundles.sort();
+    bundles.dedup();
+    Ok(bundles)
+}
+
+fn discover_local_utm_bundle_paths_recursive(
+    current: &Path,
+    bundles: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|err| {
+            format!(
+                "read UTM documents directory failed ({}): {err}",
+                current.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("read file type failed ({}): {err}", path.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if path.extension().and_then(|value| value.to_str()) == Some("utm") {
+                bundles.push(fs::canonicalize(path.as_path()).map_err(|err| {
+                    format!("canonicalize UTM bundle failed ({}): {err}", path.display())
+                })?);
+            } else {
+                discover_local_utm_bundle_paths_recursive(path.as_path(), bundles)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn select_live_ssh_host_from_utm_output(
+    output: &str,
+    last_known_ip: Option<&str>,
+    mesh_ip: Option<&str>,
+) -> Option<String> {
+    let candidates = output
+        .lines()
+        .filter_map(|line| line.trim().parse::<IpAddr>().ok())
+        .collect::<Vec<_>>();
+    select_preferred_live_ssh_ip(candidates.as_slice(), last_known_ip, mesh_ip)
+        .map(|ip| ip.to_string())
+}
+
+fn select_preferred_live_ssh_ip(
+    candidates: &[IpAddr],
+    last_known_ip: Option<&str>,
+    mesh_ip: Option<&str>,
+) -> Option<IpAddr> {
+    let last_known_ip = last_known_ip.and_then(|value| value.parse::<IpAddr>().ok());
+    let mesh_ip = mesh_ip.and_then(|value| value.parse::<IpAddr>().ok());
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| is_viable_live_ssh_ip(*candidate))
+        .filter(|candidate| Some(*candidate) != mesh_ip)
+        .max_by_key(|candidate| live_ssh_ip_score(*candidate, last_known_ip))
+}
+
+fn is_viable_live_ssh_ip(candidate: IpAddr) -> bool {
+    match candidate {
+        IpAddr::V4(addr) => !(addr.is_unspecified() || addr.is_loopback() || addr.is_multicast()),
+        IpAddr::V6(addr) => {
+            !(addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_multicast()
+                || addr.is_unicast_link_local())
+        }
+    }
+}
+
+fn live_ssh_ip_score(candidate: IpAddr, last_known_ip: Option<IpAddr>) -> i32 {
+    let mut score = 0;
+    if Some(candidate) == last_known_ip {
+        score += 100;
+    }
+    if let Some(last_known_ip) = last_known_ip
+        && std::mem::discriminant(&candidate) == std::mem::discriminant(&last_known_ip)
+    {
+        score += 40;
+    }
+    match candidate {
+        IpAddr::V4(addr) => {
+            score += 30;
+            if addr.is_private() {
+                score += 20;
+            }
+            if ipv4_is_shared_address_space(addr) {
+                score -= 10;
+            }
+        }
+        IpAddr::V6(addr) => {
+            if !addr.is_unique_local() {
+                score += 5;
+            }
+        }
+    }
+    score
+}
+
+fn ipv4_is_shared_address_space(addr: std::net::Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+}
+
+fn rewrite_ssh_target_host(ssh_target: &str, new_host: &str) -> String {
+    let formatted_host = if new_host.contains(':') {
+        format!("[{new_host}]")
+    } else {
+        new_host.to_string()
+    };
+    match ssh_target.rsplit_once('@') {
+        Some((user, _)) => format!("{user}@{formatted_host}"),
+        None => formatted_host,
+    }
+}
+
+fn literal_ip_host_from_ssh_target(ssh_target: &str) -> Option<String> {
+    let host = ssh_target_host(ssh_target);
+    host.parse::<IpAddr>().ok().map(|_| host)
 }
 
 fn select_inventory_entries(
@@ -3662,6 +5543,13 @@ fn prepare_local_source_bundle_extras(
         let stderr = String::from_utf8_lossy(output.stderr.as_slice())
             .trim()
             .to_string();
+        if stderr.contains("--offline was specified")
+            || stderr.contains("failed to download")
+            || stderr.contains("failed to sync")
+        {
+            let _ = fs::remove_dir_all(temp_root.as_path());
+            return Ok(None);
+        }
         let _ = fs::remove_dir_all(temp_root.as_path());
         return Err(format!(
             "prepare vendored cargo dependencies failed with status {}{}",
@@ -3847,27 +5735,47 @@ fn should_skip_raw_local_source_path(relative: &Path) -> bool {
 
 fn sync_local_source_archive_to_target(
     archive_path: &Path,
-    target: &str,
-    ssh_user: Option<&str>,
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     dest_dir: &str,
     timeout: Duration,
 ) -> Result<(), String> {
     ensure_local_regular_file_path(archive_path, "local source archive")?;
     // These guest images accept SFTP writes into the SSH user's home directory
     // reliably, while absolute /tmp uploads are rejected on some hosts.
-    let remote_archive = format!(".rn-vm-lab-source-{}.tar", unique_suffix());
+    let remote_archive = if remote_target_local_utm(target).is_some() {
+        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+        format!(
+            "{}/.rn-vm-lab-source-{}.tar",
+            remote_target_home(ssh_user.as_str()),
+            unique_suffix()
+        )
+    } else {
+        format!(".rn-vm-lab-source-{}.tar", unique_suffix())
+    };
     ensure_success_status(
-        scp_to_remote(
-            archive_path,
+        scp_to_remote_for_target(
             target,
-            ssh_user,
+            ssh_user_override,
+            ssh_identity_file,
+            known_hosts_path,
+            archive_path,
             remote_archive.as_str(),
             timeout,
         )?,
         "copy local source archive to remote",
     )?;
     let extract_script = build_local_source_extract_script(dest_dir, remote_archive.as_str())?;
-    let status = run_remote_shell_command(target, ssh_user, extract_script.as_str(), timeout)?;
+    let status = run_remote_shell_command_for_target(
+        target,
+        ssh_user_override,
+        ssh_identity_file,
+        known_hosts_path,
+        extract_script.as_str(),
+        timeout,
+    )?;
     ensure_success_status(status, "extract local source archive on remote")
 }
 
@@ -3897,9 +5805,649 @@ fn build_remote_argv_script(
     Ok(format!("set -eu; cd {}; {}", shell_quote(workdir), command))
 }
 
+fn ensure_optional_local_regular_file_path(path: Option<&Path>, label: &str) -> Result<(), String> {
+    if let Some(path) = path {
+        ensure_local_regular_file_path(path, label)?;
+    }
+    Ok(())
+}
+
+fn append_ssh_transport_options(
+    command: &mut Command,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+) -> Result<(), String> {
+    ensure_optional_local_regular_file_path(ssh_identity_file, "SSH identity file")?;
+    ensure_optional_local_regular_file_path(known_hosts_path, "SSH known_hosts file")?;
+    if let Some(path) = ssh_identity_file {
+        command.arg("-i").arg(path);
+    }
+    if let Some(path) = known_hosts_path {
+        command
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile={}", path.display()));
+    }
+    Ok(())
+}
+
+fn remote_target_local_utm(target: &RemoteTarget) -> Option<(&str, &Path)> {
+    match target.controller.as_ref() {
+        Some(VmController::LocalUtm {
+            utm_name,
+            bundle_path,
+        }) => Some((utm_name.as_str(), bundle_path.as_path())),
+        None => None,
+    }
+}
+
+fn remote_target_effective_user(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+) -> Result<String, String> {
+    if let Some(ssh_user) = ssh_user_override {
+        ensure_ssh_user(ssh_user)?;
+        return Ok(ssh_user.to_string());
+    }
+    if let Some(ssh_user) = target.ssh_user.as_deref() {
+        ensure_ssh_user(ssh_user)?;
+        return Ok(ssh_user.to_string());
+    }
+    if let Some(ssh_user) = ssh_target_user(target.ssh_target.as_str()) {
+        ensure_ssh_user(ssh_user)?;
+        return Ok(ssh_user.to_string());
+    }
+    Err(format!(
+        "UTM-backed target {} requires an explicit ssh_user or user@host SSH target",
+        target.label
+    ))
+}
+
+fn remote_target_home(ssh_user: &str) -> String {
+    if ssh_user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{ssh_user}")
+    }
+}
+
+fn utmctl_binary_path() -> Result<PathBuf, String> {
+    let path = default_utmctl_path();
+    if !path.is_file() {
+        return Err(format!("utmctl binary is not present: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn utm_push_raw(
+    utm_name: &str,
+    src: &Path,
+    dst: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    ensure_local_regular_file_path(src, "UTM push source file")?;
+    ensure_no_control_chars("UTM push destination path", dst)?;
+    let utmctl_path = utmctl_binary_path()?;
+    let stdin = fs::File::open(src)
+        .map_err(|err| format!("open UTM push source failed ({}): {err}", src.display()))?;
+    let mut command = Command::new(utmctl_path);
+    command.arg("file").arg("push").arg(utm_name).arg(dst);
+    command.stdin(Stdio::from(stdin));
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    run_status_with_timeout_preserve(&mut command, timeout)
+}
+
+fn utm_pull_raw(
+    utm_name: &str,
+    src: &str,
+    dst: &Path,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    ensure_no_control_chars("UTM pull source path", src)?;
+    let utmctl_path = utmctl_binary_path()?;
+    let parent = dst.parent().filter(|path| !path.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create UTM pull destination dir failed ({}): {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let stdout = fs::File::create(dst).map_err(|err| {
+        format!(
+            "create UTM pull destination failed ({}): {err}",
+            dst.display()
+        )
+    })?;
+    let mut command = Command::new(utmctl_path);
+    command.arg("file").arg("pull").arg(utm_name).arg(src);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::from(stdout));
+    command.stderr(Stdio::null());
+    run_status_with_timeout_preserve(&mut command, timeout)
+}
+
+fn utm_exec_root_raw(
+    utm_name: &str,
+    command_script: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    ensure_no_control_chars("UTM exec command", command_script)?;
+    let utmctl_path = utmctl_binary_path()?;
+    let mut command = Command::new(utmctl_path);
+    command
+        .arg("exec")
+        .arg(utm_name)
+        .arg("--cmd")
+        .arg("/bin/bash")
+        .arg("-lc")
+        .arg(command_script);
+    run_status_with_timeout(&mut command, timeout)
+}
+
+fn utm_cleanup_exec_files(
+    utm_name: &str,
+    remote_script: &str,
+    remote_wrapper: &str,
+    remote_output: &str,
+    remote_rc: &str,
+) {
+    let cleanup = format!(
+        "rm -f {} {} {} {}",
+        shell_quote(remote_script),
+        shell_quote(remote_wrapper),
+        shell_quote(remote_output),
+        shell_quote(remote_rc),
+    );
+    let _ = utm_exec_root_raw(utm_name, cleanup.as_str(), Duration::from_secs(20));
+}
+
+fn execute_utm_remote_script_as_user(
+    utm_name: &str,
+    ssh_user: &str,
+    home: &str,
+    remote_script: &str,
+    timeout: Duration,
+) -> Result<(i32, String), String> {
+    ensure_ssh_user(ssh_user)?;
+    ensure_no_control_chars("UTM exec home", home)?;
+    if remote_script.chars().any(|ch| ch == '\0') {
+        return Err("UTM remote script contains unsupported NUL byte".to_string());
+    }
+
+    let temp_root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-{}", unique_suffix()));
+    fs::create_dir_all(temp_root.as_path()).map_err(|err| {
+        format!(
+            "create local UTM helper dir failed ({}): {err}",
+            temp_root.display()
+        )
+    })?;
+    let local_script = temp_root.join("command.sh");
+    let local_wrapper = temp_root.join("wrapper.sh");
+    let local_output = temp_root.join("output.txt");
+    let local_rc = temp_root.join("rc.txt");
+    fs::write(
+        local_script.as_path(),
+        format!("#!/usr/bin/env bash\nset -euo pipefail\n{remote_script}\n").as_bytes(),
+    )
+    .map_err(|err| {
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        format!(
+            "write local UTM command script failed ({}): {err}",
+            local_script.display()
+        )
+    })?;
+    fs::write(
+        local_wrapper.as_path(),
+        br#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 5 ]]; then
+  echo "usage: rn-utm-wrapper.sh <user> <home> <command-script> <output-path> <rc-path>" >&2
+  exit 2
+fi
+
+user="$1"
+home="$2"
+command_script="$3"
+output_path="$4"
+rc_path="$5"
+rc=0
+
+if [[ "$user" == "root" ]]; then
+  chmod 700 "$command_script"
+  if /usr/bin/env HOME="$home" USER=root LOGNAME=root PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    /bin/bash "$command_script" >"$output_path" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+else
+  chmod 755 "$command_script"
+  if runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    /bin/bash "$command_script" >"$output_path" 2>&1
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+fi
+
+printf '%s\n' "$rc" > "$rc_path"
+sync "$output_path" "$rc_path" >/dev/null 2>&1 || sync >/dev/null 2>&1 || true
+exit 0
+"#,
+    )
+    .map_err(|err| {
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        format!(
+            "write local UTM wrapper script failed ({}): {err}",
+            local_wrapper.display()
+        )
+    })?;
+
+    let remote_base = format!("/var/tmp/rn-utm-exec.{}", unique_suffix());
+    let remote_command_path = format!("{remote_base}.sh");
+    let remote_wrapper_path = format!("{remote_base}.wrapper.sh");
+    let remote_output_path = format!("{remote_base}.out");
+    let remote_rc_path = format!("{remote_base}.rc");
+
+    let push_timeout = timeout.min(Duration::from_secs(60));
+    for (path, destination, label) in [
+        (
+            local_script.as_path(),
+            remote_command_path.as_str(),
+            "command",
+        ),
+        (
+            local_wrapper.as_path(),
+            remote_wrapper_path.as_str(),
+            "wrapper",
+        ),
+    ] {
+        let status = utm_push_raw(utm_name, path, destination, push_timeout).map_err(|err| {
+            let _ = fs::remove_dir_all(temp_root.as_path());
+            format!("UTM push {label} script failed: {err}")
+        })?;
+        if !status.success() {
+            let _ = fs::remove_dir_all(temp_root.as_path());
+            return Err(format!(
+                "UTM push {label} script failed with status {}",
+                status_code(status)
+            ));
+        }
+    }
+
+    let host_status = {
+        let utmctl_path = utmctl_binary_path()?;
+        let mut command = Command::new(utmctl_path);
+        command
+            .arg("exec")
+            .arg(utm_name)
+            .arg("--cmd")
+            .arg("/bin/bash")
+            .arg(remote_wrapper_path.as_str())
+            .arg(ssh_user)
+            .arg(home)
+            .arg(remote_command_path.as_str())
+            .arg(remote_output_path.as_str())
+            .arg(remote_rc_path.as_str());
+        run_status_with_timeout(&mut command, timeout + Duration::from_secs(30))?
+    };
+    if !host_status.success() {
+        utm_cleanup_exec_files(
+            utm_name,
+            remote_command_path.as_str(),
+            remote_wrapper_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        );
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        return Err(format!(
+            "UTM exec wrapper failed with status {}",
+            status_code(host_status)
+        ));
+    }
+
+    let max_rc_attempts = timeout.as_secs().max(10);
+    let mut rc = None;
+    for attempt in 1..=max_rc_attempts {
+        let rc_status = utm_pull_raw(
+            utm_name,
+            remote_rc_path.as_str(),
+            local_rc.as_path(),
+            push_timeout,
+        )?;
+        if rc_status.success()
+            && let Ok(rc_text) = fs::read_to_string(local_rc.as_path())
+            && let Ok(parsed_rc) = rc_text.trim().parse::<i32>()
+        {
+            rc = Some(parsed_rc);
+            break;
+        }
+        if attempt < max_rc_attempts {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let rc = if let Some(rc) = rc {
+        rc
+    } else {
+        utm_cleanup_exec_files(
+            utm_name,
+            remote_command_path.as_str(),
+            remote_wrapper_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        );
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        return Err(format!(
+            "parse local UTM exit-code failed ({}): cannot parse integer from empty string",
+            local_rc.display()
+        ));
+    };
+    let output_status = utm_pull_raw(
+        utm_name,
+        remote_output_path.as_str(),
+        local_output.as_path(),
+        push_timeout,
+    )?;
+    if !output_status.success() {
+        utm_cleanup_exec_files(
+            utm_name,
+            remote_command_path.as_str(),
+            remote_wrapper_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        );
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        return Err(format!(
+            "UTM exec output pull failed with status {}",
+            status_code(output_status)
+        ));
+    }
+
+    let output_bytes = fs::read(local_output.as_path()).map_err(|err| {
+        utm_cleanup_exec_files(
+            utm_name,
+            remote_command_path.as_str(),
+            remote_wrapper_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        );
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        format!(
+            "read local UTM output file failed ({}): {err}",
+            local_output.display()
+        )
+    })?;
+    let output = String::from_utf8(output_bytes).map_err(|err| {
+        utm_cleanup_exec_files(
+            utm_name,
+            remote_command_path.as_str(),
+            remote_wrapper_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        );
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        format!("UTM remote output was not valid UTF-8: {err}")
+    })?;
+
+    utm_cleanup_exec_files(
+        utm_name,
+        remote_command_path.as_str(),
+        remote_wrapper_path.as_str(),
+        remote_output_path.as_str(),
+        remote_rc_path.as_str(),
+    );
+    let _ = fs::remove_dir_all(temp_root.as_path());
+    Ok((rc, output))
+}
+
+fn synthetic_exit_status(code: i32) -> ExitStatus {
+    let normalized = code.clamp(0, 255);
+    ExitStatus::from_raw(normalized << 8)
+}
+
+fn fallback_remote_shell_command_to_ssh(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    remote_script: &str,
+    timeout: Duration,
+    utm_error: &str,
+) -> Result<ExitStatus, String> {
+    run_remote_shell_command(
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        remote_script,
+        timeout,
+    )
+    .map_err(|ssh_err| {
+        format!(
+            "UTM transport failed for {} ({utm_error}); SSH fallback failed: {ssh_err}",
+            target.label
+        )
+    })
+}
+
+fn fallback_capture_remote_shell_command_to_ssh(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    remote_script: &str,
+    timeout: Duration,
+    utm_error: &str,
+) -> Result<String, String> {
+    capture_remote_shell_command(
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        remote_script,
+        timeout,
+    )
+    .map_err(|ssh_err| {
+        format!(
+            "UTM transport failed for {} ({utm_error}); SSH fallback failed: {ssh_err}",
+            target.label
+        )
+    })
+}
+
+fn fallback_scp_to_remote(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    src: &Path,
+    dst: &str,
+    timeout: Duration,
+    utm_error: &str,
+) -> Result<ExitStatus, String> {
+    scp_to_remote(
+        src,
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        dst,
+        timeout,
+    )
+    .map_err(|ssh_err| {
+        format!(
+            "UTM transport failed for {} ({utm_error}); SSH fallback failed: {ssh_err}",
+            target.label
+        )
+    })
+}
+
+fn run_remote_shell_command_for_target(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    remote_script: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    if let Some((utm_name, _)) = remote_target_local_utm(target) {
+        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+        let home = remote_target_home(ssh_user.as_str());
+        let (rc, _) = match execute_utm_remote_script_as_user(
+            utm_name,
+            ssh_user.as_str(),
+            home.as_str(),
+            remote_script,
+            timeout,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                return fallback_remote_shell_command_to_ssh(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    remote_script,
+                    timeout,
+                    err.as_str(),
+                );
+            }
+        };
+        return Ok(synthetic_exit_status(rc));
+    }
+    run_remote_shell_command(
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        remote_script,
+        timeout,
+    )
+}
+
+fn capture_remote_shell_command_for_target(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    remote_script: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    if let Some((utm_name, _)) = remote_target_local_utm(target) {
+        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+        let home = remote_target_home(ssh_user.as_str());
+        let (rc, output) = match execute_utm_remote_script_as_user(
+            utm_name,
+            ssh_user.as_str(),
+            home.as_str(),
+            remote_script,
+            timeout,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                return fallback_capture_remote_shell_command_to_ssh(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    remote_script,
+                    timeout,
+                    err.as_str(),
+                );
+            }
+        };
+        if rc != 0 {
+            return Err(format!("remote command exited with status {rc}"));
+        }
+        return Ok(output);
+    }
+    capture_remote_shell_command(
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        remote_script,
+        timeout,
+    )
+}
+
+fn scp_to_remote_for_target(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    src: &Path,
+    dst: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    if let Some((utm_name, _)) = remote_target_local_utm(target) {
+        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+        let status = match utm_push_raw(utm_name, src, dst, timeout) {
+            Ok(status) if status.success() => status,
+            Ok(status) => {
+                return fallback_scp_to_remote(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    src,
+                    dst,
+                    timeout,
+                    format!("UTM push failed with status {}", status_code(status)).as_str(),
+                );
+            }
+            Err(err) => {
+                return fallback_scp_to_remote(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    src,
+                    dst,
+                    timeout,
+                    err.as_str(),
+                );
+            }
+        };
+        if ssh_user != "root" {
+            let chown_status = utm_exec_root_raw(
+                utm_name,
+                format!(
+                    "chown {}:{} {}",
+                    shell_quote(ssh_user.as_str()),
+                    shell_quote(ssh_user.as_str()),
+                    shell_quote(dst),
+                )
+                .as_str(),
+                Duration::from_secs(20),
+            )?;
+            if !chown_status.success() {
+                return Ok(chown_status);
+            }
+        }
+        return Ok(status);
+    }
+    scp_to_remote(
+        src,
+        target.ssh_target.as_str(),
+        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_identity_file,
+        known_hosts_path,
+        dst,
+        timeout,
+    )
+}
+
 fn run_remote_shell_command(
     target: &str,
     ssh_user: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     remote_script: &str,
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
@@ -3922,6 +6470,7 @@ fn run_remote_shell_command(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-l").arg(ssh_user);
     }
@@ -3932,6 +6481,8 @@ fn run_remote_shell_command(
 fn capture_remote_shell_command(
     target: &str,
     ssh_user: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     remote_script: &str,
     timeout: Duration,
 ) -> Result<String, String> {
@@ -3954,6 +6505,7 @@ fn capture_remote_shell_command(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-l").arg(ssh_user);
     }
@@ -3973,6 +6525,8 @@ fn scp_to_remote(
     src: &Path,
     target: &str,
     ssh_user: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     dst: &str,
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
@@ -3992,6 +6546,7 @@ fn scp_to_remote(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-o").arg(format!("User={ssh_user}"));
     }
@@ -4003,10 +6558,17 @@ fn scp_to_remote(
 }
 
 fn run_status_with_timeout(command: &mut Command, timeout: Duration) -> Result<ExitStatus, String> {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    run_status_with_timeout_preserve(command, timeout)
+}
+
+fn run_status_with_timeout_preserve(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
     let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("spawn failed: {err}"))?;
     let started_at = Instant::now();
@@ -4030,10 +6592,17 @@ fn run_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    run_output_with_timeout_preserve(command, timeout)
+}
+
+fn run_output_with_timeout_preserve(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("spawn failed: {err}"))?;
     let started_at = Instant::now();
@@ -4088,26 +6657,61 @@ fn transition_local_utm_vm(
     expected_process_present: bool,
     timeout: Duration,
 ) -> Result<(), String> {
+    transition_local_utm_vm_with_process_probe(
+        utmctl_path,
+        Path::new("ps"),
+        utm_name,
+        bundle_path,
+        action,
+        expected_process_present,
+        timeout,
+    )
+}
+
+fn transition_local_utm_vm_with_process_probe(
+    utmctl_path: &Path,
+    ps_path: &Path,
+    utm_name: &str,
+    bundle_path: &Path,
+    action: &str,
+    expected_process_present: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let observed = local_utm_process_present_with_ps(ps_path, bundle_path, timeout)?;
+    if observed == expected_process_present {
+        return Ok(());
+    }
+
     let mut command = Command::new(utmctl_path);
     command.arg(action).arg(utm_name);
     let status = run_status_with_timeout(&mut command, timeout)?;
     if !status.success() {
+        let observed = local_utm_process_present_with_ps(ps_path, bundle_path, timeout)?;
+        if observed == expected_process_present {
+            return Ok(());
+        }
         return Err(format!(
             "{action} exited with status {}",
             status_code(status)
         ));
     }
-    wait_for_local_utm_process_state(bundle_path, expected_process_present, timeout)
+    wait_for_local_utm_process_state_with_ps(
+        ps_path,
+        bundle_path,
+        expected_process_present,
+        timeout,
+    )
 }
 
-fn wait_for_local_utm_process_state(
+fn wait_for_local_utm_process_state_with_ps(
+    ps_path: &Path,
     bundle_path: &Path,
     expected_present: bool,
     timeout: Duration,
 ) -> Result<(), String> {
     let started_at = Instant::now();
     loop {
-        let observed = local_utm_process_present(bundle_path, timeout)?;
+        let observed = local_utm_process_present_with_ps(ps_path, bundle_path, timeout)?;
         if observed == expected_present {
             return Ok(());
         }
@@ -4123,8 +6727,16 @@ fn wait_for_local_utm_process_state(
 }
 
 fn local_utm_process_present(bundle_path: &Path, timeout: Duration) -> Result<bool, String> {
-    let mut command = Command::new("ps");
-    command.args(["ax", "-o", "command"]);
+    local_utm_process_present_with_ps(Path::new("ps"), bundle_path, timeout)
+}
+
+fn local_utm_process_present_with_ps(
+    ps_path: &Path,
+    bundle_path: &Path,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let mut command = Command::new(ps_path);
+    command.args(["axww", "-o", "command"]);
     let output = run_output_with_timeout(&mut command, timeout)?;
     if !output.status.success() {
         return Err(format!(
@@ -4275,6 +6887,10 @@ fn ssh_target_host(value: &str) -> String {
         .to_string()
 }
 
+fn ssh_target_user(value: &str) -> Option<&str> {
+    value.rsplit_once('@').map(|(user, _)| user)
+}
+
 fn resolve_known_hosts_targets(
     inventory: &[VmInventoryEntry],
     aliases: &[String],
@@ -4285,7 +6901,19 @@ fn resolve_known_hosts_targets(
     let mut seen = HashSet::new();
     if select_all || !aliases.is_empty() {
         for entry in select_inventory_entries(inventory, aliases, select_all)? {
-            let mut candidates = vec![ssh_target_host(entry.ssh_target.as_str())];
+            let mut candidates = Vec::new();
+            let live_host = ssh_target_host(resolved_inventory_ssh_target(&entry).as_str());
+            if !live_host.is_empty() {
+                candidates.push(live_host);
+            }
+            let inventory_host = ssh_target_host(entry.ssh_target.as_str());
+            if !inventory_host.is_empty()
+                && !candidates
+                    .iter()
+                    .any(|candidate| candidate == &inventory_host)
+            {
+                candidates.push(inventory_host);
+            }
             if let Some(last_known_ip) = entry.last_known_ip.as_deref()
                 && !candidates
                     .iter()
@@ -4435,8 +7063,9 @@ fn build_vm_lab_topology(entries: &[VmInventoryEntry], suite: &str) -> Result<Va
     let mut roles = BTreeMap::new();
     let mut nodes = Vec::new();
     for entry in entries {
+        let resolved_target = resolved_inventory_ssh_target(entry);
         let normalized_target = normalized_ssh_target(
-            entry.ssh_target.as_str(),
+            resolved_target.as_str(),
             entry.ssh_user.as_deref(),
             entry.alias.as_str(),
         )?;
@@ -4477,7 +7106,8 @@ fn build_vm_lab_topology(entries: &[VmInventoryEntry], suite: &str) -> Result<Va
             "lab_role": lab_role,
             "network_id": network_id,
             "mesh_ip": entry.mesh_ip,
-            "last_known_ip": entry.last_known_ip,
+            "last_known_ip": literal_ip_host_from_ssh_target(normalized_target.as_str())
+                .or_else(|| entry.last_known_ip.clone()),
             "exit_capable": entry.exit_capable.unwrap_or(false),
             "relay_capable": entry.relay_capable.unwrap_or(false),
             "rustynet_src_dir": entry.rustynet_src_dir,
@@ -4653,6 +7283,8 @@ fn build_nodes_spec(
     inventory: &[VmInventoryEntry],
     timeout: Duration,
     ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
 ) -> Result<String, String> {
     let mut parts = Vec::new();
     for node in nodes {
@@ -4661,21 +7293,15 @@ fn build_nodes_spec(
             .find(|entry| entry.alias == node.alias)
             .cloned()
             .ok_or_else(|| format!("topology alias missing from inventory: {}", node.alias))?;
-        let target = RemoteTarget {
-            label: inventory_entry.alias.clone(),
-            ssh_target: inventory_entry.ssh_target.clone(),
-            ssh_user: ssh_user_override
-                .map(ToString::to_string)
-                .or(inventory_entry.ssh_user.clone()),
-        };
-        let pubkey_hex = collect_public_key_hex_for_target(&target, timeout)?;
-        let underlay_ip = node
-            .last_known_ip
-            .clone()
-            .or_else(|| {
-                let host = ssh_target_host(node.normalized_target.as_str());
-                host.parse::<IpAddr>().ok().map(|_| host)
-            })
+        let target = remote_target_from_inventory_entry(&inventory_entry, ssh_user_override);
+        let pubkey_hex = collect_public_key_hex_for_target(
+            &target,
+            ssh_identity_file,
+            known_hosts_path,
+            timeout,
+        )?;
+        let underlay_ip = literal_ip_host_from_ssh_target(node.normalized_target.as_str())
+            .or_else(|| node.last_known_ip.clone())
             .ok_or_else(|| {
                 format!(
                     "node {} is missing last_known_ip and its SSH target is not a literal IP; cannot build authoritative NODES_SPEC endpoint",
@@ -4692,11 +7318,15 @@ fn build_nodes_spec(
 
 fn collect_public_key_hex_for_target(
     target: &RemoteTarget,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     timeout: Duration,
 ) -> Result<String, String> {
-    let output = capture_remote_shell_command(
-        target.ssh_target.as_str(),
-        target.ssh_user.as_deref(),
+    let output = capture_remote_shell_command_for_target(
+        target,
+        None,
+        ssh_identity_file,
+        known_hosts_path,
         "set -eu; if sudo -n true >/dev/null 2>&1; then sudo -n cat /var/lib/rustynet/keys/wireguard.pub; else cat /var/lib/rustynet/keys/wireguard.pub; fi",
         timeout,
     )
@@ -4830,15 +7460,19 @@ fn build_assignment_refresh_env(
 }
 
 fn capture_remote_file_to_local(
-    target: &str,
-    ssh_user: Option<&str>,
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     remote_path: &str,
     local_path: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
-    let output = capture_remote_shell_command(
+    let output = capture_remote_shell_command_for_target(
         target,
-        ssh_user,
+        ssh_user_override,
+        ssh_identity_file,
+        known_hosts_path,
         format!(
             "set -eu; if sudo -n true >/dev/null 2>&1; then sudo -n cat {}; else cat {}; fi",
             shell_quote(remote_path),
@@ -4862,53 +7496,65 @@ fn install_state_artifacts_on_target(
     traversal_pub: &Path,
     traversal_bundle: &Path,
     refresh_env: &Path,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
     timeout: Duration,
 ) -> Result<(), String> {
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            target,
+            None,
+            ssh_identity_file,
+            known_hosts_path,
             assignment_pub,
-            target.ssh_target.as_str(),
-            target.ssh_user.as_deref(),
             "/tmp/rn-assignment.pub",
             timeout,
         )?,
         "copy assignment verifier to remote",
     )?;
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            target,
+            None,
+            ssh_identity_file,
+            known_hosts_path,
             assignment_bundle,
-            target.ssh_target.as_str(),
-            target.ssh_user.as_deref(),
             "/tmp/rn-assignment.bundle",
             timeout,
         )?,
         "copy assignment bundle to remote",
     )?;
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            target,
+            None,
+            ssh_identity_file,
+            known_hosts_path,
             traversal_pub,
-            target.ssh_target.as_str(),
-            target.ssh_user.as_deref(),
             "/tmp/rn-traversal.pub",
             timeout,
         )?,
         "copy traversal verifier to remote",
     )?;
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            target,
+            None,
+            ssh_identity_file,
+            known_hosts_path,
             traversal_bundle,
-            target.ssh_target.as_str(),
-            target.ssh_user.as_deref(),
             "/tmp/rn-traversal.bundle",
             timeout,
         )?,
         "copy traversal bundle to remote",
     )?;
     ensure_success_status(
-        scp_to_remote(
+        scp_to_remote_for_target(
+            target,
+            None,
+            ssh_identity_file,
+            known_hosts_path,
             refresh_env,
-            target.ssh_target.as_str(),
-            target.ssh_user.as_deref(),
             "/tmp/rn-assignment-refresh.env",
             timeout,
         )?,
@@ -4924,9 +7570,11 @@ $SUDO install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rus
 $SUDO rm -f /var/lib/rustynet/rustynetd.traversal.watermark; \
 $SUDO install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env; \
 $SUDO rm -f /tmp/rn-assignment.pub /tmp/rn-assignment.bundle /tmp/rn-traversal.pub /tmp/rn-traversal.bundle /tmp/rn-assignment-refresh.env";
-    let status = run_remote_shell_command(
-        target.ssh_target.as_str(),
-        target.ssh_user.as_deref(),
+    let status = run_remote_shell_command_for_target(
+        target,
+        None,
+        ssh_identity_file,
+        known_hosts_path,
         install_script,
         timeout,
     )
@@ -5140,6 +7788,8 @@ fn normalized_bootstrap_phase(value: &str) -> Result<String, String> {
 
 struct BootstrapPhaseContext<'a> {
     ssh_user: Option<&'a str>,
+    ssh_identity_file: Option<&'a Path>,
+    known_hosts_path: Option<&'a Path>,
     workdir: &'a str,
     repo_url: Option<&'a str>,
     branch: &'a str,
@@ -5160,9 +7810,11 @@ fn execute_bootstrap_phase_for_target(
                     target.label
                 )
             })?;
-            let status = run_remote_shell_command(
-                target.ssh_target.as_str(),
+            let status = run_remote_shell_command_for_target(
+                target,
                 context.ssh_user,
+                context.ssh_identity_file,
+                context.known_hosts_path,
                 build_repo_sync_script(repo_url, context.workdir, context.branch, context.remote)?
                     .as_str(),
                 context.timeout,
@@ -5178,11 +7830,28 @@ fn execute_bootstrap_phase_for_target(
         }
         "build-release" => {
             let tmpdir = format!("{}/.tmp", context.workdir);
-            let status = run_remote_shell_command(
-                target.ssh_target.as_str(),
+            let status = run_remote_shell_command_for_target(
+                target,
                 context.ssh_user,
+                context.ssh_identity_file,
+                context.known_hosts_path,
                 format!(
-                    "set -eu; cd {workdir}; mkdir -p {tmpdir}; TMPDIR={tmpdir} exec cargo build --locked --release -p rustynetd -p rustynet-cli",
+                    "set -eu; cd {workdir}; mkdir -p {tmpdir}; \
+toolchain_name=''; \
+if command -v rustup >/dev/null 2>&1; then \
+  toolchain_name=\"$(rustup toolchain list 2>/dev/null | awk 'NR==1 {{ print $1; exit }}' | sed 's/ (default)$//')\"; \
+fi; \
+cargo_bin='cargo'; \
+toolchain_bin=''; \
+if [ -n \"$toolchain_name\" ] && [ -d \"$HOME/.rustup/toolchains/$toolchain_name/bin\" ]; then \
+  toolchain_bin=\"$HOME/.rustup/toolchains/$toolchain_name/bin\"; \
+  cargo_bin=\"$toolchain_bin/cargo\"; \
+fi; \
+if [ -n \"$toolchain_bin\" ]; then \
+  export PATH=\"$toolchain_bin:$PATH\"; \
+  export RUSTC=\"$toolchain_bin/rustc\"; \
+fi; \
+TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked --release -p rustynetd -p rustynet-cli",
                     workdir = shell_quote(context.workdir),
                     tmpdir = shell_quote(tmpdir.as_str()),
                 )
@@ -5206,9 +7875,11 @@ $SUDO install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd; \
 $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
                 workdir = shell_quote(context.workdir),
             );
-            let status = run_remote_shell_command(
-                target.ssh_target.as_str(),
+            let status = run_remote_shell_command_for_target(
+                target,
                 context.ssh_user,
+                context.ssh_identity_file,
+                context.known_hosts_path,
                 script.as_str(),
                 context.timeout,
             )
@@ -5222,9 +7893,11 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
             }
         }
         "restart-runtime" => {
-            let status = run_remote_shell_command(
-                target.ssh_target.as_str(),
+            let status = run_remote_shell_command_for_target(
+                target,
                 context.ssh_user,
+                context.ssh_identity_file,
+                context.known_hosts_path,
                 "set -eu; if sudo -n true >/dev/null 2>&1; then sudo -n systemctl restart rustynetd.service; else systemctl restart rustynetd.service; fi",
                 context.timeout,
             )
@@ -5240,9 +7913,11 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
         "verify-runtime" => {
             let status_script = privileged_rustynet_cli_script("status");
             let netcheck_script = privileged_rustynet_cli_script("netcheck");
-            let status = run_remote_shell_command(
-                target.ssh_target.as_str(),
+            let status = run_remote_shell_command_for_target(
+                target,
                 context.ssh_user,
+                context.ssh_identity_file,
+                context.known_hosts_path,
                 format!("set -eu; {status_script} >/dev/null; {netcheck_script} >/dev/null")
                     .as_str(),
                 context.timeout,
@@ -5275,26 +7950,33 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabProfile, LiveLabStageSummary, VmInventoryEntry, VmLabIterationValidationStep,
+        LiveLabProfile, LiveLabStageRecord, LiveLabStageSummary, VmInventoryEntry,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
         build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_repo_sync_script, build_suite_command, build_vendored_cargo_config,
-        build_vm_lab_topology, default_inventory_path, default_live_lab_iteration_profile_path,
-        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
-        default_utmctl_path, ensure_inventory_entries_share_network,
-        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_validate_live_lab_profile,
-        execute_ops_vm_lab_write_live_lab_profile, load_inventory, load_live_lab_profile,
-        local_utm_process_present_in_ps_output, parse_live_lab_stage_records,
-        parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
-        privileged_rustynet_cli_script, render_live_lab_iteration_summary,
-        resolve_iteration_source_selection, resolve_remote_targets, resolve_repo_sync_source,
-        resolve_start_targets, select_inventory_entries, summarize_live_lab_report,
+        build_vm_lab_topology, collect_live_lab_stage_local_bundle, default_inventory_path,
+        default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
+        default_live_lab_orchestrator_path, default_utmctl_path, discover_local_utm_bundle_paths,
+        ensure_inventory_entries_share_network, execute_ops_vm_lab_diff_live_lab_runs,
+        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
+        execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
+        live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
+        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
+        parse_live_lab_stage_records, parse_vm_lab_iteration_validation_step_spec,
+        parse_vm_lab_topology, privileged_rustynet_cli_script, render_live_lab_iteration_summary,
+        render_live_lab_stage_forensics_review, resolve_iteration_source_selection,
+        resolve_remote_targets, resolve_repo_sync_source, resolve_start_targets,
+        resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
+        select_inventory_entries, select_live_ssh_host_from_utm_output, summarize_live_lab_report,
+        transition_local_utm_vm_with_process_probe,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn write_temp_inventory(body: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -5312,6 +7994,23 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    fn write_temp_executable(body: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-bin-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp executable dir should exist");
+        let path = dir.join("mock-bin.sh");
+        fs::write(&path, body).expect("temp executable should be written");
+        let mut permissions = fs::metadata(&path)
+            .expect("temp executable metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("temp executable should be chmodded");
+        path
     }
 
     fn write_temp_report_dir() -> PathBuf {
@@ -5552,6 +8251,254 @@ mod tests {
     }
 
     #[test]
+    fn live_ssh_host_selector_prefers_underlay_ipv4_over_mesh_ip() {
+        let selected = select_live_ssh_host_from_utm_output(
+            "192.168.64.8\n100.64.0.1\n",
+            Some("192.168.64.3"),
+            Some("100.64.0.1"),
+        )
+        .expect("live SSH host should resolve");
+        assert_eq!(selected, "192.168.64.8");
+    }
+
+    #[test]
+    fn resolved_inventory_ssh_target_uses_live_local_utm_ip() {
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"debian-headless-1\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let entry = VmInventoryEntry {
+            alias: "debian-headless-1".to_string(),
+            ssh_target: "192.168.64.3".to_string(),
+            ssh_user: Some("debian".to_string()),
+            ssh_password: None,
+            include_in_all: Some(true),
+            os: None,
+            last_known_ip: Some("192.168.64.3".to_string()),
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: None,
+            mesh_ip: Some("100.64.0.1".to_string()),
+            exit_capable: None,
+            relay_capable: None,
+            rustynet_src_dir: None,
+            controller: Some(super::VmController::LocalUtm {
+                utm_name: "debian-headless-1".to_string(),
+                bundle_path: PathBuf::from("/tmp/debian-headless-1.utm"),
+            }),
+        };
+        let resolved = resolved_inventory_ssh_target_with_utmctl(&entry, utmctl.as_path());
+        assert_eq!(resolved, "192.168.64.8");
+        let _ = fs::remove_dir_all(
+            utmctl
+                .parent()
+                .expect("temp executable parent should exist"),
+        );
+    }
+
+    #[test]
+    fn discover_local_utm_bundle_paths_recurses_into_nested_documents() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
+        fs::create_dir_all(root.join("nested").join("alpha.utm"))
+            .expect("nested bundle should exist");
+        fs::create_dir_all(root.join("beta.utm")).expect("top-level bundle should exist");
+        fs::create_dir_all(root.join("nested").join("ignored"))
+            .expect("nested directory should exist");
+
+        let bundles = discover_local_utm_bundle_paths(root.as_path())
+            .expect("bundle discovery should succeed");
+        assert_eq!(bundles.len(), 2);
+        assert!(
+            bundles
+                .iter()
+                .any(|path| path.ends_with(Path::new("alpha.utm")))
+        );
+        assert!(
+            bundles
+                .iter()
+                .any(|path| path.ends_with(Path::new("beta.utm")))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_discover_local_utm_reports_live_bundle_status() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
+        let bundle = root.join("nested").join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle should exist");
+
+        let inventory = write_temp_inventory(&format!(
+            r#"{{
+  "version": 1,
+  "entries": [
+    {{
+      "alias": "alpha",
+      "ssh_target": "alpha-host",
+      "ssh_user": "debian",
+      "node_id": "alpha-1",
+      "lab_role": "exit",
+      "last_known_ip": "192.168.64.20",
+      "mesh_ip": "100.64.0.1",
+      "controller": {{
+        "type": "local_utm",
+        "utm_name": "alpha",
+        "bundle_path": "{}"
+      }}
+    }}
+  ]
+}}"#,
+            bundle.display()
+        ));
+
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let ssh_port = 65_534;
+
+        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(inventory.clone()),
+            utm_documents_root: Some(root.clone()),
+            utmctl_path: Some(utmctl.clone()),
+            ssh_port,
+            timeout_secs: 2,
+        })
+        .expect("discovery report should be produced");
+        let parsed: serde_json::Value =
+            serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
+        assert_eq!(parsed["mode"].as_str(), Some("vm_lab_local_utm_discovery"));
+        assert_eq!(parsed["summary"]["bundle_count"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["summary"]["inventory_matched_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(parsed["summary"]["live_ip_count"].as_u64(), Some(1));
+        assert_eq!(parsed["summary"]["ssh_port_open_count"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["ready_count"].as_u64(), Some(0));
+        assert_eq!(parsed["summary"]["status"].as_str(), Some("partial"));
+        assert_eq!(parsed["entries"][0]["utm_name"].as_str(), Some("alpha"));
+        assert_eq!(
+            parsed["entries"][0]["inventory_match"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["entries"][0]["live_ip"].as_str(),
+            Some("192.168.64.8")
+        );
+        assert_eq!(
+            parsed["entries"][0]["ssh_port_status"].as_str(),
+            Some("closed")
+        );
+        assert_eq!(parsed["entries"][0]["ssh_user"].as_str(), Some("debian"));
+        assert_eq!(
+            parsed["entries"][0]["ssh_target_source"].as_str(),
+            Some("inventory")
+        );
+
+        let _ = fs::remove_dir_all(
+            inventory
+                .parent()
+                .expect("temp inventory parent should exist"),
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(
+            utmctl
+                .parent()
+                .expect("temp executable parent should exist"),
+        );
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_discover_local_utm_summary_renders_setup_view() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
+        let bundle = root.join("nested").join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle should exist");
+
+        let inventory = write_temp_inventory(&format!(
+            r#"{{
+  "version": 1,
+  "entries": [
+    {{
+      "alias": "alpha",
+      "ssh_target": "alpha-host",
+      "ssh_user": "debian",
+      "last_known_ip": "192.168.64.20",
+      "mesh_ip": "100.64.0.1",
+      "controller": {{
+        "type": "local_utm",
+        "utm_name": "alpha",
+        "bundle_path": "{}"
+      }}
+    }}
+  ]
+}}"#,
+            bundle.display()
+        ));
+
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+
+        let report = execute_ops_vm_lab_discover_local_utm_summary(VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(inventory.clone()),
+            utm_documents_root: Some(root.clone()),
+            utmctl_path: Some(utmctl.clone()),
+            ssh_port: 65_534,
+            timeout_secs: 2,
+        })
+        .expect("summary report should be produced");
+
+        assert!(report.contains("discovery_summary.status=partial"));
+        assert!(report.contains("discovery_summary.bundle_count=1"));
+        assert!(report.contains("discovery_summary.ready_count=0"));
+        assert!(report.contains("node[0].alias=alpha"));
+        assert!(report.contains("node[0].inventory_ssh_target=alpha-host"));
+        assert!(report.contains("node[0].inventory_last_known_ip=192.168.64.20"));
+        assert!(report.contains("node[0].live_ip=192.168.64.8"));
+        assert!(report.contains("node[0].ssh_target=192.168.64.8"));
+        assert!(report.contains("node[0].ssh_port_status=closed"));
+        assert!(report.contains("node[0].ready=false"));
+        assert!(!report.contains("inventory_error="));
+
+        let _ = fs::remove_dir_all(
+            inventory
+                .parent()
+                .expect("temp inventory parent should exist"),
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(
+            utmctl
+                .parent()
+                .expect("temp executable parent should exist"),
+        );
+    }
+
+    #[test]
+    fn rewrite_ssh_target_host_preserves_user_and_formats_ipv6() {
+        assert_eq!(
+            rewrite_ssh_target_host("debian@192.168.64.3", "192.168.64.8"),
+            "debian@192.168.64.8"
+        );
+        assert_eq!(
+            rewrite_ssh_target_host("debian@example", "fd00::10"),
+            "debian@[fd00::10]"
+        );
+    }
+
+    #[test]
     fn resolve_start_targets_rejects_non_local_entries() {
         let path = write_temp_inventory(
             r#"{
@@ -5706,13 +8653,23 @@ directory = "vendor"
       "alias": "exit-vm",
       "ssh_target": "exit-host",
       "ssh_user": "debian",
-      "network_group": "lan-a"
+      "network_group": "lan-a",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian-headless-1",
+        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-1.utm"
+      }
     },
     {
       "alias": "client-vm",
       "ssh_target": "client-host",
       "ssh_user": "debian",
-      "network_group": "lan-a"
+      "network_group": "lan-a",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian-headless-2",
+        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-2.utm"
+      }
     }
   ]
 }"#,
@@ -5766,6 +8723,10 @@ directory = "vendor"
         let body = fs::read_to_string(&output).expect("profile should be readable");
         assert!(body.contains("EXIT_TARGET=\"debian@exit-host\""));
         assert!(body.contains("CLIENT_TARGET=\"debian@client-host\""));
+        assert!(body.contains("EXIT_UTM_NAME=\"debian-headless-1\""));
+        assert!(body.contains("CLIENT_UTM_NAME=\"debian-headless-2\""));
+        assert!(body.contains("FIFTH_CLIENT_TARGET=\"\""));
+        assert!(body.contains("FIFTH_CLIENT_UTM_NAME=\"\""));
         assert!(body.contains("SSH_IDENTITY_FILE="));
         assert!(body.contains("RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\""));
         assert!(body.contains("SOURCE_MODE=\"local-head\""));
@@ -5907,6 +8868,166 @@ enforce_baseline_runtime\thard\tfail\t1\t{}/logs/enforce_baseline_runtime.log\te
     }
 
     #[test]
+    fn collect_stage_local_bundle_copies_report_context_and_worker_results() {
+        let report_dir = write_temp_report_dir();
+        let diagnostics_dir = report_dir.join("diagnostics/validate_baseline_runtime");
+        let stage_log = report_dir.join("logs/validate_baseline_runtime.log");
+        let parallel_dir = report_dir.join("state/parallel-validate_baseline_runtime");
+        fs::create_dir_all(parallel_dir.join("evidence/client"))
+            .expect("parallel dir should exist");
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!(
+                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
+validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\tvalidate one-hop routing and no-plaintext-passphrase state\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n",
+                report_dir.display(),
+                report_dir.display()
+            ),
+        )
+        .expect("stages should write");
+        fs::write(report_dir.join("failure_digest.md"), "# digest\n").expect("digest should write");
+        fs::write(report_dir.join("failure_digest.json"), "{}\n")
+            .expect("digest json should write");
+        fs::write(report_dir.join("run_summary.md"), "# summary\n").expect("summary should write");
+        fs::write(report_dir.join("run_summary.json"), "{}\n").expect("summary json should write");
+        fs::write(&stage_log, "error: route missing\n").expect("stage log should write");
+        fs::write(
+            parallel_dir.join("results.tsv"),
+            format!(
+                "validate_baseline_runtime\tclient\tdebian@client\tclient-1\tclient\t1\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\t{}/state/parallel-validate_baseline_runtime/client.log\t{}/state/parallel-validate_baseline_runtime/evidence/client/snapshot.txt\t{}/state/parallel-validate_baseline_runtime/evidence/client/route_policy.txt\t{}/state/parallel-validate_baseline_runtime/evidence/client/dns_state.txt\troute missing\n",
+                report_dir.display(),
+                report_dir.display(),
+                report_dir.display(),
+                report_dir.display()
+            ),
+        )
+        .expect("results should write");
+        fs::write(parallel_dir.join("client.log"), "route missing\n")
+            .expect("client log should write");
+        fs::write(
+            parallel_dir.join("evidence/client/snapshot.txt"),
+            "snapshot\n",
+        )
+        .expect("snapshot should write");
+        fs::write(
+            parallel_dir.join("evidence/client/route_policy.txt"),
+            "route policy\n",
+        )
+        .expect("route policy should write");
+        fs::write(
+            parallel_dir.join("evidence/client/dns_state.txt"),
+            "dns state\n",
+        )
+        .expect("dns state should write");
+
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)
+            .expect("summary should build");
+        let stage_record = LiveLabStageRecord {
+            name: "validate_baseline_runtime".to_string(),
+            severity: "hard".to_string(),
+            status: "fail".to_string(),
+            rc: "1".to_string(),
+            log_path: stage_log.clone(),
+            description: "validate one-hop routing and no-plaintext-passphrase state".to_string(),
+        };
+        let bundle = collect_live_lab_stage_local_bundle(
+            report_dir.as_path(),
+            &stage_record,
+            &summary,
+            diagnostics_dir.as_path(),
+        )
+        .expect("bundle should collect");
+
+        assert_eq!(bundle.worker_results.len(), 1);
+        assert!(
+            bundle
+                .report_context_dir
+                .join("state/parallel-validate_baseline_runtime/results.tsv")
+                .is_file()
+        );
+        assert!(
+            bundle
+                .report_context_dir
+                .join("logs/validate_baseline_runtime.log")
+                .is_file()
+        );
+        assert!(
+            bundle
+                .worker_results_json_path
+                .as_deref()
+                .expect("worker results json path should exist")
+                .is_file()
+        );
+        let worker_markdown = fs::read_to_string(
+            bundle
+                .worker_results_markdown_path
+                .as_deref()
+                .expect("worker results markdown path should exist"),
+        )
+        .expect("worker markdown should read");
+        assert!(worker_markdown.contains("route missing"));
+        assert!(worker_markdown.contains("client-1"));
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn stage_forensics_review_highlights_baseline_expectations() {
+        let report_dir = write_temp_report_dir();
+        let diagnostics_dir = report_dir.join("diagnostics/validate_baseline_runtime");
+        fs::create_dir_all(&diagnostics_dir).expect("diagnostics dir should exist");
+        let stage_log = report_dir.join("logs/validate_baseline_runtime.log");
+        fs::write(report_dir.join("failure_digest.md"), "# digest\n").expect("digest should write");
+        fs::write(&stage_log, "error: route missing\n").expect("stage log should write");
+
+        let local_bundle = super::LiveLabStageLocalBundle {
+            report_context_dir: diagnostics_dir.join("report_context"),
+            copied_paths: vec![diagnostics_dir.join("report_context/failure_digest.md")],
+            worker_results: Vec::new(),
+            worker_results_json_path: None,
+            worker_results_markdown_path: None,
+        };
+        let review = render_live_lab_stage_forensics_review(
+            report_dir.as_path(),
+            &LiveLabStageRecord {
+                name: "validate_baseline_runtime".to_string(),
+                severity: "hard".to_string(),
+                status: "fail".to_string(),
+                rc: "1".to_string(),
+                log_path: stage_log,
+                description: "validate one-hop routing and no-plaintext-passphrase state"
+                    .to_string(),
+            },
+            &LiveLabStageSummary {
+                overall_status: "fail".to_string(),
+                first_failed_stage: Some("validate_baseline_runtime".to_string()),
+                key_report_path: report_dir.join("failure_digest.md"),
+                key_log_path: Some(report_dir.join("logs/validate_baseline_runtime.log")),
+                likely_reason: Some("error: route missing".to_string()),
+                failed_log_tail: None,
+            },
+            "validate-baseline-runtime",
+            &local_bundle,
+            Some(
+                report_dir
+                    .join("remote_validate_baseline_runtime")
+                    .as_path(),
+            ),
+            live_lab_stage_forensics_notes("validate_baseline_runtime").as_slice(),
+            &["warning example".to_string()],
+        );
+        assert!(
+            review
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        assert!(review.contains("no-plaintext-passphrase-files"));
+        assert!(review.contains("remote_probe_dir="));
+        assert!(review.contains("warning example"));
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
     fn live_lab_profile_loader_parses_targets_and_metadata() {
         let profile_path = write_temp_live_lab_profile(
             "# Generated by test\n\
@@ -5915,6 +9036,7 @@ CLIENT_TARGET=\"debian@client-host\"\n\
 ENTRY_TARGET=\"debian@entry-host\"\n\
 AUX_TARGET=\"debian@aux-host\"\n\
 EXTRA_TARGET=\"debian@extra-host\"\n\
+FIFTH_CLIENT_TARGET=\"\"\n\
 SSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n\
 SSH_KNOWN_HOSTS_FILE=\"$KNOWN_HOSTS_FILE\"\n\
 RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\"\n\
@@ -5935,6 +9057,7 @@ REPORT_DIR=\"artifacts/live_lab/test\"\n",
                     ("ENTRY_TARGET".to_string(), "debian@entry-host".to_string()),
                     ("EXIT_TARGET".to_string(), "debian@exit-host".to_string()),
                     ("EXTRA_TARGET".to_string(), "debian@extra-host".to_string()),
+                    ("FIFTH_CLIENT_TARGET".to_string(), String::new()),
                     (
                         "REPORT_DIR".to_string(),
                         "artifacts/live_lab/test".to_string()
@@ -5970,6 +9093,66 @@ REPORT_DIR=\"artifacts/live_lab/test\"\n",
         assert_eq!(targets[0].role, "exit");
         assert_eq!(targets[1].role, "client");
 
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+    }
+
+    #[test]
+    fn resolve_live_lab_profile_targets_uses_inventory_utm_metadata() {
+        let inventory_path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "debian-headless-1",
+      "ssh_target": "192.168.64.3",
+      "ssh_user": "debian",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian-headless-1",
+        "bundle_path": "/tmp/debian-headless-1.utm"
+      }
+    },
+    {
+      "alias": "debian-headless-2",
+      "ssh_target": "192.168.64.4",
+      "ssh_user": "debian",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "debian-headless-2",
+        "bundle_path": "/tmp/debian-headless-2.utm"
+      }
+    }
+  ]
+}"#,
+        );
+        let profile_path = write_temp_live_lab_profile(
+            "# Generated by test\n\
+EXIT_TARGET=\"debian@192.168.64.8\"\n\
+EXIT_UTM_NAME=\"debian-headless-1\"\n\
+CLIENT_TARGET=\"debian@192.168.64.4\"\n\
+CLIENT_UTM_NAME=\"debian-headless-2\"\n\
+SSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+
+        let profile = load_live_lab_profile(profile_path.as_path()).expect("profile should parse");
+        let targets = super::resolve_live_lab_profile_targets(inventory_path.as_path(), &profile)
+            .expect("targets should resolve");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].role, "exit");
+        assert_eq!(targets[0].profile_target, "debian@192.168.64.8");
+        assert_eq!(targets[0].remote_target.label, "exit");
+        assert_eq!(targets[0].remote_target.ssh_user.as_deref(), Some("debian"));
+        assert!(matches!(
+            targets[0].remote_target.controller,
+            Some(super::VmController::LocalUtm { .. })
+        ));
+        assert_eq!(targets[1].role, "client");
+        assert!(matches!(
+            targets[1].remote_target.controller,
+            Some(super::VmController::LocalUtm { .. })
+        ));
+
+        cleanup_temp_inventory(inventory_path.as_path());
         let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
     }
 
@@ -6176,6 +9359,106 @@ live_lan_toggle\thard\tfail\t1\t{}/logs/live_lan_toggle.log\trun LAN access togg
             "789 /usr/libexec/other-process\n",
             bundle
         ));
+    }
+
+    #[test]
+    fn local_utm_process_present_uses_wide_ps_output() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-ps-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let bundle = dir.join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle dir should exist");
+        let args_log = dir.join("ps-args.log");
+        let ps = dir.join("ps");
+        fs::write(
+            &ps,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"{}\"\nprintf '123 /Applications/UTM.app/Contents/XPCServices/QEMUHelper.xpc/Contents/MacOS/QEMULauncher -drive if=pflash,file={}/Data/efi_vars.fd\\n'\n",
+                args_log.display(),
+                bundle.display()
+            ),
+        )
+        .expect("ps script should write");
+        let mut permissions = fs::metadata(&ps)
+            .expect("ps script metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&ps, permissions).expect("ps script should be executable");
+
+        let present = local_utm_process_present_with_ps(
+            ps.as_path(),
+            bundle.as_path(),
+            Duration::from_secs(1),
+        )
+        .expect("process probe should succeed");
+
+        assert!(present);
+        assert_eq!(
+            fs::read_to_string(&args_log)
+                .expect("ps args log should read")
+                .trim(),
+            "axww -o command"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transition_local_utm_vm_skips_stop_when_vm_is_already_stopped() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-transition-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let bundle = dir.join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle dir should exist");
+        let utmctl_log = dir.join("utmctl.log");
+        let utmctl = dir.join("utmctl");
+        fs::write(
+            &utmctl,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> \"{}\"\nexit 0\n",
+                utmctl_log.display()
+            ),
+        )
+        .expect("utmctl script should write");
+        let mut utmctl_permissions = fs::metadata(&utmctl)
+            .expect("utmctl script metadata should read")
+            .permissions();
+        utmctl_permissions.set_mode(0o755);
+        fs::set_permissions(&utmctl, utmctl_permissions)
+            .expect("utmctl script should be executable");
+
+        let ps = dir.join("ps");
+        fs::write(
+            &ps,
+            "#!/bin/sh\nprintf '789 /usr/libexec/other-process\\n'\n",
+        )
+        .expect("ps script should write");
+        let mut ps_permissions = fs::metadata(&ps)
+            .expect("ps script metadata should read")
+            .permissions();
+        ps_permissions.set_mode(0o755);
+        fs::set_permissions(&ps, ps_permissions).expect("ps script should be executable");
+
+        transition_local_utm_vm_with_process_probe(
+            utmctl.as_path(),
+            ps.as_path(),
+            "alpha",
+            bundle.as_path(),
+            "stop",
+            false,
+            Duration::from_secs(1),
+        )
+        .expect("stopped VM transition should no-op successfully");
+
+        assert_eq!(fs::read_to_string(&utmctl_log).unwrap_or_default(), "");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

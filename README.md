@@ -44,6 +44,49 @@ Optional Rust-native operator menu (baseline UX path):
 rustynet operator menu
 ```
 
+If you are starting from local UTM VMs and want the fastest first-pass inventory,
+use the compact discovery summary first:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm-summary --inventory documents/operations/active/vm_lab_inventory.json
+```
+
+Use the full JSON discovery report when you need the raw bundle, IP, SSH, and
+readiness details:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
+```
+
+## Live Lab Workflow
+
+Use this four-step path when you want to exercise the local UTM lab end to end:
+
+1. Discover
+   - `ops vm-lab-discover-local-utm-summary`
+   - Finds the local UTM bundles, live IPs, SSH readiness, and the fastest
+     “can I use this lab?” summary.
+   - Use `ops vm-lab-discover-local-utm` when you need the full JSON evidence.
+   - If discovery shows live IPs but `ready=false` or `ssh_port_status=closed`,
+     restart the local UTM fleet and wait for SSH readiness before you proceed:
+     `ops vm-lab-restart --all --wait-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file ~/.ssh/known_hosts`
+2. Setup
+   - `stage_run_fresh_bootstrap_and_network_setup`
+   - Installs Rustynet on the selected nodes, boots the shared network, and
+     enforces the baseline runtime state.
+3. Link and Test
+   - `ops vm-lab-run-live-lab`
+   - Runs the full live-lab suite against the prepared network.
+   - Use `stage_run_extended_soak` when you want the longer resilience and
+     reboot-recovery coverage after baseline is healthy.
+4. Diagnose
+   - `ops vm-lab-diagnose-live-lab-failure`
+   - Collects the first failed stage and packages the useful failure context
+     for triage.
+
+This is the recommended operator path for live-lab work:
+discover, set up, link and test, then diagnose if something fails.
+
 The wizard handles:
 - role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions
 - guided in-menu role switching (`client` <-> `admin`) with local signed assignment refresh support on Linux
