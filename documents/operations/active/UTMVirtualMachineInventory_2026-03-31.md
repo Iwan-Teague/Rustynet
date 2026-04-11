@@ -101,10 +101,14 @@ Operational meaning:
 - `ops vm-lab-issue-and-distribute-state` issues signed assignment/traversal state on an authority VM and installs it onto the selected topology nodes
 - `ops vm-lab-run-suite` wraps the existing hardened live/cross-network lab scripts using inventory/topology metadata
 - `ops vm-lab-write-live-lab-profile` renders a non-interactive profile for `scripts/e2e/live_linux_lab_orchestrator.sh`
+- `ops vm-lab-setup-live-lab` is the setup-phase operator wrapper:
+  - generates or validates the live-lab profile
+  - runs the setup-only orchestration path through baseline validation
+  - emits structured JSON with report-dir, stage outcomes, warnings, and next actions
+  - supports `--resume-from` and `--rerun-stage` for setup-stage recovery in the same report dir
 - `ops vm-lab-iterate-live-lab` is the narrow reduced-live-lab iteration wrapper:
   - runs only typed local validation steps (`fmt`, `check`, `check-bin`, `test`, `test-bin`)
   - writes the live-lab profile
-  - runs preflight
   - launches the reduced live-lab orchestrator
   - waits for completion and prints the first failed stage plus key report/log paths
   - supports explicit provenance guards:
@@ -114,7 +118,7 @@ Operational meaning:
 - `ops vm-lab-validate-live-lab-profile` validates a generated live-lab profile and can assert expected backend/source-mode plus five-node topology completeness
 - `ops vm-lab-diagnose-live-lab-failure` reads a report/profile pair, captures `vm-lab-status`, and optionally collects the standard per-node artifact bundle for the configured live-lab targets
 - `ops vm-lab-diff-live-lab-runs` compares two live-lab report directories and prints the first divergent stage plus changed stage outcomes
-- `ops vm-lab-run-live-lab` launches the existing live-lab orchestrator from a generated profile
+- `ops vm-lab-run-live-lab` launches the full live-lab suite from a generated profile, validates required run artifacts, and can continue from a setup-only report directory without rerunning setup
 - remote or same-network VMs hosted on another machine should be recorded as SSH-reachable entries without a `controller`
 - if you keep a bootstrap password in inventory, treat it as sensitive recovery metadata and do not log it or echo it in helper output
 - if you keep a recovery-only host in inventory, set `include_in_all=false` so bulk lab selection does not treat it as a UTM lab member
@@ -189,6 +193,19 @@ cargo run -q -p rustynet-cli -- \
   --require-five-node
 
 cargo run -q -p rustynet-cli -- \
+  ops vm-lab-setup-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --report-dir artifacts/live_lab/setup_example \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
+  --exit-vm debian-headless-1 \
+  --client-vm debian-headless-2 \
+  --entry-vm debian-headless-3 \
+  --aux-vm debian-headless-4 \
+  --extra-vm debian-headless-5 \
+  --require-same-network
+
+cargo run -q -p rustynet-cli -- \
   ops vm-lab-iterate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
@@ -208,10 +225,16 @@ cargo run -q -p rustynet-cli -- \
   --collect-failure-diagnostics
 
 cargo run -q -p rustynet-cli -- \
+  ops vm-lab-run-live-lab \
+  --profile artifacts/live_lab/setup_example/setup_profile.env \
+  --report-dir artifacts/live_lab/setup_example \
+  --skip-cross-network
+
+cargo run -q -p rustynet-cli -- \
   ops vm-lab-diagnose-live-lab-failure \
   --inventory documents/operations/active/vm_lab_inventory.json \
-  --profile profiles/live_lab/generated_vm_lab.env \
-  --report-dir artifacts/live_lab/iteration_123 \
+  --profile artifacts/live_lab/setup_example/setup_profile.env \
+  --report-dir artifacts/live_lab/setup_example \
   --collect-artifacts
 
 cargo run -q -p rustynet-cli -- \

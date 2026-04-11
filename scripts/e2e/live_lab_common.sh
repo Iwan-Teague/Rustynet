@@ -222,6 +222,9 @@ live_lab_target_utm_name() {
 }
 
 live_lab_target_uses_utm_transport() {
+  if [[ "${LIVE_LAB_FORCE_SSH_TRANSPORT:-0}" == "1" ]]; then
+    return 1
+  fi
   local utm_name
   utm_name="$(live_lab_target_utm_name "$1" 2>/dev/null || true)"
   [[ -n "$utm_name" ]]
@@ -229,6 +232,12 @@ live_lab_target_uses_utm_transport() {
 
 live_lab_has_utm_transport() {
   [[ -n "${EXIT_UTM_NAME:-}${CLIENT_UTM_NAME:-}${ENTRY_UTM_NAME:-}${AUX_UTM_NAME:-}${EXTRA_UTM_NAME:-}${FIFTH_CLIENT_UTM_NAME:-}" ]]
+}
+
+live_lab_can_use_ssh_transport() {
+  [[ -n "${LIVE_LAB_SSH_IDENTITY_FILE:-}" && -f "${LIVE_LAB_SSH_IDENTITY_FILE}" ]] || return 1
+  [[ -n "${LIVE_LAB_KNOWN_HOSTS:-}" && -f "${LIVE_LAB_KNOWN_HOSTS}" ]] || return 1
+  return 0
 }
 
 live_lab_require_utmctl() {
@@ -812,14 +821,10 @@ live_lab_remote_src_dir() {
   printf '/home/%s/Rustynet' "$user"
 }
 
-live_lab_ssh() {
+live_lab_ssh_via_ssh() {
   local target="$1"
   local command="$2"
-  local timeout="${3:-10800}"
-  if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_exec "$target" "$command" "$timeout"
-    return $?
-  fi
+  local _timeout="${3:-10800}"
   local ssh_args=(
     ssh
     -n
@@ -852,15 +857,11 @@ live_lab_ssh() {
   "${ssh_args[@]}"
 }
 
-live_lab_scp_to() {
+live_lab_scp_to_via_ssh() {
   local src="$1"
   local target="$2"
   local dst="$3"
-  local timeout="${4:-10800}"
-  if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_push "$src" "$target" "$dst"
-    return $?
-  fi
+  local _timeout="${4:-10800}"
   local scp_args=(
     scp
     -q
@@ -893,15 +894,11 @@ live_lab_scp_to() {
   "${scp_args[@]}"
 }
 
-live_lab_scp_from() {
+live_lab_scp_from_via_ssh() {
   local target="$1"
   local src="$2"
   local dst="$3"
-  local timeout="${4:-10800}"
-  if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_pull "$target" "$src" "$dst"
-    return $?
-  fi
+  local _timeout="${4:-10800}"
   local scp_args=(
     scp
     -q
@@ -934,17 +931,67 @@ live_lab_scp_from() {
   "${scp_args[@]}"
 }
 
+live_lab_capture_via_ssh() {
+  local target="$1"
+  local body="$2"
+  local timeout="${3:-10800}"
+  local raw
+  raw="$(live_lab_ssh_via_ssh "$target" "printf '__CAP_BEGIN__\\n'; { ${body}; }; printf '\\n__CAP_END__\\n'" "$timeout")" || return $?
+  live_lab_extract_capture_output "$raw"
+}
+
+live_lab_ssh() {
+  local target="$1"
+  local command="$2"
+  local timeout="${3:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    if live_lab_utm_exec "$target" "$command" "$timeout"; then
+      return 0
+    fi
+    printf 'UTM exec failed for %s; falling back to SSH\n' "$target" >&2
+  fi
+  live_lab_ssh_via_ssh "$target" "$command" "$timeout"
+}
+
+live_lab_scp_to() {
+  local src="$1"
+  local target="$2"
+  local dst="$3"
+  local timeout="${4:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    if live_lab_utm_push "$src" "$target" "$dst"; then
+      return 0
+    fi
+    printf 'UTM file push failed for %s; falling back to SCP\n' "$target" >&2
+  fi
+  live_lab_scp_to_via_ssh "$src" "$target" "$dst" "$timeout"
+}
+
+live_lab_scp_from() {
+  local target="$1"
+  local src="$2"
+  local dst="$3"
+  local timeout="${4:-10800}"
+  if live_lab_target_uses_utm_transport "$target"; then
+    if live_lab_utm_pull "$target" "$src" "$dst"; then
+      return 0
+    fi
+    printf 'UTM file pull failed for %s; falling back to SCP\n' "$target" >&2
+  fi
+  live_lab_scp_from_via_ssh "$target" "$src" "$dst" "$timeout"
+}
+
 live_lab_capture() {
   local target="$1"
   local body="$2"
   local timeout="${3:-10800}"
   if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_exec "$target" "$body" "$timeout"
-    return $?
+    if live_lab_utm_exec "$target" "$body" "$timeout"; then
+      return 0
+    fi
+    printf 'UTM capture failed for %s; falling back to SSH\n' "$target" >&2
   fi
-  local raw
-  raw="$(live_lab_ssh "$target" "printf '__CAP_BEGIN__\\n'; { ${body}; }; printf '\\n__CAP_END__\\n'" "$timeout")"
-  live_lab_extract_capture_output "$raw"
+  live_lab_capture_via_ssh "$target" "$body" "$timeout"
 }
 
 live_lab_extract_capture_output() {
@@ -1044,11 +1091,13 @@ live_lab_run_root() {
   local target="$1"
   local body="$2"
   if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"
-    return $?
+    if live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"; then
+      return 0
+    fi
+    printf 'UTM root exec failed for %s; falling back to SSH\n' "$target" >&2
   fi
   live_lab_push_sudo_password "$target" || return 1
-  live_lab_ssh "$target" "$(live_lab_rootify "$body")"
+  live_lab_ssh_via_ssh "$target" "$(live_lab_rootify "$body")"
 }
 
 live_lab_retry_root() {
@@ -1072,11 +1121,13 @@ live_lab_capture_root() {
   local target="$1"
   local body="$2"
   if live_lab_target_uses_utm_transport "$target"; then
-    live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"
-    return $?
+    if live_lab_utm_exec_root "$target" "$(live_lab_rootify_direct "$body")"; then
+      return 0
+    fi
+    printf 'UTM root capture failed for %s; falling back to SSH\n' "$target" >&2
   fi
   live_lab_push_sudo_password "$target" || return 1
-  live_lab_capture "$target" "$(live_lab_rootify "$body")"
+  live_lab_capture_via_ssh "$target" "$(live_lab_rootify "$body")"
 }
 
 live_lab_base64_to_hex() {
@@ -1162,14 +1213,14 @@ live_lab_install_assignment_bundle() {
   live_lab_ensure_rustynetd_group "$target" || return 1
   live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
   live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
-  live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
+  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
 }
 
 live_lab_install_assignment_refresh_env() {
   local target="$1"
   local env_local="$2"
   live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
-  live_lab_run_root "$target" "root mkdir -p /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
+  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
 }
 
 live_lab_install_dns_zone_bundle() {
@@ -1179,7 +1230,7 @@ live_lab_install_dns_zone_bundle() {
   live_lab_ensure_rustynetd_group "$target" || return 1
   live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
   live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
-  live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
+  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
 }
 
 live_lab_ensure_rustynetd_group() {
@@ -1242,11 +1293,15 @@ live_lab_apply_role_coupling() {
   local preferred_exit_node_id="${3:-}"
   local enable_exit_advertise="${4:-false}"
   local env_path="${5:-/etc/rustynet/assignment-refresh.env}"
+  local skip_client_exit_route_wait="${6:-false}"
   local command
   live_lab_push_sudo_password "$target" || return 1
   command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-role-coupling --target-role '${target_role}' --enable-exit-advertise '${enable_exit_advertise}' --env-path '${env_path}'"
   if [[ -n "$preferred_exit_node_id" ]]; then
     command+=" --preferred-exit-node-id '${preferred_exit_node_id}'"
+  fi
+  if [[ "$skip_client_exit_route_wait" == "true" ]]; then
+    command+=" --skip-client-exit-route-convergence-wait"
   fi
   live_lab_run_root "$target" "$command" || return 1
 }
@@ -2493,7 +2548,10 @@ live_lab_collect_runtime_validation_snapshot() {
   if [[ "$role" == "client" ]]; then
     expected_next_hop="direct:rustynet0"
   fi
-  body="$(printf '%s\n%s\n' \
+  # Keep the runtime convergence snapshot small on the UTM path.
+  # Signed-state and DNS-zone convergence are validated separately by
+  # dedicated collectors before baseline runtime sampling begins.
+  body="$(printf '%s\n%s\n%s\n' \
     "$(live_lab_status_snapshot_body)" \
     "$(live_lab_route_policy_snapshot_body "1.1.1.1" "$expected_next_hop")" \
     "$(live_lab_secret_hygiene_snapshot_body)")"

@@ -27,6 +27,7 @@ const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-handoff";
 const DNS_ZONE_RECORDS_REMOTE: &str = "/tmp/rn-exit-handoff-dns-records.manifest";
 const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/valid.dns-zone";
 const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-dns-zone.pub";
+const ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const HANDOFF_PRE_MONITOR_TIMEOUT_SECS: u64 = 60;
 const HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
@@ -469,6 +470,12 @@ fn run() -> Result<(), String> {
         &config.exit_b_host,
         "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0",
     )?;
+    pin_client_to_expected_exit(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+        &config.exit_a_node_id,
+    )?;
 
     wait_for_handoff_monitor_prereqs(
         &mut logger,
@@ -608,14 +615,11 @@ fn run() -> Result<(), String> {
                 )
                 .as_str(),
             )?;
-            live_lab_support::apply_role_coupling(
+            pin_client_to_expected_exit(
                 &config.ssh_identity_file,
                 &work_known_hosts,
                 &config.client_host,
-                "client",
-                Some(&config.exit_b_node_id),
-                false,
-                "/etc/rustynet/assignment-refresh.env",
+                &config.exit_b_node_id,
             )?;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1213,6 +1217,29 @@ fn managed_dns_state_is_valid(status: &str) -> bool {
         && status.contains("dns_alarm_state=ok")
 }
 
+fn pin_client_to_expected_exit(
+    identity: &Path,
+    known_hosts: &Path,
+    client_host: &str,
+    expected_exit_node_id: &str,
+) -> Result<(), String> {
+    live_lab_support::apply_role_coupling(
+        identity,
+        known_hosts,
+        client_host,
+        "client",
+        Some(expected_exit_node_id),
+        false,
+        ASSIGNMENT_REFRESH_ENV_PATH,
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        client_host,
+        "rustynet ops force-local-assignment-refresh-now",
+    )
+}
+
 fn handoff_runtime_ready(status: &str) -> bool {
     status_field(status, "restricted_safe_mode") == Some("false")
         && status_field(status, "bootstrap_error") == Some("none")
@@ -1251,6 +1278,12 @@ fn wait_for_handoff_monitor_expected_exit(
             expected_exit_node_id
         )
         .as_str(),
+    )?;
+    pin_client_to_expected_exit(
+        &config.ssh_identity_file,
+        known_hosts,
+        &config.client_host,
+        expected_exit_node_id,
     )?;
     let start_ts = unix_now();
     let mut last_client_status = String::new();
@@ -1313,6 +1346,12 @@ fn wait_for_handoff_monitor_prereqs(
     logger.line(
         "[exit-handoff] waiting for baseline exit route and managed DNS freshness before monitor",
     )?;
+    pin_client_to_expected_exit(
+        &config.ssh_identity_file,
+        known_hosts,
+        &config.client_host,
+        &config.exit_a_node_id,
+    )?;
     let start_ts = unix_now();
     let mut next_coordination_refresh_ts =
         next_refresh_deadline(start_ts, config.traversal_refresh_interval_secs);
@@ -1347,6 +1386,12 @@ fn wait_for_handoff_monitor_prereqs(
                 dns_passphrase_remote,
                 nodes_spec,
                 allow_spec,
+            )?;
+            pin_client_to_expected_exit(
+                &config.ssh_identity_file,
+                known_hosts,
+                &config.client_host,
+                &config.exit_a_node_id,
             )?;
             next_coordination_refresh_ts = advance_periodic_refresh_deadline(
                 next_coordination_refresh_ts,
@@ -1520,7 +1565,7 @@ fn install_assignment_bundle(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -1555,7 +1600,7 @@ fn install_dns_bundle(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -1598,7 +1643,7 @@ fn install_assignment_refresh_env(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -1633,7 +1678,7 @@ fn install_traversal_bundle(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,

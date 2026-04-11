@@ -29,11 +29,11 @@ The following repository state is already true and must not be regressed.
 - `rustynet-cli` now has a narrow typed reduced-live-lab iteration helper:
   - `ops vm-lab-iterate-live-lab`
   - it only accepts typed local validation steps (`fmt`, `check`, `check-bin`, `test`, `test-bin`)
-  - it writes the live-lab profile, runs preflight, launches the standard reduced five-node live-lab orchestrator, waits for completion, and prints the first failed stage plus key report/log paths
+  - it writes the live-lab profile, launches the standard reduced five-node live-lab orchestrator, waits for completion, and prints the first failed stage plus key report/log paths
   - it supports strict provenance guards:
     - `--require-clean-tree`
     - `--require-local-head`
-  - it does **not** accept arbitrary shell commands or widen the operator surface beyond the existing `vm-lab-write-live-lab-profile`, `vm-lab-preflight`, and `vm-lab-run-live-lab` flow
+  - it does **not** accept arbitrary shell commands or widen the operator surface beyond the hardened `vm-lab-setup-live-lab` and `vm-lab-run-live-lab` flow plus the supporting profile helpers
 - `rustynet-cli` now also has narrow live-lab support helpers:
   - `ops vm-lab-validate-live-lab-profile`
   - `ops vm-lab-diagnose-live-lab-failure`
@@ -225,8 +225,7 @@ The endpoint-visibility subcheck is not the blocker:
 Keep using the built-in helper flow rather than ad hoc SSH orchestration:
 - preferred narrow wrapper for reduced five-node iteration:
   - `ops vm-lab-iterate-live-lab`
-- `ops vm-lab-write-live-lab-profile`
-- `ops vm-lab-preflight`
+- `ops vm-lab-setup-live-lab`
 - `ops vm-lab-run-live-lab`
 
 The new wrapper is the standard path for iterative reduced-lab debugging because it:
@@ -422,9 +421,8 @@ Use this order so failures are local and explainable:
 - run-to-run blocker comparison:
   - `cargo run --quiet -p rustynet-cli -- ops vm-lab-diff-live-lab-runs --old-report-dir artifacts/live_lab/<old> --new-report-dir artifacts/live_lab/<new>`
 - underlying built-in flow that the helper wraps:
-- `cargo run --quiet -p rustynet-cli -- ops vm-lab-write-live-lab-profile ... --backend linux-wireguard-userspace-shared --source-mode local-head --repo-ref HEAD`
-- `cargo run --quiet -p rustynet-cli -- ops vm-lab-preflight ...`
-- `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile profiles/live_lab/generated_vm_lab_5node.env --skip-gates --skip-soak --skip-cross-network`
+- `cargo run --quiet -p rustynet-cli -- ops vm-lab-setup-live-lab --report-dir artifacts/live_lab/setup_<id> --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --source-mode local-head --repo-ref HEAD`
+- `cargo run --quiet -p rustynet-cli -- ops vm-lab-run-live-lab --profile artifacts/live_lab/setup_<id>/setup_profile.env --report-dir artifacts/live_lab/setup_<id> --skip-gates --skip-soak --skip-cross-network`
 
 ### 7.3 Follow-on repo-level validation after the runtime slice is clean
 Do not claim repo-level pre-live-lab readiness until these are revisited honestly:

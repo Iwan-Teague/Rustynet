@@ -14,7 +14,7 @@ use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
     Logger, apply_role_coupling, capture_root, create_workspace, enforce_host, field_value,
     git_head_commit, read_last_matching_line, remote_src_dir, require_command, run_cargo_ops,
-    run_root, scp_from, scp_to, shell_quote, ssh_status, status, unix_now, wait_for_daemon_socket,
+    run_root, scp_to, shell_quote, ssh_status, status, unix_now, wait_for_daemon_socket,
     write_file,
 };
 
@@ -31,6 +31,17 @@ struct TraversalRefreshContext {
     env_file: PathBuf,
     exit_host: String,
     targets: Vec<TraversalRefreshTarget>,
+}
+
+struct ClientRoleContext<'a> {
+    logger: &'a mut Logger,
+    identity: &'a Path,
+    known_hosts: &'a Path,
+    host: &'a str,
+    node_id: &'a str,
+    ssh_allow_cidrs: &'a str,
+    workspace_dir: &'a Path,
+    traversal_refresh: Option<&'a TraversalRefreshContext>,
 }
 
 fn main() {
@@ -343,7 +354,7 @@ fn process_host(
     traversal_refresh: Option<&TraversalRefreshContext>,
 ) -> Result<(), String> {
     logger.line(format!("[role-switch] {os_id} {host} -> {temp_role}").as_str())?;
-    let baseline = ensure_client_role(
+    let mut client_role = ClientRoleContext {
         logger,
         identity,
         known_hosts,
@@ -352,7 +363,8 @@ fn process_host(
         ssh_allow_cidrs,
         workspace_dir,
         traversal_refresh,
-    )?;
+    };
+    let baseline = ensure_client_role(&mut client_role)?;
     let baseline_exit = field_value(&baseline, "exit_node");
 
     switch_role(
@@ -384,17 +396,8 @@ fn process_host(
         least_privilege_preserved = "pass";
     }
 
-    let after_restore = ensure_client_role_with_expected_exit(
-        logger,
-        identity,
-        known_hosts,
-        host,
-        node_id,
-        ssh_allow_cidrs,
-        Some(&baseline_exit),
-        workspace_dir,
-        traversal_refresh,
-    )?;
+    let after_restore =
+        ensure_client_role_with_expected_exit(&mut client_role, Some(&baseline_exit))?;
 
     if field_value(&after_temp, "node_role") == temp_role
         && field_value(&after_restore, "node_role") == "client"
@@ -485,41 +488,16 @@ fn switch_role(
     )
 }
 
-fn ensure_client_role(
-    logger: &mut Logger,
-    identity: &Path,
-    known_hosts: &Path,
-    host: &str,
-    node_id: &str,
-    ssh_allow_cidrs: &str,
-    workspace_dir: &Path,
-    traversal_refresh: Option<&TraversalRefreshContext>,
-) -> Result<String, String> {
-    ensure_client_role_with_expected_exit(
-        logger,
-        identity,
-        known_hosts,
-        host,
-        node_id,
-        ssh_allow_cidrs,
-        None,
-        workspace_dir,
-        traversal_refresh,
-    )
+fn ensure_client_role(context: &mut ClientRoleContext<'_>) -> Result<String, String> {
+    ensure_client_role_with_expected_exit(context, None)
 }
 
 fn ensure_client_role_with_expected_exit(
-    logger: &mut Logger,
-    identity: &Path,
-    known_hosts: &Path,
-    host: &str,
-    node_id: &str,
-    ssh_allow_cidrs: &str,
+    context: &mut ClientRoleContext<'_>,
     expected_exit: Option<&str>,
-    workspace_dir: &Path,
-    traversal_refresh: Option<&TraversalRefreshContext>,
 ) -> Result<String, String> {
-    let baseline = capture_client_role_snapshot(identity, known_hosts, host)?;
+    let baseline =
+        capture_client_role_snapshot(context.identity, context.known_hosts, context.host)?;
     let baseline_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
         .map(|value| value.to_string())
@@ -533,18 +511,18 @@ fn ensure_client_role_with_expected_exit(
     }
 
     switch_role(
-        identity,
-        known_hosts,
-        host,
+        context.identity,
+        context.known_hosts,
+        context.host,
         "client",
-        node_id,
-        ssh_allow_cidrs,
+        context.node_id,
+        context.ssh_allow_cidrs,
     )?;
     if baseline_exit.is_empty() || baseline_exit == "none" {
         apply_role_coupling(
-            identity,
-            known_hosts,
-            host,
+            context.identity,
+            context.known_hosts,
+            context.host,
             "client",
             None,
             false,
@@ -552,34 +530,39 @@ fn ensure_client_role_with_expected_exit(
         )?;
     } else {
         apply_role_coupling(
-            identity,
-            known_hosts,
-            host,
+            context.identity,
+            context.known_hosts,
+            context.host,
             "client",
             Some(baseline_exit.as_str()),
             false,
             "/etc/rustynet/assignment-refresh.env",
         )?;
     }
-    force_runtime_state_refresh(identity, known_hosts, host)?;
-    if let Some(refresh) = traversal_refresh {
+    force_runtime_state_refresh(context.identity, context.known_hosts, context.host)?;
+    if let Some(refresh) = context.traversal_refresh {
         refresh_traversal_for_role_restore(
-            logger,
-            identity,
-            known_hosts,
-            workspace_dir,
+            context.logger,
+            context.identity,
+            context.known_hosts,
+            context.workspace_dir,
             refresh,
-            node_id,
+            context.node_id,
         )?;
         force_runtime_state_refresh_targets_ordered(
-            identity,
-            known_hosts,
+            context.identity,
+            context.known_hosts,
             refresh.targets.as_slice(),
             refresh.exit_host.as_str(),
-            host,
+            context.host,
         )?;
     }
-    let after_switch = wait_for_role(identity, known_hosts, host, "client")?;
+    let after_switch = wait_for_role(
+        context.identity,
+        context.known_hosts,
+        context.host,
+        "client",
+    )?;
     let restore_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
         .map(|value| value.to_string())
@@ -587,7 +570,12 @@ fn ensure_client_role_with_expected_exit(
     if restore_exit.is_empty() || restore_exit == "none" {
         Ok(after_switch)
     } else {
-        wait_for_client_exit_route_convergence(identity, known_hosts, host, &restore_exit)
+        wait_for_client_exit_route_convergence(
+            context.identity,
+            context.known_hosts,
+            context.host,
+            &restore_exit,
+        )
     }
 }
 
@@ -652,7 +640,7 @@ fn refresh_traversal_for_role_restore(
     );
 
     let verifier_key = issue_dir.join("rn-traversal.pub");
-    scp_from(
+    capture_root_file_to_path(
         identity,
         known_hosts,
         refresh.exit_host.as_str(),
@@ -662,7 +650,7 @@ fn refresh_traversal_for_role_restore(
 
     for target in &refresh.targets {
         let bundle = issue_dir.join(format!("rn-traversal-{}.traversal", target.node_id));
-        scp_from(
+        capture_root_file_to_path(
             identity,
             known_hosts,
             refresh.exit_host.as_str(),
@@ -690,11 +678,36 @@ fn refresh_traversal_for_role_restore(
             identity,
             known_hosts,
             target.host.as_str(),
-            "mkdir -p /etc/rustynet /var/lib/rustynet && if ! getent group rustynetd >/dev/null 2>&1; then groupadd --system rustynetd; fi && install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle",
+            "if ! getent group rustynetd >/dev/null 2>&1; then groupadd --system rustynetd; fi && install -d -m 0750 -o root -g rustynetd /etc/rustynet && install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle",
         )?;
     }
 
     Ok(())
+}
+
+fn capture_root_file_to_path(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<(), String> {
+    let command = format!("cat {}", shell_quote(remote_path));
+    let contents = capture_root(identity, known_hosts, host, command.as_str())?;
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create local traversal capture dir {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(local_path, contents).map_err(|err| {
+        format!(
+            "failed to write captured traversal file {}: {err}",
+            local_path.display()
+        )
+    })
 }
 
 fn force_runtime_state_refresh_targets_ordered(

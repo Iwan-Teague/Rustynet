@@ -40,13 +40,21 @@ and readiness details:
 cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
-The summary command is the quickest way to confirm whether the local lab is
-ready to feed into `ops vm-lab-write-live-lab-profile` and the main live-lab
-setup wrapper.
+Add `--update-inventory-live-ips` when you want a fully ready discovery pass to
+refresh inventory IPs in place, and `--report-dir <path>` when you want the
+JSON report and summary written as local artifacts.
 
-If discovery shows live IPs but `ready=false` or `ssh_port_status=closed`, the
-guest IPs are known but the host-to-guest SSH path is still not usable. Use the
-local restart wrapper and wait for readiness before continuing:
+The summary command is the quickest way to confirm whether the local lab is
+ready for the standard four-stage operator pipeline:
+
+1. `ops vm-lab-discover-local-utm-summary`
+2. `ops vm-lab-setup-live-lab`
+3. `ops vm-lab-run-live-lab`
+4. `ops vm-lab-diagnose-live-lab-failure`
+
+If discovery shows live IPs but `readiness.execution_ready=false`, the guest IPs
+are known but the host-to-guest SSH path is still not usable end to end. Use
+the local restart wrapper and wait for readiness before continuing:
 
 ```bash
 cargo run --quiet -p rustynet-cli -- ops vm-lab-restart \
@@ -56,6 +64,27 @@ cargo run --quiet -p rustynet-cli -- ops vm-lab-restart \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
   --known-hosts-file ~/.ssh/known_hosts
 ```
+
+On success, the restart wrapper also updates
+`documents/operations/active/vm_lab_inventory.json` so `ssh_target` and
+`last_known_ip` reflect the live IPs that actually came back after restart.
+Add `--json` when the caller wants a machine-readable restart result, and
+`--report-dir <path>` when the restart evidence should be captured on disk.
+
+If you want the CLI to make that restart decision and then continue through the
+usual setup, run, and diagnose-on-failure path automatically, use:
+
+```bash
+cargo run --quiet -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --report-dir artifacts/live_lab/$(date -u +%Y%m%dT%H%M%SZ)_orchestrated \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
+  --require-same-network
+```
+
+Add `--stop-after-ready` when you want the wrapper to prove UTM recovery and
+inventory freshness without continuing into setup.
 
 ## Target topology
 
@@ -126,7 +155,26 @@ The following stages now execute one worker per target in parallel:
 - `enforce_baseline_runtime`
 - `validate_baseline_runtime`
 
-The high-level setup flow is grouped by `stage_run_fresh_bootstrap_and_network_setup`, which sequences source packaging, an explicit SSH reachability gate, remote access priming, cleanup, bootstrap, pubkey collection, membership setup, membership distribution, assignment issuance, traversal issuance, baseline enforcement, and baseline validation as one composed orchestration helper.
+The public Rust entrypoint for the setup-only flow is
+`ops vm-lab-setup-live-lab`. It drives the shell orchestrator with explicit
+setup-only semantics and sequences:
+
+- source packaging
+- explicit SSH reachability gate
+- remote access priming
+- cleanup
+- bootstrap
+- pubkey collection
+- membership setup
+- membership distribution
+- assignment issuance
+- traversal issuance
+- baseline enforcement
+- baseline validation
+
+The wrapper also supports deterministic reruns of the setup slice through
+`--resume-from <stage>` and `--rerun-stage <stage>`, and the shell now caps
+parallel node workers to avoid oversubscribing the Mac-hosted UTM fleet.
 
 Security and determinism constraints for parallel work:
 

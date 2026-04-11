@@ -15,9 +15,9 @@ end.
 | Step | Primary wrapper | What it does |
 | --- | --- | --- |
 | Discover | `ops vm-lab-discover-local-utm-summary` | Finds the local UTM bundles, live IPs, SSH readiness, and the fastest setup summary. Use `ops vm-lab-discover-local-utm` when you need the full JSON report. |
-| Setup | `stage_run_fresh_bootstrap_and_network_setup` | Installs Rustynet on the selected nodes, boots the shared network, and enforces the baseline runtime state. |
-| Link and Test | `ops vm-lab-run-live-lab` | Runs the full live-lab suite against the prepared topology. Use `stage_run_extended_soak` afterward when you want the longer resilience and reboot-recovery coverage. |
-| Diagnose | `ops vm-lab-diagnose-live-lab-failure` | Collects the first failed stage and packages the useful failure context for triage. |
+| Setup | `ops vm-lab-setup-live-lab` | Generates or validates the live-lab profile, runs the setup-only sequence through baseline validation, and writes a resumable report directory. |
+| Link and Test | `ops vm-lab-run-live-lab` | Runs the full live-lab suite, validates the report contract, and automatically continues from a setup-only report directory when setup already completed. |
+| Diagnose | `ops vm-lab-diagnose-live-lab-failure` | Collects the first failed stage and packages a stage-aware forensic bundle for triage. |
 
 This is the recommended operator path: discover, set up, link and test, then
 diagnose if something fails.
@@ -53,17 +53,24 @@ orchestrator remains the execution engine behind them.
 | --- | --- | --- |
 | `ops vm-lab-write-live-lab-profile` | Generates a non-interactive live-lab profile from inventory-backed VM aliases or explicit SSH targets | First step for any repeatable live-lab run |
 | `ops vm-lab-validate-live-lab-profile` | Verifies the generated profile is internally consistent and matches the expected backend/source-mode/topology | Before a run when profile or provenance correctness matters |
-| `ops vm-lab-iterate-live-lab` | Runs typed local validation, writes the profile, performs preflight, launches the reduced live-lab flow, and prints the first failed stage on error | Narrow iteration loop while debugging a red live-lab stage |
+| `ops vm-lab-setup-live-lab` | Drives the setup-only live-lab pipeline, emits structured JSON, and supports `--resume-from` and `--rerun-stage` for setup-stage recovery | Preferred operator entrypoint for repeatable lab setup without immediately running the full suite |
+| `ops vm-lab-orchestrate-live-lab` | Discovers selected local UTM VMs, restarts only the aliases that are not execution-ready, reruns discovery, then drives setup, run, and diagnose-on-failure in one report directory. `--stop-after-ready` exits after the readiness gate when you only need VM recovery proof. | Preferred one-shot wrapper when the operator wants recovery plus the standard live-lab workflow without manual branching |
+| `ops vm-lab-run-live-lab` | Runs the full live-lab suite, validates required report artifacts, and can continue from an existing setup-only report directory | Preferred operator entrypoint for the full suite after setup is complete |
+| `ops vm-lab-iterate-live-lab` | Runs typed local validation, writes the profile, launches the reduced live-lab flow, and prints the first failed stage on error | Narrow iteration loop while debugging a red live-lab stage |
 | `ops vm-lab-diff-live-lab-runs` | Compares two report directories and shows the first divergent stage outcome | When a patch moves the blocker and you want a quick regression/progression diff |
 | `ops vm-lab-bootstrap-phase --phase all` | Runs the reusable Rust bootstrap pipeline across the selected VM set: sync source, build release, install release, restart runtime, verify runtime | Fresh-install or rebuild-only workflow when you want provisioning without the full live-lab test suite |
 | `ops vm-lab-preflight` | Verifies SSH reachability, sudo, free disk, and required commands | Standalone readiness check before provisioning or a live-lab run |
-| `ops vm-lab-discover-local-utm` | Automatically scans the local UTM documents tree, resolves live IPs, and reports SSH port/process readiness for every discovered bundle | Use when you want the full machine-discovered local UTM lab inventory |
-| `ops vm-lab-restart --wait-ready` | Restarts the selected local UTM VMs and waits for process presence, live IP resolution, SSH port-open state, and SSH auth readiness | Recovery path when discovery knows the VMs but they are not yet actually reachable over SSH |
+| `ops vm-lab-discover-local-utm` | Automatically scans the local UTM documents tree, resolves live IPs, and reports SSH port/process readiness for every discovered bundle. `--update-inventory-live-ips` persists the refreshed IPs only when the whole matched set is execution-ready. | Use when you want the full machine-discovered local UTM lab inventory |
+| `ops vm-lab-restart --wait-ready` | Restarts the selected local UTM VMs, waits for process presence, live IP resolution, SSH port-open state, and SSH auth readiness, then refreshes the inventory IP fields on success. `--json` and `--report-dir` add machine-readable result and artifact output. | Recovery path when discovery knows the VMs but they are not yet actually reachable over SSH |
 | `ops vm-lab-status` | Captures per-node runtime and service status snapshots | Fast point-in-time inspection outside the failure-diagnostics wrapper |
 
 The four entries above the fold are the recommended operator path:
-`ops vm-lab-discover-local-utm-summary`, `stage_run_fresh_bootstrap_and_network_setup`,
+`ops vm-lab-discover-local-utm-summary`, `ops vm-lab-setup-live-lab`,
 `ops vm-lab-run-live-lab`, and `ops vm-lab-diagnose-live-lab-failure`.
+
+`ops vm-lab-orchestrate-live-lab` is the optional one-shot wrapper that
+automates the common discovery -> restart-if-needed -> setup -> run ->
+diagnose-on-failure decision tree.
 
 ## Recommended Workflows
 
@@ -72,23 +79,25 @@ Use the smallest wrapper set that matches the task:
 | Goal | Preferred wrapper flow |
 | --- | --- |
 | Fresh install all selected Rustynet nodes | `ops vm-lab-bootstrap-phase --phase all` |
-| Fresh install plus baseline and the full standard live suite | `ops vm-lab-write-live-lab-profile` -> `ops vm-lab-validate-live-lab-profile` -> `ops vm-lab-run-live-lab` |
+| Fresh install plus baseline and the full standard live suite | `ops vm-lab-setup-live-lab` -> `ops vm-lab-run-live-lab` |
+| One command that recovers unready local UTM VMs and then runs the standard live-lab flow | `ops vm-lab-orchestrate-live-lab` |
 | Reduced repeatable debug loop for a failing live-lab stage | `ops vm-lab-iterate-live-lab` |
 | Investigate a red run after completion | `ops vm-lab-diagnose-live-lab-failure` and optionally `ops vm-lab-diff-live-lab-runs` |
 
-Minimal three-command live-lab path:
+Minimal four-command live-lab path:
 
 | Step | Preferred command |
 | --- | --- |
-| Fresh install and bootstrap all selected nodes | `ops vm-lab-bootstrap-phase --phase all` |
-| Configure the topology and run the full setup plus test sequence | `ops vm-lab-write-live-lab-profile` -> `ops vm-lab-validate-live-lab-profile` -> `ops vm-lab-run-live-lab` |
+| Discover local UTM state and SSH readiness | `ops vm-lab-discover-local-utm-summary` |
+| Configure the topology and complete setup-only stages | `ops vm-lab-setup-live-lab` |
+| Run the full live-lab suite | `ops vm-lab-run-live-lab` |
 | Gather a stage-aware forensic bundle after a red run | `ops vm-lab-diagnose-live-lab-failure` |
 
 Current usage in this repo:
 
-- We have been using `ops vm-lab-write-live-lab-profile`, `ops vm-lab-validate-live-lab-profile`, and `ops vm-lab-run-live-lab` for the current five-node UTM lab work.
+- We now use `ops vm-lab-setup-live-lab` plus `ops vm-lab-run-live-lab` as the primary operator path for the current five-node UTM lab work.
 - `ops vm-lab-diagnose-live-lab-failure` is now the preferred post-failure collection path because it packages the failed stage context and targeted diagnostics into one bundle.
-- The current blocker is inside the orchestration behavior reached by `ops vm-lab-run-live-lab`, not because these wrapper commands are missing.
+- The lower-level profile and preflight helpers still exist when you need tighter control over one slice of the workflow.
 
 ## Primitive Building Blocks
 

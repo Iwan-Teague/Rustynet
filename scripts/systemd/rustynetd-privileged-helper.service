@@ -4,7 +4,6 @@ Documentation=https://github.com/Iwan-Teague/Rustynet
 After=network-online.target
 Wants=network-online.target
 Before=rustynetd.service
-PartOf=rustynetd.service
 StartLimitBurst=5
 StartLimitIntervalSec=60
 

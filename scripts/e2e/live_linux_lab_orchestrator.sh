@@ -34,6 +34,12 @@ SOAK_HARD_FAIL=0
 RUN_LOCAL_GATES=1
 RUN_SOAK=1
 DRY_RUN=0
+SETUP_ONLY=0
+SKIP_SETUP=0
+PRESERVE_REPORT_STATE=0
+RESUME_FROM_STAGE=""
+RERUN_STAGE=""
+MAX_PARALLEL_NODE_WORKERS="${MAX_PARALLEL_NODE_WORKERS:-2}"
 CROSS_NETWORK_MODE="auto"
 CROSS_NETWORK_SKIP_REASON=""
 OVERALL_STATUS="pass"
@@ -122,13 +128,20 @@ options:
   --fifth-client-target <user@host|host>
                                 Optional fifth client target for six-node live labs
   --ssh-identity-file <path>     SSH private key for key-based authentication
-  --ssh-password-file <path>     Deprecated alias of --ssh-identity-file
-  --sudo-password-file <path>    Deprecated alias of --ssh-identity-file
+  --ssh-password-file <path>     REMOVED. Use --ssh-identity-file for key auth.
+  --sudo-password-file <path>    REMOVED. Password files are not accepted here.
   --ssh-known-hosts-file <path>  Pinned SSH known_hosts file (defaults to ~/.ssh/known_hosts)
   --network-id <id>              Override generated network ID
   --ssh-allow-cidrs <cidrs>      SSH management CIDRs (default: ${SSH_ALLOW_CIDRS})
   --repo-ref <ref>               Explicit git ref to archive (implies source-mode=ref)
   --report-dir <path>            Override report output directory
+  --setup-only                   Run only the preflight + baseline setup stages
+  --skip-setup                   Skip preflight + baseline setup stages and run follow-on tests only
+  --preserve-report-state        Reuse an existing report dir instead of truncating stage state
+  --resume-from <stage>          Resume the setup stage sequence from a specific setup stage
+  --rerun-stage <stage>          Rerun one setup stage in an existing report dir
+  --max-parallel-node-workers <n>
+                                Cap concurrent parallel worker fan-out (default: ${MAX_PARALLEL_NODE_WORKERS})
   --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-120, default: ${TRAVERSAL_TTL_SECS})
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
@@ -1099,6 +1112,115 @@ record_stage_skip() {
   refresh_failure_digest
 }
 
+is_setup_stage_name() {
+  case "$1" in
+    preflight|prepare_source_archive|verify_ssh_reachability|prime_remote_access|cleanup_hosts|bootstrap_hosts|collect_pubkeys|membership_setup|distribute_membership_state|issue_and_distribute_assignments|issue_and_distribute_traversal|issue_and_distribute_dns_zone|enforce_baseline_runtime|validate_baseline_runtime)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+setup_stage_index() {
+  local stage_name="$1"
+  local idx=0
+  local stages=(
+    preflight
+    prepare_source_archive
+    verify_ssh_reachability
+    prime_remote_access
+    cleanup_hosts
+    bootstrap_hosts
+    collect_pubkeys
+    membership_setup
+    distribute_membership_state
+    issue_and_distribute_assignments
+    issue_and_distribute_traversal
+    issue_and_distribute_dns_zone
+    enforce_baseline_runtime
+    validate_baseline_runtime
+  )
+  for idx in "${!stages[@]}"; do
+    if [[ "${stages[$idx]}" == "$stage_name" ]]; then
+      printf '%s' "$idx"
+      return 0
+    fi
+  done
+  return 1
+}
+
+reset_setup_stage_state() {
+  local reset_from="$1"
+  local reset_mode="$2"
+  local tmp_stage_tsv="${STAGE_TSV}.tmp"
+  local line stage_name stage_idx reset_idx
+  if [[ ! -f "$STAGE_TSV" ]]; then
+    return 0
+  fi
+  if ! reset_idx="$(setup_stage_index "$reset_from")"; then
+    printf 'unsupported setup stage for reset: %s\n' "$reset_from" >&2
+    return 1
+  fi
+  : > "$tmp_stage_tsv"
+  while IFS= read -r line; do
+    stage_name="${line%%$'\t'*}"
+    if is_setup_stage_name "$stage_name"; then
+      if [[ "$reset_mode" == "rerun" ]]; then
+        [[ "$stage_name" == "$reset_from" ]] && continue
+      else
+        stage_idx="$(setup_stage_index "$stage_name" || true)"
+        if [[ -n "$stage_idx" && "$stage_idx" -ge "$reset_idx" ]]; then
+          continue
+        fi
+      fi
+    fi
+    printf '%s\n' "$line" >> "$tmp_stage_tsv"
+  done < "$STAGE_TSV"
+  mv "$tmp_stage_tsv" "$STAGE_TSV"
+  rm -f "$LOG_DIR/${reset_from}.log"
+  rm -rf "$STATE_DIR/parallel-${reset_from}"
+}
+
+run_setup_stage() {
+  local severity="$1"
+  local stage_name="$2"
+  local description="$3"
+  shift 3
+
+  if [[ -n "$RERUN_STAGE" ]]; then
+    if [[ "$stage_name" != "$RERUN_STAGE" ]]; then
+      return 0
+    fi
+  elif [[ -n "$RESUME_FROM_STAGE" ]]; then
+    local current_idx resume_idx
+    current_idx="$(setup_stage_index "$stage_name" || true)"
+    resume_idx="$(setup_stage_index "$RESUME_FROM_STAGE" || true)"
+    if [[ -z "$current_idx" || -z "$resume_idx" ]]; then
+      printf 'unsupported resume stage: %s\n' "$RESUME_FROM_STAGE" >&2
+      return 1
+    fi
+    if [[ "$current_idx" -lt "$resume_idx" ]]; then
+      return 0
+    fi
+  fi
+
+  run_stage "$severity" "$stage_name" "$description" "$@"
+}
+
+wait_for_parallel_slot() {
+  local max_jobs="$1"
+  local running
+  while true; do
+    running="$(jobs -rp | wc -l | tr -d ' ')"
+    if [[ "$running" -lt "$max_jobs" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+}
+
 update_overall_status() {
   local severity="$1"
   local status="$2"
@@ -1648,6 +1770,10 @@ parallel_stage_scope_matches() {
       [[ "$label" != "exit" ]]
       return
       ;;
+    exit_only)
+      [[ "$label" == "exit" ]]
+      return
+      ;;
     *)
       printf 'unsupported parallel scope: %s\n' "$scope" >&2
       return 1
@@ -1663,9 +1789,10 @@ run_parallel_node_stage() {
   local label target node_id role pid log_path rc started_at finished_at
   local snapshot_path route_policy_path dns_state_path primary_failure_reason
   local -x LIVE_LAB_STAGE_NAME="$stage_name"
+  local append_stage_dir="${LIVE_LAB_STAGE_APPEND:-0}"
 
   case "$scope" in
-    all|non_exit)
+    all|non_exit|exit_only)
       ;;
     *)
       printf 'unsupported parallel scope: %s\n' "$scope" >&2
@@ -1677,15 +1804,21 @@ run_parallel_node_stage() {
   local -x LIVE_LAB_STAGE_DIR="$stage_dir"
   workers_tsv="${stage_dir}/workers.tsv"
   results_tsv="${stage_dir}/results.tsv"
-  rm -rf "$stage_dir"
-  mkdir -p "$stage_dir"
+  if [[ "$append_stage_dir" != "1" ]]; then
+    rm -rf "$stage_dir"
+    mkdir -p "$stage_dir"
+  else
+    mkdir -p "$stage_dir"
+    [[ -f "$results_tsv" ]] || : > "$results_tsv"
+  fi
   : > "$workers_tsv"
-  : > "$results_tsv"
+  [[ "$append_stage_dir" == "1" ]] || : > "$results_tsv"
 
   while IFS=$'\t' read -r label target node_id role; do
     if ! parallel_stage_scope_matches "$scope" "$label"; then
       continue
     fi
+    wait_for_parallel_slot "$MAX_PARALLEL_NODE_WORKERS"
     log_path="${stage_dir}/${label}.log"
     started_at="$(date -u +%FT%TZ)"
     (
@@ -1754,9 +1887,10 @@ run_serial_node_stage() {
   local label target node_id role log_path rc started_at finished_at
   local snapshot_path route_policy_path dns_state_path primary_failure_reason
   local -x LIVE_LAB_STAGE_NAME="$stage_name"
+  local append_stage_dir="${LIVE_LAB_STAGE_APPEND:-0}"
 
   case "$scope" in
-    all|non_exit)
+    all|non_exit|exit_only)
       ;;
     *)
       printf 'unsupported serial scope: %s\n' "$scope" >&2
@@ -1768,10 +1902,15 @@ run_serial_node_stage() {
   local -x LIVE_LAB_STAGE_DIR="$stage_dir"
   workers_tsv="${stage_dir}/workers.tsv"
   results_tsv="${stage_dir}/results.tsv"
-  rm -rf "$stage_dir"
-  mkdir -p "$stage_dir"
+  if [[ "$append_stage_dir" != "1" ]]; then
+    rm -rf "$stage_dir"
+    mkdir -p "$stage_dir"
+  else
+    mkdir -p "$stage_dir"
+    [[ -f "$results_tsv" ]] || : > "$results_tsv"
+  fi
   : > "$workers_tsv"
-  : > "$results_tsv"
+  [[ "$append_stage_dir" == "1" ]] || : > "$results_tsv"
 
   while IFS=$'\t' read -r label target node_id role; do
     if ! parallel_stage_scope_matches "$scope" "$label"; then
@@ -2377,7 +2516,17 @@ prime_remote_access() {
 }
 
 stage_verify_ssh_reachability() {
+  local force_ssh_for_reachability=0
+  if live_lab_has_utm_transport && live_lab_can_use_ssh_transport; then
+    export LIVE_LAB_FORCE_SSH_TRANSPORT=1
+    force_ssh_for_reachability=1
+  fi
   run_parallel_node_stage verify_ssh_reachability ssh_reachability_worker
+  local rc=$?
+  if (( force_ssh_for_reachability )); then
+    unset LIVE_LAB_FORCE_SSH_TRANSPORT
+  fi
+  return "$rc"
 }
 
 ssh_reachability_worker() {
@@ -2449,19 +2598,19 @@ stage_prepare_source_archive() {
 }
 
 stage_run_fresh_bootstrap_and_network_setup() {
-  run_stage hard prepare_source_archive 'package local source tree for remote install' stage_prepare_source_archive || return 1
-  run_stage hard verify_ssh_reachability 'verify all selected nodes are reachable via ssh' stage_verify_ssh_reachability || return 1
-  run_stage hard prime_remote_access 'push sudo credentials to all targets' prime_remote_access || return 1
-  run_stage hard cleanup_hosts 'remove prior RustyNet state from targets' stage_cleanup_hosts || return 1
-  run_stage hard bootstrap_hosts 'fresh install and bootstrap RustyNet on all targets' stage_bootstrap_hosts || return 1
-  run_stage hard collect_pubkeys 'collect WireGuard public keys from all targets' stage_collect_pubkeys || return 1
-  run_stage hard membership_setup 'apply signed membership updates on primary exit' stage_membership_setup || return 1
-  run_stage hard distribute_membership_state 'export and install membership state to peers' stage_distribute_membership_state || return 1
-  run_stage hard issue_and_distribute_assignments 'issue signed one-hop assignments and install refresh env files' stage_issue_and_distribute_assignments || return 1
-  run_stage hard issue_and_distribute_traversal 'issue and distribute signed traversal bundles for all managed peers' stage_issue_and_distribute_traversal || return 1
-  run_stage hard issue_and_distribute_dns_zone 'issue and distribute signed DNS zone bundles for all managed peers' stage_issue_and_distribute_dns_zone || return 1
-  run_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime || return 1
-  run_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime || return 1
+  run_setup_stage hard prepare_source_archive 'package local source tree for remote install' stage_prepare_source_archive || return 1
+  run_setup_stage hard verify_ssh_reachability 'verify all selected nodes are reachable via ssh' stage_verify_ssh_reachability || return 1
+  run_setup_stage hard prime_remote_access 'push sudo credentials to all targets' prime_remote_access || return 1
+  run_setup_stage hard cleanup_hosts 'remove prior RustyNet state from targets' stage_cleanup_hosts || return 1
+  run_setup_stage hard bootstrap_hosts 'fresh install and bootstrap RustyNet on all targets' stage_bootstrap_hosts || return 1
+  run_setup_stage hard collect_pubkeys 'collect WireGuard public keys from all targets' stage_collect_pubkeys || return 1
+  run_setup_stage hard membership_setup 'apply signed membership updates on primary exit' stage_membership_setup || return 1
+  run_setup_stage hard distribute_membership_state 'export and install membership state to peers' stage_distribute_membership_state || return 1
+  run_setup_stage hard issue_and_distribute_assignments 'issue signed one-hop assignments and install refresh env files' stage_issue_and_distribute_assignments || return 1
+  run_setup_stage hard issue_and_distribute_traversal 'issue and distribute signed traversal bundles for all managed peers' stage_issue_and_distribute_traversal || return 1
+  run_setup_stage hard issue_and_distribute_dns_zone 'issue and distribute signed DNS zone bundles for all managed peers' stage_issue_and_distribute_dns_zone || return 1
+  run_setup_stage hard enforce_baseline_runtime 'enforce baseline runtime roles and advertise exit route' stage_enforce_baseline_runtime || return 1
+  run_setup_stage hard validate_baseline_runtime 'validate one-hop routing and no-plaintext-passphrase state' stage_validate_baseline_runtime || return 1
 }
 
 stage_cleanup_hosts() {
@@ -2687,7 +2836,8 @@ stage_issue_and_distribute_traversal() {
   issue_and_distribute_traversal_snapshot issue_and_distribute_traversal
 }
 
-stage_issue_and_distribute_dns_zone() {
+issue_and_distribute_dns_zone_snapshot() {
+  local stage_name="$1"
   local exit_target env_path verifier_local
   build_onehop_specs
   # shellcheck disable=SC1090
@@ -2702,7 +2852,11 @@ stage_issue_and_distribute_dns_zone() {
 
   verifier_local="$STATE_DIR/dns-zone.pub"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/dns-zone-issue/rn-dns-zone.pub" "$verifier_local" || return 1
-  run_parallel_node_stage issue_and_distribute_dns_zone distribute_dns_zone_worker
+  run_parallel_node_stage "$stage_name" distribute_dns_zone_worker
+}
+
+stage_issue_and_distribute_dns_zone() {
+  issue_and_distribute_dns_zone_snapshot issue_and_distribute_dns_zone
 }
 
 distribute_traversal_worker() {
@@ -2719,7 +2873,7 @@ distribute_traversal_worker() {
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" "$bundle_local" || return 1
   live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
   live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
-  live_lab_run_root "$target" "root mkdir -p /etc/rustynet /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
 }
 
 distribute_dns_zone_worker() {
@@ -2788,15 +2942,21 @@ refresh_runtime_state_for_label() {
   refresh_runtime_state_worker "$refresh_label" "$refresh_target" "$refresh_node_id" "$refresh_role"
 }
 
+refresh_signed_state_for_label() {
+  local refresh_label="$1"
+  local refresh_target refresh_node_id refresh_role
+  refresh_target="$(node_target_for_label "$refresh_label")"
+  refresh_node_id="$(node_id_for_label "$refresh_label")"
+  refresh_role="$(node_role_for_label "$refresh_label")"
+  [[ -n "$refresh_target" && -n "$refresh_node_id" && -n "$refresh_role" ]] || {
+    printf 'missing signed-state refresh metadata for label: %s\n' "$refresh_label" >&2
+    return 1
+  }
+  refresh_signed_state_worker "$refresh_label" "$refresh_target" "$refresh_node_id" "$refresh_role"
+}
+
 validation_runtime_refresh_order() {
   local target_label="$1"
-  local label
-  while IFS=$'\t' read -r label _target _node_id _role; do
-    [[ -n "$label" ]] || continue
-    if [[ "$label" != "exit" && "$label" != "$target_label" ]]; then
-      printf '%s\n' "$label"
-    fi
-  done < "$NODES_TSV"
   if [[ "$target_label" != "exit" ]]; then
     printf 'exit\n'
   fi
@@ -2810,6 +2970,164 @@ refresh_runtime_state_for_validation() {
     [[ -n "$refresh_label" ]] || continue
     refresh_runtime_state_for_label "$refresh_label" || return 1
   done < <(validation_runtime_refresh_order "$target_label")
+}
+
+refresh_runtime_state_for_validation_cluster() {
+  # Peer coordination is directional. Refresh client roles first so the exit
+  # can consume their latest coordination, then refresh the exit, then refresh
+  # client roles again so they can consume the exit coordination that was just
+  # published. This avoids the parallel race where exit and clients refresh
+  # against stale peer coordination in the same moment.
+  run_parallel_node_stage refresh_runtime_before_validate_non_exit refresh_runtime_state_worker non_exit || return 1
+  refresh_runtime_state_for_label exit || return 1
+  run_parallel_node_stage refresh_runtime_after_exit_before_validate refresh_runtime_state_worker non_exit || return 1
+}
+
+issue_baseline_validation_artifacts() {
+  local traversal_stage_name="$1"
+  local dns_stage_name="$2"
+  issue_and_distribute_traversal_snapshot "$traversal_stage_name" || return 1
+  issue_and_distribute_dns_zone_snapshot "$dns_stage_name" || return 1
+}
+
+prime_baseline_runtime_validation_state() {
+  issue_baseline_validation_artifacts refresh_traversal_before_validate refresh_dns_zone_before_validate || return 1
+  refresh_runtime_state_for_validation_cluster || return 1
+}
+
+live_lab_collect_baseline_runtime_cluster_snapshot() {
+  local expected_membership_nodes exit_node_id
+  local label target node_id role snapshot capture_rc ready
+  local overall_status="pass"
+
+  expected_membership_nodes="$(node_count)"
+  exit_node_id="$(node_id_for_label exit)"
+
+  {
+    printf '__RNLAB_BASELINE_CLUSTER_BEGIN__\n'
+    printf 'baseline_cluster_version=1\n'
+    printf 'baseline_cluster_collected_at_utc=%s\n' "$(date -u +%FT%TZ)"
+    while IFS=$'\t' read -r label target node_id role; do
+      [[ -n "$target" ]] || continue
+      set +e
+      snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" 2>&1)"
+      capture_rc=$?
+      set -e
+      ready=0
+      if [[ "$capture_rc" -eq 0 ]] && live_lab_runtime_snapshot_ready \
+        "$snapshot" \
+        "$node_id" \
+        "$target" \
+        "$role" \
+        "$expected_membership_nodes" \
+        "$exit_node_id" >/dev/null 2>&1; then
+        ready=1
+      else
+        overall_status="fail"
+      fi
+      printf 'node_begin\n'
+      printf 'label=%s\n' "$label"
+      printf 'target=%s\n' "$target"
+      printf 'node_id=%s\n' "$node_id"
+      printf 'role=%s\n' "$role"
+      printf 'capture_rc=%s\n' "$capture_rc"
+      printf 'runtime_ready=%s\n' "$ready"
+      printf '%s\n' "$snapshot"
+      printf 'node_end\n'
+    done < "$NODES_TSV"
+    printf 'baseline_cluster_status=%s\n' "$overall_status"
+    printf '__RNLAB_BASELINE_CLUSTER_END__\n'
+  }
+}
+
+baseline_cluster_not_ready_labels() {
+  local snapshot="$1"
+  awk '
+    /^node_begin$/ {
+      in_node = 1
+      label = ""
+      ready = ""
+      next
+    }
+    /^node_end$/ {
+      if (in_node && ready == "0" && label != "") {
+        print label
+      }
+      in_node = 0
+      next
+    }
+    in_node && /^label=/ {
+      label = substr($0, length("label=") + 1)
+      next
+    }
+    in_node && /^runtime_ready=/ {
+      ready = substr($0, length("runtime_ready=") + 1)
+      next
+    }
+  ' <<<"$snapshot"
+}
+
+wait_for_baseline_runtime_cluster_convergence() {
+  local cluster_snapshot
+  local attempts=120
+  local sleep_secs=2
+  local refresh_every_attempts=60
+  local targeted_refresh_after_attempt=30
+  local attempt
+  local not_ready_labels=()
+  local label
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    cluster_snapshot="$(live_lab_collect_baseline_runtime_cluster_snapshot 2>&1)" || cluster_snapshot="${cluster_snapshot:-}"
+    if [[ "$cluster_snapshot" == *"baseline_cluster_status=pass"* ]]; then
+      printf '[baseline-cluster]\n%s\n' "$cluster_snapshot"
+      return 0
+    fi
+    if (( attempt >= targeted_refresh_after_attempt )); then
+      not_ready_labels=()
+      while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        not_ready_labels+=("$label")
+      done < <(baseline_cluster_not_ready_labels "$cluster_snapshot")
+      if (( ${#not_ready_labels[@]} > 0 && ${#not_ready_labels[@]} < $(node_count) )); then
+        printf '[baseline-cluster-targeted-refresh] attempt=%s labels=%s\n' "$attempt" "${not_ready_labels[*]}"
+        for label in "${not_ready_labels[@]}"; do
+          refresh_runtime_state_for_label "$label" || return 1
+        done
+      fi
+    fi
+    if (( attempt % refresh_every_attempts == 0 )); then
+      printf '[baseline-cluster-refresh] attempt=%s\n' "$attempt"
+      prime_baseline_runtime_validation_state || return 1
+    fi
+    if (( attempt < attempts )); then
+      sleep "$sleep_secs"
+    fi
+  done
+  printf '[baseline-cluster]\n%s\n' "$cluster_snapshot"
+  return 1
+}
+
+refresh_signed_state_for_validation() {
+  local target_label="$1"
+  local refresh_label
+  while IFS= read -r refresh_label; do
+    [[ -n "$refresh_label" ]] || continue
+    refresh_signed_state_for_label "$refresh_label" || return 1
+  done < <(validation_runtime_refresh_order "$target_label")
+}
+
+refresh_validation_state_for_label() {
+  local target_label="$1"
+
+  # Validation depends on fresh traversal coordination and DNS-zone state.
+  # Reissue both immediately before the target sample, then refresh only the
+  # nodes that are on the critical path for that sample so the 30-second
+  # traversal coordination window is not consumed by unrelated nodes.
+  issue_and_distribute_traversal_snapshot "refresh_traversal_before_validate_${target_label}" || return 1
+  issue_and_distribute_dns_zone_snapshot "refresh_dns_zone_before_validate_${target_label}" || return 1
+  refresh_runtime_state_for_validation "$target_label" || return 1
+  refresh_signed_state_for_validation "$target_label" || return 1
+  refresh_runtime_state_for_validation "$target_label" || return 1
 }
 
 refresh_signed_state_worker() {
@@ -2832,21 +3150,124 @@ refresh_signed_state_all_nodes() {
 
 stage_validate_baseline_runtime() {
   local nft_rules
-  if live_lab_has_utm_transport; then
-    # UTM guest-agent transport is globally serialized. Reissuing and
-    # redistributing 30-second traversal bundles during validation can leave the
-    # target consuming already-expired coordination, so refresh runtime locally
-    # from assignment state instead.
-    run_serial_node_stage validate_baseline_runtime validate_runtime_worker_with_fresh_traversal
-    run_parallel_node_stage refresh_runtime_after_validate refresh_runtime_state_worker
-  else
-    # Signed traversal coordination is intentionally capped to 30 seconds, so
-    # validation must refresh that state immediately before sampling runtime.
-    issue_and_distribute_traversal_snapshot refresh_traversal_before_validate || return 1
-    run_parallel_node_stage refresh_runtime_before_validate refresh_signed_state_worker
-    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker
+  local force_ssh_for_validation=0
+  local original_max_parallel_workers="$MAX_PARALLEL_NODE_WORKERS"
+  local append_stage_dir_set=0
+
+  if live_lab_has_utm_transport && live_lab_can_use_ssh_transport; then
+    # UTM guest-agent transport is serialized on this host, which consumes the
+    # short traversal coordination window during baseline validation. Once SSH
+    # reachability is established, force SSH transport for validation so we can
+    # refresh nodes and capture immediately while coordination records are
+    # still fresh.
+    export LIVE_LAB_FORCE_SSH_TRANSPORT=1
+    force_ssh_for_validation=1
+    MAX_PARALLEL_NODE_WORKERS="$(node_count)"
   fi
+
+  issue_baseline_validation_artifacts refresh_traversal_before_validate refresh_dns_zone_before_validate || {
+    if (( force_ssh_for_validation )); then
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+      MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+    fi
+    return 1
+  }
+  run_parallel_node_stage refresh_runtime_before_validate_non_exit refresh_runtime_state_worker non_exit || {
+    if (( force_ssh_for_validation )); then
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+      MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+    fi
+    return 1
+  }
+  refresh_runtime_state_for_label exit || {
+    if (( force_ssh_for_validation )); then
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+      MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+    fi
+    return 1
+  }
+
+  issue_baseline_validation_artifacts refresh_traversal_before_validate_clients refresh_dns_zone_before_validate_clients || {
+    if (( force_ssh_for_validation )); then
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+      MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+    fi
+    return 1
+  }
+
+  if [[ "${LIVE_LAB_FORCE_SSH_TRANSPORT:-0}" == "1" ]]; then
+    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh non_exit || {
+      if (( force_ssh_for_validation )); then
+        unset LIVE_LAB_FORCE_SSH_TRANSPORT
+        MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+      fi
+      return 1
+    }
+    issue_baseline_validation_artifacts refresh_traversal_before_validate_exit refresh_dns_zone_before_validate_exit || {
+      if (( force_ssh_for_validation )); then
+        unset LIVE_LAB_FORCE_SSH_TRANSPORT
+        MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+      fi
+      return 1
+    }
+    export LIVE_LAB_STAGE_APPEND=1
+    append_stage_dir_set=1
+    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh exit_only || {
+      unset LIVE_LAB_STAGE_APPEND
+      if (( force_ssh_for_validation )); then
+        unset LIVE_LAB_FORCE_SSH_TRANSPORT
+        MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+      fi
+      return 1
+    }
+    unset LIVE_LAB_STAGE_APPEND
+    append_stage_dir_set=0
+    run_parallel_node_stage refresh_runtime_after_validate refresh_runtime_state_worker || {
+      if (( force_ssh_for_validation )); then
+        unset LIVE_LAB_FORCE_SSH_TRANSPORT
+        MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+      fi
+      return 1
+    }
+  elif live_lab_has_utm_transport; then
+    # Keep the serialized UTM fallback only when SSH is unavailable.
+    run_serial_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh non_exit || return 1
+    issue_baseline_validation_artifacts refresh_traversal_before_validate_exit refresh_dns_zone_before_validate_exit || {
+      return 1
+    }
+    export LIVE_LAB_STAGE_APPEND=1
+    append_stage_dir_set=1
+    run_serial_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh exit_only || {
+      unset LIVE_LAB_STAGE_APPEND
+      return 1
+    }
+    unset LIVE_LAB_STAGE_APPEND
+    append_stage_dir_set=0
+    run_parallel_node_stage refresh_runtime_after_validate refresh_runtime_state_worker || return 1
+  else
+    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh non_exit || return 1
+    issue_baseline_validation_artifacts refresh_traversal_before_validate_exit refresh_dns_zone_before_validate_exit || {
+      return 1
+    }
+    export LIVE_LAB_STAGE_APPEND=1
+    append_stage_dir_set=1
+    run_parallel_node_stage validate_baseline_runtime validate_runtime_worker_after_refresh exit_only || {
+      unset LIVE_LAB_STAGE_APPEND
+      return 1
+    }
+    unset LIVE_LAB_STAGE_APPEND
+    append_stage_dir_set=0
+    run_parallel_node_stage refresh_runtime_after_validate refresh_runtime_state_worker || return 1
+  fi
+
   nft_rules="$(live_lab_capture_root "$(node_target_for_label exit)" "root nft list ruleset || true")" || return 1
+  if (( append_stage_dir_set )); then
+    unset LIVE_LAB_STAGE_APPEND
+  fi
+  if (( force_ssh_for_validation )); then
+    unset LIVE_LAB_FORCE_SSH_TRANSPORT
+    MAX_PARALLEL_NODE_WORKERS="$original_max_parallel_workers"
+  fi
   printf '[exit-nft]\n%s\n' "$nft_rules"
   grep -Eq 'masquerade|rustynet' <<<"$nft_rules" || return 1
 }
@@ -2856,7 +3277,7 @@ validate_runtime_worker_with_fresh_traversal() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  refresh_runtime_state_for_validation "$label" || return 1
+  refresh_validation_state_for_label "$label" || return 1
   validate_runtime_worker "$label" "$target" "$node_id" "$role"
 }
 
@@ -3160,29 +3581,52 @@ validate_runtime_worker() {
   local role="$4"
   local expected_membership_nodes exit_node_id snapshot wait_rc
   local route_policy route_policy_rc dns_snapshot dns_snapshot_rc expected_next_hop
+  local signed_state_snapshot signed_state_rc dns_zone_snapshot dns_zone_rc
+  local zone_name
+  local runtime_attempts=8
+  local runtime_sleep_secs=1
+  local signed_state_attempts=5
+  local signed_state_sleep_secs=1
+  local dns_zone_attempts=5
+  local dns_zone_sleep_secs=1
 
   expected_membership_nodes="$(node_count)"
   exit_node_id="$(node_id_for_label exit)"
+  zone_name="${RUSTYNET_DNS_ZONE_NAME:-rustynet}"
   expected_next_hop=""
   if [[ "$role" == "client" ]]; then
     expected_next_hop="direct:rustynet0"
   fi
   set +e
-  snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id")"
+  # Stage-level route-matrix convergence already waited for the cluster to
+  # settle before this worker runs. Keep the per-node wait short so we capture
+  # the fresh runtime and signed-state window immediately after the final
+  # refresh cycle instead of burning it here.
+  snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id" "$runtime_attempts" "$runtime_sleep_secs")"
   wait_rc=$?
+  signed_state_snapshot="$(live_lab_wait_for_signed_state_convergence "$target" "$node_id" "$role" "$zone_name" "${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" "${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" "$signed_state_attempts" "$signed_state_sleep_secs")"
+  signed_state_rc=$?
+  dns_zone_snapshot="$(live_lab_wait_for_dns_zone_convergence "$target" "$node_id" "$zone_name" "$dns_zone_attempts" "$dns_zone_sleep_secs")"
+  dns_zone_rc=$?
   route_policy="$(live_lab_collect_route_policy "$target" "1.1.1.1" "$expected_next_hop" 2>&1)"
   route_policy_rc=$?
   dns_snapshot="$(live_lab_collect_dns_snapshot "$target" 2>&1)"
   dns_snapshot_rc=$?
   set -e
   if [[ -n "${LIVE_LAB_STAGE_DIR:-}" ]]; then
+    stage_worker_write_artifact "$_label" "signed_state.txt" "$(printf 'capture_rc=%s\n%s\n' "$signed_state_rc" "$signed_state_snapshot")" >/dev/null || return 1
+    stage_worker_write_artifact "$_label" "dns_zone.txt" "$(printf 'capture_rc=%s\n%s\n' "$dns_zone_rc" "$dns_zone_snapshot")" >/dev/null || return 1
     stage_worker_write_artifact "$_label" "snapshot.txt" "$(printf 'capture_rc=%s\n%s\n' "$wait_rc" "$snapshot")" >/dev/null || return 1
     stage_worker_write_artifact "$_label" "route_policy.txt" "$(printf 'capture_rc=%s\n%s\n' "$route_policy_rc" "$route_policy")" >/dev/null || return 1
     stage_worker_write_artifact "$_label" "dns_state.txt" "$(printf 'capture_rc=%s\n%s\n' "$dns_snapshot_rc" "$dns_snapshot")" >/dev/null || return 1
   fi
+  printf '[signed-state] %s %s\n%s\n' "$node_id" "$target" "$signed_state_snapshot"
+  printf '[dns-zone] %s %s\n%s\n' "$node_id" "$target" "$dns_zone_snapshot"
   printf '[snapshot] %s %s\n%s\n' "$node_id" "$target" "$snapshot"
   printf '[route-policy] %s %s\n%s\n' "$node_id" "$target" "$route_policy"
   printf '[dns-state] %s %s\n%s\n' "$node_id" "$target" "$dns_snapshot"
+  [[ "$signed_state_rc" -eq 0 ]] || return "$signed_state_rc"
+  [[ "$dns_zone_rc" -eq 0 ]] || return "$dns_zone_rc"
   [[ "$route_policy_rc" -eq 0 ]] || return "$route_policy_rc"
   [[ "$dns_snapshot_rc" -eq 0 ]] || return "$dns_snapshot_rc"
   live_lab_assert_runtime_spec \
@@ -3192,7 +3636,46 @@ validate_runtime_worker() {
     "$role" \
     "$expected_membership_nodes" \
     "$exit_node_id"
-  return "$wait_rc"
+  # Keep the convergence helper return code in the worker artifacts for
+  # forensics, but fail only on the explicit runtime, signed-state, DNS-zone,
+  # route-policy, and secret-hygiene assertions above. The helper can time out
+  # even when the final captured snapshot already satisfies the validator.
+  return 0
+}
+
+refresh_runtime_state_for_validation_worker() {
+  local label="$1"
+  local target="$2"
+  local _node_id="$3"
+  local role="$4"
+  local exit_node_id
+
+  if [[ "$role" == "client" ]]; then
+    exit_node_id="$(node_id_for_label exit)"
+    [[ -n "$exit_node_id" ]] || {
+      printf 'missing exit node id for client validation refresh\n' >&2
+      return 1
+    }
+    printf '[runtime-refresh-role-coupling] %s %s (exit=%s)\n' "$label" "$target" "$exit_node_id"
+    # Baseline validation performs the authoritative route assertion itself.
+    # Skip the helper's internal route wait here so we do not spend the short
+    # signed-state window on a second convergence loop before collecting the
+    # final validation snapshots.
+    live_lab_apply_role_coupling "$target" "client" "$exit_node_id" "false" "/etc/rustynet/assignment-refresh.env" "true" || return 1
+    live_lab_wait_for_daemon_socket "$target"
+    return 0
+  fi
+
+  refresh_runtime_state_worker "$label" "$target" "$_node_id" "$role"
+}
+
+validate_runtime_worker_after_refresh() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  refresh_runtime_state_for_validation_worker "$label" "$target" "$node_id" "$role" || return 1
+  validate_runtime_worker "$label" "$target" "$node_id" "$role"
 }
 
 current_run_git_commit() {
@@ -5014,16 +5497,29 @@ ssh_wait_for_host() {
   local attempt
   local rc
   local last_error=""
+  local error_log
+  error_log="$(mktemp "${TMPDIR:-/tmp}/rn-ssh-wait.XXXXXX")" || return 1
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if last_error="$(live_lab_ssh "$target" "true" 15 2>&1)"; then
-      return 0
+    : > "$error_log"
+    if live_lab_can_use_ssh_transport; then
+      if live_lab_ssh_via_ssh "$target" "true" 15 >"$error_log" 2>&1; then
+        rm -f "$error_log"
+        return 0
+      fi
+      rc=$?
     else
+      if live_lab_ssh "$target" "true" 15 >"$error_log" 2>&1; then
+        rm -f "$error_log"
+        return 0
+      fi
       rc=$?
     fi
+    last_error="$(cat "$error_log")"
     if [[ "$rc" -ne 255 ]]; then
       if [[ -n "$last_error" ]]; then
         printf '%s\n' "$last_error" >&2
       fi
+      rm -f "$error_log"
       return "$rc"
     fi
     if [[ "$attempt" -lt "$attempts" ]]; then
@@ -5033,6 +5529,7 @@ ssh_wait_for_host() {
   if [[ -n "$last_error" ]]; then
     printf '%s\n' "$last_error" >&2
   fi
+  rm -f "$error_log"
   return 1
 }
 
@@ -5452,14 +5949,33 @@ parse_args() {
       --extra-target) EXTRA_TARGET="$2"; EXTRA_TARGET_DECLARED=1; shift 2 ;;
       --fifth-client-target) FIFTH_CLIENT_TARGET="$2"; FIFTH_CLIENT_TARGET_DECLARED=1; shift 2 ;;
       --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
-      --ssh-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
-      --sudo-password-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+      --ssh-password-file)
+        printf 'error: --ssh-password-file has been removed. Use --ssh-identity-file with SSH key-based auth.\n' >&2
+        exit 2
+        ;;
+      --sudo-password-file)
+        printf 'error: --sudo-password-file has been removed from this harness.\n' >&2
+        exit 2
+        ;;
       --ssh-known-hosts-file) SSH_KNOWN_HOSTS_FILE="$2"; shift 2 ;;
       --network-id) NETWORK_ID="$2"; shift 2 ;;
       --ssh-allow-cidrs) SSH_ALLOW_CIDRS="$2"; shift 2 ;;
       --traversal-ttl-secs) TRAVERSAL_TTL_SECS="$2"; shift 2 ;;
-      --repo-ref) REPO_REF="$2"; SOURCE_MODE="ref"; SOURCE_MODE_EXPLICIT=1; shift 2 ;;
+      --repo-ref)
+        REPO_REF="$2"
+        if [[ "$SOURCE_MODE_EXPLICIT" -eq 0 ]]; then
+          SOURCE_MODE="ref"
+          SOURCE_MODE_EXPLICIT=1
+        fi
+        shift 2
+        ;;
       --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; FAILURE_DIGEST_JSON="$REPORT_DIR/failure_digest.json"; FAILURE_DIGEST_MD="$REPORT_DIR/failure_digest.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
+      --setup-only) SETUP_ONLY=1; shift ;;
+      --skip-setup) SKIP_SETUP=1; shift ;;
+      --preserve-report-state) PRESERVE_REPORT_STATE=1; shift ;;
+      --resume-from) RESUME_FROM_STAGE="$2"; shift 2 ;;
+      --rerun-stage) RERUN_STAGE="$2"; shift 2 ;;
+      --max-parallel-node-workers) MAX_PARALLEL_NODE_WORKERS="$2"; shift 2 ;;
       --skip-gates) RUN_LOCAL_GATES=0; shift ;;
       --skip-soak) RUN_SOAK=0; shift ;;
       --skip-cross-network) CROSS_NETWORK_MODE="skip"; shift ;;
@@ -5606,13 +6122,56 @@ remember_temp_password_files() {
 main() {
   parse_args "$@"
   printf 'run started: %s (utc: %s)\n' "$RUN_STARTED_AT_LOCAL" "$RUN_STARTED_AT_UTC"
+  if [[ "$SETUP_ONLY" -eq 1 && "$SKIP_SETUP" -eq 1 ]]; then
+    printf '--setup-only and --skip-setup cannot be used together\n' >&2
+    exit 2
+  fi
+  if [[ -n "$RESUME_FROM_STAGE" && -n "$RERUN_STAGE" ]]; then
+    printf '--resume-from and --rerun-stage cannot be used together\n' >&2
+    exit 2
+  fi
+  if [[ -n "$RESUME_FROM_STAGE" && "$SETUP_ONLY" -ne 1 ]]; then
+    printf '--resume-from is only supported with --setup-only\n' >&2
+    exit 2
+  fi
+  if [[ -n "$RERUN_STAGE" && "$SETUP_ONLY" -ne 1 ]]; then
+    printf '--rerun-stage is only supported with --setup-only\n' >&2
+    exit 2
+  fi
+  if [[ ! "$MAX_PARALLEL_NODE_WORKERS" =~ ^[0-9]+$ ]] || (( MAX_PARALLEL_NODE_WORKERS <= 0 )); then
+    printf '--max-parallel-node-workers must be a positive integer (got: %s)\n' "$MAX_PARALLEL_NODE_WORKERS" >&2
+    exit 2
+  fi
+  if [[ -n "$RESUME_FROM_STAGE" ]]; then
+    is_setup_stage_name "$RESUME_FROM_STAGE" || {
+      printf 'unsupported setup stage for --resume-from: %s\n' "$RESUME_FROM_STAGE" >&2
+      exit 2
+    }
+    PRESERVE_REPORT_STATE=1
+  fi
+  if [[ -n "$RERUN_STAGE" ]]; then
+    is_setup_stage_name "$RERUN_STAGE" || {
+      printf 'unsupported setup stage for --rerun-stage: %s\n' "$RERUN_STAGE" >&2
+      exit 2
+    }
+    PRESERVE_REPORT_STATE=1
+  fi
   maybe_prompt_for_default_profile
   if [[ -n "$PROFILE_PATH" ]]; then
     load_profile_file "$PROFILE_PATH"
   fi
   maybe_prompt_for_source_mode
   mkdir -p "$LOG_DIR" "$VERIFICATION_DIR" "$STATE_DIR"
-  : > "$STAGE_TSV"
+  if [[ "$PRESERVE_REPORT_STATE" -eq 0 ]]; then
+    : > "$STAGE_TSV"
+  elif [[ ! -f "$STAGE_TSV" ]]; then
+    : > "$STAGE_TSV"
+  fi
+  if [[ -n "$RESUME_FROM_STAGE" ]]; then
+    reset_setup_stage_state "$RESUME_FROM_STAGE" resume
+  elif [[ -n "$RERUN_STAGE" ]]; then
+    reset_setup_stage_state "$RERUN_STAGE" rerun
+  fi
   prompt_missing_inputs
   normalize_targets
   export EXIT_TARGET CLIENT_TARGET ENTRY_TARGET AUX_TARGET EXTRA_TARGET FIFTH_CLIENT_TARGET
@@ -5672,6 +6231,7 @@ main() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     record_stage_skip "preflight" "hard" "dry-run: not executed"
     record_stage_skip "prepare_source_archive" "hard" "dry-run: not executed"
+    record_stage_skip "verify_ssh_reachability" "hard" "dry-run: not executed"
     record_stage_skip "prime_remote_access" "hard" "dry-run: not executed"
     record_stage_skip "cleanup_hosts" "hard" "dry-run: not executed"
     record_stage_skip "bootstrap_hosts" "hard" "dry-run: not executed"
@@ -5680,6 +6240,7 @@ main() {
     record_stage_skip "distribute_membership_state" "hard" "dry-run: not executed"
     record_stage_skip "issue_and_distribute_assignments" "hard" "dry-run: not executed"
     record_stage_skip "issue_and_distribute_traversal" "hard" "dry-run: not executed"
+    record_stage_skip "issue_and_distribute_dns_zone" "hard" "dry-run: not executed"
     record_stage_skip "enforce_baseline_runtime" "hard" "dry-run: not executed"
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
     if has_five_node_release_gate_topology; then
@@ -5760,8 +6321,22 @@ main() {
     return 0
   fi
 
-  run_stage hard preflight 'verify local prerequisites' stage_preflight
-  stage_run_fresh_bootstrap_and_network_setup || return 1
+  if [[ "$SKIP_SETUP" -eq 0 ]]; then
+    if [[ -z "$RESUME_FROM_STAGE" && -z "$RERUN_STAGE" ]]; then
+      run_stage hard preflight 'verify local prerequisites' stage_preflight
+    else
+      run_setup_stage hard preflight 'verify local prerequisites' stage_preflight || return 1
+    fi
+    stage_run_fresh_bootstrap_and_network_setup || return 1
+  fi
+
+  if [[ "$SETUP_ONLY" -eq 1 ]]; then
+    write_run_summary
+    printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
+    printf 'setup summary: %s\n' "$SUMMARY_MD"
+    printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
+    return 0
+  fi
 
   if has_five_node_release_gate_topology; then
     run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix

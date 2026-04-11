@@ -487,6 +487,12 @@ enum OpsCommand {
     VmLabWriteLiveLabProfile {
         config: vm_lab::VmLabWriteLiveLabProfileConfig,
     },
+    VmLabSetupLiveLab {
+        config: vm_lab::VmLabSetupLiveLabConfig,
+    },
+    VmLabOrchestrateLiveLab {
+        config: vm_lab::VmLabOrchestrateLiveLabConfig,
+    },
     VmLabValidateLiveLabProfile {
         config: vm_lab::VmLabValidateLiveLabProfileConfig,
     },
@@ -597,6 +603,7 @@ enum OpsCommand {
         preferred_exit_node_id: Option<String>,
         enable_exit_advertise: bool,
         assignment_refresh_env_path: PathBuf,
+        skip_client_exit_route_convergence_wait: bool,
     },
     PeerStoreValidate {
         config_dir: PathBuf,
@@ -1737,9 +1744,19 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 inventory_path: parser.optional_path("--inventory"),
                 utm_documents_root: parser.optional_path("--utm-documents-root"),
                 utmctl_path: parser.optional_path("--utmctl-path"),
+                ssh_identity_file: Some(parser.path_or_default(
+                    "--ssh-identity-file",
+                    vm_lab::default_lab_ssh_identity_path(),
+                )),
+                known_hosts_path: Some(
+                    parser
+                        .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
+                ),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
                     .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 5)?,
+                update_inventory_live_ips: parser.has_flag("--update-inventory-live-ips"),
+                report_dir: parser.optional_path("--report-dir"),
             },
         }),
         "vm-lab-discover-local-utm-summary" => Ok(OpsCommand::VmLabDiscoverLocalUtmSummary {
@@ -1747,9 +1764,19 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 inventory_path: parser.optional_path("--inventory"),
                 utm_documents_root: parser.optional_path("--utm-documents-root"),
                 utmctl_path: parser.optional_path("--utmctl-path"),
+                ssh_identity_file: Some(parser.path_or_default(
+                    "--ssh-identity-file",
+                    vm_lab::default_lab_ssh_identity_path(),
+                )),
+                known_hosts_path: Some(
+                    parser
+                        .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
+                ),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
                     .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 5)?,
+                update_inventory_live_ips: parser.has_flag("--update-inventory-live-ips"),
+                report_dir: parser.optional_path("--report-dir"),
             },
         }),
         "vm-lab-start" => {
@@ -1914,6 +1941,82 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "vm-lab-setup-live-lab" => Ok(OpsCommand::VmLabSetupLiveLab {
+            config: vm_lab::VmLabSetupLiveLabConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                profile_path: parser.optional_path("--profile"),
+                profile_output_path: parser.optional_path("--profile-output"),
+                exit_vm: parser.value("--exit-vm"),
+                client_vm: parser.value("--client-vm"),
+                entry_vm: parser.value("--entry-vm"),
+                aux_vm: parser.value("--aux-vm"),
+                extra_vm: parser.value("--extra-vm"),
+                fifth_client_vm: parser.value("--fifth-client-vm"),
+                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                require_same_network: parser.has_flag("--require-same-network"),
+                script_path: parser
+                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
+                report_dir: parser.required_path("--report-dir")?,
+                source_mode: parser.value("--source-mode"),
+                repo_ref: parser.value("--repo-ref"),
+                resume_from: parser.value("--resume-from"),
+                rerun_stage: parser.value("--rerun-stage"),
+                max_parallel_node_workers: match parser.value("--max-parallel-node-workers") {
+                    Some(value) => Some(value.parse::<usize>().map_err(|err| {
+                        format!("invalid value for --max-parallel-node-workers: {err}")
+                    })?),
+                    None => None,
+                },
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                dry_run: parser.has_flag("--dry-run"),
+            },
+        }),
+        "vm-lab-orchestrate-live-lab" => Ok(OpsCommand::VmLabOrchestrateLiveLab {
+            config: vm_lab::VmLabOrchestrateLiveLabConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                profile_path: parser.optional_path("--profile"),
+                profile_output_path: parser.optional_path("--profile-output"),
+                exit_vm: parser.value("--exit-vm"),
+                client_vm: parser.value("--client-vm"),
+                entry_vm: parser.value("--entry-vm"),
+                aux_vm: parser.value("--aux-vm"),
+                extra_vm: parser.value("--extra-vm"),
+                fifth_client_vm: parser.value("--fifth-client-vm"),
+                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                require_same_network: parser.has_flag("--require-same-network"),
+                script_path: parser
+                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
+                report_dir: parser.required_path("--report-dir")?,
+                source_mode: parser.value("--source-mode"),
+                repo_ref: parser.value("--repo-ref"),
+                max_parallel_node_workers: match parser.value("--max-parallel-node-workers") {
+                    Some(value) => Some(value.parse::<usize>().map_err(|err| {
+                        format!("invalid value for --max-parallel-node-workers: {err}")
+                    })?),
+                    None => None,
+                },
+                skip_gates: parser.has_flag("--skip-gates"),
+                skip_soak: parser.has_flag("--skip-soak"),
+                skip_cross_network: parser.has_flag("--skip-cross-network"),
+                utm_documents_root: parser.optional_path("--utm-documents-root"),
+                utmctl_path: parser.optional_path("--utmctl-path"),
+                ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                discovery_timeout_secs: parser
+                    .parse_u64_or_default("--discovery-timeout-secs", 5)?,
+                ready_timeout_secs: parser
+                    .parse_u64_or_default("--wait-ready-timeout-secs", 300)?,
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                collect_artifacts_on_failure: parser.has_flag("--collect-artifacts-on-failure"),
+                skip_diagnose_on_failure: parser.has_flag("--skip-diagnose-on-failure"),
+                stop_after_ready: parser.has_flag("--stop-after-ready"),
+                dry_run: parser.has_flag("--dry-run"),
+            },
+        }),
         "vm-lab-validate-live-lab-profile" => Ok(OpsCommand::VmLabValidateLiveLabProfile {
             config: vm_lab::VmLabValidateLiveLabProfileConfig {
                 profile_path: parser.required_path("--profile")?,
@@ -2000,6 +2103,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 script_path: parser
                     .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
                 dry_run: parser.has_flag("--dry-run"),
+                skip_setup: parser.has_flag("--skip-setup"),
                 skip_gates: parser.has_flag("--skip-gates"),
                 skip_soak: parser.has_flag("--skip-soak"),
                 skip_cross_network: parser.has_flag("--skip-cross-network"),
@@ -2129,6 +2233,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                     known_hosts_path: parser.optional_path("--known-hosts-file"),
                     timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                    json_output: parser.has_flag("--json"),
+                    report_dir: parser.optional_path("--report-dir"),
                 },
             })
         }
@@ -2540,6 +2646,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 "--env-path",
                 PathBuf::from(DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH),
             ),
+            skip_client_exit_route_convergence_wait: parser
+                .has_flag("--skip-client-exit-route-convergence-wait"),
         }),
         "peer-store-validate" => Ok(OpsCommand::PeerStoreValidate {
             config_dir: parser.required_path("--config-dir")?,
@@ -4032,6 +4140,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::VmLabWriteLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_write_live_lab_profile(config)
         }
+        OpsCommand::VmLabSetupLiveLab { config } => {
+            vm_lab::execute_ops_vm_lab_setup_live_lab(config)
+        }
+        OpsCommand::VmLabOrchestrateLiveLab { config } => {
+            vm_lab::execute_ops_vm_lab_orchestrate_live_lab(config)
+        }
         OpsCommand::VmLabValidateLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_validate_live_lab_profile(config)
         }
@@ -4150,11 +4264,13 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             preferred_exit_node_id,
             enable_exit_advertise,
             assignment_refresh_env_path,
+            skip_client_exit_route_convergence_wait,
         } => execute_ops_apply_role_coupling(
             target_role,
             preferred_exit_node_id,
             enable_exit_advertise,
             assignment_refresh_env_path,
+            skip_client_exit_route_convergence_wait,
         ),
         OpsCommand::PeerStoreValidate {
             config_dir,
@@ -7902,6 +8018,7 @@ fn execute_ops_apply_role_coupling(
     preferred_exit_node_id: Option<String>,
     enable_exit_advertise: bool,
     assignment_refresh_env_path: PathBuf,
+    skip_client_exit_route_convergence_wait: bool,
 ) -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
@@ -7955,16 +8072,21 @@ fn execute_ops_apply_role_coupling(
     if target_role == "client"
         && let Some(expected_exit_node) = preferred_exit_node_id.as_deref()
     {
-        let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
-        if let Err(err) = wait_for_client_exit_route_convergence(
-            socket_path.as_path(),
-            assignment_refresh_env_path.as_path(),
-            expected_exit_node,
-            Duration::from_secs(30),
-        ) {
-            return Err(format!(
-                "client exit route convergence failed after role coupling: {err}"
-            ));
+        if skip_client_exit_route_convergence_wait {
+            warnings
+                .push("skipped client exit route convergence wait after role coupling".to_string());
+        } else {
+            let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+            if let Err(err) = wait_for_client_exit_route_convergence(
+                socket_path.as_path(),
+                assignment_refresh_env_path.as_path(),
+                expected_exit_node,
+                Duration::from_secs(30),
+            ) {
+                return Err(format!(
+                    "client exit route convergence failed after role coupling: {err}"
+                ));
+            }
         }
     }
 
@@ -9062,6 +9184,8 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path.as_path())?;
     remove_file_if_present(bundle_path.as_path())?;
     remove_file_if_present(watermark_path.as_path())?;
+    let _ = run_systemctl_action("reset-failed", "rustynetd-privileged-helper.service");
+    let _ = run_systemctl_action("reset-failed", "rustynetd.service");
     run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
     run_systemctl_action("restart", "rustynetd.service")?;
     wait_for_socket_path(socket_path.as_path(), Duration::from_secs(20))?;
@@ -11269,25 +11393,27 @@ fn help_text() -> String {
         "  ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
         "  ops vm-lab-list [--inventory <path>]",
-        "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--timeout-secs <secs>]",
-        "  ops vm-lab-discover-local-utm-summary [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--timeout-secs <secs>]",
+        "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
+        "  ops vm-lab-discover-local-utm-summary [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
         "  ops vm-lab-start [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
         "  ops vm-lab-sync-repo [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--branch <name>] [--remote <name>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-sync-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--workdir <absolute-path>] [--branch <name>] [--remote <name>] --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-run [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
+        "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
         "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
-        "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",
         "  ops vm-lab-preflight [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--require-same-network] [--require-command <name>]... [--require-commands <name[,name...]>] [--min-free-kib <kib>] [--require-rustynet-installed] [--timeout-secs <secs>]",
         "  ops vm-lab-status [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-stop [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
         "  ops vm-lab-shutdown [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
-        "  ops vm-lab-restart [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--service <name>] [--wait-ready] [--ssh-port <port>] [--wait-ready-timeout-secs <secs>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-restart [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--service <name>] [--wait-ready] [--ssh-port <port>] [--wait-ready-timeout-secs <secs>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--utmctl-path <absolute-path>] [--timeout-secs <secs>] [--json] [--report-dir <path>]",
         "  ops vm-lab-collect-artifacts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --output-dir <path> [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-write-topology [--inventory <path>] --suite <direct-remote-exit|relay-remote-exit|failback-roaming|full-live-lab> --output <path> [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--require-same-network]",
         "  ops vm-lab-issue-and-distribute-state [--inventory <path>] --topology <path> --authority-vm <alias> [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
@@ -11324,7 +11450,7 @@ fn help_text() -> String {
         "  ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]",
         "  ops force-local-assignment-refresh-now",
         "  ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]",
-        "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>]",
+        "  ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>] [--skip-client-exit-route-convergence-wait]",
         "  ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>",
         "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
@@ -11342,7 +11468,7 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute,
+        CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute, help_text,
         is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
         load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
         parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
@@ -12860,8 +12986,12 @@ mod tests {
             "exit-40".to_string(),
             "--enable-exit-advertise".to_string(),
             "false".to_string(),
+            "--skip-client-exit-route-convergence-wait".to_string(),
         ]);
         assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
+        assert!(
+            format!("{role_coupling:?}").contains("skip_client_exit_route_convergence_wait: true")
+        );
 
         let peer_store_validate = parse_command(&[
             "ops".to_string(),
@@ -13008,19 +13138,31 @@ mod tests {
             "2222".to_string(),
             "--timeout-secs".to_string(),
             "15".to_string(),
+            "--update-inventory-live-ips".to_string(),
+            "--report-dir".to_string(),
+            "/tmp/vm-lab-discovery".to_string(),
         ]);
         assert!(format!("{vm_lab_discover_local_utm:?}").contains("VmLabDiscoverLocalUtm"));
         assert!(format!("{vm_lab_discover_local_utm:?}").contains("2222"));
+        assert!(
+            format!("{vm_lab_discover_local_utm:?}").contains("update_inventory_live_ips: true")
+        );
+        assert!(format!("{vm_lab_discover_local_utm:?}").contains("/tmp/vm-lab-discovery"));
 
         let vm_lab_discover_local_utm_summary = parse_command(&[
             "ops".to_string(),
             "vm-lab-discover-local-utm-summary".to_string(),
             "--inventory".to_string(),
             "/tmp/vm_lab_inventory.json".to_string(),
+            "--update-inventory-live-ips".to_string(),
         ]);
         assert!(
             format!("{vm_lab_discover_local_utm_summary:?}")
                 .contains("VmLabDiscoverLocalUtmSummary")
+        );
+        assert!(
+            format!("{vm_lab_discover_local_utm_summary:?}")
+                .contains("update_inventory_live_ips: true")
         );
 
         let vm_lab_start = parse_command(&[
@@ -13171,6 +13313,44 @@ mod tests {
         assert!(format!("{vm_lab_profile:?}").contains("debian-headless-1"));
         assert!(format!("{vm_lab_profile:?}").contains("linux-wireguard-userspace-shared"));
 
+        let vm_lab_setup = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-setup-live-lab".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab/setup_test".to_string(),
+            "--ssh-identity-file".to_string(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--require-same-network".to_string(),
+            "--resume-from".to_string(),
+            "bootstrap_hosts".to_string(),
+            "--max-parallel-node-workers".to_string(),
+            "2".to_string(),
+        ]);
+        assert!(format!("{vm_lab_setup:?}").contains("VmLabSetupLiveLab"));
+        assert!(format!("{vm_lab_setup:?}").contains("bootstrap_hosts"));
+
+        let vm_lab_orchestrate = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-orchestrate-live-lab".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab/orchestrate_test".to_string(),
+            "--ssh-identity-file".to_string(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
+            "--inventory".to_string(),
+            "/tmp/vm_lab_inventory.json".to_string(),
+            "--require-same-network".to_string(),
+            "--wait-ready-timeout-secs".to_string(),
+            "180".to_string(),
+            "--collect-artifacts-on-failure".to_string(),
+            "--stop-after-ready".to_string(),
+        ]);
+        assert!(format!("{vm_lab_orchestrate:?}").contains("VmLabOrchestrateLiveLab"));
+        assert!(format!("{vm_lab_orchestrate:?}").contains("ready_timeout_secs: 180"));
+        assert!(format!("{vm_lab_orchestrate:?}").contains("collect_artifacts_on_failure: true"));
+        assert!(format!("{vm_lab_orchestrate:?}").contains("stop_after_ready: true"));
+
         let vm_lab_validate_profile = parse_command(&[
             "ops".to_string(),
             "vm-lab-validate-live-lab-profile".to_string(),
@@ -13234,10 +13414,12 @@ mod tests {
             "--profile".to_string(),
             "/tmp/live_lab.env".to_string(),
             "--dry-run".to_string(),
+            "--skip-setup".to_string(),
             "--skip-gates".to_string(),
         ]);
         assert!(format!("{vm_lab_live_lab:?}").contains("VmLabRunLiveLab"));
         assert!(format!("{vm_lab_live_lab:?}").contains("dry_run: true"));
+        assert!(format!("{vm_lab_live_lab:?}").contains("skip_setup: true"));
 
         let vm_lab_known_hosts = parse_command(&[
             "ops".to_string(),
@@ -13308,12 +13490,17 @@ mod tests {
             "2222".to_string(),
             "--wait-ready-timeout-secs".to_string(),
             "45".to_string(),
+            "--json".to_string(),
+            "--report-dir".to_string(),
+            "/tmp/vm-lab-restart".to_string(),
         ]);
         let vm_lab_restart_wait_ready = format!("{vm_lab_restart_wait_ready:?}");
         assert!(vm_lab_restart_wait_ready.contains("VmLabRestart"));
         assert!(vm_lab_restart_wait_ready.contains("wait_ready: true"));
         assert!(vm_lab_restart_wait_ready.contains("ssh_port: 2222"));
         assert!(vm_lab_restart_wait_ready.contains("ready_timeout_secs: 45"));
+        assert!(vm_lab_restart_wait_ready.contains("json_output: true"));
+        assert!(vm_lab_restart_wait_ready.contains("/tmp/vm-lab-restart"));
 
         let vm_lab_collect_artifacts = parse_command(&[
             "ops".to_string(),
@@ -13397,6 +13584,15 @@ mod tests {
         assert_eq!(command, CliCommand::StateRefresh);
         let ipc = to_ipc_command(command);
         assert_eq!(ipc, IpcCommand::StateRefresh);
+    }
+
+    #[test]
+    fn help_text_lists_vm_lab_setup_and_skip_setup() {
+        let help = help_text();
+        assert!(help.contains("ops vm-lab-setup-live-lab"));
+        assert!(help.contains("ops vm-lab-orchestrate-live-lab"));
+        assert!(help.contains("ops vm-lab-run-live-lab --profile <path>"));
+        assert!(help.contains("[--skip-setup]"));
     }
 
     #[test]

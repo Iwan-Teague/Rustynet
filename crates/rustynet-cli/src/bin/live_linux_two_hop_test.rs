@@ -881,7 +881,7 @@ fn install_assignment_bundle(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -924,7 +924,7 @@ fn install_assignment_refresh_env(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,
@@ -959,7 +959,7 @@ fn install_traversal_bundle(
         identity,
         known_hosts,
         target,
-        "install -d -m 0755 -o root -g root /etc/rustynet",
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
     )?;
     run_root(
         identity,

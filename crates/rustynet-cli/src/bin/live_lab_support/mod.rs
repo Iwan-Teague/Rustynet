@@ -42,7 +42,21 @@ fn env_var_nonempty(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_flag_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(flag) if matches!(flag.as_str(), "1" | "true" | "yes" | "on")
+    )
+}
+
+fn utm_transport_enabled() -> bool {
+    env_flag_truthy(env::var("LIVE_LAB_ENABLE_UTM_TRANSPORT").ok().as_deref())
+}
+
 fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
+    if !utm_transport_enabled() {
+        return None;
+    }
     for (target_key, utm_key) in [
         ("EXIT_TARGET", "EXIT_UTM_NAME"),
         ("CLIENT_TARGET", "CLIENT_UTM_NAME"),
@@ -1161,9 +1175,19 @@ pub fn run_remote_shell(
 #[cfg(test)]
 mod tests {
     use super::{
-        known_hosts_lookup_host, resolved_known_hosts_candidates,
+        env_flag_truthy, known_hosts_lookup_host, resolved_known_hosts_candidates,
         resolved_target_address_from_ssh_g,
     };
+
+    #[test]
+    fn env_flag_truthy_accepts_expected_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(env_flag_truthy(Some(value)));
+        }
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!env_flag_truthy(value));
+        }
+    }
 
     #[test]
     fn resolved_known_hosts_candidates_include_alias_raw_and_hostname() {

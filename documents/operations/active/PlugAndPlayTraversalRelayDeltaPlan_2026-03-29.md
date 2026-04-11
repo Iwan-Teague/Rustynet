@@ -2771,6 +2771,70 @@ What remains blocked:
   - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
 ```
 
+```text
+Date: 2026-04-11
+Phase / Slice: Live-lab operator pipeline hardening - setup-only wrapper, readiness typing, artifact validation, and operator docs alignment
+Files changed:
+  - crates/rustynet-cli/Cargo.toml
+    - Added `serde` derive support for machine-readable vm-lab command results.
+  - Cargo.lock
+    - Recorded the lockfile update for the new CLI serialization dependency.
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Added `ops vm-lab-setup-live-lab` as a first-class setup-only wrapper.
+    - Added structured `VmLabCommandResult` output for setup, run, and diagnose commands.
+    - Added typed UTM discovery probe states and execution-readiness reporting.
+    - Added live-lab report and diagnostics artifact validation.
+    - Tightened local UTM restart readiness so SSH auth must be ready before success is reported.
+    - Removed the redundant explicit preflight hop from `vm-lab-iterate-live-lab`.
+  - crates/rustynet-cli/src/main.rs
+    - Added CLI parsing, dispatch, help text, and test coverage for `vm-lab-setup-live-lab`.
+    - Updated `vm-lab-run-live-lab` help text to expose `--skip-setup`.
+  - crates/rustynet-cli/src/bin/live_linux_role_switch_matrix_test.rs
+    - Reduced argument fanout with a role-context struct to keep the touched CLI crate clippy-clean.
+  - scripts/e2e/live_linux_lab_orchestrator.sh
+    - Added `--setup-only`, `--skip-setup`, `--preserve-report-state`, `--resume-from`, `--rerun-stage`, and bounded node-worker concurrency.
+    - Removed the misleading `--ssh-password-file` and `--sudo-password-file` aliases.
+  - README.md
+    - Updated the public live-lab workflow to the four-stage operator pipeline:
+      discover -> setup -> run -> diagnose.
+  - scripts/e2e/README.md
+    - Updated the shell runbook to make the public wrappers primary and the shell stages secondary.
+  - documents/operations/LiveLinuxLabOrchestrator.md
+    - Updated the runbook to describe the new setup-only wrapper and stricter discovery readiness semantics.
+  - documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md
+    - Added the setup wrapper and revised example operator flow.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the active delta notes so the documented operator path matches the implemented wrapper flow.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `cargo fmt --all`
+  - `cargo check -p rustynet-cli`
+  - `cargo clippy -p rustynet-cli --all-targets -- -D warnings`
+  - `cargo test -p rustynet-cli --bin rustynet-cli tests::parse_supports_ops_commands -- --exact`
+  - `cargo test -p rustynet-cli --bin rustynet-cli`
+  - `bash -n scripts/e2e/live_linux_lab_orchestrator.sh`
+Validation outcomes:
+  - `ops vm-lab-setup-live-lab` now exists as a dedicated setup-phase wrapper with deterministic report-dir semantics, setup-stage resume/rerun support, and JSON output.
+  - `ops vm-lab-run-live-lab` now validates the live-lab report contract and can continue from a completed setup-only report instead of blindly trusting the shell exit code.
+  - Discovery now preserves probe reasons and separates powered/networked/TCP/auth readiness from `execution_ready`.
+  - Local UTM restart readiness no longer reports success before SSH auth is actually ready.
+  - The CLI help text now advertises the full four-stage surface, including setup and `--skip-setup`.
+  - The touched CLI and shell surfaces passed targeted formatting, compile, clippy, parser, and unit coverage checks.
+Security invariants re-verified:
+  - No new generic remote-shell or arbitrary-command operator surface was introduced.
+  - The setup/run wrappers remain artifact- and profile-driven and fail closed on missing required artifacts.
+  - SSH readiness now requires auth success before restart recovery reports a usable VM.
+  - Misleading password-file aliases were removed from the active shell path instead of being silently tolerated.
+What this slice completed:
+  - The live-lab operator path is now a deterministic four-stage wrapper flow with resumable setup and structured outputs.
+  - Discovery, restart, setup, run, and diagnosis now align on a stricter and more explicit readiness/reporting contract.
+  - Public docs and CLI self-documentation now match the implemented workflow.
+What remains blocked:
+  - No fresh end-to-end five-node live-lab rerun was claimed in this slice; the current command-surface hardening still needs live proof on the current tree.
+  - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
 ## 19. Definition of Done for This Document
 This delta is complete only when all are true:
 - direct path uses correct measured candidates,

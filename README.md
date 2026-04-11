@@ -10,8 +10,8 @@
 
 If you are implementing or reviewing work in this repository, start here:
 
-- [AGENTS.md](/Users/iwanteague/Desktop/Rustynet/AGENTS.md)
-- [CLAUDE.md](/Users/iwanteague/Desktop/Rustynet/CLAUDE.md)
+- [AGENTS.md](./AGENTS.md)
+- [CLAUDE.md](./CLAUDE.md)
 - [documents/README.md](./documents/README.md)
 - [documents/Requirements.md](./documents/Requirements.md)
 - [documents/SecurityMinimumBar.md](./documents/SecurityMinimumBar.md)
@@ -58,6 +58,11 @@ readiness details:
 cargo run --quiet -p rustynet-cli -- ops vm-lab-discover-local-utm --inventory documents/operations/active/vm_lab_inventory.json
 ```
 
+Add `--update-inventory-live-ips` when you want a fully ready discovery pass to
+refresh `documents/operations/active/vm_lab_inventory.json` without first
+forcing a restart. Add `--report-dir <path>` when you want the JSON report and
+summary written as artifacts.
+
 ## Live Lab Workflow
 
 Use this four-step path when you want to exercise the local UTM lab end to end:
@@ -67,25 +72,52 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
    - Finds the local UTM bundles, live IPs, SSH readiness, and the fastest
      “can I use this lab?” summary.
    - Use `ops vm-lab-discover-local-utm` when you need the full JSON evidence.
-   - If discovery shows live IPs but `ready=false` or `ssh_port_status=closed`,
-     restart the local UTM fleet and wait for SSH readiness before you proceed:
+   - If discovery shows live IPs but `readiness.execution_ready=false`,
+     restart the local UTM fleet and wait for SSH auth readiness before you
+     proceed:
      `ops vm-lab-restart --all --wait-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file ~/.ssh/known_hosts`
+   - A successful `ops vm-lab-restart --wait-ready` run also refreshes the
+     local UTM inventory IP tracking in
+     `documents/operations/active/vm_lab_inventory.json` so `ssh_target` and
+     `last_known_ip` match the authoritative live IPs that actually came back.
+   - Add `--json` when you want a machine-readable restart result, and
+     `--report-dir <path>` when you want restart artifacts written to disk.
 2. Setup
-   - `stage_run_fresh_bootstrap_and_network_setup`
-   - Installs Rustynet on the selected nodes, boots the shared network, and
-     enforces the baseline runtime state.
+   - `ops vm-lab-setup-live-lab`
+   - Generates or validates the live-lab profile, runs preflight plus the
+     setup-only stages, writes the report directory, and supports
+     `--resume-from` or `--rerun-stage` for deterministic reruns.
 3. Link and Test
    - `ops vm-lab-run-live-lab`
-   - Runs the full live-lab suite against the prepared network.
-   - Use `stage_run_extended_soak` when you want the longer resilience and
-     reboot-recovery coverage after baseline is healthy.
+   - Runs the full live-lab suite and validates the report contract instead of
+     trusting the shell exit code alone.
+   - If the report directory already contains only completed setup stages from
+     `ops vm-lab-setup-live-lab`, it continues with the test stages without
+     rerunning setup.
 4. Diagnose
    - `ops vm-lab-diagnose-live-lab-failure`
-   - Collects the first failed stage and packages the useful failure context
+   - Collects the first failed stage and packages stage-aware failure context
      for triage.
 
 This is the recommended operator path for live-lab work:
 discover, set up, link and test, then diagnose if something fails.
+
+If you want the CLI to make the discovery-versus-restart decision for you and
+then run the standard workflow in one shot, use:
+
+- `ops vm-lab-orchestrate-live-lab`
+- It discovers the selected local UTM VMs, restarts only the aliases that are
+  not `readiness.execution_ready`, reruns discovery, then proceeds through
+  setup, full live-lab execution, and diagnose-on-failure using the same report
+  directory.
+- Add `--stop-after-ready` when you want it to stop after proving VM
+  reachability and inventory freshness, without starting setup.
+
+Supporting wrappers remain available when you need tighter control over one part
+of the flow:
+- `ops vm-lab-write-live-lab-profile`
+- `ops vm-lab-validate-live-lab-profile`
+- `ops vm-lab-bootstrap-phase --phase all`
 
 The wizard handles:
 - role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions
