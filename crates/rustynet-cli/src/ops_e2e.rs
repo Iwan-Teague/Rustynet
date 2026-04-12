@@ -11,7 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::unistd::Uid;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
     EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType, NodeMetadata,
@@ -32,6 +32,12 @@ const MEMBERSHIP_STATE_PATHS: [&str; 3] = [
     "/var/lib/rustynet/membership.log",
     "/var/lib/rustynet/membership.watermark",
 ];
+
+fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
+    OsRng
+        .try_fill_bytes(bytes)
+        .map_err(|err| format!("os randomness unavailable for {label}: {err}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebianTwoNodeE2eConfig {
@@ -345,7 +351,7 @@ pub fn execute_ops_e2e_bootstrap_host(
     );
     let bootstrap_result = (|| -> Result<(), String> {
         let mut passphrase_bytes = [0u8; 48];
-        OsRng.fill_bytes(&mut passphrase_bytes);
+        fill_os_random_bytes(&mut passphrase_bytes, "bootstrap passphrase")?;
         let mut passphrase_hex = String::with_capacity(passphrase_bytes.len() * 2 + 1);
         for byte in passphrase_bytes {
             write!(&mut passphrase_hex, "{byte:02x}")
@@ -1789,7 +1795,9 @@ fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) 
 fn random_nonzero_coordination_bytes() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     while bytes.iter().all(|value| *value == 0) {
-        OsRng.fill_bytes(&mut bytes);
+        OsRng
+            .try_fill_bytes(&mut bytes)
+            .expect("os randomness unavailable for traversal coordination bytes");
     }
     bytes
 }

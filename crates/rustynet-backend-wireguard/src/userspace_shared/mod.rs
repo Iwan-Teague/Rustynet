@@ -553,6 +553,7 @@ mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -571,6 +572,8 @@ mod tests {
         TunExitModeMutation, TunRouteMutation, TunRouteMutationKind,
     };
     use crate::userspace_shared::runtime::RecordedAuthoritativeTransportOperationKind;
+
+    static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
@@ -600,9 +603,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should move forward")
             .as_nanos();
+        let counter = UNIQUE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "rustynet-userspace-shared-{name}-{}-{nanos}.key",
-            std::process::id()
+            "rustynet-userspace-shared-{name}-{}-{nanos}-{counter}.key",
+            std::process::id(),
         ))
     }
 

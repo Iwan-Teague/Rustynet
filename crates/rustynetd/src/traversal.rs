@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::TryRngCore;
 use rustynet_backend_api::{NodeId, SocketEndpoint};
 use rustynet_control::SignedTraversalCoordinationRecord;
 
@@ -289,7 +289,9 @@ impl CandidateGatherer {
         timeout: Duration,
     ) -> Result<SocketEndpoint, TraversalError> {
         let mut transaction_id = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(transaction_id.as_mut_slice());
+        rand::rngs::OsRng
+            .try_fill_bytes(transaction_id.as_mut_slice())
+            .map_err(|err| TraversalError::Stun(format!("os randomness unavailable: {err}")))?;
         let request = build_stun_binding_request(transaction_id);
         self.local_socket
             .set_read_timeout(Some(timeout))
@@ -1433,7 +1435,9 @@ pub fn schedule_proactive_refresh(
 ) -> Instant {
     let jitter_secs = if jitter_max_secs > 0 {
         let mut buf = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut buf)
+            .expect("os randomness unavailable for traversal refresh jitter");
         u64::from_le_bytes(buf) % jitter_max_secs
     } else {
         0

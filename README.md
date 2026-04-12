@@ -102,6 +102,13 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
 This is the recommended operator path for live-lab work:
 discover, set up, link and test, then diagnose if something fails.
 
+Live-lab automation security expectations:
+
+- SSH host trust must be pinned with `--ssh-known-hosts-file` or a pre-populated `~/.ssh/known_hosts`
+- SSH TOFU (`accept-new`) is not part of the active wrapper path
+- automation targets are expected to satisfy `sudo -n`
+- unattended runtime secret custody remains credential-only; plaintext passphrase files are not an acceptable substitute
+
 If you want the CLI to make the discovery-versus-restart decision for you and
 then run the standard workflow in one shot, use:
 
@@ -118,6 +125,25 @@ of the flow:
 - `ops vm-lab-write-live-lab-profile`
 - `ops vm-lab-validate-live-lab-profile`
 - `ops vm-lab-bootstrap-phase --phase all`
+
+## Release Readiness
+
+Use this final sign-off command when you want the repo-level release-readiness
+guardrail:
+
+```bash
+./scripts/ci/release_readiness_gates.sh
+```
+
+That wrapper keeps the Phase 5 release-doc/provenance path and the Phase 10
+fresh-install/cross-network evidence path on one fail-closed command. Reduced
+helper evidence is useful for narrowing defects, but it is not treated as a
+substitute for full release-gate evidence.
+
+Current sign-off references:
+
+- [documents/operations/ReleaseReadinessGuardrails.md](./documents/operations/ReleaseReadinessGuardrails.md)
+- [documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md](./documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md)
 
 The wizard handles:
 - role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions

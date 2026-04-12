@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::env_file::{format_env_assignment, parse_env_value};
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, User, chown};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::membership::{
     MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
     MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipUpdateRecord,
@@ -87,6 +87,12 @@ const DNS_ZONE_RECORDS_MANIFEST_MAX_VALUE_BYTES: usize = 1_536;
 const DNS_ZONE_RECORDS_MANIFEST_MAX_KEY_DEPTH: usize = 5;
 const DNS_ZONE_RECORDS_MANIFEST_MAX_RECORD_COUNT: usize = 1_024;
 const DNS_ZONE_RECORDS_MANIFEST_MAX_ALIAS_COUNT: usize = 8;
+
+fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
+    OsRng
+        .try_fill_bytes(bytes)
+        .map_err(|err| format!("os randomness unavailable for {label}: {err}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
@@ -3145,6 +3151,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Help => Ok(help_text()),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
+        CliCommand::StateRefresh => execute_state_refresh(),
         CliCommand::DnsZoneIssue(command) => execute_dns_zone_issue(*command),
         CliCommand::DnsZoneVerify {
             bundle_path,
@@ -3176,6 +3183,15 @@ fn execute(command: CliCommand) -> Result<String, String> {
             }
         }
     }
+}
+
+fn execute_state_refresh() -> Result<String, String> {
+    let response = send_command(IpcCommand::StateRefresh)?;
+    if !response.ok {
+        return Err(response.message);
+    }
+    reconcile_persisted_lan_blackhole_routes_after_refresh()?;
+    Ok(response.message)
 }
 
 fn execute_traversal(command: TraversalCommand) -> Result<String, String> {
@@ -3276,7 +3292,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
             force,
         } => {
             let mut secret = vec![0u8; length_bytes];
-            OsRng.fill_bytes(secret.as_mut_slice());
+            fill_os_random_bytes(secret.as_mut_slice(), "assignment signing secret")?;
             persist_encrypted_secret_material(
                 &output_path,
                 secret.as_slice(),
@@ -3824,7 +3840,7 @@ fn execute_trust(command: TrustCommand) -> Result<String, String> {
             force,
         } => {
             let mut seed = [0u8; 32];
-            OsRng.fill_bytes(&mut seed);
+            fill_os_random_bytes(&mut seed, "trust signing key")?;
             persist_encrypted_secret_material(
                 &signing_key_path,
                 &seed,
@@ -7498,7 +7514,7 @@ fn execute_ops_ensure_local_trust_material(
         )
     } else {
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        fill_os_random_bytes(&mut seed, "trust signing key")?;
         let signing_key = SigningKey::from_bytes(&seed);
         let persist_result = persist_encrypted_secret_material(
             trust_signer_key_path.as_path(),
@@ -7716,7 +7732,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
     let passphrase_tmp =
         create_secure_temp_file(std::env::temp_dir().as_path(), "tunnel-passphrase.")?;
     let mut random_bytes = [0u8; 48];
-    OsRng.fill_bytes(&mut random_bytes);
+    fill_os_random_bytes(&mut random_bytes, "tunnel passphrase")?;
     let mut passphrase_hex = Zeroizing::new(hex_bytes(&random_bytes));
     random_bytes.zeroize();
     passphrase_hex.push('\n');
@@ -7914,6 +7930,15 @@ fn execute_ops_apply_lan_access_coupling(
         assignment_refresh_env_value(existing.as_str(), "RUSTYNET_ASSIGNMENT_LAN_ROUTES")?
             .map(split_csv)
             .unwrap_or_default();
+    let previous_lan_block_routes =
+        assignment_refresh_env_value(existing.as_str(), "RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES")?
+            .map(split_csv)
+            .unwrap_or_default();
+    let disable_blackhole_routes = disable_lan_blackhole_routes(
+        lan_routes.as_slice(),
+        previous_lan_block_routes.as_slice(),
+        previous_lan_routes.as_slice(),
+    );
 
     let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
     let status = send_command_with_socket(IpcCommand::Status, socket_path.clone())?;
@@ -7953,9 +7978,17 @@ fn execute_ops_apply_lan_access_coupling(
         }
     }
 
-    let rewritten = rewrite_assignment_refresh_lan_routes(
-        existing.as_str(),
-        if enable { lan_routes.as_slice() } else { &[] },
+    let rewritten = rewrite_assignment_refresh_lan_block_routes(
+        rewrite_assignment_refresh_lan_routes(
+            existing.as_str(),
+            if enable { lan_routes.as_slice() } else { &[] },
+        )
+        .as_str(),
+        if enable {
+            lan_routes.as_slice()
+        } else {
+            disable_blackhole_routes.as_slice()
+        },
     );
     let parent = assignment_refresh_env_path.parent().ok_or_else(|| {
         format!(
@@ -7981,12 +8014,7 @@ fn execute_ops_apply_lan_access_coupling(
     }
 
     if !enable {
-        let blackhole_routes = if lan_routes.is_empty() {
-            previous_lan_routes.as_slice()
-        } else {
-            lan_routes.as_slice()
-        };
-        apply_lan_blackhole_routes(blackhole_routes, true)?;
+        apply_lan_blackhole_routes(disable_blackhole_routes.as_slice(), true)?;
     }
     force_local_assignment_refresh_now_ops()?;
     wait_for_daemon_status_field(
@@ -7997,6 +8025,10 @@ fn execute_ops_apply_lan_access_coupling(
     )?;
     if enable {
         apply_lan_blackhole_routes(lan_routes.as_slice(), false)?;
+    } else {
+        // Reinstall the fail-closed blackhole after the refresh path, because
+        // the dataplane generation rebuild can replace table 51820 contents.
+        apply_lan_blackhole_routes(disable_blackhole_routes.as_slice(), true)?;
     }
 
     Ok(if enable {
@@ -8011,6 +8043,62 @@ fn execute_ops_apply_lan_access_coupling(
             assignment_refresh_env_path.display()
         )
     })
+}
+
+fn disable_lan_blackhole_routes(
+    requested_lan_routes: &[String],
+    previous_lan_block_routes: &[String],
+    previous_lan_routes: &[String],
+) -> Vec<String> {
+    if requested_lan_routes.is_empty() {
+        if previous_lan_block_routes.is_empty() {
+            previous_lan_routes.to_vec()
+        } else {
+            previous_lan_block_routes.to_vec()
+        }
+    } else {
+        requested_lan_routes.to_vec()
+    }
+}
+
+fn reconcile_persisted_lan_blackhole_routes_after_refresh() -> Result<(), String> {
+    let assignment_refresh_env_path = env_path_or_default(
+        "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
+        DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH,
+    )?;
+    if !assignment_refresh_env_path.exists() {
+        return Ok(());
+    }
+
+    ensure_regular_file_no_symlink(
+        assignment_refresh_env_path.as_path(),
+        "assignment refresh env file",
+    )?;
+    let existing = fs::read_to_string(&assignment_refresh_env_path)
+        .map_err(|err| format!("read assignment refresh env failed: {err}"))?;
+    let lan_block_routes =
+        assignment_refresh_env_value(existing.as_str(), "RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES")?
+            .map(split_csv)
+            .unwrap_or_default();
+    if lan_block_routes.is_empty() {
+        return Ok(());
+    }
+
+    let status = send_command(IpcCommand::Status)?;
+    if !status.ok {
+        return Err(format!(
+            "query daemon status failed after state refresh: {}",
+            status.message
+        ));
+    }
+    let lan_access = status_field(status.message.as_str(), "lan_access").unwrap_or_default();
+    let exit_node = status_field(status.message.as_str(), "exit_node").unwrap_or_default();
+    if lan_access == "off" && !exit_node.is_empty() && exit_node != "none" {
+        apply_lan_blackhole_routes(lan_block_routes.as_slice(), true)?;
+    } else {
+        apply_lan_blackhole_routes(lan_block_routes.as_slice(), false)?;
+    }
+    Ok(())
 }
 
 fn execute_ops_apply_role_coupling(
@@ -9448,7 +9536,7 @@ fn ensure_signing_passphrase_material_linux(
     let tmp_passphrase =
         create_secure_temp_file(std::env::temp_dir().as_path(), "signing-passphrase.")?;
     let mut random_bytes = [0u8; 48];
-    OsRng.fill_bytes(&mut random_bytes);
+    fill_os_random_bytes(&mut random_bytes, "signing credential passphrase")?;
     let mut passphrase_hex = Zeroizing::new(hex_bytes(&random_bytes));
     random_bytes.zeroize();
     passphrase_hex.push('\n');
@@ -9811,6 +9899,42 @@ fn rewrite_assignment_refresh_lan_routes(body: &str, lan_routes: &[String]) -> S
     format!("{}\n", rewritten_lines.join("\n"))
 }
 
+fn rewrite_assignment_refresh_lan_block_routes(body: &str, lan_routes: &[String]) -> String {
+    let mut rewritten_lines = Vec::new();
+    let mut inserted = false;
+    for line in body.lines() {
+        if line.starts_with("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES=") {
+            if !inserted && !lan_routes.is_empty() {
+                rewritten_lines.push(
+                    format_env_assignment(
+                        "RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES",
+                        lan_routes.join(",").as_str(),
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("invalid assignment refresh LAN block routes: {err}")
+                    }),
+                );
+            }
+            inserted = true;
+            continue;
+        }
+        rewritten_lines.push(line.to_string());
+    }
+    if !inserted && !lan_routes.is_empty() {
+        rewritten_lines.push(
+            format_env_assignment(
+                "RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES",
+                lan_routes.join(",").as_str(),
+            )
+            .unwrap_or_else(|err| panic!("invalid assignment refresh LAN block routes: {err}")),
+        );
+    }
+    if rewritten_lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", rewritten_lines.join("\n"))
+}
+
 fn require_root_execution() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
@@ -10127,7 +10251,7 @@ fn ensure_directory_exists(path: &Path, mode: u32, owner: Uid, group: Gid) -> Re
 fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     let mut random_bytes = [0u8; 8];
     for _ in 0..32 {
-        OsRng.fill_bytes(&mut random_bytes);
+        fill_os_random_bytes(&mut random_bytes, "temporary file name")?;
         let candidate = dir.join(format!("{prefix}{}", hex_bytes(&random_bytes)));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);
@@ -10151,7 +10275,7 @@ fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> 
 fn create_secure_temp_directory(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     let mut random_bytes = [0u8; 8];
     for _ in 0..32 {
-        OsRng.fill_bytes(&mut random_bytes);
+        fill_os_random_bytes(&mut random_bytes, "temporary directory name")?;
         let candidate = dir.join(format!("{prefix}{}", hex_bytes(&random_bytes)));
         match fs::create_dir(candidate.as_path()) {
             Ok(()) => {
@@ -13653,6 +13777,46 @@ mod tests {
 
         let cleared = rewrite_assignment_refresh_lan_routes(existing, &[]);
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_ROUTES="));
+    }
+
+    #[test]
+    fn disable_lan_blackhole_routes_prefers_requested_routes_and_falls_back_to_previous() {
+        assert_eq!(
+            super::disable_lan_blackhole_routes(
+                &[String::from("192.168.1.0/24")],
+                &[String::from("172.16.0.0/16")],
+                &[String::from("10.0.0.0/24")]
+            ),
+            vec![String::from("192.168.1.0/24")]
+        );
+        assert_eq!(
+            super::disable_lan_blackhole_routes(
+                &[],
+                &[String::from("172.16.0.0/16")],
+                &[String::from("10.0.0.0/24")]
+            ),
+            vec![String::from("172.16.0.0/16")]
+        );
+        assert_eq!(
+            super::disable_lan_blackhole_routes(&[], &[], &[String::from("10.0.0.0/24")]),
+            vec![String::from("10.0.0.0/24")]
+        );
+    }
+
+    #[test]
+    fn rewrite_assignment_refresh_lan_block_routes_updates_and_clears() {
+        let existing = "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"node-40\"\nRUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES=\"10.0.0.0/24\"\nRUSTYNET_ASSIGNMENT_ALLOW=\"a|b\"\n";
+        let updated = super::rewrite_assignment_refresh_lan_block_routes(
+            existing,
+            &[String::from("192.168.1.0/24"), String::from("fd00::/64")],
+        );
+        assert!(
+            updated.contains("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES=\"192.168.1.0/24,fd00::/64\"")
+        );
+        assert!(!updated.contains("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES=\"10.0.0.0/24\""));
+
+        let cleared = super::rewrite_assignment_refresh_lan_block_routes(existing, &[]);
+        assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES="));
     }
 
     #[test]

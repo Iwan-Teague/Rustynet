@@ -1,0 +1,52 @@
+# Phase 5 Release Readiness Checklist
+
+Prepared: 2026-04-12
+Scope: durable release-signoff guardrails, operator/release docs, and the final readiness bundle
+Objective: make the critical release gates reproducible, keep the operator security posture explicit, and publish a final readiness summary that distinguishes reduced helper evidence from full release-gate evidence
+
+## Checklist
+
+- [x] Gate procedure or CI guardrail documented or enforced
+  Evidence:
+  - `/Users/iwan/Desktop/Rustynet/scripts/ci/release_readiness_gates.sh`
+  - `/Users/iwan/Desktop/Rustynet/crates/rustynet-cli/src/bin/release_readiness_gates.rs`
+  - `/Users/iwan/Desktop/Rustynet/documents/operations/ReleaseReadinessGuardrails.md`
+  Notes:
+  - the top-level release-readiness gate now requires both the Phase 5 and Phase 10 gate paths
+  - this keeps the critical Rust, advisory, license, and live evidence gates on one explicit sign-off path
+
+- [x] Operator docs keep strict host-key and credential posture explicit
+  Evidence:
+  - `/Users/iwan/Desktop/Rustynet/README.md`
+  - `/Users/iwan/Desktop/Rustynet/documents/operations/ReleaseReadinessGuardrails.md`
+  - `/Users/iwan/Desktop/Rustynet/documents/operations/LiveLinuxLabOrchestrator.md`
+  - `/Users/iwan/Desktop/Rustynet/scripts/e2e/README.md`
+  Notes:
+  - pinned host-key handling, no TOFU, passwordless sudo, and credential-only secret custody are now stated explicitly in the release-readiness and live-lab docs
+
+- [x] Final readiness summary distinguishes reduced versus full-gate evidence
+  Evidence:
+  - `/Users/iwan/Desktop/Rustynet/documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md`
+  Notes:
+  - the summary explicitly separates reduced helper/local-gate proof from full release-gate proof
+  - the summary does not present the current repo state as release-ready
+
+- [x] Final sign-off bundle assembled with refreshed artifacts
+  Evidence:
+  - `/Users/iwan/Desktop/Rustynet/artifacts/release/phase5_readiness_bundle.json`
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_two_hop_report.json`
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_lan_toggle_report.json`
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_managed_dns_retry_report.json`
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_exit_handoff_retry_report.json`
+  Notes:
+  - the bundle exists and links the refreshed reduced-helper artifacts that are actually current
+  - the bundle also records the remaining full-gate blockers instead of hiding them
+
+## Current Phase 5 Truth
+
+- The durable sign-off path now exists as `./scripts/ci/release_readiness_gates.sh`.
+- The operator docs state the live-lab trust and credential posture explicitly.
+- The final readiness summary and bundle exist.
+- The repo is still not release-ready because:
+  - fresh-install evidence is not yet regenerated for a clean current commit
+  - canonical cross-network evidence is not yet regenerated for a clean current commit

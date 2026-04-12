@@ -2895,9 +2895,11 @@ stage_enforce_baseline_runtime() {
   run_parallel_node_stage refresh_runtime_after_enforce refresh_runtime_state_worker
   live_lab_retry_root "$(node_target_for_label exit)" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2 || return 1
   sleep 5
-  # Refresh traversal coordination immediately before baseline validation so the
-  # 30-second signed-coordination window is not spent on earlier enforcement work.
+  # Refresh short-lived signed artifacts immediately before baseline validation
+  # so the runtime refresh path is not forced to consume stale trust or
+  # traversal inputs after the long bootstrap/setup window.
   issue_and_distribute_traversal_snapshot refresh_traversal_after_enforce || return 1
+  run_parallel_node_stage refresh_trust_after_traversal refresh_trust_evidence_worker
   run_parallel_node_stage refresh_runtime_after_traversal refresh_signed_state_worker
 }
 
@@ -2919,6 +2921,16 @@ refresh_runtime_state_worker() {
   printf '[runtime-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
   live_lab_run_root "$target" "root rustynet ops force-local-assignment-refresh-now"
   live_lab_wait_for_daemon_socket "$target"
+}
+
+refresh_trust_evidence_worker() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local _role="$4"
+  printf '[trust-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
+  live_lab_wait_for_daemon_socket "$target"
+  live_lab_retry_root "$target" "root rustynet ops refresh-signed-trust" 5 2
 }
 
 refresh_runtime_state_all_nodes() {

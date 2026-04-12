@@ -17,6 +17,7 @@ use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tar::Builder;
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
@@ -39,9 +40,22 @@ const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
+const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
+const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
 const DEFAULT_PRECHECK_COMMANDS: &[&str] = &["git", "cargo", "systemctl"];
 const POLL_INTERVAL_MILLIS: u64 = 100;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const FULL_RELEASE_GATE_REQUIRED_STAGES: &[&str] = &[
+    "live_role_switch_matrix",
+    "live_exit_handoff",
+    "live_two_hop",
+    "live_lan_toggle",
+    "live_managed_dns",
+    "fresh_install_os_matrix_report",
+    "local_full_gate_suite",
+    "extended_soak",
+    "cross_network_nat_matrix",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabListConfig {
@@ -598,6 +612,26 @@ struct LiveLabSetupSelection {
     profile_generation_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabSetupManifest {
+    version: u32,
+    profile_path: String,
+    profile_sha256: String,
+    script_path: String,
+    script_sha256: String,
+    source_mode: String,
+    repo_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReleaseGateCompletenessReport {
+    requested: bool,
+    status: String,
+    required_stages: Vec<String>,
+    observed_pass_stages: Vec<String>,
+    missing_or_non_pass_stages: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveLabStageReviewContext<'a> {
     report_dir: &'a Path,
@@ -791,6 +825,116 @@ fn setup_stage_names() -> &'static [&'static str] {
         "enforce_baseline_runtime",
         "validate_baseline_runtime",
     ]
+}
+
+fn normalize_manifest_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path)
+        .map_err(|err| format!("read for sha256 failed ({}): {err}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn build_setup_manifest(
+    profile_path: &Path,
+    script_path: &Path,
+    source_mode: &str,
+    repo_ref: Option<&str>,
+) -> Result<LiveLabSetupManifest, String> {
+    Ok(LiveLabSetupManifest {
+        version: 1,
+        profile_path: normalize_manifest_path(profile_path),
+        profile_sha256: file_sha256_hex(profile_path)?,
+        script_path: normalize_manifest_path(script_path),
+        script_sha256: file_sha256_hex(script_path)?,
+        source_mode: source_mode.to_string(),
+        repo_ref: repo_ref.map(ToOwned::to_owned),
+    })
+}
+
+fn write_setup_manifest(report_dir: &Path, manifest: &LiveLabSetupManifest) -> Result<(), String> {
+    let path = report_dir.join(SETUP_MANIFEST_RELATIVE_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("setup manifest path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create setup manifest directory failed ({}): {err}",
+            parent.display()
+        )
+    })?;
+    let body = serde_json::to_vec_pretty(manifest)
+        .map_err(|err| format!("serialize setup manifest failed: {err}"))?;
+    fs::write(&path, body)
+        .map_err(|err| format!("write setup manifest failed ({}): {err}", path.display()))
+}
+
+fn read_setup_manifest(report_dir: &Path) -> Result<LiveLabSetupManifest, String> {
+    let path = report_dir.join(SETUP_MANIFEST_RELATIVE_PATH);
+    let body = fs::read(&path)
+        .map_err(|err| format!("read setup manifest failed ({}): {err}", path.display()))?;
+    serde_json::from_slice(&body)
+        .map_err(|err| format!("parse setup manifest failed ({}): {err}", path.display()))
+}
+
+fn setup_manifest_matches(actual: &LiveLabSetupManifest, expected: &LiveLabSetupManifest) -> bool {
+    actual.version == expected.version
+        && actual.profile_sha256 == expected.profile_sha256
+        && actual.script_sha256 == expected.script_sha256
+        && actual.source_mode == expected.source_mode
+        && actual.repo_ref == expected.repo_ref
+}
+
+fn validate_setup_manifest(
+    report_dir: &Path,
+    profile_path: &Path,
+    script_path: &Path,
+    source_mode: &str,
+    repo_ref: Option<&str>,
+) -> Result<(), String> {
+    let actual = read_setup_manifest(report_dir)?;
+    let expected = build_setup_manifest(profile_path, script_path, source_mode, repo_ref)?;
+    if setup_manifest_matches(&actual, &expected) {
+        return Ok(());
+    }
+    Err(format!(
+        "setup manifest does not match current live-lab inputs: actual={} expected={}",
+        serde_json::to_string(&actual).unwrap_or_else(|_| "<manifest-serialize-error>".to_string()),
+        serde_json::to_string(&expected)
+            .unwrap_or_else(|_| "<manifest-serialize-error>".to_string())
+    ))
+}
+
+fn live_lab_report_has_existing_state(report_dir: &Path) -> bool {
+    report_dir.join("state/stages.tsv").exists()
+        || report_dir.join(SETUP_MANIFEST_RELATIVE_PATH).exists()
+}
+
+fn resolve_run_setup_reuse(
+    report_dir: &Path,
+    profile_path: &Path,
+    script_path: &Path,
+    source_mode: &str,
+    repo_ref: Option<&str>,
+    skip_setup: bool,
+) -> Result<bool, String> {
+    if !report_dir.exists() {
+        return Ok(false);
+    }
+    let can_continue_from_setup = live_lab_setup_complete(report_dir)?
+        && !live_lab_report_has_non_setup_stage_records(report_dir)?;
+    let explicit_skip_reuses_state = skip_setup && live_lab_report_has_existing_state(report_dir);
+    if can_continue_from_setup || explicit_skip_reuses_state {
+        validate_setup_manifest(report_dir, profile_path, script_path, source_mode, repo_ref)?;
+    }
+    Ok(can_continue_from_setup)
 }
 
 impl VmLabIterationValidationStep {
@@ -2438,10 +2582,13 @@ fn render_vm_lab_command_result(
     records: &[LiveLabStageRecord],
     warnings: Vec<String>,
     next_actions: Vec<String>,
+    overall_status_override: Option<VmLabCommandOverallStatus>,
 ) -> Result<String, String> {
+    let overall_status =
+        overall_status_override.unwrap_or_else(|| command_status_from_summary(summary));
     serialize_vm_lab_command_result(&VmLabCommandResult {
         command: command.to_string(),
-        overall_status: command_status_from_summary(summary),
+        overall_status,
         report_dir: report_dir.display().to_string(),
         outcomes: stage_outcomes_from_records(records),
         warnings,
@@ -2539,10 +2686,33 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     if let Some(profile_summary) = selection.profile_generation_summary {
         warnings.push(profile_summary);
     }
-    let next_actions = if status.success() {
+    let manifest_error = if status.success() {
+        match build_setup_manifest(
+            selection.profile_path.as_path(),
+            config.script_path.as_path(),
+            resolved_source_mode.as_str(),
+            resolved_repo_ref.as_deref(),
+        )
+        .and_then(|manifest| write_setup_manifest(config.report_dir.as_path(), &manifest))
+        {
+            Ok(()) => None,
+            Err(err) => {
+                warnings.push(err.clone());
+                Some(err)
+            }
+        }
+    } else {
+        None
+    };
+    let next_actions = if status.success() && manifest_error.is_none() {
         vec![format!(
             "Run vm-lab-run-live-lab with --profile {} --report-dir {}",
             selection.profile_path.display(),
+            config.report_dir.display()
+        )]
+    } else if manifest_error.is_some() {
+        vec![format!(
+            "Re-run vm-lab-setup-live-lab for report dir {} after fixing setup manifest persistence",
             config.report_dir.display()
         )]
     } else {
@@ -2559,8 +2729,11 @@ pub fn execute_ops_vm_lab_setup_live_lab(
         &records,
         warnings,
         next_actions,
+        manifest_error
+            .as_ref()
+            .map(|_| VmLabCommandOverallStatus::Fail),
     )?;
-    if status.success() {
+    if status.success() && manifest_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -2594,12 +2767,14 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
                 default_live_lab_report_root().join(format!("run_{}", unique_suffix()))
             }),
     };
-    let can_continue_from_setup = if report_dir.exists() {
-        live_lab_setup_complete(report_dir.as_path())?
-            && !live_lab_report_has_non_setup_stage_records(report_dir.as_path())?
-    } else {
-        false
-    };
+    let can_continue_from_setup = resolve_run_setup_reuse(
+        report_dir.as_path(),
+        config.profile_path.as_path(),
+        config.script_path.as_path(),
+        resolved_source_mode.as_str(),
+        resolved_repo_ref.as_deref(),
+        config.skip_setup,
+    )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
     let mut command = Command::new("bash");
     command.arg(config.script_path.as_path());
@@ -2633,6 +2808,11 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     validate_live_lab_run_artifacts(report_dir.as_path())?;
     let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let records = parse_live_lab_stage_records(report_dir.as_path())?;
+    let release_gate_report = build_release_gate_completeness_report(
+        &records,
+        full_release_gate_requested(&profile, &config),
+    );
+    write_release_gate_completeness(report_dir.as_path(), &release_gate_report)?;
     let mut warnings = Vec::new();
     if can_continue_from_setup && !config.skip_setup {
         warnings.push(
@@ -2640,8 +2820,30 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
                 .to_string(),
         );
     }
-    let next_actions = if status.success() {
+    let completeness_error = if release_gate_report.requested
+        && !release_gate_report.missing_or_non_pass_stages.is_empty()
+    {
+        let message = format!(
+            "full release-gate mode requested, but required stages were missing or not pass: {}",
+            release_gate_report.missing_or_non_pass_stages.join(", ")
+        );
+        warnings.push(message.clone());
+        Some(message)
+    } else {
+        None
+    };
+    let next_actions = if status.success() && completeness_error.is_none() {
         Vec::new()
+    } else if let Some(message) = completeness_error.as_ref() {
+        vec![
+            message.clone(),
+            format!(
+                "Inspect {} for the required stage set and rerun without skip flags",
+                report_dir
+                    .join(RELEASE_GATE_COMPLETENESS_RELATIVE_PATH)
+                    .display()
+            ),
+        ]
     } else {
         vec![format!(
             "Run vm-lab-diagnose-live-lab-failure with --profile {} --report-dir {}",
@@ -2656,8 +2858,12 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         &records,
         warnings,
         next_actions,
+        completeness_error
+            .as_ref()
+            .filter(|_| status.success())
+            .map(|_| VmLabCommandOverallStatus::Fail),
     )?;
-    if status.success() {
+    if status.success() && completeness_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -4990,6 +5196,93 @@ fn validate_live_lab_run_artifacts(report_dir: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn live_lab_profile_has_full_release_gate_topology(profile: &LiveLabProfile) -> bool {
+    ["ENTRY_TARGET", "AUX_TARGET", "EXTRA_TARGET"]
+        .iter()
+        .all(|key| {
+            profile
+                .optional(key)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        })
+}
+
+fn full_release_gate_requested(profile: &LiveLabProfile, config: &VmLabRunLiveLabConfig) -> bool {
+    !config.skip_gates
+        && !config.skip_soak
+        && !config.skip_cross_network
+        && live_lab_profile_has_full_release_gate_topology(profile)
+}
+
+fn build_release_gate_completeness_report(
+    records: &[LiveLabStageRecord],
+    requested: bool,
+) -> ReleaseGateCompletenessReport {
+    let observed_pass_stages = records
+        .iter()
+        .filter(|record| record.status == "pass")
+        .map(|record| record.name.clone())
+        .collect::<Vec<_>>();
+    let observed_pass_set = observed_pass_stages
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let required_stages = FULL_RELEASE_GATE_REQUIRED_STAGES
+        .iter()
+        .map(|stage| (*stage).to_string())
+        .collect::<Vec<_>>();
+    let missing_or_non_pass_stages = if requested {
+        FULL_RELEASE_GATE_REQUIRED_STAGES
+            .iter()
+            .filter(|stage| !observed_pass_set.contains(**stage))
+            .map(|stage| (*stage).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let status = if !requested {
+        "not_requested"
+    } else if missing_or_non_pass_stages.is_empty() {
+        "complete"
+    } else {
+        "incomplete"
+    };
+    ReleaseGateCompletenessReport {
+        requested,
+        status: status.to_string(),
+        required_stages,
+        observed_pass_stages,
+        missing_or_non_pass_stages,
+    }
+}
+
+fn write_release_gate_completeness(
+    report_dir: &Path,
+    report: &ReleaseGateCompletenessReport,
+) -> Result<(), String> {
+    let path = report_dir.join(RELEASE_GATE_COMPLETENESS_RELATIVE_PATH);
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "release-gate completeness path has no parent: {}",
+            path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create release-gate completeness directory failed ({}): {err}",
+            parent.display()
+        )
+    })?;
+    let body = serde_json::to_vec_pretty(report)
+        .map_err(|err| format!("serialize release-gate completeness failed: {err}"))?;
+    fs::write(&path, body).map_err(|err| {
+        format!(
+            "write release-gate completeness failed ({}): {err}",
+            path.display()
+        )
+    })
 }
 
 fn validate_live_lab_diagnostics_artifacts(diagnostics_dir: &Path) -> Result<(), String> {
@@ -10185,6 +10478,21 @@ mod tests {
         profile_path
     }
 
+    fn write_temp_stage_rows(report_dir: &Path, rows: &[(&str, &str)]) {
+        let mut rendered = String::new();
+        for (index, (name, status)) in rows.iter().enumerate() {
+            let log_path = report_dir.join("logs").join(format!("{name}.log"));
+            fs::write(&log_path, format!("{name} {status}\n")).expect("stage log should write");
+            rendered.push_str(&format!(
+                "{name}\thard\t{status}\t{}\t{}\t{name} stage\t2026-04-12T00:00:{index:02}Z\t2026-04-12T00:00:{end:02}Z\n",
+                if *status == "pass" { 0 } else { 1 },
+                log_path.display(),
+                end = index + 1,
+            ));
+        }
+        fs::write(report_dir.join("state/stages.tsv"), rendered).expect("stages should write");
+    }
+
     #[test]
     fn default_utmctl_path_matches_expected_bundle_location() {
         assert_eq!(
@@ -11924,13 +12232,18 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         fs::create_dir_all(&bundle).expect("bundle dir should exist");
         let state_file = dir.join("vm-state");
         fs::write(&state_file, "started\n").expect("state file should write");
+        let stop_requested = dir.join("stop-requested");
+        let poll_count = dir.join("poll-count");
+        fs::write(&poll_count, "0\n").expect("poll count should write");
 
         let utmctl = dir.join("utmctl");
         fs::write(
             &utmctl,
             format!(
-                "#!/bin/sh\nSTATE_FILE=\"{}\"\ncase \"$1\" in\n  list)\n    state=$(cat \"$STATE_FILE\")\n    printf 'UUID                                 Status   Name\\n00000000-0000-0000-0000-000000000000 %s alpha\\n' \"$state\"\n    exit 0\n    ;;\n  stop)\n    nohup sh -c 'sleep 0.2; printf \"stopped\\\\n\" > \"$1\"' _ \"$STATE_FILE\" >/dev/null 2>&1 &\n    sleep 2\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
-                state_file.display()
+                "#!/bin/sh\nSTATE_FILE=\"{}\"\nSTOP_REQUESTED=\"{}\"\nPOLL_COUNT=\"{}\"\ncase \"$1\" in\n  list)\n    if [ -f \"$STOP_REQUESTED\" ]; then\n      count=$(cat \"$POLL_COUNT\")\n      count=$((count + 1))\n      printf '%s\\n' \"$count\" > \"$POLL_COUNT\"\n      if [ \"$count\" -ge 2 ]; then\n        printf 'stopped\\n' > \"$STATE_FILE\"\n      fi\n    fi\n    state=$(cat \"$STATE_FILE\")\n    printf 'UUID                                 Status   Name\\n00000000-0000-0000-0000-000000000000 %s alpha\\n' \"$state\"\n    exit 0\n    ;;\n  stop)\n    : > \"$STOP_REQUESTED\"\n    sleep 2\n    exit 0\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n",
+                state_file.display(),
+                stop_requested.display(),
+                poll_count.display(),
             ),
         )
         .expect("utmctl script should write");
@@ -12035,5 +12348,208 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(command.rendered.contains("--client-host"));
         assert!(command.rendered.contains("debian@client-host"));
         assert!(command.rendered.contains("--exit-network-id"));
+    }
+
+    #[test]
+    fn validate_setup_manifest_rejects_mismatched_source_mode() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let manifest = super::build_setup_manifest(
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+        )
+        .expect("manifest should build");
+        super::write_setup_manifest(report_dir.as_path(), &manifest)
+            .expect("manifest should write");
+
+        let err = super::validate_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "archive",
+            Some("HEAD"),
+        )
+        .expect_err("mismatched source mode must fail closed");
+
+        assert!(err.contains("setup manifest does not match current live-lab inputs"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_allows_matching_auto_continue() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        write_temp_stage_rows(
+            report_dir.as_path(),
+            &[("validate_baseline_runtime", "pass")],
+        );
+        let manifest = super::build_setup_manifest(
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+        )
+        .expect("manifest should build");
+        super::write_setup_manifest(report_dir.as_path(), &manifest)
+            .expect("manifest should write");
+
+        let continue_from_setup = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            false,
+        )
+        .expect("matching manifest should allow setup reuse");
+
+        assert!(continue_from_setup);
+
+        let _ = fs::remove_dir_all(report_dir);
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_explicit_skip_setup_when_manifest_mismatches() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        write_temp_stage_rows(
+            report_dir.as_path(),
+            &[("validate_baseline_runtime", "pass")],
+        );
+        let manifest = super::build_setup_manifest(
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+        )
+        .expect("manifest should build");
+        super::write_setup_manifest(report_dir.as_path(), &manifest)
+            .expect("manifest should write");
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "archive",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("explicit skip-setup with mismatched manifest must fail closed");
+
+        assert!(err.contains("setup manifest does not match current live-lab inputs"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+    }
+
+    #[test]
+    fn build_release_gate_completeness_report_marks_subset_runs_not_requested() {
+        let records = vec![
+            LiveLabStageRecord {
+                name: "live_role_switch_matrix".to_string(),
+                severity: "hard".to_string(),
+                status: "pass".to_string(),
+                rc: "0".to_string(),
+                log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
+                description: "role switch".to_string(),
+            },
+            LiveLabStageRecord {
+                name: "live_two_hop".to_string(),
+                severity: "hard".to_string(),
+                status: "pass".to_string(),
+                rc: "0".to_string(),
+                log_path: PathBuf::from("/tmp/live_two_hop.log"),
+                description: "two hop".to_string(),
+            },
+        ];
+
+        let report = super::build_release_gate_completeness_report(&records, false);
+
+        assert!(!report.requested);
+        assert_eq!(report.status, "not_requested");
+        assert!(report.missing_or_non_pass_stages.is_empty());
+        assert_eq!(report.observed_pass_stages.len(), 2);
+    }
+
+    #[test]
+    fn write_release_gate_completeness_writes_incomplete_requested_artifact() {
+        let report_dir = write_temp_report_dir();
+        let report = super::build_release_gate_completeness_report(
+            &[LiveLabStageRecord {
+                name: "live_role_switch_matrix".to_string(),
+                severity: "hard".to_string(),
+                status: "pass".to_string(),
+                rc: "0".to_string(),
+                log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
+                description: "role switch".to_string(),
+            }],
+            true,
+        );
+
+        super::write_release_gate_completeness(report_dir.as_path(), &report)
+            .expect("release-gate completeness should write");
+
+        let artifact_path = report_dir.join(super::RELEASE_GATE_COMPLETENESS_RELATIVE_PATH);
+        let parsed: serde_json::Value = serde_json::from_slice(
+            &fs::read(&artifact_path).expect("release-gate completeness should read"),
+        )
+        .expect("artifact should parse");
+
+        assert_eq!(parsed["requested"].as_bool(), Some(true));
+        assert_eq!(parsed["status"].as_str(), Some("incomplete"));
+        assert!(
+            parsed["missing_or_non_pass_stages"]
+                .as_array()
+                .expect("missing stage array should exist")
+                .iter()
+                .any(|value| value.as_str() == Some("cross_network_nat_matrix"))
+        );
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn build_release_gate_completeness_report_marks_complete_when_all_required_stages_pass() {
+        let records = super::FULL_RELEASE_GATE_REQUIRED_STAGES
+            .iter()
+            .map(|stage| LiveLabStageRecord {
+                name: (*stage).to_string(),
+                severity: "hard".to_string(),
+                status: "pass".to_string(),
+                rc: "0".to_string(),
+                log_path: PathBuf::from(format!("/tmp/{stage}.log")),
+                description: format!("{stage} stage"),
+            })
+            .collect::<Vec<_>>();
+
+        let report = super::build_release_gate_completeness_report(&records, true);
+
+        assert!(report.requested);
+        assert_eq!(report.status, "complete");
+        assert!(report.missing_or_non_pass_stages.is_empty());
+        assert_eq!(
+            report.observed_pass_stages.len(),
+            super::FULL_RELEASE_GATE_REQUIRED_STAGES.len()
+        );
     }
 }

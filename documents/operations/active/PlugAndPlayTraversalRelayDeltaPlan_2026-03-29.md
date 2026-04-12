@@ -2772,6 +2772,54 @@ What remains blocked:
 ```
 
 ```text
+Date: 2026-04-12
+Phase / Slice: Phase 4 live-lab reruns and evidence refresh status
+Files changed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - Kept the userspace-shared backend test fixture path race-free while rerunning the local typed validation stack.
+  - crates/rustynet-cli/src/bin/live_linux_managed_dns_test.rs
+    - Refreshed managed-DNS restore handling so invalid-bundle cases recapture a fresh signed zone before the next restore.
+  - crates/rustynet-cli/src/bin/live_linux_exit_handoff_test.rs
+    - Refreshed signed trust explicitly before handoff signed-state refresh so the isolated exit-handoff rerun proves the real runtime path instead of aging out trust evidence mid-stage.
+  - scripts/e2e/live_linux_lab_orchestrator.sh
+    - Refreshed signed trust immediately after traversal refresh during baseline enforcement so the setup-only rerun no longer fails on stale trust evidence before baseline validation.
+  - documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md
+    - Updated the current narrow-delta truth now that the stricter five-node local-gates route blocker is cleared and only evidence/provenance blockers remain.
+  - documents/operations/active/MasterWorkPlan_2026-03-22.md
+    - Updated the repo-wide Track E truth with the current local-gates status and the remaining fresh-install/cross-network blockers.
+  - documents/operations/active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md
+    - Marked the active-docs item complete and kept the fresh-install/cross-network items fail-closed.
+Commands run:
+  - `cargo fmt --all -- --check`
+  - `cargo check -p rustynetd`
+  - `cargo check -p rustynet-cli`
+  - `cargo test -p rustynetd phase10 -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_two_hop_test -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_exit_handoff_test -- --nocapture`
+  - `cargo test -p rustynet-cli --bin live_linux_lan_toggle_test -- --nocapture`
+  - `cargo test -p rustynet-backend-wireguard userspace_shared -- --nocapture`
+  - reduced isolation reruns for the first failing live stages:
+    - `live_linux_managed_dns_test`
+    - `live_linux_exit_handoff_test`
+Validation outcomes:
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_two_hop_report.json` records `second_client_route_via_rustynet0 = pass`.
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_lan_toggle_report.json` records a pass on the stricter five-node local-gates path.
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_managed_dns_retry_report.json` records a green managed-DNS isolation rerun after the stale-restore fix.
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_exit_handoff_retry_report.json` records a green exit-handoff isolation rerun with the final route still measured via `rustynet0`.
+Security invariants re-verified:
+  - `second_client_route_via_rustynet0` was not softened or removed; the measured route proof is still the gate.
+  - Backend-authoritative endpoint visibility remains authoritative; debug-only `wg show` output was not substituted in as proof.
+  - Cross-network proof was not faked from the same-underlay UTM topology, and SSH TOFU was not introduced for `debian-lan-11`.
+What this slice completed:
+  - The stricter five-node local-gates route-truth blocker identified by Phase 4 is cleared in live measured artifacts.
+  - The active docs now reflect that current truth explicitly instead of continuing to name `second_client_route_via_rustynet0` as the next code fix.
+What remains blocked:
+  - Fresh-install evidence for current `HEAD` is still blocked by provenance: the Phase 4 run was `SOURCE_MODE="working-tree"` and the recorded git status is dirty, so the generator correctly refuses to mint commit-bound evidence from it.
+  - Canonical cross-network evidence for current `HEAD` is still blocked by environment trust material: the only distinct-underlay inventory target is `debian-lan-11`, and strict preflight correctly fails because `/Users/iwan/.ssh/known_hosts` lacks a pinned host key for that target.
+  - `vm-lab-run-live-lab` reuse behavior on the same report directory still needs a separate follow-up because a later reinvocation restarted setup instead of reusing the already-complete setup state.
+```
+
+```text
 Date: 2026-04-11
 Phase / Slice: Live-lab operator pipeline hardening - setup-only wrapper, readiness typing, artifact validation, and operator docs alignment
 Files changed:

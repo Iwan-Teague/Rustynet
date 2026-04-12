@@ -13,6 +13,7 @@ Start with these, depending on what you are doing:
 - service and runtime operation: [ProductionRunbook.md](./ProductionRunbook.md)
 - live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md), and the script-local function map at [scripts/e2e/README.md](../../scripts/e2e/README.md)
 - release-readiness and support posture: [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md) and [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
+- final release sign-off gate: [ReleaseReadinessGuardrails.md](./ReleaseReadinessGuardrails.md)
 - phase10 exit-node and dataplane behavior: [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
 - security and compliance mapping: [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md), [ComplianceControlMap.md](./ComplianceControlMap.md), and [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 
@@ -41,6 +42,14 @@ Supporting active implementation plan for the remaining production shared-transp
 Supporting active implementation delta for the remaining Linux live-lab blocker:
 - [active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 
+Current phase-local hardening checklist:
+- [active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
+- [active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
+- [active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
+- [active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
+- [active/Phase5ReleaseReadinessChecklist_2026-04-12.md](./active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
+- [active/Phase5ReleaseReadinessSummary_2026-04-12.md](./active/Phase5ReleaseReadinessSummary_2026-04-12.md)
+
 ## High-Value Evergreen References
 
 - [BackendAgilityValidation.md](./BackendAgilityValidation.md)
@@ -62,6 +71,7 @@ Supporting active implementation delta for the remaining Linux live-lab blocker:
 - [PolicyRolloutRunbook.md](./PolicyRolloutRunbook.md)
 - [ProductionRunbook.md](./ProductionRunbook.md)
 - [ProductionSLOAndIncidentReadiness.md](./ProductionSLOAndIncidentReadiness.md)
+- [ReleaseReadinessGuardrails.md](./ReleaseReadinessGuardrails.md)
 - [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 - [SecretRedactionCoverage.md](./SecretRedactionCoverage.md)
 - [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md)

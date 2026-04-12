@@ -477,6 +477,7 @@ fn run() -> Result<(), String> {
         &allow_spec,
         &verifier_local,
         &valid_bundle_local,
+        &passphrase_file,
     )?;
 
     let replay_case = exercise_invalid_bundle_case(
@@ -503,6 +504,7 @@ fn run() -> Result<(), String> {
         &allow_spec,
         &verifier_local,
         &valid_bundle_local,
+        &passphrase_file,
     )?;
 
     let forged_case = exercise_invalid_bundle_case(
@@ -529,6 +531,7 @@ fn run() -> Result<(), String> {
         &allow_spec,
         &verifier_local,
         &valid_bundle_local,
+        &passphrase_file,
     )?;
 
     let tampered_case = exercise_invalid_bundle_case(
@@ -555,6 +558,7 @@ fn run() -> Result<(), String> {
         &allow_spec,
         &verifier_local,
         &valid_bundle_local,
+        &passphrase_file,
     )?;
 
     let policy_invalid_case = exercise_invalid_bundle_case(
@@ -573,28 +577,7 @@ fn run() -> Result<(), String> {
         &["subject node id does not match local node"],
     )?;
 
-    // Re-issue a fresh valid client bundle after the adversarial sequence.
-    // The original valid bundle can age out during long soak runs.
-    issue_dns_bundle(
-        &ctx,
-        &config.signer_host,
-        &passphrase_file,
-        &config.client_node_id,
-        &config.zone_name,
-        &nodes_spec,
-        &allow_spec,
-        DNS_RECORDS_REMOTE,
-        issue_dir,
-        "valid-refresh.dns-zone",
-        None,
-        None,
-    )?;
-    capture_remote_text(
-        &ctx,
-        &config.signer_host,
-        &format!("{issue_dir}/valid-refresh.dns-zone"),
-        &valid_bundle_local,
-    )?;
+    // Restore a fresh valid client bundle after the adversarial sequence.
     restore_valid_bundle_after_invalid_case(
         &ctx,
         &config,
@@ -604,6 +587,7 @@ fn run() -> Result<(), String> {
         &allow_spec,
         &verifier_local,
         &valid_bundle_local,
+        &passphrase_file,
     )?;
     let dns_inspect_restored =
         wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
@@ -1031,6 +1015,40 @@ fn issue_dns_bundle(
         }
     }
     ctx.run_root(signer_host, &args)?;
+    Ok(())
+}
+
+fn issue_and_capture_valid_client_bundle(
+    ctx: &LiveLabContext,
+    config: &Config,
+    passphrase_file: &str,
+    nodes_spec: &str,
+    allow_spec: &str,
+    records_manifest_remote: &str,
+    issue_dir: &str,
+    output_name: &str,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    issue_dns_bundle(
+        ctx,
+        &config.signer_host,
+        passphrase_file,
+        &config.client_node_id,
+        &config.zone_name,
+        nodes_spec,
+        allow_spec,
+        records_manifest_remote,
+        issue_dir,
+        output_name,
+        None,
+        None,
+    )?;
+    capture_remote_text(
+        ctx,
+        &config.signer_host,
+        &format!("{issue_dir}/{output_name}"),
+        bundle_local,
+    )?;
     Ok(())
 }
 
@@ -1744,12 +1762,24 @@ fn restore_valid_bundle_after_invalid_case(
     allow_spec: &str,
     verifier_local: &Path,
     valid_bundle_local: &Path,
+    passphrase_file: &str,
 ) -> Result<(), String> {
     retry_remote_step(
         &format!("restore valid managed DNS bundle on {}", config.client_host),
         SOAK_SSH_RETRY_ATTEMPTS,
         SOAK_SSH_RETRY_SLEEP_SECS,
         || {
+            issue_and_capture_valid_client_bundle(
+                ctx,
+                config,
+                passphrase_file,
+                nodes_spec,
+                allow_spec,
+                DNS_RECORDS_REMOTE,
+                ISSUE_DIR,
+                "valid-restore.dns-zone",
+                valid_bundle_local,
+            )?;
             install_dns_bundle(ctx, &config.client_host, verifier_local, valid_bundle_local)?;
             refresh_traversal_bundles(
                 ctx,

@@ -62,6 +62,12 @@ The active-work folder contains the current implementation and hardening plans.
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
 - [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./operations/active/MagicDnsSignedZoneSchema_2026-03-09.md)
+- [Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./operations/active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
+- [Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./operations/active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
+- [Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./operations/active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
+- [Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./operations/active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
+- [Phase5ReleaseReadinessChecklist_2026-04-12.md](./operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
+- [Phase5ReleaseReadinessSummary_2026-04-12.md](./operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md)
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
@@ -93,6 +99,9 @@ Start there when you need:
 - release-gate expectations
 - platform support policy
 - evidence generation or incident response context
+
+Release-signoff guardrail:
+- [operations/ReleaseReadinessGuardrails.md](./operations/ReleaseReadinessGuardrails.md)
 
 ## Historical Archives
 

@@ -1057,6 +1057,15 @@ fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Re
     )
 }
 
+fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "rustynet ops refresh-signed-trust",
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refresh_handoff_coordination(
     identity: &Path,
@@ -1106,6 +1115,8 @@ fn refresh_handoff_coordination(
         refresh_targets,
     )?;
     for target in refresh_targets {
+        // Keep trust evidence fresh immediately before the strict signed-state refresh.
+        refresh_trust_evidence(identity, known_hosts, target.host.as_str())?;
         refresh_signed_state(identity, known_hosts, target.host.as_str())?;
     }
     Ok(())
@@ -1954,5 +1965,23 @@ peer.1.endpoint=192.168.128.26:51820
             route,
             "exit-1",
         ));
+    }
+
+    #[test]
+    fn exit_handoff_source_contains_explicit_trust_refresh_before_state_refresh() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/live_linux_exit_handoff_test.rs");
+        let source = std::fs::read_to_string(&source_path)
+            .expect("live exit handoff source should be readable");
+        let trust_idx = source
+            .find("refresh_trust_evidence(identity, known_hosts, target.host.as_str())")
+            .expect("source should refresh trust evidence inside handoff coordination");
+        let state_idx = source
+            .find("refresh_signed_state(identity, known_hosts, target.host.as_str())")
+            .expect("source should refresh signed state inside handoff coordination");
+        assert!(
+            trust_idx < state_idx,
+            "trust refresh must happen before signed state refresh in handoff coordination"
+        );
     }
 }

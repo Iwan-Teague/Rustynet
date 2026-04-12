@@ -24,6 +24,16 @@ Companion documents:
 - cross-network prerequisites checklist: `documents/operations/CrossNetworkLiveLabPrerequisitesChecklist.md`
 - cross-network incident response playbook: `documents/operations/CrossNetworkRemoteExitIncidentPlaybook.md`
 
+## Operator Security Preconditions
+
+These expectations are part of the active live-lab contract:
+
+- SSH host trust must be pinned in the operator-supplied `known_hosts` file
+- SSH TOFU / `accept-new` is not allowed in automation
+- automation targets are expected to satisfy `sudo -n`
+- unattended runtime secret custody remains credential-only; plaintext passphrase files are not an acceptable substitute for the release path
+- same-underlay local UTM evidence is useful for reduced helper/debug loops, but it is not cross-network release evidence
+
 ## Quick Discovery
 
 If you are on a local machine with UTM-backed lab VMs, start by discovering the

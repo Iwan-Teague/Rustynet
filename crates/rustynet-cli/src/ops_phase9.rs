@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use nix::unistd::Uid;
-use rand::RngCore;
+use rand::TryRngCore;
 use rand::rngs::OsRng;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -77,6 +77,12 @@ const PHASE6_PARITY_ATTESTATION_COMMAND_LITERAL: &str =
     "rustynet ops generate-platform-parity-report";
 const PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION: u64 = 1;
 const PHASE9_EVIDENCE_ATTESTATION_COMMAND_LITERAL: &str = "rustynet ops generate-phase9-artifacts";
+
+fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
+    OsRng
+        .try_fill_bytes(bytes)
+        .map_err(|err| format!("os randomness unavailable for {label}: {err}"))
+}
 
 const PHASE9_REQUIRED_SOURCES: &[&str] = &[
     "compatibility_policy.json",
@@ -448,7 +454,7 @@ fn write_phase10_provenance_keypair(
     }
 
     let mut signing_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut signing_seed);
+    fill_os_random_bytes(&mut signing_seed, "phase10 provenance signing seed")?;
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let verifier_key = signing_key.verifying_key();
     let mut signing_key_hex = hex_encode(&signing_seed);
@@ -740,7 +746,7 @@ fn write_release_provenance_keypair(
     }
 
     let mut signing_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut signing_seed);
+    fill_os_random_bytes(&mut signing_seed, "release provenance signing seed")?;
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let verifier_key = signing_key.verifying_key();
     let mut signing_key_hex = hex_encode(&signing_seed);

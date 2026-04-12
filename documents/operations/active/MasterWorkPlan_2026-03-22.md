@@ -1596,6 +1596,13 @@ Phase 5 (final):
 2. Regenerate stale measured artifacts on the current commit and fail closed on age/commit mismatch.
 3. Resolve residual warnings in touched crates when they intersect security gate signal quality.
 
+**2026-04-12 status note:**
+- the stricter five-node local-gates blocker on `second_client_route_via_rustynet0` is no longer the first open issue; measured artifacts under `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/` now show `live_two_hop`, `live_lan_toggle`, `live_managed_dns`, and an isolated `live_exit_handoff` rerun all passing for the right reason
+- Track E remains open because the repo still lacks:
+  - commit-bound fresh-install evidence for the current code state
+  - canonical cross-network evidence for a distinct-underlay topology on current `HEAD`
+- the current cross-network blocker is not a same-underlay shortcut or a softened gate; it is missing trusted pinned host-key coverage for `debian-lan-11`, the only inventory entry currently capable of providing the required distinct underlay
+
 ---
 
 ## TRACK A — A3 (HP-4) / A4 (HP-5) / A5 Work Attempt — 2026-03-23

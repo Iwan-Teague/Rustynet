@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use rand::RngCore;
+use rand::TryRngCore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId([u8; 16]);
@@ -13,7 +13,9 @@ pub struct SessionId([u8; 16]);
 impl SessionId {
     pub fn generate() -> Self {
         let mut id = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut id);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut id)
+            .expect("os randomness unavailable for relay session id");
         Self(id)
     }
 

@@ -22,6 +22,13 @@ end.
 This is the recommended operator path: discover, set up, link and test, then
 diagnose if something fails.
 
+Automation security posture for this workflow:
+
+- SSH host trust is pinned from the operator-supplied `known_hosts` file
+- SSH TOFU / `accept-new` is not part of the active wrapper path
+- the active wrapper path expects passwordless sudo (`sudo -n`) on automation targets
+- unattended runtime passphrase custody remains credential-only; plaintext passphrase files are not part of the live-lab release path
+
 ## How The Orchestrator Works
 
 - `run_stage` wraps a stage with logging, summary recording, failure-digest refresh, and optional forensics capture.

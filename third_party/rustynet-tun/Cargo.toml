@@ -1,0 +1,9 @@
+[package]
+name = "rustynet-tun"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Rustynet Team"]
+
+[dependencies]
+libc = "0.2"

@@ -20,5 +20,9 @@ __pycache__/
 /artifacts/**
 !/artifacts/**/.gitkeep
 /profiles/live_lab/*.env
+/profiles/live_lab/generated_vm_lab_*_known_hosts
 !/profiles/live_lab/default_four_node.env
 !/profiles/live_lab/default_five_node.env
+/third_party/boringtun/.cargo-ok
+/third_party/boringtun/.cargo_vcs_info.json
+/third_party/boringtun/Cargo.toml.orig

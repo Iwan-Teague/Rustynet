@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::env_file::{format_env_assignment, parse_env_value};
 use nix::unistd::{Gid, Group, Uid, User, chown};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRngCore, rngs::OsRng};
 use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
@@ -42,6 +42,12 @@ const ASSIGNMENT_REFRESH_SERVICE_DST: &str =
     "/etc/systemd/system/rustynetd-assignment-refresh.service";
 const ASSIGNMENT_REFRESH_TIMER_DST: &str = "/etc/systemd/system/rustynetd-assignment-refresh.timer";
 const MANAGED_DNS_SERVICE_DST: &str = "/etc/systemd/system/rustynetd-managed-dns.service";
+
+fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
+    OsRng
+        .try_fill_bytes(bytes)
+        .map_err(|err| format!("os randomness unavailable for {label}: {err}"))
+}
 
 #[derive(Debug, Clone)]
 struct InstallSources {
@@ -2119,7 +2125,7 @@ fn bytes_to_hex(input: &[u8]) -> String {
 fn create_secure_temp_file(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     let mut random_bytes = [0u8; 8];
     for _ in 0..32 {
-        OsRng.fill_bytes(&mut random_bytes);
+        fill_os_random_bytes(&mut random_bytes, "temporary filename")?;
         let candidate = dir.join(format!("{prefix}{}", bytes_to_hex(&random_bytes)));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);

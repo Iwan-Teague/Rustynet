@@ -1303,6 +1303,7 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        ["-4", "route", "show", "table", "51820"] => Ok(()),
         [
             "-6",
             "route",
@@ -1314,6 +1315,9 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
             "51820",
         ] if is_cidr_token(cidr) && is_interface_name(interface) => Ok(()),
         ["route", "flush", "table", "51820"] => Ok(()),
+        ["rule", "show"] => Ok(()),
+        ["-4", "route", "get", target] if target.parse::<std::net::Ipv4Addr>().is_ok() => Ok(()),
+        ["-6", "route", "flush", "table", "51820"] => Ok(()),
         ["route", "get", target] if is_ipv4_or_ipv6(target) => Ok(()),
         ["-6", "route", "get", target] if target.parse::<std::net::Ipv6Addr>().is_ok() => Ok(()),
         ["rule", "del", "table", "51820"] => Ok(()),
@@ -1621,6 +1625,31 @@ mod tests {
             ],
         )
         .expect("known ip schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_ipv6_route_flush_table_schema() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-6", "route", "flush", "table", "51820"],
+        )
+        .expect("ipv6 route flush schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_phase1_route_truth_probe_schemas() {
+        validate_request(PrivilegedCommandProgram::Ip, &["rule", "show"])
+            .expect("ip rule show schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "route", "show", "table", "51820"],
+        )
+        .expect("ip -4 route show table 51820 schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "route", "get", "1.1.1.1"],
+        )
+        .expect("ip -4 route get schema should be accepted");
     }
 
     #[test]

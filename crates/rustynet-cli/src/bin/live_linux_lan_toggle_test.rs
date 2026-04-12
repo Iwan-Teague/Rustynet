@@ -17,6 +17,20 @@ const LAN_TEST_PROBE_IP: &str = "192.168.1.1";
 const LAN_TEST_CIDR: &str = "192.168.1.0/24";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 
+fn etc_rustynet_install_dir_args() -> [&'static str; 9] {
+    [
+        "install",
+        "-d",
+        "-m",
+        "0750",
+        "-o",
+        "root",
+        "-g",
+        "rustynetd",
+        "/etc/rustynet",
+    ]
+}
+
 fn main() {
     let code = match run() {
         Ok(()) => 0,
@@ -925,24 +939,11 @@ fn install_assignment_bundle(
             eprintln!("{err}");
             1
         })?;
-    ctx.run_root(
-        target,
-        &[
-            "install",
-            "-d",
-            "-m",
-            "0750",
-            "-o",
-            "rustynetd",
-            "-g",
-            "rustynetd",
-            "/etc/rustynet",
-        ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
     ctx.run_root(
         target,
         &[
@@ -1002,24 +1003,11 @@ fn install_assignment_refresh_env(
             eprintln!("{err}");
             1
         })?;
-    ctx.run_root(
-        target,
-        &[
-            "install",
-            "-d",
-            "-m",
-            "0750",
-            "-o",
-            "root",
-            "-g",
-            "root",
-            "/etc/rustynet",
-        ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
     ctx.run_root(
         target,
         &[
@@ -1058,24 +1046,11 @@ fn install_traversal_bundle(
             eprintln!("{err}");
             1
         })?;
-    ctx.run_root(
-        target,
-        &[
-            "install",
-            "-d",
-            "-m",
-            "0750",
-            "-o",
-            "root",
-            "-g",
-            "root",
-            "/etc/rustynet",
-        ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
     ctx.run_root(
         target,
         &[
@@ -1431,6 +1406,24 @@ mod tests {
         assert_eq!(
             super::traversal_refresh_interval_secs(120),
             super::MAX_TRAVERSAL_COORDINATION_TTL_SECS / 2
+        );
+    }
+
+    #[test]
+    fn etc_rustynet_install_dir_uses_rustynetd_group_access() {
+        assert_eq!(
+            super::etc_rustynet_install_dir_args(),
+            [
+                "install",
+                "-d",
+                "-m",
+                "0750",
+                "-o",
+                "root",
+                "-g",
+                "rustynetd",
+                "/etc/rustynet",
+            ]
         );
     }
 }

@@ -18,6 +18,37 @@ This document does **not** replace the public ledger or the broader backend plan
 - execution evidence and current truth remain in [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - broader backend phase history remains in [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 
+## 0.1 2026-04-12 Update
+
+The narrow reduced-live-lab delta captured below is now materially smaller than it was on 2026-04-04:
+
+- the stricter five-node local-gates path now has measured green artifacts for:
+  - `live_role_switch_matrix`
+  - `live_exit_handoff`
+  - `live_two_hop`
+  - `live_lan_toggle`
+  - `live_managed_dns`
+- `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_two_hop_report.json` records `second_client_route_via_rustynet0 = pass`
+- the remaining Phase 4 blockers are no longer local route-truth code defects in this path
+
+What still blocks an honest Phase 4 close:
+
+- commit-bound fresh-install evidence for current `HEAD`
+  - the current Phase 4 run used `SOURCE_MODE="working-tree"`
+  - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/state/git_status.txt` is intentionally non-empty
+  - `generate-linux-fresh-install-os-matrix-report` correctly refuses to turn that dirty working-tree run into commit-bound evidence
+- canonical cross-network evidence for current `HEAD`
+  - the five UTM lab nodes all share `utm-shared-192.168.64.0/24`
+  - the only distinct-underlay inventory row is `debian-lan-11`
+  - strict preflight for that node still fails because `/Users/iwan/.ssh/known_hosts` lacks a pinned host key for both `debian-lan-11` and `192.168.0.11`
+
+Operational consequence:
+
+- this document should no longer be read as “the next code fix is `second_client_route_via_rustynet0`”
+- the next honest work is:
+  - create a clean current commit before regenerating fresh-install evidence
+  - provision trusted pinned host-key coverage and reachability for `debian-lan-11` before attempting canonical cross-network proof
+
 ## 1. Current Audited Truth As Of 2026-04-04
 The following repository state is already true and must not be regressed.
 

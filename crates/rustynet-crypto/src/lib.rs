@@ -711,7 +711,7 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
 }
 
 pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
     rng.fill_bytes(&mut salt);

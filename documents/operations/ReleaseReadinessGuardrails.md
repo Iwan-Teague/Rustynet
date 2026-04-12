@@ -1,0 +1,74 @@
+# Release Readiness Guardrails
+
+## Purpose
+
+Define the one durable sign-off path for Rustynet release readiness.
+
+This guardrail is intentionally stricter than the reduced helper workflow. It is
+the operator and CI entrypoint that keeps the critical Rust, advisory, license,
+and live-lab evidence gates together instead of relying on ad hoc judgment.
+
+## Primary Command
+
+Run:
+
+```bash
+./scripts/ci/release_readiness_gates.sh
+```
+
+That wrapper executes:
+
+1. `./scripts/ci/phase5_gates.sh`
+2. `./scripts/ci/phase10_gates.sh`
+
+The result is fail-closed:
+
+- Rust formatting, clippy, check, and test gates must pass.
+- Phase 5 release-doc/provenance/SBOM gates must pass.
+- Advisory and license policy gates must pass.
+- Fresh-install release-gate evidence must validate.
+- Canonical Phase 10 cross-network evidence must validate.
+- The final readiness docs and bundle manifest must exist.
+
+If any one of those inputs is missing, stale, malformed, or not bound to the
+current commit/evidence state, the release-readiness gate must fail.
+
+## Evidence Boundaries
+
+Reduced helper evidence is useful for narrowing runtime defects, but it is not a
+substitute for full release-gate evidence.
+
+The release-ready claim requires:
+
+- current Phase 5 docs and final bundle
+- current fresh-install OS matrix evidence for the exact commit under test
+- current canonical cross-network evidence for the exact commit under test
+
+Reduced helper or same-underlay local-lab reruns must not be presented as if
+they satisfy the full release-gate path.
+
+## Operator Security Preconditions
+
+The release-readiness and live-lab automation path assumes all of the following:
+
+- SSH host trust is pinned
+  - use a pinned `known_hosts` file
+  - no TOFU / `accept-new` in automation
+- SSH authentication uses operator key material with owner-only permissions
+- passwordless sudo is available on automation targets
+  - `sudo -n` must succeed
+  - password-file based sudo is not part of the active live-lab wrapper path
+- secret custody for unattended runtime remains credential-only
+  - encrypted systemd credentials
+  - no plaintext runtime passphrase files at rest
+
+If any of those expectations are not true, stop before claiming release
+evidence.
+
+## Related Docs
+
+- [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md)
+- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md)
+- [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
+- [Phase5ReleaseReadinessChecklist_2026-04-12.md](./active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
+- [Phase5ReleaseReadinessSummary_2026-04-12.md](./active/Phase5ReleaseReadinessSummary_2026-04-12.md)

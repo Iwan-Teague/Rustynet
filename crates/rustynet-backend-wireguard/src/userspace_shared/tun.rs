@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
 use rustynet_backend_api::{BackendError, ExitMode, Route, RouteKind, RuntimeContext};
-use tun_rs::{DeviceBuilder, SyncDevice};
+use rustynet_tun::SyncDevice;
 
 use crate::linux_command::{LinuxCommandRunner, WireguardCommandRunner, validate_interface_name};
 
@@ -215,22 +215,59 @@ impl TunLifecycle for DirectTunLifecycle {
         interface_name: &str,
         context: &RuntimeContext,
     ) -> Result<TunDevice, BackendError> {
-        let local = ParsedLocalCidr::parse(&context.local_cidr)?;
-        let device = DeviceBuilder::new()
-            .name(interface_name)
-            .ipv4(local.address, local.prefix_len, None::<Ipv4Addr>)
-            .build_sync()
-            .map_err(|err| {
+        ParsedLocalCidr::parse(&context.local_cidr)?;
+        remove_interface_if_present(&mut self.runner, interface_name)?;
+        let result = (|| -> Result<TunDevice, BackendError> {
+            self.runner.run(
+                "ip",
+                &[
+                    "tuntap".to_string(),
+                    "add".to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                    "mode".to_string(),
+                    "tun".to_string(),
+                ],
+            )?;
+            self.runner.run(
+                "ip",
+                &[
+                    "address".to_string(),
+                    "add".to_string(),
+                    context.local_cidr.clone(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            )?;
+            self.runner.run(
+                "ip",
+                &[
+                    "link".to_string(),
+                    "set".to_string(),
+                    "up".to_string(),
+                    "dev".to_string(),
+                    interface_name.to_string(),
+                ],
+            )?;
+
+            let device = SyncDevice::open(interface_name).map_err(|err| {
                 BackendError::internal(format!(
                     "linux userspace-shared TUN create/open failed for {interface_name}: {err}"
                 ))
             })?;
-        device.set_nonblocking(true).map_err(|err| {
-            BackendError::internal(format!(
-                "linux userspace-shared TUN nonblocking setup failed for {interface_name}: {err}"
-            ))
-        })?;
-        Ok(TunDevice::real(device))
+            device.set_nonblocking(true).map_err(|err| {
+                BackendError::internal(format!(
+                    "linux userspace-shared TUN nonblocking setup failed for {interface_name}: {err}"
+                ))
+            })?;
+            Ok(TunDevice::real(device))
+        })();
+
+        if result.is_err() {
+            let _ = remove_interface_if_present(&mut self.runner, interface_name);
+        }
+
+        result
     }
 
     fn reconcile_routes(
@@ -256,7 +293,7 @@ impl TunLifecycle for DirectTunLifecycle {
     }
 
     fn cleanup(&mut self, _interface_name: &str) -> Result<(), BackendError> {
-        Ok(())
+        remove_interface_if_present(&mut self.runner, _interface_name)
     }
 }
 
@@ -288,17 +325,7 @@ impl HelperBackedTunLifecycle {
     }
 
     fn remove_interface_if_present(&mut self, interface_name: &str) -> Result<(), BackendError> {
-        let args = vec![
-            "link".to_string(),
-            "del".to_string(),
-            "dev".to_string(),
-            interface_name.to_string(),
-        ];
-        match self.runner.run("ip", &args) {
-            Ok(()) => Ok(()),
-            Err(err) if is_missing_interface_error(&err) => Ok(()),
-            Err(err) => Err(err),
-        }
+        remove_interface_if_present(self.runner.as_mut(), interface_name)
     }
 }
 
@@ -348,15 +375,11 @@ impl TunLifecycle for HelperBackedTunLifecycle {
                 ],
             )?;
 
-            let device = DeviceBuilder::new()
-                .name(interface_name)
-                .inherit_enable_state()
-                .build_sync()
-                .map_err(|err| {
-                    BackendError::internal(format!(
-                        "linux userspace-shared TUN open failed for {interface_name}: {err}"
-                    ))
-                })?;
+            let device = SyncDevice::open(interface_name).map_err(|err| {
+                BackendError::internal(format!(
+                    "linux userspace-shared TUN open failed for {interface_name}: {err}"
+                ))
+            })?;
             device.set_nonblocking(true).map_err(|err| {
                 BackendError::internal(format!(
                     "linux userspace-shared TUN nonblocking setup failed for {interface_name}: {err}"
@@ -396,6 +419,23 @@ impl TunLifecycle for HelperBackedTunLifecycle {
 
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError> {
         self.remove_interface_if_present(interface_name)
+    }
+}
+
+fn remove_interface_if_present(
+    runner: &mut dyn WireguardCommandRunner,
+    interface_name: &str,
+) -> Result<(), BackendError> {
+    let args = vec![
+        "link".to_string(),
+        "del".to_string(),
+        "dev".to_string(),
+        interface_name.to_string(),
+    ];
+    match runner.run("ip", &args) {
+        Ok(()) => Ok(()),
+        Err(err) if is_missing_interface_error(&err) => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

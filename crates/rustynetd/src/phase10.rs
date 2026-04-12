@@ -419,6 +419,9 @@ pub trait DataplaneSystem {
         Ok(())
     }
     fn assert_killswitch(&mut self) -> Result<(), SystemError>;
+    fn assert_exit_policy(&mut self, _exit_mode: ExitMode) -> Result<(), SystemError> {
+        self.assert_killswitch()
+    }
     fn block_all_egress(&mut self) -> Result<(), SystemError>;
 }
 
@@ -484,6 +487,13 @@ impl DataplaneSystem for DryRunSystem {
         self.step("check_prerequisites")
     }
 
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        _peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        self.step("apply_peer_endpoint_bypass_routes")
+    }
+
     fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
         self.step("apply_routes")
     }
@@ -526,6 +536,14 @@ impl DataplaneSystem for DryRunSystem {
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
         self.step("assert_killswitch")
+    }
+
+    fn assert_exit_policy(&mut self, exit_mode: ExitMode) -> Result<(), SystemError> {
+        match exit_mode {
+            ExitMode::Off => self.step("assert_exit_policy:off")?,
+            ExitMode::FullTunnel => self.step("assert_exit_policy:full_tunnel")?,
+        }
+        self.assert_killswitch()
     }
 
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
@@ -775,6 +793,104 @@ impl LinuxCommandSystem {
         }
         Err(SystemError::RouteApplyFailed(format!(
             "route interface resolution failed for {target_ip}: missing dev in output={}",
+            output.stdout.trim()
+        )))
+    }
+
+    fn assert_rule_lookup_51820(&self, expected: bool) -> Result<(), SystemError> {
+        let output = self.run_capture(PrivilegedCommandProgram::Ip, &["rule", "show"])?;
+        if !output.success() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "ip rule show failed: status={} stderr={}",
+                output.status,
+                output.stderr.trim()
+            )));
+        }
+        let present = output
+            .stdout
+            .lines()
+            .any(|line| line.contains("lookup 51820"));
+        if present == expected {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "unexpected policy-rule state for table 51820: expected_present={} output={}",
+            expected,
+            output.stdout.trim()
+        )))
+    }
+
+    fn assert_default_route_via_tunnel(&self) -> Result<(), SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "route", "show", "table", "51820"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "ip -4 route show table 51820 failed: status={} stderr={}",
+                output.status,
+                output.stderr.trim()
+            )));
+        }
+        let expected = format!("default dev {}", self.interface_name);
+        if output.stdout.contains(expected.as_str()) {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "missing full-tunnel default route in table 51820: expected={} output={}",
+            expected,
+            output.stdout.trim()
+        )))
+    }
+
+    fn assert_probe_route_uses_interface(
+        &self,
+        expected_interface: &str,
+    ) -> Result<(), SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "route", "get", "1.1.1.1"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "ip -4 route get 1.1.1.1 failed: status={} stderr={}",
+                output.status,
+                output.stderr.trim()
+            )));
+        }
+        let expected = format!("dev {expected_interface}");
+        if output.stdout.contains(expected.as_str()) {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "route probe does not use expected interface: expected={} output={}",
+            expected,
+            output.stdout.trim()
+        )))
+    }
+
+    fn assert_probe_route_avoids_interface(
+        &self,
+        forbidden_interface: &str,
+    ) -> Result<(), SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "route", "get", "1.1.1.1"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "ip -4 route get 1.1.1.1 failed: status={} stderr={}",
+                output.status,
+                output.stderr.trim()
+            )));
+        }
+        let forbidden = format!("dev {forbidden_interface}");
+        if !output.stdout.contains(forbidden.as_str()) {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "route probe unexpectedly uses tunnel interface while exit mode is off: forbidden={} output={}",
+            forbidden,
             output.stdout.trim()
         )))
     }
@@ -1133,6 +1249,10 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.run_allow_failure(
             PrivilegedCommandProgram::Ip,
             &["route", "flush", "table", "51820"],
+        );
+        self.run_allow_failure(
+            PrivilegedCommandProgram::Ip,
+            &["-6", "route", "flush", "table", "51820"],
         );
         Ok(())
     }
@@ -1529,6 +1649,22 @@ impl DataplaneSystem for LinuxCommandSystem {
             &["list", "table", "inet", table.as_str()],
         )
         .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))
+    }
+
+    fn assert_exit_policy(&mut self, exit_mode: ExitMode) -> Result<(), SystemError> {
+        self.assert_killswitch()?;
+        match exit_mode {
+            ExitMode::Off => {
+                self.assert_rule_lookup_51820(false)?;
+                self.assert_probe_route_avoids_interface(self.interface_name.as_str())?;
+            }
+            ExitMode::FullTunnel => {
+                self.assert_rule_lookup_51820(true)?;
+                self.assert_default_route_via_tunnel()?;
+                self.assert_probe_route_uses_interface(self.interface_name.as_str())?;
+            }
+        }
+        Ok(())
     }
 
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
@@ -2116,6 +2252,14 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn assert_exit_policy(&mut self, exit_mode: ExitMode) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.assert_exit_policy(exit_mode),
+            RuntimeSystem::Linux(system) => system.assert_exit_policy(exit_mode),
+            RuntimeSystem::Macos(system) => system.assert_exit_policy(exit_mode),
+        }
+    }
+
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.block_all_egress(),
@@ -2165,6 +2309,7 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     lan_route_acl: HashMap<(String, String), bool>,
     managed_peers: BTreeMap<NodeId, ManagedPeer>,
     current_routes: Vec<Route>,
+    current_exit_mode: ExitMode,
     /// How long a Direct candidate must be continuously observed before committing (ms).
     pub direct_stability_window_ms: u64,
     /// How long a Relay candidate must be continuously observed before committing (ms).
@@ -2195,6 +2340,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             lan_route_acl: HashMap::new(),
             managed_peers: BTreeMap::new(),
             current_routes: Vec::new(),
+            current_exit_mode: ExitMode::Off,
             direct_stability_window_ms: 3_000,
             relay_stability_window_ms: 5_000,
             membership: MembershipDirectory::default(),
@@ -2224,6 +2370,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn selected_exit_node(&self) -> Option<NodeId> {
         self.selected_exit_node.clone()
+    }
+
+    pub fn current_exit_mode(&self) -> ExitMode {
+        self.current_exit_mode
     }
 
     pub fn lan_access_enabled(&self) -> bool {
@@ -2323,6 +2473,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             applied_stages.push(StageMarker::PeerApplied);
         }
 
+        self.system.rollback_routes()?;
         self.system.apply_peer_endpoint_bypass_routes(&peers)?;
         applied_stages.push(StageMarker::EndpointBypassApplied);
 
@@ -2357,7 +2508,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.backend.set_exit_mode(options.exit_mode)?;
         applied_stages.push(StageMarker::ExitModeApplied);
 
-        self.system.assert_killswitch()?;
+        self.system.assert_exit_policy(options.exit_mode)?;
+        self.current_exit_mode = options.exit_mode;
 
         Ok(())
     }
@@ -2370,6 +2522,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             match stage {
                 StageMarker::ExitModeApplied => {
                     let _ = self.backend.set_exit_mode(ExitMode::Off);
+                    self.current_exit_mode = ExitMode::Off;
                 }
                 StageMarker::Ipv6Blocked => {
                     self.system.rollback_ipv6_egress()?;
@@ -2410,6 +2563,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn force_fail_closed(&mut self, reason: &str) -> Result<(), Phase10Error> {
         self.system.block_all_egress()?;
+        self.current_exit_mode = ExitMode::Off;
         self.transition_to(DataplaneState::FailClosed, reason);
         Ok(())
     }
@@ -2433,6 +2587,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         self.backend.set_exit_mode(ExitMode::FullTunnel)?;
+        self.system.assert_exit_policy(ExitMode::FullTunnel)?;
+        self.current_exit_mode = ExitMode::FullTunnel;
         self.selected_exit_node = Some(node_id);
         self.transition_to(DataplaneState::ExitActive, "exit_node_selected");
         Ok(())
@@ -2441,6 +2597,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     pub fn clear_exit_node(&mut self) -> Result<(), Phase10Error> {
         self.ensure_started()?;
         self.backend.set_exit_mode(ExitMode::Off)?;
+        self.system.assert_exit_policy(ExitMode::Off)?;
+        self.current_exit_mode = ExitMode::Off;
         self.selected_exit_node = None;
         self.transition_to(DataplaneState::DataplaneApplied, "exit_node_cleared");
         Ok(())
@@ -2566,10 +2724,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(())
     }
 
-    /// Commit a path change for a peer.  This is the **single hardened apply
-    /// path** for peer endpoint updates.  It updates the backend, refreshes
-    /// routes, asserts the kill-switch, clears hysteresis state, and logs the
-    /// transition.
+    /// Commit a path change for a peer. This is the **single hardened apply
+    /// path** for peer endpoint updates. It updates the backend, refreshes
+    /// routes, asserts the measured exit policy, clears hysteresis state, and
+    /// logs the transition.
     fn commit_path_change_for_peer(
         &mut self,
         node_id: &NodeId,
@@ -2964,6 +3122,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.lan_access_enabled = false;
         self.managed_peers.clear();
         self.current_routes.clear();
+        self.current_exit_mode = ExitMode::Off;
         self.transition_to(DataplaneState::Init, "shutdown");
         Ok(())
     }
@@ -2988,7 +3147,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
         self.backend.update_peer_endpoint(node_id, endpoint)?;
         self.refresh_peer_endpoint_routes()?;
-        self.system.assert_killswitch()?;
+        self.system.assert_exit_policy(self.current_exit_mode)?;
         self.managed_peers.insert(node_id.clone(), peer);
         Ok(())
     }
@@ -3936,6 +4095,106 @@ mod tests {
         (commands, stop, handle)
     }
 
+    #[cfg(target_os = "linux")]
+    fn spawn_privileged_scripted_helper(
+        socket_path: &Path,
+        scripted_responses: Vec<(String, PrivilegedCommandOutput)>,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let commands_clone = Arc::clone(&commands);
+        let stop_clone = Arc::clone(&stop);
+        let responses = scripted_responses;
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let reader_stream = match stream.try_clone() {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
+                        let mut reader = BufReader::new(reader_stream);
+                        let mut line = String::new();
+                        let command = match reader.read_line(&mut line) {
+                            Ok(read) if read > 0 => {
+                                let Some(parsed) = parse_helper_request_command(line.trim_end())
+                                else {
+                                    let _ = stream.write_all(
+                                        b"{\"ok\":false,\"error\":\"invalid helper request\"}\n",
+                                    );
+                                    let _ = stream.flush();
+                                    continue;
+                                };
+                                commands_clone
+                                    .lock()
+                                    .expect("test helper command log should lock")
+                                    .push(parsed.clone());
+                                parsed
+                            }
+                            _ => {
+                                let _ = stream.write_all(
+                                    b"{\"ok\":false,\"error\":\"helper request read failed\"}\n",
+                                );
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        };
+
+                        let scripted = responses
+                            .iter()
+                            .find(|(needle, _)| command.contains(needle.as_str()))
+                            .map(|(_, output)| output.clone())
+                            .unwrap_or(PrivilegedCommandOutput {
+                                status: 0,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                            });
+                        let response = serde_json::json!({
+                            "ok": true,
+                            "status": scripted.status,
+                            "stdout": scripted.stdout,
+                            "stderr": scripted.stderr,
+                        });
+                        if stream
+                            .write_all(format!("{response}\n").as_bytes())
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (commands, stop, handle)
+    }
+
     #[test]
     fn transition_to_fail_closed_when_trust_is_invalid() {
         let policy = allow_shared_exit_policy();
@@ -3984,6 +4243,143 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::ExitActive);
         assert_eq!(controller.generation(), 1);
         assert_eq!(controller.last_safe_generation(), 1);
+    }
+
+    #[test]
+    fn full_tunnel_apply_tracks_exit_mode_and_asserts_measured_policy() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("full-tunnel apply should succeed");
+
+        assert_eq!(controller.current_exit_mode(), ExitMode::FullTunnel);
+        assert_eq!(controller.backend.exit_mode, ExitMode::FullTunnel);
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"assert_exit_policy:full_tunnel".to_string()),
+            "phase 10 must assert measured full-tunnel truth before claiming ExitActive"
+        );
+    }
+
+    #[test]
+    fn apply_generation_flushes_routes_before_endpoint_bypass_rebuild() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let rollback_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "rollback_routes")
+            .expect("route flush must happen before route rebuild");
+        let endpoint_bypass_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "apply_peer_endpoint_bypass_routes")
+            .expect("endpoint bypass routes must be re-applied");
+        let apply_routes_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "apply_routes")
+            .expect("managed routes must be re-applied");
+
+        assert!(
+            rollback_index < endpoint_bypass_index && endpoint_bypass_index < apply_routes_index,
+            "route table 51820 must flush before endpoint bypass routes, and endpoint bypass routes must precede managed route re-apply"
+        );
+    }
+
+    #[test]
+    fn set_and_clear_exit_node_track_exit_mode_and_assert_measured_policy() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let exit_node = NodeId::new("exit-1").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        let set_ops_start = controller.system.operations.len();
+        controller
+            .set_exit_node(exit_node.clone(), "user:alice", Protocol::Tcp)
+            .expect("policy should allow selecting exit");
+        let set_ops = &controller.system.operations[set_ops_start..];
+        assert_eq!(controller.current_exit_mode(), ExitMode::FullTunnel);
+        assert_eq!(controller.backend.exit_mode, ExitMode::FullTunnel);
+        assert!(
+            set_ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            "exit selection must assert measured full-tunnel truth"
+        );
+
+        let clear_ops_start = controller.system.operations.len();
+        controller
+            .clear_exit_node()
+            .expect("clearing exit selection should succeed");
+        let clear_ops = &controller.system.operations[clear_ops_start..];
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            clear_ops.contains(&"assert_exit_policy:off".to_string()),
+            "exit clearing must assert measured off-mode truth"
+        );
     }
 
     #[test]
@@ -5086,6 +5482,254 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_routes_flushes_ipv4_and_ipv6_table_51820() {
+        let socket_path = phase10_test_socket_path("r");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::rollback_routes(&mut system).expect("route rollback should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("ip route flush table 51820")),
+            "route rollback must flush IPv4 table 51820 state"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("ip -6 route flush table 51820")),
+            "route rollback must flush IPv6 table 51820 state"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_full_tunnel_checks_rule_table_and_probe() {
+        let socket_path = phase10_test_socket_path("x");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "table inet rustynet_g1".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "0: from all lookup local\n32765: from all lookup 51820\n32766: from all lookup main\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "default dev rustynet0 scope link\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route get 1.1.1.1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "1.1.1.1 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"
+                            .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+
+        DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel)
+            .expect("full-tunnel proof should succeed");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains("ip rule show")),
+            "measured full-tunnel proof must inspect policy routing rules"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("ip -4 route show table 51820")),
+            "measured full-tunnel proof must inspect table 51820 contents"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("ip -4 route get 1.1.1.1")),
+            "measured full-tunnel proof must probe effective route truth"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_off_checks_rule_absence_and_underlay_probe() {
+        let socket_path = phase10_test_socket_path("o");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "table inet rustynet_g1".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout:
+                            "0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n"
+                                .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route get 1.1.1.1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout:
+                            "1.1.1.1 via 192.168.64.1 dev enp0s9 src 192.168.64.8 uid 0\n    cache\n"
+                                .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+
+        DataplaneSystem::assert_exit_policy(&mut system, ExitMode::Off)
+            .expect("off-mode proof should succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_off_rejects_tunnel_probe_route() {
+        let socket_path = phase10_test_socket_path("n");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "table inet rustynet_g1".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout:
+                            "0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n"
+                                .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route get 1.1.1.1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "1.1.1.1 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"
+                            .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+
+        let err = DataplaneSystem::assert_exit_policy(&mut system, ExitMode::Off)
+            .expect_err("off-mode proof must fail when the effective route still uses the tunnel");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            err.to_string()
+                .contains("route probe unexpectedly uses tunnel interface"),
+            "measured off-mode proof must reject tunnel egress"
+        );
+    }
+
     #[test]
     fn peer_endpoint_bypass_route_args_use_ipv4_host_route() {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
@@ -5659,17 +6303,19 @@ mod tests {
 
     // ── A4-b: Path Transition ACL Preservation ─────────────────────────────
     //
-    // These tests verify that the kill-switch is re-asserted on every
-    // direct↔relay path transition.  The invariant: `assert_killswitch` must
-    // appear in `DryRunSystem::operations` after each committed path change —
-    // the ACL rule set must never be in a more-permissive state after a
-    // transition than it was before.
+    // These tests verify that measured exit-policy proof is re-asserted on
+    // every direct↔relay path transition. The invariant:
+    // `assert_exit_policy:*` must appear in `DryRunSystem::operations` after
+    // each committed path change — the ACL rule set must never be in a
+    // more-permissive state after a transition than it was before.
 
     /// Helper: build a Phase10Controller in DataplaneApplied state with one
     /// managed peer (node-b) that has both direct and relay endpoints
     /// configured.  Stability windows are set to 0 so the second consecutive
     /// call to `consider_path_change_for_peer` always commits immediately.
-    fn make_a4b_controller_with_both_endpoints() -> (
+    fn make_a4b_controller_with_both_endpoints_and_options(
+        options: ApplyOptions,
+    ) -> (
         Phase10Controller<RecordingBackend, DryRunSystem>,
         NodeId,
         SocketEndpoint,
@@ -5705,7 +6351,7 @@ mod tests {
                     via_node: NodeId::new("node-b").expect("node"),
                     kind: RouteKind::Mesh,
                 }],
-                ApplyOptions::default(),
+                options,
             )
             .expect("apply should succeed");
         controller
@@ -5715,8 +6361,17 @@ mod tests {
         (controller, peer_id, direct_endpoint, relay_endpoint)
     }
 
+    fn make_a4b_controller_with_both_endpoints() -> (
+        Phase10Controller<RecordingBackend, DryRunSystem>,
+        NodeId,
+        SocketEndpoint,
+        SocketEndpoint,
+    ) {
+        make_a4b_controller_with_both_endpoints_and_options(ApplyOptions::default())
+    }
+
     #[test]
-    fn test_a4b_direct_to_relay_transition_asserts_killswitch() {
+    fn test_a4b_direct_to_relay_transition_asserts_measured_exit_policy() {
         let (mut controller, peer_id, _direct_ep, _relay_ep) =
             make_a4b_controller_with_both_endpoints();
         assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
@@ -5738,11 +6393,11 @@ mod tests {
             "path must be Relay after committed failover"
         );
 
-        // ACL invariant: assert_killswitch must appear after the transition.
+        // ACL invariant: measured off-mode proof must appear after the transition.
         let new_ops = &controller.system.operations[ops_before..];
         assert!(
-            new_ops.contains(&"assert_killswitch".to_string()),
-            "assert_killswitch must be called during direct→relay transition; ops={new_ops:?}"
+            new_ops.contains(&"assert_exit_policy:off".to_string()),
+            "assert_exit_policy:off must be called during direct→relay transition; ops={new_ops:?}"
         );
 
         // DataplaneState must remain applied (never FailClosed) during transition.
@@ -5754,7 +6409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a4b_relay_to_direct_transition_asserts_killswitch() {
+    fn test_a4b_relay_to_direct_transition_asserts_measured_exit_policy() {
         let (mut controller, peer_id, _direct_ep, _relay_ep) =
             make_a4b_controller_with_both_endpoints();
 
@@ -5781,11 +6436,11 @@ mod tests {
             "path must be Direct after committed recovery"
         );
 
-        // ACL invariant: assert_killswitch must be called on relay→direct too.
+        // ACL invariant: measured off-mode proof must be called on relay→direct too.
         let new_ops = &controller.system.operations[ops_before..];
         assert!(
-            new_ops.contains(&"assert_killswitch".to_string()),
-            "assert_killswitch must be called during relay→direct transition; ops={new_ops:?}"
+            new_ops.contains(&"assert_exit_policy:off".to_string()),
+            "assert_exit_policy:off must be called during relay→direct transition; ops={new_ops:?}"
         );
 
         assert_ne!(controller.state(), DataplaneState::FailClosed);
@@ -5814,33 +6469,57 @@ mod tests {
             controller
                 .system
                 .operations
-                .contains(&"assert_killswitch".to_string()),
-            "assert_killswitch must appear after first path transition"
+                .contains(&"assert_exit_policy:off".to_string()),
+            "assert_exit_policy:off must appear after first path transition"
         );
 
         // Relay → Direct.
-        let ks_count_after_first = controller
+        let proof_count_after_first = controller
             .system
             .operations
             .iter()
-            .filter(|op| *op == "assert_killswitch")
+            .filter(|op| *op == "assert_exit_policy:off")
             .count();
         controller.mark_direct_recovered(&peer_id).expect("pending");
         controller
             .mark_direct_recovered(&peer_id)
             .expect("commit direct");
-        let ks_count_after_second = controller
+        let proof_count_after_second = controller
             .system
             .operations
             .iter()
-            .filter(|op| *op == "assert_killswitch")
+            .filter(|op| *op == "assert_exit_policy:off")
             .count();
 
         assert!(
-            ks_count_after_second > ks_count_after_first,
-            "assert_killswitch call count must increase on relay→direct transition"
+            proof_count_after_second > proof_count_after_first,
+            "assert_exit_policy:off call count must increase on relay→direct transition"
         );
         assert_ne!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    #[test]
+    fn managed_peer_reconfigure_asserts_current_full_tunnel_policy() {
+        let (mut controller, peer_id, _direct_ep, _relay_ep) =
+            make_a4b_controller_with_both_endpoints_and_options(ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                ..ApplyOptions::default()
+            });
+
+        let ops_before = controller.system.operations.len();
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("first signal starts pending");
+        controller
+            .mark_direct_failed(&peer_id)
+            .expect("second signal commits relay path");
+
+        let new_ops = &controller.system.operations[ops_before..];
+        assert_eq!(controller.current_exit_mode(), ExitMode::FullTunnel);
+        assert!(
+            new_ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            "managed-peer endpoint reconfiguration must assert the controller's current full-tunnel policy"
+        );
     }
 
     #[test]

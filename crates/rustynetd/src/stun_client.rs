@@ -222,7 +222,7 @@ impl StunClient {
 
     fn generate_tx_id(&self) -> [u8; 12] {
         let mut tx_id = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut tx_id);
+        rand::rng().fill_bytes(&mut tx_id);
         tx_id
     }
 

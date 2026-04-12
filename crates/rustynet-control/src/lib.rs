@@ -22,7 +22,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 #[cfg(unix)]
 use nix::unistd::Uid;
-use rand::RngCore;
+use rand::TryRngCore;
 pub use rustynet_dns_zone::{DnsRecordType, DnsTargetAddrKind, SignedDnsZoneBundle};
 use rustynet_dns_zone::{
     DnsZoneError, DnsZoneRecordInput, build_signed_dns_zone_bundle,
@@ -1119,7 +1119,9 @@ fn load_or_create_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStat
     }
     ensure_secure_parent_directory(path)?;
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut key)
+        .map_err(|_| TrustStateError::KeyUnavailable)?;
     let body = format!("{}\n", hex_bytes(&key));
     atomic_write_secure(path, body.as_bytes(), 0o600)?;
     validate_secure_file(path, "trust state integrity key", 0o077)?;
@@ -1532,7 +1534,9 @@ impl RelaySessionToken {
             .expect("system clock must be after UNIX_EPOCH")
             .as_secs();
         let mut nonce = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce)
+            .expect("os randomness unavailable for relay token nonce");
         let mut token = Self {
             node_id: node_id.to_string(),
             peer_node_id: peer_node_id.to_string(),
@@ -2748,7 +2752,9 @@ fn map_dns_zone_error(err: DnsZoneError) -> ControlPlaneError {
 
 fn random_nonce_hex(length_bytes: usize) -> String {
     let mut nonce = vec![0u8; length_bytes];
-    rand::rngs::OsRng.fill_bytes(nonce.as_mut_slice());
+    rand::rngs::OsRng
+        .try_fill_bytes(nonce.as_mut_slice())
+        .expect("os randomness unavailable for control-plane nonce");
     let encoded = hex_bytes(nonce.as_slice());
     nonce.zeroize();
     encoded

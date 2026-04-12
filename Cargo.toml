@@ -20,5 +20,8 @@ version = "0.1.0"
 license = "MIT"
 authors = ["Rustynet Team"]
 
+[workspace.dependencies]
+rand = "0.9.3"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
