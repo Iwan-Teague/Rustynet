@@ -5,7 +5,10 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
+
 SSH_IDENTITY_FILE=""
+KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-}"
 CLIENT_HOST=""
 EXIT_HOST=""
 PROBE_HOST=""
@@ -26,6 +29,7 @@ CHECK_STALE_TRAVERSAL_REJECTED="fail"
 CHECK_REPLAYED_TRAVERSAL_REJECTED="fail"
 CHECK_ROGUE_ENDPOINT_REJECTED="fail"
 CHECK_CONTROL_SURFACE_EXPOSURE_BLOCKED="fail"
+SSH_TRUST_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
 
@@ -34,6 +38,7 @@ usage() {
 usage: live_linux_cross_network_traversal_adversarial_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --probe-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --known-hosts-file <path>
   --nat-profile <profile>
   --impairment-profile <profile>
   --rogue-endpoint-ip <ipv4>
@@ -90,6 +95,7 @@ cleanup() {
   if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
     rm -rf "$WORK_DIR"
   fi
+  live_lab_cleanup
   exit "$rc"
 }
 
@@ -105,6 +111,7 @@ run_local_test() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --known-hosts-file) KNOWN_HOSTS_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --probe-host) PROBE_HOST="$2"; shift 2 ;;
@@ -130,6 +137,9 @@ if [[ -z "$NAT_PROFILE" || -z "$IMPAIRMENT_PROFILE" ]]; then
 fi
 
 cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$ROGUE_ENDPOINT_IP" >/dev/null
+if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -147,9 +157,17 @@ main() {
   endpoint_log="$ARTIFACT_DIR/cross_network_traversal_adversarial_endpoint_hijack.log"
   control_report="$ARTIFACT_DIR/cross_network_traversal_adversarial_control_surface_report.json"
   control_log="$ARTIFACT_DIR/cross_network_traversal_adversarial_control_surface.log"
-  SOURCE_ARTIFACTS=("$endpoint_report" "$control_report")
+  SSH_TRUST_SUMMARY_PATH="$ARTIFACT_DIR/cross_network_traversal_adversarial_ssh_trust_summary.txt"
+  SOURCE_ARTIFACTS=("$endpoint_report" "$control_report" "$SSH_TRUST_SUMMARY_PATH")
   LOG_ARTIFACTS=("$local_gate_log" "$endpoint_log" "$control_log")
   : > "$local_gate_log"
+
+  FAILURE_SUMMARY="verifying pinned host-key and passwordless-sudo prerequisites"
+  live_lab_init "rustynet-cross-network-traversal-adversarial" "$SSH_IDENTITY_FILE"
+  live_lab_push_sudo_password "$EXIT_HOST"
+  live_lab_push_sudo_password "$CLIENT_HOST"
+  live_lab_push_sudo_password "$PROBE_HOST"
+  live_lab_write_ssh_trust_summary "$SSH_TRUST_SUMMARY_PATH" "$CLIENT_HOST" "$EXIT_HOST" "$PROBE_HOST"
 
   FAILURE_SUMMARY="running signed traversal tamper and replay regression tests"
   if run_local_test "$local_gate_log" 'daemon::tests::traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay' && \

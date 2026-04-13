@@ -49,6 +49,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
         ],
         required_pass_source_artifacts: &[
             "cross_network_direct_remote_exit_server_ip_bypass_report.json",
+            "cross_network_direct_remote_exit_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &["cross_network_direct_remote_exit_server_ip_bypass.log"],
     },
@@ -71,6 +72,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
         ],
         required_pass_source_artifacts: &[
             "cross_network_relay_remote_exit_server_ip_bypass_report.json",
+            "cross_network_relay_remote_exit_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &["cross_network_relay_remote_exit_server_ip_bypass.log"],
     },
@@ -98,6 +100,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "cross_network_failback_roaming_relay_stage_report.json",
             "cross_network_failback_roaming_server_ip_bypass_report.json",
             "cross_network_failback_roaming_slo_summary.json",
+            "cross_network_failback_roaming_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &[
             "cross_network_failback_roaming_relay_stage.log",
@@ -126,6 +129,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
         required_pass_source_artifacts: &[
             "cross_network_traversal_adversarial_endpoint_hijack_report.json",
             "cross_network_traversal_adversarial_control_surface_report.json",
+            "cross_network_traversal_adversarial_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &[
             "cross_network_traversal_adversarial_local_tests.log",
@@ -152,6 +156,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
         required_pass_source_artifacts: &[
             "cross_network_remote_exit_dns_direct_remote_exit_report.json",
             "cross_network_remote_exit_dns_managed_dns_report.json",
+            "cross_network_remote_exit_dns_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &[
             "cross_network_remote_exit_dns_direct_remote_exit.log",
@@ -182,6 +187,7 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
             "cross_network_remote_exit_soak_direct_remote_exit_report.json",
             "cross_network_remote_exit_soak_server_ip_bypass_report.json",
             "cross_network_remote_exit_soak_monitor_summary.json",
+            "cross_network_remote_exit_soak_ssh_trust_summary.txt",
         ],
         required_pass_log_artifacts: &[
             "cross_network_remote_exit_soak_direct_remote_exit.log",
@@ -280,6 +286,22 @@ pub struct WriteCrossNetworkSoakMonitorSummaryConfig {
     pub direct_remote_exit_ready: String,
     pub post_soak_bypass_ready: String,
     pub no_plaintext_passphrase_files: String,
+    pub direct_samples: u64,
+    pub relay_samples: u64,
+    pub fail_closed_samples: u64,
+    pub other_path_samples: u64,
+    pub path_transition_count: u64,
+    pub status_mismatch_samples: u64,
+    pub route_mismatch_samples: u64,
+    pub endpoint_mismatch_samples: u64,
+    pub dns_alarm_bad_samples: u64,
+    pub transport_identity_failures: u64,
+    pub endpoint_change_events_start: u64,
+    pub endpoint_change_events_end: u64,
+    pub endpoint_change_events_delta: u64,
+    pub first_non_direct_reason: String,
+    pub last_path_mode: String,
+    pub last_path_reason: String,
     pub first_failure_reason: String,
     pub long_soak_stable: String,
 }
@@ -354,6 +376,17 @@ fn extract_inline_field(line: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn extract_optional_u64_inline_field(line: &str, key: &str) -> Result<Option<u64>, String> {
+    match extract_inline_field(line, key) {
+        Some(value) if value == "none" => Ok(None),
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|err| format!("status line {key} invalid: {err}")),
+        None => Ok(None),
+    }
+}
+
 fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
     let path_mode = extract_inline_field(status_line, "path_mode")
         .ok_or_else(|| "status line missing path_mode".to_string())?;
@@ -361,6 +394,12 @@ fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
         .ok_or_else(|| "status line missing path_reason".to_string())?;
     let path_programmed_mode = extract_inline_field(status_line, "path_programmed_mode")
         .ok_or_else(|| "status line missing path_programmed_mode".to_string())?;
+    let transport_socket_identity_state =
+        extract_inline_field(status_line, "transport_socket_identity_state")
+            .ok_or_else(|| "status line missing transport_socket_identity_state".to_string())?;
+    let transport_socket_identity_error =
+        extract_inline_field(status_line, "transport_socket_identity_error")
+            .ok_or_else(|| "status line missing transport_socket_identity_error".to_string())?;
     let path_live_proven = match extract_inline_field(status_line, "path_live_proven")
         .ok_or_else(|| "status line missing path_live_proven".to_string())?
         .as_str()
@@ -374,17 +413,23 @@ fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
         }
     };
     let path_latest_live_handshake_unix =
-        match extract_inline_field(status_line, "path_latest_live_handshake_unix") {
-            Some(value) if value == "none" => None,
-            Some(value) => Some(value.parse::<u64>().map_err(|err| {
-                format!("status line path_latest_live_handshake_unix invalid: {err}")
-            })?),
-            None => None,
-        };
+        extract_optional_u64_inline_field(status_line, "path_latest_live_handshake_unix")?;
     let relay_session_state = extract_inline_field(status_line, "relay_session_state");
     let traversal_alarm_state = extract_inline_field(status_line, "traversal_alarm_state");
+    let traversal_alarm_reason = extract_inline_field(status_line, "traversal_alarm_reason");
     let dns_alarm_state = extract_inline_field(status_line, "dns_alarm_state");
+    let dns_alarm_reason = extract_inline_field(status_line, "dns_alarm_reason");
     let traversal_error = extract_inline_field(status_line, "traversal_error");
+    let transport_socket_identity_label =
+        extract_inline_field(status_line, "transport_socket_identity_label");
+    let transport_socket_identity_local_addr =
+        extract_inline_field(status_line, "transport_socket_identity_local_addr");
+    let traversal_probe_result = extract_inline_field(status_line, "traversal_probe_result");
+    let traversal_probe_reason = extract_inline_field(status_line, "traversal_probe_reason");
+    let traversal_endpoint_change_events =
+        extract_optional_u64_inline_field(status_line, "traversal_endpoint_change_events")?;
+    let stun_transport_port_binding =
+        extract_inline_field(status_line, "stun_transport_port_binding");
 
     Ok(json!({
         "path_mode": path_mode,
@@ -394,8 +439,18 @@ fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
         "path_latest_live_handshake_unix": path_latest_live_handshake_unix,
         "relay_session_state": relay_session_state,
         "traversal_alarm_state": traversal_alarm_state,
+        "traversal_alarm_reason": traversal_alarm_reason,
         "dns_alarm_state": dns_alarm_state,
+        "dns_alarm_reason": dns_alarm_reason,
         "traversal_error": traversal_error,
+        "transport_socket_identity_state": transport_socket_identity_state,
+        "transport_socket_identity_error": transport_socket_identity_error,
+        "transport_socket_identity_label": transport_socket_identity_label,
+        "transport_socket_identity_local_addr": transport_socket_identity_local_addr,
+        "traversal_probe_result": traversal_probe_result,
+        "traversal_probe_reason": traversal_probe_reason,
+        "traversal_endpoint_change_events": traversal_endpoint_change_events,
+        "stun_transport_port_binding": stun_transport_port_binding,
     }))
 }
 
@@ -527,6 +582,417 @@ fn value_as_non_empty_string(value: Option<&Value>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn resolve_artifact_by_basename(
+    report_path: &Path,
+    entries: &[Value],
+    basename: &str,
+) -> Result<Option<PathBuf>, String> {
+    let mut matches = entries
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|raw_path| resolve_artifact_path(report_path, raw_path))
+        .filter(|artifact_path| {
+            artifact_path.file_name().and_then(|value| value.to_str()) == Some(basename)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(format!(
+            "{}: source_artifacts contains duplicate basename {:?}",
+            report_path.display(),
+            basename
+        ));
+    }
+    Ok(matches.pop())
+}
+
+fn parse_key_value_artifact(path: &Path) -> Result<HashMap<String, String>, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("{}: read key/value artifact failed: {err}", path.display()))?;
+    let mut out = HashMap::new();
+    for (line_index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = trimmed.split_once('=') else {
+            return Err(format!(
+                "{}: malformed key/value line {}",
+                path.display(),
+                line_index + 1
+            ));
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            return Err(format!(
+                "{}: empty key on line {}",
+                path.display(),
+                line_index + 1
+            ));
+        }
+        if out
+            .insert(key.to_string(), raw_value.trim().to_string())
+            .is_some()
+        {
+            return Err(format!("{}: duplicate key {:?}", path.display(), key));
+        }
+    }
+    Ok(out)
+}
+
+fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let summary = match parse_key_value_artifact(path) {
+        Ok(summary) => summary,
+        Err(err) => return vec![err],
+    };
+
+    let expect_non_empty = |key: &str, problems: &mut Vec<String>| -> Option<String> {
+        let value = summary.get(key).cloned().unwrap_or_default();
+        if value.trim().is_empty() {
+            problems.push(format!(
+                "{}: {key} must be a non-empty string",
+                path.display()
+            ));
+            None
+        } else {
+            Some(value)
+        }
+    };
+
+    if summary.get("schema_version").map(String::as_str) != Some("1") {
+        problems.push(format!("{}: schema_version must equal 1", path.display()));
+    }
+    if expect_non_empty("pinned_known_hosts_file", &mut problems).is_none() {
+        // recorded in problems
+    }
+    let pinned_known_hosts_sha256 = expect_non_empty("pinned_known_hosts_sha256", &mut problems);
+    if pinned_known_hosts_sha256.as_deref().is_some_and(|value| {
+        value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        problems.push(format!(
+            "{}: pinned_known_hosts_sha256 must be a 64-character lowercase hex digest",
+            path.display()
+        ));
+    }
+    if summary.get("all_targets_pinned").map(String::as_str) != Some("true") {
+        problems.push(format!(
+            "{}: all_targets_pinned must equal true",
+            path.display()
+        ));
+    }
+    if summary
+        .get("all_targets_passwordless_sudo")
+        .map(String::as_str)
+        != Some("true")
+    {
+        problems.push(format!(
+            "{}: all_targets_passwordless_sudo must equal true",
+            path.display()
+        ));
+    }
+
+    let target_count = summary
+        .get("target_count")
+        .and_then(|value| value.parse::<usize>().ok());
+    let Some(target_count) = target_count else {
+        problems.push(format!(
+            "{}: target_count must be a positive integer",
+            path.display()
+        ));
+        return problems;
+    };
+    if target_count == 0 {
+        problems.push(format!(
+            "{}: target_count must be a positive integer",
+            path.display()
+        ));
+    }
+
+    for index in 0..target_count {
+        let target_key = format!("target[{index}].target");
+        let checked_candidates_key = format!("target[{index}].checked_candidates");
+        let matched_candidate_key = format!("target[{index}].matched_candidate");
+        let host_key_status_key = format!("target[{index}].host_key_status");
+        let passwordless_sudo_status_key = format!("target[{index}].passwordless_sudo_status");
+        let configured_transport_key = format!("target[{index}].configured_transport");
+
+        let checked_candidates = expect_non_empty(checked_candidates_key.as_str(), &mut problems);
+        let matched_candidate = expect_non_empty(matched_candidate_key.as_str(), &mut problems);
+        let _target = expect_non_empty(target_key.as_str(), &mut problems);
+        let configured_transport =
+            expect_non_empty(configured_transport_key.as_str(), &mut problems);
+        if configured_transport
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "ssh" | "utm"))
+        {
+            problems.push(format!(
+                "{}: {configured_transport_key} must equal ssh or utm",
+                path.display()
+            ));
+        }
+        if summary
+            .get(host_key_status_key.as_str())
+            .map(String::as_str)
+            != Some(CHECK_PASS)
+        {
+            problems.push(format!(
+                "{}: {host_key_status_key} must equal pass",
+                path.display()
+            ));
+        }
+        if summary
+            .get(passwordless_sudo_status_key.as_str())
+            .map(String::as_str)
+            != Some(CHECK_PASS)
+        {
+            problems.push(format!(
+                "{}: {passwordless_sudo_status_key} must equal pass",
+                path.display()
+            ));
+        }
+        if let (Some(checked_candidates), Some(matched_candidate)) =
+            (checked_candidates.as_deref(), matched_candidate.as_deref())
+        {
+            let matched = checked_candidates
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == matched_candidate);
+            if !matched {
+                problems.push(format!(
+                    "{}: {matched_candidate_key} must appear in {checked_candidates_key}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    problems
+}
+
+fn parse_json_object_file(path: &Path, label: &str) -> Result<Map<String, Value>, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("{}: read {label} failed: {err}", path.display()))?;
+    let payload: Value = serde_json::from_str(&body)
+        .map_err(|err| format!("{}: invalid {label} JSON ({err})", path.display()))?;
+    payload
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("{}: {label} must be a JSON object", path.display()))
+}
+
+fn validate_soak_monitor_summary_artifact(path: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let payload = match parse_json_object_file(path, "soak monitor summary") {
+        Ok(payload) => payload,
+        Err(err) => return vec![err],
+    };
+
+    let read_u64 = |field: &str, problems: &mut Vec<String>| -> Option<u64> {
+        let value = payload.get(field).and_then(Value::as_u64);
+        if value.is_none() {
+            problems.push(format!(
+                "{}: {field} must be a non-negative integer",
+                path.display()
+            ));
+        }
+        value
+    };
+    let read_status = |field: &str, problems: &mut Vec<String>| -> Option<String> {
+        let value = value_as_non_empty_string(payload.get(field));
+        if value.is_none() {
+            problems.push(format!(
+                "{}: {field} must be a non-empty string",
+                path.display()
+            ));
+        }
+        value
+    };
+
+    let samples = read_u64("samples", &mut problems);
+    let failing_samples = read_u64("failing_samples", &mut problems);
+    let max_consecutive_failures_observed =
+        read_u64("max_consecutive_failures_observed", &mut problems);
+    let elapsed_secs = read_u64("elapsed_secs", &mut problems);
+    let required_soak_duration_secs = read_u64("required_soak_duration_secs", &mut problems);
+    let allowed_failing_samples = read_u64("allowed_failing_samples", &mut problems);
+    let allowed_max_consecutive_failures =
+        read_u64("allowed_max_consecutive_failures", &mut problems);
+    let direct_samples = read_u64("direct_samples", &mut problems);
+    let relay_samples = read_u64("relay_samples", &mut problems);
+    let fail_closed_samples = read_u64("fail_closed_samples", &mut problems);
+    let other_path_samples = read_u64("other_path_samples", &mut problems);
+    let path_transition_count = read_u64("path_transition_count", &mut problems);
+    let status_mismatch_samples = read_u64("status_mismatch_samples", &mut problems);
+    let route_mismatch_samples = read_u64("route_mismatch_samples", &mut problems);
+    let endpoint_mismatch_samples = read_u64("endpoint_mismatch_samples", &mut problems);
+    let dns_alarm_bad_samples = read_u64("dns_alarm_bad_samples", &mut problems);
+    let transport_identity_failures = read_u64("transport_identity_failures", &mut problems);
+    let endpoint_change_events_start = read_u64("endpoint_change_events_start", &mut problems);
+    let endpoint_change_events_end = read_u64("endpoint_change_events_end", &mut problems);
+    let endpoint_change_events_delta = read_u64("endpoint_change_events_delta", &mut problems);
+
+    let direct_remote_exit_ready = read_status("direct_remote_exit_ready", &mut problems);
+    let post_soak_bypass_ready = read_status("post_soak_bypass_ready", &mut problems);
+    let no_plaintext_passphrase_files = read_status("no_plaintext_passphrase_files", &mut problems);
+    let first_non_direct_reason = read_status("first_non_direct_reason", &mut problems);
+    let first_failure_reason = read_status("first_failure_reason", &mut problems);
+    let last_path_mode = read_status("last_path_mode", &mut problems);
+    let last_path_reason = read_status("last_path_reason", &mut problems);
+    let long_soak_stable = read_status("long_soak_stable", &mut problems);
+
+    if let (
+        Some(samples),
+        Some(direct_samples),
+        Some(relay_samples),
+        Some(fail_closed_samples),
+        Some(other_path_samples),
+    ) = (
+        samples,
+        direct_samples,
+        relay_samples,
+        fail_closed_samples,
+        other_path_samples,
+    ) && direct_samples + relay_samples + fail_closed_samples + other_path_samples != samples
+    {
+        problems.push(format!(
+            "{}: direct/relay/fail_closed/other sample counts must sum to samples",
+            path.display()
+        ));
+    }
+    if let (Some(start), Some(end), Some(delta)) = (
+        endpoint_change_events_start,
+        endpoint_change_events_end,
+        endpoint_change_events_delta,
+    ) {
+        if end < start {
+            problems.push(format!(
+                "{}: endpoint_change_events_end must be >= endpoint_change_events_start",
+                path.display()
+            ));
+        }
+        if end.saturating_sub(start) != delta {
+            problems.push(format!(
+                "{}: endpoint_change_events_delta must equal end-start",
+                path.display()
+            ));
+        }
+    }
+
+    if elapsed_secs
+        .zip(required_soak_duration_secs)
+        .is_some_and(|(elapsed, required)| elapsed < required)
+    {
+        problems.push(format!(
+            "{}: elapsed_secs must be >= required_soak_duration_secs",
+            path.display()
+        ));
+    }
+    if failing_samples
+        .zip(allowed_failing_samples)
+        .is_some_and(|(failing, allowed)| failing > allowed)
+    {
+        problems.push(format!(
+            "{}: failing_samples must be <= allowed_failing_samples",
+            path.display()
+        ));
+    }
+    if max_consecutive_failures_observed
+        .zip(allowed_max_consecutive_failures)
+        .is_some_and(|(observed, allowed)| observed > allowed)
+    {
+        problems.push(format!(
+            "{}: max_consecutive_failures_observed must be <= allowed_max_consecutive_failures",
+            path.display()
+        ));
+    }
+
+    if direct_remote_exit_ready.as_deref() != Some(CHECK_PASS) {
+        problems.push(format!(
+            "{}: direct_remote_exit_ready must equal pass",
+            path.display()
+        ));
+    }
+    if post_soak_bypass_ready.as_deref() != Some(CHECK_PASS) {
+        problems.push(format!(
+            "{}: post_soak_bypass_ready must equal pass",
+            path.display()
+        ));
+    }
+    if no_plaintext_passphrase_files.as_deref() != Some(CHECK_PASS) {
+        problems.push(format!(
+            "{}: no_plaintext_passphrase_files must equal pass",
+            path.display()
+        ));
+    }
+    if long_soak_stable.as_deref() != Some(CHECK_PASS) {
+        problems.push(format!(
+            "{}: long_soak_stable must equal pass",
+            path.display()
+        ));
+    }
+    if direct_samples != samples {
+        problems.push(format!(
+            "{}: direct_samples must equal samples for authoritative direct-path soak evidence",
+            path.display()
+        ));
+    }
+    for (field, value) in [
+        ("relay_samples", relay_samples),
+        ("fail_closed_samples", fail_closed_samples),
+        ("other_path_samples", other_path_samples),
+        ("path_transition_count", path_transition_count),
+        ("status_mismatch_samples", status_mismatch_samples),
+        ("route_mismatch_samples", route_mismatch_samples),
+        ("endpoint_mismatch_samples", endpoint_mismatch_samples),
+        ("dns_alarm_bad_samples", dns_alarm_bad_samples),
+        ("transport_identity_failures", transport_identity_failures),
+        ("failing_samples", failing_samples),
+        (
+            "max_consecutive_failures_observed",
+            max_consecutive_failures_observed,
+        ),
+    ] {
+        if value.is_some_and(|entry| entry != 0) {
+            problems.push(format!(
+                "{}: {field} must equal 0 for authoritative direct-path soak evidence",
+                path.display()
+            ));
+        }
+    }
+    if first_non_direct_reason.as_deref() != Some("none") {
+        problems.push(format!(
+            "{}: first_non_direct_reason must equal none for authoritative direct-path soak evidence",
+            path.display()
+        ));
+    }
+    if first_failure_reason.as_deref() != Some("none") {
+        problems.push(format!(
+            "{}: first_failure_reason must equal none for authoritative direct-path soak evidence",
+            path.display()
+        ));
+    }
+    if last_path_mode.as_deref() != Some("direct_active") {
+        problems.push(format!(
+            "{}: last_path_mode must equal direct_active",
+            path.display()
+        ));
+    }
+    if last_path_reason
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty() || value == "none")
+    {
+        problems.push(format!(
+            "{}: last_path_reason must be a non-empty direct-path reason",
+            path.display()
+        ));
+    }
+
+    problems
 }
 
 fn validate_report_payload(
@@ -803,8 +1269,19 @@ fn validate_report_payload(
             value_as_non_empty_string(path_evidence.get("relay_session_state"));
         let traversal_alarm_state =
             value_as_non_empty_string(path_evidence.get("traversal_alarm_state"));
+        let traversal_alarm_reason =
+            value_as_non_empty_string(path_evidence.get("traversal_alarm_reason"));
         let dns_alarm_state = value_as_non_empty_string(path_evidence.get("dns_alarm_state"));
+        let dns_alarm_reason = value_as_non_empty_string(path_evidence.get("dns_alarm_reason"));
         let traversal_error = value_as_non_empty_string(path_evidence.get("traversal_error"));
+        let transport_socket_identity_state =
+            value_as_non_empty_string(path_evidence.get("transport_socket_identity_state"));
+        let transport_socket_identity_error =
+            value_as_non_empty_string(path_evidence.get("transport_socket_identity_error"));
+        let transport_socket_identity_label =
+            value_as_non_empty_string(path_evidence.get("transport_socket_identity_label"));
+        let transport_socket_identity_local_addr =
+            value_as_non_empty_string(path_evidence.get("transport_socket_identity_local_addr"));
 
         if requires_live_path_evidence {
             if path_mode.is_none() {
@@ -824,6 +1301,38 @@ fn validate_report_payload(
             if path_latest_live_handshake_unix.is_none() {
                 problems.push(
                     "path_evidence.path_latest_live_handshake_unix must be a positive integer"
+                        .to_string(),
+                );
+            }
+            if transport_socket_identity_state.as_deref()
+                != Some("authoritative_backend_shared_transport")
+            {
+                problems.push(
+                    "path_evidence.transport_socket_identity_state must equal authoritative_backend_shared_transport for pass reports"
+                        .to_string(),
+                );
+            }
+            if transport_socket_identity_error.as_deref() != Some("none") {
+                problems.push(
+                    "path_evidence.transport_socket_identity_error must equal none for pass reports"
+                        .to_string(),
+                );
+            }
+            if transport_socket_identity_label
+                .as_deref()
+                .is_none_or(|value| value == "none")
+            {
+                problems.push(
+                    "path_evidence.transport_socket_identity_label must be a non-empty backend identity label"
+                        .to_string(),
+                );
+            }
+            if transport_socket_identity_local_addr
+                .as_deref()
+                .is_none_or(|value| value == "none")
+            {
+                problems.push(
+                    "path_evidence.transport_socket_identity_local_addr must be a non-empty backend local address"
                         .to_string(),
                 );
             }
@@ -851,6 +1360,23 @@ fn validate_report_payload(
             {
                 problems.push(
                     "path_evidence.traversal_error must equal none for pass reports".to_string(),
+                );
+            }
+            if traversal_alarm_reason
+                .as_deref()
+                .is_some_and(|value| value != "none")
+            {
+                problems.push(
+                    "path_evidence.traversal_alarm_reason must equal none for pass reports"
+                        .to_string(),
+                );
+            }
+            if dns_alarm_reason
+                .as_deref()
+                .is_some_and(|value| value != "none")
+            {
+                problems.push(
+                    "path_evidence.dns_alarm_reason must equal none for pass reports".to_string(),
                 );
             }
         }
@@ -908,6 +1434,33 @@ fn validate_report_payload(
                     problems.push(format!(
                         "source_artifacts must include measured evidence file {basename:?}"
                     ));
+                }
+            }
+            for basename in spec
+                .required_pass_source_artifacts
+                .iter()
+                .copied()
+                .filter(|basename| basename.ends_with("_ssh_trust_summary.txt"))
+            {
+                match resolve_artifact_by_basename(report_path, entries, basename) {
+                    Ok(Some(path)) => {
+                        problems.extend(validate_ssh_trust_summary_artifact(path.as_path()))
+                    }
+                    Ok(None) => {}
+                    Err(err) => problems.push(err),
+                }
+            }
+            if spec.suite == "cross_network_remote_exit_soak" {
+                match resolve_artifact_by_basename(
+                    report_path,
+                    entries,
+                    "cross_network_remote_exit_soak_monitor_summary.json",
+                ) {
+                    Ok(Some(path)) => {
+                        problems.extend(validate_soak_monitor_summary_artifact(path.as_path()))
+                    }
+                    Ok(None) => {}
+                    Err(err) => problems.push(err),
                 }
             }
         }
@@ -1843,6 +2396,22 @@ pub fn execute_ops_write_cross_network_soak_monitor_summary(
         "direct_remote_exit_ready": config.direct_remote_exit_ready,
         "post_soak_bypass_ready": config.post_soak_bypass_ready,
         "no_plaintext_passphrase_files": config.no_plaintext_passphrase_files,
+        "direct_samples": config.direct_samples,
+        "relay_samples": config.relay_samples,
+        "fail_closed_samples": config.fail_closed_samples,
+        "other_path_samples": config.other_path_samples,
+        "path_transition_count": config.path_transition_count,
+        "status_mismatch_samples": config.status_mismatch_samples,
+        "route_mismatch_samples": config.route_mismatch_samples,
+        "endpoint_mismatch_samples": config.endpoint_mismatch_samples,
+        "dns_alarm_bad_samples": config.dns_alarm_bad_samples,
+        "transport_identity_failures": config.transport_identity_failures,
+        "endpoint_change_events_start": config.endpoint_change_events_start,
+        "endpoint_change_events_end": config.endpoint_change_events_end,
+        "endpoint_change_events_delta": config.endpoint_change_events_delta,
+        "first_non_direct_reason": config.first_non_direct_reason,
+        "last_path_mode": config.last_path_mode,
+        "last_path_reason": config.last_path_reason,
         "first_failure_reason": config.first_failure_reason,
         "long_soak_stable": config.long_soak_stable,
     });
@@ -1909,17 +2478,7 @@ mod tests {
         let mut log_artifacts = vec![log_path.display().to_string()];
         for basename in spec.required_pass_source_artifacts {
             let artifact_path = artifact_dir.join(basename);
-            let artifact_body = if basename.ends_with(".json") {
-                "{\n  \"status\": \"pass\"\n}\n".to_string()
-            } else {
-                format!("measured {basename}\n")
-            };
-            fs::write(&artifact_path, artifact_body).map_err(|err| {
-                format!(
-                    "write source artifact failed ({}): {err}",
-                    artifact_path.display()
-                )
-            })?;
+            write_test_source_artifact(spec, artifact_path.as_path(), basename)?;
             source_artifacts.push(artifact_path.display().to_string());
         }
         for basename in spec.required_pass_log_artifacts {
@@ -2013,8 +2572,18 @@ mod tests {
                     "path_latest_live_handshake_unix": unix_now(),
                     "relay_session_state": relay_session_state,
                     "traversal_alarm_state": "ok",
+                    "traversal_alarm_reason": "none",
                     "dns_alarm_state": "ok",
+                    "dns_alarm_reason": "none",
                     "traversal_error": "none",
+                    "transport_socket_identity_state": "authoritative_backend_shared_transport",
+                    "transport_socket_identity_error": "none",
+                    "transport_socket_identity_label": "udp4:51820",
+                    "transport_socket_identity_local_addr": "192.0.2.10:51820",
+                    "traversal_probe_result": "pass",
+                    "traversal_probe_reason": "fresh_handshake_observed",
+                    "traversal_endpoint_change_events": 0,
+                    "stun_transport_port_binding": "192.0.2.10:51820",
                 }),
             );
         }
@@ -2025,6 +2594,80 @@ mod tests {
             );
         }
         Ok(payload)
+    }
+
+    fn write_test_source_artifact(
+        spec: &CrossNetworkReportSpec,
+        artifact_path: &Path,
+        basename: &str,
+    ) -> Result<(), String> {
+        let artifact_body = if basename.ends_with("_ssh_trust_summary.txt") {
+            let target_count = spec.required_participants.len();
+            let mut lines = vec![
+                "schema_version=1".to_string(),
+                format!("generated_at_unix={}", unix_now()),
+                "pinned_known_hosts_file=/tmp/rustynet-known_hosts".to_string(),
+                format!("pinned_known_hosts_sha256={}", "b".repeat(64)),
+                format!("target_count={target_count}"),
+            ];
+            for index in 0..target_count {
+                lines.push(format!("target[{index}].target=host-{index}"));
+                lines.push(format!("target[{index}].configured_transport=utm"));
+                lines.push(format!(
+                    "target[{index}].checked_candidates=host-{index},192.0.2.{}",
+                    index + 10
+                ));
+                lines.push(format!("target[{index}].matched_candidate=host-{index}"));
+                lines.push(format!("target[{index}].host_key_status=pass"));
+                lines.push(format!("target[{index}].passwordless_sudo_status=pass"));
+            }
+            lines.push("all_targets_pinned=true".to_string());
+            lines.push("all_targets_passwordless_sudo=true".to_string());
+            format!("{}\n", lines.join("\n"))
+        } else if basename == "cross_network_remote_exit_soak_monitor_summary.json" {
+            serde_json::to_string_pretty(&json!({
+                "samples": 24,
+                "failing_samples": 0,
+                "max_consecutive_failures_observed": 0,
+                "elapsed_secs": 120,
+                "required_soak_duration_secs": 120,
+                "allowed_failing_samples": 2,
+                "allowed_max_consecutive_failures": 1,
+                "direct_remote_exit_ready": "pass",
+                "post_soak_bypass_ready": "pass",
+                "no_plaintext_passphrase_files": "pass",
+                "direct_samples": 24,
+                "relay_samples": 0,
+                "fail_closed_samples": 0,
+                "other_path_samples": 0,
+                "path_transition_count": 0,
+                "status_mismatch_samples": 0,
+                "route_mismatch_samples": 0,
+                "endpoint_mismatch_samples": 0,
+                "dns_alarm_bad_samples": 0,
+                "transport_identity_failures": 0,
+                "endpoint_change_events_start": 1,
+                "endpoint_change_events_end": 1,
+                "endpoint_change_events_delta": 0,
+                "first_non_direct_reason": "none",
+                "last_path_mode": "direct_active",
+                "last_path_reason": "fresh_handshake_observed",
+                "first_failure_reason": "none",
+                "long_soak_stable": "pass",
+            }))
+            .map(|rendered| format!("{rendered}\n"))
+            .map_err(|err| format!("serialize soak monitor summary failed: {err}"))?
+        } else if basename.ends_with(".json") {
+            "{\n  \"status\": \"pass\"\n}\n".to_string()
+        } else {
+            format!("measured {basename}\n")
+        };
+        fs::write(artifact_path, artifact_body).map_err(|err| {
+            format!(
+                "write source artifact failed ({}): {err}",
+                artifact_path.display()
+            )
+        })
     }
 
     fn write_valid_report(artifact_dir: &Path, suite: &str) -> Result<PathBuf, String> {
@@ -2268,6 +2911,92 @@ mod tests {
                 "source_artifacts must include measured evidence file \"cross_network_failback_roaming_relay_stage_report.json\""
             )),
             "expected missing failback child artifact error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_pass_status_without_authoritative_transport_identity() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_direct_remote_exit").expect("direct spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        payload["path_evidence"]["transport_socket_identity_state"] =
+            Value::String("blocked_backend_opaque_socket".to_string());
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.iter().any(|entry| entry.contains(
+                "path_evidence.transport_socket_identity_state must equal authoritative_backend_shared_transport"
+            )),
+            "expected authoritative shared transport rejection, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_pass_status_with_failed_ssh_trust_summary() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_direct_remote_exit").expect("direct spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        let trust_summary_path = temp_dir
+            .path()
+            .join("cross_network_direct_remote_exit_ssh_trust_summary.txt");
+        let summary = fs::read_to_string(&trust_summary_path).expect("read trust summary");
+        let summary = summary.replace("all_targets_pinned=true", "all_targets_pinned=false");
+        fs::write(&trust_summary_path, summary).expect("rewrite trust summary");
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors
+                .iter()
+                .any(|entry| entry.contains("all_targets_pinned must equal true")),
+            "expected failed SSH trust summary rejection, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_report_payload_rejects_soak_pass_with_non_direct_samples() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_remote_exit_soak").expect("soak spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        let soak_summary_path = temp_dir
+            .path()
+            .join("cross_network_remote_exit_soak_monitor_summary.json");
+        let mut soak_summary =
+            parse_json_object_file(soak_summary_path.as_path(), "soak monitor summary")
+                .expect("parse soak summary");
+        soak_summary.insert("direct_samples".to_string(), Value::from(23u64));
+        soak_summary.insert("relay_samples".to_string(), Value::from(1u64));
+        soak_summary.insert(
+            "first_non_direct_reason".to_string(),
+            Value::String("relay_selected_no_direct_candidate".to_string()),
+        );
+        fs::write(
+            &soak_summary_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&Value::Object(soak_summary))
+                    .expect("serialize soak summary")
+            ),
+        )
+        .expect("rewrite soak summary");
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.iter().any(|entry| entry.contains(
+                "relay_samples must equal 0 for authoritative direct-path soak evidence"
+            )),
+            "expected soak relay-sample rejection, got: {errors:?}"
         );
     }
 

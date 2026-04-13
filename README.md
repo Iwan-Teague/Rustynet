@@ -115,6 +115,8 @@ Live-lab automation security expectations:
 - SSH TOFU (`accept-new`) is not part of the active wrapper path
 - automation targets are expected to satisfy `sudo -n`
 - unattended runtime secret custody remains credential-only; plaintext passphrase files are not an acceptable substitute
+- canonical cross-network pass reports now require per-suite SSH trust summaries plus daemon path evidence showing `transport_socket_identity_state=authoritative_backend_shared_transport`
+- canonical cross-network soak evidence now fails closed unless the direct path stays direct for the full soak with zero fallback/drift samples
 
 If you want the CLI to make the discovery-versus-restart decision for you and
 then run the standard workflow in one shot, use:

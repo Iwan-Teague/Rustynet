@@ -21,6 +21,7 @@ Start with these when you need current status, remaining work, or the public imp
 - [Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
 - [Phase5ReleaseReadinessChecklist_2026-04-12.md](./Phase5ReleaseReadinessChecklist_2026-04-12.md)
 - [Phase5ReleaseReadinessSummary_2026-04-12.md](./Phase5ReleaseReadinessSummary_2026-04-12.md)
+- [Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)

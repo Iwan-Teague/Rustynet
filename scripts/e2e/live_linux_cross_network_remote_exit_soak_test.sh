@@ -11,6 +11,7 @@ LIVE_LAB_LOG_PREFIX="cross-network-remote-exit-soak"
 export LIVE_LAB_LOG_PREFIX
 
 SSH_IDENTITY_FILE=""
+KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-}"
 CLIENT_HOST=""
 EXIT_HOST=""
 CLIENT_NODE_ID="client-1"
@@ -44,6 +45,7 @@ BYPASS_REPORT_PATH=""
 BYPASS_LOG_PATH=""
 MONITOR_LOG_PATH=""
 MONITOR_SUMMARY_PATH=""
+SSH_TRUST_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
 PATH_STATUS_LINE=""
@@ -56,6 +58,7 @@ usage() {
 usage: live_linux_cross_network_remote_exit_soak_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --known-hosts-file <path>
   --client-node-id <id>                Default: client-1
   --exit-node-id <id>                  Default: exit-1
   --nat-profile <profile>              Default: baseline_lan
@@ -143,6 +146,7 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --known-hosts-file) KNOWN_HOSTS_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-node-id) CLIENT_NODE_ID="$2"; shift 2 ;;
@@ -200,6 +204,9 @@ if (( SOAK_SAMPLE_INTERVAL_SECS > SOAK_DURATION_SECS )); then
   echo "sample interval must be <= soak duration" >&2
   exit 2
 fi
+if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -213,8 +220,16 @@ main() {
   local sample_ts start_ts end_ts elapsed_secs deadline
   local samples=0 failing_samples=0 consecutive_failures=0 max_consecutive_observed=0
   local first_failure_reason=""
+  local direct_samples=0 relay_samples=0 fail_closed_samples=0 other_path_samples=0
+  local path_transition_count=0 status_mismatch_samples=0 route_mismatch_samples=0
+  local endpoint_mismatch_samples=0 dns_alarm_bad_samples=0 transport_identity_failures=0
+  local endpoint_change_events_start=0 endpoint_change_events_end=0 endpoint_change_events_delta=0
+  local first_non_direct_reason="none" last_path_mode="none" last_path_reason="none"
+  local previous_path_mode=""
   local client_plaintext_start exit_plaintext_start client_plaintext_end exit_plaintext_end
   local status_ok route_ok endpoint_ok
+  local path_mode path_reason transport_identity_state transport_identity_error
+  local dns_alarm_state dns_alarm_reason endpoint_change_events_raw endpoint_change_events
   local pre_leak_check="fail" pre_bypass_check="fail"
   local post_leak_check="fail" post_bypass_check="fail"
 
@@ -228,7 +243,8 @@ main() {
   BYPASS_LOG_PATH="$artifact_dir/cross_network_remote_exit_soak_server_ip_bypass.log"
   MONITOR_LOG_PATH="$artifact_dir/cross_network_remote_exit_soak_monitor.log"
   MONITOR_SUMMARY_PATH="$artifact_dir/cross_network_remote_exit_soak_monitor_summary.json"
-  SOURCE_ARTIFACTS=("$DIRECT_REPORT_PATH" "$BYPASS_REPORT_PATH" "$MONITOR_SUMMARY_PATH")
+  SSH_TRUST_SUMMARY_PATH="$artifact_dir/cross_network_remote_exit_soak_ssh_trust_summary.txt"
+  SOURCE_ARTIFACTS=("$DIRECT_REPORT_PATH" "$BYPASS_REPORT_PATH" "$MONITOR_SUMMARY_PATH" "$SSH_TRUST_SUMMARY_PATH")
   LOG_ARTIFACTS=("$DIRECT_LOG_PATH" "$BYPASS_LOG_PATH" "$MONITOR_LOG_PATH")
 
   FAILURE_SUMMARY="bootstrapping secure direct remote-exit baseline for soak validation"
@@ -314,6 +330,7 @@ main() {
   live_lab_init "rustynet-cross-network-remote-exit-soak" "$SSH_IDENTITY_FILE"
   live_lab_push_sudo_password "$EXIT_HOST"
   live_lab_push_sudo_password "$CLIENT_HOST"
+  live_lab_write_ssh_trust_summary "$SSH_TRUST_SUMMARY_PATH" "$CLIENT_HOST" "$EXIT_HOST"
   live_lab_wait_for_daemon_socket "$EXIT_HOST"
   live_lab_wait_for_daemon_socket "$CLIENT_HOST"
 
@@ -349,24 +366,94 @@ main() {
       endpoint_ok=0
     fi
 
+    path_mode="$(live_lab_extract_inline_field "$client_status" "path_mode" || true)"
+    path_reason="$(live_lab_extract_inline_field "$client_status" "path_reason" || true)"
+    transport_identity_state="$(live_lab_extract_inline_field "$client_status" "transport_socket_identity_state" || true)"
+    transport_identity_error="$(live_lab_extract_inline_field "$client_status" "transport_socket_identity_error" || true)"
+    dns_alarm_state="$(live_lab_extract_inline_field "$client_status" "dns_alarm_state" || true)"
+    dns_alarm_reason="$(live_lab_extract_inline_field "$client_status" "dns_alarm_reason" || true)"
+    endpoint_change_events_raw="$(live_lab_extract_inline_field "$client_status" "traversal_endpoint_change_events" || true)"
+    if [[ "$endpoint_change_events_raw" =~ ^[0-9]+$ ]]; then
+      endpoint_change_events="$endpoint_change_events_raw"
+    else
+      endpoint_change_events=0
+    fi
+    if (( samples == 1 )); then
+      endpoint_change_events_start="$endpoint_change_events"
+    fi
+    endpoint_change_events_end="$endpoint_change_events"
+    last_path_mode="${path_mode:-unknown}"
+    last_path_reason="${path_reason:-unknown}"
+    if [[ -n "$previous_path_mode" && "$last_path_mode" != "$previous_path_mode" ]]; then
+      path_transition_count=$((path_transition_count + 1))
+    fi
+    previous_path_mode="$last_path_mode"
+
+    case "$last_path_mode" in
+      direct_active)
+        direct_samples=$((direct_samples + 1))
+        ;;
+      relay_active)
+        relay_samples=$((relay_samples + 1))
+        if [[ "$first_non_direct_reason" == "none" ]]; then
+          first_non_direct_reason="${last_path_reason:-unknown}"
+        fi
+        ;;
+      *)
+        if grep -Fq 'state=FailClosed' <<<"$client_status" || [[ "$last_path_mode" == *"fail_closed"* ]] || [[ "$last_path_mode" == *"blocked"* ]]; then
+          fail_closed_samples=$((fail_closed_samples + 1))
+        else
+          other_path_samples=$((other_path_samples + 1))
+        fi
+        if [[ "$last_path_mode" != "direct_active" && "$first_non_direct_reason" == "none" ]]; then
+          first_non_direct_reason="${last_path_reason:-unknown}"
+        fi
+        ;;
+    esac
+
+    if [[ "$last_path_mode" != "direct_active" ]]; then
+      sample_result="fail"
+      sample_reason+="path_not_direct;"
+    fi
+
     if (( status_ok == 0 )) || ! grep -Fq "exit_node=${EXIT_NODE_ID}" <<<"$client_status" || ! grep -Fq 'state=ExitActive' <<<"$client_status"; then
       sample_result="fail"
       sample_reason+="status_not_exit_active;"
+      status_mismatch_samples=$((status_mismatch_samples + 1))
     fi
     if (( route_ok == 0 )) || ! grep -Fq 'dev rustynet0' <<<"$client_route"; then
       sample_result="fail"
       sample_reason+="route_not_tunnelled;"
+      route_mismatch_samples=$((route_mismatch_samples + 1))
     fi
     if (( endpoint_ok == 0 )) || ! grep -Fq "${EXIT_ADDR}:51820" <<<"$client_endpoints"; then
       sample_result="fail"
       sample_reason+="exit_endpoint_not_visible;"
+      endpoint_mismatch_samples=$((endpoint_mismatch_samples + 1))
+    fi
+    if [[ "$dns_alarm_state" == "critical" || "$dns_alarm_state" == "error" || "$dns_alarm_state" == "missing" || "${dns_alarm_reason:-none}" != "none" ]]; then
+      sample_result="fail"
+      sample_reason+="dns_alarm_bad;"
+      dns_alarm_bad_samples=$((dns_alarm_bad_samples + 1))
+    fi
+    if [[ "$transport_identity_state" != "authoritative_backend_shared_transport" || "${transport_identity_error:-none}" != "none" ]]; then
+      sample_result="fail"
+      sample_reason+="transport_identity_not_authoritative;"
+      transport_identity_failures=$((transport_identity_failures + 1))
     fi
 
-    printf '%s|sample=%s|result=%s|reason=%s|status=%s|route=%s|endpoints=%s\n' \
+    printf '%s|sample=%s|result=%s|reason=%s|path_mode=%s|path_reason=%s|transport_identity_state=%s|transport_identity_error=%s|dns_alarm_state=%s|dns_alarm_reason=%s|endpoint_change_events=%s|status=%s|route=%s|endpoints=%s\n' \
       "$sample_ts" \
       "$samples" \
       "$sample_result" \
       "${sample_reason:-none}" \
+      "${last_path_mode:-unknown}" \
+      "${last_path_reason:-unknown}" \
+      "${transport_identity_state:-missing}" \
+      "${transport_identity_error:-missing}" \
+      "${dns_alarm_state:-missing}" \
+      "${dns_alarm_reason:-missing}" \
+      "$endpoint_change_events" \
       "$(printf '%s' "$client_status" | tr -s ' ' | tr '\n' ';')" \
       "$(printf '%s' "$client_route" | tr -s ' ' | tr '\n' ';')" \
       "$(printf '%s' "$client_endpoints" | tr -s ' ' | tr '\n' ';')" >> "$MONITOR_LOG_PATH"
@@ -393,6 +480,11 @@ main() {
 
   end_ts="$(date +%s)"
   elapsed_secs=$((end_ts - start_ts))
+  if (( endpoint_change_events_end >= endpoint_change_events_start )); then
+    endpoint_change_events_delta=$((endpoint_change_events_end - endpoint_change_events_start))
+  else
+    endpoint_change_events_delta=0
+  fi
 
   client_plaintext_end="$(live_lab_no_plaintext_passphrase_check "$CLIENT_HOST" || true)"
   exit_plaintext_end="$(live_lab_no_plaintext_passphrase_check "$EXIT_HOST" || true)"
@@ -458,7 +550,7 @@ main() {
   live_lab_log "Final client status after soak"
   printf '%s\n' "$final_client_status"
 
-  if (( samples > 0 && elapsed_secs >= SOAK_DURATION_SECS && failing_samples <= SOAK_MAX_FAILING_SAMPLES && max_consecutive_observed <= SOAK_MAX_CONSECUTIVE_FAILURES && bypass_rc == 0 )) && [[ "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' ]]; then
+  if (( samples > 0 && elapsed_secs >= SOAK_DURATION_SECS && failing_samples <= SOAK_MAX_FAILING_SAMPLES && max_consecutive_observed <= SOAK_MAX_CONSECUTIVE_FAILURES && bypass_rc == 0 && direct_samples == samples && relay_samples == 0 && fail_closed_samples == 0 && other_path_samples == 0 && path_transition_count == 0 && status_mismatch_samples == 0 && route_mismatch_samples == 0 && endpoint_mismatch_samples == 0 && dns_alarm_bad_samples == 0 && transport_identity_failures == 0 )) && [[ "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" == 'pass' ]]; then
     CHECK_LONG_SOAK_STABLE="pass"
   fi
 
@@ -474,6 +566,22 @@ main() {
     --direct-remote-exit-ready "$CHECK_DIRECT_REMOTE_EXIT_READY" \
     --post-soak-bypass-ready "$CHECK_POST_SOAK_BYPASS_READY" \
     --no-plaintext-passphrase-files "$CHECK_NO_PLAINTEXT_PASSPHRASE_FILES" \
+    --direct-samples "$direct_samples" \
+    --relay-samples "$relay_samples" \
+    --fail-closed-samples "$fail_closed_samples" \
+    --other-path-samples "$other_path_samples" \
+    --path-transition-count "$path_transition_count" \
+    --status-mismatch-samples "$status_mismatch_samples" \
+    --route-mismatch-samples "$route_mismatch_samples" \
+    --endpoint-mismatch-samples "$endpoint_mismatch_samples" \
+    --dns-alarm-bad-samples "$dns_alarm_bad_samples" \
+    --transport-identity-failures "$transport_identity_failures" \
+    --endpoint-change-events-start "$endpoint_change_events_start" \
+    --endpoint-change-events-end "$endpoint_change_events_end" \
+    --endpoint-change-events-delta "$endpoint_change_events_delta" \
+    --first-non-direct-reason "${first_non_direct_reason:-none}" \
+    --last-path-mode "${last_path_mode:-none}" \
+    --last-path-reason "${last_path_reason:-none}" \
     --first-failure-reason "${first_failure_reason:-none}" \
     --long-soak-stable "$CHECK_LONG_SOAK_STABLE" >/dev/null
 
@@ -494,7 +602,7 @@ main() {
     return 1
   fi
   if [[ "$CHECK_LONG_SOAK_STABLE" != 'pass' ]]; then
-    FAILURE_SUMMARY="cross-network remote-exit soak stability checks failed (samples=${samples}, failing=${failing_samples}, consecutive=${max_consecutive_observed}, elapsed=${elapsed_secs}s, first_failure=${first_failure_reason:-none})"
+    FAILURE_SUMMARY="cross-network remote-exit soak stability checks failed (samples=${samples}, failing=${failing_samples}, consecutive=${max_consecutive_observed}, direct=${direct_samples}, relay=${relay_samples}, fail_closed=${fail_closed_samples}, other=${other_path_samples}, transitions=${path_transition_count}, status_mismatch=${status_mismatch_samples}, route_mismatch=${route_mismatch_samples}, endpoint_mismatch=${endpoint_mismatch_samples}, dns_alarm_bad=${dns_alarm_bad_samples}, transport_identity_failures=${transport_identity_failures}, elapsed=${elapsed_secs}s, first_failure=${first_failure_reason:-none}, first_non_direct=${first_non_direct_reason:-none})"
     return 1
   fi
   if [[ "$CHECK_REMOTE_EXIT_NO_UNDERLAY_LEAK" != 'pass' ]]; then

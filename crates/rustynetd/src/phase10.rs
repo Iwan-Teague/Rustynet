@@ -566,12 +566,28 @@ pub struct LinuxCommandSystem {
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    dns_protected: bool,
+    expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
+    expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxDataplaneMode {
     Shell,
     HybridNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RouteTableFamily {
+    V4,
+    V6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExpectedBypassRoute {
+    destination: String,
+    interface_name: String,
+    family: RouteTableFamily,
 }
 
 impl LinuxCommandSystem {
@@ -610,6 +626,9 @@ impl LinuxCommandSystem {
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
+            dns_protected: false,
+            expected_management_bypass_routes: BTreeSet::new(),
+            expected_peer_endpoint_bypass_routes: BTreeSet::new(),
         })
     }
 
@@ -740,7 +759,8 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    fn apply_fail_closed_management_bypass_routes(&self) -> Result<(), SystemError> {
+    fn apply_fail_closed_management_bypass_routes(&mut self) -> Result<(), SystemError> {
+        self.expected_management_bypass_routes.clear();
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
@@ -756,6 +776,11 @@ impl LinuxCommandSystem {
                     "management ssh bypass route failed for {cidr}: {err}"
                 ))
             })?;
+            self.expected_management_bypass_routes
+                .insert(Self::expected_bypass_route(
+                    cidr.to_string(),
+                    self.egress_interface.clone(),
+                ));
         }
         Ok(())
     }
@@ -797,6 +822,311 @@ impl LinuxCommandSystem {
         )))
     }
 
+    fn route_table_output(&self, family: RouteTableFamily) -> Result<String, SystemError> {
+        let args = match family {
+            RouteTableFamily::V4 => ["-4", "route", "show", "table", "51820"],
+            RouteTableFamily::V6 => ["-6", "route", "show", "table", "51820"],
+        };
+        let output = self.run_capture(PrivilegedCommandProgram::Ip, &args)?;
+        if output.success() {
+            return Ok(output.stdout);
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "{} failed: status={} stderr={}",
+            args.join(" "),
+            output.status,
+            output.stderr.trim()
+        )))
+    }
+
+    fn nft_table_output(
+        &self,
+        family: &str,
+        table: &str,
+        context: &str,
+    ) -> Result<String, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "table", family, table],
+        )?;
+        if output.success() {
+            return Ok(output.stdout);
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "{context} failed: status={} stderr={}",
+            output.status,
+            output.stderr.trim()
+        )))
+    }
+
+    fn normalize_ruleset_line(line: &str) -> String {
+        line.replace('"', "")
+    }
+
+    fn nft_chain_lines(ruleset: &str, chain_name: &str) -> Option<Vec<String>> {
+        let mut in_chain = false;
+        let mut depth = 0usize;
+        let mut lines = Vec::new();
+
+        for raw_line in ruleset.lines() {
+            let normalized = Self::normalize_ruleset_line(raw_line);
+            let trimmed = normalized.trim();
+            if !in_chain {
+                if trimmed.starts_with(&format!("chain {chain_name}")) {
+                    in_chain = true;
+                    depth = depth
+                        .saturating_add(trimmed.matches('{').count())
+                        .saturating_sub(trimmed.matches('}').count());
+                }
+                continue;
+            }
+
+            depth = depth
+                .saturating_add(trimmed.matches('{').count())
+                .saturating_sub(trimmed.matches('}').count());
+            if trimmed != "}" {
+                lines.push(trimmed.to_string());
+            }
+            if depth == 0 {
+                return Some(lines);
+            }
+        }
+
+        None
+    }
+
+    fn chain_contains_all_tokens(lines: &[String], tokens: &[&str]) -> bool {
+        lines
+            .iter()
+            .any(|line| tokens.iter().all(|token| line.contains(token)))
+    }
+
+    fn assert_chain_contains(
+        &self,
+        chain_lines: &[String],
+        tokens: &[&str],
+        message: &str,
+    ) -> Result<(), SystemError> {
+        if Self::chain_contains_all_tokens(chain_lines, tokens) {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "{message}: missing tokens={} chain_lines={}",
+            tokens.join(" "),
+            chain_lines.join(" | ")
+        )))
+    }
+
+    fn expected_bypass_route(addr_or_cidr: String, interface_name: String) -> ExpectedBypassRoute {
+        let family = if addr_or_cidr.contains(':') {
+            RouteTableFamily::V6
+        } else {
+            RouteTableFamily::V4
+        };
+        ExpectedBypassRoute {
+            destination: addr_or_cidr,
+            interface_name,
+            family,
+        }
+    }
+
+    fn assert_expected_bypass_routes(&self) -> Result<(), SystemError> {
+        let mut table_v4: Option<String> = None;
+        let mut table_v6: Option<String> = None;
+        for route in self
+            .expected_management_bypass_routes
+            .iter()
+            .chain(self.expected_peer_endpoint_bypass_routes.iter())
+        {
+            let table_output = match route.family {
+                RouteTableFamily::V4 => {
+                    if table_v4.is_none() {
+                        table_v4 = Some(self.route_table_output(RouteTableFamily::V4)?);
+                    }
+                    table_v4.as_deref().ok_or_else(|| {
+                        SystemError::KillSwitchAssertionFailed(
+                            "missing cached ipv4 route table output".to_string(),
+                        )
+                    })?
+                }
+                RouteTableFamily::V6 => {
+                    if table_v6.is_none() {
+                        table_v6 = Some(self.route_table_output(RouteTableFamily::V6)?);
+                    }
+                    table_v6.as_deref().ok_or_else(|| {
+                        SystemError::KillSwitchAssertionFailed(
+                            "missing cached ipv6 route table output".to_string(),
+                        )
+                    })?
+                }
+            };
+            let expected = format!("{} dev {}", route.destination, route.interface_name);
+            if table_output.contains(expected.as_str()) {
+                continue;
+            }
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "missing owned bypass route in table 51820: expected={} output={}",
+                expected,
+                table_output.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn assert_default_route_absent_from_tunnel(
+        &self,
+        route_table_output: &str,
+    ) -> Result<(), SystemError> {
+        let forbidden = format!("default dev {}", self.interface_name);
+        if !route_table_output.contains(forbidden.as_str()) {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "unexpected full-tunnel default route remains in table 51820 while exit mode is off: forbidden={} output={}",
+            forbidden,
+            route_table_output.trim()
+        )))
+    }
+
+    fn assert_nat_forwarding(&self) -> Result<(), SystemError> {
+        let Some(table) = self.nat_table.as_deref() else {
+            return Ok(());
+        };
+        let ruleset = self.nft_table_output("ip", table, "nft list nat table")?;
+        let postrouting = Self::nft_chain_lines(&ruleset, "postrouting").ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_string())
+        })?;
+        self.assert_chain_contains(
+            &postrouting,
+            &["oifname", self.egress_interface.as_str(), "masquerade"],
+            "egress masquerade rule missing",
+        )?;
+        if self.allow_tunnel_relay_forward {
+            self.assert_chain_contains(
+                &postrouting,
+                &[
+                    "iifname",
+                    self.interface_name.as_str(),
+                    "oifname",
+                    self.interface_name.as_str(),
+                    "masquerade",
+                ],
+                "relay-with-upstream masquerade rule missing",
+            )?;
+        }
+        let forwarding_enabled =
+            Self::read_sysctl_bool("/proc/sys/net/ipv4/ip_forward", "net.ipv4.ip_forward")?;
+        if forwarding_enabled {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(
+            "ipv4 forwarding is disabled while nat forwarding is active".to_string(),
+        ))
+    }
+
+    fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
+        let table = self.firewall_table.clone().ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("killswitch table missing".to_string())
+        })?;
+        let ruleset = self.nft_table_output("inet", table.as_str(), "nft list killswitch table")?;
+        let killswitch = Self::nft_chain_lines(&ruleset, "killswitch").ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("killswitch chain missing".to_string())
+        })?;
+        let forward = Self::nft_chain_lines(&ruleset, "forward").ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed("forward chain missing".to_string())
+        })?;
+        self.assert_chain_contains(
+            &killswitch,
+            &["oifname", "lo", "accept"],
+            "loopback killswitch allow rule missing",
+        )?;
+        self.assert_chain_contains(
+            &killswitch,
+            &["ct state established,related", "accept"],
+            "established/related killswitch allow rule missing",
+        )?;
+        self.assert_chain_contains(
+            &killswitch,
+            &["oifname", self.interface_name.as_str(), "accept"],
+            "tunnel-interface killswitch allow rule missing",
+        )?;
+        self.assert_chain_contains(
+            &forward,
+            &["ct state established,related", "accept"],
+            "forward established/related allow rule missing",
+        )?;
+        self.assert_chain_contains(
+            &forward,
+            &[
+                "iifname",
+                self.interface_name.as_str(),
+                "oifname",
+                self.egress_interface.as_str(),
+                "accept",
+            ],
+            "forwarding allow rule to underlay egress missing",
+        )?;
+        if self.allow_tunnel_relay_forward {
+            self.assert_chain_contains(
+                &forward,
+                &[
+                    "iifname",
+                    self.interface_name.as_str(),
+                    "oifname",
+                    self.interface_name.as_str(),
+                    "accept",
+                ],
+                "relay-with-upstream forwarding allow rule missing",
+            )?;
+        }
+        if self.nat_table.is_some() {
+            self.assert_chain_contains(
+                &killswitch,
+                &["oifname", self.egress_interface.as_str(), "accept"],
+                "egress-interface killswitch allow rule missing while nat forwarding is active",
+            )?;
+        }
+        if self.dns_protected {
+            self.assert_chain_contains(
+                &killswitch,
+                &[
+                    "udp",
+                    "dport",
+                    "53",
+                    "oifname",
+                    "!=",
+                    self.interface_name.as_str(),
+                    "drop",
+                ],
+                "dns udp fail-closed rule missing",
+            )?;
+            self.assert_chain_contains(
+                &killswitch,
+                &[
+                    "tcp",
+                    "dport",
+                    "53",
+                    "oifname",
+                    "!=",
+                    self.interface_name.as_str(),
+                    "drop",
+                ],
+                "dns tcp fail-closed rule missing",
+            )?;
+            self.assert_chain_contains(
+                &killswitch,
+                &["udp", "dport", "53", "accept"],
+                "dns udp allow rule missing",
+            )?;
+            self.assert_chain_contains(
+                &killswitch,
+                &["tcp", "dport", "53", "accept"],
+                "dns tcp allow rule missing",
+            )?;
+        }
+        Ok(())
+    }
+
     fn assert_rule_lookup_51820(&self, expected: bool) -> Result<(), SystemError> {
         let output = self.run_capture(PrivilegedCommandProgram::Ip, &["rule", "show"])?;
         if !output.success() {
@@ -820,26 +1150,15 @@ impl LinuxCommandSystem {
         )))
     }
 
-    fn assert_default_route_via_tunnel(&self) -> Result<(), SystemError> {
-        let output = self.run_capture(
-            PrivilegedCommandProgram::Ip,
-            &["-4", "route", "show", "table", "51820"],
-        )?;
-        if !output.success() {
-            return Err(SystemError::KillSwitchAssertionFailed(format!(
-                "ip -4 route show table 51820 failed: status={} stderr={}",
-                output.status,
-                output.stderr.trim()
-            )));
-        }
+    fn assert_default_route_via_tunnel(&self, route_table_output: &str) -> Result<(), SystemError> {
         let expected = format!("default dev {}", self.interface_name);
-        if output.stdout.contains(expected.as_str()) {
+        if route_table_output.contains(expected.as_str()) {
             return Ok(());
         }
         Err(SystemError::KillSwitchAssertionFailed(format!(
             "missing full-tunnel default route in table 51820: expected={} output={}",
             expected,
-            output.stdout.trim()
+            route_table_output.trim()
         )))
     }
 
@@ -1206,6 +1525,7 @@ impl DataplaneSystem for LinuxCommandSystem {
         peers: &[PeerConfig],
     ) -> Result<(), SystemError> {
         let mut endpoints = BTreeSet::new();
+        self.expected_peer_endpoint_bypass_routes.clear();
         for peer in peers {
             endpoints.insert(peer.endpoint.addr);
         }
@@ -1219,6 +1539,14 @@ impl DataplaneSystem for LinuxCommandSystem {
                         "peer endpoint bypass route failed for {endpoint}: {err}"
                     ))
                 })?;
+            self.expected_peer_endpoint_bypass_routes
+                .insert(Self::expected_bypass_route(
+                    match endpoint {
+                        IpAddr::V4(value) => format!("{value}/32"),
+                        IpAddr::V6(value) => format!("{value}/128"),
+                    },
+                    route_interface,
+                ));
         }
         Ok(())
     }
@@ -1254,6 +1582,8 @@ impl DataplaneSystem for LinuxCommandSystem {
             PrivilegedCommandProgram::Ip,
             &["-6", "route", "flush", "table", "51820"],
         );
+        self.expected_management_bypass_routes.clear();
+        self.expected_peer_endpoint_bypass_routes.clear();
         Ok(())
     }
 
@@ -1616,10 +1946,13 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "accept",
             ],
         )
-        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))
+        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        self.dns_protected = true;
+        Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        self.dns_protected = false;
         Ok(())
     }
 
@@ -1641,26 +1974,23 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
-        let table = self.firewall_table.clone().ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("killswitch table missing".to_string())
-        })?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &["list", "table", "inet", table.as_str()],
-        )
-        .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))
+        self.assert_firewall_ruleset()
     }
 
     fn assert_exit_policy(&mut self, exit_mode: ExitMode) -> Result<(), SystemError> {
         self.assert_killswitch()?;
+        self.assert_nat_forwarding()?;
+        self.assert_expected_bypass_routes()?;
+        let route_table_v4 = self.route_table_output(RouteTableFamily::V4)?;
         match exit_mode {
             ExitMode::Off => {
                 self.assert_rule_lookup_51820(false)?;
+                self.assert_default_route_absent_from_tunnel(route_table_v4.as_str())?;
                 self.assert_probe_route_avoids_interface(self.interface_name.as_str())?;
             }
             ExitMode::FullTunnel => {
                 self.assert_rule_lookup_51820(true)?;
-                self.assert_default_route_via_tunnel()?;
+                self.assert_default_route_via_tunnel(route_table_v4.as_str())?;
                 self.assert_probe_route_uses_interface(self.interface_name.as_str())?;
             }
         }
@@ -2780,7 +3110,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     pub fn apply_revocation(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
         self.backend.remove_peer(node_id)?;
         self.managed_peers.remove(node_id);
-        self.refresh_peer_endpoint_routes()?;
+        self.refresh_peer_endpoint_routes_and_attest()?;
         log::info!(
             "peer {} revoked and removed from dataplane",
             node_id.as_str()
@@ -3146,13 +3476,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Ok(());
         }
         self.backend.update_peer_endpoint(node_id, endpoint)?;
-        self.refresh_peer_endpoint_routes()?;
-        self.system.assert_exit_policy(self.current_exit_mode)?;
+        self.refresh_peer_endpoint_routes_and_attest()?;
         self.managed_peers.insert(node_id.clone(), peer);
         Ok(())
     }
 
-    fn refresh_peer_endpoint_routes(&mut self) -> Result<(), Phase10Error> {
+    fn refresh_peer_endpoint_routes_and_attest(&mut self) -> Result<(), Phase10Error> {
         self.system.rollback_routes()?;
         let peers = self
             .managed_peers
@@ -3161,6 +3490,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .collect::<Vec<_>>();
         self.system.apply_peer_endpoint_bypass_routes(&peers)?;
         self.system.apply_routes(&self.current_routes)?;
+        self.system.assert_exit_policy(self.current_exit_mode)?;
         Ok(())
     }
 
@@ -4383,6 +4713,49 @@ mod tests {
     }
 
     #[test]
+    fn peer_revocation_reasserts_measured_exit_policy_after_route_refresh() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let peer_id = NodeId::new("node-b").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: peer_id.clone(),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("apply should succeed");
+
+        let op_start = controller.system.operations.len();
+        controller
+            .apply_revocation(&peer_id)
+            .expect("revocation refresh should succeed");
+        let ops = &controller.system.operations[op_start..];
+
+        assert!(
+            ops.contains(&"rollback_routes".to_string())
+                && ops.contains(&"apply_peer_endpoint_bypass_routes".to_string())
+                && ops.contains(&"apply_routes".to_string())
+                && ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            "peer revocation must rebuild owned routes and re-assert measured full-tunnel truth"
+        );
+    }
+
+    #[test]
     fn relay_with_upstream_enables_tunnel_forwarding_path() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(
@@ -5523,6 +5896,45 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn sample_linux_firewall_ruleset(
+        interface_name: &str,
+        egress_interface: &str,
+        include_egress_allow: bool,
+        dns_protected: bool,
+        allow_tunnel_relay_forward: bool,
+    ) -> String {
+        let mut rules = format!(
+            "table inet rustynet_g1 {{\n  chain killswitch {{\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n    ct state established,related accept\n    oifname \"{interface_name}\" accept\n"
+        );
+        if include_egress_allow {
+            rules.push_str(format!("    oifname \"{egress_interface}\" accept\n").as_str());
+        }
+        if dns_protected {
+            rules.push_str(
+                format!(
+                    "    udp dport 53 oifname != \"{interface_name}\" drop\n    tcp dport 53 oifname != \"{interface_name}\" drop\n    udp dport 53 accept\n    tcp dport 53 accept\n"
+                )
+                .as_str(),
+            );
+        }
+        rules.push_str(
+            "  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n",
+        );
+        rules.push_str(
+            format!("    iifname \"{interface_name}\" oifname \"{egress_interface}\" accept\n")
+                .as_str(),
+        );
+        if allow_tunnel_relay_forward {
+            rules.push_str(
+                format!("    iifname \"{interface_name}\" oifname \"{interface_name}\" accept\n")
+                    .as_str(),
+            );
+        }
+        rules.push_str("  }\n}\n");
+        rules
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_assert_exit_policy_full_tunnel_checks_rule_table_and_probe() {
         let socket_path = phase10_test_socket_path("x");
@@ -5533,7 +5945,13 @@ mod tests {
                     "nft list table inet rustynet_g1".to_string(),
                     PrivilegedCommandOutput {
                         status: 0,
-                        stdout: "table inet rustynet_g1".to_string(),
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
                         stderr: String::new(),
                     },
                 ),
@@ -5549,7 +5967,7 @@ mod tests {
                     "ip -4 route show table 51820".to_string(),
                     PrivilegedCommandOutput {
                         status: 0,
-                        stdout: "default dev rustynet0 scope link\n".to_string(),
+                        stdout: "default dev rustynet0 scope link\n203.0.113.10/32 dev enp0s9 scope link\n".to_string(),
                         stderr: String::new(),
                     },
                 ),
@@ -5576,6 +5994,13 @@ mod tests {
         )
         .expect("linux command system should initialize");
         system.firewall_table = Some("rustynet_g1".to_string());
+        system
+            .expected_peer_endpoint_bypass_routes
+            .insert(ExpectedBypassRoute {
+                destination: "203.0.113.10/32".to_string(),
+                interface_name: "enp0s9".to_string(),
+                family: RouteTableFamily::V4,
+            });
 
         DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel)
             .expect("full-tunnel proof should succeed");
@@ -5616,7 +6041,13 @@ mod tests {
                     "nft list table inet rustynet_g1".to_string(),
                     PrivilegedCommandOutput {
                         status: 0,
-                        stdout: "table inet rustynet_g1".to_string(),
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
                         stderr: String::new(),
                     },
                 ),
@@ -5627,6 +6058,14 @@ mod tests {
                         stdout:
                             "0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n"
                                 .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "203.0.113.10/32 dev enp0s9 scope link\n".to_string(),
                         stderr: String::new(),
                     },
                 ),
@@ -5654,6 +6093,13 @@ mod tests {
         )
         .expect("linux command system should initialize");
         system.firewall_table = Some("rustynet_g1".to_string());
+        system
+            .expected_peer_endpoint_bypass_routes
+            .insert(ExpectedBypassRoute {
+                destination: "203.0.113.10/32".to_string(),
+                interface_name: "enp0s9".to_string(),
+                family: RouteTableFamily::V4,
+            });
 
         DataplaneSystem::assert_exit_policy(&mut system, ExitMode::Off)
             .expect("off-mode proof should succeed");
@@ -5676,7 +6122,13 @@ mod tests {
                     "nft list table inet rustynet_g1".to_string(),
                     PrivilegedCommandOutput {
                         status: 0,
-                        stdout: "table inet rustynet_g1".to_string(),
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
                         stderr: String::new(),
                     },
                 ),
@@ -5687,6 +6139,14 @@ mod tests {
                         stdout:
                             "0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n"
                                 .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "203.0.113.10/32 dev enp0s9 scope link\n".to_string(),
                         stderr: String::new(),
                     },
                 ),
@@ -5713,6 +6173,13 @@ mod tests {
         )
         .expect("linux command system should initialize");
         system.firewall_table = Some("rustynet_g1".to_string());
+        system
+            .expected_peer_endpoint_bypass_routes
+            .insert(ExpectedBypassRoute {
+                destination: "203.0.113.10/32".to_string(),
+                interface_name: "enp0s9".to_string(),
+                family: RouteTableFamily::V4,
+            });
 
         let err = DataplaneSystem::assert_exit_policy(&mut system, ExitMode::Off)
             .expect_err("off-mode proof must fail when the effective route still uses the tunnel");
@@ -5728,6 +6195,157 @@ mod tests {
                 .contains("route probe unexpectedly uses tunnel interface"),
             "measured off-mode proof must reject tunnel egress"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_rejects_missing_owned_endpoint_bypass_route() {
+        let socket_path = phase10_test_socket_path("xb");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "0: from all lookup local\n32765: from all lookup 51820\n32766: from all lookup main\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "default dev rustynet0 scope link\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+        system
+            .expected_peer_endpoint_bypass_routes
+            .insert(ExpectedBypassRoute {
+                destination: "203.0.113.10/32".to_string(),
+                interface_name: "enp0s9".to_string(),
+                family: RouteTableFamily::V4,
+            });
+
+        let err = DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel)
+            .expect_err("full-tunnel proof must fail when endpoint bypass ownership drifted");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            err.to_string()
+                .contains("missing owned bypass route in table 51820")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_rejects_missing_dns_fail_closed_rule() {
+        let socket_path = phase10_test_socket_path("xd");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout:
+                            "0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n"
+                                .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route get 1.1.1.1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout:
+                            "1.1.1.1 via 192.168.64.1 dev enp0s9 src 192.168.64.8 uid 0\n    cache\n"
+                                .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+        system.dns_protected = true;
+
+        let err = DataplaneSystem::assert_exit_policy(&mut system, ExitMode::Off)
+            .expect_err("dns-protected proof must fail if dns fail-closed rules are missing");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(err.to_string().contains("dns udp fail-closed rule missing"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ LIVE_LAB_LOG_PREFIX="cross-network-failback-roaming"
 export LIVE_LAB_LOG_PREFIX
 
 SSH_IDENTITY_FILE=""
+KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-}"
 CLIENT_HOST=""
 EXIT_HOST=""
 RELAY_HOST=""
@@ -47,6 +48,7 @@ BYPASS_REPORT_PATH=""
 BYPASS_LOG_PATH=""
 FAILBACK_MONITOR_LOG=""
 FAILBACK_SLO_SUMMARY_PATH=""
+SSH_TRUST_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
 PATH_STATUS_LINE=""
@@ -62,6 +64,7 @@ usage() {
 usage: live_linux_cross_network_failback_roaming_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --relay-host <user@host> --client-node-id <id> --exit-node-id <id> --relay-node-id <id> --client-network-id <id> --exit-network-id <id> --relay-network-id <id> [options]
 
 options:
+  --known-hosts-file <path>
   --nat-profile <profile>
   --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
@@ -150,6 +153,7 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --known-hosts-file) KNOWN_HOSTS_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --relay-host) RELAY_HOST="$2"; shift 2 ;;
@@ -205,6 +209,9 @@ fi
 if [[ -n "$RELAY_UNDERLAY_IP" ]]; then
   cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$RELAY_UNDERLAY_IP" >/dev/null
 fi
+if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -232,7 +239,8 @@ main() {
   BYPASS_LOG_PATH="$artifact_dir/cross_network_failback_roaming_server_ip_bypass.log"
   FAILBACK_MONITOR_LOG="$artifact_dir/cross_network_failback_roaming_monitor.log"
   FAILBACK_SLO_SUMMARY_PATH="$artifact_dir/cross_network_failback_roaming_slo_summary.json"
-  SOURCE_ARTIFACTS=("$RELAY_REPORT_PATH" "$BYPASS_REPORT_PATH" "$FAILBACK_SLO_SUMMARY_PATH")
+  SSH_TRUST_SUMMARY_PATH="$artifact_dir/cross_network_failback_roaming_ssh_trust_summary.txt"
+  SOURCE_ARTIFACTS=("$RELAY_REPORT_PATH" "$BYPASS_REPORT_PATH" "$FAILBACK_SLO_SUMMARY_PATH" "$SSH_TRUST_SUMMARY_PATH")
   LOG_ARTIFACTS=("$RELAY_LOG_PATH" "$BYPASS_LOG_PATH" "$FAILBACK_MONITOR_LOG")
 
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \
@@ -293,6 +301,7 @@ main() {
   live_lab_push_sudo_password "$EXIT_HOST"
   live_lab_push_sudo_password "$RELAY_HOST"
   live_lab_push_sudo_password "$CLIENT_HOST"
+  live_lab_write_ssh_trust_summary "$SSH_TRUST_SUMMARY_PATH" "$CLIENT_HOST" "$EXIT_HOST" "$RELAY_HOST"
   live_lab_wait_for_daemon_socket "$EXIT_HOST"
   live_lab_wait_for_daemon_socket "$RELAY_HOST"
   live_lab_wait_for_daemon_socket "$CLIENT_HOST"

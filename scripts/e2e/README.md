@@ -28,6 +28,9 @@ Automation security posture for this workflow:
 - SSH TOFU / `accept-new` is not part of the active wrapper path
 - the active wrapper path expects passwordless sudo (`sudo -n`) on automation targets
 - unattended runtime passphrase custody remains credential-only; plaintext passphrase files are not part of the live-lab release path
+- canonical cross-network pass reports now require a suite-local SSH trust summary proving pinned host-key coverage and `sudo -n` for every participating target
+- canonical cross-network pass reports now require daemon path evidence to show `transport_socket_identity_state=authoritative_backend_shared_transport`
+- canonical cross-network soak pass now requires the soak to remain direct for the full duration with zero relay/fail-closed/drift samples
 
 ## How The Orchestrator Works
 

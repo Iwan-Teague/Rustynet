@@ -5,7 +5,10 @@ umask 077
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/scripts/e2e/live_lab_common.sh"
+
 SSH_IDENTITY_FILE=""
+KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-}"
 CLIENT_HOST=""
 EXIT_HOST=""
 CLIENT_NODE_ID=""
@@ -35,6 +38,7 @@ DIRECT_REPORT_PATH=""
 DIRECT_LOG_PATH=""
 MANAGED_DNS_REPORT_PATH=""
 MANAGED_DNS_LOG_PATH=""
+SSH_TRUST_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
 
@@ -43,6 +47,7 @@ usage() {
 usage: live_linux_cross_network_remote_exit_dns_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --known-hosts-file <path>
   --nat-profile <profile>
   --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
@@ -105,6 +110,7 @@ cleanup() {
     write_report fail
   fi
   REPORT_WRITTEN=1
+  live_lab_cleanup
   exit "$rc"
 }
 
@@ -113,6 +119,7 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --known-hosts-file) KNOWN_HOSTS_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-node-id) CLIENT_NODE_ID="$2"; shift 2 ;;
@@ -159,6 +166,9 @@ fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
   cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
+if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -173,8 +183,15 @@ main() {
   DIRECT_LOG_PATH="$artifact_dir/cross_network_remote_exit_dns_direct_remote_exit.log"
   MANAGED_DNS_REPORT_PATH="$artifact_dir/cross_network_remote_exit_dns_managed_dns_report.json"
   MANAGED_DNS_LOG_PATH="$artifact_dir/cross_network_remote_exit_dns_managed_dns.log"
-  SOURCE_ARTIFACTS=("$DIRECT_REPORT_PATH" "$MANAGED_DNS_REPORT_PATH")
+  SSH_TRUST_SUMMARY_PATH="$artifact_dir/cross_network_remote_exit_dns_ssh_trust_summary.txt"
+  SOURCE_ARTIFACTS=("$DIRECT_REPORT_PATH" "$MANAGED_DNS_REPORT_PATH" "$SSH_TRUST_SUMMARY_PATH")
   LOG_ARTIFACTS=("$DIRECT_LOG_PATH" "$MANAGED_DNS_LOG_PATH")
+
+  FAILURE_SUMMARY="verifying pinned host-key and passwordless-sudo prerequisites"
+  live_lab_init "rustynet-cross-network-remote-exit-dns" "$SSH_IDENTITY_FILE"
+  live_lab_push_sudo_password "$EXIT_HOST"
+  live_lab_push_sudo_password "$CLIENT_HOST"
+  live_lab_write_ssh_trust_summary "$SSH_TRUST_SUMMARY_PATH" "$CLIENT_HOST" "$EXIT_HOST"
 
   FAILURE_SUMMARY="bootstrapping direct remote-exit path for DNS validation"
   if RUSTYNET_EXPECTED_GIT_COMMIT="${RUSTYNET_EXPECTED_GIT_COMMIT:-}" \

@@ -86,6 +86,10 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
 - Use explicit impairment profile labels for each run.
 - Stamp reports with commit-bound evidence (`git_commit`).
 - Store outputs in canonical artifact directory (`artifacts/phase10`).
+- Require suite-local SSH trust summary artifacts for authoritative reports:
+  - pinned host-key proof for every participating target
+  - `sudo -n` proof for every participating target
+- Require path evidence to prove authoritative backend-owned shared transport for authoritative pass claims.
 - Require schema and NAT-matrix validation pass before accepting results.
 
 ## 9) Pre-Run Go/No-Go Checklist
@@ -99,4 +103,3 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
 - [ ] Artifact output directory writable.
 
 If any item fails, stop and remediate before running cross-network validators.
-

@@ -110,14 +110,43 @@ live_lab_known_hosts_lookup_host() {
   printf '[%s]:%s' "$host" "$port"
 }
 
-live_lab_require_pinned_host_entry() {
+live_lab_join_by_delimiter() {
+  local delimiter="$1"
+  shift || true
+  local first=1
+  local item
+  for item in "$@"; do
+    if [[ "$first" -eq 1 ]]; then
+      printf '%s' "$item"
+      first=0
+    else
+      printf '%s%s' "$delimiter" "$item"
+    fi
+  done
+}
+
+live_lab_extract_inline_field() {
+  local line="$1"
+  local key="$2"
+  local token prefix
+  prefix="${key}="
+  for token in $line; do
+    if [[ "$token" == "$prefix"* ]]; then
+      printf '%s' "${token#"$prefix"}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+live_lab_known_hosts_lookup_candidates() {
   local target="$1"
   local resolved raw_host port hostkeyalias hostname lookup_host
   local -a lookup_candidates=()
   raw_host="$(live_lab_target_address "$target")"
   resolved="$(ssh -G "$target" 2>/dev/null)" || {
     echo "failed resolving SSH target for host-key verification: ${target}" >&2
-    exit 1
+    return 1
   }
   port="$(awk '$1=="port"{print $2; exit}' <<<"$resolved")"
   hostkeyalias="$(awk '$1=="hostkeyalias"{print $2; exit}' <<<"$resolved")"
@@ -126,39 +155,141 @@ live_lab_require_pinned_host_entry() {
   if [[ -n "$hostkeyalias" && "$hostkeyalias" != "none" ]]; then
     lookup_host="$(live_lab_known_hosts_lookup_host "$hostkeyalias" "$port")" || {
       echo "failed rendering hostkeyalias known_hosts lookup for ${target}" >&2
-      exit 1
+      return 1
     }
     lookup_candidates+=("$lookup_host")
   fi
 
   lookup_host="$(live_lab_known_hosts_lookup_host "$raw_host" "$port")" || {
     echo "failed rendering raw host known_hosts lookup for ${target}" >&2
-    exit 1
+    return 1
   }
   lookup_candidates+=("$lookup_host")
 
   if [[ -n "$hostname" ]]; then
     lookup_host="$(live_lab_known_hosts_lookup_host "$hostname" "$port")" || {
       echo "failed rendering resolved host known_hosts lookup for ${target}" >&2
-      exit 1
+      return 1
     }
     if [[ " ${lookup_candidates[*]} " != *" ${lookup_host} "* ]]; then
       lookup_candidates+=("$lookup_host")
     fi
   fi
 
+  if [[ "${#lookup_candidates[@]}" -eq 0 ]]; then
+    echo "pinned known_hosts verification resolved no lookup candidates for ${target}" >&2
+    return 1
+  fi
+  printf '%s\n' "${lookup_candidates[@]}"
+}
+
+live_lab_find_pinned_host_entry() {
+  local target="$1"
+  local lookup_host
+  local -a lookup_candidates=()
+
+  mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || return 1
   for lookup_host in "${lookup_candidates[@]}"; do
     if ssh-keygen -F "$lookup_host" -f "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >/dev/null 2>&1; then
+      printf '%s' "$lookup_host"
       return 0
     fi
   done
+  return 1
+}
 
-  if [[ "${#lookup_candidates[@]}" -eq 0 ]]; then
-    echo "pinned known_hosts verification resolved no lookup candidates for ${target}" >&2
-  else
-    echo "pinned known_hosts file lacks host key for ${target}; checked ${lookup_candidates[*]} in ${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE}" >&2
+live_lab_target_configured_transport() {
+  local target="$1"
+  if live_lab_target_uses_utm_transport "$target"; then
+    printf 'utm'
+    return 0
   fi
-  exit 1
+  printf 'ssh'
+}
+
+live_lab_require_pinned_host_entry() {
+  local target="$1"
+  local matched lookup_host
+  local -a lookup_candidates=()
+
+  mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || exit 1
+  matched="$(live_lab_find_pinned_host_entry "$target")" || {
+    if [[ "${#lookup_candidates[@]}" -eq 0 ]]; then
+      echo "pinned known_hosts verification resolved no lookup candidates for ${target}" >&2
+    else
+      echo "pinned known_hosts file lacks host key for ${target}; checked ${lookup_candidates[*]} in ${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE}" >&2
+    fi
+    exit 1
+  }
+  [[ -n "$matched" ]] || exit 1
+}
+
+live_lab_write_ssh_trust_summary() {
+  local output_path="$1"
+  shift || true
+  local target_count="$#"
+  local output_dir pinned_known_hosts_sha256
+  local all_targets_pinned=true
+  local all_targets_passwordless_sudo=true
+  local idx=0
+  local target matched_candidate configured_transport checked_candidates_csv
+  local host_key_status passwordless_sudo_status
+  local -a lookup_candidates=()
+
+  output_dir="$(dirname "$output_path")"
+  mkdir -p "$output_dir"
+  pinned_known_hosts_sha256="$(shasum -a 256 "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" | awk '{print $1}')" || {
+    echo "failed to hash pinned known_hosts file: $LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >&2
+    return 1
+  }
+
+  {
+    printf 'schema_version=1\n'
+    printf 'generated_at_unix=%s\n' "$(date +%s)"
+    printf 'pinned_known_hosts_file=%s\n' "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE"
+    printf 'pinned_known_hosts_sha256=%s\n' "$pinned_known_hosts_sha256"
+    printf 'target_count=%s\n' "$target_count"
+  } > "$output_path"
+
+  for target in "$@"; do
+    mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || return 1
+    checked_candidates_csv="$(live_lab_join_by_delimiter "," "${lookup_candidates[@]}")"
+    if matched_candidate="$(live_lab_find_pinned_host_entry "$target")"; then
+      host_key_status="pass"
+    else
+      matched_candidate=""
+      host_key_status="fail"
+      all_targets_pinned=false
+    fi
+
+    if live_lab_verify_sudo "$target" >/dev/null 2>&1; then
+      passwordless_sudo_status="pass"
+    else
+      passwordless_sudo_status="fail"
+      all_targets_passwordless_sudo=false
+    fi
+
+    configured_transport="$(live_lab_target_configured_transport "$target")"
+    {
+      printf 'target[%s].target=%s\n' "$idx" "$target"
+      printf 'target[%s].configured_transport=%s\n' "$idx" "$configured_transport"
+      printf 'target[%s].checked_candidates=%s\n' "$idx" "$checked_candidates_csv"
+      printf 'target[%s].matched_candidate=%s\n' "$idx" "$matched_candidate"
+      printf 'target[%s].host_key_status=%s\n' "$idx" "$host_key_status"
+      printf 'target[%s].passwordless_sudo_status=%s\n' "$idx" "$passwordless_sudo_status"
+    } >> "$output_path"
+    idx=$((idx + 1))
+  done
+
+  {
+    printf 'all_targets_pinned=%s\n' "$all_targets_pinned"
+    printf 'all_targets_passwordless_sudo=%s\n' "$all_targets_passwordless_sudo"
+  } >> "$output_path"
+
+  if [[ "$all_targets_pinned" != "true" || "$all_targets_passwordless_sudo" != "true" ]]; then
+    echo "SSH trust summary verification failed; inspect $output_path" >&2
+    return 1
+  fi
 }
 
 live_lab_prepare_worker_known_hosts() {
@@ -1035,9 +1166,6 @@ live_lab_rootify_direct() {
 
 live_lab_verify_sudo() {
   local target="$1"
-  if live_lab_target_uses_utm_transport "$target"; then
-    return 0
-  fi
   local hostname_precheck_cmd
   local verify_cmd
   hostname_precheck_cmd="current_hostname=\$(hostname); if ! grep -Eq \"(^|[[:space:]])\${current_hostname}([[:space:]]|$)\" /etc/hosts; then printf 'local hostname %s is missing from /etc/hosts\\n' \"\$current_hostname\"; exit 1; fi"
@@ -1070,10 +1198,12 @@ live_lab_push_sudo_password() {
     local existing
     for existing in "${LIVE_LAB_REMOTE_CLEANUP_TARGETS[@]:-}"; do
       if [[ "$existing" == "$target" ]]; then
+        live_lab_retry_verify_sudo "$target" || return 1
         return 0
       fi
     done
     LIVE_LAB_REMOTE_CLEANUP_TARGETS+=("$target")
+    live_lab_retry_verify_sudo "$target" || return 1
     return 0
   fi
   local existing

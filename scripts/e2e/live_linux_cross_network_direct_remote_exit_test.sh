@@ -11,6 +11,7 @@ LIVE_LAB_LOG_PREFIX="cross-network-direct-remote-exit"
 export LIVE_LAB_LOG_PREFIX
 
 SSH_IDENTITY_FILE=""
+KNOWN_HOSTS_FILE="${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE:-}"
 CLIENT_HOST=""
 EXIT_HOST=""
 CLIENT_NODE_ID=""
@@ -48,6 +49,7 @@ CLIENT_ENDPOINTS_FILE=""
 EXIT_NFT_FILE=""
 CLIENT_PLAINTEXT_FILE=""
 EXIT_PLAINTEXT_FILE=""
+SSH_TRUST_SUMMARY_PATH=""
 SOURCE_ARTIFACTS=()
 LOG_ARTIFACTS=()
 PATH_STATUS_LINE=""
@@ -57,6 +59,7 @@ usage() {
 usage: live_linux_cross_network_direct_remote_exit_test.sh --ssh-identity-file <path> --client-host <user@host> --exit-host <user@host> --client-node-id <id> --exit-node-id <id> --client-network-id <id> --exit-network-id <id> [options]
 
 options:
+  --known-hosts-file <path>
   --nat-profile <profile>
   --impairment-profile <profile>
   --ssh-allow-cidrs <cidr[,cidr]>
@@ -128,6 +131,7 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-identity-file) SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --known-hosts-file) KNOWN_HOSTS_FILE="$2"; shift 2 ;;
     --client-host) CLIENT_HOST="$2"; shift 2 ;;
     --exit-host) EXIT_HOST="$2"; shift 2 ;;
     --client-node-id) CLIENT_NODE_ID="$2"; shift 2 ;;
@@ -171,6 +175,9 @@ fi
 if [[ -n "$EXIT_UNDERLAY_IP" ]]; then
   cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$EXIT_UNDERLAY_IP" >/dev/null
 fi
+if [[ -n "$KNOWN_HOSTS_FILE" ]]; then
+  export LIVE_LAB_PINNED_KNOWN_HOSTS_FILE="$KNOWN_HOSTS_FILE"
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$LOG_PATH")"
 : > "$LOG_PATH"
@@ -202,7 +209,8 @@ main() {
   artifact_dir="$(dirname "$REPORT_PATH")"
   BYPASS_REPORT_PATH="$artifact_dir/cross_network_direct_remote_exit_server_ip_bypass_report.json"
   BYPASS_LOG_PATH="$artifact_dir/cross_network_direct_remote_exit_server_ip_bypass.log"
-  SOURCE_ARTIFACTS=("$BYPASS_REPORT_PATH")
+  SSH_TRUST_SUMMARY_PATH="$artifact_dir/cross_network_direct_remote_exit_ssh_trust_summary.txt"
+  SOURCE_ARTIFACTS=("$BYPASS_REPORT_PATH" "$SSH_TRUST_SUMMARY_PATH")
   LOG_ARTIFACTS=("$BYPASS_LOG_PATH")
   CLIENT_STATUS_FILE="$LIVE_LAB_WORK_DIR/client_status.txt"
   EXIT_STATUS_FILE="$LIVE_LAB_WORK_DIR/exit_status.txt"
@@ -214,6 +222,7 @@ main() {
 
   live_lab_push_sudo_password "$EXIT_HOST"
   live_lab_push_sudo_password "$CLIENT_HOST"
+  live_lab_write_ssh_trust_summary "$SSH_TRUST_SUMMARY_PATH" "$CLIENT_HOST" "$EXIT_HOST"
 
   live_lab_log "Collecting WireGuard public keys"
   EXIT_PUB_HEX="$(live_lab_collect_pubkey_hex "$EXIT_HOST")"
