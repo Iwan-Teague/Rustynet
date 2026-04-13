@@ -9695,38 +9695,40 @@ fn transition_local_utm_vm_with_process_probe(
     let status = match run_status_with_timeout(&mut command, timeout) {
         Ok(status) => status,
         Err(err) => {
-            if wait_for_local_utm_process_state_with_probes(
+            match wait_for_local_utm_process_state_with_probes(
                 utmctl_path,
                 ps_path,
                 utm_name,
                 bundle_path,
                 expected_process_present,
                 transition_reconciliation_timeout(timeout),
-            )
-            .is_ok()
-            {
-                return Ok(());
+            ) {
+                Ok(()) => return Ok(()),
+                Err(probe_err) => {
+                    return Err(format!(
+                        "{err}; follow-up process-state probe failed: {probe_err}"
+                    ));
+                }
             }
-            return Err(err);
         }
     };
     if !status.success() {
-        if wait_for_local_utm_process_state_with_probes(
+        match wait_for_local_utm_process_state_with_probes(
             utmctl_path,
             ps_path,
             utm_name,
             bundle_path,
             expected_process_present,
             transition_reconciliation_timeout(timeout),
-        )
-        .is_ok()
-        {
-            return Ok(());
+        ) {
+            Ok(()) => return Ok(()),
+            Err(probe_err) => {
+                return Err(format!(
+                    "{action} exited with status {}; follow-up process-state probe failed: {probe_err}",
+                    status_code(status)
+                ));
+            }
         }
-        return Err(format!(
-            "{action} exited with status {}",
-            status_code(status)
-        ));
     }
     wait_for_local_utm_process_state_with_probes(
         utmctl_path,
@@ -9776,10 +9778,18 @@ fn local_utm_process_present_with_probes(
     bundle_path: &Path,
     timeout: Duration,
 ) -> Result<bool, String> {
-    if let Some(present) =
-        local_utm_process_present_with_utmctl_list(utmctl_path, utm_name, timeout)?
-    {
-        return Ok(present);
+    match local_utm_process_present_with_utmctl_list(utmctl_path, utm_name, timeout) {
+        Ok(Some(present)) => return Ok(present),
+        Ok(None) => {}
+        Err(utmctl_err) => {
+            return local_utm_process_present_with_ps(ps_path, bundle_path, timeout).map_err(
+                |ps_err| {
+                    format!(
+                        "utmctl process probe failed: {utmctl_err}; ps process probe failed: {ps_err}"
+                    )
+                },
+            );
+        }
     }
     local_utm_process_present_with_ps(ps_path, bundle_path, timeout)
 }
@@ -12906,6 +12916,54 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             Duration::from_secs(5),
         )
         .expect("stopped VM transition should no-op successfully");
+
+        assert_eq!(fs::read_to_string(&utmctl_log).unwrap_or_default(), "");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transition_local_utm_vm_skips_stop_when_utmctl_probe_spawn_fails_but_ps_reports_stopped() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-transition-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let bundle = dir.join("alpha.utm");
+        fs::create_dir_all(&bundle).expect("bundle dir should exist");
+        let utmctl_log = dir.join("utmctl.log");
+        let utmctl = dir.join("utmctl");
+        fs::write(&utmctl, "#!/bin/sh\nexit 0\n").expect("utmctl placeholder should write");
+        let mut utmctl_permissions = fs::metadata(&utmctl)
+            .expect("utmctl placeholder metadata should read")
+            .permissions();
+        utmctl_permissions.set_mode(0o644);
+        fs::set_permissions(&utmctl, utmctl_permissions)
+            .expect("utmctl placeholder permissions should write");
+
+        let ps = dir.join("ps");
+        fs::write(
+            &ps,
+            "#!/bin/sh\nprintf '789 /usr/libexec/other-process\\n'\n",
+        )
+        .expect("ps script should write");
+        let mut ps_permissions = fs::metadata(&ps)
+            .expect("ps script metadata should read")
+            .permissions();
+        ps_permissions.set_mode(0o755);
+        fs::set_permissions(&ps, ps_permissions).expect("ps script should be executable");
+
+        transition_local_utm_vm_with_process_probe(
+            utmctl.as_path(),
+            ps.as_path(),
+            "alpha",
+            bundle.as_path(),
+            "stop",
+            false,
+            Duration::from_secs(5),
+        )
+        .expect("stopped VM transition should fall back to ps when utmctl cannot spawn");
 
         assert_eq!(fs::read_to_string(&utmctl_log).unwrap_or_default(), "");
 
