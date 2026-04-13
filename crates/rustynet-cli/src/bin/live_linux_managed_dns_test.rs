@@ -198,6 +198,15 @@ fn run() -> Result<(), String> {
         &config.signer_host,
         policy_invalid_records_remote,
     )?;
+    let dns_issue = DnsIssueContext {
+        ctx: &ctx,
+        signer_host: &config.signer_host,
+        passphrase_file: &passphrase_file,
+        zone_name: &config.zone_name,
+        nodes_spec: &nodes_spec,
+        allow_spec: &allow_spec,
+        issue_dir,
+    };
 
     logger.line(
         format!(
@@ -207,60 +216,52 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
     issue_dns_bundle(
-        &ctx,
-        &config.signer_host,
-        &passphrase_file,
-        &config.client_node_id,
-        &config.zone_name,
-        &nodes_spec,
-        &allow_spec,
-        DNS_RECORDS_REMOTE,
-        issue_dir,
-        "valid.dns-zone",
-        Some(valid_generated_at),
-        Some(valid_nonce),
+        dns_issue,
+        DnsBundleSpec {
+            subject_node_id: &config.client_node_id,
+            records_manifest_remote: DNS_RECORDS_REMOTE,
+            output_name: "valid.dns-zone",
+            timing: DnsBundleTiming {
+                generated_at: Some(valid_generated_at),
+                nonce: Some(valid_nonce),
+            },
+        },
     )?;
     issue_dns_bundle(
-        &ctx,
-        &config.signer_host,
-        &passphrase_file,
-        &config.client_node_id,
-        &config.zone_name,
-        &nodes_spec,
-        &allow_spec,
-        DNS_RECORDS_REMOTE,
-        issue_dir,
-        "stale.dns-zone",
-        Some(stale_generated_at),
-        Some(stale_nonce),
+        dns_issue,
+        DnsBundleSpec {
+            subject_node_id: &config.client_node_id,
+            records_manifest_remote: DNS_RECORDS_REMOTE,
+            output_name: "stale.dns-zone",
+            timing: DnsBundleTiming {
+                generated_at: Some(stale_generated_at),
+                nonce: Some(stale_nonce),
+            },
+        },
     )?;
     issue_dns_bundle(
-        &ctx,
-        &config.signer_host,
-        &passphrase_file,
-        &config.client_node_id,
-        &config.zone_name,
-        &nodes_spec,
-        &allow_spec,
-        replay_records_remote,
-        issue_dir,
-        "replay.dns-zone",
-        Some(valid_generated_at),
-        Some(valid_nonce),
+        dns_issue,
+        DnsBundleSpec {
+            subject_node_id: &config.client_node_id,
+            records_manifest_remote: replay_records_remote,
+            output_name: "replay.dns-zone",
+            timing: DnsBundleTiming {
+                generated_at: Some(valid_generated_at),
+                nonce: Some(valid_nonce),
+            },
+        },
     )?;
     issue_dns_bundle(
-        &ctx,
-        &config.signer_host,
-        &passphrase_file,
-        &config.signer_node_id,
-        &config.zone_name,
-        &nodes_spec,
-        &allow_spec,
-        policy_invalid_records_remote,
-        issue_dir,
-        "policy-invalid.dns-zone",
-        Some(valid_generated_at.saturating_add(1)),
-        Some(valid_nonce.saturating_add(1)),
+        dns_issue,
+        DnsBundleSpec {
+            subject_node_id: &config.signer_node_id,
+            records_manifest_remote: policy_invalid_records_remote,
+            output_name: "policy-invalid.dns-zone",
+            timing: DnsBundleTiming {
+                generated_at: Some(valid_generated_at.saturating_add(1)),
+                nonce: Some(valid_nonce.saturating_add(1)),
+            },
+        },
     )?;
 
     let verifier_local = workspace.join("dns-zone.pub");
@@ -451,143 +452,102 @@ fn run() -> Result<(), String> {
         "[managed-dns] valid resolvectl query",
         &resolvectl_query_valid,
     )?;
+    let validation = ManagedDnsValidationContext {
+        logger: &logger,
+        root_dir: &root_dir,
+        config: &config,
+        workspace: &workspace,
+        host_by_node: &host_by_node,
+        verifier_local: &verifier_local,
+        dns_issue,
+    };
 
     let stale_case = exercise_invalid_bundle_case(
-        &ctx,
-        &logger,
-        &root_dir,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &stale_bundle_local,
-        true,
-        "stale",
-        &["stale"],
+        validation,
+        InvalidBundleCaseSpec {
+            bundle_local: &stale_bundle_local,
+            clear_watermark: true,
+            case_label: "stale",
+            expected_reason_fragments: &["stale"],
+        },
     )?;
 
     restore_valid_bundle_after_invalid_case(
-        &ctx,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &valid_bundle_local,
-        &passphrase_file,
+        validation,
+        RestoreValidBundleSpec {
+            valid_bundle_local: &valid_bundle_local,
+            output_name: "valid-restore.dns-zone",
+        },
     )?;
 
     let replay_case = exercise_invalid_bundle_case(
-        &ctx,
-        &logger,
-        &root_dir,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &replay_bundle_local,
-        false,
-        "replay",
-        &["replay detected"],
+        validation,
+        InvalidBundleCaseSpec {
+            bundle_local: &replay_bundle_local,
+            clear_watermark: false,
+            case_label: "replay",
+            expected_reason_fragments: &["replay detected"],
+        },
     )?;
     restore_valid_bundle_after_invalid_case(
-        &ctx,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &valid_bundle_local,
-        &passphrase_file,
+        validation,
+        RestoreValidBundleSpec {
+            valid_bundle_local: &valid_bundle_local,
+            output_name: "valid-restore.dns-zone",
+        },
     )?;
 
     let forged_case = exercise_invalid_bundle_case(
-        &ctx,
-        &logger,
-        &root_dir,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &forged_bundle_local,
-        true,
-        "forged",
-        &["signature verification failed"],
+        validation,
+        InvalidBundleCaseSpec {
+            bundle_local: &forged_bundle_local,
+            clear_watermark: true,
+            case_label: "forged",
+            expected_reason_fragments: &["signature verification failed"],
+        },
     )?;
     restore_valid_bundle_after_invalid_case(
-        &ctx,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &valid_bundle_local,
-        &passphrase_file,
+        validation,
+        RestoreValidBundleSpec {
+            valid_bundle_local: &valid_bundle_local,
+            output_name: "valid-restore.dns-zone",
+        },
     )?;
 
     let tampered_case = exercise_invalid_bundle_case(
-        &ctx,
-        &logger,
-        &root_dir,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &tampered_bundle_local,
-        true,
-        "tampered",
-        &["invalid format"],
+        validation,
+        InvalidBundleCaseSpec {
+            bundle_local: &tampered_bundle_local,
+            clear_watermark: true,
+            case_label: "tampered",
+            expected_reason_fragments: &["invalid format"],
+        },
     )?;
     restore_valid_bundle_after_invalid_case(
-        &ctx,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &valid_bundle_local,
-        &passphrase_file,
+        validation,
+        RestoreValidBundleSpec {
+            valid_bundle_local: &valid_bundle_local,
+            output_name: "valid-restore.dns-zone",
+        },
     )?;
 
     let policy_invalid_case = exercise_invalid_bundle_case(
-        &ctx,
-        &logger,
-        &root_dir,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &policy_invalid_bundle_local,
-        true,
-        "policy-invalid",
-        &["subject node id does not match local node"],
+        validation,
+        InvalidBundleCaseSpec {
+            bundle_local: &policy_invalid_bundle_local,
+            clear_watermark: true,
+            case_label: "policy-invalid",
+            expected_reason_fragments: &["subject node id does not match local node"],
+        },
     )?;
 
     // Restore a fresh valid client bundle after the adversarial sequence.
     restore_valid_bundle_after_invalid_case(
-        &ctx,
-        &config,
-        &workspace,
-        &host_by_node,
-        &nodes_spec,
-        &allow_spec,
-        &verifier_local,
-        &valid_bundle_local,
-        &passphrase_file,
+        validation,
+        RestoreValidBundleSpec {
+            valid_bundle_local: &valid_bundle_local,
+            output_name: "valid-restore.dns-zone",
+        },
     )?;
     let dns_inspect_restored =
         wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
@@ -617,18 +577,16 @@ fn run() -> Result<(), String> {
 
         let output_name = format!("valid-{node_id}.dns-zone");
         issue_dns_bundle(
-            &ctx,
-            &config.signer_host,
-            &passphrase_file,
-            &node_id,
-            &config.zone_name,
-            &nodes_spec,
-            &allow_spec,
-            peer_records_remote.as_str(),
-            issue_dir,
-            output_name.as_str(),
-            None,
-            None,
+            dns_issue,
+            DnsBundleSpec {
+                subject_node_id: &node_id,
+                records_manifest_remote: peer_records_remote.as_str(),
+                output_name: output_name.as_str(),
+                timing: DnsBundleTiming {
+                    generated_at: None,
+                    nonce: None,
+                },
+            },
         )?;
         let _ = ctx.run_root_allow_failure(
             &config.signer_host,
@@ -957,25 +915,67 @@ fn validate_targets(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn issue_dns_bundle(
-    ctx: &LiveLabContext,
-    signer_host: &str,
-    passphrase_file: &str,
-    subject_node_id: &str,
-    zone_name: &str,
-    nodes_spec: &str,
-    allow_spec: &str,
-    records_manifest_remote: &str,
-    issue_dir: &str,
-    output_name: &str,
+#[derive(Debug, Clone, Copy)]
+struct DnsBundleTiming {
     generated_at: Option<u64>,
     nonce: Option<u64>,
-) -> Result<(), String> {
-    let output_path = format!("{issue_dir}/{output_name}");
-    let verifier_key_output = format!("{issue_dir}/rn-dns-zone.pub");
-    let generated_at_string = generated_at.map(|value| value.to_string());
-    let nonce_string = nonce.map(|value| value.to_string());
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DnsIssueContext<'a> {
+    ctx: &'a LiveLabContext,
+    signer_host: &'a str,
+    passphrase_file: &'a str,
+    zone_name: &'a str,
+    nodes_spec: &'a str,
+    allow_spec: &'a str,
+    issue_dir: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DnsBundleSpec<'a> {
+    subject_node_id: &'a str,
+    records_manifest_remote: &'a str,
+    output_name: &'a str,
+    timing: DnsBundleTiming,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DnsBundleCaptureSpec<'a> {
+    bundle: DnsBundleSpec<'a>,
+    bundle_local: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedDnsValidationContext<'a> {
+    logger: &'a Logger,
+    root_dir: &'a Path,
+    config: &'a Config,
+    workspace: &'a Path,
+    host_by_node: &'a HashMap<String, String>,
+    verifier_local: &'a Path,
+    dns_issue: DnsIssueContext<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InvalidBundleCaseSpec<'a> {
+    bundle_local: &'a Path,
+    clear_watermark: bool,
+    case_label: &'a str,
+    expected_reason_fragments: &'a [&'a str],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestoreValidBundleSpec<'a> {
+    valid_bundle_local: &'a Path,
+    output_name: &'a str,
+}
+
+fn issue_dns_bundle(issue: DnsIssueContext<'_>, bundle: DnsBundleSpec<'_>) -> Result<(), String> {
+    let output_path = format!("{}/{}", issue.issue_dir, bundle.output_name);
+    let verifier_key_output = format!("{}/rn-dns-zone.pub", issue.issue_dir);
+    let generated_at_string = bundle.timing.generated_at.map(|value| value.to_string());
+    let nonce_string = bundle.timing.nonce.map(|value| value.to_string());
     let mut args = vec![
         "rustynet",
         "dns",
@@ -984,70 +984,50 @@ fn issue_dns_bundle(
         "--signing-secret",
         "/etc/rustynet/membership.owner.key",
         "--signing-secret-passphrase-file",
-        passphrase_file,
+        issue.passphrase_file,
         "--subject-node-id",
-        subject_node_id,
+        bundle.subject_node_id,
         "--nodes",
-        nodes_spec,
+        issue.nodes_spec,
         "--allow",
-        allow_spec,
+        issue.allow_spec,
         "--records-manifest",
-        records_manifest_remote,
+        bundle.records_manifest_remote,
         "--output",
         output_path.as_str(),
         "--verifier-key-output",
         verifier_key_output.as_str(),
         "--zone-name",
-        zone_name,
+        issue.zone_name,
         "--ttl-secs",
         "300",
     ];
-    if generated_at.is_some() {
+    if bundle.timing.generated_at.is_some() {
         args.push("--generated-at");
         if let Some(generated_at_string) = generated_at_string.as_ref() {
             args.push(generated_at_string.as_str());
         }
     }
-    if nonce.is_some() {
+    if bundle.timing.nonce.is_some() {
         args.push("--nonce");
         if let Some(nonce_string) = nonce_string.as_ref() {
             args.push(nonce_string.as_str());
         }
     }
-    ctx.run_root(signer_host, &args)?;
+    issue.ctx.run_root(issue.signer_host, &args)?;
     Ok(())
 }
 
 fn issue_and_capture_valid_client_bundle(
-    ctx: &LiveLabContext,
-    config: &Config,
-    passphrase_file: &str,
-    nodes_spec: &str,
-    allow_spec: &str,
-    records_manifest_remote: &str,
-    issue_dir: &str,
-    output_name: &str,
-    bundle_local: &Path,
+    issue: DnsIssueContext<'_>,
+    capture: DnsBundleCaptureSpec<'_>,
 ) -> Result<(), String> {
-    issue_dns_bundle(
-        ctx,
-        &config.signer_host,
-        passphrase_file,
-        &config.client_node_id,
-        &config.zone_name,
-        nodes_spec,
-        allow_spec,
-        records_manifest_remote,
-        issue_dir,
-        output_name,
-        None,
-        None,
-    )?;
+    issue_dns_bundle(issue, capture.bundle)?;
     capture_remote_text(
-        ctx,
-        &config.signer_host,
-        &format!("{issue_dir}/{output_name}"),
-        bundle_local,
+        issue.ctx,
+        issue.signer_host,
+        &format!("{}/{}", issue.issue_dir, capture.bundle.output_name),
+        capture.bundle_local,
     )?;
     Ok(())
 }
@@ -1605,62 +1585,67 @@ struct RemoteDnsQueryCapture {
     failure_reason: String,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn exercise_invalid_bundle_case(
-    ctx: &LiveLabContext,
-    logger: &Logger,
-    root_dir: &Path,
-    config: &Config,
-    workspace: &Path,
-    host_by_node: &HashMap<String, String>,
-    nodes_spec: &str,
-    allow_spec: &str,
-    verifier_local: &Path,
-    bundle_local: &Path,
-    clear_watermark: bool,
-    case_label: &str,
-    expected_reason_fragments: &[&str],
+    validation: ManagedDnsValidationContext<'_>,
+    case: InvalidBundleCaseSpec<'_>,
 ) -> Result<InvalidBundleCaseResult, String> {
-    logger.line(
+    validation.logger.line(
         format!(
             "[managed-dns] installing {case_label} managed DNS bundle on {}",
-            config.client_host
+            validation.config.client_host,
+            case_label = case.case_label,
         )
         .as_str(),
     )?;
     install_dns_bundle_with_options(
-        ctx,
-        &config.client_host,
-        verifier_local,
-        bundle_local,
-        clear_watermark,
+        validation.dns_issue.ctx,
+        &validation.config.client_host,
+        validation.verifier_local,
+        case.bundle_local,
+        case.clear_watermark,
     )?;
-    refresh_traversal_bundles(ctx, config, workspace, host_by_node, nodes_spec, allow_spec)?;
-    let dns_inspect = restart_managed_dns_stack_allow_invalid_dns(ctx, &config.client_host)?;
-    let rustynetd_state = ctx.capture_root_allow_failure_with_retry(
-        &config.client_host,
-        &["systemctl", "is-active", "rustynetd.service"],
-        SOAK_SSH_RETRY_ATTEMPTS,
-        SOAK_SSH_RETRY_SLEEP_SECS,
+    refresh_traversal_bundles(
+        validation.dns_issue.ctx,
+        validation.config,
+        validation.workspace,
+        validation.host_by_node,
+        validation.dns_issue.nodes_spec,
+        validation.dns_issue.allow_spec,
     )?;
-    let rustynetd_journal = ctx.capture_root_allow_failure_with_retry(
-        &config.client_host,
-        &[
-            "journalctl",
-            "-u",
-            "rustynetd.service",
-            "-n",
-            "40",
-            "--no-pager",
-        ],
-        SOAK_SSH_RETRY_ATTEMPTS,
-        SOAK_SSH_RETRY_SLEEP_SECS,
+    let dns_inspect = restart_managed_dns_stack_allow_invalid_dns(
+        validation.dns_issue.ctx,
+        &validation.config.client_host,
     )?;
+    let rustynetd_state = validation
+        .dns_issue
+        .ctx
+        .capture_root_allow_failure_with_retry(
+            &validation.config.client_host,
+            &["systemctl", "is-active", "rustynetd.service"],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        )?;
+    let rustynetd_journal = validation
+        .dns_issue
+        .ctx
+        .capture_root_allow_failure_with_retry(
+            &validation.config.client_host,
+            &[
+                "journalctl",
+                "-u",
+                "rustynetd.service",
+                "-n",
+                "40",
+                "--no-pager",
+            ],
+            SOAK_SSH_RETRY_ATTEMPTS,
+            SOAK_SSH_RETRY_SLEEP_SECS,
+        )?;
     let direct_query = remote_dns_query_capture_allow_failure(
-        ctx,
-        &config.client_host,
-        config,
-        &config.managed_fqdn(),
+        validation.dns_issue.ctx,
+        &validation.config.client_host,
+        validation.config,
+        &validation.config.managed_fqdn(),
     )?;
     let direct_query_log = if direct_query.payload.trim().is_empty() && direct_query.command_failed
     {
@@ -1673,29 +1658,45 @@ fn exercise_invalid_bundle_case(
         direct_query.payload.clone()
     };
 
-    logger.block(
-        format!("[managed-dns] {case_label} dns inspect").as_str(),
+    validation.logger.block(
+        format!(
+            "[managed-dns] {case_label} dns inspect",
+            case_label = case.case_label
+        )
+        .as_str(),
         &dns_inspect,
     )?;
-    logger.block(
-        format!("[managed-dns] {case_label} rustynetd state").as_str(),
+    validation.logger.block(
+        format!(
+            "[managed-dns] {case_label} rustynetd state",
+            case_label = case.case_label
+        )
+        .as_str(),
         &rustynetd_state,
     )?;
-    logger.block(
-        format!("[managed-dns] {case_label} rustynetd journal").as_str(),
+    validation.logger.block(
+        format!(
+            "[managed-dns] {case_label} rustynetd journal",
+            case_label = case.case_label
+        )
+        .as_str(),
         &rustynetd_journal,
     )?;
-    logger.block(
-        format!("[managed-dns] {case_label} loopback DNS query").as_str(),
+    validation.logger.block(
+        format!(
+            "[managed-dns] {case_label} loopback DNS query",
+            case_label = case.case_label
+        )
+        .as_str(),
         &direct_query_log,
     )?;
 
     let passed = managed_dns_invalid_state_observed(
         dns_inspect.as_str(),
         rustynetd_journal.as_str(),
-        expected_reason_fragments,
+        case.expected_reason_fragments,
     ) && dns_query_failed_closed(
-        root_dir,
+        validation.root_dir,
         direct_query.payload.as_str(),
         direct_query.command_failed,
     )?;
@@ -1752,44 +1753,48 @@ fn restart_managed_dns_stack_allow_invalid_dns(
     wait_for_dns_inspect_state(ctx, client_host, None, 20, 2)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn restore_valid_bundle_after_invalid_case(
-    ctx: &LiveLabContext,
-    config: &Config,
-    workspace: &Path,
-    host_by_node: &HashMap<String, String>,
-    nodes_spec: &str,
-    allow_spec: &str,
-    verifier_local: &Path,
-    valid_bundle_local: &Path,
-    passphrase_file: &str,
+    validation: ManagedDnsValidationContext<'_>,
+    restore: RestoreValidBundleSpec<'_>,
 ) -> Result<(), String> {
     retry_remote_step(
-        &format!("restore valid managed DNS bundle on {}", config.client_host),
+        &format!(
+            "restore valid managed DNS bundle on {}",
+            validation.config.client_host
+        ),
         SOAK_SSH_RETRY_ATTEMPTS,
         SOAK_SSH_RETRY_SLEEP_SECS,
         || {
             issue_and_capture_valid_client_bundle(
-                ctx,
-                config,
-                passphrase_file,
-                nodes_spec,
-                allow_spec,
-                DNS_RECORDS_REMOTE,
-                ISSUE_DIR,
-                "valid-restore.dns-zone",
-                valid_bundle_local,
+                validation.dns_issue,
+                DnsBundleCaptureSpec {
+                    bundle: DnsBundleSpec {
+                        subject_node_id: &validation.config.client_node_id,
+                        records_manifest_remote: DNS_RECORDS_REMOTE,
+                        output_name: restore.output_name,
+                        timing: DnsBundleTiming {
+                            generated_at: None,
+                            nonce: None,
+                        },
+                    },
+                    bundle_local: restore.valid_bundle_local,
+                },
             )?;
-            install_dns_bundle(ctx, &config.client_host, verifier_local, valid_bundle_local)?;
+            install_dns_bundle(
+                validation.dns_issue.ctx,
+                &validation.config.client_host,
+                validation.verifier_local,
+                restore.valid_bundle_local,
+            )?;
             refresh_traversal_bundles(
-                ctx,
-                config,
-                workspace,
-                host_by_node,
-                nodes_spec,
-                allow_spec,
+                validation.dns_issue.ctx,
+                validation.config,
+                validation.workspace,
+                validation.host_by_node,
+                validation.dns_issue.nodes_spec,
+                validation.dns_issue.allow_spec,
             )?;
-            restart_managed_dns_stack(ctx, &config.client_host)
+            restart_managed_dns_stack(validation.dns_issue.ctx, &validation.config.client_host)
         },
     )
 }
