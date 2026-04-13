@@ -12,11 +12,19 @@ What is now durable:
 
 - there is one explicit final sign-off gate:
   - `./scripts/ci/release_readiness_gates.sh`
+- Phase 5 now executes:
+  - `cargo audit --deny warnings`
+  - `cargo deny check advisories bans licenses sources`
+  as hard gates, not advisory side notes
 - the operator docs state:
   - pinned host-key handling only
   - no SSH TOFU in automation
   - passwordless sudo expectations for live-lab automation
   - credential-only secret custody for unattended runtime
+- the gate layer now writes authoritative machine-readable reports:
+  - `artifacts/release/phase5_gate_report.json`
+  - `artifacts/release/phase5_readiness_bundle.json`
+  - both distinguish `executed_passed`, `executed_failed`, and `not_executed`
 
 What is still missing:
 
@@ -91,11 +99,16 @@ That gate intentionally requires:
 - final readiness docs and bundle
 
 It should fail closed until the missing full-gate evidence exists.
+It also must not treat a pre-existing bundle file as proof; the current gate run
+must regenerate the report state and validate the Phase 5 step set, including
+`cargo audit` and `cargo deny`.
 
 ## Attached Artifacts
 
 - readiness bundle:
   - `/Users/iwan/Desktop/Rustynet/artifacts/release/phase5_readiness_bundle.json`
+- phase5 gate report:
+  - `/Users/iwan/Desktop/Rustynet/artifacts/release/phase5_gate_report.json`
 - Phase 3 policy outcome:
   - `/Users/iwan/Desktop/Rustynet/documents/operations/active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md`
 - Phase 4 local-gate evidence:

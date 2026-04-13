@@ -87,13 +87,20 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
    - Generates or validates the live-lab profile, runs preflight plus the
      setup-only stages, writes the report directory, and supports
      `--resume-from` or `--rerun-stage` for deterministic reruns.
+   - The setup wrapper now writes provenance-bound `state/setup_manifest.json`
+     and `state/report_state.json` before execution. A reused setup report
+     directory is accepted only when the current commit, dirty/clean tree
+     state, profile, inventory identity, wrapper version/source, and setup
+     flags match the recorded setup provenance.
 3. Link and Test
    - `ops vm-lab-run-live-lab`
    - Runs the full live-lab suite and validates the report contract instead of
      trusting the shell exit code alone.
    - If the report directory already contains only completed setup stages from
      `ops vm-lab-setup-live-lab`, it continues with the test stages without
-     rerunning setup.
+     rerunning setup, but only when the existing report directory passes the
+     full provenance check. Any commit, dirty-tree, profile, inventory, or
+     wrapper mismatch fails closed instead of attempting best-effort reuse.
 4. Diagnose
    - `ops vm-lab-diagnose-live-lab-failure`
    - Collects the first failed stage and packages stage-aware failure context
@@ -117,8 +124,16 @@ then run the standard workflow in one shot, use:
   not `readiness.execution_ready`, reruns discovery, then proceeds through
   setup, full live-lab execution, and diagnose-on-failure using the same report
   directory.
+- The orchestration wrapper requires a fresh report directory and refuses to
+  write into a populated one.
 - Add `--stop-after-ready` when you want it to stop after proving VM
   reachability and inventory freshness, without starting setup.
+
+If report-directory reuse is rejected, do one of these:
+
+- use a new empty `--report-dir`, or
+- rerun the original setup/report flow from the exact same commit and inputs on
+  the original directory
 
 Supporting wrappers remain available when you need tighter control over one part
 of the flow:
@@ -139,6 +154,15 @@ That wrapper keeps the Phase 5 release-doc/provenance path and the Phase 10
 fresh-install/cross-network evidence path on one fail-closed command. Reduced
 helper evidence is useful for narrowing defects, but it is not treated as a
 substitute for full release-gate evidence.
+
+Authoritative release-gate reporting is generated during gate execution:
+
+- `artifacts/release/phase5_gate_report.json`
+- `artifacts/release/phase5_readiness_bundle.json`
+
+Those files must come from the current gate run. They record
+`executed_passed`, `executed_failed`, and `not_executed` states; pre-existing
+files are not accepted as proof.
 
 Current sign-off references:
 

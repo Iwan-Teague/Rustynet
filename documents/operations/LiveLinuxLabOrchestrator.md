@@ -62,6 +62,11 @@ ready for the standard four-stage operator pipeline:
 3. `ops vm-lab-run-live-lab`
 4. `ops vm-lab-diagnose-live-lab-failure`
 
+`ops vm-lab-setup-live-lab` writes `state/setup_manifest.json` and
+`state/report_state.json` before the setup stages run. Those artifacts bind the
+report directory to the current commit, dirty/clean tree state, profile,
+inventory identity when present, wrapper version/source, and setup flags.
+
 If discovery shows live IPs but `readiness.execution_ready=false`, the guest IPs
 are known but the host-to-guest SSH path is still not usable end to end. Use
 the local restart wrapper and wait for readiness before continuing:
@@ -95,6 +100,19 @@ cargo run --quiet -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
 
 Add `--stop-after-ready` when you want the wrapper to prove UTM recovery and
 inventory freshness without continuing into setup.
+
+Reuse rules are fail-closed:
+
+- `ops vm-lab-run-live-lab` only reuses a setup-only report directory when the
+  provenance-bound setup manifest still matches the current commit, dirty-tree
+  state, profile, wrapper identity, and any stored inventory identity.
+- A populated report directory that already contains run-stage evidence is not
+  reusable for a fresh run.
+- `ops vm-lab-orchestrate-live-lab` requires a fresh report directory and will
+  not write into a populated one.
+
+When reuse is rejected, either pick a new empty `--report-dir` or rerun setup
+from the exact same commit and inputs against the original report directory.
 
 ## Target topology
 

@@ -41,7 +41,9 @@ const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
+const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
+const VM_LAB_WRAPPER_SOURCE_RELATIVE_PATH: &str = "crates/rustynet-cli/src/vm_lab/mod.rs";
 const DEFAULT_PRECHECK_COMMANDS: &[&str] = &["git", "cargo", "systemctl"];
 const POLL_INTERVAL_MILLIS: u64 = 100;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -613,14 +615,77 @@ struct LiveLabSetupSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LiveLabSetupManifest {
-    version: u32,
-    profile_path: String,
-    profile_sha256: String,
-    script_path: String,
-    script_sha256: String,
+struct LiveLabFileBinding {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabGitProvenance {
+    git_commit: String,
+    git_tree_clean: bool,
     source_mode: String,
     repo_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabSetupModeFlags {
+    require_same_network: Option<bool>,
+    dry_run: bool,
+    max_parallel_node_workers: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabRunModeFlags {
+    dry_run: bool,
+    skip_setup: bool,
+    skip_gates: bool,
+    skip_soak: bool,
+    skip_cross_network: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabSetupManifest {
+    version: u32,
+    created_at_unix: u64,
+    report_dir_path: String,
+    report_dir_sha256: String,
+    profile: LiveLabFileBinding,
+    profile_semantic_sha256: String,
+    script: LiveLabFileBinding,
+    inventory: Option<LiveLabFileBinding>,
+    wrapper_source: LiveLabFileBinding,
+    wrapper_version: String,
+    git: LiveLabGitProvenance,
+    setup_flags: LiveLabSetupModeFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabRunProvenance {
+    invoked_at_unix: u64,
+    profile: LiveLabFileBinding,
+    profile_semantic_sha256: String,
+    script: LiveLabFileBinding,
+    wrapper_source: LiveLabFileBinding,
+    wrapper_version: String,
+    git: LiveLabGitProvenance,
+    run_flags: LiveLabRunModeFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LiveLabReportState {
+    version: u32,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    report_dir_path: String,
+    report_dir_sha256: String,
+    setup_manifest_sha256: String,
+    setup_complete: bool,
+    run_complete: bool,
+    run_passed: bool,
+    full_release_gate_requested: bool,
+    full_release_evidence_complete: bool,
+    last_run: Option<LiveLabRunProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,28 +899,196 @@ fn normalize_manifest_path(path: &Path) -> String {
         .to_string()
 }
 
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn file_sha256_hex(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path)
         .map_err(|err| format!("read for sha256 failed ({}): {err}", path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex_bytes(bytes.as_slice()))
 }
 
-fn build_setup_manifest(
-    profile_path: &Path,
-    script_path: &Path,
+fn semantic_live_lab_profile_sha256(path: &Path) -> Result<String, String> {
+    let profile = load_live_lab_profile(path)?;
+    let body = serde_json::to_vec(&profile.values)
+        .map_err(|err| format!("serialize live-lab profile semantic digest failed: {err}"))?;
+    Ok(sha256_hex_bytes(body.as_slice()))
+}
+
+fn report_dir_sha256(report_dir: &Path) -> String {
+    sha256_hex_bytes(normalize_manifest_path(report_dir).as_bytes())
+}
+
+fn file_binding(path: &Path) -> Result<LiveLabFileBinding, String> {
+    Ok(LiveLabFileBinding {
+        path: normalize_manifest_path(path),
+        sha256: file_sha256_hex(path)?,
+    })
+}
+
+fn optional_file_binding(path: Option<&Path>) -> Result<Option<LiveLabFileBinding>, String> {
+    path.map(file_binding).transpose()
+}
+
+fn git_head_commit() -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.current_dir(workspace_root_path());
+    command.args(["rev-parse", "HEAD"]);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed with status {}",
+            status_code(output.status)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))?;
+    let commit = stdout.trim().to_ascii_lowercase();
+    if commit.len() != 40
+        || !commit
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "git rev-parse HEAD returned invalid commit: {commit}"
+        ));
+    }
+    Ok(commit)
+}
+
+fn current_git_provenance(
     source_mode: &str,
     repo_ref: Option<&str>,
-) -> Result<LiveLabSetupManifest, String> {
-    Ok(LiveLabSetupManifest {
-        version: 1,
-        profile_path: normalize_manifest_path(profile_path),
-        profile_sha256: file_sha256_hex(profile_path)?,
-        script_path: normalize_manifest_path(script_path),
-        script_sha256: file_sha256_hex(script_path)?,
+) -> Result<LiveLabGitProvenance, String> {
+    Ok(LiveLabGitProvenance {
+        git_commit: git_head_commit()?,
+        git_tree_clean: !git_worktree_is_dirty()?,
         source_mode: source_mode.to_string(),
         repo_ref: repo_ref.map(ToOwned::to_owned),
+    })
+}
+
+fn current_wrapper_source_binding() -> Result<LiveLabFileBinding, String> {
+    file_binding(&workspace_root_path().join(VM_LAB_WRAPPER_SOURCE_RELATIVE_PATH))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabSetupManifestInput {
+    report_dir: PathBuf,
+    profile_path: PathBuf,
+    script_path: PathBuf,
+    inventory_path: Option<PathBuf>,
+    source_mode: String,
+    repo_ref: Option<String>,
+    require_same_network: Option<bool>,
+    dry_run: bool,
+    max_parallel_node_workers: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveLabSetupManifestExpectation {
+    report_dir: PathBuf,
+    profile_path: PathBuf,
+    script_path: PathBuf,
+    inventory_path: Option<PathBuf>,
+    source_mode: String,
+    repo_ref: Option<String>,
+    require_same_network: Option<bool>,
+    dry_run: Option<bool>,
+    max_parallel_node_workers: Option<usize>,
+}
+
+fn validate_file_binding(
+    label: &str,
+    actual: &LiveLabFileBinding,
+    current: &LiveLabFileBinding,
+) -> Result<(), String> {
+    if actual.path != current.path || actual.sha256 != current.sha256 {
+        return Err(format!(
+            "setup manifest {label} provenance mismatch: actual={} current={}",
+            serde_json::to_string(actual)
+                .unwrap_or_else(|_| format!("<{label}-actual-serialize-error>")),
+            serde_json::to_string(current)
+                .unwrap_or_else(|_| format!("<{label}-current-serialize-error>"))
+        ));
+    }
+    Ok(())
+}
+
+fn report_dir_contains_regular_entries(report_dir: &Path) -> Result<bool, String> {
+    if !report_dir.exists() {
+        return Ok(false);
+    }
+    if !report_dir.is_dir() {
+        return Err(format!(
+            "report directory path is not a directory: {}",
+            report_dir.display()
+        ));
+    }
+    let mut pending = vec![report_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)
+            .map_err(|err| format!("read report directory failed ({}): {err}", dir.display()))?
+        {
+            let entry = entry.map_err(|err| {
+                format!("iterate report directory failed ({}): {err}", dir.display())
+            })?;
+            let file_type = entry.file_type().map_err(|err| {
+                format!(
+                    "read report directory entry type failed ({}): {err}",
+                    entry.path().display()
+                )
+            })?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_report_dir_fresh(report_dir: &Path, command_name: &str) -> Result<(), String> {
+    if !report_dir.exists() {
+        return Ok(());
+    }
+    if report_dir_contains_regular_entries(report_dir)? {
+        return Err(format!(
+            "{command_name} refuses to reuse non-empty report dir {}; use a new report dir or the matching provenance-bound resume path",
+            report_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn build_setup_manifest(input: &LiveLabSetupManifestInput) -> Result<LiveLabSetupManifest, String> {
+    Ok(LiveLabSetupManifest {
+        version: 2,
+        created_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("clock failure while building setup manifest: {err}"))?
+            .as_secs(),
+        report_dir_path: normalize_manifest_path(input.report_dir.as_path()),
+        report_dir_sha256: report_dir_sha256(input.report_dir.as_path()),
+        profile: file_binding(input.profile_path.as_path())?,
+        profile_semantic_sha256: semantic_live_lab_profile_sha256(input.profile_path.as_path())?,
+        script: file_binding(input.script_path.as_path())?,
+        inventory: optional_file_binding(input.inventory_path.as_deref())?,
+        wrapper_source: current_wrapper_source_binding()?,
+        wrapper_version: env!("CARGO_PKG_VERSION").to_string(),
+        git: current_git_provenance(input.source_mode.as_str(), input.repo_ref.as_deref())?,
+        setup_flags: LiveLabSetupModeFlags {
+            require_same_network: input.require_same_network,
+            dry_run: input.dry_run,
+            max_parallel_node_workers: input.max_parallel_node_workers,
+        },
     })
 }
 
@@ -884,37 +1117,281 @@ fn read_setup_manifest(report_dir: &Path) -> Result<LiveLabSetupManifest, String
         .map_err(|err| format!("parse setup manifest failed ({}): {err}", path.display()))
 }
 
-fn setup_manifest_matches(actual: &LiveLabSetupManifest, expected: &LiveLabSetupManifest) -> bool {
-    actual.version == expected.version
-        && actual.profile_sha256 == expected.profile_sha256
-        && actual.script_sha256 == expected.script_sha256
-        && actual.source_mode == expected.source_mode
-        && actual.repo_ref == expected.repo_ref
+fn setup_manifest_sha256(report_dir: &Path) -> Result<String, String> {
+    file_sha256_hex(&report_dir.join(SETUP_MANIFEST_RELATIVE_PATH))
 }
 
-fn validate_setup_manifest(
+fn write_report_state(report_dir: &Path, state: &LiveLabReportState) -> Result<(), String> {
+    let path = report_dir.join(REPORT_STATE_RELATIVE_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("report state path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create report state directory failed ({}): {err}",
+            parent.display()
+        )
+    })?;
+    let body = serde_json::to_vec_pretty(state)
+        .map_err(|err| format!("serialize report state failed: {err}"))?;
+    fs::write(&path, body)
+        .map_err(|err| format!("write report state failed ({}): {err}", path.display()))
+}
+
+fn read_report_state(report_dir: &Path) -> Result<LiveLabReportState, String> {
+    let path = report_dir.join(REPORT_STATE_RELATIVE_PATH);
+    let body = fs::read(&path)
+        .map_err(|err| format!("read report state failed ({}): {err}", path.display()))?;
+    serde_json::from_slice(&body)
+        .map_err(|err| format!("parse report state failed ({}): {err}", path.display()))
+}
+
+fn initial_report_state(
     report_dir: &Path,
+    _manifest: &LiveLabSetupManifest,
+) -> Result<LiveLabReportState, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock failure while building report state: {err}"))?
+        .as_secs();
+    Ok(LiveLabReportState {
+        version: 1,
+        created_at_unix: now,
+        updated_at_unix: now,
+        report_dir_path: normalize_manifest_path(report_dir),
+        report_dir_sha256: report_dir_sha256(report_dir),
+        setup_manifest_sha256: setup_manifest_sha256(report_dir)?,
+        setup_complete: false,
+        run_complete: false,
+        run_passed: false,
+        full_release_gate_requested: false,
+        full_release_evidence_complete: false,
+        last_run: None,
+    })
+}
+
+fn update_report_state_setup_complete(report_dir: &Path) -> Result<(), String> {
+    let mut state = read_report_state(report_dir)?;
+    state.updated_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock failure while updating setup state: {err}"))?
+        .as_secs();
+    state.setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
+    state.setup_complete = true;
+    state.run_complete = false;
+    state.run_passed = false;
+    state.full_release_gate_requested = false;
+    state.full_release_evidence_complete = false;
+    state.last_run = None;
+    write_report_state(report_dir, &state)
+}
+
+fn build_run_provenance(
     profile_path: &Path,
     script_path: &Path,
     source_mode: &str,
     repo_ref: Option<&str>,
-) -> Result<(), String> {
-    let actual = read_setup_manifest(report_dir)?;
-    let expected = build_setup_manifest(profile_path, script_path, source_mode, repo_ref)?;
-    if setup_manifest_matches(&actual, &expected) {
-        return Ok(());
-    }
-    Err(format!(
-        "setup manifest does not match current live-lab inputs: actual={} expected={}",
-        serde_json::to_string(&actual).unwrap_or_else(|_| "<manifest-serialize-error>".to_string()),
-        serde_json::to_string(&expected)
-            .unwrap_or_else(|_| "<manifest-serialize-error>".to_string())
-    ))
+    flags: &LiveLabRunModeFlags,
+) -> Result<LiveLabRunProvenance, String> {
+    Ok(LiveLabRunProvenance {
+        invoked_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| format!("clock failure while building run provenance: {err}"))?
+            .as_secs(),
+        profile: file_binding(profile_path)?,
+        profile_semantic_sha256: semantic_live_lab_profile_sha256(profile_path)?,
+        script: file_binding(script_path)?,
+        wrapper_source: current_wrapper_source_binding()?,
+        wrapper_version: env!("CARGO_PKG_VERSION").to_string(),
+        git: current_git_provenance(source_mode, repo_ref)?,
+        run_flags: flags.clone(),
+    })
 }
 
-fn live_lab_report_has_existing_state(report_dir: &Path) -> bool {
-    report_dir.join("state/stages.tsv").exists()
-        || report_dir.join(SETUP_MANIFEST_RELATIVE_PATH).exists()
+fn update_report_state_after_run(
+    report_dir: &Path,
+    run_provenance: LiveLabRunProvenance,
+    run_passed: bool,
+    full_release_gate_requested: bool,
+    full_release_evidence_complete: bool,
+) -> Result<(), String> {
+    let mut state = read_report_state(report_dir)?;
+    state.updated_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("clock failure while updating run state: {err}"))?
+        .as_secs();
+    state.setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
+    state.setup_complete = live_lab_setup_complete(report_dir)?;
+    state.run_complete = true;
+    state.run_passed = run_passed;
+    state.full_release_gate_requested = full_release_gate_requested;
+    state.full_release_evidence_complete = full_release_evidence_complete;
+    state.last_run = Some(run_provenance);
+    write_report_state(report_dir, &state)
+}
+
+fn validate_setup_manifest(
+    report_dir: &Path,
+    expected: &LiveLabSetupManifestExpectation,
+) -> Result<(), String> {
+    let actual = read_setup_manifest(report_dir)?;
+    if actual.version != 2 {
+        return Err(format!(
+            "unsupported setup manifest version {} in {}",
+            actual.version,
+            report_dir.join(SETUP_MANIFEST_RELATIVE_PATH).display()
+        ));
+    }
+    let expected_report_dir_path = normalize_manifest_path(expected.report_dir.as_path());
+    let expected_report_dir_sha256 = report_dir_sha256(expected.report_dir.as_path());
+    if actual.report_dir_path != expected_report_dir_path
+        || actual.report_dir_sha256 != expected_report_dir_sha256
+    {
+        return Err(format!(
+            "setup manifest report-dir provenance mismatch: actual={{\"path\":\"{}\",\"sha256\":\"{}\"}} current={{\"path\":\"{}\",\"sha256\":\"{}\"}}",
+            actual.report_dir_path,
+            actual.report_dir_sha256,
+            expected_report_dir_path,
+            expected_report_dir_sha256
+        ));
+    }
+    let current_profile = file_binding(expected.profile_path.as_path())?;
+    validate_file_binding("profile", &actual.profile, &current_profile)?;
+    let current_profile_semantic_sha256 =
+        semantic_live_lab_profile_sha256(expected.profile_path.as_path())?;
+    if actual.profile_semantic_sha256 != current_profile_semantic_sha256 {
+        return Err(format!(
+            "setup manifest profile semantic provenance mismatch: actual={} current={}",
+            actual.profile_semantic_sha256, current_profile_semantic_sha256
+        ));
+    }
+    let current_script = file_binding(expected.script_path.as_path())?;
+    validate_file_binding("script", &actual.script, &current_script)?;
+    let current_inventory_binding = match expected.inventory_path.as_deref() {
+        Some(path) => Some(file_binding(path)?),
+        None => actual
+            .inventory
+            .as_ref()
+            .map(|binding| file_binding(Path::new(binding.path.as_str())))
+            .transpose()?,
+    };
+    match (&actual.inventory, &current_inventory_binding) {
+        (Some(actual_binding), Some(current_binding)) => {
+            validate_file_binding("inventory", actual_binding, current_binding)?
+        }
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("setup manifest inventory provenance mismatch".to_string());
+        }
+    }
+    let current_wrapper_source = current_wrapper_source_binding()?;
+    validate_file_binding(
+        "wrapper_source",
+        &actual.wrapper_source,
+        &current_wrapper_source,
+    )?;
+    if actual.wrapper_version != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "setup manifest wrapper version mismatch: actual={} current={}",
+            actual.wrapper_version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    let current_git =
+        current_git_provenance(expected.source_mode.as_str(), expected.repo_ref.as_deref())?;
+    if actual.git != current_git {
+        return Err(format!(
+            "setup manifest git provenance mismatch: actual={} current={}",
+            serde_json::to_string(&actual.git)
+                .unwrap_or_else(|_| "<git-serialize-error>".to_string()),
+            serde_json::to_string(&current_git)
+                .unwrap_or_else(|_| "<git-serialize-error>".to_string())
+        ));
+    }
+    if let Some(value) = expected.require_same_network
+        && actual.setup_flags.require_same_network != Some(value)
+    {
+        return Err(format!(
+            "setup manifest require_same_network mismatch: actual={} current={value}",
+            actual
+                .setup_flags
+                .require_same_network
+                .map(|flag| flag.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    }
+    if let Some(value) = expected.dry_run
+        && actual.setup_flags.dry_run != value
+    {
+        return Err(format!(
+            "setup manifest dry_run mismatch: actual={} current={value}",
+            actual.setup_flags.dry_run
+        ));
+    }
+    if let Some(value) = expected.max_parallel_node_workers
+        && actual.setup_flags.max_parallel_node_workers != Some(value)
+    {
+        return Err(format!(
+            "setup manifest max_parallel_node_workers mismatch: actual={} current={value}",
+            actual
+                .setup_flags
+                .max_parallel_node_workers
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    }
+    Ok(())
+}
+
+fn validate_report_state(report_dir: &Path) -> Result<LiveLabReportState, String> {
+    let state = read_report_state(report_dir)?;
+    if state.version != 1 {
+        return Err(format!(
+            "unsupported report state version {} in {}",
+            state.version,
+            report_dir.join(REPORT_STATE_RELATIVE_PATH).display()
+        ));
+    }
+    let expected_report_dir_path = normalize_manifest_path(report_dir);
+    let expected_report_dir_sha256 = report_dir_sha256(report_dir);
+    if state.report_dir_path != expected_report_dir_path
+        || state.report_dir_sha256 != expected_report_dir_sha256
+    {
+        return Err(format!(
+            "report state report-dir provenance mismatch: actual={{\"path\":\"{}\",\"sha256\":\"{}\"}} current={{\"path\":\"{}\",\"sha256\":\"{}\"}}",
+            state.report_dir_path,
+            state.report_dir_sha256,
+            expected_report_dir_path,
+            expected_report_dir_sha256
+        ));
+    }
+    let expected_setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
+    if state.setup_manifest_sha256 != expected_setup_manifest_sha256 {
+        return Err(format!(
+            "report state setup manifest provenance mismatch: actual={} current={}",
+            state.setup_manifest_sha256, expected_setup_manifest_sha256
+        ));
+    }
+    Ok(state)
+}
+
+fn resolve_setup_selection_from_existing_manifest(
+    report_dir: &Path,
+) -> Result<LiveLabSetupSelection, String> {
+    let manifest = read_setup_manifest(report_dir)?;
+    let profile_path = PathBuf::from(manifest.profile.path);
+    ensure_local_regular_file_path(profile_path.as_path(), "existing live-lab profile")?;
+    execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+        profile_path: profile_path.clone(),
+        expected_backend: None,
+        expected_source_mode: None,
+        require_five_node: false,
+    })?;
+    Ok(LiveLabSetupSelection {
+        profile_path,
+        profile_generated: false,
+        profile_generation_summary: None,
+    })
 }
 
 fn resolve_run_setup_reuse(
@@ -926,15 +1403,62 @@ fn resolve_run_setup_reuse(
     skip_setup: bool,
 ) -> Result<bool, String> {
     if !report_dir.exists() {
+        if skip_setup {
+            return Err(format!(
+                "vm-lab-run-live-lab --skip-setup requires an existing provenance-bound setup report dir: {}",
+                report_dir.display()
+            ));
+        }
         return Ok(false);
     }
-    let can_continue_from_setup = live_lab_setup_complete(report_dir)?
-        && !live_lab_report_has_non_setup_stage_records(report_dir)?;
-    let explicit_skip_reuses_state = skip_setup && live_lab_report_has_existing_state(report_dir);
-    if can_continue_from_setup || explicit_skip_reuses_state {
-        validate_setup_manifest(report_dir, profile_path, script_path, source_mode, repo_ref)?;
+    let has_regular_entries = report_dir_contains_regular_entries(report_dir)?;
+    if !has_regular_entries {
+        if skip_setup {
+            return Err(format!(
+                "vm-lab-run-live-lab --skip-setup requires a populated provenance-bound setup report dir: {}",
+                report_dir.display()
+            ));
+        }
+        return Ok(false);
     }
-    Ok(can_continue_from_setup)
+    let expectation = LiveLabSetupManifestExpectation {
+        report_dir: report_dir.to_path_buf(),
+        profile_path: profile_path.to_path_buf(),
+        script_path: script_path.to_path_buf(),
+        inventory_path: None,
+        source_mode: source_mode.to_string(),
+        repo_ref: repo_ref.map(ToOwned::to_owned),
+        require_same_network: None,
+        dry_run: None,
+        max_parallel_node_workers: None,
+    };
+    validate_setup_manifest(report_dir, &expectation)?;
+    let report_state = validate_report_state(report_dir)?;
+    if !report_state.setup_complete {
+        return Err(format!(
+            "report dir {} cannot be reused because setup is not complete",
+            report_dir.display()
+        ));
+    }
+    if report_state.run_complete || report_state.last_run.is_some() {
+        return Err(format!(
+            "report dir {} already contains run provenance; use a fresh report dir for a new run",
+            report_dir.display()
+        ));
+    }
+    if !live_lab_setup_complete(report_dir)? {
+        return Err(format!(
+            "report dir {} is missing completed setup stage evidence",
+            report_dir.display()
+        ));
+    }
+    if live_lab_report_has_non_setup_stage_records(report_dir)? {
+        return Err(format!(
+            "report dir {} already contains non-setup stage records and cannot be reused for a fresh run",
+            report_dir.display()
+        ));
+    }
+    Ok(true)
 }
 
 impl VmLabIterationValidationStep {
@@ -2625,14 +3149,30 @@ pub fn execute_ops_vm_lab_setup_live_lab(
                 .to_string(),
         );
     }
-
-    fs::create_dir_all(config.report_dir.as_path()).map_err(|err| {
+    let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
+    let setup_reuse_requested = config.resume_from.is_some() || config.rerun_stage.is_some();
+    if setup_reuse_requested {
+        if !report_dir.exists() {
+            return Err(format!(
+                "vm-lab-setup-live-lab resume/rerun requires an existing report dir: {}",
+                report_dir.display()
+            ));
+        }
+        if !report_dir_contains_regular_entries(report_dir.as_path())? {
+            return Err(format!(
+                "vm-lab-setup-live-lab resume/rerun requires an existing provenance-bound report dir with setup state: {}",
+                report_dir.display()
+            ));
+        }
+    } else {
+        ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-setup-live-lab")?;
+    }
+    fs::create_dir_all(report_dir.as_path()).map_err(|err| {
         format!(
             "create setup report directory failed ({}): {err}",
-            config.report_dir.display()
+            report_dir.display()
         )
     })?;
-    let selection = resolve_setup_live_lab_selection(&config)?;
     let (resolved_source_mode, resolved_repo_ref) = resolve_iteration_source_selection(
         config.source_mode.as_deref(),
         config.repo_ref.as_deref(),
@@ -2640,13 +3180,76 @@ pub fn execute_ops_vm_lab_setup_live_lab(
         false,
         false,
     )?;
+    let selection = if setup_reuse_requested {
+        let selection = match config.profile_path.as_deref() {
+            Some(profile_path) => {
+                execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+                    profile_path: profile_path.to_path_buf(),
+                    expected_backend: None,
+                    expected_source_mode: None,
+                    require_five_node: false,
+                })?;
+                LiveLabSetupSelection {
+                    profile_path: profile_path.to_path_buf(),
+                    profile_generated: false,
+                    profile_generation_summary: None,
+                }
+            }
+            None => resolve_setup_selection_from_existing_manifest(report_dir.as_path())?,
+        };
+        let expectation = LiveLabSetupManifestExpectation {
+            report_dir: report_dir.clone(),
+            profile_path: selection.profile_path.clone(),
+            script_path: config.script_path.clone(),
+            inventory_path: Some(config.inventory_path.clone()),
+            source_mode: resolved_source_mode.clone(),
+            repo_ref: resolved_repo_ref.clone(),
+            require_same_network: Some(config.require_same_network),
+            dry_run: Some(config.dry_run),
+            max_parallel_node_workers: config.max_parallel_node_workers,
+        };
+        validate_setup_manifest(report_dir.as_path(), &expectation)?;
+        let report_state = validate_report_state(report_dir.as_path())?;
+        if report_state.run_complete || report_state.last_run.is_some() {
+            return Err(format!(
+                "report dir {} already contains run provenance and cannot be reused for setup",
+                report_dir.display()
+            ));
+        }
+        if live_lab_report_has_non_setup_stage_records(report_dir.as_path())? {
+            return Err(format!(
+                "report dir {} already contains non-setup stage records and cannot be reused for setup",
+                report_dir.display()
+            ));
+        }
+        selection
+    } else {
+        let mut selection_config = config.clone();
+        selection_config.report_dir = report_dir.clone();
+        let selection = resolve_setup_live_lab_selection(&selection_config)?;
+        let manifest = build_setup_manifest(&LiveLabSetupManifestInput {
+            report_dir: report_dir.clone(),
+            profile_path: selection.profile_path.clone(),
+            script_path: config.script_path.clone(),
+            inventory_path: Some(config.inventory_path.clone()),
+            source_mode: resolved_source_mode.clone(),
+            repo_ref: resolved_repo_ref.clone(),
+            require_same_network: Some(config.require_same_network),
+            dry_run: config.dry_run,
+            max_parallel_node_workers: config.max_parallel_node_workers,
+        })?;
+        write_setup_manifest(report_dir.as_path(), &manifest)?;
+        let report_state = initial_report_state(report_dir.as_path(), &manifest)?;
+        write_report_state(report_dir.as_path(), &report_state)?;
+        selection
+    };
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
     let mut command = Command::new("bash");
     command.arg(config.script_path.as_path());
     command
         .arg("--profile")
         .arg(selection.profile_path.as_path());
-    command.arg("--report-dir").arg(config.report_dir.as_path());
+    command.arg("--report-dir").arg(report_dir.as_path());
     command.arg("--setup-only");
     if config.dry_run {
         command.arg("--dry-run");
@@ -2673,9 +3276,9 @@ pub fn execute_ops_vm_lab_setup_live_lab(
 
     let status = run_status_with_timeout_passthrough(&mut command, timeout)
         .map_err(|err| format!("live-lab setup failed: {err}"))?;
-    validate_live_lab_run_artifacts(config.report_dir.as_path())?;
-    let summary = summarize_live_lab_report(config.report_dir.as_path(), false, 1)?;
-    let records = parse_live_lab_stage_records(config.report_dir.as_path())?;
+    validate_live_lab_run_artifacts(report_dir.as_path())?;
+    let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
+    let records = parse_live_lab_stage_records(report_dir.as_path())?;
     let mut warnings = Vec::new();
     if selection.profile_generated {
         warnings.push(format!(
@@ -2686,15 +3289,8 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     if let Some(profile_summary) = selection.profile_generation_summary {
         warnings.push(profile_summary);
     }
-    let manifest_error = if status.success() {
-        match build_setup_manifest(
-            selection.profile_path.as_path(),
-            config.script_path.as_path(),
-            resolved_source_mode.as_str(),
-            resolved_repo_ref.as_deref(),
-        )
-        .and_then(|manifest| write_setup_manifest(config.report_dir.as_path(), &manifest))
-        {
+    let state_update_error = if status.success() {
+        match update_report_state_setup_complete(report_dir.as_path()) {
             Ok(()) => None,
             Err(err) => {
                 warnings.push(err.clone());
@@ -2704,36 +3300,36 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     } else {
         None
     };
-    let next_actions = if status.success() && manifest_error.is_none() {
+    let next_actions = if status.success() && state_update_error.is_none() {
         vec![format!(
             "Run vm-lab-run-live-lab with --profile {} --report-dir {}",
             selection.profile_path.display(),
-            config.report_dir.display()
+            report_dir.display()
         )]
-    } else if manifest_error.is_some() {
+    } else if state_update_error.is_some() {
         vec![format!(
-            "Re-run vm-lab-setup-live-lab for report dir {} after fixing setup manifest persistence",
-            config.report_dir.display()
+            "Re-run vm-lab-setup-live-lab for report dir {} after fixing report-state persistence",
+            report_dir.display()
         )]
     } else {
         vec![format!(
             "Run vm-lab-diagnose-live-lab-failure with --profile {} --report-dir {}",
             selection.profile_path.display(),
-            config.report_dir.display()
+            report_dir.display()
         )]
     };
     let rendered = render_vm_lab_command_result(
         "vm-lab-setup-live-lab",
-        config.report_dir.as_path(),
+        report_dir.as_path(),
         &summary,
         &records,
         warnings,
         next_actions,
-        manifest_error
+        state_update_error
             .as_ref()
             .map(|_| VmLabCommandOverallStatus::Fail),
     )?;
-    if status.success() && manifest_error.is_none() {
+    if status.success() && state_update_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -2767,6 +3363,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
                 default_live_lab_report_root().join(format!("run_{}", unique_suffix()))
             }),
     };
+    let report_dir = resolve_absolute_path(report_dir.as_path())?;
     let can_continue_from_setup = resolve_run_setup_reuse(
         report_dir.as_path(),
         config.profile_path.as_path(),
@@ -2775,6 +3372,29 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         resolved_repo_ref.as_deref(),
         config.skip_setup,
     )?;
+    if !can_continue_from_setup {
+        ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-run-live-lab")?;
+        fs::create_dir_all(report_dir.as_path()).map_err(|err| {
+            format!(
+                "create live-lab report directory failed ({}): {err}",
+                report_dir.display()
+            )
+        })?;
+        let manifest = build_setup_manifest(&LiveLabSetupManifestInput {
+            report_dir: report_dir.clone(),
+            profile_path: config.profile_path.clone(),
+            script_path: config.script_path.clone(),
+            inventory_path: None,
+            source_mode: resolved_source_mode.clone(),
+            repo_ref: resolved_repo_ref.clone(),
+            require_same_network: None,
+            dry_run: config.dry_run,
+            max_parallel_node_workers: None,
+        })?;
+        write_setup_manifest(report_dir.as_path(), &manifest)?;
+        let report_state = initial_report_state(report_dir.as_path(), &manifest)?;
+        write_report_state(report_dir.as_path(), &report_state)?;
+    }
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
     let mut command = Command::new("bash");
     command.arg(config.script_path.as_path());
@@ -2832,6 +3452,37 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     } else {
         None
     };
+    let run_passed = status.success() && completeness_error.is_none();
+    let full_release_evidence_complete =
+        run_passed && release_gate_report.requested && release_gate_report.status == "complete";
+    let state_update_error = match build_run_provenance(
+        config.profile_path.as_path(),
+        config.script_path.as_path(),
+        resolved_source_mode.as_str(),
+        resolved_repo_ref.as_deref(),
+        &LiveLabRunModeFlags {
+            dry_run: config.dry_run,
+            skip_setup: config.skip_setup || can_continue_from_setup,
+            skip_gates: config.skip_gates,
+            skip_soak: config.skip_soak,
+            skip_cross_network: config.skip_cross_network,
+        },
+    )
+    .and_then(|run_provenance| {
+        update_report_state_after_run(
+            report_dir.as_path(),
+            run_provenance,
+            run_passed,
+            release_gate_report.requested,
+            full_release_evidence_complete,
+        )
+    }) {
+        Ok(()) => None,
+        Err(err) => {
+            warnings.push(err.clone());
+            Some(err)
+        }
+    };
     let next_actions = if status.success() && completeness_error.is_none() {
         Vec::new()
     } else if let Some(message) = completeness_error.as_ref() {
@@ -2858,12 +3509,17 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         &records,
         warnings,
         next_actions,
-        completeness_error
+        state_update_error
             .as_ref()
-            .filter(|_| status.success())
-            .map(|_| VmLabCommandOverallStatus::Fail),
+            .map(|_| VmLabCommandOverallStatus::Fail)
+            .or_else(|| {
+                completeness_error
+                    .as_ref()
+                    .filter(|_| status.success())
+                    .map(|_| VmLabCommandOverallStatus::Fail)
+            }),
     )?;
-    if status.success() && completeness_error.is_none() {
+    if status.success() && completeness_error.is_none() && state_update_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -2881,6 +3537,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     )?;
 
     let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
+    ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")?;
     fs::create_dir_all(report_dir.as_path()).map_err(|err| {
         format!(
             "create orchestration report directory failed ({}): {err}",
@@ -10493,6 +11150,42 @@ mod tests {
         fs::write(report_dir.join("state/stages.tsv"), rendered).expect("stages should write");
     }
 
+    fn cleanup_temp_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    fn build_test_setup_manifest(
+        report_dir: &Path,
+        profile_path: &Path,
+        script_path: &Path,
+        inventory_path: Option<&Path>,
+    ) -> super::LiveLabSetupManifest {
+        super::build_setup_manifest(&super::LiveLabSetupManifestInput {
+            report_dir: report_dir.to_path_buf(),
+            profile_path: profile_path.to_path_buf(),
+            script_path: script_path.to_path_buf(),
+            inventory_path: inventory_path.map(Path::to_path_buf),
+            source_mode: "local-head".to_string(),
+            repo_ref: Some("HEAD".to_string()),
+            require_same_network: Some(true),
+            dry_run: false,
+            max_parallel_node_workers: None,
+        })
+        .expect("manifest should build")
+    }
+
+    fn write_setup_only_report_state(report_dir: &Path, manifest: &super::LiveLabSetupManifest) {
+        super::write_setup_manifest(report_dir, manifest).expect("manifest should write");
+        let state =
+            super::initial_report_state(report_dir, manifest).expect("report state should build");
+        super::write_report_state(report_dir, &state).expect("report state should write");
+        write_temp_stage_rows(report_dir, &[("validate_baseline_runtime", "pass")]);
+        super::update_report_state_setup_complete(report_dir)
+            .expect("setup-complete state should write");
+    }
+
     #[test]
     fn default_utmctl_path_matches_expected_bundle_location() {
         assert_eq!(
@@ -12354,57 +13047,57 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn validate_setup_manifest_rejects_mismatched_source_mode() {
         let report_dir = write_temp_report_dir();
         let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
         );
         let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
 
-        let manifest = super::build_setup_manifest(
+        let manifest = build_test_setup_manifest(
+            report_dir.as_path(),
             profile_path.as_path(),
             script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-        )
-        .expect("manifest should build");
+            None,
+        );
         super::write_setup_manifest(report_dir.as_path(), &manifest)
             .expect("manifest should write");
 
         let err = super::validate_setup_manifest(
             report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "archive",
-            Some("HEAD"),
+            &super::LiveLabSetupManifestExpectation {
+                report_dir: report_dir.clone(),
+                profile_path: profile_path.clone(),
+                script_path: script_path.clone(),
+                inventory_path: None,
+                source_mode: "archive".to_string(),
+                repo_ref: Some("HEAD".to_string()),
+                require_same_network: Some(true),
+                dry_run: Some(false),
+                max_parallel_node_workers: None,
+            },
         )
         .expect_err("mismatched source mode must fail closed");
 
-        assert!(err.contains("setup manifest does not match current live-lab inputs"));
+        assert!(err.contains("git provenance mismatch"));
 
         let _ = fs::remove_dir_all(report_dir);
-        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
-        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
     }
 
     #[test]
     fn resolve_run_setup_reuse_allows_matching_auto_continue() {
         let report_dir = write_temp_report_dir();
         let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
         );
         let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
 
-        write_temp_stage_rows(
+        let manifest = build_test_setup_manifest(
             report_dir.as_path(),
-            &[("validate_baseline_runtime", "pass")],
-        );
-        let manifest = super::build_setup_manifest(
             profile_path.as_path(),
             script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-        )
-        .expect("manifest should build");
-        super::write_setup_manifest(report_dir.as_path(), &manifest)
-            .expect("manifest should write");
+            None,
+        );
+        write_setup_only_report_state(report_dir.as_path(), &manifest);
 
         let continue_from_setup = super::resolve_run_setup_reuse(
             report_dir.as_path(),
@@ -12417,17 +13110,129 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         .expect("matching manifest should allow setup reuse");
 
         assert!(continue_from_setup);
+        let report_state = super::validate_report_state(report_dir.as_path())
+            .expect("report state should validate");
+        assert!(report_state.setup_complete);
+        assert!(!report_state.run_complete);
 
         let _ = fs::remove_dir_all(report_dir);
-        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
-        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
     }
 
     #[test]
-    fn resolve_run_setup_reuse_rejects_explicit_skip_setup_when_manifest_mismatches() {
+    fn resolve_run_setup_reuse_rejects_commit_mismatch() {
         let report_dir = write_temp_report_dir();
         let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let mut manifest = build_test_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            None,
+        );
+        manifest.git.git_commit = "0000000000000000000000000000000000000000".to_string();
+        write_setup_only_report_state(report_dir.as_path(), &manifest);
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("commit mismatch must fail closed");
+
+        assert!(err.contains("git provenance mismatch"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_dirty_tree_mismatch() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let mut manifest = build_test_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            None,
+        );
+        manifest.git.git_tree_clean = !manifest.git.git_tree_clean;
+        write_setup_only_report_state(report_dir.as_path(), &manifest);
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("dirty-tree mismatch must fail closed");
+
+        assert!(err.contains("git provenance mismatch"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_profile_topology_mismatch() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nENTRY_TARGET=\"debian@entry-a\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let manifest = build_test_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            None,
+        );
+        write_setup_only_report_state(report_dir.as_path(), &manifest);
+        fs::write(
+            profile_path.as_path(),
+            fs::read_to_string(profile_path.as_path())
+                .expect("profile should read")
+                .replace("entry-a", "entry-b"),
+        )
+        .expect("profile should rewrite");
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("profile topology mismatch must fail closed");
+
+        assert!(err.contains("profile provenance mismatch"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_missing_manifest() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
         );
         let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
 
@@ -12435,31 +13240,161 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             report_dir.as_path(),
             &[("validate_baseline_runtime", "pass")],
         );
-        let manifest = super::build_setup_manifest(
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-        )
-        .expect("manifest should build");
-        super::write_setup_manifest(report_dir.as_path(), &manifest)
-            .expect("manifest should write");
 
         let err = super::resolve_run_setup_reuse(
             report_dir.as_path(),
             profile_path.as_path(),
             script_path.as_path(),
-            "archive",
+            "local-head",
             Some("HEAD"),
             true,
         )
-        .expect_err("explicit skip-setup with mismatched manifest must fail closed");
+        .expect_err("missing manifest must fail closed");
 
-        assert!(err.contains("setup manifest does not match current live-lab inputs"));
+        assert!(err.contains("read setup manifest failed"));
 
         let _ = fs::remove_dir_all(report_dir);
-        let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
-        let _ = fs::remove_dir_all(script_path.parent().expect("script dir should exist"));
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_malformed_manifest() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        fs::write(
+            report_dir.join(super::SETUP_MANIFEST_RELATIVE_PATH),
+            "{not-json\n",
+        )
+        .expect("manifest should write");
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("malformed manifest must fail closed");
+
+        assert!(err.contains("parse setup manifest failed"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_missing_report_state() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let manifest = build_test_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            None,
+        );
+        super::write_setup_manifest(report_dir.as_path(), &manifest)
+            .expect("manifest should write");
+        write_temp_stage_rows(
+            report_dir.as_path(),
+            &[("validate_baseline_runtime", "pass")],
+        );
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("missing report state must fail closed");
+
+        assert!(err.contains("read report state failed"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn resolve_run_setup_reuse_rejects_prior_run_state() {
+        let report_dir = write_temp_report_dir();
+        let profile_path = write_temp_live_lab_profile(
+            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
+        );
+        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
+
+        let manifest = build_test_setup_manifest(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            None,
+        );
+        write_setup_only_report_state(report_dir.as_path(), &manifest);
+        let run_provenance = super::build_run_provenance(
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            &super::LiveLabRunModeFlags {
+                dry_run: false,
+                skip_setup: true,
+                skip_gates: false,
+                skip_soak: false,
+                skip_cross_network: false,
+            },
+        )
+        .expect("run provenance should build");
+        super::update_report_state_after_run(
+            report_dir.as_path(),
+            run_provenance,
+            false,
+            false,
+            false,
+        )
+        .expect("run state should write");
+
+        let err = super::resolve_run_setup_reuse(
+            report_dir.as_path(),
+            profile_path.as_path(),
+            script_path.as_path(),
+            "local-head",
+            Some("HEAD"),
+            true,
+        )
+        .expect_err("prior run state must fail closed");
+
+        assert!(err.contains("already contains run provenance"));
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+        cleanup_temp_path(script_path.as_path());
+    }
+
+    #[test]
+    fn ensure_report_dir_fresh_rejects_non_empty_directory() {
+        let report_dir = write_temp_report_dir();
+        fs::write(report_dir.join("orchestration.log"), "occupied\n")
+            .expect("occupied marker should write");
+
+        let err =
+            super::ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")
+                .expect_err("non-empty report dir must fail closed");
+
+        assert!(err.contains("refuses to reuse non-empty report dir"));
+
+        let _ = fs::remove_dir_all(report_dir);
     }
 
     #[test]
