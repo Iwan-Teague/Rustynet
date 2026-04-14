@@ -3794,6 +3794,7 @@ stage_run_local_full_gate_suite() {
     fi
     printf '[%s] PASS %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$script" | tee -a "$gate_log"
   }
+  refresh_phase6_linux_parity_probe_from_lab
   run_gate ./scripts/ci/phase1_gates.sh
   run_gate ./scripts/ci/phase3_gates.sh
   run_gate ./scripts/ci/phase4_gates.sh
@@ -3812,6 +3813,56 @@ stage_run_local_full_gate_suite() {
   run_gate ./scripts/ci/supply_chain_integrity_gates.sh
   run_gate ./scripts/ci/perf_regression_gate.sh
   printf '\n[%s] FULL GATE SUITE PASS\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$gate_log"
+}
+
+phase6_parity_inbox_dir() {
+  printf '%s/artifacts/release/inbox' "$ROOT_DIR"
+}
+
+phase6_linux_parity_inbox_path() {
+  printf '%s/platform_parity_linux.json' "$(phase6_parity_inbox_dir)"
+}
+
+refresh_phase6_linux_parity_probe_from_lab() {
+  local target remote_raw_dir remote_probe_path remote_leak_report local_inbox
+  local local_leak_report
+  target="${EXIT_TARGET:-}"
+  if [[ -z "$target" ]]; then
+    printf 'phase6 linux parity refresh requires an exit target\n' >&2
+    return 1
+  fi
+
+  remote_raw_dir="/var/tmp/rustynet-phase6-parity"
+  remote_probe_path="/tmp/rn-platform-parity-linux.json"
+  remote_leak_report="/tmp/rn-phase6-leak_test_report.json"
+  local_inbox="$(phase6_linux_parity_inbox_path)"
+  local_leak_report="${ROOT_DIR}/artifacts/phase10/leak_test_report.json"
+
+  if [[ ! -f "$local_leak_report" ]]; then
+    printf 'phase6 linux parity refresh requires local leak report: %s\n' "$local_leak_report" >&2
+    return 1
+  fi
+
+  mkdir -p "$(phase6_parity_inbox_dir)"
+  if ! live_lab_scp_to "$local_leak_report" "$target" "$remote_leak_report"; then
+    return 1
+  fi
+  if ! live_lab_run_root "$target" "root install -d -m 0700 '${remote_raw_dir}' && root env RUSTYNET_PHASE6_PARITY_RAW_DIR='${remote_raw_dir}' RUSTYNET_PHASE6_PLATFORM_OVERRIDE='linux' RUSTYNET_PHASE6_LEAK_REPORT_LINUX='${remote_leak_report}' rustynet ops collect-platform-probe && root install -m 0644 '${remote_raw_dir}/platform_parity_linux.json' '${remote_probe_path}'"; then
+    live_lab_run_root "$target" "root rm -f '${remote_probe_path}' '${remote_leak_report}' '${remote_raw_dir}/platform_parity_linux.json' >/dev/null 2>&1 || true; root rmdir '${remote_raw_dir}' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if ! live_lab_scp_from "$target" "$remote_probe_path" "$local_inbox"; then
+    live_lab_run_root "$target" "root rm -f '${remote_probe_path}' '${remote_leak_report}' '${remote_raw_dir}/platform_parity_linux.json' >/dev/null 2>&1 || true; root rmdir '${remote_raw_dir}' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  live_lab_run_root "$target" "root rustynet ops secure-remove --path '${remote_probe_path}' >/dev/null 2>&1 || root rm -f '${remote_probe_path}'; root rustynet ops secure-remove --path '${remote_leak_report}' >/dev/null 2>&1 || root rm -f '${remote_leak_report}'; root rustynet ops secure-remove --path '${remote_raw_dir}/platform_parity_linux.json' >/dev/null 2>&1 || root rm -f '${remote_raw_dir}/platform_parity_linux.json'; root rmdir '${remote_raw_dir}' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+
+  cargo run --quiet -p rustynet-cli -- ops check-local-file-mode \
+    --path "$local_inbox" \
+    --policy no-group-world-write \
+    --label 'phase6 linux parity inbox probe' >/dev/null
 }
 
 stage_run_live_exit_handoff() {

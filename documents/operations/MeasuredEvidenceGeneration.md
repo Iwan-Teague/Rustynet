@@ -57,6 +57,16 @@ Generate full three-platform bundle (collects local host probe, imports missing 
 ./scripts/release/collect_platform_parity_bundle.sh
 ```
 
+Bundle-collection import policy:
+- the collector imports a probe from `artifacts/release/inbox/` when the raw probe is missing
+- the collector also replaces a stale or older raw probe with a fresher inbox probe for the same platform
+- stale seeded raw probes are not authoritative if fresher measured inbox evidence exists
+- when a fresh external measured probe file already exists on disk, you can stage it into the inbox during bundle collection with:
+  - `RUSTYNET_PHASE6_LINUX_PROBE_SOURCE=/absolute/path/to/platform_parity_linux.json`
+  - `RUSTYNET_PHASE6_MACOS_PROBE_SOURCE=/absolute/path/to/platform_parity_macos.json`
+  - `RUSTYNET_PHASE6_WINDOWS_PROBE_SOURCE=/absolute/path/to/platform_parity_windows.json`
+- staged external probe files must already be measured, platform-matching, and fresh; stale or future-dated probe files fail closed and are not imported
+
 Optional inbox location for probes collected on other hosts:
 - `artifacts/release/inbox/platform_parity_linux.json`
 - `artifacts/release/inbox/platform_parity_macos.json`

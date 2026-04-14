@@ -518,6 +518,7 @@ Raw measured inputs must exist first:
 - `artifacts/release/raw/platform_parity_linux.json`
 - `artifacts/release/raw/platform_parity_macos.json`
 - `artifacts/release/raw/platform_parity_windows.json`
+- if a fresh measured platform probe was collected on another host first, stage it into the Phase 6 bundle with `RUSTYNET_PHASE6_{LINUX|MACOS|WINDOWS}_PROBE_SOURCE=/absolute/path/to/platform_parity_<platform>.json` before running the parity bundle/gates
 - `artifacts/operations/source/*.ndjson|*.json` phase9 source logs/config:
   - `compatibility_policy.json`
   - `crypto_deprecation_schedule.json`

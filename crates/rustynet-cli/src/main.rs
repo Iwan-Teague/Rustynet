@@ -4818,6 +4818,14 @@ impl Phase6Platform {
         }
     }
 
+    fn probe_source_env_var(self) -> &'static str {
+        match self {
+            Self::Linux => "RUSTYNET_PHASE6_LINUX_PROBE_SOURCE",
+            Self::Macos => "RUSTYNET_PHASE6_MACOS_PROBE_SOURCE",
+            Self::Windows => "RUSTYNET_PHASE6_WINDOWS_PROBE_SOURCE",
+        }
+    }
+
     fn all() -> [Self; 3] {
         [Self::Linux, Self::Macos, Self::Windows]
     }
@@ -4862,28 +4870,23 @@ fn execute_ops_collect_platform_parity_bundle() -> Result<String, String> {
         )
     })?;
 
+    let now_unix = unix_now();
+    for platform in Phase6Platform::all() {
+        let inbox_path = inbox_dir.join(platform.raw_filename());
+        phase6_stage_probe_from_source_env(platform, inbox_path.as_path(), now_unix)?;
+    }
+
     collect_platform_probe_artifact()?;
 
     for platform in Phase6Platform::all() {
         let raw_path = raw_dir.join(platform.raw_filename());
         let inbox_path = inbox_dir.join(platform.raw_filename());
-        if !raw_path.exists() && inbox_path.exists() {
-            fs::copy(&inbox_path, &raw_path).map_err(|err| {
-                format!(
-                    "copy platform probe from inbox failed ({} -> {}): {err}",
-                    inbox_path.display(),
-                    raw_path.display()
-                )
-            })?;
-        }
-        if !raw_path.exists() {
-            return Err(format!(
-                "missing platform parity probe for {}: expected {} or {}",
-                platform.as_str(),
-                raw_path.display(),
-                inbox_path.display()
-            ));
-        }
+        phase6_sync_platform_probe_from_inbox(
+            platform,
+            raw_path.as_path(),
+            inbox_path.as_path(),
+            now_unix,
+        )?;
     }
 
     let report_path = generate_platform_parity_report_artifact()?;
@@ -4892,6 +4895,162 @@ fn execute_ops_collect_platform_parity_bundle() -> Result<String, String> {
     ops_phase9::execute_ops_verify_phase6_parity_evidence()?;
 
     Ok("phase6 platform parity bundle generated from probes".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct Phase6ProbeMetadata {
+    payload: Value,
+    probe_time_unix: u64,
+    is_fresh: bool,
+}
+
+fn phase6_load_probe_metadata(
+    path: &Path,
+    platform: Phase6Platform,
+    now_unix: u64,
+) -> Result<Option<Phase6ProbeMetadata>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let payload = read_json_value(path, "platform parity probe")?;
+    let payload_obj = payload.as_object().ok_or_else(|| {
+        format!(
+            "platform parity probe must be JSON object: {}",
+            path.display()
+        )
+    })?;
+    if payload_obj
+        .get("evidence_mode")
+        .and_then(Value::as_str)
+        .is_none_or(|mode| mode != "measured")
+    {
+        return Err(format!(
+            "platform parity probe must set evidence_mode=measured: {}",
+            path.display()
+        ));
+    }
+
+    let payload_platform = payload_obj
+        .get("platform")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if payload_platform != platform.as_str() {
+        return Err(format!(
+            "platform parity probe platform mismatch: expected {} got {} ({})",
+            platform.as_str(),
+            if payload_platform.is_empty() {
+                "<missing>"
+            } else {
+                payload_platform.as_str()
+            },
+            path.display()
+        ));
+    }
+
+    let probe_time_unix = payload_obj
+        .get("probe_time_unix")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "platform parity probe requires positive integer probe_time_unix: {}",
+                path.display()
+            )
+        })?;
+    if probe_time_unix == 0 {
+        return Err(format!(
+            "platform parity probe requires positive integer probe_time_unix: {}",
+            path.display()
+        ));
+    }
+    if probe_time_unix > now_unix.saturating_add(300) {
+        return Err(format!(
+            "platform parity probe probe_time_unix is too far in the future: {}",
+            path.display()
+        ));
+    }
+
+    Ok(Some(Phase6ProbeMetadata {
+        payload,
+        probe_time_unix,
+        is_fresh: now_unix.saturating_sub(probe_time_unix) <= PHASE6_MAX_EVIDENCE_AGE_SECS,
+    }))
+}
+
+fn phase6_stage_probe_from_source_env(
+    platform: Phase6Platform,
+    inbox_path: &Path,
+    now_unix: u64,
+) -> Result<(), String> {
+    let Some(source_path) =
+        env_optional_string(platform.probe_source_env_var())?.map(PathBuf::from)
+    else {
+        return Ok(());
+    };
+
+    phase6_stage_probe_from_source(platform, source_path.as_path(), inbox_path, now_unix)
+}
+
+fn phase6_stage_probe_from_source(
+    platform: Phase6Platform,
+    source_path: &Path,
+    inbox_path: &Path,
+    now_unix: u64,
+) -> Result<(), String> {
+    let metadata =
+        phase6_load_probe_metadata(source_path, platform, now_unix)?.ok_or_else(|| {
+            format!(
+                "phase6 external platform probe missing: {}",
+                source_path.display()
+            )
+        })?;
+    if !metadata.is_fresh {
+        return Err(format!(
+            "phase6 external platform probe is stale; recollect probe evidence: {}",
+            source_path.display()
+        ));
+    }
+
+    write_json_pretty_file(inbox_path, &metadata.payload)?;
+    Ok(())
+}
+
+fn phase6_sync_platform_probe_from_inbox(
+    platform: Phase6Platform,
+    raw_path: &Path,
+    inbox_path: &Path,
+    now_unix: u64,
+) -> Result<(), String> {
+    let raw_metadata = phase6_load_probe_metadata(raw_path, platform, now_unix)?;
+    let inbox_metadata = phase6_load_probe_metadata(inbox_path, platform, now_unix)?;
+
+    let should_import_inbox = match (&raw_metadata, &inbox_metadata) {
+        (None, Some(inbox)) => inbox.is_fresh,
+        (Some(raw), Some(inbox)) => {
+            inbox.is_fresh && (!raw.is_fresh || inbox.probe_time_unix > raw.probe_time_unix)
+        }
+        _ => false,
+    };
+
+    if should_import_inbox {
+        let inbox_payload = inbox_metadata
+            .as_ref()
+            .expect("inbox metadata must exist when import is selected");
+        write_json_pretty_file(raw_path, &inbox_payload.payload)?;
+    }
+
+    if raw_path.exists() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "missing platform parity probe for {}: expected {} or {}",
+        platform.as_str(),
+        raw_path.display(),
+        inbox_path.display()
+    ))
 }
 
 fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
@@ -11608,17 +11767,20 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, contains_ip_rule_lookup_table, detect_tampered_log, execute, help_text,
-        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
-        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
-        render_launchd_plist, required_macos_tunnel_keychain_account,
-        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
-        rewrite_env_key_value, to_ipc_command, validate_control_socket_security,
+        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, contains_ip_rule_lookup_table,
+        detect_tampered_log, execute, help_text, is_interface_absent_detail, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
+        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
+        parse_command, parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
+        persist_encrypted_secret_material, phase6_stage_probe_from_source,
+        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
+        phase6_validate_platform_parity_report, read_json_value, render_launchd_plist,
+        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
+        validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
+    use serde_json::Value;
     use std::fs;
 
     #[test]
@@ -11904,6 +12066,335 @@ mod tests {
         let error = phase6_validate_platform_parity_report(report_path.as_path())
             .expect_err("expected fail-closed parity validation error");
         assert!(error.contains("route_hook_ready must be true"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_sync_platform_probe_from_inbox_prefers_fresh_inbox_over_stale_raw() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-sync-fresh-inbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let raw_path = base.join("platform_parity_linux.json");
+        let inbox_path = base.join("platform_parity_linux.inbox.json");
+        let now = unix_now();
+        let stale_probe_time = now.saturating_sub(PHASE6_MAX_EVIDENCE_AGE_SECS + 10);
+        let fresh_probe_time = now.saturating_sub(5);
+
+        write_json_pretty_file(
+            raw_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "linux",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": stale_probe_time,
+                "probe_host": "stale-linux-host",
+                "probe_sources": {
+                    "route": "ip -o route show default",
+                    "dns": "resolvectl status",
+                    "firewall": "nft list tables",
+                    "leak_report": "artifacts/phase10/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write stale raw probe");
+        write_json_pretty_file(
+            inbox_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "linux",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": fresh_probe_time,
+                "probe_host": "fresh-linux-host",
+                "probe_sources": {
+                    "route": "ip -o route show default",
+                    "dns": "resolvectl status",
+                    "firewall": "nft list tables",
+                    "leak_report": "artifacts/phase10/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write inbox probe");
+
+        phase6_sync_platform_probe_from_inbox(
+            Phase6Platform::Linux,
+            raw_path.as_path(),
+            inbox_path.as_path(),
+            now,
+        )
+        .expect("fresh inbox probe should replace stale raw probe");
+
+        let synced = read_json_value(raw_path.as_path(), "synced parity probe")
+            .expect("synced raw probe should be readable");
+        assert_eq!(
+            synced
+                .get("probe_host")
+                .and_then(Value::as_str)
+                .expect("probe_host should exist"),
+            "fresh-linux-host"
+        );
+        assert_eq!(
+            synced
+                .get("probe_time_unix")
+                .and_then(Value::as_u64)
+                .expect("probe_time_unix should exist"),
+            fresh_probe_time
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_sync_platform_probe_from_inbox_keeps_fresh_raw_when_inbox_is_stale() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-sync-keep-raw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let raw_path = base.join("platform_parity_windows.json");
+        let inbox_path = base.join("platform_parity_windows.inbox.json");
+        let now = unix_now();
+        let fresh_probe_time = now.saturating_sub(5);
+        let stale_probe_time = now.saturating_sub(PHASE6_MAX_EVIDENCE_AGE_SECS + 10);
+
+        write_json_pretty_file(
+            raw_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "windows",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": fresh_probe_time,
+                "probe_host": "fresh-windows-host",
+                "probe_sources": {
+                    "route": "powershell.exe Get-NetRoute",
+                    "dns": "powershell.exe Get-DnsClientServerAddress",
+                    "firewall": "powershell.exe Get-NetFirewallProfile",
+                    "leak_report": "artifacts/phase10/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write fresh raw probe");
+        write_json_pretty_file(
+            inbox_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "windows",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": stale_probe_time,
+                "probe_host": "stale-windows-host",
+                "probe_sources": {
+                    "route": "powershell.exe Get-NetRoute",
+                    "dns": "powershell.exe Get-DnsClientServerAddress",
+                    "firewall": "powershell.exe Get-NetFirewallProfile",
+                    "leak_report": "artifacts/phase10/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write stale inbox probe");
+
+        phase6_sync_platform_probe_from_inbox(
+            Phase6Platform::Windows,
+            raw_path.as_path(),
+            inbox_path.as_path(),
+            now,
+        )
+        .expect("stale inbox probe must not override fresh raw probe");
+
+        let synced = read_json_value(raw_path.as_path(), "synced parity probe")
+            .expect("raw probe should still be readable");
+        assert_eq!(
+            synced
+                .get("probe_host")
+                .and_then(Value::as_str)
+                .expect("probe_host should exist"),
+            "fresh-windows-host"
+        );
+        assert_eq!(
+            synced
+                .get("probe_time_unix")
+                .and_then(Value::as_u64)
+                .expect("probe_time_unix should exist"),
+            fresh_probe_time
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_stage_probe_from_source_rejects_stale_probe() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-stage-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let source_path = base.join("platform_parity_windows.source.json");
+        let inbox_path = base.join("platform_parity_windows.inbox.json");
+        let now = unix_now();
+        let stale_probe_time = now.saturating_sub(PHASE6_MAX_EVIDENCE_AGE_SECS + 10);
+
+        write_json_pretty_file(
+            source_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "windows",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": stale_probe_time,
+                "probe_host": "stale-windows-host",
+                "probe_sources": {
+                    "route": "powershell.exe Get-NetRoute",
+                    "dns": "powershell.exe Get-DnsClientServerAddress",
+                    "firewall": "powershell.exe Get-NetFirewallProfile",
+                    "leak_report": "C:/Temp/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write stale probe");
+
+        let error = phase6_stage_probe_from_source(
+            Phase6Platform::Windows,
+            source_path.as_path(),
+            inbox_path.as_path(),
+            now,
+        )
+        .expect_err("stale external probe must be rejected");
+        assert!(error.contains("stale"));
+        assert!(!inbox_path.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_stage_probe_from_source_writes_fresh_probe_to_inbox() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-stage-fresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let source_path = base.join("platform_parity_windows.source.json");
+        let inbox_path = base.join("platform_parity_windows.inbox.json");
+        let now = unix_now();
+        let fresh_probe_time = now.saturating_sub(5);
+
+        write_json_pretty_file(
+            source_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "windows",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": fresh_probe_time,
+                "probe_host": "fresh-windows-host",
+                "probe_sources": {
+                    "route": "powershell.exe Get-NetRoute",
+                    "dns": "powershell.exe Get-DnsClientServerAddress",
+                    "firewall": "powershell.exe Get-NetFirewallProfile",
+                    "leak_report": "C:/Temp/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write fresh probe");
+
+        phase6_stage_probe_from_source(
+            Phase6Platform::Windows,
+            source_path.as_path(),
+            inbox_path.as_path(),
+            now,
+        )
+        .expect("fresh external probe must be staged");
+
+        let staged = read_json_value(inbox_path.as_path(), "staged parity probe")
+            .expect("staged probe should be readable");
+        assert_eq!(
+            staged
+                .get("probe_host")
+                .and_then(Value::as_str)
+                .expect("probe_host should exist"),
+            "fresh-windows-host"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn phase6_sync_platform_probe_from_inbox_rejects_future_dated_probe() {
+        let base = std::env::temp_dir().join(format!(
+            "rustynet-phase6-sync-future-inbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let raw_path = base.join("platform_parity_windows.json");
+        let inbox_path = base.join("platform_parity_windows.inbox.json");
+        let now = unix_now();
+        let future_probe_time = now.saturating_add(301);
+
+        write_json_pretty_file(
+            inbox_path.as_path(),
+            &serde_json::json!({
+                "evidence_mode": "measured",
+                "platform": "windows",
+                "route_hook_ready": true,
+                "dns_hook_ready": true,
+                "firewall_hook_ready": true,
+                "leak_matrix_passed": true,
+                "probe_time_unix": future_probe_time,
+                "probe_host": "future-windows-host",
+                "probe_sources": {
+                    "route": "powershell.exe Get-NetRoute",
+                    "dns": "powershell.exe Get-DnsClientServerAddress",
+                    "firewall": "powershell.exe Get-NetFirewallProfile",
+                    "leak_report": "C:/Temp/leak_test_report.json",
+                },
+            }),
+        )
+        .expect("write future probe");
+
+        let error = phase6_sync_platform_probe_from_inbox(
+            Phase6Platform::Windows,
+            raw_path.as_path(),
+            inbox_path.as_path(),
+            now,
+        )
+        .expect_err("future-dated probe must be rejected");
+        assert!(error.contains("too far in the future"));
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
