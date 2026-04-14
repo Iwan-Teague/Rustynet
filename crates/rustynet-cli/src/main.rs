@@ -11760,6 +11760,7 @@ fn help_text() -> String {
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-dns-zone-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
+        "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, install, and diagnostics; Linux UTM targets continue to use the existing shell path.",
     ]
     .join("\n")
 }

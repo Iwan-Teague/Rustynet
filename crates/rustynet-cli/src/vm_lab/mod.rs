@@ -40,6 +40,10 @@ const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
+const WINDOWS_VM_LAB_HELPER_ROOT: &str = "scripts/vm_lab/windows";
+const WINDOWS_ENABLE_ACCESS_HELPER_FILE: &str = "Enable-WindowsVmLabAccess.ps1";
+const WINDOWS_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindows.ps1";
+const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
@@ -472,6 +476,281 @@ enum VmController {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VmGuestPlatform {
+    Linux,
+    Macos,
+    Windows,
+    Ios,
+    Android,
+}
+
+impl VmGuestPlatform {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "linux" | "debian" | "ubuntu" | "fedora" | "mint" => Ok(Self::Linux),
+            "macos" | "mac_os" | "osx" | "mac" | "darwin" => Ok(Self::Macos),
+            "windows" | "windows11" | "windows_11" | "win11" | "windows10" | "windows_10" => {
+                Ok(Self::Windows)
+            }
+            "ios" | "iphoneos" | "ipad_os" | "ipados" => Ok(Self::Ios),
+            "android" => Ok(Self::Android),
+            other => Err(format!("unsupported vm guest platform: {other}")),
+        }
+    }
+
+    fn infer(
+        explicit: Option<Self>,
+        os_name: Option<&str>,
+        alias: &str,
+        utm_name: Option<&str>,
+    ) -> Self {
+        if let Some(platform) = explicit {
+            return platform;
+        }
+
+        let mut haystacks = vec![alias.to_ascii_lowercase()];
+        if let Some(value) = os_name {
+            haystacks.push(value.to_ascii_lowercase());
+        }
+        if let Some(value) = utm_name {
+            haystacks.push(value.to_ascii_lowercase());
+        }
+
+        if haystacks.iter().any(|value| {
+            value.contains("windows") || value.contains("win11") || value.contains("win10")
+        }) {
+            Self::Windows
+        } else if haystacks.iter().any(|value| {
+            value.contains("macos")
+                || value.contains("mac os")
+                || value.contains("os x")
+                || value.contains("darwin")
+        }) {
+            Self::Macos
+        } else if haystacks.iter().any(|value| {
+            value.contains("ios") || value.contains("iphone") || value.contains("ipad")
+        }) {
+            Self::Ios
+        } else if haystacks.iter().any(|value| value.contains("android")) {
+            Self::Android
+        } else {
+            Self::Linux
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+            Self::Windows => "windows",
+            Self::Ios => "ios",
+            Self::Android => "android",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VmRemoteShell {
+    Posix,
+    Powershell,
+    Unsupported,
+}
+
+impl VmRemoteShell {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "posix" | "bash" | "sh" => Ok(Self::Posix),
+            "powershell" | "pwsh" => Ok(Self::Powershell),
+            "unsupported" | "none" => Ok(Self::Unsupported),
+            other => Err(format!("unsupported vm remote shell: {other}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::Powershell => "powershell",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VmGuestExecMode {
+    LinuxBash,
+    MacosPosix,
+    WindowsPowershell,
+    Unsupported,
+}
+
+impl VmGuestExecMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "linux_bash" | "bash" => Ok(Self::LinuxBash),
+            "macos_posix" | "macos_shell" | "zsh" => Ok(Self::MacosPosix),
+            "windows_powershell" | "powershell" => Ok(Self::WindowsPowershell),
+            "unsupported" | "none" => Ok(Self::Unsupported),
+            other => Err(format!("unsupported vm guest exec mode: {other}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxBash => "linux_bash",
+            Self::MacosPosix => "macos_posix",
+            Self::WindowsPowershell => "windows_powershell",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VmServiceManager {
+    Systemd,
+    Launchd,
+    WindowsService,
+    Unsupported,
+}
+
+impl VmServiceManager {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "systemd" => Ok(Self::Systemd),
+            "launchd" => Ok(Self::Launchd),
+            "windows_service" | "service" => Ok(Self::WindowsService),
+            "unsupported" | "none" => Ok(Self::Unsupported),
+            other => Err(format!("unsupported vm service manager: {other}")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Systemd => "systemd",
+            Self::Launchd => "launchd",
+            Self::WindowsService => "windows_service",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmPlatformProfile {
+    platform: VmGuestPlatform,
+    remote_shell: VmRemoteShell,
+    guest_exec_mode: VmGuestExecMode,
+    service_manager: VmServiceManager,
+}
+
+fn controller_utm_name(controller: Option<&VmController>) -> Option<&str> {
+    match controller {
+        Some(VmController::LocalUtm { utm_name, .. }) => Some(utm_name.as_str()),
+        None => None,
+    }
+}
+
+fn default_platform_profile(platform: VmGuestPlatform) -> VmPlatformProfile {
+    match platform {
+        VmGuestPlatform::Linux => VmPlatformProfile {
+            platform,
+            remote_shell: VmRemoteShell::Posix,
+            guest_exec_mode: VmGuestExecMode::LinuxBash,
+            service_manager: VmServiceManager::Systemd,
+        },
+        VmGuestPlatform::Macos => VmPlatformProfile {
+            platform,
+            remote_shell: VmRemoteShell::Posix,
+            guest_exec_mode: VmGuestExecMode::MacosPosix,
+            service_manager: VmServiceManager::Launchd,
+        },
+        VmGuestPlatform::Windows => VmPlatformProfile {
+            platform,
+            remote_shell: VmRemoteShell::Powershell,
+            guest_exec_mode: VmGuestExecMode::WindowsPowershell,
+            service_manager: VmServiceManager::WindowsService,
+        },
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => VmPlatformProfile {
+            platform,
+            remote_shell: VmRemoteShell::Unsupported,
+            guest_exec_mode: VmGuestExecMode::Unsupported,
+            service_manager: VmServiceManager::Unsupported,
+        },
+    }
+}
+
+fn effective_platform_profile(
+    explicit_platform: Option<VmGuestPlatform>,
+    explicit_remote_shell: Option<VmRemoteShell>,
+    explicit_guest_exec_mode: Option<VmGuestExecMode>,
+    explicit_service_manager: Option<VmServiceManager>,
+    os_name: Option<&str>,
+    alias: &str,
+    controller: Option<&VmController>,
+) -> VmPlatformProfile {
+    let platform = VmGuestPlatform::infer(
+        explicit_platform,
+        os_name,
+        alias,
+        controller_utm_name(controller),
+    );
+    let defaults = default_platform_profile(platform);
+    VmPlatformProfile {
+        platform,
+        remote_shell: explicit_remote_shell.unwrap_or(defaults.remote_shell),
+        guest_exec_mode: explicit_guest_exec_mode.unwrap_or(defaults.guest_exec_mode),
+        service_manager: explicit_service_manager.unwrap_or(defaults.service_manager),
+    }
+}
+
+fn default_rustynet_src_dir_for_profile(
+    profile: VmPlatformProfile,
+    ssh_user: Option<&str>,
+) -> String {
+    match profile.platform {
+        VmGuestPlatform::Linux => match ssh_user {
+            Some("root") => "/root/Rustynet".to_string(),
+            Some(user) => format!("/home/{user}/Rustynet"),
+            None => "/home/debian/Rustynet".to_string(),
+        },
+        VmGuestPlatform::Macos => match ssh_user {
+            Some("root") => "/var/root/Rustynet".to_string(),
+            Some(user) => format!("/Users/{user}/Rustynet"),
+            None => "/Users/Shared/Rustynet".to_string(),
+        },
+        VmGuestPlatform::Windows => r"C:\Rustynet".to_string(),
+        VmGuestPlatform::Ios => "/var/mobile/Rustynet-unsupported".to_string(),
+        VmGuestPlatform::Android => "/data/local/tmp/Rustynet-unsupported".to_string(),
+    }
+}
+
+fn default_remote_temp_dir_for_profile(profile: VmPlatformProfile) -> String {
+    match profile.platform {
+        VmGuestPlatform::Linux => "/var/tmp".to_string(),
+        VmGuestPlatform::Macos => "/private/var/tmp".to_string(),
+        VmGuestPlatform::Windows => r"C:\ProgramData\Rustynet\vm-lab".to_string(),
+        VmGuestPlatform::Ios => "/var/mobile/tmp/rustynet-unsupported".to_string(),
+        VmGuestPlatform::Android => "/data/local/tmp/rustynet-unsupported".to_string(),
+    }
+}
+
+fn windows_helper_script_local_path(file_name: &str) -> PathBuf {
+    workspace_root_path()
+        .join(WINDOWS_VM_LAB_HELPER_ROOT)
+        .join(file_name)
+}
+
+fn windows_install_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_INSTALL_HELPER_FILE)
+}
+
+fn windows_diagnostics_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VmInventoryEntry {
     alias: String,
@@ -489,8 +768,27 @@ struct VmInventoryEntry {
     mesh_ip: Option<String>,
     exit_capable: Option<bool>,
     relay_capable: Option<bool>,
+    remote_temp_dir: Option<String>,
     rustynet_src_dir: Option<String>,
+    platform: Option<VmGuestPlatform>,
+    remote_shell: Option<VmRemoteShell>,
+    guest_exec_mode: Option<VmGuestExecMode>,
+    service_manager: Option<VmServiceManager>,
     controller: Option<VmController>,
+}
+
+impl VmInventoryEntry {
+    fn platform_profile(&self) -> VmPlatformProfile {
+        effective_platform_profile(
+            self.platform,
+            self.remote_shell,
+            self.guest_exec_mode,
+            self.service_manager,
+            self.os.as_deref(),
+            self.alias.as_str(),
+            self.controller.as_ref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,6 +797,9 @@ struct RemoteTarget {
     ssh_target: String,
     ssh_user: Option<String>,
     controller: Option<VmController>,
+    platform_profile: VmPlatformProfile,
+    rustynet_src_dir: Option<String>,
+    remote_temp_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +810,7 @@ struct StartTarget {
     ssh_user: Option<String>,
     last_known_ip: Option<String>,
     mesh_ip: Option<String>,
+    platform_profile: VmPlatformProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -733,6 +1035,8 @@ struct RoleTarget {
     normalized_target: String,
     network_group: Option<String>,
     utm_name: Option<String>,
+    platform_profile: VmPlatformProfile,
+    rustynet_src_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1704,8 +2008,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let mut inventory_mesh_ip = None;
         let mut inventory_controller_bundle_path = None;
         let mut inventory_controller_utm_name = None;
-
-        if let Some(entry) = inventory_match {
+        let discovery_platform_profile = if let Some(entry) = inventory_match {
             matched_inventory_count += 1;
             inventory_alias = Some(entry.alias.clone());
             inventory_node_id = entry.node_id.clone();
@@ -1737,7 +2040,11 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 discovery_notes
                     .push("utmctl-ip-address-unavailable-using-inventory-fallback".to_string());
             }
+            Some(entry.platform_profile())
         } else {
+            let inferred_platform =
+                VmGuestPlatform::infer(None, None, utm_name.as_str(), Some(utm_name.as_str()));
+            let profile = default_platform_profile(inferred_platform);
             if let Some(ip) = resolve_local_utm_live_host_by_name(
                 utm_name.as_str(),
                 None,
@@ -1748,11 +2055,21 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 live_ip = Some(ip);
             }
             if let Some(ip) = live_ip.clone() {
-                ssh_target_source = "default-debian-guess".to_string();
-                ssh_user = Some("debian".to_string());
-                advisory_ssh_target = Some(rewrite_ssh_target_host("debian@", ip.as_str()));
+                ssh_target_source =
+                    format!("platform-aware-unmatched-{}", inferred_platform.as_str());
+                advisory_ssh_target =
+                    unmatched_local_utm_advisory_target(inferred_platform, ip.as_str());
+                if inferred_platform == VmGuestPlatform::Linux {
+                    ssh_user = Some("debian".to_string());
+                } else {
+                    discovery_notes.push(
+                        "windows-utm-discovered-without-inventory-no-linux-user-assumed"
+                            .to_string(),
+                    );
+                }
             }
-        }
+            Some(profile)
+        };
 
         let live_ip_state = match live_ip.clone() {
             Some(ip) if live_ip_source == "utmctl" => ProbeState::Ok { value: ip },
@@ -1828,20 +2145,26 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 reason: format!("ssh-port-status={ssh_port_status}"),
             },
             (Some(_), Some(ssh_user), Some(ssh_target)) => {
-                match run_remote_shell_command(
-                    ssh_target,
-                    Some(ssh_user),
-                    config.ssh_identity_file.as_deref(),
-                    config.known_hosts_path.as_deref(),
-                    "true",
-                    timeout,
+                match ssh_auth_probe_command(
+                    discovery_platform_profile
+                        .unwrap_or_else(|| default_platform_profile(VmGuestPlatform::Linux)),
                 ) {
-                    Ok(status) if status.success() => ProbeState::Ok {
-                        value: "ok".to_string(),
-                    },
-                    Ok(status) => ProbeState::Fallback {
-                        value: format!("failed-exit-{}", status_code(status)),
-                        reason: "ssh-auth-command-failed".to_string(),
+                    Ok(probe_command) => match run_remote_shell_command(
+                        ssh_target,
+                        Some(ssh_user),
+                        config.ssh_identity_file.as_deref(),
+                        config.known_hosts_path.as_deref(),
+                        probe_command,
+                        timeout,
+                    ) {
+                        Ok(status) if status.success() => ProbeState::Ok {
+                            value: "ok".to_string(),
+                        },
+                        Ok(status) => ProbeState::Fallback {
+                            value: format!("failed-exit-{}", status_code(status)),
+                            reason: "ssh-auth-command-failed".to_string(),
+                        },
+                        Err(err) => ProbeState::Error { reason: err },
                     },
                     Err(err) => ProbeState::Error { reason: err },
                 }
@@ -2200,6 +2523,23 @@ pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, Stri
             target.utm_name,
             target.bundle_path.display()
         ));
+        if target.platform_profile.platform == VmGuestPlatform::Windows {
+            let bootstrap_target = remote_target_from_start_target(target);
+            let host_key_line = bootstrap_windows_access_for_target(
+                &bootstrap_target,
+                None,
+                None,
+                None,
+                None,
+                22,
+                timeout,
+            )
+            .map_err(|err| format!("{} Windows access bootstrap failed: {err}", target.alias))?;
+            results.push(format!(
+                "{} windows-access-bootstrap host_key={}",
+                target.alias, host_key_line
+            ));
+        }
     }
     Ok(results.join("\n"))
 }
@@ -2269,14 +2609,15 @@ pub fn execute_ops_vm_lab_run(
         "SSH known_hosts file",
     )?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
-    let remote_script = build_remote_argv_script(
-        config.workdir.as_str(),
-        config.program.as_str(),
-        config.argv.as_slice(),
-        config.sudo,
-    )?;
     let mut results = Vec::new();
     for target in &targets {
+        let remote_script = build_remote_argv_script_for_target(
+            target,
+            config.workdir.as_str(),
+            config.program.as_str(),
+            config.argv.as_slice(),
+            config.sudo,
+        )?;
         let effective_user = config.ssh_user.as_deref();
         let status = run_remote_shell_command_for_target(
             target,
@@ -2402,6 +2743,17 @@ fn sync_repo_targets(
     timeout: Duration,
 ) -> Result<Vec<String>, String> {
     ensure_no_control_chars("destination directory", dest_dir)?;
+    if targets.iter().any(|target| {
+        matches!(
+            target.platform_profile.platform,
+            VmGuestPlatform::Ios | VmGuestPlatform::Android
+        )
+    }) {
+        return Err(
+            "iOS and Android targets are scaffolding-only for vm-lab repo sync right now"
+                .to_string(),
+        );
+    }
     let mut results = Vec::new();
     match source {
         RepoSyncSource::Git {
@@ -2409,13 +2761,14 @@ fn sync_repo_targets(
             branch,
             remote,
         } => {
-            let repo_sync_script = build_repo_sync_script(
-                repo_url.as_str(),
-                dest_dir,
-                branch.as_str(),
-                remote.as_str(),
-            )?;
             for target in targets {
+                let repo_sync_script = build_repo_sync_script_for_target(
+                    target,
+                    repo_url.as_str(),
+                    dest_dir,
+                    branch.as_str(),
+                    remote.as_str(),
+                )?;
                 let status = run_remote_shell_command_for_target(
                     target,
                     ssh_user_override,
@@ -2446,6 +2799,14 @@ fn sync_repo_targets(
             }
         }
         RepoSyncSource::LocalSource { source_dir } => {
+            if targets
+                .iter()
+                .any(|target| target.platform_profile.platform == VmGuestPlatform::Windows)
+            {
+                return Err(
+                    "Windows targets are not yet supported for vm-lab local-source repo sync in phase 3".to_string(),
+                );
+            }
             let archive = prepare_local_source_archive(source_dir.as_path(), timeout)?;
             for target in targets {
                 sync_local_source_archive_to_target(
@@ -2472,6 +2833,63 @@ fn sync_repo_targets(
         }
     }
     Ok(results)
+}
+
+fn append_target_platform_metadata(
+    lines: &mut Vec<String>,
+    env_prefix: &str,
+    target: &RoleTarget,
+) -> Result<(), String> {
+    let prefix = env_prefix.to_ascii_uppercase();
+    lines.push(format_env_assignment(
+        format!("{}_PLATFORM", prefix).as_str(),
+        target.platform_profile.platform.as_str(),
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_REMOTE_SHELL", prefix).as_str(),
+        target.platform_profile.remote_shell.as_str(),
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_GUEST_EXEC_MODE", prefix).as_str(),
+        target.platform_profile.guest_exec_mode.as_str(),
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_SERVICE_MANAGER", prefix).as_str(),
+        target.platform_profile.service_manager.as_str(),
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_RUSTYNET_SRC_DIR", prefix).as_str(),
+        target.rustynet_src_dir.as_deref().unwrap_or(""),
+    )?);
+    Ok(())
+}
+
+fn append_empty_target_platform_metadata(
+    lines: &mut Vec<String>,
+    env_prefix: &str,
+) -> Result<(), String> {
+    let prefix = env_prefix.to_ascii_uppercase();
+    lines.push(format_env_assignment(
+        format!("{}_PLATFORM", prefix).as_str(),
+        "",
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_REMOTE_SHELL", prefix).as_str(),
+        "",
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_GUEST_EXEC_MODE", prefix).as_str(),
+        "",
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_SERVICE_MANAGER", prefix).as_str(),
+        "",
+    )?);
+    lines.push(format_env_assignment(
+        format!("{}_RUSTYNET_SRC_DIR", prefix).as_str(),
+        "",
+    )?);
+    Ok(())
 }
 
 pub fn execute_ops_vm_lab_write_live_lab_profile(
@@ -2574,9 +2992,11 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
     if let Some(utm_name) = exit_target.utm_name.as_deref() {
         lines.push(format_env_assignment("EXIT_UTM_NAME", utm_name)?);
     }
+    append_target_platform_metadata(&mut lines, "EXIT", &exit_target)?;
     if let Some(utm_name) = client_target.utm_name.as_deref() {
         lines.push(format_env_assignment("CLIENT_UTM_NAME", utm_name)?);
     }
+    append_target_platform_metadata(&mut lines, "CLIENT", &client_target)?;
     if let Some(target) = entry_target {
         lines.push(format_env_assignment(
             "ENTRY_TARGET",
@@ -2585,6 +3005,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         if let Some(utm_name) = target.utm_name.as_deref() {
             lines.push(format_env_assignment("ENTRY_UTM_NAME", utm_name)?);
         }
+        append_target_platform_metadata(&mut lines, "ENTRY", &target)?;
+    } else {
+        append_empty_target_platform_metadata(&mut lines, "ENTRY")?;
     }
     if let Some(target) = aux_target {
         lines.push(format_env_assignment(
@@ -2594,6 +3017,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         if let Some(utm_name) = target.utm_name.as_deref() {
             lines.push(format_env_assignment("AUX_UTM_NAME", utm_name)?);
         }
+        append_target_platform_metadata(&mut lines, "AUX", &target)?;
+    } else {
+        append_empty_target_platform_metadata(&mut lines, "AUX")?;
     }
     if let Some(target) = extra_target {
         lines.push(format_env_assignment(
@@ -2603,6 +3029,9 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
         if let Some(utm_name) = target.utm_name.as_deref() {
             lines.push(format_env_assignment("EXTRA_UTM_NAME", utm_name)?);
         }
+        append_target_platform_metadata(&mut lines, "EXTRA", &target)?;
+    } else {
+        append_empty_target_platform_metadata(&mut lines, "EXTRA")?;
     }
     match fifth_client_target {
         Some(target) => {
@@ -2613,12 +3042,14 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
             if let Some(utm_name) = target.utm_name.as_deref() {
                 lines.push(format_env_assignment("FIFTH_CLIENT_UTM_NAME", utm_name)?);
             }
+            append_target_platform_metadata(&mut lines, "FIFTH_CLIENT", &target)?;
         }
         None => {
             // Keep five-node profiles explicitly non-interactive by declaring the
             // optional sixth-node slots as intentionally empty.
             lines.push(format_env_assignment("FIFTH_CLIENT_TARGET", "")?);
             lines.push(format_env_assignment("FIFTH_CLIENT_UTM_NAME", "")?);
+            append_empty_target_platform_metadata(&mut lines, "FIFTH_CLIENT")?;
         }
     }
     if let Some(path) = config.ssh_known_hosts_file.as_deref() {
@@ -4717,6 +5148,121 @@ fn write_live_lab_worker_results_summary(
     Ok(())
 }
 
+fn collect_windows_diagnostics_for_target(
+    target: &ResolvedLiveLabTarget,
+    target_dir: &Path,
+    timeout: Duration,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let helper_local_path = windows_diagnostics_helper_script_local_path();
+    let remote_root = windows_helper_script_remote_path(
+        &target.remote_target,
+        &format!(
+            "diagnostics\\{}",
+            sanitize_label_for_path(target.role.as_str())
+        ),
+    )?;
+    let context = RemoteFallbackContext {
+        target: &target.remote_target,
+        ssh_user_override: None,
+        ssh_identity_file: None,
+        known_hosts_path: None,
+        timeout,
+    };
+    let output = capture_windows_helper_script_output_from_path(
+        &context,
+        helper_local_path.as_path(),
+        WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
+        &["-OutputRoot".to_string(), remote_root.clone()],
+    )?;
+    let helper_output_root = output.trim();
+    if helper_output_root.is_empty() {
+        return Err(format!(
+            "Windows diagnostics helper did not emit an output root for {}",
+            target.role
+        ));
+    }
+    if helper_output_root != remote_root {
+        return Err(format!(
+            "Windows diagnostics helper emitted unexpected output root for {}: expected {}, got {}",
+            target.role, remote_root, helper_output_root
+        ));
+    }
+
+    let output_files = [
+        "services.txt",
+        "net-ip.txt",
+        "routes.txt",
+        "dns.txt",
+        "firewall.txt",
+        "events-system.txt",
+        "events-application.txt",
+        "tooling.txt",
+    ];
+    let mut copied_paths = Vec::new();
+    for file_name in output_files {
+        let remote_file = windows_guest_path_join(helper_output_root, file_name)?;
+        let local_file = target_dir.join(file_name);
+        let status = if let Some(VmController::LocalUtm { utm_name, .. }) =
+            target.remote_target.controller.as_ref()
+        {
+            utm_pull_raw(
+                utm_name.as_str(),
+                remote_file.as_str(),
+                local_file.as_path(),
+                timeout,
+            )?
+        } else {
+            scp_from_remote(
+                &target.remote_target,
+                None,
+                None,
+                None,
+                remote_file.as_str(),
+                local_file.as_path(),
+                timeout,
+            )?
+        };
+        ensure_success_status(
+            status,
+            format!("copy Windows diagnostics file {file_name}").as_str(),
+        )?;
+        copied_paths.push(local_file);
+    }
+
+    let metadata_path = target_dir.join("metadata.json");
+    let metadata = json!({
+        "role": target.role,
+        "target": target.profile_target,
+        "ssh_target": target.remote_target.ssh_target,
+        "platform": target.remote_target.platform_profile.platform.as_str(),
+        "remote_shell": target.remote_target.platform_profile.remote_shell.as_str(),
+        "guest_exec_mode": target.remote_target.platform_profile.guest_exec_mode.as_str(),
+        "service_manager": target.remote_target.platform_profile.service_manager.as_str(),
+        "remote_output_root": helper_output_root,
+        "helper_script": WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
+        "copied_paths": copied_paths,
+    });
+    fs::write(
+        metadata_path.as_path(),
+        serde_json::to_vec_pretty(&metadata)
+            .map_err(|err| format!("serialize Windows diagnostics metadata failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write Windows diagnostics metadata failed ({}): {err}",
+            metadata_path.display()
+        )
+    })?;
+
+    Ok((
+        vec![format!(
+            "Windows diagnostics helper collected services, network, route, DNS, firewall, event-log, and tooling state for {} via {}",
+            target.role, WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE
+        )],
+        Vec::new(),
+    ))
+}
+
 fn collect_validate_baseline_runtime_remote_probe(
     diagnostics_dir: &Path,
     targets: &[ResolvedLiveLabTarget],
@@ -4729,49 +5275,9 @@ fn collect_validate_baseline_runtime_remote_probe(
             remote_probe_dir.display()
         )
     })?;
-
-    let rustynet_status_script = privileged_rustynet_cli_script("status");
-    let rustynet_netcheck_script = privileged_rustynet_cli_script("netcheck");
-    let sections = [
-        ("hostname", "hostname"),
-        (
-            "service_active",
-            "if command -v systemctl >/dev/null 2>&1; then systemctl is-active rustynetd.service 2>&1; else echo systemctl-unavailable; fi",
-        ),
-        ("rustynet_status", rustynet_status_script.as_str()),
-        ("rustynet_netcheck", rustynet_netcheck_script.as_str()),
-        (
-            "daemon_socket",
-            "if [ -S /run/rustynet/rustynetd.sock ]; then echo daemon_socket=present; else echo daemon_socket=missing; fi",
-        ),
-        (
-            "route_get_1_1_1_1",
-            "if command -v ip >/dev/null 2>&1; then ip -4 route get 1.1.1.1 2>&1; else echo ip-unavailable; fi",
-        ),
-        (
-            "plaintext_passphrase_check",
-            "if test ! -e /var/lib/rustynet/keys/wireguard.passphrase && test ! -e /etc/rustynet/wireguard.passphrase && test ! -e /etc/rustynet/signing_key_passphrase; then echo no-plaintext-passphrase-files; else echo plaintext-passphrase-files-present; fi",
-        ),
-        (
-            "plaintext_passphrase_paths",
-            "for path in /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase /etc/rustynet/signing_key_passphrase; do if [ -e \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
-        ),
-        (
-            "runtime_state_paths",
-            "for path in /run/rustynet/rustynetd.sock /var/lib/rustynet/rustynetd.assignment /var/lib/rustynet/rustynetd.traversal /var/lib/rustynet/rustynetd.dns-zone /var/lib/rustynet/rustynetd.trust; do if [ -e \"$path\" ] || [ -S \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
-        ),
-        (
-            "time_state",
-            "if command -v timedatectl >/dev/null 2>&1; then timedatectl status 2>&1; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi",
-        ),
-        (
-            "journalctl_rustynetd_tail",
-            "if command -v journalctl >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n journalctl -u rustynetd.service --no-pager -n 80 2>&1; else journalctl -u rustynetd.service --no-pager -n 80 2>&1; fi; else echo journalctl-unavailable; fi",
-        ),
-    ];
-    let capture_script = build_section_capture_script(sections.as_slice());
     let mut warnings = Vec::new();
     let mut results = Vec::new();
+    let mut notes = Vec::new();
 
     for target in targets {
         let target_dir = remote_probe_dir.join(sanitize_label_for_path(target.role.as_str()));
@@ -4781,72 +5287,163 @@ fn collect_validate_baseline_runtime_remote_probe(
                 target_dir.display()
             )
         })?;
-        match capture_remote_shell_command_for_target(
-            &target.remote_target,
-            None,
-            None,
-            None,
-            capture_script.as_str(),
-            timeout,
-        ) {
-            Ok(output) => {
-                let sections = parse_section_capture(output.as_str());
-                for (name, body) in &sections {
-                    fs::write(target_dir.join(format!("{name}.txt")), body.as_bytes()).map_err(
-                        |err| {
+        match target.remote_target.platform_profile.platform {
+            VmGuestPlatform::Linux | VmGuestPlatform::Macos => {
+                let rustynet_status_script = privileged_rustynet_cli_script("status");
+                let rustynet_netcheck_script = privileged_rustynet_cli_script("netcheck");
+                let sections = [
+                    ("hostname", "hostname"),
+                    (
+                        "service_active",
+                        "if command -v systemctl >/dev/null 2>&1; then systemctl is-active rustynetd.service 2>&1; else echo systemctl-unavailable; fi",
+                    ),
+                    ("rustynet_status", rustynet_status_script.as_str()),
+                    ("rustynet_netcheck", rustynet_netcheck_script.as_str()),
+                    (
+                        "daemon_socket",
+                        "if [ -S /run/rustynet/rustynetd.sock ]; then echo daemon_socket=present; else echo daemon_socket=missing; fi",
+                    ),
+                    (
+                        "route_get_1_1_1_1",
+                        "if command -v ip >/dev/null 2>&1; then ip -4 route get 1.1.1.1 2>&1; else echo ip-unavailable; fi",
+                    ),
+                    (
+                        "plaintext_passphrase_check",
+                        "if test ! -e /var/lib/rustynet/keys/wireguard.passphrase && test ! -e /etc/rustynet/wireguard.passphrase && test ! -e /etc/rustynet/signing_key_passphrase; then echo no-plaintext-passphrase-files; else echo plaintext-passphrase-files-present; fi",
+                    ),
+                    (
+                        "plaintext_passphrase_paths",
+                        "for path in /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase /etc/rustynet/signing_key_passphrase; do if [ -e \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
+                    ),
+                    (
+                        "runtime_state_paths",
+                        "for path in /run/rustynet/rustynetd.sock /var/lib/rustynet/rustynetd.assignment /var/lib/rustynet/rustynetd.traversal /var/lib/rustynet/rustynetd.dns-zone /var/lib/rustynet/rustynetd.trust; do if [ -e \"$path\" ] || [ -S \"$path\" ]; then ls -ld \"$path\" 2>&1; else printf '%s missing\\n' \"$path\"; fi; done",
+                    ),
+                    (
+                        "time_state",
+                        "if command -v timedatectl >/dev/null 2>&1; then timedatectl status 2>&1; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi",
+                    ),
+                    (
+                        "journalctl_rustynetd_tail",
+                        "if command -v journalctl >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n journalctl -u rustynetd.service --no-pager -n 80 2>&1; else journalctl -u rustynetd.service --no-pager -n 80 2>&1; fi; else echo journalctl-unavailable; fi",
+                    ),
+                ];
+                let capture_script = build_section_capture_script(sections.as_slice());
+                match capture_remote_shell_command_for_target(
+                    &target.remote_target,
+                    None,
+                    None,
+                    None,
+                    capture_script.as_str(),
+                    timeout,
+                ) {
+                    Ok(output) => {
+                        let sections = parse_section_capture(output.as_str());
+                        for (name, body) in &sections {
+                            fs::write(target_dir.join(format!("{name}.txt")), body.as_bytes())
+                                .map_err(|err| {
+                                    format!(
+                                        "write baseline stage probe failed ({} {}): {err}",
+                                        target.role, name
+                                    )
+                                })?;
+                        }
+                        let metadata_path = target_dir.join("metadata.json");
+                        let metadata = json!({
+                            "role": target.role,
+                            "target": target.profile_target,
+                            "ssh_target": target.remote_target.ssh_target,
+                            "platform": target.remote_target.platform_profile.platform.as_str(),
+                            "sections": sections.keys().cloned().collect::<Vec<_>>(),
+                        });
+                        fs::write(
+                            metadata_path.as_path(),
+                            serde_json::to_vec_pretty(&metadata).map_err(|err| {
+                                format!("serialize baseline probe metadata failed: {err}")
+                            })?,
+                        )
+                        .map_err(|err| {
                             format!(
-                                "write baseline stage probe failed ({} {}): {err}",
-                                target.role, name
+                                "write baseline probe metadata failed ({}): {err}",
+                                metadata_path.display()
                             )
-                        },
-                    )?;
+                        })?;
+                        results.push(json!({
+                            "role": target.role,
+                            "target": target.profile_target,
+                            "ssh_target": target.remote_target.ssh_target,
+                            "platform": target.remote_target.platform_profile.platform.as_str(),
+                            "target_dir": target_dir,
+                            "error": Value::Null,
+                        }));
+                    }
+                    Err(err) => {
+                        warnings.push(format!(
+                            "baseline runtime probe failed for {} ({}): {err}",
+                            target.role, target.profile_target
+                        ));
+                        let error_path = target_dir.join("error.txt");
+                        fs::write(error_path.as_path(), err.as_bytes()).map_err(|write_err| {
+                            format!(
+                                "write baseline probe error failed ({}): {write_err}",
+                                error_path.display()
+                            )
+                        })?;
+                        results.push(json!({
+                            "role": target.role,
+                            "target": target.profile_target,
+                            "ssh_target": target.remote_target.ssh_target,
+                            "platform": target.remote_target.platform_profile.platform.as_str(),
+                            "target_dir": target_dir,
+                            "error": err,
+                        }));
+                    }
                 }
-                let metadata_path = target_dir.join("metadata.json");
-                let metadata = json!({
-                    "role": target.role,
-                    "target": target.profile_target,
-                    "ssh_target": target.remote_target.ssh_target,
-                    "sections": sections.keys().cloned().collect::<Vec<_>>(),
-                });
-                fs::write(
-                    metadata_path.as_path(),
-                    serde_json::to_vec_pretty(&metadata).map_err(|err| {
-                        format!("serialize baseline probe metadata failed: {err}")
-                    })?,
-                )
-                .map_err(|err| {
-                    format!(
-                        "write baseline probe metadata failed ({}): {err}",
-                        metadata_path.display()
-                    )
-                })?;
-                results.push(json!({
-                    "role": target.role,
-                    "target": target.profile_target,
-                    "ssh_target": target.remote_target.ssh_target,
-                    "target_dir": target_dir,
-                    "error": Value::Null,
-                }));
             }
-            Err(err) => {
-                warnings.push(format!(
-                    "baseline runtime probe failed for {} ({}): {err}",
-                    target.role, target.profile_target
+            VmGuestPlatform::Windows => {
+                match collect_windows_diagnostics_for_target(target, target_dir.as_path(), timeout)
+                {
+                    Ok((target_notes, target_warnings)) => {
+                        notes.extend(target_notes);
+                        warnings.extend(target_warnings);
+                        results.push(json!({
+                            "role": target.role,
+                            "target": target.profile_target,
+                            "ssh_target": target.remote_target.ssh_target,
+                            "platform": target.remote_target.platform_profile.platform.as_str(),
+                            "target_dir": target_dir,
+                            "error": Value::Null,
+                        }));
+                    }
+                    Err(err) => {
+                        warnings.push(format!(
+                            "Windows baseline runtime diagnostics failed for {} ({}): {err}",
+                            target.role, target.profile_target
+                        ));
+                        let error_path = target_dir.join("error.txt");
+                        fs::write(error_path.as_path(), err.as_bytes()).map_err(|write_err| {
+                            format!(
+                                "write Windows baseline probe error failed ({}): {write_err}",
+                                error_path.display()
+                            )
+                        })?;
+                        results.push(json!({
+                            "role": target.role,
+                            "target": target.profile_target,
+                            "ssh_target": target.remote_target.ssh_target,
+                            "platform": target.remote_target.platform_profile.platform.as_str(),
+                            "target_dir": target_dir,
+                            "error": err,
+                        }));
+                    }
+                }
+            }
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => {
+                return Err(format!(
+                    "baseline runtime diagnostics are not implemented for platform {} ({})",
+                    target.remote_target.platform_profile.platform.as_str(),
+                    target.role
                 ));
-                let error_path = target_dir.join("error.txt");
-                fs::write(error_path.as_path(), err.as_bytes()).map_err(|write_err| {
-                    format!(
-                        "write baseline probe error failed ({}): {write_err}",
-                        error_path.display()
-                    )
-                })?;
-                results.push(json!({
-                    "role": target.role,
-                    "target": target.profile_target,
-                    "ssh_target": target.remote_target.ssh_target,
-                    "target_dir": target_dir,
-                    "error": err,
-                }));
             }
         }
     }
@@ -4868,11 +5465,14 @@ fn collect_validate_baseline_runtime_remote_probe(
         )
     })?;
 
+    let mut summary_notes = vec![
+        "Baseline runtime forensics include focused remote probes for rustynet status, daemon socket presence, route selection, plaintext-passphrase absence, runtime state files, time state, and the last 80 journal lines from rustynetd.".to_string(),
+    ];
+    summary_notes.extend(notes);
+
     Ok(LiveLabStageRemoteProbeSummary {
         remote_probe_dir: Some(remote_probe_dir),
-        notes: vec![
-            "Baseline runtime forensics include focused remote probes for rustynet status, daemon socket presence, route selection, plaintext-passphrase absence, runtime state files, time state, and the last 80 journal lines from rustynetd.".to_string(),
-        ],
+        notes: summary_notes,
         warnings,
     })
 }
@@ -5411,12 +6011,10 @@ fn resolve_live_lab_profile_remote_target(
         return Ok(remote_target);
     }
 
-    Ok(RemoteTarget {
-        label: profile_target.role.clone(),
-        ssh_target: profile_target.target.clone(),
-        ssh_user: ssh_target_user(profile_target.target.as_str()).map(str::to_string),
-        controller: None,
-    })
+    Ok(remote_target_from_raw_target(
+        profile_target.role.clone(),
+        profile_target.target.clone(),
+    ))
 }
 
 fn ensure_live_lab_profile_key(key: &str) -> Result<(), String> {
@@ -7319,6 +7917,7 @@ fn resolve_start_targets(
     let chosen = select_inventory_entries(&inventory, aliases, select_all)?;
     let mut results = Vec::new();
     for entry in chosen {
+        let platform_profile = entry.platform_profile();
         let Some(controller) = entry.controller else {
             return Err(format!(
                 "VM alias {} does not declare a local start controller; only local UTM-backed entries can be started here",
@@ -7329,14 +7928,17 @@ fn resolve_start_targets(
             VmController::LocalUtm {
                 utm_name,
                 bundle_path,
-            } => results.push(StartTarget {
-                alias: entry.alias,
-                utm_name,
-                bundle_path,
-                ssh_user: entry.ssh_user,
-                last_known_ip: entry.last_known_ip,
-                mesh_ip: entry.mesh_ip,
-            }),
+            } => {
+                results.push(StartTarget {
+                    alias: entry.alias,
+                    utm_name,
+                    bundle_path,
+                    ssh_user: entry.ssh_user,
+                    last_known_ip: entry.last_known_ip,
+                    mesh_ip: entry.mesh_ip,
+                    platform_profile,
+                });
+            }
         }
     }
     Ok(results)
@@ -7381,6 +7983,29 @@ fn wait_for_local_utm_targets_ready(
     }
 }
 
+fn ssh_auth_probe_command(profile: VmPlatformProfile) -> Result<&'static str, String> {
+    match profile.remote_shell {
+        VmRemoteShell::Posix => Ok("true"),
+        VmRemoteShell::Powershell => Ok(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$PSVersionTable.PSVersion.ToString() | Out-Null; exit 0\"",
+        ),
+        VmRemoteShell::Unsupported => Err(format!(
+            "vm-lab SSH readiness probing is not yet implemented for platform {}",
+            profile.platform.as_str()
+        )),
+    }
+}
+
+fn unmatched_local_utm_advisory_target(platform: VmGuestPlatform, live_ip: &str) -> Option<String> {
+    match platform {
+        VmGuestPlatform::Linux => Some(rewrite_ssh_target_host("debian@", live_ip)),
+        VmGuestPlatform::Macos
+        | VmGuestPlatform::Windows
+        | VmGuestPlatform::Ios
+        | VmGuestPlatform::Android => Some(live_ip.to_string()),
+    }
+}
+
 fn observe_local_utm_target_ready(
     target: &StartTarget,
     utmctl_path: &Path,
@@ -7413,20 +8038,21 @@ fn observe_local_utm_target_ready(
         (None, _) => "skipped-no-live-ip".to_string(),
         (_, None) => "skipped-no-ssh-user".to_string(),
         (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_string(),
-        (Some(ip), Some(ssh_user)) => {
-            match run_remote_shell_command(
+        (Some(ip), Some(ssh_user)) => match ssh_auth_probe_command(target.platform_profile) {
+            Ok(probe_command) => match run_remote_shell_command(
                 ip,
                 Some(ssh_user),
                 ssh_identity_file,
                 known_hosts_path,
-                "true",
+                probe_command,
                 timeout,
             ) {
                 Ok(status) if status.success() => "ok".to_string(),
                 Ok(status) => format!("failed-exit-{}", status_code(status)),
                 Err(err) => format!("error:{err}"),
-            }
-        }
+            },
+            Err(err) => format!("error:{err}"),
+        },
     };
     LocalUtmReadyState {
         alias: target.alias.clone(),
@@ -7646,12 +8272,10 @@ fn resolve_remote_targets(
         ensure_ssh_target("target", raw_target)?;
         let key = format!("|{raw_target}");
         if seen.insert(key) {
-            resolved.push(RemoteTarget {
-                label: raw_target.clone(),
-                ssh_target: raw_target.clone(),
-                ssh_user: None,
-                controller: None,
-            });
+            resolved.push(remote_target_from_raw_target(
+                raw_target.clone(),
+                raw_target.clone(),
+            ));
         }
     }
 
@@ -7711,13 +8335,23 @@ fn resolve_role_target_from_inventory(
         entry.ssh_user.as_deref(),
         role_label,
     )?;
+    let platform_profile = entry.platform_profile();
+    let utm_name = entry
+        .controller
+        .as_ref()
+        .map(|VmController::LocalUtm { utm_name, .. }| utm_name.clone());
     Ok(RoleTarget {
         label: entry.alias,
         normalized_target,
         network_group: entry.network_group,
-        utm_name: entry
-            .controller
-            .map(|VmController::LocalUtm { utm_name, .. }| utm_name),
+        utm_name,
+        platform_profile,
+        rustynet_src_dir: entry.rustynet_src_dir.clone().or_else(|| {
+            Some(default_rustynet_src_dir_for_profile(
+                platform_profile,
+                entry.ssh_user.as_deref(),
+            ))
+        }),
     })
 }
 
@@ -7728,11 +8362,18 @@ fn resolve_role_target_from_raw(role_label: &str, raw_target: &str) -> Result<Ro
             "{role_label} raw target must include an explicit SSH user (user@host): {raw_target}"
         ));
     }
+    let platform_profile = default_platform_profile(VmGuestPlatform::Linux);
+    let ssh_user = ssh_target_user(raw_target).map(str::to_string);
     Ok(RoleTarget {
         label: raw_target.to_string(),
         normalized_target: raw_target.to_string(),
         network_group: None,
         utm_name: None,
+        platform_profile,
+        rustynet_src_dir: Some(default_rustynet_src_dir_for_profile(
+            platform_profile,
+            ssh_user.as_deref(),
+        )),
     })
 }
 
@@ -7758,13 +8399,62 @@ fn remote_target_from_inventory_entry(
     entry: &VmInventoryEntry,
     ssh_user_override: Option<&str>,
 ) -> RemoteTarget {
+    let platform_profile = entry.platform_profile();
+    let ssh_user = ssh_user_override
+        .map(ToString::to_string)
+        .or_else(|| entry.ssh_user.clone());
     RemoteTarget {
         label: entry.alias.clone(),
         ssh_target: resolved_inventory_ssh_target(entry),
-        ssh_user: ssh_user_override
-            .map(ToString::to_string)
-            .or_else(|| entry.ssh_user.clone()),
+        ssh_user: ssh_user.clone(),
         controller: entry.controller.clone(),
+        platform_profile,
+        rustynet_src_dir: entry.rustynet_src_dir.clone().or_else(|| {
+            Some(default_rustynet_src_dir_for_profile(
+                platform_profile,
+                ssh_user.as_deref(),
+            ))
+        }),
+        remote_temp_dir: entry
+            .remote_temp_dir
+            .clone()
+            .or_else(|| Some(default_remote_temp_dir_for_profile(platform_profile))),
+    }
+}
+
+fn remote_target_from_raw_target(label: String, ssh_target: String) -> RemoteTarget {
+    let platform_profile = default_platform_profile(VmGuestPlatform::Linux);
+    let ssh_user = ssh_target_user(ssh_target.as_str()).map(str::to_string);
+    RemoteTarget {
+        label,
+        ssh_target,
+        ssh_user: ssh_user.clone(),
+        controller: None,
+        platform_profile,
+        rustynet_src_dir: Some(default_rustynet_src_dir_for_profile(
+            platform_profile,
+            ssh_user.as_deref(),
+        )),
+        remote_temp_dir: Some(default_remote_temp_dir_for_profile(platform_profile)),
+    }
+}
+
+fn remote_target_from_start_target(target: &StartTarget) -> RemoteTarget {
+    RemoteTarget {
+        label: target.alias.clone(),
+        ssh_target: target
+            .last_known_ip
+            .clone()
+            .or_else(|| target.mesh_ip.clone())
+            .unwrap_or_else(|| target.utm_name.clone()),
+        ssh_user: target.ssh_user.clone(),
+        controller: Some(VmController::LocalUtm {
+            utm_name: target.utm_name.clone(),
+            bundle_path: target.bundle_path.clone(),
+        }),
+        platform_profile: target.platform_profile,
+        rustynet_src_dir: None,
+        remote_temp_dir: None,
     }
 }
 
@@ -8188,10 +8878,40 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     }
     let exit_capable = optional_bool_field(object, "exit_capable")?;
     let relay_capable = optional_bool_field(object, "relay_capable")?;
+    let remote_temp_dir = optional_string_field(object, "remote_temp_dir")?;
+    if let Some(value) = remote_temp_dir.as_deref() {
+        ensure_no_control_chars("remote_temp_dir", value)?;
+    }
     let rustynet_src_dir = optional_string_field(object, "rustynet_src_dir")?;
     if let Some(value) = rustynet_src_dir.as_deref() {
         ensure_no_control_chars("rustynet_src_dir", value)?;
     }
+    let platform = match optional_string_field(object, "platform")? {
+        Some(value) => {
+            Some(VmGuestPlatform::parse(value.as_str()).map_err(|err| format!("platform: {err}"))?)
+        }
+        None => None,
+    };
+    let remote_shell = match optional_string_field(object, "remote_shell")? {
+        Some(value) => Some(
+            VmRemoteShell::parse(value.as_str()).map_err(|err| format!("remote_shell: {err}"))?,
+        ),
+        None => None,
+    };
+    let guest_exec_mode = match optional_string_field(object, "guest_exec_mode")? {
+        Some(value) => Some(
+            VmGuestExecMode::parse(value.as_str())
+                .map_err(|err| format!("guest_exec_mode: {err}"))?,
+        ),
+        None => None,
+    };
+    let service_manager = match optional_string_field(object, "service_manager")? {
+        Some(value) => Some(
+            VmServiceManager::parse(value.as_str())
+                .map_err(|err| format!("service_manager: {err}"))?,
+        ),
+        None => None,
+    };
     let controller = match object.get("controller") {
         None | Some(Value::Null) => None,
         Some(value) => Some(parse_controller(value)?),
@@ -8212,7 +8932,12 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
         mesh_ip,
         exit_capable,
         relay_capable,
+        remote_temp_dir,
         rustynet_src_dir,
+        platform,
+        remote_shell,
+        guest_exec_mode,
+        service_manager,
         controller,
     })
 }
@@ -8364,6 +9089,56 @@ git -C {dest_dir} reset --hard {remote}/{branch}",
         repo_url = shell_quote(repo_url),
         branch = shell_quote(branch),
     ))
+}
+
+fn build_windows_repo_sync_script(
+    repo_url: &str,
+    dest_dir: &str,
+    branch: &str,
+    remote: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("repo URL", repo_url)?;
+    ensure_no_control_chars("destination directory", dest_dir)?;
+    ensure_no_control_chars("branch", branch)?;
+    ensure_no_control_chars("remote", remote)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $dest = {dest}; \
+         $parent = Split-Path -Parent $dest; \
+         if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Force -Path $parent | Out-Null }}; \
+         if (-not (Test-Path -LiteralPath $dest)) {{ git clone --origin {remote_name} --branch {branch_name} --single-branch {repo} $dest | Out-Null }} \
+         elseif (Test-Path -LiteralPath (Join-Path $dest '.git')) {{ \
+             git -C $dest remote set-url {remote_name} {repo}; \
+             git -C $dest fetch {remote_name} {branch_name} --prune; \
+             git -C $dest checkout -B {branch_name} FETCH_HEAD; \
+             git -C $dest reset --hard FETCH_HEAD; \
+             git -C $dest clean -fdx \
+         }} else {{ throw \"destination exists but is not a git repository: $dest\" }}",
+        dest = powershell_quote(dest_dir)?,
+        remote_name = powershell_quote(remote)?,
+        branch_name = powershell_quote(branch)?,
+        repo = powershell_quote(repo_url)?,
+    ))
+}
+
+fn build_repo_sync_script_for_target(
+    target: &RemoteTarget,
+    repo_url: &str,
+    dest_dir: &str,
+    branch: &str,
+    remote: &str,
+) -> Result<String, String> {
+    match target.platform_profile.platform {
+        VmGuestPlatform::Linux => build_repo_sync_script(repo_url, dest_dir, branch, remote),
+        VmGuestPlatform::Windows => {
+            build_windows_repo_sync_script(repo_url, dest_dir, branch, remote)
+        }
+        other => Err(format!(
+            "repo sync is not implemented for {other:?} targets: {}",
+            target.label
+        )),
+    }
 }
 
 fn build_local_source_extract_script(
@@ -8753,6 +9528,12 @@ fn sync_local_source_archive_to_target(
     timeout: Duration,
 ) -> Result<(), String> {
     ensure_local_regular_file_path(archive_path, "local source archive")?;
+    if target.platform_profile.platform == VmGuestPlatform::Windows {
+        return Err(format!(
+            "local-source archive sync is not yet implemented for Windows targets: {}",
+            target.label
+        ));
+    }
     // These guest images accept SFTP writes into the SSH user's home directory
     // reliably, while absolute /tmp uploads are rejected on some hosts.
     let remote_archive = if remote_target_local_utm(target).is_some() {
@@ -9229,12 +10010,13 @@ fn fallback_remote_shell_command_to_ssh(
     timeout: Duration,
     utm_error: &str,
 ) -> Result<ExitStatus, String> {
+    let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
     run_remote_shell_command(
         target.ssh_target.as_str(),
         ssh_user_override.or(target.ssh_user.as_deref()),
         ssh_identity_file,
         known_hosts_path,
-        remote_script,
+        ssh_script.as_str(),
         timeout,
     )
     .map_err(|ssh_err| {
@@ -9254,12 +10036,13 @@ fn fallback_capture_remote_shell_command_to_ssh(
     timeout: Duration,
     utm_error: &str,
 ) -> Result<String, String> {
+    let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
     capture_remote_shell_command(
         target.ssh_target.as_str(),
         ssh_user_override.or(target.ssh_user.as_deref()),
         ssh_identity_file,
         known_hosts_path,
-        remote_script,
+        ssh_script.as_str(),
         timeout,
     )
     .map_err(|ssh_err| {
@@ -9304,36 +10087,69 @@ fn run_remote_shell_command_for_target(
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
     if let Some((utm_name, _)) = remote_target_local_utm(target) {
-        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
-        let home = remote_target_home(ssh_user.as_str());
-        let (rc, _) = match execute_utm_remote_script_as_user(
-            utm_name,
-            ssh_user.as_str(),
-            home.as_str(),
-            remote_script,
-            timeout,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                return fallback_remote_shell_command_to_ssh(
-                    target,
-                    ssh_user_override,
-                    ssh_identity_file,
-                    known_hosts_path,
+        return match target.platform_profile.platform {
+            VmGuestPlatform::Linux => {
+                let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+                let home = remote_target_home(ssh_user.as_str());
+                let (rc, _) = match execute_utm_remote_script_as_user(
+                    utm_name,
+                    ssh_user.as_str(),
+                    home.as_str(),
                     remote_script,
                     timeout,
-                    err.as_str(),
-                );
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return fallback_remote_shell_command_to_ssh(
+                            target,
+                            ssh_user_override,
+                            ssh_identity_file,
+                            known_hosts_path,
+                            remote_script,
+                            timeout,
+                            err.as_str(),
+                        );
+                    }
+                };
+                Ok(synthetic_exit_status(rc))
             }
+            VmGuestPlatform::Windows => {
+                match utm_exec_windows_raw(utm_name, remote_script, timeout) {
+                    Ok(status) => Ok(status),
+                    Err(err) => fallback_remote_shell_command_to_ssh(
+                        target,
+                        ssh_user_override,
+                        ssh_identity_file,
+                        known_hosts_path,
+                        remote_script,
+                        timeout,
+                        err.as_str(),
+                    ),
+                }
+            }
+            VmGuestPlatform::Macos => fallback_remote_shell_command_to_ssh(
+                target,
+                ssh_user_override,
+                ssh_identity_file,
+                known_hosts_path,
+                remote_script,
+                timeout,
+                "local UTM guest exec is not yet implemented for macOS targets",
+            ),
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+                "local UTM guest exec is not supported for platform {} ({})",
+                target.platform_profile.platform.as_str(),
+                target.label
+            )),
         };
-        return Ok(synthetic_exit_status(rc));
     }
+    let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
     run_remote_shell_command(
         target.ssh_target.as_str(),
         ssh_user_override.or(target.ssh_user.as_deref()),
         ssh_identity_file,
         known_hosts_path,
-        remote_script,
+        ssh_script.as_str(),
         timeout,
     )
 }
@@ -9347,39 +10163,78 @@ fn capture_remote_shell_command_for_target(
     timeout: Duration,
 ) -> Result<String, String> {
     if let Some((utm_name, _)) = remote_target_local_utm(target) {
-        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
-        let home = remote_target_home(ssh_user.as_str());
-        let (rc, output) = match execute_utm_remote_script_as_user(
-            utm_name,
-            ssh_user.as_str(),
-            home.as_str(),
-            remote_script,
-            timeout,
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                return fallback_capture_remote_shell_command_to_ssh(
-                    target,
-                    ssh_user_override,
-                    ssh_identity_file,
-                    known_hosts_path,
+        return match target.platform_profile.platform {
+            VmGuestPlatform::Linux => {
+                let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+                let home = remote_target_home(ssh_user.as_str());
+                let (rc, output) = match execute_utm_remote_script_as_user(
+                    utm_name,
+                    ssh_user.as_str(),
+                    home.as_str(),
                     remote_script,
                     timeout,
-                    err.as_str(),
-                );
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return fallback_capture_remote_shell_command_to_ssh(
+                            target,
+                            ssh_user_override,
+                            ssh_identity_file,
+                            known_hosts_path,
+                            remote_script,
+                            timeout,
+                            err.as_str(),
+                        );
+                    }
+                };
+                if rc != 0 {
+                    return Err(format!("remote command exited with status {rc}"));
+                }
+                Ok(output)
             }
+            VmGuestPlatform::Windows => {
+                match execute_utm_remote_powershell_capture(utm_name, remote_script, timeout) {
+                    Ok((rc, output)) => {
+                        if rc != 0 {
+                            Err(format!("remote command exited with status {rc}"))
+                        } else {
+                            Ok(output)
+                        }
+                    }
+                    Err(err) => fallback_capture_remote_shell_command_to_ssh(
+                        target,
+                        ssh_user_override,
+                        ssh_identity_file,
+                        known_hosts_path,
+                        remote_script,
+                        timeout,
+                        err.as_str(),
+                    ),
+                }
+            }
+            VmGuestPlatform::Macos => fallback_capture_remote_shell_command_to_ssh(
+                target,
+                ssh_user_override,
+                ssh_identity_file,
+                known_hosts_path,
+                remote_script,
+                timeout,
+                "local UTM guest exec is not yet implemented for macOS targets",
+            ),
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+                "local UTM guest exec is not supported for platform {} ({})",
+                target.platform_profile.platform.as_str(),
+                target.label
+            )),
         };
-        if rc != 0 {
-            return Err(format!("remote command exited with status {rc}"));
-        }
-        return Ok(output);
     }
+    let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
     capture_remote_shell_command(
         target.ssh_target.as_str(),
         ssh_user_override.or(target.ssh_user.as_deref()),
         ssh_identity_file,
         known_hosts_path,
-        remote_script,
+        ssh_script.as_str(),
         timeout,
     )
 }
@@ -9393,54 +10248,106 @@ fn scp_to_remote_for_target(
     dst: &str,
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
+    let dst = remote_copy_destination_for_target(target, dst);
     if let Some((utm_name, _)) = remote_target_local_utm(target) {
-        let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
-        let fallback_context = RemoteFallbackContext {
-            target,
-            ssh_user_override,
-            ssh_identity_file,
-            known_hosts_path,
-            timeout,
-        };
-        let status = match utm_push_raw(utm_name, src, dst, timeout) {
-            Ok(status) if status.success() => status,
-            Ok(status) => {
-                return fallback_scp_to_remote(
+        return match target.platform_profile.platform {
+            VmGuestPlatform::Linux => {
+                let ssh_user = remote_target_effective_user(target, ssh_user_override)?;
+                let fallback_context = RemoteFallbackContext {
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    timeout,
+                };
+                let status = match utm_push_raw(utm_name, src, dst.as_str(), timeout) {
+                    Ok(status) if status.success() => status,
+                    Ok(status) => {
+                        return fallback_scp_to_remote(
+                            &fallback_context,
+                            src,
+                            dst.as_str(),
+                            format!("UTM push failed with status {}", status_code(status)).as_str(),
+                        );
+                    }
+                    Err(err) => {
+                        return fallback_scp_to_remote(
+                            &fallback_context,
+                            src,
+                            dst.as_str(),
+                            err.as_str(),
+                        );
+                    }
+                };
+                if ssh_user != "root" {
+                    let chown_status = utm_exec_root_raw(
+                        utm_name,
+                        format!(
+                            "chown {}:{} {}",
+                            shell_quote(ssh_user.as_str()),
+                            shell_quote(ssh_user.as_str()),
+                            shell_quote(dst.as_str()),
+                        )
+                        .as_str(),
+                        Duration::from_secs(20),
+                    )?;
+                    if !chown_status.success() {
+                        return Ok(chown_status);
+                    }
+                }
+                Ok(status)
+            }
+            VmGuestPlatform::Windows => {
+                let fallback_context = RemoteFallbackContext {
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    timeout,
+                };
+                match utm_push_raw(utm_name, src, dst.as_str(), timeout) {
+                    Ok(status) if status.success() => Ok(status),
+                    Ok(status) => fallback_scp_to_remote(
+                        &fallback_context,
+                        src,
+                        dst.as_str(),
+                        format!("UTM push failed with status {}", status_code(status)).as_str(),
+                    ),
+                    Err(err) => {
+                        fallback_scp_to_remote(&fallback_context, src, dst.as_str(), err.as_str())
+                    }
+                }
+            }
+            VmGuestPlatform::Macos => {
+                let fallback_context = RemoteFallbackContext {
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    timeout,
+                };
+                fallback_scp_to_remote(
                     &fallback_context,
                     src,
-                    dst,
-                    format!("UTM push failed with status {}", status_code(status)).as_str(),
-                );
-            }
-            Err(err) => {
-                return fallback_scp_to_remote(&fallback_context, src, dst, err.as_str());
-            }
-        };
-        if ssh_user != "root" {
-            let chown_status = utm_exec_root_raw(
-                utm_name,
-                format!(
-                    "chown {}:{} {}",
-                    shell_quote(ssh_user.as_str()),
-                    shell_quote(ssh_user.as_str()),
-                    shell_quote(dst),
+                    dst.as_str(),
+                    "local UTM file push is not yet implemented for macOS targets",
                 )
-                .as_str(),
-                Duration::from_secs(20),
-            )?;
-            if !chown_status.success() {
-                return Ok(chown_status);
             }
-        }
-        return Ok(status);
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+                "local UTM file copy is not supported for platform {} ({})",
+                target.platform_profile.platform.as_str(),
+                target.label
+            )),
+        };
     }
+    let ssh_user = ssh_user_override.or(target.ssh_user.as_deref());
     scp_to_remote(
         src,
         target.ssh_target.as_str(),
-        ssh_user_override.or(target.ssh_user.as_deref()),
+        ssh_user,
         ssh_identity_file,
         known_hosts_path,
-        dst,
+        dst.as_str(),
         timeout,
     )
 }
@@ -9556,6 +10463,54 @@ fn scp_to_remote(
         .arg("--")
         .arg(src.as_os_str())
         .arg(format!("{target}:{dst}"));
+    run_status_with_timeout(&mut command, timeout)
+}
+
+fn scp_from_remote(
+    target: &RemoteTarget,
+    ssh_user: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    src: &str,
+    dst: &Path,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    validate_target_user_combination(target.ssh_target.as_str(), ssh_user)?;
+    ensure_no_control_chars("remote source path", src)?;
+    let mut command = Command::new("scp");
+    command.args([
+        "-q",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "IdentitiesOnly=yes",
+    ]);
+    append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
+    if let Some(ssh_user) = ssh_user {
+        command.arg("-o").arg(format!("User={ssh_user}"));
+    }
+    if let Some(parent) = dst.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create remote scp destination dir failed ({}): {err}",
+                parent.display()
+            )
+        })?;
+    }
+    command
+        .arg("--")
+        .arg(format!(
+            "{}:{}",
+            target.ssh_target,
+            remote_copy_source_for_target(target, src)
+        ))
+        .arg(dst.as_os_str());
     run_status_with_timeout(&mut command, timeout)
 }
 
@@ -9951,6 +10906,458 @@ fn shell_quote(value: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+fn powershell_quote(value: &str) -> Result<String, String> {
+    ensure_no_control_chars("PowerShell literal", value)?;
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+fn encode_powershell_command(script: &str) -> Result<String, String> {
+    if script.chars().any(|ch| ch == '\0') {
+        return Err("PowerShell script contains unsupported NUL byte".to_string());
+    }
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(BASE64_STANDARD.encode(bytes))
+}
+
+fn build_ssh_powershell_encoded_invocation(script: &str) -> Result<String, String> {
+    let encoded = encode_powershell_command(script)?;
+    Ok(format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    ))
+}
+
+fn build_remote_argv_powershell_script(
+    workdir: &str,
+    program: &str,
+    argv: &[String],
+) -> Result<String, String> {
+    ensure_no_control_chars("workdir", workdir)?;
+    ensure_no_control_chars("program", program)?;
+    let mut script = String::new();
+    script.push_str("Set-StrictMode -Version Latest; ");
+    script.push_str("$ErrorActionPreference = 'Stop'; ");
+    script.push_str(format!("Set-Location -LiteralPath {}; ", powershell_quote(workdir)?).as_str());
+    script.push_str(format!("& {}", powershell_quote(program)?).as_str());
+    for arg in argv {
+        ensure_no_control_chars("command arg", arg.as_str())?;
+        script.push(' ');
+        script.push_str(powershell_quote(arg.as_str())?.as_str());
+    }
+    script
+        .push_str("; if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    Ok(script)
+}
+
+fn build_remote_argv_script_for_target(
+    target: &RemoteTarget,
+    workdir: &str,
+    program: &str,
+    argv: &[String],
+    sudo: bool,
+) -> Result<String, String> {
+    match target.platform_profile.remote_shell {
+        VmRemoteShell::Posix => build_remote_argv_script(workdir, program, argv, sudo),
+        VmRemoteShell::Powershell => {
+            if sudo {
+                return Err(format!(
+                    "sudo is not supported for Windows targets: {}",
+                    target.label
+                ));
+            }
+            build_remote_argv_powershell_script(workdir, program, argv)
+        }
+        VmRemoteShell::Unsupported => Err(format!(
+            "vm-lab remote shell is not yet implemented for platform {} ({})",
+            target.platform_profile.platform.as_str(),
+            target.label
+        )),
+    }
+}
+
+fn remote_script_for_ssh_transport(
+    target: &RemoteTarget,
+    remote_script: &str,
+) -> Result<String, String> {
+    match target.platform_profile.remote_shell {
+        VmRemoteShell::Posix => Ok(remote_script.to_string()),
+        VmRemoteShell::Powershell => build_ssh_powershell_encoded_invocation(remote_script),
+        VmRemoteShell::Unsupported => Err(format!(
+            "SSH transport is not yet implemented for platform {} ({})",
+            target.platform_profile.platform.as_str(),
+            target.label
+        )),
+    }
+}
+
+fn remote_copy_destination_for_target(target: &RemoteTarget, dst: &str) -> String {
+    match target.platform_profile.platform {
+        VmGuestPlatform::Linux
+        | VmGuestPlatform::Macos
+        | VmGuestPlatform::Ios
+        | VmGuestPlatform::Android => dst.to_string(),
+        VmGuestPlatform::Windows => dst.replace('\\', "/"),
+    }
+}
+
+fn remote_copy_source_for_target(target: &RemoteTarget, src: &str) -> String {
+    match target.platform_profile.platform {
+        VmGuestPlatform::Linux
+        | VmGuestPlatform::Macos
+        | VmGuestPlatform::Ios
+        | VmGuestPlatform::Android => src.to_string(),
+        VmGuestPlatform::Windows => src.replace('\\', "/"),
+    }
+}
+
+fn windows_guest_path_join(root: &str, file_name: &str) -> Result<String, String> {
+    ensure_no_control_chars("Windows guest root", root)?;
+    ensure_no_control_chars("Windows guest file name", file_name)?;
+    let trimmed = root.trim_end_matches(['\\', '/']);
+    Ok(format!(r"{trimmed}\{file_name}"))
+}
+
+fn windows_helper_script_remote_path(
+    target: &RemoteTarget,
+    file_name: &str,
+) -> Result<String, String> {
+    let remote_root = target
+        .remote_temp_dir
+        .clone()
+        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile));
+    let remote_root = remote_root.as_str();
+    windows_guest_path_join(remote_root, file_name)
+}
+
+fn utm_exec_windows_raw(
+    utm_name: &str,
+    powershell_script: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    ensure_no_control_chars("UTM exec command", powershell_script)?;
+    let encoded = encode_powershell_command(powershell_script)?;
+    let utmctl_path = utmctl_binary_path()?;
+    let mut command = Command::new(utmctl_path);
+    command
+        .arg("exec")
+        .arg(utm_name)
+        .arg("--cmd")
+        .arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-EncodedCommand")
+        .arg(encoded);
+    run_status_with_timeout(&mut command, timeout)
+}
+
+fn execute_utm_remote_powershell_capture(
+    utm_name: &str,
+    powershell_script: &str,
+    timeout: Duration,
+) -> Result<(i32, String), String> {
+    if powershell_script.chars().any(|ch| ch == '\0') {
+        return Err("UTM remote PowerShell script contains unsupported NUL byte".to_string());
+    }
+
+    let suffix = unique_suffix();
+    let remote_root = format!(r"C:\ProgramData\Rustynet\vm-lab\{suffix}");
+    let remote_output = format!(r"{remote_root}\stdout.txt");
+    let remote_rc = format!(r"{remote_root}\rc.txt");
+    let wrapped_script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         New-Item -ItemType Directory -Force -Path {root} | Out-Null; \
+         $rc = 0; \
+         try {{ & {{ {body} }} *>{output}; if ($LASTEXITCODE -ne $null) {{ $rc = [int]$LASTEXITCODE }} }} \
+         catch {{ $_ | Out-String | Set-Content -Encoding utf8 -LiteralPath {output}; $rc = 1 }}; \
+         Set-Content -Encoding ascii -LiteralPath {rc} -Value $rc",
+        root = powershell_quote(remote_root.as_str())?,
+        body = powershell_script,
+        output = powershell_quote(remote_output.as_str())?,
+        rc = powershell_quote(remote_rc.as_str())?,
+    );
+    let status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout)?;
+    if !status.success() {
+        return Err(format!(
+            "UTM Windows PowerShell wrapper exited with status {}",
+            status_code(status)
+        ));
+    }
+
+    let temp_root = std::env::temp_dir().join(format!("rustynet-vm-lab-win-{}", unique_suffix()));
+    fs::create_dir_all(temp_root.as_path()).map_err(|err| {
+        format!(
+            "create temporary output dir failed ({}): {err}",
+            temp_root.display()
+        )
+    })?;
+    let local_output = temp_root.join("stdout.txt");
+    let local_rc = temp_root.join("rc.txt");
+
+    let pull_output_status = utm_pull_raw(
+        utm_name,
+        remote_output.as_str(),
+        local_output.as_path(),
+        timeout,
+    )?;
+    if !pull_output_status.success() {
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        return Err(format!(
+            "UTM Windows stdout pull failed with status {}",
+            status_code(pull_output_status)
+        ));
+    }
+    let pull_rc_status = utm_pull_raw(utm_name, remote_rc.as_str(), local_rc.as_path(), timeout)?;
+    if !pull_rc_status.success() {
+        let _ = fs::remove_dir_all(temp_root.as_path());
+        return Err(format!(
+            "UTM Windows rc pull failed with status {}",
+            status_code(pull_rc_status)
+        ));
+    }
+
+    let output = fs::read_to_string(local_output.as_path()).map_err(|err| {
+        format!(
+            "read UTM Windows stdout failed ({}): {err}",
+            local_output.display()
+        )
+    })?;
+    let rc_text = fs::read_to_string(local_rc.as_path())
+        .map_err(|err| format!("read UTM Windows rc failed ({}): {err}", local_rc.display()))?;
+    let rc = rc_text
+        .trim()
+        .parse::<i32>()
+        .map_err(|err| format!("parse UTM Windows rc failed: {err}"))?;
+
+    let cleanup = format!(
+        "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
+        powershell_quote(remote_root.as_str())?
+    );
+    let _ = utm_exec_windows_raw(utm_name, cleanup.as_str(), Duration::from_secs(20));
+    let _ = fs::remove_dir_all(temp_root.as_path());
+
+    Ok((rc, output))
+}
+
+fn stage_windows_helper_script_from_path(
+    context: &RemoteFallbackContext<'_>,
+    local_path: &Path,
+    remote_file_name: &str,
+) -> Result<String, String> {
+    ensure_local_regular_file_path(local_path, "Windows helper script")?;
+    let remote_path = windows_helper_script_remote_path(context.target, remote_file_name)?;
+    let status = scp_to_remote_for_target(
+        context.target,
+        context.ssh_user_override,
+        context.ssh_identity_file,
+        context.known_hosts_path,
+        local_path,
+        remote_path.as_str(),
+        context.timeout,
+    )?;
+    if !status.success() {
+        return Err(format!(
+            "stage Windows helper script failed with status {} ({})",
+            status_code(status),
+            local_path.display()
+        ));
+    }
+    Ok(remote_path)
+}
+
+fn stage_windows_helper_script(
+    context: &RemoteFallbackContext<'_>,
+    helper_file_name: &str,
+    remote_file_name: &str,
+) -> Result<String, String> {
+    let local_path = windows_helper_script_local_path(helper_file_name);
+    stage_windows_helper_script_from_path(context, local_path.as_path(), remote_file_name)
+}
+
+fn build_windows_helper_invocation_script(
+    remote_path: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let mut script = format!("& {}", powershell_quote(remote_path)?);
+    for arg in args {
+        ensure_no_control_chars("Windows helper arg", arg.as_str())?;
+        script.push(' ');
+        script.push_str(powershell_quote(arg.as_str())?.as_str());
+    }
+    Ok(script)
+}
+
+struct WindowsHelperInvocation<'a> {
+    helper_file_name: &'a str,
+    remote_file_name: &'a str,
+    args: &'a [String],
+}
+
+fn capture_windows_helper_script_output_for_target(
+    context: &RemoteFallbackContext<'_>,
+    helper_file_name: &str,
+    remote_file_name: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let local_path = windows_helper_script_local_path(helper_file_name);
+    capture_windows_helper_script_output_from_path(
+        context,
+        local_path.as_path(),
+        remote_file_name,
+        args,
+    )
+}
+
+fn capture_windows_helper_script_output_from_path(
+    context: &RemoteFallbackContext<'_>,
+    local_path: &Path,
+    remote_file_name: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let remote_path = stage_windows_helper_script_from_path(context, local_path, remote_file_name)?;
+    let script = build_windows_helper_invocation_script(remote_path.as_str(), args)?;
+    capture_remote_shell_command_for_target(
+        context.target,
+        context.ssh_user_override,
+        context.ssh_identity_file,
+        context.known_hosts_path,
+        script.as_str(),
+        context.timeout,
+    )
+}
+
+fn invoke_windows_helper_script_for_target(
+    context: &RemoteFallbackContext<'_>,
+    invocation: WindowsHelperInvocation<'_>,
+) -> Result<ExitStatus, String> {
+    let local_path = match invocation.helper_file_name {
+        WINDOWS_INSTALL_HELPER_FILE => windows_install_helper_script_local_path(),
+        WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE => windows_diagnostics_helper_script_local_path(),
+        _ => windows_helper_script_local_path(invocation.helper_file_name),
+    };
+    let remote_path = stage_windows_helper_script(
+        context,
+        local_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(invocation.helper_file_name),
+        invocation.remote_file_name,
+    )?;
+    let script = build_windows_helper_invocation_script(remote_path.as_str(), invocation.args)?;
+    run_remote_shell_command_for_target(
+        context.target,
+        context.ssh_user_override,
+        context.ssh_identity_file,
+        context.known_hosts_path,
+        script.as_str(),
+        context.timeout,
+    )
+}
+
+fn render_known_hosts_line(host: &str, port: u16, public_key_line: &str) -> Result<String, String> {
+    ensure_no_control_chars("known_hosts host", host)?;
+    ensure_no_control_chars("known_hosts key", public_key_line)?;
+    let mut parts = public_key_line.split_whitespace();
+    let key_type = parts
+        .next()
+        .ok_or_else(|| "Windows SSH host key line is missing key type".to_string())?;
+    let key_data = parts
+        .next()
+        .ok_or_else(|| "Windows SSH host key line is missing key payload".to_string())?;
+    let host_field = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    Ok(format!("{host_field} {key_type} {key_data}"))
+}
+
+fn append_known_hosts_entry(path: &Path, rendered_line: &str) -> Result<(), String> {
+    ensure_no_control_chars("known_hosts entry", rendered_line)?;
+    let mut existing = if path.exists() {
+        fs::read_to_string(path)
+            .map_err(|err| format!("read known_hosts file failed ({}): {err}", path.display()))?
+    } else {
+        String::new()
+    };
+    if existing
+        .lines()
+        .any(|line| line.trim() == rendered_line.trim())
+    {
+        return Ok(());
+    }
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(rendered_line.trim_end());
+    existing.push('\n');
+    write_text_file_atomically(path, existing.as_str())
+}
+
+fn bootstrap_windows_access_for_target(
+    target: &RemoteTarget,
+    ssh_user_override: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    automation_public_key: Option<&str>,
+    ssh_port: u16,
+    timeout: Duration,
+) -> Result<String, String> {
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "Windows access bootstrap requested for non-Windows target: {}",
+            target.label
+        ));
+    }
+
+    let mut args = Vec::new();
+    if let Some(public_key) = automation_public_key {
+        ensure_no_control_chars("automation public key", public_key)?;
+        args.push("-AutomationPublicKey".to_string());
+        args.push(public_key.to_string());
+    }
+
+    let context = RemoteFallbackContext {
+        target,
+        ssh_user_override,
+        ssh_identity_file,
+        known_hosts_path,
+        timeout,
+    };
+    let host_key_line = capture_windows_helper_script_output_for_target(
+        &context,
+        WINDOWS_ENABLE_ACCESS_HELPER_FILE,
+        WINDOWS_ENABLE_ACCESS_HELPER_FILE,
+        args.as_slice(),
+    )?;
+    let host_key_line = host_key_line.trim();
+    if host_key_line.is_empty() {
+        return Err(format!(
+            "Windows access bootstrap helper did not emit a host key for {}",
+            target.label
+        ));
+    }
+    if host_key_line == "host-key-unavailable" {
+        return Err(format!(
+            "Windows access bootstrap helper reported host-key-unavailable for {}",
+            target.label
+        ));
+    }
+
+    if let Some(path) = known_hosts_path {
+        let host = ssh_target_host(target.ssh_target.as_str());
+        let rendered = render_known_hosts_line(host.as_str(), ssh_port, host_key_line)?;
+        append_known_hosts_entry(path, rendered.as_str())?;
+    }
+
+    Ok(host_key_line.to_string())
 }
 
 fn validate_target_user_combination(target: &str, ssh_user: Option<&str>) -> Result<(), String> {
@@ -10910,6 +12317,65 @@ fn execute_bootstrap_phase_for_target(
     target: &RemoteTarget,
     context: &BootstrapPhaseContext<'_>,
 ) -> Result<(), String> {
+    if target.platform_profile.platform == VmGuestPlatform::Windows {
+        return match phase {
+            "install-release" => {
+                let repo_url = context.repo_url.ok_or_else(|| {
+                    format!(
+                        "bootstrap phase install-release requires --repo-url for {}",
+                        target.label
+                    )
+                })?;
+                let args = [
+                    "-RepoUrl".to_string(),
+                    repo_url.to_string(),
+                    "-Branch".to_string(),
+                    context.branch.to_string(),
+                    "-RustyNetRoot".to_string(),
+                    context.workdir.to_string(),
+                ];
+                let helper_context = RemoteFallbackContext {
+                    target,
+                    ssh_user_override: context.ssh_user,
+                    ssh_identity_file: context.ssh_identity_file,
+                    known_hosts_path: context.known_hosts_path,
+                    timeout: context.timeout,
+                };
+                let status = invoke_windows_helper_script_for_target(
+                    &helper_context,
+                    WindowsHelperInvocation {
+                        helper_file_name: WINDOWS_INSTALL_HELPER_FILE,
+                        remote_file_name: WINDOWS_INSTALL_HELPER_FILE,
+                        args: args.as_slice(),
+                    },
+                )?;
+                if !status.success() {
+                    return Err(format!(
+                        "install-release failed for {} with status {}",
+                        target.label,
+                        status_code(status)
+                    ));
+                }
+                Ok(())
+            }
+            "sync-source" | "build-release" | "restart-runtime" | "verify-runtime" | "all" => {
+                Err(format!(
+                    "bootstrap phase {phase} is not yet implemented for Windows targets: {}",
+                    target.label
+                ))
+            }
+            _ => Err(format!(
+                "unsupported bootstrap phase for execution: {phase}"
+            )),
+        };
+    }
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "bootstrap phase {phase} is currently implemented only for Linux targets; platform {} remains scaffold-only here ({})",
+            target.platform_profile.platform.as_str(),
+            target.label
+        ));
+    }
     match phase {
         "sync-source" => {
             let repo_url = context.repo_url.ok_or_else(|| {
@@ -11059,28 +12525,33 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
 mod tests {
     use super::{
         LiveLabProfile, LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState,
-        VmInventoryEntry, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
+        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabDiscoverLocalUtmConfig,
+        VmLabIterationValidationStep, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager,
         build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
-        build_repo_sync_script, build_suite_command, build_utm_readiness,
+        build_remote_argv_script_for_target, build_repo_sync_script,
+        build_ssh_powershell_encoded_invocation, build_suite_command, build_utm_readiness,
         build_vendored_cargo_config, build_vm_lab_topology, collect_live_lab_stage_local_bundle,
         default_inventory_path, default_live_lab_iteration_profile_path,
         default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
-        default_utmctl_path, discover_local_utm_bundle_paths,
-        ensure_inventory_entries_share_network, execute_ops_vm_lab_diff_live_lab_runs,
-        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
+        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
+        encode_powershell_command, ensure_inventory_entries_share_network,
+        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
+        execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
         local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
         parse_live_lab_stage_records, parse_local_utm_list_started_status,
         parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
         persist_local_utm_ready_states_to_inventory, privileged_rustynet_cli_script,
+        remote_copy_destination_for_target, remote_script_for_ssh_transport,
         render_live_lab_iteration_summary, render_live_lab_stage_forensics_review,
         resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
         resolve_repo_sync_source, resolve_start_targets, resolved_inventory_ssh_target_with_utmctl,
         rewrite_ssh_target_host, select_inventory_entries, select_live_ssh_host_from_utm_output,
-        selected_local_utm_readiness_from_report, summarize_live_lab_report,
-        transition_local_utm_vm_with_process_probe, validate_live_lab_run_artifacts,
+        selected_local_utm_readiness_from_report, ssh_auth_probe_command,
+        summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
+        validate_live_lab_run_artifacts, windows_helper_script_remote_path,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -11102,6 +12573,72 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    fn resolve_platform_remote_target(platform: &str) -> (PathBuf, super::RemoteTarget) {
+        let (alias, ssh_target, ssh_user, remote_temp_dir) = match platform {
+            "windows" => (
+                "windows-utm-1",
+                "192.168.64.20",
+                "Administrator",
+                r"C:\ProgramData\Rustynet\vm-lab",
+            ),
+            "macos" => (
+                "macos-utm-1",
+                "macos@192.168.64.30",
+                "macos",
+                "/private/var/tmp",
+            ),
+            "ios" => (
+                "ios-sim-1",
+                "ios@192.168.64.40",
+                "mobile",
+                "/var/mobile/tmp",
+            ),
+            "android" => (
+                "android-emulator-1",
+                "android@192.168.64.50",
+                "shell",
+                "/data/local/tmp",
+            ),
+            other => panic!("unsupported test platform: {other}"),
+        };
+        let remote_temp_dir = remote_temp_dir.replace('\\', "\\\\");
+        let path = write_temp_inventory(&format!(
+            r#"{{
+  "version": 1,
+  "entries": [
+    {{
+      "alias": "{alias}",
+      "ssh_target": "{ssh_target}",
+      "ssh_user": "{ssh_user}",
+      "platform": "{platform}",
+      "remote_temp_dir": "{remote_temp_dir}",
+      "controller": {{
+        "type": "local_utm",
+        "utm_name": "{alias}",
+        "bundle_path": "/tmp/{alias}.utm"
+      }}
+    }}
+  ]
+}}"#,
+        ));
+        let raw_targets: Vec<String> = Vec::new();
+        let target = resolve_remote_targets(
+            path.as_path(),
+            &[alias.to_string()],
+            false,
+            raw_targets.as_slice(),
+        )
+        .expect("target should resolve")
+        .into_iter()
+        .next()
+        .expect("resolved target should exist");
+        (path, target)
+    }
+
+    fn resolve_windows_remote_target() -> (PathBuf, super::RemoteTarget) {
+        resolve_platform_remote_target("windows")
     }
 
     fn write_temp_executable(body: &str) -> PathBuf {
@@ -11321,6 +12858,53 @@ mod tests {
     }
 
     #[test]
+    fn load_inventory_parses_windows_platform_metadata() {
+        let path = write_temp_inventory(
+            r#"{
+                "version": 1,
+                "entries": [
+                    {
+                        "alias": "windows-utm-1",
+                        "ssh_target": "192.168.64.20",
+                        "ssh_user": "Administrator",
+                        "os": "Windows 11",
+                        "platform": "windows",
+                        "remote_shell": "powershell",
+                        "guest_exec_mode": "windows_powershell",
+                        "service_manager": "windows_service",
+                        "remote_temp_dir": "C:\\ProgramData\\Rustynet\\vm-lab",
+                        "rustynet_src_dir": "C:\\Rustynet"
+                    }
+                ]
+            }"#,
+        );
+        let inventory = load_inventory(path.as_path()).expect("inventory should load");
+        assert_eq!(inventory[0].platform, Some(VmGuestPlatform::Windows));
+        assert_eq!(inventory[0].remote_shell, Some(VmRemoteShell::Powershell));
+        assert_eq!(
+            inventory[0].guest_exec_mode,
+            Some(VmGuestExecMode::WindowsPowershell)
+        );
+        assert_eq!(
+            inventory[0].service_manager,
+            Some(VmServiceManager::WindowsService)
+        );
+        assert_eq!(
+            inventory[0].remote_temp_dir.as_deref(),
+            Some(r"C:\ProgramData\Rustynet\vm-lab")
+        );
+        assert_eq!(
+            inventory[0].rustynet_src_dir.as_deref(),
+            Some(r"C:\Rustynet")
+        );
+        assert_eq!(
+            inventory[0].platform_profile().platform,
+            VmGuestPlatform::Windows
+        );
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
     fn select_inventory_entries_skips_all_excluded_rows() {
         let inventory = vec![
             VmInventoryEntry {
@@ -11339,7 +12923,12 @@ mod tests {
                 mesh_ip: None,
                 exit_capable: None,
                 relay_capable: None,
+                remote_temp_dir: None,
                 rustynet_src_dir: None,
+                platform: None,
+                remote_shell: None,
+                guest_exec_mode: None,
+                service_manager: None,
                 controller: None,
             },
             VmInventoryEntry {
@@ -11358,7 +12947,12 @@ mod tests {
                 mesh_ip: None,
                 exit_capable: None,
                 relay_capable: None,
+                remote_temp_dir: None,
                 rustynet_src_dir: None,
+                platform: None,
+                remote_shell: None,
+                guest_exec_mode: None,
+                service_manager: None,
                 controller: None,
             },
         ];
@@ -11396,7 +12990,9 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].label, "debian-headless-1");
         assert_eq!(targets[0].ssh_user.as_deref(), Some("debian"));
+        assert_eq!(targets[0].platform_profile.platform, VmGuestPlatform::Linux);
         assert_eq!(targets[1].ssh_target, "root@192.168.18.52");
+        assert_eq!(targets[1].platform_profile.platform, VmGuestPlatform::Linux);
         cleanup_temp_inventory(path.as_path());
     }
 
@@ -11432,7 +13028,12 @@ mod tests {
             mesh_ip: Some("100.64.0.1".to_string()),
             exit_capable: None,
             relay_capable: None,
+            remote_temp_dir: None,
             rustynet_src_dir: None,
+            platform: None,
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
             controller: Some(super::VmController::LocalUtm {
                 utm_name: "debian-headless-1".to_string(),
                 bundle_path: PathBuf::from("/tmp/debian-headless-1.utm"),
@@ -11645,6 +13246,253 @@ mod tests {
     }
 
     #[test]
+    fn ssh_auth_probe_command_selects_platform_specific_probe() {
+        assert_eq!(
+            ssh_auth_probe_command(default_platform_profile(VmGuestPlatform::Linux))
+                .expect("linux probe should exist"),
+            "true"
+        );
+        assert_eq!(
+            ssh_auth_probe_command(default_platform_profile(VmGuestPlatform::Windows))
+                .expect("windows probe should exist"),
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$PSVersionTable.PSVersion.ToString() | Out-Null; exit 0\""
+        );
+    }
+
+    #[test]
+    fn platform_scaffold_distinguishes_desktop_and_mobile_profiles() {
+        let macos = default_platform_profile(VmGuestPlatform::Macos);
+        assert_eq!(macos.remote_shell, VmRemoteShell::Posix);
+        assert_eq!(macos.guest_exec_mode, VmGuestExecMode::MacosPosix);
+        assert_eq!(macos.service_manager, VmServiceManager::Launchd);
+
+        let ios = default_platform_profile(VmGuestPlatform::Ios);
+        assert_eq!(ios.remote_shell, VmRemoteShell::Unsupported);
+        assert_eq!(ios.guest_exec_mode, VmGuestExecMode::Unsupported);
+        assert_eq!(ios.service_manager, VmServiceManager::Unsupported);
+
+        let android = default_platform_profile(VmGuestPlatform::Android);
+        assert_eq!(android.remote_shell, VmRemoteShell::Unsupported);
+        assert_eq!(android.guest_exec_mode, VmGuestExecMode::Unsupported);
+        assert_eq!(android.service_manager, VmServiceManager::Unsupported);
+    }
+
+    #[test]
+    fn powershell_encoding_helper_emits_utf16le_base64() {
+        assert_eq!(
+            encode_powershell_command("A").expect("encoding should succeed"),
+            "QQA="
+        );
+        assert!(
+            build_ssh_powershell_encoded_invocation("A")
+                .expect("SSH wrapper should build")
+                .contains("-EncodedCommand QQA=")
+        );
+    }
+
+    #[test]
+    fn windows_transport_dispatch_selection_uses_powershell_for_windows_targets() {
+        let (inventory, target) = resolve_windows_remote_target();
+        let remote_script = build_remote_argv_script_for_target(
+            &target,
+            r"C:\Rustynet",
+            "rustynet",
+            &["status".to_string()],
+            false,
+        )
+        .expect("Windows PowerShell script should build");
+        assert!(remote_script.contains("Set-Location -LiteralPath 'C:\\Rustynet'"));
+        assert!(remote_script.contains("& 'rustynet' 'status'"));
+
+        let ssh_script = remote_script_for_ssh_transport(&target, remote_script.as_str())
+            .expect("SSH wrapper should encode the Windows script");
+        assert!(ssh_script.starts_with(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+        ));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn windows_utm_copy_path_selection_normalizes_backslashes() {
+        let (inventory, target) = resolve_windows_remote_target();
+        assert_eq!(
+            remote_copy_destination_for_target(
+                &target,
+                r"C:\ProgramData\Rustynet\vm-lab\Enable-WindowsVmLabAccess.ps1"
+            ),
+            "C:/ProgramData/Rustynet/vm-lab/Enable-WindowsVmLabAccess.ps1"
+        );
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn windows_repo_sync_script_selection_uses_powershell_for_windows_targets() {
+        let (inventory, target) = resolve_windows_remote_target();
+        let script = build_repo_sync_script_for_target(
+            &target,
+            "git@github.com:iwanteague/Rustyfin.git",
+            r"C:\Rustynet",
+            "main",
+            "origin",
+        )
+        .expect("Windows repo sync script should build");
+        assert!(script.contains("Set-StrictMode -Version Latest"));
+        assert!(script.contains("git clone --origin 'origin' --branch 'main' --single-branch"));
+        assert!(script.contains("$dest = 'C:\\Rustynet';"));
+        assert!(script.contains("git -C $dest remote set-url 'origin'"));
+        assert!(script.contains("git -C $dest reset --hard FETCH_HEAD"));
+        assert!(!script.contains("set -eu;"));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn helper_script_staging_path_construction_uses_remote_temp_dir() {
+        let (inventory, target) = resolve_windows_remote_target();
+        assert_eq!(
+            windows_helper_script_remote_path(&target, "Enable-WindowsVmLabAccess.ps1")
+                .expect("remote helper path should build"),
+            r"C:\ProgramData\Rustynet\vm-lab\Enable-WindowsVmLabAccess.ps1"
+        );
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn windows_diagnostics_helper_selection_uses_windows_script_path() {
+        assert!(
+            windows_diagnostics_helper_script_local_path().ends_with(Path::new(
+                "scripts/vm_lab/windows/Collect-RustyNetWindowsDiagnostics.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn platform_scaffold_inventory_parsing_accepts_macos_ios_and_android() {
+        let path = write_temp_inventory(
+            r#"{
+                "version": 1,
+                "entries": [
+                    {
+                        "alias": "macos-utm-1",
+                        "ssh_target": "macos@192.168.64.30",
+                        "platform": "macos"
+                    },
+                    {
+                        "alias": "ios-sim-1",
+                        "ssh_target": "ios@192.168.64.40",
+                        "platform": "ios"
+                    },
+                    {
+                        "alias": "android-emulator-1",
+                        "ssh_target": "android@192.168.64.50",
+                        "platform": "android"
+                    }
+                ]
+            }"#,
+        );
+        let inventory = load_inventory(path.as_path()).expect("inventory should load");
+        assert_eq!(inventory[0].platform, Some(VmGuestPlatform::Macos));
+        assert_eq!(inventory[1].platform, Some(VmGuestPlatform::Ios));
+        assert_eq!(inventory[2].platform, Some(VmGuestPlatform::Android));
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn mobile_platforms_fail_closed_for_vm_lab_transport_scaffold() {
+        let (ios_inventory, ios_target) = resolve_platform_remote_target("ios");
+        let ios_err = build_remote_argv_script_for_target(
+            &ios_target,
+            "/var/mobile",
+            "rustynet",
+            &["status".to_string()],
+            false,
+        )
+        .expect_err("ios transport should remain unsupported");
+        assert!(ios_err.contains("platform ios"));
+        cleanup_temp_inventory(ios_inventory.as_path());
+
+        let (android_inventory, android_target) = resolve_platform_remote_target("android");
+        let android_err = remote_script_for_ssh_transport(&android_target, "echo nope")
+            .expect_err("android SSH transport should remain unsupported");
+        assert!(android_err.contains("platform android"));
+        cleanup_temp_inventory(android_inventory.as_path());
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_discover_local_utm_marks_windows_unmatched_without_debian_guess() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
+        let bundle = root.join("nested").join("windows-utm-1.utm");
+        fs::create_dir_all(&bundle).expect("bundle should exist");
+
+        let inventory_body = r#"{{
+  "version": 1,
+  "entries": [
+    {{
+      "alias": "other-linux-vm",
+      "ssh_target": "other-linux-host",
+      "ssh_user": "debian",
+      "platform": "linux"
+    }}
+  ]
+}}"#
+        .to_string();
+        let inventory = write_temp_inventory(inventory_body.as_str());
+
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"windows-utm-1\" ]; then\n  printf '192.168.64.20\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+
+        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(inventory.clone()),
+            utm_documents_root: Some(root.clone()),
+            utmctl_path: Some(utmctl.clone()),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 65_534,
+            timeout_secs: 2,
+            update_inventory_live_ips: false,
+            report_dir: None,
+        })
+        .expect("discovery report should be produced");
+        let parsed: serde_json::Value =
+            serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
+        assert_eq!(
+            parsed["entries"][0]["ssh_target_source"].as_str(),
+            Some("platform-aware-unmatched-windows")
+        );
+        assert_eq!(
+            parsed["entries"][0]["advisory_ssh_target"].as_str(),
+            Some("192.168.64.20")
+        );
+        assert_eq!(parsed["entries"][0]["ssh_user"].as_str(), None);
+        assert!(
+            !parsed["entries"][0]["ssh_target"]
+                .as_str()
+                .unwrap_or("")
+                .contains("debian@")
+        );
+        assert!(
+            parsed["entries"][0]["notes"]
+                .as_array()
+                .expect("notes should be an array")
+                .iter()
+                .any(|note| note.as_str()
+                    == Some("windows-utm-discovered-without-inventory-no-linux-user-assumed"))
+        );
+
+        cleanup_temp_inventory(inventory.as_path());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(
+            utmctl
+                .parent()
+                .expect("temp executable parent should exist"),
+        );
+    }
+
+    #[test]
     fn selected_local_utm_readiness_tracks_unready_aliases_with_reasons() {
         let report = json!({
             "entries": [
@@ -11747,6 +13595,40 @@ mod tests {
         let err = resolve_start_targets(path.as_path(), &["remote-debian-1".to_string()], false)
             .expect_err("remote-only entries must not start locally");
         assert!(err.contains("does not declare a local start controller"));
+        cleanup_temp_inventory(path.as_path());
+    }
+
+    #[test]
+    fn resolve_start_targets_carries_platform_profile() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "windows-utm-1",
+      "ssh_target": "192.168.64.20",
+      "ssh_user": "Administrator",
+      "platform": "windows",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "windows-utm-1",
+        "bundle_path": "/tmp/windows-utm-1.utm"
+      }
+    }
+  ]
+}"#,
+        );
+        let targets = resolve_start_targets(path.as_path(), &["windows-utm-1".to_string()], false)
+            .expect("windows start target should resolve");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].platform_profile.platform,
+            VmGuestPlatform::Windows
+        );
+        assert_eq!(
+            targets[0].platform_profile.remote_shell,
+            VmRemoteShell::Powershell
+        );
         cleanup_temp_inventory(path.as_path());
     }
 
@@ -11998,7 +13880,7 @@ directory = "vendor"
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
             .as_nanos();
-        let exit_utm_name = format!("debian-headless-test-exit-{unique}");
+        let exit_utm_name = format!("windows-utm-test-exit-{unique}");
         let client_utm_name = format!("debian-headless-test-client-{unique}");
         let inventory = write_temp_inventory(
             format!(
@@ -12007,13 +13889,15 @@ directory = "vendor"
   "entries": [
     {{
       "alias": "exit-vm",
-      "ssh_target": "exit-host",
-      "ssh_user": "debian",
+      "ssh_target": "192.168.64.20",
+      "ssh_user": "Administrator",
+      "platform": "windows",
+      "remote_temp_dir": "C:\\ProgramData\\Rustynet\\vm-lab",
       "network_group": "lan-a",
       "controller": {{
         "type": "local_utm",
         "utm_name": "{exit_utm_name}",
-        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-1.utm"
+        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/windows-utm-1.utm"
       }}
     }},
     {{
@@ -12079,12 +13963,25 @@ directory = "vendor"
         .expect("profile should be written");
         assert!(result.contains("wrote live-lab profile"));
         let body = fs::read_to_string(&output).expect("profile should be readable");
-        assert!(body.contains("EXIT_TARGET=\"debian@exit-host\""));
+        assert!(body.contains("EXIT_TARGET=\"Administrator@192.168.64.20\""));
         assert!(body.contains("CLIENT_TARGET=\"debian@client-host\""));
         assert!(body.contains(format!("EXIT_UTM_NAME=\"{exit_utm_name}\"").as_str()));
         assert!(body.contains(format!("CLIENT_UTM_NAME=\"{client_utm_name}\"").as_str()));
+        assert!(body.contains("EXIT_PLATFORM=\"windows\""));
+        assert!(body.contains("EXIT_REMOTE_SHELL=\"powershell\""));
+        assert!(body.contains("EXIT_GUEST_EXEC_MODE=\"windows_powershell\""));
+        assert!(body.contains("EXIT_SERVICE_MANAGER=\"windows_service\""));
+        assert!(body.contains("EXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\""));
+        assert!(body.contains("CLIENT_PLATFORM=\"linux\""));
+        assert!(body.contains("CLIENT_REMOTE_SHELL=\"posix\""));
+        assert!(body.contains("CLIENT_GUEST_EXEC_MODE=\"linux_posix\""));
+        assert!(body.contains("CLIENT_SERVICE_MANAGER=\"systemd\""));
         assert!(body.contains("FIFTH_CLIENT_TARGET=\"\""));
         assert!(body.contains("FIFTH_CLIENT_UTM_NAME=\"\""));
+        assert!(body.contains("FIFTH_CLIENT_PLATFORM=\"\""));
+        assert!(body.contains("FIFTH_CLIENT_REMOTE_SHELL=\"\""));
+        assert!(body.contains("FIFTH_CLIENT_GUEST_EXEC_MODE=\"\""));
+        assert!(body.contains("FIFTH_CLIENT_SERVICE_MANAGER=\"\""));
         assert!(body.contains("SSH_IDENTITY_FILE="));
         assert!(body.contains("RUSTYNET_BACKEND=\"linux-wireguard-userspace-shared\""));
         assert!(body.contains("SOURCE_MODE=\"local-head\""));
@@ -12852,7 +14749,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let present = local_utm_process_present_with_ps(
             ps.as_path(),
             bundle.as_path(),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .expect("process probe should succeed");
 
@@ -13024,7 +14921,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             bundle.as_path(),
             "stop",
             false,
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .expect("timed out stop should succeed once state is stopped");
 
