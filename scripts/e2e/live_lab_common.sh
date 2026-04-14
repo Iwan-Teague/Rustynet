@@ -185,10 +185,16 @@ live_lab_known_hosts_lookup_candidates() {
 
 live_lab_find_pinned_host_entry() {
   local target="$1"
+  local lookup_candidates_output line
   local lookup_host
   local -a lookup_candidates=()
 
-  mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || return 1
+  lookup_candidates_output="$(live_lab_known_hosts_lookup_candidates "$target")" || return 1
+  if [[ -n "$lookup_candidates_output" ]]; then
+    while IFS= read -r line; do
+      lookup_candidates+=("$line")
+    done <<<"$lookup_candidates_output"
+  fi
   for lookup_host in "${lookup_candidates[@]}"; do
     if ssh-keygen -F "$lookup_host" -f "$LIVE_LAB_PINNED_KNOWN_HOSTS_FILE" >/dev/null 2>&1; then
       printf '%s' "$lookup_host"
@@ -209,19 +215,24 @@ live_lab_target_configured_transport() {
 
 live_lab_require_pinned_host_entry() {
   local target="$1"
-  local matched lookup_host
+  local matched lookup_host lookup_candidates_output line
   local -a lookup_candidates=()
 
-  mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || exit 1
+  lookup_candidates_output="$(live_lab_known_hosts_lookup_candidates "$target")" || return 1
+  if [[ -n "$lookup_candidates_output" ]]; then
+    while IFS= read -r line; do
+      lookup_candidates+=("$line")
+    done <<<"$lookup_candidates_output"
+  fi
   matched="$(live_lab_find_pinned_host_entry "$target")" || {
     if [[ "${#lookup_candidates[@]}" -eq 0 ]]; then
       echo "pinned known_hosts verification resolved no lookup candidates for ${target}" >&2
     else
       echo "pinned known_hosts file lacks host key for ${target}; checked ${lookup_candidates[*]} in ${LIVE_LAB_PINNED_KNOWN_HOSTS_FILE}" >&2
     fi
-    exit 1
+    return 1
   }
-  [[ -n "$matched" ]] || exit 1
+  [[ -n "$matched" ]] || return 1
 }
 
 live_lab_write_ssh_trust_summary() {
@@ -252,7 +263,13 @@ live_lab_write_ssh_trust_summary() {
   } > "$output_path"
 
   for target in "$@"; do
-    mapfile -t lookup_candidates < <(live_lab_known_hosts_lookup_candidates "$target") || return 1
+    lookup_candidates=()
+    lookup_candidates_output="$(live_lab_known_hosts_lookup_candidates "$target")" || return 1
+    if [[ -n "$lookup_candidates_output" ]]; then
+      while IFS= read -r line; do
+        lookup_candidates+=("$line")
+      done <<<"$lookup_candidates_output"
+    fi
     checked_candidates_csv="$(live_lab_join_by_delimiter "," "${lookup_candidates[@]}")"
     if matched_candidate="$(live_lab_find_pinned_host_entry "$target")"; then
       host_key_status="pass"
@@ -971,7 +988,7 @@ live_lab_ssh_via_ssh() {
     -- "$target" "$command"
   )
   local attempt rc
-  live_lab_require_pinned_host_entry "$target"
+  live_lab_require_pinned_host_entry "$target" || return 1
   for attempt in 1 2 3; do
     if "${ssh_args[@]}"; then
       return 0
@@ -1008,7 +1025,7 @@ live_lab_scp_to_via_ssh() {
     -- "$src" "${target}:${dst}"
   )
   local attempt rc
-  live_lab_require_pinned_host_entry "$target"
+  live_lab_require_pinned_host_entry "$target" || return 1
   for attempt in 1 2 3; do
     if "${scp_args[@]}"; then
       return 0
@@ -1045,7 +1062,7 @@ live_lab_scp_from_via_ssh() {
     -- "${target}:${src}" "$dst"
   )
   local attempt rc
-  live_lab_require_pinned_host_entry "$target"
+  live_lab_require_pinned_host_entry "$target" || return 1
   for attempt in 1 2 3; do
     if "${scp_args[@]}"; then
       return 0

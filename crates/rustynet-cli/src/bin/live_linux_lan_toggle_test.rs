@@ -2,6 +2,7 @@
 
 mod live_lab_support;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +17,48 @@ const LAN_TEST_GATEWAY_IP: &str = "192.168.1.1/24";
 const LAN_TEST_PROBE_IP: &str = "192.168.1.1";
 const LAN_TEST_CIDR: &str = "192.168.1.0/24";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
+const DNS_ZONE_NAME: &str = "rustynet";
+const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue-lan-toggle";
+const DNS_ZONE_VALID_BUNDLE_REMOTE: &str = "/run/rustynet/dns-zone-issue-lan-toggle/valid.dns-zone";
+const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-lan-toggle/rn-dns-zone.pub";
+
+#[derive(Clone, Copy)]
+struct DnsRefreshTarget<'a> {
+    host: &'a str,
+    node_id: &'a str,
+    records_local: &'a Path,
+    bundle_local: &'a Path,
+}
+
+#[derive(Clone, Copy)]
+struct DnsRefreshConfig<'a> {
+    signer_host: &'a str,
+    dns_verifier_local: &'a Path,
+    passphrase_remote: &'a str,
+    nodes_spec: &'a str,
+    allow_spec: &'a str,
+    targets: &'a [DnsRefreshTarget<'a>],
+}
+
+#[derive(Clone, Copy)]
+struct SignedStateRefreshConfig<'a> {
+    traversal: TraversalRefreshConfig<'a>,
+    dns: DnsRefreshConfig<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentAuthorityScope {
+    node_id: String,
+    peer_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedDnsRecordTemplate {
+    label: String,
+    target_node_id: String,
+    ttl_secs: u64,
+    aliases: Vec<String>,
+}
 
 fn etc_rustynet_install_dir_args() -> [&'static str; 9] {
     [
@@ -142,9 +185,10 @@ fn run() -> Result<(), i32> {
         eprintln!("{err}");
         1
     })?;
-    let _cleanup = LanToggleCleanup {
+    let mut cleanup = LanToggleCleanup {
         ctx: ctx.clone(),
         exit_host: exit_host.clone(),
+        dns_passphrase_remote: None,
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
@@ -251,6 +295,30 @@ fn run() -> Result<(), i32> {
         &format!("/run/rustynet/assignment-issue/rn-assignment-{blind_exit_node_id}.assignment"),
         &blind_exit_assignment_local,
     )?;
+    let exit_scope = parse_assignment_authority_scope(
+        std::fs::read_to_string(&exit_assignment_local)
+            .map_err(|err| {
+                eprintln!("{err}");
+                1
+            })?
+            .as_str(),
+    )?;
+    let client_scope = parse_assignment_authority_scope(
+        std::fs::read_to_string(&client_assignment_local)
+            .map_err(|err| {
+                eprintln!("{err}");
+                1
+            })?
+            .as_str(),
+    )?;
+    let blind_exit_scope = parse_assignment_authority_scope(
+        std::fs::read_to_string(&blind_exit_assignment_local)
+            .map_err(|err| {
+                eprintln!("{err}");
+                1
+            })?
+            .as_str(),
+    )?;
 
     logger
         .line("Distributing signed assignments")
@@ -309,6 +377,81 @@ fn run() -> Result<(), i32> {
     let exit_traversal_local = ctx.work_dir.join("traversal-exit");
     let client_traversal_local = ctx.work_dir.join("traversal-client");
     let blind_exit_traversal_local = ctx.work_dir.join("traversal-blind-exit");
+    let dns_verifier_local = ctx.work_dir.join("dns-zone.pub");
+    let exit_dns_records_local = ctx.work_dir.join("dns-zone-records-exit.manifest");
+    let client_dns_records_local = ctx.work_dir.join("dns-zone-records-client.manifest");
+    let blind_exit_dns_records_local = ctx.work_dir.join("dns-zone-records-blind-exit.manifest");
+    let exit_dns_local = ctx.work_dir.join("dns-zone-exit");
+    let client_dns_local = ctx.work_dir.join("dns-zone-client");
+    let blind_exit_dns_local = ctx.work_dir.join("dns-zone-blind-exit");
+    let dns_base_records =
+        managed_dns_base_records(&exit_node_id, &client_node_id, &blind_exit_node_id);
+    write_secure_text(
+        &exit_dns_records_local,
+        &managed_dns_records_manifest_for_scope(&dns_base_records, &exit_scope)?,
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    write_secure_text(
+        &client_dns_records_local,
+        &managed_dns_records_manifest_for_scope(&dns_base_records, &client_scope)?,
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    write_secure_text(
+        &blind_exit_dns_records_local,
+        &managed_dns_records_manifest_for_scope(&dns_base_records, &blind_exit_scope)?,
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    let dns_passphrase_remote = ctx
+        .capture_root(
+            &exit_host,
+            &["mktemp", "/tmp/rn-lan-toggle-dns-passphrase.XXXXXX"],
+        )
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?
+        .trim()
+        .to_string();
+    ctx.run_root(
+        &exit_host,
+        &[
+            "rustynet",
+            "ops",
+            "materialize-signing-passphrase",
+            "--output",
+            dns_passphrase_remote.as_str(),
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(
+        &exit_host,
+        &["chmod", "0600", dns_passphrase_remote.as_str()],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(
+        &exit_host,
+        &["install", "-d", "-m", "0700", DNS_ZONE_ISSUE_DIR],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    cleanup.dns_passphrase_remote = Some(dns_passphrase_remote.clone());
     let traversal_refresh = TraversalRefreshConfig {
         signer_host: exit_host.as_str(),
         exit_host: exit_host.as_str(),
@@ -323,13 +466,44 @@ fn run() -> Result<(), i32> {
         client_node_id: client_node_id.as_str(),
         blind_exit_node_id: blind_exit_node_id.as_str(),
     };
+    let dns_targets = [
+        DnsRefreshTarget {
+            host: exit_host.as_str(),
+            node_id: exit_node_id.as_str(),
+            records_local: exit_dns_records_local.as_path(),
+            bundle_local: exit_dns_local.as_path(),
+        },
+        DnsRefreshTarget {
+            host: client_host.as_str(),
+            node_id: client_node_id.as_str(),
+            records_local: client_dns_records_local.as_path(),
+            bundle_local: client_dns_local.as_path(),
+        },
+        DnsRefreshTarget {
+            host: blind_exit_host.as_str(),
+            node_id: blind_exit_node_id.as_str(),
+            records_local: blind_exit_dns_records_local.as_path(),
+            bundle_local: blind_exit_dns_local.as_path(),
+        },
+    ];
+    let signed_state_refresh = SignedStateRefreshConfig {
+        traversal: traversal_refresh,
+        dns: DnsRefreshConfig {
+            signer_host: exit_host.as_str(),
+            dns_verifier_local: dns_verifier_local.as_path(),
+            passphrase_remote: dns_passphrase_remote.as_str(),
+            nodes_spec: nodes_spec.as_str(),
+            allow_spec: allow_spec.as_str(),
+            targets: &dns_targets,
+        },
+    };
     logger
         .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")
         .map_err(|err| {
             eprintln!("{err}");
             1
         })?;
-    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
 
     logger.line("Enforcing runtime roles").map_err(|err| {
         eprintln!("{err}");
@@ -417,13 +591,13 @@ fn run() -> Result<(), i32> {
             1
         })?;
 
-    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     let mut last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
     let lan_off_state = wait_for_lan_access_state(
         &ctx,
         &logger,
-        &traversal_refresh,
+        &signed_state_refresh,
         &mut last_traversal_refresh_unix,
         &client_host,
         false,
@@ -432,7 +606,7 @@ fn run() -> Result<(), i32> {
     let lan_off_ping_status = wait_for_lan_probe_state(
         &ctx,
         &logger,
-        &traversal_refresh,
+        &signed_state_refresh,
         &mut last_traversal_refresh_unix,
         &client_host,
         "blocked",
@@ -442,13 +616,13 @@ fn run() -> Result<(), i32> {
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
-    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, true, LAN_TEST_CIDR)?;
     let lan_on_state = wait_for_lan_access_state(
         &ctx,
         &logger,
-        &traversal_refresh,
+        &signed_state_refresh,
         &mut last_traversal_refresh_unix,
         &client_host,
         true,
@@ -458,7 +632,7 @@ fn run() -> Result<(), i32> {
         wait_for_lan_probe_state(
             &ctx,
             &logger,
-            &traversal_refresh,
+            &signed_state_refresh,
             &mut last_traversal_refresh_unix,
             &client_host,
             "reachable",
@@ -477,13 +651,13 @@ fn run() -> Result<(), i32> {
         )
         .unwrap_or_default();
 
-    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, false, LAN_TEST_CIDR)?;
     let lan_off_again_state = wait_for_lan_access_state(
         &ctx,
         &logger,
-        &traversal_refresh,
+        &signed_state_refresh,
         &mut last_traversal_refresh_unix,
         &client_host,
         false,
@@ -492,7 +666,7 @@ fn run() -> Result<(), i32> {
     let lan_off_again_status = wait_for_lan_probe_state(
         &ctx,
         &logger,
-        &traversal_refresh,
+        &signed_state_refresh,
         &mut last_traversal_refresh_unix,
         &client_host,
         "blocked",
@@ -502,7 +676,7 @@ fn run() -> Result<(), i32> {
         .capture_root(&client_host, &["rustynet", "status"])
         .unwrap_or_default();
 
-    refresh_traversal_bundles(&ctx, &logger, &traversal_refresh)?;
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     let blind_exit_denied_status =
         if apply_lan_access_expect_denied(&ctx, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
@@ -668,6 +842,7 @@ fn run() -> Result<(), i32> {
 struct LanToggleCleanup {
     ctx: LiveLabContext,
     exit_host: String,
+    dns_passphrase_remote: Option<String>,
 }
 
 impl Drop for LanToggleCleanup {
@@ -676,6 +851,20 @@ impl Drop for LanToggleCleanup {
             &self.exit_host,
             &["ip", "link", "delete", LAN_TEST_INTERFACE],
         );
+        if let Some(path) = self.dns_passphrase_remote.as_deref() {
+            let _ = self
+                .ctx
+                .run_root_allow_failure(&self.exit_host, &["rm", "-f", path]);
+        }
+        let _ = self
+            .ctx
+            .run_root_allow_failure(&self.exit_host, &["rm", "-f", DNS_ZONE_VALID_BUNDLE_REMOTE]);
+        let _ = self
+            .ctx
+            .run_root_allow_failure(&self.exit_host, &["rm", "-f", DNS_ZONE_VERIFIER_REMOTE]);
+        let _ = self
+            .ctx
+            .run_root_allow_failure(&self.exit_host, &["rmdir", DNS_ZONE_ISSUE_DIR]);
     }
 }
 
@@ -700,14 +889,19 @@ fn apply_lan_access(
 fn wait_for_lan_probe_state(
     ctx: &LiveLabContext,
     logger: &Logger,
-    refresh_config: &TraversalRefreshConfig<'_>,
+    refresh_config: &SignedStateRefreshConfig<'_>,
     last_traversal_refresh_unix: &mut u64,
     target: &str,
     desired_state: &str,
     attempts: u32,
 ) -> Result<bool, i32> {
     for _ in 0..attempts {
-        maybe_refresh_traversal_bundles(ctx, logger, refresh_config, last_traversal_refresh_unix)?;
+        maybe_refresh_signed_state_artifacts(
+            ctx,
+            logger,
+            refresh_config,
+            last_traversal_refresh_unix,
+        )?;
         let reachable = ctx
             .run(target, &["ping", "-c", "1", "-W", "1", LAN_TEST_PROBE_IP])
             .is_ok();
@@ -803,7 +997,7 @@ fn summarize_command_output(output: &Output) -> String {
 fn wait_for_lan_access_state(
     ctx: &LiveLabContext,
     logger: &Logger,
-    refresh_config: &TraversalRefreshConfig<'_>,
+    refresh_config: &SignedStateRefreshConfig<'_>,
     last_traversal_refresh_unix: &mut u64,
     target: &str,
     expected_enabled: bool,
@@ -815,7 +1009,12 @@ fn wait_for_lan_access_state(
         "lan_access=off"
     };
     for _ in 0..attempts {
-        maybe_refresh_traversal_bundles(ctx, logger, refresh_config, last_traversal_refresh_unix)?;
+        maybe_refresh_signed_state_artifacts(
+            ctx,
+            logger,
+            refresh_config,
+            last_traversal_refresh_unix,
+        )?;
         if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"])
             && status.contains(expected)
         {
@@ -1100,6 +1299,77 @@ fn install_traversal_bundle(
     Ok(())
 }
 
+fn install_dns_zone_bundle(
+    ctx: &LiveLabContext,
+    target: &str,
+    verifier_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), i32> {
+    ctx.scp_to(verifier_local, target, "/tmp/rn-dns-zone.pub")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-dns-zone.bundle")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    ctx.run_root(
+        target,
+        &[
+            "install",
+            "-m",
+            "0644",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            "/tmp/rn-dns-zone.pub",
+            "/etc/rustynet/dns-zone.pub",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    ctx.run_root(
+        target,
+        &[
+            "install",
+            "-m",
+            "0640",
+            "-o",
+            "root",
+            "-g",
+            "rustynetd",
+            "/tmp/rn-dns-zone.bundle",
+            "/var/lib/rustynet/rustynetd.dns-zone",
+        ],
+    )
+    .map_err(|err| {
+        eprintln!("{err}");
+        1
+    })?;
+    let _ = ctx.run_root_allow_failure(
+        target,
+        &[
+            "rm",
+            "-f",
+            "/var/lib/rustynet/rustynetd.dns-zone.watermark",
+            "/tmp/rn-dns-zone.pub",
+            "/tmp/rn-dns-zone.bundle",
+        ],
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
 struct TraversalRefreshConfig<'a> {
     signer_host: &'a str,
     exit_host: &'a str,
@@ -1113,6 +1383,20 @@ struct TraversalRefreshConfig<'a> {
     exit_node_id: &'a str,
     client_node_id: &'a str,
     blind_exit_node_id: &'a str,
+}
+
+fn refresh_signed_state_artifacts(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    config: &SignedStateRefreshConfig<'_>,
+) -> Result<(), i32> {
+    refresh_traversal_bundles(ctx, logger, &config.traversal)?;
+    refresh_dns_zone_bundles(ctx, logger, &config.dns)?;
+    for target in config.dns.targets {
+        refresh_trust_evidence(ctx, target.host)?;
+        refresh_signed_state_now(ctx, target.host)?;
+    }
+    Ok(())
 }
 
 fn refresh_traversal_bundles(
@@ -1189,17 +1473,94 @@ fn refresh_traversal_bundles(
     Ok(())
 }
 
-fn maybe_refresh_traversal_bundles(
+fn refresh_dns_zone_bundles(
     ctx: &LiveLabContext,
     logger: &Logger,
-    config: &TraversalRefreshConfig<'_>,
+    config: &DnsRefreshConfig<'_>,
+) -> Result<(), i32> {
+    logger
+        .line("Refreshing signed DNS zone bundles for LAN-toggle participants")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    for target in config.targets {
+        let remote_records = format!("/tmp/rn-lan-toggle-dns-records-{}.manifest", target.node_id);
+        ctx.scp_to(
+            target.records_local,
+            config.signer_host,
+            remote_records.as_str(),
+        )
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+        ctx.run_root(
+            config.signer_host,
+            &[
+                "rustynet",
+                "dns",
+                "zone",
+                "issue",
+                "--signing-secret",
+                "/etc/rustynet/membership.owner.key",
+                "--signing-secret-passphrase-file",
+                config.passphrase_remote,
+                "--subject-node-id",
+                target.node_id,
+                "--nodes",
+                config.nodes_spec,
+                "--allow",
+                config.allow_spec,
+                "--zone-name",
+                DNS_ZONE_NAME,
+                "--records-manifest",
+                remote_records.as_str(),
+                "--output",
+                DNS_ZONE_VALID_BUNDLE_REMOTE,
+                "--verifier-key-output",
+                DNS_ZONE_VERIFIER_REMOTE,
+            ],
+        )
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+        let _ =
+            ctx.run_root_allow_failure(config.signer_host, &["rm", "-f", remote_records.as_str()]);
+        capture_remote_file(
+            ctx,
+            config.signer_host,
+            DNS_ZONE_VERIFIER_REMOTE,
+            config.dns_verifier_local,
+        )?;
+        capture_remote_file(
+            ctx,
+            config.signer_host,
+            DNS_ZONE_VALID_BUNDLE_REMOTE,
+            target.bundle_local,
+        )?;
+        install_dns_zone_bundle(
+            ctx,
+            target.host,
+            config.dns_verifier_local,
+            target.bundle_local,
+        )?;
+    }
+    Ok(())
+}
+
+fn maybe_refresh_signed_state_artifacts(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    config: &SignedStateRefreshConfig<'_>,
     last_traversal_refresh_unix: &mut u64,
 ) -> Result<(), i32> {
     let now = unix_now();
     if now.saturating_sub(*last_traversal_refresh_unix)
         >= traversal_refresh_interval_secs(MAX_TRAVERSAL_COORDINATION_TTL_SECS)
     {
-        refresh_traversal_bundles(ctx, logger, config)?;
+        refresh_signed_state_artifacts(ctx, logger, config)?;
         *last_traversal_refresh_unix = unix_now();
     }
     Ok(())
@@ -1225,6 +1586,28 @@ fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
         eprintln!("{err}");
         1
     })
+}
+
+fn refresh_signed_state_now(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    refresh_signed_state(ctx, target)
+}
+
+fn refresh_trust_evidence(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    ctx.run_root(target, &["rustynet", "ops", "refresh-signed-trust"])
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })
 }
 
 fn issue_assignment_bundles_from_env(
@@ -1350,6 +1733,113 @@ fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<()
     Ok(())
 }
 
+fn managed_dns_base_records(
+    exit_node_id: &str,
+    client_node_id: &str,
+    blind_exit_node_id: &str,
+) -> Vec<ManagedDnsRecordTemplate> {
+    vec![
+        ManagedDnsRecordTemplate {
+            label: "exit".to_string(),
+            target_node_id: exit_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: vec!["gateway".to_string()],
+        },
+        ManagedDnsRecordTemplate {
+            label: "client".to_string(),
+            target_node_id: client_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        },
+        ManagedDnsRecordTemplate {
+            label: "blind-exit".to_string(),
+            target_node_id: blind_exit_node_id.to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn managed_dns_records_manifest_for_scope(
+    records: &[ManagedDnsRecordTemplate],
+    scope: &AssignmentAuthorityScope,
+) -> Result<String, i32> {
+    let allowed_targets = scope.peer_node_ids.iter().cloned().collect::<HashSet<_>>();
+    let filtered = records
+        .iter()
+        .filter(|record| {
+            record.target_node_id == scope.node_id
+                || allowed_targets.contains(&record.target_node_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        eprintln!(
+            "managed DNS scope for {} produced no policy-authorized records",
+            scope.node_id
+        );
+        return Err(1);
+    }
+    let mut manifest = String::new();
+    manifest.push_str("version=1\n");
+    manifest.push_str(&format!("record_count={}\n", filtered.len()));
+    for (index, record) in filtered.iter().enumerate() {
+        manifest.push_str(&format!("record.{index}.label={}\n", record.label));
+        manifest.push_str(&format!(
+            "record.{index}.target_node_id={}\n",
+            record.target_node_id
+        ));
+        manifest.push_str(&format!("record.{index}.ttl_secs={}\n", record.ttl_secs));
+        manifest.push_str(&format!(
+            "record.{index}.alias_count={}\n",
+            record.aliases.len()
+        ));
+        for (alias_index, alias) in record.aliases.iter().enumerate() {
+            manifest.push_str(&format!("record.{index}.alias.{alias_index}={alias}\n"));
+        }
+    }
+    Ok(manifest)
+}
+
+fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, i32> {
+    let mut node_id = None;
+    let mut peer_node_ids = Vec::new();
+    for line in bundle.lines() {
+        if let Some(value) = line.strip_prefix("node_id=") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                eprintln!("assignment bundle node_id must not be empty");
+                return Err(1);
+            }
+            node_id = Some(trimmed.to_string());
+            continue;
+        }
+        if let Some((prefix, value)) = line.split_once('=')
+            && prefix.starts_with("peer.")
+            && prefix.ends_with(".node_id")
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                eprintln!("assignment bundle peer id must not be empty: {prefix}");
+                return Err(1);
+            }
+            peer_node_ids.push(trimmed.to_string());
+        }
+    }
+    peer_node_ids.sort();
+    peer_node_ids.dedup();
+    match node_id {
+        Some(node_id) => Ok(AssignmentAuthorityScope {
+            node_id,
+            peer_node_ids,
+        }),
+        None => {
+            eprintln!("assignment bundle is missing node_id");
+            Err(1)
+        }
+    }
+}
+
 fn git_commit(root_dir: &Path) -> String {
     if let Ok(value) = std::env::var("RUSTYNET_EXPECTED_GIT_COMMIT") {
         return value.trim().to_lowercase();
@@ -1394,6 +1884,11 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        AssignmentAuthorityScope, ManagedDnsRecordTemplate, managed_dns_base_records,
+        managed_dns_records_manifest_for_scope, parse_assignment_authority_scope,
+    };
+
     #[test]
     fn traversal_refresh_interval_is_half_coordination_ttl() {
         assert_eq!(super::traversal_refresh_interval_secs(30), 15);
@@ -1425,5 +1920,39 @@ mod tests {
                 "/etc/rustynet",
             ]
         );
+    }
+
+    #[test]
+    fn parse_assignment_authority_scope_collects_subject_and_peers() {
+        let bundle = "node_id=client-1\npeer.0.node_id=exit-1\npeer.1.node_id=client-3\n";
+        let scope = parse_assignment_authority_scope(bundle).expect("scope should parse");
+        assert_eq!(
+            scope,
+            AssignmentAuthorityScope {
+                node_id: "client-1".to_string(),
+                peer_node_ids: vec!["client-3".to_string(), "exit-1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn managed_dns_records_manifest_filters_unauthorized_targets() {
+        let mut records = managed_dns_base_records("exit-1", "client-1", "client-3");
+        records.push(ManagedDnsRecordTemplate {
+            label: "blocked".to_string(),
+            target_node_id: "client-9".to_string(),
+            ttl_secs: 300,
+            aliases: Vec::new(),
+        });
+        let scope = AssignmentAuthorityScope {
+            node_id: "client-1".to_string(),
+            peer_node_ids: vec!["exit-1".to_string()],
+        };
+        let manifest = managed_dns_records_manifest_for_scope(&records, &scope)
+            .expect("manifest should be filtered to authorized records");
+        assert!(manifest.contains("target_node_id=client-1"));
+        assert!(manifest.contains("target_node_id=exit-1"));
+        assert!(!manifest.contains("target_node_id=client-3"));
+        assert!(!manifest.contains("target_node_id=client-9"));
     }
 }

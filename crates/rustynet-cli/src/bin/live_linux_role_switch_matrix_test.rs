@@ -21,16 +21,35 @@ use live_lab_support::{
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Clone, Debug)]
-struct TraversalRefreshTarget {
+struct SignedStateRefreshTarget {
     host: String,
     node_id: String,
 }
 
 #[derive(Clone, Debug)]
-struct TraversalRefreshContext {
-    env_file: PathBuf,
+struct SignedStateRefreshContext {
+    traversal_env_file: PathBuf,
+    dns_zone_env_file: PathBuf,
     exit_host: String,
-    targets: Vec<TraversalRefreshTarget>,
+    targets: Vec<SignedStateRefreshTarget>,
+}
+
+struct RoleSwitchRunContext<'a> {
+    logger: &'a mut Logger,
+    identity: &'a Path,
+    known_hosts: &'a Path,
+    ssh_allow_cidrs: &'a str,
+    hosts_json_path: &'a Path,
+    workspace_dir: &'a Path,
+    signed_state_refresh: Option<&'a SignedStateRefreshContext>,
+}
+
+#[derive(Clone, Copy)]
+struct HostSwitchSpec<'a> {
+    host: &'a str,
+    os_id: &'a str,
+    temp_role: &'a str,
+    node_id: &'a str,
 }
 
 struct ClientRoleContext<'a> {
@@ -41,7 +60,7 @@ struct ClientRoleContext<'a> {
     node_id: &'a str,
     ssh_allow_cidrs: &'a str,
     workspace_dir: &'a Path,
-    traversal_refresh: Option<&'a TraversalRefreshContext>,
+    signed_state_refresh: Option<&'a SignedStateRefreshContext>,
 }
 
 fn main() {
@@ -98,8 +117,8 @@ fn run() -> Result<(), String> {
         ],
     )?;
 
-    let pinned_known_hosts = match config.pinned_known_hosts_file {
-        Some(path) => path,
+    let pinned_known_hosts = match &config.pinned_known_hosts_file {
+        Some(path) => path.clone(),
         None => live_lab_support::load_home_known_hosts_path()?,
     };
     live_lab_support::ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
@@ -109,7 +128,7 @@ fn run() -> Result<(), String> {
     live_lab_support::seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
     let mut logger = Logger::new(&config.log_path)?;
     let mut source_body = String::new();
-    let git_commit = config.git_commit.unwrap_or_else(|| {
+    let git_commit = config.git_commit.clone().unwrap_or_else(|| {
         git_head_commit(&root_dir).unwrap_or_else(|err| {
             eprintln!("{err}");
             std::process::exit(1);
@@ -125,73 +144,49 @@ fn run() -> Result<(), String> {
 
     logger.line("[role-switch] starting live role-switch matrix validation")?;
 
-    let traversal_refresh =
-        config
-            .traversal_env_file
-            .as_ref()
-            .map(|env_file| TraversalRefreshContext {
-                env_file: env_file.clone(),
-                exit_host: config.exit_host.clone(),
-                targets: vec![
-                    TraversalRefreshTarget {
-                        host: config.exit_host.clone(),
-                        node_id: config.exit_node_id.clone(),
-                    },
-                    TraversalRefreshTarget {
-                        host: config.debian_host.clone(),
-                        node_id: config.debian_node_id.clone(),
-                    },
-                    TraversalRefreshTarget {
-                        host: config.ubuntu_host.clone(),
-                        node_id: config.ubuntu_node_id.clone(),
-                    },
-                    TraversalRefreshTarget {
-                        host: config.fedora_host.clone(),
-                        node_id: config.fedora_node_id.clone(),
-                    },
-                    TraversalRefreshTarget {
-                        host: config.mint_host.clone(),
-                        node_id: config.mint_node_id.clone(),
-                    },
-                ],
-            });
+    let signed_state_refresh = build_signed_state_refresh_context(&config)?;
+    let mut run_context = RoleSwitchRunContext {
+        logger: &mut logger,
+        identity: &config.ssh_identity_file,
+        known_hosts: &work_known_hosts,
+        ssh_allow_cidrs: &config.ssh_allow_cidrs,
+        hosts_json_path: &tmp_json,
+        workspace_dir: workspace.path(),
+        signed_state_refresh: signed_state_refresh.as_ref(),
+    };
 
     let mut overall_status = "pass".to_string();
-    for (host, os_id, temp_role, node_id) in [
-        (
-            &config.debian_host,
-            "debian13",
-            "admin",
-            &config.debian_node_id,
-        ),
-        (
-            &config.fedora_host,
-            "fedora",
-            "blind_exit",
-            &config.fedora_node_id,
-        ),
-        (
-            &config.ubuntu_host,
-            "ubuntu",
-            "admin",
-            &config.ubuntu_node_id,
-        ),
-        (&config.mint_host, "mint", "admin", &config.mint_node_id),
+    for host in [
+        HostSwitchSpec {
+            host: &config.debian_host,
+            os_id: "debian13",
+            temp_role: "admin",
+            node_id: &config.debian_node_id,
+        },
+        HostSwitchSpec {
+            host: &config.fedora_host,
+            os_id: "fedora",
+            temp_role: "blind_exit",
+            node_id: &config.fedora_node_id,
+        },
+        HostSwitchSpec {
+            host: &config.ubuntu_host,
+            os_id: "ubuntu",
+            temp_role: "admin",
+            node_id: &config.ubuntu_node_id,
+        },
+        HostSwitchSpec {
+            host: &config.mint_host,
+            os_id: "mint",
+            temp_role: "admin",
+            node_id: &config.mint_node_id,
+        },
     ] {
         process_host(
-            &mut logger,
-            &work_known_hosts,
-            &config.ssh_identity_file,
+            &mut run_context,
             host,
-            os_id,
-            temp_role,
-            node_id,
-            &config.ssh_allow_cidrs,
-            &tmp_json,
             &mut source_body,
             &mut overall_status,
-            workspace.path(),
-            traversal_refresh.as_ref(),
         )?;
     }
 
@@ -246,6 +241,7 @@ struct Config {
     pinned_known_hosts_file: Option<PathBuf>,
     git_commit: Option<String>,
     traversal_env_file: Option<PathBuf>,
+    dns_zone_env_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -269,6 +265,7 @@ impl Config {
             pinned_known_hosts_file: None,
             git_commit: None,
             traversal_env_file: None,
+            dns_zone_env_file: None,
         };
 
         let mut iter = args.into_iter();
@@ -298,6 +295,9 @@ impl Config {
                 "--git-commit" => config.git_commit = Some(next_value(&mut iter, &arg)?),
                 "--traversal-env-file" => {
                     config.traversal_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                }
+                "--dns-zone-env-file" => {
+                    config.dns_zone_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -333,79 +333,165 @@ impl Config {
         {
             return Err(format!("missing traversal env file: {}", path.display()));
         }
+        if let Some(path) = &config.dns_zone_env_file
+            && !path.is_file()
+        {
+            return Err(format!("missing dns zone env file: {}", path.display()));
+        }
         Ok(config)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn build_signed_state_refresh_context(
+    config: &Config,
+) -> Result<Option<SignedStateRefreshContext>, String> {
+    match (
+        config.traversal_env_file.as_ref(),
+        config.dns_zone_env_file.as_ref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(
+            "role-switch signed-state refresh requires --dns-zone-env-file when --traversal-env-file is set"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "role-switch signed-state refresh requires --traversal-env-file when --dns-zone-env-file is set"
+                .to_string(),
+        ),
+        (Some(traversal_env_file), Some(dns_zone_env_file)) => {
+            Ok(Some(SignedStateRefreshContext {
+                traversal_env_file: traversal_env_file.clone(),
+                dns_zone_env_file: dns_zone_env_file.clone(),
+                exit_host: config.exit_host.clone(),
+                targets: vec![
+                    SignedStateRefreshTarget {
+                        host: config.exit_host.clone(),
+                        node_id: config.exit_node_id.clone(),
+                    },
+                    SignedStateRefreshTarget {
+                        host: config.debian_host.clone(),
+                        node_id: config.debian_node_id.clone(),
+                    },
+                    SignedStateRefreshTarget {
+                        host: config.ubuntu_host.clone(),
+                        node_id: config.ubuntu_node_id.clone(),
+                    },
+                    SignedStateRefreshTarget {
+                        host: config.fedora_host.clone(),
+                        node_id: config.fedora_node_id.clone(),
+                    },
+                    SignedStateRefreshTarget {
+                        host: config.mint_host.clone(),
+                        node_id: config.mint_node_id.clone(),
+                    },
+                ],
+            }))
+        }
+    }
+}
+
 fn process_host(
-    logger: &mut Logger,
-    known_hosts: &Path,
-    identity: &Path,
-    host: &str,
-    os_id: &str,
-    temp_role: &str,
-    node_id: &str,
-    ssh_allow_cidrs: &str,
-    hosts_json_path: &Path,
+    context: &mut RoleSwitchRunContext<'_>,
+    spec: HostSwitchSpec<'_>,
     source_body: &mut String,
     overall_status: &mut String,
-    workspace_dir: &Path,
-    traversal_refresh: Option<&TraversalRefreshContext>,
 ) -> Result<(), String> {
-    logger.line(format!("[role-switch] {os_id} {host} -> {temp_role}").as_str())?;
-    let mut client_role = ClientRoleContext {
-        logger,
-        identity,
-        known_hosts,
-        host,
-        node_id,
-        ssh_allow_cidrs,
-        workspace_dir,
-        traversal_refresh,
+    context.logger.line(
+        format!(
+            "[role-switch] {} {} -> {}",
+            spec.os_id, spec.host, spec.temp_role
+        )
+        .as_str(),
+    )?;
+    let (baseline, baseline_exit) = {
+        let mut client_role = ClientRoleContext {
+            logger: &mut *context.logger,
+            identity: context.identity,
+            known_hosts: context.known_hosts,
+            host: spec.host,
+            node_id: spec.node_id,
+            ssh_allow_cidrs: context.ssh_allow_cidrs,
+            workspace_dir: context.workspace_dir,
+            signed_state_refresh: context.signed_state_refresh,
+        };
+        let baseline = ensure_client_role(&mut client_role)?;
+        let baseline_exit = field_value(&baseline, "exit_node");
+        (baseline, baseline_exit)
     };
-    let baseline = ensure_client_role(&mut client_role)?;
-    let baseline_exit = field_value(&baseline, "exit_node");
 
     switch_role(
-        identity,
-        known_hosts,
-        host,
-        temp_role,
-        node_id,
-        ssh_allow_cidrs,
+        context.identity,
+        context.known_hosts,
+        spec.host,
+        spec.temp_role,
+        spec.node_id,
+        context.ssh_allow_cidrs,
     )?;
-    let after_temp = wait_for_role(identity, known_hosts, host, temp_role)?;
+    if let Some(refresh) = context.signed_state_refresh {
+        refresh_signed_state_for_transition(
+            context.logger,
+            context.identity,
+            context.known_hosts,
+            context.workspace_dir,
+            refresh,
+            spec.host,
+            format!(
+                "before waiting for {} to settle as {}",
+                spec.node_id, spec.temp_role
+            )
+            .as_str(),
+        )?;
+    }
+    let after_temp = wait_for_role(
+        context.identity,
+        context.known_hosts,
+        spec.host,
+        spec.temp_role,
+    )?;
 
     let mut switch_execution = "fail";
     let mut post_switch_reconcile = "fail";
     let mut policy_still_enforced = "fail";
     let mut least_privilege_preserved = "fail";
 
-    if temp_role == "blind_exit" {
-        if route_advertise_denied(identity, known_hosts, host)? {
+    if spec.temp_role == "blind_exit" {
+        if route_advertise_denied(context.identity, context.known_hosts, spec.host)? {
             policy_still_enforced = "pass";
         }
-        if exit_select_denied(identity, known_hosts, host, &baseline_exit)?
-            && lan_toggle_denied(identity, known_hosts, host)?
+        if exit_select_denied(
+            context.identity,
+            context.known_hosts,
+            spec.host,
+            &baseline_exit,
+        )? && lan_toggle_denied(context.identity, context.known_hosts, spec.host)?
         {
             least_privilege_preserved = "pass";
         }
-    } else if route_advertise_denied(identity, known_hosts, host)? {
+    } else if route_advertise_denied(context.identity, context.known_hosts, spec.host)? {
         policy_still_enforced = "pass";
         least_privilege_preserved = "pass";
     }
 
+    let mut restore_context = ClientRoleContext {
+        logger: &mut *context.logger,
+        identity: context.identity,
+        known_hosts: context.known_hosts,
+        host: spec.host,
+        node_id: spec.node_id,
+        ssh_allow_cidrs: context.ssh_allow_cidrs,
+        workspace_dir: context.workspace_dir,
+        signed_state_refresh: context.signed_state_refresh,
+    };
     let after_restore =
-        ensure_client_role_with_expected_exit(&mut client_role, Some(&baseline_exit))?;
+        ensure_client_role_with_expected_exit(&mut restore_context, Some(&baseline_exit))?;
 
-    if field_value(&after_temp, "node_role") == temp_role
+    if field_value(&after_temp, "node_role") == spec.temp_role
         && field_value(&after_restore, "node_role") == "client"
     {
         switch_execution = "pass";
     }
 
-    if temp_role == "blind_exit" {
+    if spec.temp_role == "blind_exit" {
         if field_value(&after_temp, "serving_exit_node") == "true"
             && field_value(&after_temp, "exit_node") == "none"
             && field_value(&after_temp, "lan_access") == "off"
@@ -424,7 +510,7 @@ fn process_host(
         post_switch_reconcile = "pass";
     }
 
-    source_body.push_str(format!("## {os_id} ({host})\n").as_str());
+    source_body.push_str(format!("## {} ({})\n", spec.os_id, spec.host).as_str());
     source_body.push_str(format!("- baseline: {}\n", sanitize_line(&baseline)).as_str());
     source_body.push_str(format!("- after_temp: {}\n", sanitize_line(&after_temp)).as_str());
     source_body
@@ -435,11 +521,11 @@ fn process_host(
         "update-role-switch-host-result",
         &[
             OsString::from("--hosts-json-path"),
-            hosts_json_path.as_os_str().to_os_string(),
+            context.hosts_json_path.as_os_str().to_os_string(),
             OsString::from("--os-id"),
-            OsString::from(os_id),
+            OsString::from(spec.os_id),
             OsString::from("--temp-role"),
-            OsString::from(temp_role),
+            OsString::from(spec.temp_role),
             OsString::from("--switch-execution"),
             OsString::from(switch_execution),
             OsString::from("--post-switch-reconcile"),
@@ -540,21 +626,15 @@ fn ensure_client_role_with_expected_exit(
         )?;
     }
     force_runtime_state_refresh(context.identity, context.known_hosts, context.host)?;
-    if let Some(refresh) = context.traversal_refresh {
-        refresh_traversal_for_role_restore(
+    if let Some(refresh) = context.signed_state_refresh {
+        refresh_signed_state_for_transition(
             context.logger,
             context.identity,
             context.known_hosts,
             context.workspace_dir,
             refresh,
-            context.node_id,
-        )?;
-        force_runtime_state_refresh_targets_ordered(
-            context.identity,
-            context.known_hosts,
-            refresh.targets.as_slice(),
-            refresh.exit_host.as_str(),
             context.host,
+            format!("before restoring {} to client", context.node_id).as_str(),
         )?;
     }
     let after_switch = wait_for_role(
@@ -579,28 +659,54 @@ fn ensure_client_role_with_expected_exit(
     }
 }
 
-fn refresh_traversal_for_role_restore(
+fn refresh_signed_state_for_transition(
     logger: &mut Logger,
     identity: &Path,
     known_hosts: &Path,
     workspace_dir: &Path,
-    refresh: &TraversalRefreshContext,
-    restore_node_id: &str,
+    refresh: &SignedStateRefreshContext,
+    target_host: &str,
+    reason: &str,
+) -> Result<(), String> {
+    refresh_traversal_bundles_for_transition(
+        logger,
+        identity,
+        known_hosts,
+        workspace_dir,
+        refresh,
+        reason,
+    )?;
+    refresh_dns_zone_bundles_for_transition(identity, known_hosts, workspace_dir, refresh)?;
+    for target in &refresh.targets {
+        refresh_trust_evidence(identity, known_hosts, target.host.as_str())?;
+        refresh_signed_state(identity, known_hosts, target.host.as_str())?;
+    }
+    force_runtime_state_refresh_targets_ordered(
+        identity,
+        known_hosts,
+        refresh.targets.as_slice(),
+        refresh.exit_host.as_str(),
+        target_host,
+    )?;
+    Ok(())
+}
+
+fn refresh_traversal_bundles_for_transition(
+    logger: &mut Logger,
+    identity: &Path,
+    known_hosts: &Path,
+    workspace_dir: &Path,
+    refresh: &SignedStateRefreshContext,
+    reason: &str,
 ) -> Result<(), String> {
     let issue_dir = workspace_dir.join(format!(
         "role-switch-traversal-{}-{}",
-        restore_node_id,
+        sanitize_path_component(reason),
         unix_now()
     ));
     let remote_env_path = "/tmp/rn-role-switch-traversal.env";
     let remote_issue_dir = "/run/rustynet/role-switch-traversal-issue";
-    logger.line(
-        format!(
-            "[role-switch] refresh traversal before restoring {} to client",
-            restore_node_id
-        )
-        .as_str(),
-    )?;
+    logger.line(format!("[role-switch] refresh traversal {reason}").as_str())?;
     fs::create_dir_all(&issue_dir).map_err(|err| {
         format!(
             "failed to create role-switch traversal workspace {}: {err}",
@@ -610,7 +716,7 @@ fn refresh_traversal_for_role_restore(
     scp_to(
         identity,
         known_hosts,
-        refresh.env_file.as_path(),
+        refresh.traversal_env_file.as_path(),
         refresh.exit_host.as_str(),
         remote_env_path,
     )?;
@@ -685,6 +791,82 @@ fn refresh_traversal_for_role_restore(
     Ok(())
 }
 
+fn refresh_dns_zone_bundles_for_transition(
+    identity: &Path,
+    known_hosts: &Path,
+    workspace_dir: &Path,
+    refresh: &SignedStateRefreshContext,
+) -> Result<(), String> {
+    let issue_dir = workspace_dir.join(format!("role-switch-dns-{}", unix_now()));
+    let remote_env_path = "/tmp/rn-role-switch-dns.env";
+    let remote_issue_dir = "/run/rustynet/dns-zone-issue";
+    fs::create_dir_all(&issue_dir).map_err(|err| {
+        format!(
+            "failed to create role-switch dns workspace {}: {err}",
+            issue_dir.display()
+        )
+    })?;
+    scp_to(
+        identity,
+        known_hosts,
+        refresh.dns_zone_env_file.as_path(),
+        refresh.exit_host.as_str(),
+        remote_env_path,
+    )?;
+    if let Err(err) = run_root(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        format!(
+            "rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file '{}' --issue-dir '{}'",
+            remote_env_path, remote_issue_dir
+        )
+        .as_str(),
+    ) {
+        let _ = run_root(
+            identity,
+            known_hosts,
+            refresh.exit_host.as_str(),
+            format!("rm -f '{}'", remote_env_path).as_str(),
+        );
+        return Err(err);
+    }
+    let _ = run_root(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        format!("rm -f '{}'", remote_env_path).as_str(),
+    );
+
+    let verifier_key = issue_dir.join("rn-dns-zone.pub");
+    capture_root_file_to_path(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        &format!("{remote_issue_dir}/rn-dns-zone.pub"),
+        verifier_key.as_path(),
+    )?;
+
+    for target in &refresh.targets {
+        let bundle = issue_dir.join(format!("rn-dns-zone-{}.dns-zone", target.node_id));
+        capture_root_file_to_path(
+            identity,
+            known_hosts,
+            refresh.exit_host.as_str(),
+            &format!("{remote_issue_dir}/rn-dns-zone-{}.dns-zone", target.node_id),
+            bundle.as_path(),
+        )?;
+        install_dns_zone_bundle(
+            identity,
+            known_hosts,
+            target.host.as_str(),
+            verifier_key.as_path(),
+            bundle.as_path(),
+        )?;
+    }
+    Ok(())
+}
+
 fn capture_root_file_to_path(
     identity: &Path,
     known_hosts: &Path,
@@ -713,7 +895,7 @@ fn capture_root_file_to_path(
 fn force_runtime_state_refresh_targets_ordered(
     identity: &Path,
     known_hosts: &Path,
-    targets: &[TraversalRefreshTarget],
+    targets: &[SignedStateRefreshTarget],
     exit_host: &str,
     target_host: &str,
 ) -> Result<(), String> {
@@ -738,6 +920,40 @@ fn force_runtime_state_refresh_targets_ordered(
     Ok(())
 }
 
+fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, host: &str) -> Result<(), String> {
+    wait_for_daemon_socket(
+        identity,
+        known_hosts,
+        host,
+        "/run/rustynet/rustynetd.sock",
+        20,
+        2,
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        host,
+        "rustynet ops refresh-signed-trust",
+    )
+}
+
+fn refresh_signed_state(identity: &Path, known_hosts: &Path, host: &str) -> Result<(), String> {
+    wait_for_daemon_socket(
+        identity,
+        known_hosts,
+        host,
+        "/run/rustynet/rustynetd.sock",
+        20,
+        2,
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        host,
+        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+    )
+}
+
 fn force_runtime_state_refresh(
     identity: &Path,
     known_hosts: &Path,
@@ -756,6 +972,41 @@ fn force_runtime_state_refresh(
         "/run/rustynet/rustynetd.sock",
         20,
         2,
+    )
+}
+
+fn install_dns_zone_bundle(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+    verifier_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    scp_to(
+        identity,
+        known_hosts,
+        verifier_local,
+        target,
+        "/tmp/rn-dns-zone.pub",
+    )?;
+    scp_to(
+        identity,
+        known_hosts,
+        bundle_local,
+        target,
+        "/tmp/rn-dns-zone.bundle",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
     )
 }
 
@@ -919,6 +1170,15 @@ fn sanitize_line(value: &str) -> String {
         .join(" ")
 }
 
+fn sanitize_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
 fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
     iter.next()
         .ok_or_else(|| format!("{flag} requires a value"))
@@ -926,7 +1186,7 @@ fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Strin
 
 fn print_usage() {
     eprintln!(
-        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>"
+        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>\n  --dns-zone-env-file <path>"
     );
 }
 
@@ -948,7 +1208,12 @@ fn utc_now_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_exit_route_converged, role_runtime_ready, route_uses_rustynet0};
+    use super::{
+        Config, build_signed_state_refresh_context, client_exit_route_converged,
+        role_runtime_ready, route_uses_rustynet0,
+    };
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn role_runtime_ready_requires_converged_runtime_state() {
@@ -992,5 +1257,52 @@ mod tests {
 
         let underlay_route = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0";
         assert!(!client_exit_route_converged(underlay_route, "exit-1"));
+    }
+
+    #[test]
+    fn signed_state_refresh_context_requires_paired_env_files() {
+        let temp_root =
+            std::env::temp_dir().join(format!("role-switch-refresh-{}", std::process::id()));
+        fs::create_dir_all(&temp_root).expect("temp dir should exist");
+        let traversal_env = temp_root.join("issue_traversal.env");
+        let dns_zone_env = temp_root.join("issue_dns_zone.env");
+        fs::write(&traversal_env, "NODES_SPEC=a\n").expect("write traversal env");
+        fs::write(&dns_zone_env, "NODES_SPEC=a\n").expect("write dns env");
+
+        let mut config = Config {
+            ssh_identity_file: PathBuf::from("/tmp/key"),
+            exit_host: "debian@192.168.64.8".to_string(),
+            exit_node_id: "exit-1".to_string(),
+            debian_host: "debian@192.168.64.4".to_string(),
+            debian_node_id: "client-1".to_string(),
+            ubuntu_host: "debian@192.168.64.9".to_string(),
+            ubuntu_node_id: "client-2".to_string(),
+            fedora_host: "debian@192.168.64.10".to_string(),
+            fedora_node_id: "client-3".to_string(),
+            mint_host: "debian@192.168.64.11".to_string(),
+            mint_node_id: "client-4".to_string(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            report_path: temp_root.join("report.json"),
+            source_path: temp_root.join("source.md"),
+            log_path: temp_root.join("role-switch.log"),
+            pinned_known_hosts_file: None,
+            git_commit: None,
+            traversal_env_file: Some(traversal_env.clone()),
+            dns_zone_env_file: None,
+        };
+
+        let err = build_signed_state_refresh_context(&config)
+            .expect_err("missing dns env file must be rejected");
+        assert!(err.contains("--dns-zone-env-file"));
+
+        config.dns_zone_env_file = Some(dns_zone_env.clone());
+        let refresh = build_signed_state_refresh_context(&config)
+            .expect("paired env files should build")
+            .expect("refresh context should exist");
+        assert_eq!(refresh.targets.len(), 5);
+        assert_eq!(refresh.traversal_env_file, traversal_env);
+        assert_eq!(refresh.dns_zone_env_file, dns_zone_env);
+
+        let _ = fs::remove_dir_all(&temp_root);
     }
 }

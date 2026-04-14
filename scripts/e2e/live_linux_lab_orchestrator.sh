@@ -3751,6 +3751,7 @@ stage_run_live_role_switch_matrix() {
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --traversal-env-file "$STATE_DIR/issue_traversal.env" \
+    --dns-zone-env-file "$STATE_DIR/issue_dns_zone.env" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
     --debian-host "$(node_target_for_label client)" \
@@ -5460,7 +5461,7 @@ stage_generate_fresh_install_os_matrix_report() {
     --two-hop-report "$REPORT_DIR/live_linux_two_hop_report.json" \
     --role-switch-report "$role_report" \
     --lan-toggle-report "$REPORT_DIR/live_linux_lan_toggle_report.json" \
-    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" >/dev/null
+    --exit-handoff-report "$REPORT_DIR/live_linux_exit_handoff_report.json" >/dev/null || return 1
   canonical_bootstrap_log="$canonical_source_dir/bootstrap_hosts.log"
   canonical_baseline_log="$canonical_source_dir/validate_baseline_runtime.log"
   canonical_two_hop_report="$canonical_source_dir/live_linux_two_hop_report.json"
@@ -5495,8 +5496,8 @@ stage_generate_fresh_install_os_matrix_report() {
     --client-node-id "$(node_id_for_label client)" \
     --ubuntu-node-id "$(node_id_for_label entry)" \
     --fedora-node-id "$(node_id_for_label aux)" \
-    --mint-node-id "$(node_id_for_label extra)"
-  cp "$canonical_report" "$REPORT_DIR/fresh_install_os_matrix_report.json"
+    --mint-node-id "$(node_id_for_label extra)" || return 1
+  cp "$canonical_report" "$REPORT_DIR/fresh_install_os_matrix_report.json" || return 1
 }
 
 ssh_wait_for_host() {
@@ -6135,23 +6136,23 @@ main() {
   parse_args "$@"
   printf 'run started: %s (utc: %s)\n' "$RUN_STARTED_AT_LOCAL" "$RUN_STARTED_AT_UTC"
   if [[ "$SETUP_ONLY" -eq 1 && "$SKIP_SETUP" -eq 1 ]]; then
-    printf '--setup-only and --skip-setup cannot be used together\n' >&2
+    printf '%s\n' '--setup-only and --skip-setup cannot be used together' >&2
     exit 2
   fi
   if [[ -n "$RESUME_FROM_STAGE" && -n "$RERUN_STAGE" ]]; then
-    printf '--resume-from and --rerun-stage cannot be used together\n' >&2
+    printf '%s\n' '--resume-from and --rerun-stage cannot be used together' >&2
     exit 2
   fi
   if [[ -n "$RESUME_FROM_STAGE" && "$SETUP_ONLY" -ne 1 ]]; then
-    printf '--resume-from is only supported with --setup-only\n' >&2
+    printf '%s\n' '--resume-from is only supported with --setup-only' >&2
     exit 2
   fi
   if [[ -n "$RERUN_STAGE" && "$SETUP_ONLY" -ne 1 ]]; then
-    printf '--rerun-stage is only supported with --setup-only\n' >&2
+    printf '%s\n' '--rerun-stage is only supported with --setup-only' >&2
     exit 2
   fi
   if [[ ! "$MAX_PARALLEL_NODE_WORKERS" =~ ^[0-9]+$ ]] || (( MAX_PARALLEL_NODE_WORKERS <= 0 )); then
-    printf '--max-parallel-node-workers must be a positive integer (got: %s)\n' "$MAX_PARALLEL_NODE_WORKERS" >&2
+    printf '%s\n' "--max-parallel-node-workers must be a positive integer (got: $MAX_PARALLEL_NODE_WORKERS)" >&2
     exit 2
   fi
   if [[ -n "$RESUME_FROM_STAGE" ]]; then

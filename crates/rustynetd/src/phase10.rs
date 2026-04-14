@@ -930,6 +930,31 @@ impl LinuxCommandSystem {
         }
     }
 
+    fn route_destination_matches_rendered(expected: &str, rendered: &str) -> bool {
+        if rendered == expected {
+            return true;
+        }
+        let Some((address, prefix)) = expected.split_once('/') else {
+            return false;
+        };
+        let host_prefix = if address.contains(':') { "128" } else { "32" };
+        prefix == host_prefix && rendered == address
+    }
+
+    fn line_matches_expected_bypass_route(line: &str, route: &ExpectedBypassRoute) -> bool {
+        let mut tokens = line.split_whitespace();
+        let Some(destination) = tokens.next() else {
+            return false;
+        };
+        if !Self::route_destination_matches_rendered(route.destination.as_str(), destination) {
+            return false;
+        }
+        let token_vec: Vec<_> = line.split_whitespace().collect();
+        token_vec
+            .windows(2)
+            .any(|window| window[0] == "dev" && window[1] == route.interface_name.as_str())
+    }
+
     fn assert_expected_bypass_routes(&self) -> Result<(), SystemError> {
         let mut table_v4: Option<String> = None;
         let mut table_v6: Option<String> = None;
@@ -960,10 +985,13 @@ impl LinuxCommandSystem {
                     })?
                 }
             };
-            let expected = format!("{} dev {}", route.destination, route.interface_name);
-            if table_output.contains(expected.as_str()) {
+            if table_output
+                .lines()
+                .any(|line| Self::line_matches_expected_bypass_route(line, route))
+            {
                 continue;
             }
+            let expected = format!("{} dev {}", route.destination, route.interface_name);
             return Err(SystemError::KillSwitchAssertionFailed(format!(
                 "missing owned bypass route in table 51820: expected={} output={}",
                 expected,
@@ -6269,6 +6297,84 @@ mod tests {
             err.to_string()
                 .contains("missing owned bypass route in table 51820")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_assert_exit_policy_accepts_host_route_rendered_without_prefix() {
+        let socket_path = phase10_test_socket_path("xbr");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "nft list table inet rustynet_g1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: sample_linux_firewall_ruleset(
+                            "rustynet0",
+                            "enp0s9",
+                            false,
+                            false,
+                            false,
+                        ),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip rule show".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "0: from all lookup local\n32765: from all lookup 51820\n32766: from all lookup main\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route show table 51820".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "default dev rustynet0 scope link\n203.0.113.10 dev enp0s9 scope link\n".to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "ip -4 route get 1.1.1.1".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "1.1.1.1 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"
+                            .to_string(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g1".to_string());
+        system
+            .expected_peer_endpoint_bypass_routes
+            .insert(ExpectedBypassRoute {
+                destination: "203.0.113.10/32".to_string(),
+                interface_name: "enp0s9".to_string(),
+                family: RouteTableFamily::V4,
+            });
+
+        DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel)
+            .expect("host route rendered without /32 must still satisfy bypass ownership proof");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     #[cfg(target_os = "linux")]

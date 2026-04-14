@@ -752,6 +752,22 @@ impl std::str::FromStr for NodeRole {
     }
 }
 
+fn sanitize_dataplane_routes_for_node_role(node_role: NodeRole, routes: Vec<Route>) -> Vec<Route> {
+    if !node_role.is_blind_exit() {
+        return routes;
+    }
+
+    routes
+        .into_iter()
+        .filter(|route| {
+            !matches!(
+                route.kind,
+                RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub node_id: String,
@@ -5033,6 +5049,7 @@ impl DaemonRuntime {
             }
         };
 
+        let routes = sanitize_dataplane_routes_for_node_role(self.node_role, routes);
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -6102,6 +6119,7 @@ impl DaemonRuntime {
                 }
             };
 
+            let routes = sanitize_dataplane_routes_for_node_role(self.node_role, routes);
             let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
@@ -10870,7 +10888,9 @@ mod tests {
     use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rustynet_backend_api::{NodeId, RuntimeContext, SocketEndpoint, TunnelBackend};
+    use rustynet_backend_api::{
+        NodeId, Route, RouteKind, RuntimeContext, SocketEndpoint, TunnelBackend,
+    };
     use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
@@ -10894,7 +10914,8 @@ mod tests {
         parse_route_interface_token, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
-        run_preflight_checks, scrub_runtime_wireguard_key_material, sha256_digest,
+        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
+        scrub_runtime_wireguard_key_material, sha256_digest,
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
         validate_daemon_config, validate_file_security, zeroize_optional_bytes,
     };
@@ -18544,6 +18565,50 @@ mod tests {
         let _ = std::fs::remove_file(traversal_verifier_path);
         let _ = std::fs::remove_file(traversal_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn sanitize_dataplane_routes_for_blind_exit_drops_exit_scoped_routes_only() {
+        let routes = vec![
+            Route {
+                destination_cidr: "100.64.0.0/10".to_string(),
+                via_node: NodeId::new("mesh-peer".to_string()).expect("mesh peer node id"),
+                kind: RouteKind::Mesh,
+            },
+            Route {
+                destination_cidr: "0.0.0.0/0".to_string(),
+                via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+                kind: RouteKind::ExitNodeDefault,
+            },
+            Route {
+                destination_cidr: "192.168.1.0/24".to_string(),
+                via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+                kind: RouteKind::ExitNodeLan,
+            },
+        ];
+
+        let sanitized = sanitize_dataplane_routes_for_node_role(NodeRole::BlindExit, routes);
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].destination_cidr, "100.64.0.0/10");
+        assert_eq!(sanitized[0].kind, RouteKind::Mesh);
+    }
+
+    #[test]
+    fn sanitize_dataplane_routes_for_non_blind_exit_preserves_routes() {
+        let routes = vec![Route {
+            destination_cidr: "0.0.0.0/0".to_string(),
+            via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+            kind: RouteKind::ExitNodeDefault,
+        }];
+
+        let client_routes =
+            sanitize_dataplane_routes_for_node_role(NodeRole::Client, routes.clone());
+        let admin_routes = sanitize_dataplane_routes_for_node_role(NodeRole::Admin, routes);
+
+        assert_eq!(client_routes.len(), 1);
+        assert_eq!(client_routes[0].kind, RouteKind::ExitNodeDefault);
+        assert_eq!(admin_routes.len(), 1);
+        assert_eq!(admin_routes[0].kind, RouteKind::ExitNodeDefault);
     }
 
     #[test]
