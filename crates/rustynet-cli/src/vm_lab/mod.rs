@@ -12530,14 +12530,14 @@ mod tests {
         VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager,
         build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
-        build_ssh_powershell_encoded_invocation, build_suite_command, build_utm_readiness,
-        build_vendored_cargo_config, build_vm_lab_topology, collect_live_lab_stage_local_bundle,
-        default_inventory_path, default_live_lab_iteration_profile_path,
-        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
-        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
-        encode_powershell_command, ensure_inventory_entries_share_network,
-        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
-        execute_ops_vm_lab_discover_local_utm_summary,
+        build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
+        build_suite_command, build_utm_readiness, build_vendored_cargo_config,
+        build_vm_lab_topology, collect_live_lab_stage_local_bundle, default_inventory_path,
+        default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
+        default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
+        discover_local_utm_bundle_paths, encode_powershell_command,
+        ensure_inventory_entries_share_network, execute_ops_vm_lab_diff_live_lab_runs,
+        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
         local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
@@ -12551,7 +12551,8 @@ mod tests {
         rewrite_ssh_target_host, select_inventory_entries, select_live_ssh_host_from_utm_output,
         selected_local_utm_readiness_from_report, ssh_auth_probe_command,
         summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
-        validate_live_lab_run_artifacts, windows_helper_script_remote_path,
+        validate_live_lab_run_artifacts, windows_diagnostics_helper_script_local_path,
+        windows_helper_script_remote_path,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -13974,7 +13975,7 @@ directory = "vendor"
         assert!(body.contains("EXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\""));
         assert!(body.contains("CLIENT_PLATFORM=\"linux\""));
         assert!(body.contains("CLIENT_REMOTE_SHELL=\"posix\""));
-        assert!(body.contains("CLIENT_GUEST_EXEC_MODE=\"linux_posix\""));
+        assert!(body.contains("CLIENT_GUEST_EXEC_MODE=\"linux_bash\""));
         assert!(body.contains("CLIENT_SERVICE_MANAGER=\"systemd\""));
         assert!(body.contains("FIFTH_CLIENT_TARGET=\"\""));
         assert!(body.contains("FIFTH_CLIENT_UTM_NAME=\"\""));
