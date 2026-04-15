@@ -50,6 +50,9 @@ Current phase-local hardening checklist:
 - [active/Phase5ReleaseReadinessChecklist_2026-04-12.md](./active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
 - [active/Phase5ReleaseReadinessSummary_2026-04-12.md](./active/Phase5ReleaseReadinessSummary_2026-04-12.md)
 - [active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md)
+- [active/VmLabCapabilityCookbook_2026-04-14.md](./active/VmLabCapabilityCookbook_2026-04-14.md)
+- [active/VmLabCapabilityReportingPlan_2026-04-14.md](./active/VmLabCapabilityReportingPlan_2026-04-14.md)
+- [active/VmLabCapabilitySources_2026-04-14.md](./active/VmLabCapabilitySources_2026-04-14.md)
 
 ## High-Value Evergreen References
 

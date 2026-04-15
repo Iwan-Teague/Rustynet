@@ -1,12 +1,44 @@
 # Rustynet Platform Support Matrix (Current Implementation)
 
-Date verified: 2026-03-05
+Date verified: 2026-04-15
 Purpose: provide a single current-state view of platform capability, security posture, and evidence depth.
 
 ## Scope
 - This matrix reflects **current implementation behavior**, not phase-plan scope text.
 - For historical phase boundaries, see `documents/phase10.md`.
 - Traversal architecture requirements are defined in `documents/Requirements.md` (section `3.2` + section `6`) and `documents/phase10.md`.
+- Windows notes in this document are scoped explicitly as VM-lab bootstrap truth
+  unless a row or note says otherwise. They are not a release-gate claim.
+
+## Windows VM-Lab Guest Truth
+
+- `bootstrap-capable/scaffolded only`: `ops vm-lab-discover-local-utm`,
+  `ops vm-lab-start`, `ops vm-lab-restart`, `ops vm-lab-sync-repo`, the
+  PowerShell-first access bootstrap helper under
+  `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`, and the canonical
+  helper root under `scripts/bootstrap/windows/` all dispatch through
+  Windows-specific PowerShell/ZIP/helper paths for `platform=windows`
+  inventory targets.
+- `partial Windows bootstrap-phase coverage`: `sync-source` and
+  `build-release` are the current helper-backed Windows phases. `build-release`
+  still depends on verified MSVC/toolchain availability or explicit bootstrap
+  configuration.
+- `live-lab wrapper boundary is fail-closed`: `ops vm-lab-validate-live-lab-profile`,
+  `ops vm-lab-setup-live-lab`, `ops vm-lab-run-live-lab`,
+  `ops vm-lab-orchestrate-live-lab`, `ops vm-lab-iterate-live-lab`,
+  `ops vm-lab-run-suite`, and `ops vm-lab-diagnose-live-lab-failure` are
+  still Linux-runtime surfaces. They reject profiles with missing target
+  metadata or any configured target that is not
+  `platform=linux`/`remote_shell=posix`/`guest_exec_mode=linux_bash`/`service_manager=systemd`
+  before any `live_linux_*` stage runs.
+- `not runtime-capable`: `install-release` is still a protective service-install
+  stub, and `restart-runtime`, `verify-runtime`, and `all` must not be treated
+  as Windows runtime-capable proof until `rustynetd` exposes a real Windows
+  service/config host surface. Helper-script parity is not treated as runtime
+  parity.
+- `not release-gated and evidenced`: Windows is intentionally excluded from the
+  current fresh-install OS matrix and Phase10 release gate because measured
+  Windows install/runtime/role-switch evidence does not yet exist.
 
 ## Capability Matrix
 

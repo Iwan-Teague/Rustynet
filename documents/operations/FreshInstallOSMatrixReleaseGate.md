@@ -31,6 +31,15 @@ This gate blocks release if any required OS/scenario evidence is missing, stale,
     - `mint`
     - `macos`
 
+## Current Windows Exclusion
+
+- Windows is intentionally not part of the required OS/scenario set on the
+  current branch.
+- Windows VM-lab bootstrap support does not satisfy this release gate.
+- Do not add a `windows` scenario key until there is measured, commit-bound
+  Windows clean-install, one-hop, two-hop, role-switch, and runtime/service
+  evidence for the current `HEAD`.
+
 ## Per-OS Scenario Requirements
 Each OS scenario must be `status=pass` and include:
 - `clean_install`

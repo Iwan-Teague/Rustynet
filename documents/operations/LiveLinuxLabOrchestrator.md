@@ -4,6 +4,10 @@ Script: `scripts/e2e/live_linux_lab_orchestrator.sh`
 
 Function reference: [`scripts/e2e/README.md`](../../scripts/e2e/README.md)
 
+Scope: this runbook is Linux-runtime specific. Windows, macOS, iOS, and
+Android targets must not be routed through these `live_linux_*` stages unless
+dedicated non-Linux runtime stages exist and are documented.
+
 ## Purpose
 
 This script automates the live Linux lab workflow that was previously being run manually:
@@ -100,6 +104,72 @@ cargo run --quiet -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
 
 Add `--stop-after-ready` when you want the wrapper to prove UTM recovery and
 inventory freshness without continuing into setup.
+
+Mixed-platform note:
+
+- Mixed Linux/Windows inventories are safe only for the platform-aware
+  discovery, start, restart, sync, and bootstrap-phase wrappers.
+- `ops vm-lab-bootstrap-phase` dispatches Linux targets to the current POSIX
+  executor and Windows targets to the Windows PowerShell provider; Windows
+  targets are never sent into `scripts/e2e/live_linux_*`.
+- The live-lab wrapper family `vm-lab-validate-live-lab-profile`,
+  `vm-lab-setup-live-lab`, `vm-lab-run-live-lab`,
+  `vm-lab-orchestrate-live-lab`, `vm-lab-iterate-live-lab`,
+  `vm-lab-run-suite`, and `vm-lab-diagnose-live-lab-failure` remains
+  Linux-runtime only. Those commands now fail closed when profile metadata is
+  missing or any configured target is not
+  `platform=linux`/`remote_shell=posix`/`guest_exec_mode=linux_bash`/`service_manager=systemd`.
+- Windows on the current branch is `bootstrap-capable/scaffolded only`, not
+  `runtime-capable` or `release-gated and evidenced`.
+- The current verified Windows bootstrap subset is `sync-source` and
+  `build-release`. `install-release` remains a protective service-install stub,
+  and `restart-runtime`, `verify-runtime`, and `all` must not be described as
+  Windows runtime success on this branch.
+
+## Wrapper Capability Truth
+
+The current top-level live-lab wrappers still make a coarse Linux-only
+accept/reject decision at the wrapper boundary. That is intentionally
+fail-closed, but it is not yet a complete capability model.
+
+The next documentation and implementation target is to make the wrapper tell the
+truth more precisely before execution starts:
+
+- supported
+- partially supported
+- unsupported
+- why, for this command, stage, source mode, and target platform mix
+
+The intended reporting surface is a pure capability evaluator, not a new
+execution path. It should classify the current wrapper truth without changing
+enforcement. The top-level wrappers should continue to reject unsupported
+combinations, but the rejection should be derived from explicit capability
+records rather than a single coarse Linux-only check.
+
+Planned capability record dimensions:
+
+- `scope` and `stage_or_phase`
+- `target_role` and `platform`
+- `source_mode`
+- `status`
+- `reason_code`
+- `message`
+- `implementation_owner`
+- `blocking_requirements`
+
+Planned machine-readable output:
+
+- `state/platform_capabilities.json` for the report directory
+- optionally a dedicated `ops vm-lab-report-capabilities` inspection command
+
+The practical policy is unchanged:
+
+- keep the current Linux-only execution guards until the capability evaluator is
+  in place
+- keep fail-closed behavior for every unsupported path
+- do not infer support from helper availability alone
+- preserve the distinction between full support, partial support, and
+  unsupported capabilities
 
 Reuse rules are fail-closed:
 

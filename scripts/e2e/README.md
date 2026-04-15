@@ -3,6 +3,8 @@
 This directory contains the shell entrypoints that drive the live Linux lab.
 The main orchestrator is [`live_linux_lab_orchestrator.sh`](./live_linux_lab_orchestrator.sh),
 with shared SSH, file, and snapshot helpers in [`live_lab_common.sh`](./live_lab_common.sh).
+These shell stages are Linux-runtime specific; Windows, macOS, iOS, and Android
+targets must not be routed into `live_linux_*` execution paths.
 
 Use this README as a quick map of the orchestration functions, especially the
 high-level wrappers that compose many lower-level stages into one operator-facing flow.
@@ -31,6 +33,62 @@ Automation security posture for this workflow:
 - canonical cross-network pass reports now require a suite-local SSH trust summary proving pinned host-key coverage and `sudo -n` for every participating target
 - canonical cross-network pass reports now require daemon path evidence to show `transport_socket_identity_state=authoritative_backend_shared_transport`
 - canonical cross-network soak pass now requires the soak to remain direct for the full duration with zero relay/fail-closed/drift samples
+
+## Windows UTM Support Matrix
+
+The Rust CLI now treats mixed Linux/Windows inventories as explicit rather than
+implicitly Linux-only:
+
+These labels describe current Rustynet wrapper support, not general Windows or
+macOS platform capability.
+
+- Supported for Windows UTM targets: `vm-lab-discover-local-utm`,
+  `vm-lab-start`, `vm-lab-restart`, `vm-lab-sync-repo`, and the partial
+  Windows bootstrap-phase surface for `sync-source` and `build-release`.
+- Windows support here is `bootstrap-capable/scaffolded only`. The Windows
+  provider and helper roots are real and platform-aware, but Windows
+  `install-release` is still a protective stub, `build-release` remains subject
+  to verified MSVC/toolchain preconditions, and `restart-runtime`,
+  `verify-runtime`, and `all` are not runtime-capable proof on the current
+  branch.
+- Intentionally blocked for Windows UTM targets: `vm-lab-validate-live-lab-profile`,
+  `vm-lab-setup-live-lab`, `vm-lab-run-live-lab`,
+  `vm-lab-orchestrate-live-lab`, `vm-lab-iterate-live-lab`,
+  `vm-lab-run-suite`, and `vm-lab-diagnose-live-lab-failure`.
+- The `scripts/e2e/live_linux_*` stage scripts remain Linux-only until a
+  Windows stage implementation exists. Mixed inventories can still live in the
+  repo, but the Linux live-lab wrappers fail closed instead of inventing Debian
+  shell assumptions for Windows entries. Those wrappers require explicit
+  `platform=linux`, `remote_shell=posix`, `guest_exec_mode=linux_bash`, and
+  `service_manager=systemd` metadata before execution starts.
+- Linux UTM targets continue to use the existing shell orchestrator path.
+
+## Capability Reporting Gap
+
+The top-level wrappers still enforce a coarse Linux-only boundary for the live
+setup/run/orchestrate flow. That is deliberate and fail-closed, but the wrapper
+surface already knows more than it currently reports because several
+sub-capabilities are platform-aware or partially implemented.
+
+The wrapper-support expectations in this section are separate from the
+implementation support matrix in
+[`documents/operations/PlatformSupportMatrix.md`](../../documents/operations/PlatformSupportMatrix.md).
+
+The documentation target is to move toward explicit capability reporting for
+each command and stage, without changing the current support truth:
+
+- `supported`
+- `partially supported`
+- `unsupported`
+
+The capability explanation should cover the command, stage or phase, source
+mode, platform mix, and the blocking requirements. The proposed machine-readable
+artifact is `state/platform_capabilities.json`; a dedicated inspection command
+would be a useful follow-up, but it is not required for the current execution
+path.
+
+Until that reporting layer exists, the existing Linux-only execution guards and
+their fail-closed errors remain the source of truth for the operator path.
 
 ## How The Orchestrator Works
 
@@ -68,7 +126,7 @@ orchestrator remains the execution engine behind them.
 | `ops vm-lab-run-live-lab` | Runs the full live-lab suite, validates required report artifacts, and can continue from an existing setup-only report directory | Preferred operator entrypoint for the full suite after setup is complete |
 | `ops vm-lab-iterate-live-lab` | Runs typed local validation, writes the profile, launches the reduced live-lab flow, and prints the first failed stage on error | Narrow iteration loop while debugging a red live-lab stage |
 | `ops vm-lab-diff-live-lab-runs` | Compares two report directories and shows the first divergent stage outcome | When a patch moves the blocker and you want a quick regression/progression diff |
-| `ops vm-lab-bootstrap-phase --phase all` | Runs the reusable Rust bootstrap pipeline across the selected VM set: sync source, build release, install release, restart runtime, verify runtime | Fresh-install or rebuild-only workflow when you want provisioning without the full live-lab test suite |
+| `ops vm-lab-bootstrap-phase --phase all` | Runs the reusable Rust bootstrap pipeline across the selected VM set: sync source, build release, install release, restart runtime, verify runtime. On the current branch, treat this as a Linux-runtime workflow; Windows guests use only the narrower verified `sync-source` and `build-release` phases plus explicit diagnostics. | Fresh-install or rebuild-only workflow when you want provisioning without the full live-lab test suite |
 | `ops vm-lab-preflight` | Verifies SSH reachability, sudo, free disk, and required commands | Standalone readiness check before provisioning or a live-lab run |
 | `ops vm-lab-discover-local-utm` | Automatically scans the local UTM documents tree, resolves live IPs, and reports SSH port/process readiness for every discovered bundle. `--update-inventory-live-ips` persists the refreshed IPs only when the whole matched set is execution-ready. | Use when you want the full machine-discovered local UTM lab inventory |
 | `ops vm-lab-restart --wait-ready` | Restarts the selected local UTM VMs, waits for process presence, live IP resolution, SSH port-open state, and SSH auth readiness, then refreshes the inventory IP fields on success. `--json` and `--report-dir` add machine-readable result and artifact output. | Recovery path when discovery knows the VMs but they are not yet actually reachable over SSH |
@@ -88,7 +146,8 @@ Use the smallest wrapper set that matches the task:
 
 | Goal | Preferred wrapper flow |
 | --- | --- |
-| Fresh install all selected Rustynet nodes | `ops vm-lab-bootstrap-phase --phase all` |
+| Fresh install all selected Linux Rustynet nodes | `ops vm-lab-bootstrap-phase --phase all` |
+| Prepare a Windows UTM guest without claiming runtime parity | `ops vm-lab-sync-repo` -> `ops vm-lab-bootstrap-phase --phase sync-source` -> `ops vm-lab-bootstrap-phase --phase build-release` |
 | Fresh install plus baseline and the full standard live suite | `ops vm-lab-setup-live-lab` -> `ops vm-lab-run-live-lab` |
 | One command that recovers unready local UTM VMs and then runs the standard live-lab flow | `ops vm-lab-orchestrate-live-lab` |
 | Reduced repeatable debug loop for a failing live-lab stage | `ops vm-lab-iterate-live-lab` |

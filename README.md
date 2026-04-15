@@ -109,6 +109,12 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
 This is the recommended operator path for live-lab work:
 discover, set up, link and test, then diagnose if something fails.
 
+This four-step live-lab wrapper path is currently Linux-runtime only. Profiles
+with missing target platform metadata, or with any target that is not
+`platform=linux`, `remote_shell=posix`, `guest_exec_mode=linux_bash`, and
+`service_manager=systemd`, fail closed before any `live_linux_*` shell stage
+runs.
+
 Live-lab automation security expectations:
 
 - SSH host trust must be pinned with `--ssh-known-hosts-file` or a pre-populated `~/.ssh/known_hosts`
@@ -142,6 +148,34 @@ of the flow:
 - `ops vm-lab-write-live-lab-profile`
 - `ops vm-lab-validate-live-lab-profile`
 - `ops vm-lab-bootstrap-phase --phase all`
+
+Current VM-lab Windows truth on this branch:
+
+- Windows UTM guests are `bootstrap-capable/scaffolded only` in the current
+  `ops vm-lab-*` surface.
+- Windows-safe helper surfaces currently include `vm-lab-discover-local-utm`,
+  `vm-lab-start`, `vm-lab-restart`, `vm-lab-sync-repo`, the PowerShell-first
+  access bootstrap under
+  `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`, diagnostics via
+  `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`, and
+  partial `vm-lab-bootstrap-phase` coverage for `sync-source` and
+  `build-release`.
+- Mixed Linux/Windows inventories dispatch bootstrap helpers by target platform;
+  Windows targets are not sent into the Linux `live_linux_*` stage scripts.
+- The live-lab wrapper family `vm-lab-validate-live-lab-profile`,
+  `vm-lab-setup-live-lab`, `vm-lab-run-live-lab`,
+  `vm-lab-orchestrate-live-lab`, `vm-lab-iterate-live-lab`,
+  `vm-lab-run-suite`, and `vm-lab-diagnose-live-lab-failure` remains
+  Linux-runtime only and fails closed on missing or incompatible target
+  metadata.
+- On the current branch, `build-release` is still conditional on verified
+  Windows/MSVC tooling being present. `install-release` is a protective service
+  install stub, and `restart-runtime`, `verify-runtime`, and `all` must not be
+  treated as runtime-capable proof until `rustynetd` exposes a real Windows
+  service/config host path with dedicated tests.
+- Windows is not `release-gated and evidenced` on the current branch. The
+  required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
+  Mint, and macOS until measured Windows evidence exists.
 
 ## Release Readiness
 

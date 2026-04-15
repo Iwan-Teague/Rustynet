@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod bootstrap;
+
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -19,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tar::Builder;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
@@ -40,9 +44,14 @@ const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
-const WINDOWS_VM_LAB_HELPER_ROOT: &str = "scripts/vm_lab/windows";
+const WINDOWS_BOOTSTRAP_HELPER_ROOT: &str = "scripts/bootstrap/windows";
+const WINDOWS_COMPAT_VM_LAB_HELPER_ROOT: &str = "scripts/vm_lab/windows";
+const WINDOWS_BOOTSTRAP_HELPER_FILE: &str = "Bootstrap-RustyNetWindows.ps1";
+const WINDOWS_BOOTSTRAP_WINGET_CONFIG_FILE: &str = "RustyNetBootstrap.winget.yml";
+const WINDOWS_BOOTSTRAP_VSCONFIG_FILE: &str = "RustyNetBuildTools.vsconfig";
 const WINDOWS_ENABLE_ACCESS_HELPER_FILE: &str = "Enable-WindowsVmLabAccess.ps1";
-const WINDOWS_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindows.ps1";
+const WINDOWS_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsService.ps1";
+const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
@@ -738,13 +747,28 @@ fn default_remote_temp_dir_for_profile(profile: VmPlatformProfile) -> String {
 }
 
 fn windows_helper_script_local_path(file_name: &str) -> PathBuf {
-    workspace_root_path()
-        .join(WINDOWS_VM_LAB_HELPER_ROOT)
-        .join(file_name)
+    let canonical = workspace_root_path()
+        .join(WINDOWS_BOOTSTRAP_HELPER_ROOT)
+        .join(file_name);
+    if canonical.is_file() {
+        canonical
+    } else {
+        workspace_root_path()
+            .join(WINDOWS_COMPAT_VM_LAB_HELPER_ROOT)
+            .join(file_name)
+    }
 }
 
-fn windows_install_helper_script_local_path() -> PathBuf {
-    windows_helper_script_local_path(WINDOWS_INSTALL_HELPER_FILE)
+fn windows_bootstrap_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_BOOTSTRAP_HELPER_FILE)
+}
+
+fn windows_service_install_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_SERVICE_INSTALL_HELPER_FILE)
+}
+
+fn windows_verify_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_VERIFY_HELPER_FILE)
 }
 
 fn windows_diagnostics_helper_script_local_path() -> PathBuf {
@@ -2799,18 +2823,58 @@ fn sync_repo_targets(
             }
         }
         RepoSyncSource::LocalSource { source_dir } => {
-            if targets
-                .iter()
-                .any(|target| target.platform_profile.platform == VmGuestPlatform::Windows)
-            {
-                return Err(
-                    "Windows targets are not yet supported for vm-lab local-source repo sync in phase 3".to_string(),
-                );
-            }
-            let archive = prepare_local_source_archive(source_dir.as_path(), timeout)?;
+            let posix_archive = if targets.iter().any(|target| {
+                matches!(
+                    repo_sync_dispatch_kind_for_target(target, RepoSyncMode::LocalSource),
+                    Ok(RepoSyncDispatchKind::PosixLocalArchive)
+                )
+            }) {
+                Some(prepare_local_source_archive(source_dir.as_path(), timeout)?)
+            } else {
+                None
+            };
+            let windows_archive = if targets.iter().any(|target| {
+                matches!(
+                    repo_sync_dispatch_kind_for_target(target, RepoSyncMode::LocalSource),
+                    Ok(RepoSyncDispatchKind::WindowsZipLocalArchive)
+                )
+            }) {
+                Some(prepare_local_source_zip_archive(
+                    source_dir.as_path(),
+                    timeout,
+                )?)
+            } else {
+                None
+            };
             for target in targets {
+                let archive =
+                    match repo_sync_dispatch_kind_for_target(target, RepoSyncMode::LocalSource)? {
+                        RepoSyncDispatchKind::WindowsZipLocalArchive => windows_archive
+                            .as_ref()
+                            .ok_or_else(|| {
+                                format!(
+                                    "missing Windows ZIP local source archive for {}",
+                                    target.label
+                                )
+                            })?
+                            .path
+                            .as_path(),
+                        RepoSyncDispatchKind::PosixLocalArchive => posix_archive
+                            .as_ref()
+                            .ok_or_else(|| {
+                                format!("missing POSIX local source archive for {}", target.label)
+                            })?
+                            .path
+                            .as_path(),
+                        other => {
+                            return Err(format!(
+                                "local source sync dispatch mismatch for {}: {other:?}",
+                                target.label
+                            ));
+                        }
+                    };
                 sync_local_source_archive_to_target(
-                    archive.path.as_path(),
+                    archive,
                     target,
                     ssh_user_override,
                     ssh_identity_file,
@@ -2833,6 +2897,50 @@ fn sync_repo_targets(
         }
     }
     Ok(results)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoSyncMode {
+    Git,
+    LocalSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoSyncDispatchKind {
+    PosixGit,
+    WindowsPowershellGit,
+    PosixLocalArchive,
+    WindowsZipLocalArchive,
+}
+
+fn repo_sync_dispatch_kind_for_target(
+    target: &RemoteTarget,
+    mode: RepoSyncMode,
+) -> Result<RepoSyncDispatchKind, String> {
+    match (mode, target.platform_profile.platform) {
+        (RepoSyncMode::Git, VmGuestPlatform::Linux) => Ok(RepoSyncDispatchKind::PosixGit),
+        (RepoSyncMode::Git, VmGuestPlatform::Windows) => {
+            Ok(RepoSyncDispatchKind::WindowsPowershellGit)
+        }
+        (RepoSyncMode::Git, other) => Err(format!(
+            "repo sync is not implemented for platform={} target={}",
+            other.as_str(),
+            target.label
+        )),
+        (RepoSyncMode::LocalSource, VmGuestPlatform::Linux | VmGuestPlatform::Macos) => {
+            Ok(RepoSyncDispatchKind::PosixLocalArchive)
+        }
+        (RepoSyncMode::LocalSource, VmGuestPlatform::Windows) => {
+            Ok(RepoSyncDispatchKind::WindowsZipLocalArchive)
+        }
+        (RepoSyncMode::LocalSource, VmGuestPlatform::Ios | VmGuestPlatform::Android) => {
+            Err(format!(
+                "local source sync is intentionally scaffold-only for platform={} target={}",
+                target.platform_profile.platform.as_str(),
+                target.label
+            ))
+        }
+    }
 }
 
 fn append_target_platform_metadata(
@@ -3444,6 +3552,8 @@ fn resolve_setup_live_lab_selection(
             expected_source_mode: None,
             require_five_node: false,
         })?;
+        let profile = load_live_lab_profile(profile_path)?;
+        ensure_live_lab_profile_linux_only(&profile, "vm-lab-setup-live-lab")?;
         return Ok(LiveLabSetupSelection {
             profile_path: profile_path.to_path_buf(),
             profile_generated: false,
@@ -3523,6 +3633,8 @@ fn resolve_setup_live_lab_selection(
         expected_source_mode: None,
         require_five_node: false,
     })?;
+    let profile = load_live_lab_profile(profile_path.as_path())?;
+    ensure_live_lab_profile_linux_only(&profile, "vm-lab-setup-live-lab")?;
     Ok(LiveLabSetupSelection {
         profile_path,
         profile_generated: true,
@@ -3771,6 +3883,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
     let profile = load_live_lab_profile(config.profile_path.as_path())?;
+    ensure_live_lab_profile_linux_only(&profile, "vm-lab-run-live-lab")?;
     if let Some(value) = config.source_mode.as_deref() {
         ensure_no_control_chars("source mode", value)?;
     }
@@ -4641,6 +4754,9 @@ pub fn execute_ops_vm_lab_validate_live_lab_profile(
         }
     }
 
+    ensure_live_lab_profile_platform_metadata(&profile)?;
+    ensure_live_lab_profile_linux_only(&profile, "vm-lab-validate-live-lab-profile")?;
+
     let targets = profile.configured_targets()?;
     let mut lines = vec![
         format!("profile_path={}", config.profile_path.display()),
@@ -4667,6 +4783,7 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
 ) -> Result<String, String> {
     let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
     let profile = load_live_lab_profile(config.profile_path.as_path())?;
+    ensure_live_lab_profile_linux_only(&profile, "vm-lab-diagnose-live-lab-failure")?;
     let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let stage = if let Some(stage) = config.stage.as_deref() {
         stage.to_string()
@@ -5902,6 +6019,107 @@ impl LiveLabProfile {
             }
         }
         Ok(targets)
+    }
+}
+
+fn live_lab_profile_target_platform_profile(
+    profile: &LiveLabProfile,
+    role: &str,
+) -> Result<Option<VmPlatformProfile>, String> {
+    let prefix = role.to_ascii_uppercase();
+    let target_key = format!("{}_TARGET", prefix);
+    let Some(target) = profile.optional(target_key.as_str()) else {
+        return Ok(None);
+    };
+    if target.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let platform = VmGuestPlatform::parse(
+        profile
+            .required(format!("{}_PLATFORM", prefix).as_str())?
+            .as_str(),
+    )
+    .map_err(|err| format!("{prefix}_PLATFORM: {err}"))?;
+    let remote_shell = VmRemoteShell::parse(
+        profile
+            .required(format!("{}_REMOTE_SHELL", prefix).as_str())?
+            .as_str(),
+    )
+    .map_err(|err| format!("{prefix}_REMOTE_SHELL: {err}"))?;
+    let guest_exec_mode = VmGuestExecMode::parse(
+        profile
+            .required(format!("{}_GUEST_EXEC_MODE", prefix).as_str())?
+            .as_str(),
+    )
+    .map_err(|err| format!("{prefix}_GUEST_EXEC_MODE: {err}"))?;
+    let service_manager = VmServiceManager::parse(
+        profile
+            .required(format!("{}_SERVICE_MANAGER", prefix).as_str())?
+            .as_str(),
+    )
+    .map_err(|err| format!("{prefix}_SERVICE_MANAGER: {err}"))?;
+
+    Ok(Some(VmPlatformProfile {
+        platform,
+        remote_shell,
+        guest_exec_mode,
+        service_manager,
+    }))
+}
+
+fn configured_live_lab_target_platform_profiles(
+    profile: &LiveLabProfile,
+) -> Result<Vec<(String, String, VmPlatformProfile)>, String> {
+    let mut targets = Vec::new();
+    for target in profile.configured_targets()? {
+        let Some(platform_profile) =
+            live_lab_profile_target_platform_profile(profile, target.role.as_str())?
+        else {
+            return Err(format!(
+                "live-lab profile target {} is missing platform metadata",
+                target.role
+            ));
+        };
+        targets.push((target.role, target.target, platform_profile));
+    }
+    Ok(targets)
+}
+
+fn ensure_live_lab_profile_platform_metadata(profile: &LiveLabProfile) -> Result<(), String> {
+    let _ = configured_live_lab_target_platform_profiles(profile)?;
+    Ok(())
+}
+
+fn ensure_live_lab_profile_linux_only(
+    profile: &LiveLabProfile,
+    command_name: &str,
+) -> Result<(), String> {
+    let blocked = configured_live_lab_target_platform_profiles(profile)?
+        .into_iter()
+        .filter(|(_, _, platform_profile)| {
+            platform_profile.platform != VmGuestPlatform::Linux
+                || platform_profile.remote_shell != VmRemoteShell::Posix
+                || platform_profile.guest_exec_mode != VmGuestExecMode::LinuxBash
+                || platform_profile.service_manager != VmServiceManager::Systemd
+        })
+        .map(|(role, target, platform_profile)| {
+            format!(
+                "role={role} target={target} platform={} remote_shell={} guest_exec_mode={} service_manager={}",
+                platform_profile.platform.as_str(),
+                platform_profile.remote_shell.as_str(),
+                platform_profile.guest_exec_mode.as_str(),
+                platform_profile.service_manager.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command_name} requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd in the current Linux live-lab shell orchestrator; blocked targets: {}",
+            blocked.join("; ")
+        ))
     }
 }
 
@@ -7741,10 +7959,10 @@ $SUDO rm -f {assignment_env} {traversal_env}",
 }
 
 pub fn execute_ops_vm_lab_run_suite(config: VmLabRunSuiteConfig) -> Result<String, String> {
+    let inventory = load_inventory(config.inventory_path.as_path())?;
     let topology = if let Some(path) = config.topology_path.as_deref() {
         load_vm_lab_topology(path)?
     } else {
-        let inventory = load_inventory(config.inventory_path.as_path())?;
         let selected =
             select_inventory_entries(&inventory, config.vm_aliases.as_slice(), config.select_all)?;
         let value = build_vm_lab_topology(selected.as_slice(), config.suite.as_str())?;
@@ -7765,6 +7983,7 @@ pub fn execute_ops_vm_lab_run_suite(config: VmLabRunSuiteConfig) -> Result<Strin
     let mut suite_command = build_suite_command(
         suite_name.as_str(),
         &topology,
+        inventory.as_slice(),
         config.ssh_identity_file.as_path(),
         config.nat_profile.as_deref(),
         config.impairment_profile.as_deref(),
@@ -7804,7 +8023,7 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             config.raw_targets.as_slice(),
         )?;
     }
-    let phase = normalized_bootstrap_phase(config.phase.as_str())?;
+    let phase = bootstrap::BootstrapPhase::parse(config.phase.as_str())?;
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
     ensure_optional_local_regular_file_path(
         config.ssh_identity_file.as_deref(),
@@ -7831,14 +8050,18 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             .ok_or_else(|| {
                 format!(
                     "bootstrap phase {} requires --dest-dir or rustynet_src_dir inventory metadata for {}",
-                    phase, target.label
+                    phase.as_str(),
+                    target.label
                 )
             })?;
         workdirs.insert(target.label.clone(), workdir);
     }
 
     let mut lines = Vec::new();
-    if phase == "sync-source" || phase == "all" {
+    if matches!(
+        phase,
+        bootstrap::BootstrapPhase::SyncSource | bootstrap::BootstrapPhase::All
+    ) {
         let sync_dest_dir = workdirs
             .values()
             .next()
@@ -7857,7 +8080,7 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             config.remote.as_str(),
         )?;
         lines.extend(sync_repo_targets(
-            &targets,
+            targets.as_slice(),
             config.ssh_user.as_deref(),
             config.ssh_identity_file.as_deref(),
             config.known_hosts_path.as_deref(),
@@ -7865,20 +8088,20 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             sync_dest_dir.as_str(),
             timeout,
         )?);
-        if phase == "sync-source" {
+        if phase == bootstrap::BootstrapPhase::SyncSource {
             return Ok(lines.join("\n"));
         }
     }
 
-    let phases: &[&str] = if phase == "all" {
-        &[
-            "build-release",
-            "install-release",
-            "restart-runtime",
-            "verify-runtime",
+    let phases = if phase == bootstrap::BootstrapPhase::All {
+        vec![
+            bootstrap::BootstrapPhase::BuildRelease,
+            bootstrap::BootstrapPhase::InstallRelease,
+            bootstrap::BootstrapPhase::RestartRuntime,
+            bootstrap::BootstrapPhase::VerifyRuntime,
         ]
     } else {
-        &[phase.as_str()]
+        vec![phase]
     };
 
     for target in &targets {
@@ -7886,7 +8109,7 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             .get(target.label.as_str())
             .ok_or_else(|| format!("missing bootstrap workdir for {}", target.label))?;
         let effective_user = config.ssh_user.as_deref().or(target.ssh_user.as_deref());
-        let context = BootstrapPhaseContext {
+        let context = bootstrap::BootstrapPhaseContext {
             ssh_user: effective_user,
             ssh_identity_file: config.ssh_identity_file.as_deref(),
             known_hosts_path: config.known_hosts_path.as_deref(),
@@ -7896,11 +8119,18 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             remote: config.remote.as_str(),
             timeout,
         };
-        for phase_name in phases {
-            execute_bootstrap_phase_for_target(phase_name, target, &context)?;
+        for phase_name in &phases {
+            if *phase_name == bootstrap::BootstrapPhase::SyncSource
+                && target.platform_profile.platform != VmGuestPlatform::Windows
+            {
+                continue;
+            }
+            execute_bootstrap_phase_for_target(phase_name.as_str(), target, &context)?;
             lines.push(format!(
                 "{} completed bootstrap phase={} workdir={}",
-                target.label, phase_name, workdir
+                target.label,
+                phase_name.as_str(),
+                workdir
             ));
         }
     }
@@ -9129,13 +9359,15 @@ fn build_repo_sync_script_for_target(
     branch: &str,
     remote: &str,
 ) -> Result<String, String> {
-    match target.platform_profile.platform {
-        VmGuestPlatform::Linux => build_repo_sync_script(repo_url, dest_dir, branch, remote),
-        VmGuestPlatform::Windows => {
+    match repo_sync_dispatch_kind_for_target(target, RepoSyncMode::Git)? {
+        RepoSyncDispatchKind::PosixGit => {
+            build_repo_sync_script(repo_url, dest_dir, branch, remote)
+        }
+        RepoSyncDispatchKind::WindowsPowershellGit => {
             build_windows_repo_sync_script(repo_url, dest_dir, branch, remote)
         }
         other => Err(format!(
-            "repo sync is not implemented for {other:?} targets: {}",
+            "repo sync dispatch mismatch for {}: {other:?}",
             target.label
         )),
     }
@@ -9175,6 +9407,28 @@ rm -f -- {remote_archive}",
     ))
 }
 
+fn build_windows_local_source_extract_script(
+    dest_dir: &str,
+    remote_archive_path: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("destination directory", dest_dir)?;
+    ensure_no_control_chars("remote archive path", remote_archive_path)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $dest = {dest}; \
+         $archive = {archive}; \
+         $parent = Split-Path -Parent $dest; \
+         if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Force -Path $parent | Out-Null }}; \
+         if (Test-Path -LiteralPath $dest) {{ Remove-Item -LiteralPath $dest -Recurse -Force }}; \
+         New-Item -ItemType Directory -Force -Path $dest | Out-Null; \
+         Expand-Archive -LiteralPath $archive -DestinationPath $dest -Force; \
+         Remove-Item -LiteralPath $archive -Force;",
+        dest = powershell_quote(dest_dir)?,
+        archive = powershell_quote(remote_archive_path)?,
+    ))
+}
+
 fn prepare_local_source_archive(
     source_dir: &Path,
     timeout: Duration,
@@ -9191,6 +9445,27 @@ fn prepare_local_source_archive(
         let _ = fs::remove_file(archive_path.as_path());
         return Err(format!(
             "local source archive failed via git-managed path ({git_err}); raw directory fallback also failed ({raw_err})"
+        ));
+    }
+    Ok(LocalSourceArchive { path: archive_path })
+}
+
+fn prepare_local_source_zip_archive(
+    source_dir: &Path,
+    timeout: Duration,
+) -> Result<LocalSourceArchive, String> {
+    ensure_local_directory_path(source_dir, "local source dir")?;
+    let archive_path =
+        std::env::temp_dir().join(format!("rustynet-vm-lab-source-{}.zip", unique_suffix()));
+    let extras = prepare_local_source_bundle_extras(source_dir, timeout)?;
+    if let Err(git_err) =
+        write_git_worktree_zip_archive(source_dir, archive_path.as_path(), timeout, extras.as_ref())
+        && let Err(raw_err) =
+            write_raw_directory_zip_archive(source_dir, archive_path.as_path(), extras.as_ref())
+    {
+        let _ = fs::remove_file(archive_path.as_path());
+        return Err(format!(
+            "local ZIP source archive failed via git-managed path ({git_err}); raw directory fallback also failed ({raw_err})"
         ));
     }
     Ok(LocalSourceArchive { path: archive_path })
@@ -9224,6 +9499,40 @@ fn write_raw_directory_archive(
             archive_path.display()
         )
     })
+}
+
+fn write_raw_directory_zip_archive(
+    source_dir: &Path,
+    archive_path: &Path,
+    extras: Option<&LocalSourceBundleExtras>,
+) -> Result<(), String> {
+    let file = fs::File::create(archive_path).map_err(|err| {
+        format!(
+            "create raw local ZIP source archive failed ({}): {err}",
+            archive_path.display()
+        )
+    })?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    let mut included = 0usize;
+    append_raw_local_source_tree_to_zip(&mut zip, &options, source_dir, source_dir, &mut included)?;
+    append_local_source_bundle_extras_to_zip(&mut zip, &options, extras, &mut included)?;
+    if included == 0 {
+        let _ = fs::remove_file(archive_path);
+        return Err(format!(
+            "local source dir did not yield any syncable files for ZIP archive: {}",
+            source_dir.display()
+        ));
+    }
+    zip.finish().map_err(|err| {
+        format!(
+            "finalize raw local ZIP source archive failed ({}): {err}",
+            archive_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn write_git_worktree_archive(
@@ -9293,6 +9602,78 @@ fn write_git_worktree_archive(
             archive_path.display()
         )
     })
+}
+
+fn write_git_worktree_zip_archive(
+    source_dir: &Path,
+    archive_path: &Path,
+    timeout: Duration,
+    extras: Option<&LocalSourceBundleExtras>,
+) -> Result<(), String> {
+    let mut list_command = Command::new("git");
+    list_command.arg("-C").arg(source_dir).args([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    let output = run_output_with_timeout(&mut list_command, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "collect local ZIP source file list failed with status {}",
+            status_code(output.status)
+        ));
+    }
+
+    let file = fs::File::create(archive_path).map_err(|err| {
+        format!(
+            "create local ZIP source archive failed ({}): {err}",
+            archive_path.display()
+        )
+    })?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    let mut included = 0usize;
+    let mut seen = HashSet::new();
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw_path)
+            .map_err(|err| format!("local source file list contained non-utf8 path: {err}"))?;
+        if relative.is_empty() || !seen.insert(relative.to_string()) {
+            continue;
+        }
+        let relative_path = Path::new(relative);
+        let absolute_path = source_dir.join(relative_path);
+        if !absolute_path.is_file() {
+            continue;
+        }
+        append_file_to_zip(
+            &mut zip,
+            &options,
+            absolute_path.as_path(),
+            relative_path,
+            &mut included,
+        )?;
+    }
+    append_local_source_bundle_extras_to_zip(&mut zip, &options, extras, &mut included)?;
+    if included == 0 {
+        return Err(format!(
+            "local source dir did not yield any syncable files for ZIP archive: {}",
+            source_dir.display()
+        ));
+    }
+    zip.finish().map_err(|err| {
+        format!(
+            "finalize local ZIP source archive failed ({}): {err}",
+            archive_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn prepare_local_source_bundle_extras(
@@ -9409,6 +9790,30 @@ fn append_local_source_bundle_extras(
     Ok(())
 }
 
+fn append_local_source_bundle_extras_to_zip(
+    zip: &mut ZipWriter<fs::File>,
+    options: &SimpleFileOptions,
+    extras: Option<&LocalSourceBundleExtras>,
+    included: &mut usize,
+) -> Result<(), String> {
+    let Some(extras) = extras else {
+        return Ok(());
+    };
+    if let Some(vendor_dir) = extras.vendor_dir.as_deref() {
+        append_directory_tree_to_zip(zip, options, vendor_dir, Path::new("vendor"), included)?;
+    }
+    if let Some(cargo_config_path) = extras.cargo_config_path.as_deref() {
+        append_file_to_zip(
+            zip,
+            options,
+            cargo_config_path,
+            Path::new(".cargo/config.toml"),
+            included,
+        )?;
+    }
+    Ok(())
+}
+
 fn append_raw_local_source_tree(
     archive: &mut Builder<fs::File>,
     source_root: &Path,
@@ -9457,6 +9862,57 @@ fn append_raw_local_source_tree(
                 )
             })?;
         *included += 1;
+    }
+    Ok(())
+}
+
+fn append_raw_local_source_tree_to_zip(
+    zip: &mut ZipWriter<fs::File>,
+    options: &SimpleFileOptions,
+    source_root: &Path,
+    current_dir: &Path,
+    included: &mut usize,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current_dir).map_err(|err| {
+        format!(
+            "read local ZIP source dir failed ({}): {err}",
+            current_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "read local ZIP source dir entry failed ({}): {err}",
+                current_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let relative = path.strip_prefix(source_root).map_err(|err| {
+            format!(
+                "strip local ZIP source prefix failed ({}): {err}",
+                path.display()
+            )
+        })?;
+        if should_skip_raw_local_source_path(relative) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|err| {
+            format!(
+                "read local ZIP source entry type failed ({}): {err}",
+                path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            append_raw_local_source_tree_to_zip(
+                zip,
+                options,
+                source_root,
+                path.as_path(),
+                included,
+            )?;
+            continue;
+        }
+        append_file_to_zip(zip, options, path.as_path(), relative, included)?;
     }
     Ok(())
 }
@@ -9510,6 +9966,89 @@ fn append_directory_tree_to_archive(
     Ok(())
 }
 
+fn append_directory_tree_to_zip(
+    zip: &mut ZipWriter<fs::File>,
+    options: &SimpleFileOptions,
+    source_root: &Path,
+    archive_root: &Path,
+    included: &mut usize,
+) -> Result<(), String> {
+    let entries = fs::read_dir(source_root).map_err(|err| {
+        format!(
+            "read ZIP archive source dir failed ({}): {err}",
+            source_root.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "read ZIP archive source dir entry failed ({}): {err}",
+                source_root.display()
+            )
+        })?;
+        let path = entry.path();
+        let archive_path = archive_root.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|err| {
+            format!(
+                "read ZIP archive source entry type failed ({}): {err}",
+                path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            append_directory_tree_to_zip(
+                zip,
+                options,
+                path.as_path(),
+                archive_path.as_path(),
+                included,
+            )?;
+            continue;
+        }
+        append_file_to_zip(
+            zip,
+            options,
+            path.as_path(),
+            archive_path.as_path(),
+            included,
+        )?;
+    }
+    Ok(())
+}
+
+fn append_file_to_zip(
+    zip: &mut ZipWriter<fs::File>,
+    options: &SimpleFileOptions,
+    source_path: &Path,
+    archive_path: &Path,
+    included: &mut usize,
+) -> Result<(), String> {
+    let name = archive_path
+        .to_str()
+        .ok_or_else(|| {
+            format!(
+                "path is not valid UTF-8 for ZIP archive: {}",
+                archive_path.display()
+            )
+        })?
+        .replace('\\', "/");
+    zip.start_file(name, *options).map_err(|err| {
+        format!(
+            "start ZIP file entry failed ({}): {err}",
+            archive_path.display()
+        )
+    })?;
+    let mut input = fs::File::open(source_path).map_err(|err| {
+        format!(
+            "open ZIP source file failed ({}): {err}",
+            source_path.display()
+        )
+    })?;
+    std::io::copy(&mut input, zip)
+        .map_err(|err| format!("write ZIP entry failed ({}): {err}", archive_path.display()))?;
+    *included += 1;
+    Ok(())
+}
+
 fn should_skip_raw_local_source_path(relative: &Path) -> bool {
     if relative.file_name().and_then(|name| name.to_str()) == Some(".DS_Store") {
         return true;
@@ -9529,10 +10068,33 @@ fn sync_local_source_archive_to_target(
 ) -> Result<(), String> {
     ensure_local_regular_file_path(archive_path, "local source archive")?;
     if target.platform_profile.platform == VmGuestPlatform::Windows {
-        return Err(format!(
-            "local-source archive sync is not yet implemented for Windows targets: {}",
-            target.label
-        ));
+        let remote_archive = format!(
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-{}.zip",
+            unique_suffix()
+        );
+        ensure_success_status(
+            scp_to_remote_for_target(
+                target,
+                ssh_user_override,
+                ssh_identity_file,
+                known_hosts_path,
+                archive_path,
+                remote_archive.as_str(),
+                timeout,
+            )?,
+            "copy local ZIP source archive to Windows remote",
+        )?;
+        let extract_script =
+            build_windows_local_source_extract_script(dest_dir, remote_archive.as_str())?;
+        let status = run_remote_shell_command_for_target(
+            target,
+            ssh_user_override,
+            ssh_identity_file,
+            known_hosts_path,
+            extract_script.as_str(),
+            timeout,
+        )?;
+        return ensure_success_status(status, "extract local ZIP source archive on Windows remote");
     }
     // These guest images accept SFTP writes into the SSH user's home directory
     // reliably, while absolute /tmp uploads are rejected on some hosts.
@@ -10001,6 +10563,24 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     ExitStatus::from_raw(normalized << 8)
 }
 
+fn format_remote_capture_exit_error(rc: i32, output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        format!("remote command exited with status {rc}")
+    } else {
+        format!("remote command exited with status {rc}: {trimmed}")
+    }
+}
+
+fn format_remote_capture_parse_error(base: &str, output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}: {trimmed}")
+    }
+}
+
 fn fallback_remote_shell_command_to_ssh(
     target: &RemoteTarget,
     ssh_user_override: Option<&str>,
@@ -10196,7 +10776,7 @@ fn capture_remote_shell_command_for_target(
                 match execute_utm_remote_powershell_capture(utm_name, remote_script, timeout) {
                     Ok((rc, output)) => {
                         if rc != 0 {
-                            Err(format!("remote command exited with status {rc}"))
+                            Err(format_remote_capture_exit_error(rc, output.as_str()))
                         } else {
                             Ok(output)
                         }
@@ -11070,19 +11650,12 @@ fn execute_utm_remote_powershell_capture(
     let remote_root = format!(r"C:\ProgramData\Rustynet\vm-lab\{suffix}");
     let remote_output = format!(r"{remote_root}\stdout.txt");
     let remote_rc = format!(r"{remote_root}\rc.txt");
-    let wrapped_script = format!(
-        "Set-StrictMode -Version Latest; \
-         $ErrorActionPreference = 'Stop'; \
-         New-Item -ItemType Directory -Force -Path {root} | Out-Null; \
-         $rc = 0; \
-         try {{ & {{ {body} }} *>{output}; if ($LASTEXITCODE -ne $null) {{ $rc = [int]$LASTEXITCODE }} }} \
-         catch {{ $_ | Out-String | Set-Content -Encoding utf8 -LiteralPath {output}; $rc = 1 }}; \
-         Set-Content -Encoding ascii -LiteralPath {rc} -Value $rc",
-        root = powershell_quote(remote_root.as_str())?,
-        body = powershell_script,
-        output = powershell_quote(remote_output.as_str())?,
-        rc = powershell_quote(remote_rc.as_str())?,
-    );
+    let wrapped_script = build_utm_windows_capture_wrapper_script(
+        remote_root.as_str(),
+        remote_output.as_str(),
+        remote_rc.as_str(),
+        powershell_script,
+    )?;
     let status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout)?;
     if !status.success() {
         return Err(format!(
@@ -11114,14 +11687,6 @@ fn execute_utm_remote_powershell_capture(
             status_code(pull_output_status)
         ));
     }
-    let pull_rc_status = utm_pull_raw(utm_name, remote_rc.as_str(), local_rc.as_path(), timeout)?;
-    if !pull_rc_status.success() {
-        let _ = fs::remove_dir_all(temp_root.as_path());
-        return Err(format!(
-            "UTM Windows rc pull failed with status {}",
-            status_code(pull_rc_status)
-        ));
-    }
 
     let output = fs::read_to_string(local_output.as_path()).map_err(|err| {
         format!(
@@ -11129,12 +11694,35 @@ fn execute_utm_remote_powershell_capture(
             local_output.display()
         )
     })?;
-    let rc_text = fs::read_to_string(local_rc.as_path())
-        .map_err(|err| format!("read UTM Windows rc failed ({}): {err}", local_rc.display()))?;
-    let rc = rc_text
-        .trim()
-        .parse::<i32>()
-        .map_err(|err| format!("parse UTM Windows rc failed: {err}"))?;
+    let max_rc_attempts = timeout.as_secs().max(10);
+    let mut rc = None;
+    let mut last_rc_text = None;
+    for attempt in 1..=max_rc_attempts {
+        let pull_rc_status =
+            utm_pull_raw(utm_name, remote_rc.as_str(), local_rc.as_path(), timeout)?;
+        if pull_rc_status.success()
+            && let Ok(rc_text) = fs::read_to_string(local_rc.as_path())
+        {
+            let trimmed_rc = rc_text.trim().to_string();
+            if let Ok(parsed_rc) = trimmed_rc.parse::<i32>() {
+                rc = Some(parsed_rc);
+                break;
+            }
+            last_rc_text = Some(trimmed_rc);
+        }
+        if attempt < max_rc_attempts {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let rc = rc.ok_or_else(|| {
+        let base = match last_rc_text.as_deref() {
+            Some(value) if !value.is_empty() => {
+                format!("parse UTM Windows rc failed: invalid integer '{value}'")
+            }
+            _ => "parse UTM Windows rc failed: cannot parse integer from empty string".to_string(),
+        };
+        format_remote_capture_parse_error(base.as_str(), output.as_str())
+    })?;
 
     let cleanup = format!(
         "Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
@@ -11144,6 +11732,35 @@ fn execute_utm_remote_powershell_capture(
     let _ = fs::remove_dir_all(temp_root.as_path());
 
     Ok((rc, output))
+}
+
+fn build_utm_windows_capture_wrapper_script(
+    remote_root: &str,
+    remote_output: &str,
+    remote_rc: &str,
+    powershell_script: &str,
+) -> Result<String, String> {
+    let encoded_body = encode_powershell_command(powershell_script)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         New-Item -ItemType Directory -Force -Path {root} | Out-Null; \
+         $rc = 0; \
+         try {{ \
+           $body = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
+           $scriptBlock = [ScriptBlock]::Create($body); \
+           & $scriptBlock *>{output}; \
+           if ($LASTEXITCODE -ne $null) {{ $rc = [int]$LASTEXITCODE }} \
+         }} catch {{ \
+           ($_ | Out-String) | Set-Content -Encoding utf8 -LiteralPath {output}; \
+           $rc = 1 \
+         }}; \
+         Set-Content -Encoding ascii -LiteralPath {rc} -Value $rc",
+        root = powershell_quote(remote_root)?,
+        encoded_body = powershell_quote(encoded_body.as_str())?,
+        output = powershell_quote(remote_output)?,
+        rc = powershell_quote(remote_rc)?,
+    ))
 }
 
 fn stage_windows_helper_script_from_path(
@@ -11181,16 +11798,40 @@ fn stage_windows_helper_script(
     stage_windows_helper_script_from_path(context, local_path.as_path(), remote_file_name)
 }
 
+fn stage_windows_helper_support_files(
+    context: &RemoteFallbackContext<'_>,
+    helper_file_name: &str,
+) -> Result<(), String> {
+    if helper_file_name != WINDOWS_BOOTSTRAP_HELPER_FILE {
+        return Ok(());
+    }
+    for support_file_name in [
+        WINDOWS_BOOTSTRAP_WINGET_CONFIG_FILE,
+        WINDOWS_BOOTSTRAP_VSCONFIG_FILE,
+        WINDOWS_SERVICE_INSTALL_HELPER_FILE,
+        WINDOWS_VERIFY_HELPER_FILE,
+        WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
+    ] {
+        let local_path = windows_helper_script_local_path(support_file_name);
+        stage_windows_helper_script_from_path(context, local_path.as_path(), support_file_name)?;
+    }
+    Ok(())
+}
+
 fn build_windows_helper_invocation_script(
     remote_path: &str,
     args: &[String],
 ) -> Result<String, String> {
-    let mut script = format!("& {}", powershell_quote(remote_path)?);
+    let mut script = format!(
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; & {}",
+        powershell_quote(remote_path)?
+    );
     for arg in args {
         ensure_no_control_chars("Windows helper arg", arg.as_str())?;
         script.push(' ');
         script.push_str(powershell_quote(arg.as_str())?.as_str());
     }
+    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; if ($LASTEXITCODE -ne $null -and [int]$LASTEXITCODE -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$LASTEXITCODE) }");
     Ok(script)
 }
 
@@ -11237,8 +11878,11 @@ fn invoke_windows_helper_script_for_target(
     context: &RemoteFallbackContext<'_>,
     invocation: WindowsHelperInvocation<'_>,
 ) -> Result<ExitStatus, String> {
+    stage_windows_helper_support_files(context, invocation.helper_file_name)?;
     let local_path = match invocation.helper_file_name {
-        WINDOWS_INSTALL_HELPER_FILE => windows_install_helper_script_local_path(),
+        WINDOWS_BOOTSTRAP_HELPER_FILE => windows_bootstrap_helper_script_local_path(),
+        WINDOWS_SERVICE_INSTALL_HELPER_FILE => windows_service_install_helper_script_local_path(),
+        WINDOWS_VERIFY_HELPER_FILE => windows_verify_helper_script_local_path(),
         WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE => windows_diagnostics_helper_script_local_path(),
         _ => windows_helper_script_local_path(invocation.helper_file_name),
     };
@@ -11251,6 +11895,32 @@ fn invoke_windows_helper_script_for_target(
         invocation.remote_file_name,
     )?;
     let script = build_windows_helper_invocation_script(remote_path.as_str(), invocation.args)?;
+    if remote_target_local_utm(context.target).is_some()
+        && context.target.platform_profile.platform == VmGuestPlatform::Windows
+    {
+        let (utm_name, _) = remote_target_local_utm(context.target)
+            .ok_or_else(|| "local UTM target lookup failed for Windows helper".to_string())?;
+        return match execute_utm_remote_powershell_capture(
+            utm_name,
+            script.as_str(),
+            context.timeout,
+        ) {
+            Ok((0, _)) => Ok(synthetic_exit_status(0)),
+            Ok((rc, output)) => Err(format_remote_capture_exit_error(rc, output.as_str())),
+            Err(utm_err) => match fallback_capture_remote_shell_command_to_ssh(
+                context.target,
+                context.ssh_user_override,
+                context.ssh_identity_file,
+                context.known_hosts_path,
+                script.as_str(),
+                context.timeout,
+                utm_err.as_str(),
+            ) {
+                Ok(_) => Ok(synthetic_exit_status(0)),
+                Err(err) => Err(err),
+            },
+        };
+    }
     run_remote_shell_command_for_target(
         context.target,
         context.ssh_user_override,
@@ -12104,9 +12774,85 @@ $SUDO rm -f /tmp/rn-assignment.pub /tmp/rn-assignment.bundle /tmp/rn-traversal.p
     Ok(())
 }
 
+fn suite_topology_nodes<'a>(
+    topology: &'a VmLabTopology,
+    suite: &str,
+) -> Result<Vec<&'a VmLabTopologyNode>, String> {
+    match suite {
+        "direct-remote-exit" => Ok(vec![
+            topology_role_node(topology, &["client"])?,
+            topology_role_node(topology, &["exit"])?,
+        ]),
+        "relay-remote-exit" | "failback-roaming" => Ok(vec![
+            topology_role_node(topology, &["client"])?,
+            topology_role_node(topology, &["exit"])?,
+            topology_role_node(topology, &["relay", "entry"])?,
+        ]),
+        "full-live-lab" => {
+            let mut nodes = vec![
+                topology_role_node(topology, &["exit"])?,
+                topology_role_node(topology, &["client"])?,
+                topology_role_node(topology, &["entry", "relay"])?,
+                topology_role_node(topology, &["aux"])?,
+            ];
+            if let Some(extra) = topology_optional_role_node(topology, &["extra"])? {
+                nodes.push(extra);
+            }
+            if let Some(fifth_client) = topology_optional_role_node(topology, &["fifth_client"])? {
+                nodes.push(fifth_client);
+            }
+            Ok(nodes)
+        }
+        _ => Err(format!("unsupported vm-lab suite: {suite}")),
+    }
+}
+
+fn ensure_suite_topology_linux_only(
+    suite: &str,
+    topology: &VmLabTopology,
+    inventory: &[VmInventoryEntry],
+) -> Result<(), String> {
+    let nodes = suite_topology_nodes(topology, suite)?;
+    let mut blocked = Vec::new();
+    for node in nodes {
+        let inventory_entry = inventory
+            .iter()
+            .find(|entry| entry.alias == node.alias)
+            .ok_or_else(|| {
+                format!(
+                    "vm-lab topology alias {} is missing from inventory; cannot verify suite platform compatibility",
+                    node.alias
+                )
+            })?;
+        let platform_profile = inventory_entry.platform_profile();
+        if platform_profile.platform != VmGuestPlatform::Linux {
+            blocked.push(format!(
+                "role={} alias={} target={} platform={} remote_shell={} guest_exec_mode={} service_manager={}",
+                node.lab_role,
+                node.alias,
+                node.normalized_target,
+                platform_profile.platform.as_str(),
+                platform_profile.remote_shell.as_str(),
+                platform_profile.guest_exec_mode.as_str(),
+                platform_profile.service_manager.as_str(),
+            ));
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "vm-lab suite {} is not yet supported for Windows targets in the Linux live-lab shell orchestrator; blocked targets: {}",
+            suite,
+            blocked.join("; ")
+        ))
+    }
+}
+
 fn build_suite_command(
     suite: &str,
     topology: &VmLabTopology,
+    inventory: &[VmInventoryEntry],
     ssh_identity_file: &Path,
     nat_profile: Option<&str>,
     impairment_profile: Option<&str>,
@@ -12114,6 +12860,7 @@ fn build_suite_command(
 ) -> Result<SuiteCommand, String> {
     let nat_profile = nat_profile.unwrap_or("baseline_lan");
     let impairment_profile = impairment_profile.unwrap_or("none");
+    ensure_suite_topology_linux_only(suite, topology, inventory)?;
     let mut command = Command::new("bash");
     let rendered = match suite {
         "direct-remote-exit" => {
@@ -12290,97 +13037,23 @@ fn render_command_for_display(command: &Command) -> String {
     rendered
 }
 
-fn normalized_bootstrap_phase(value: &str) -> Result<String, String> {
-    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
-    match normalized.as_str() {
-        "sync-source" | "build-release" | "install-release" | "restart-runtime"
-        | "verify-runtime" | "all" => Ok(normalized),
-        _ => Err(format!(
-            "unsupported vm-lab bootstrap phase: {value} (expected sync-source|build-release|install-release|restart-runtime|verify-runtime|all)"
-        )),
-    }
-}
-
-struct BootstrapPhaseContext<'a> {
-    ssh_user: Option<&'a str>,
-    ssh_identity_file: Option<&'a Path>,
-    known_hosts_path: Option<&'a Path>,
-    workdir: &'a str,
-    repo_url: Option<&'a str>,
-    branch: &'a str,
-    remote: &'a str,
-    timeout: Duration,
-}
-
-fn execute_bootstrap_phase_for_target(
-    phase: &str,
+fn execute_legacy_posix_bootstrap_phase_for_target(
+    phase: bootstrap::BootstrapPhase,
     target: &RemoteTarget,
-    context: &BootstrapPhaseContext<'_>,
+    context: &bootstrap::BootstrapPhaseContext<'_>,
 ) -> Result<(), String> {
-    if target.platform_profile.platform == VmGuestPlatform::Windows {
-        return match phase {
-            "install-release" => {
-                let repo_url = context.repo_url.ok_or_else(|| {
-                    format!(
-                        "bootstrap phase install-release requires --repo-url for {}",
-                        target.label
-                    )
-                })?;
-                let args = [
-                    "-RepoUrl".to_string(),
-                    repo_url.to_string(),
-                    "-Branch".to_string(),
-                    context.branch.to_string(),
-                    "-RustyNetRoot".to_string(),
-                    context.workdir.to_string(),
-                ];
-                let helper_context = RemoteFallbackContext {
-                    target,
-                    ssh_user_override: context.ssh_user,
-                    ssh_identity_file: context.ssh_identity_file,
-                    known_hosts_path: context.known_hosts_path,
-                    timeout: context.timeout,
-                };
-                let status = invoke_windows_helper_script_for_target(
-                    &helper_context,
-                    WindowsHelperInvocation {
-                        helper_file_name: WINDOWS_INSTALL_HELPER_FILE,
-                        remote_file_name: WINDOWS_INSTALL_HELPER_FILE,
-                        args: args.as_slice(),
-                    },
-                )?;
-                if !status.success() {
-                    return Err(format!(
-                        "install-release failed for {} with status {}",
-                        target.label,
-                        status_code(status)
-                    ));
-                }
-                Ok(())
-            }
-            "sync-source" | "build-release" | "restart-runtime" | "verify-runtime" | "all" => {
-                Err(format!(
-                    "bootstrap phase {phase} is not yet implemented for Windows targets: {}",
-                    target.label
-                ))
-            }
-            _ => Err(format!(
-                "unsupported bootstrap phase for execution: {phase}"
-            )),
-        };
-    }
     if target.platform_profile.platform != VmGuestPlatform::Linux {
         return Err(format!(
-            "bootstrap phase {phase} is currently implemented only for Linux targets; platform {} remains scaffold-only here ({})",
-            target.platform_profile.platform.as_str(),
+            "legacy POSIX bootstrap executor only supports Linux targets: {}",
             target.label
         ));
     }
     match phase {
-        "sync-source" => {
+        bootstrap::BootstrapPhase::SyncSource => {
             let repo_url = context.repo_url.ok_or_else(|| {
                 format!(
-                    "bootstrap phase sync-source requires --repo-url for {}",
+                    "bootstrap phase {} requires --repo-url for {}",
+                    phase.as_str(),
                     target.label
                 )
             })?;
@@ -12393,16 +13066,17 @@ fn execute_bootstrap_phase_for_target(
                     .as_str(),
                 context.timeout,
             )
-            .map_err(|err| format!("sync-source failed for {}: {err}", target.label))?;
+            .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
                 return Err(format!(
-                    "sync-source failed for {} with status {}",
+                    "{} failed for {} with status {}",
+                    phase.as_str(),
                     target.label,
                     status_code(status)
                 ));
             }
         }
-        "build-release" => {
+        bootstrap::BootstrapPhase::BuildRelease => {
             let tmpdir = format!("{}/.tmp", context.workdir);
             let status = run_remote_shell_command_for_target(
                 target,
@@ -12432,16 +13106,17 @@ TMPDIR={tmpdir} RUSTUP_SKIP_UPDATE_CHECK=yes exec \"$cargo_bin\" build --locked 
                 .as_str(),
                 context.timeout,
             )
-            .map_err(|err| format!("build-release failed for {}: {err}", target.label))?;
+            .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
                 return Err(format!(
-                    "build-release failed for {} with status {}",
+                    "{} failed for {} with status {}",
+                    phase.as_str(),
                     target.label,
                     status_code(status)
                 ));
             }
         }
-        "install-release" => {
+        bootstrap::BootstrapPhase::InstallRelease => {
             let script = format!(
                 "set -eu; cd {workdir}; \
 if sudo -n true >/dev/null 2>&1; then SUDO='sudo -n'; else SUDO=''; fi; \
@@ -12457,16 +13132,17 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
                 script.as_str(),
                 context.timeout,
             )
-            .map_err(|err| format!("install-release failed for {}: {err}", target.label))?;
+            .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
                 return Err(format!(
-                    "install-release failed for {} with status {}",
+                    "{} failed for {} with status {}",
+                    phase.as_str(),
                     target.label,
                     status_code(status)
                 ));
             }
         }
-        "restart-runtime" => {
+        bootstrap::BootstrapPhase::RestartRuntime => {
             let status = run_remote_shell_command_for_target(
                 target,
                 context.ssh_user,
@@ -12475,16 +13151,17 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
                 "set -eu; if sudo -n true >/dev/null 2>&1; then sudo -n systemctl restart rustynetd.service; else systemctl restart rustynetd.service; fi",
                 context.timeout,
             )
-            .map_err(|err| format!("restart-runtime failed for {}: {err}", target.label))?;
+            .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
                 return Err(format!(
-                    "restart-runtime failed for {} with status {}",
+                    "{} failed for {} with status {}",
+                    phase.as_str(),
                     target.label,
                     status_code(status)
                 ));
             }
         }
-        "verify-runtime" => {
+        bootstrap::BootstrapPhase::VerifyRuntime => {
             let status_script = privileged_rustynet_cli_script("status");
             let netcheck_script = privileged_rustynet_cli_script("netcheck");
             let status = run_remote_shell_command_for_target(
@@ -12496,43 +13173,69 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
                     .as_str(),
                 context.timeout,
             )
-            .map_err(|err| format!("verify-runtime failed for {}: {err}", target.label))?;
+            .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
                 return Err(format!(
-                    "verify-runtime failed for {} with status {}",
+                    "{} failed for {} with status {}",
+                    phase.as_str(),
                     target.label,
                     status_code(status)
                 ));
             }
         }
-        "all" => {
-            execute_bootstrap_phase_for_target("sync-source", target, context)?;
-            execute_bootstrap_phase_for_target("build-release", target, context)?;
-            execute_bootstrap_phase_for_target("install-release", target, context)?;
-            execute_bootstrap_phase_for_target("restart-runtime", target, context)?;
-            execute_bootstrap_phase_for_target("verify-runtime", target, context)?;
-        }
-        _ => {
-            return Err(format!(
-                "unsupported bootstrap phase for execution: {phase}"
-            ));
+        bootstrap::BootstrapPhase::All => {
+            execute_legacy_posix_bootstrap_phase_for_target(
+                bootstrap::BootstrapPhase::SyncSource,
+                target,
+                context,
+            )?;
+            execute_legacy_posix_bootstrap_phase_for_target(
+                bootstrap::BootstrapPhase::BuildRelease,
+                target,
+                context,
+            )?;
+            execute_legacy_posix_bootstrap_phase_for_target(
+                bootstrap::BootstrapPhase::InstallRelease,
+                target,
+                context,
+            )?;
+            execute_legacy_posix_bootstrap_phase_for_target(
+                bootstrap::BootstrapPhase::RestartRuntime,
+                target,
+                context,
+            )?;
+            execute_legacy_posix_bootstrap_phase_for_target(
+                bootstrap::BootstrapPhase::VerifyRuntime,
+                target,
+                context,
+            )?;
         }
     }
     Ok(())
 }
 
+fn execute_bootstrap_phase_for_target(
+    phase: &str,
+    target: &RemoteTarget,
+    context: &bootstrap::BootstrapPhaseContext<'_>,
+) -> Result<(), String> {
+    bootstrap::execute_bootstrap_phase_for_target(phase, target, context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabProfile, LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState,
-        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabDiscoverLocalUtmConfig,
-        VmLabIterationValidationStep, VmLabValidateLiveLabProfileConfig,
-        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager,
-        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
+        LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState, RepoSyncDispatchKind,
+        RepoSyncMode, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
+        VmLabSetupLiveLabConfig, VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
+        VmRemoteShell, VmServiceManager, build_assignment_refresh_env,
+        build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
-        build_vm_lab_topology, collect_live_lab_stage_local_bundle, default_inventory_path,
+        build_vm_lab_topology, build_windows_local_source_extract_script,
+        collect_live_lab_stage_local_bundle, default_inventory_path,
         default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
         default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
         discover_local_utm_bundle_paths, encode_powershell_command,
@@ -12546,16 +13249,18 @@ mod tests {
         persist_local_utm_ready_states_to_inventory, privileged_rustynet_cli_script,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
         render_live_lab_iteration_summary, render_live_lab_stage_forensics_review,
-        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
-        resolve_repo_sync_source, resolve_start_targets, resolved_inventory_ssh_target_with_utmctl,
-        rewrite_ssh_target_host, select_inventory_entries, select_live_ssh_host_from_utm_output,
+        repo_sync_dispatch_kind_for_target, resolve_iteration_source_selection,
+        resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
+        resolve_start_targets, resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
+        select_inventory_entries, select_live_ssh_host_from_utm_output,
         selected_local_utm_readiness_from_report, ssh_auth_probe_command,
         summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
-        validate_live_lab_run_artifacts, windows_diagnostics_helper_script_local_path,
-        windows_helper_script_remote_path,
+        validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
+        windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
+        windows_service_install_helper_script_local_path, windows_verify_helper_script_local_path,
+        workspace_root_path,
     };
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -12578,6 +13283,7 @@ mod tests {
 
     fn resolve_platform_remote_target(platform: &str) -> (PathBuf, super::RemoteTarget) {
         let (alias, ssh_target, ssh_user, remote_temp_dir) = match platform {
+            "linux" => ("linux-utm-1", "debian@192.168.64.10", "debian", "/var/tmp"),
             "windows" => (
                 "windows-utm-1",
                 "192.168.64.20",
@@ -12679,8 +13385,23 @@ mod tests {
                 "$KNOWN_HOSTS_FILE",
                 known_hosts.display().to_string().as_str(),
             );
+        let rendered = append_default_live_lab_platform_metadata(rendered.as_str());
         fs::write(&profile_path, rendered).expect("profile should write");
         profile_path
+    }
+
+    fn append_default_live_lab_platform_metadata(rendered: &str) -> String {
+        let mut rendered = rendered.to_string();
+        for role in ["EXIT", "CLIENT", "ENTRY", "AUX", "EXTRA", "FIFTH_CLIENT"] {
+            let target_key = format!("{role}_TARGET=");
+            let platform_key = format!("{role}_PLATFORM=");
+            if rendered.contains(target_key.as_str()) && !rendered.contains(platform_key.as_str()) {
+                rendered.push_str(&format!(
+                    "\n{role}_PLATFORM=\"linux\"\n{role}_REMOTE_SHELL=\"posix\"\n{role}_GUEST_EXEC_MODE=\"linux_bash\"\n{role}_SERVICE_MANAGER=\"systemd\"\n{role}_RUSTYNET_SRC_DIR=\"/home/debian/Rustynet\"\n"
+                ));
+            }
+        }
+        rendered
     }
 
     fn write_temp_stage_rows(report_dir: &Path, rows: &[(&str, &str)]) {
@@ -13347,6 +14068,67 @@ mod tests {
     }
 
     #[test]
+    fn mixed_platform_repo_sync_dispatch_is_platform_explicit() {
+        let (linux_inventory, linux_target) = resolve_platform_remote_target("linux");
+        let (windows_inventory, windows_target) = resolve_windows_remote_target();
+
+        assert_eq!(
+            repo_sync_dispatch_kind_for_target(&linux_target, RepoSyncMode::Git)
+                .expect("linux git repo sync should dispatch"),
+            RepoSyncDispatchKind::PosixGit
+        );
+        assert_eq!(
+            repo_sync_dispatch_kind_for_target(&windows_target, RepoSyncMode::Git)
+                .expect("windows git repo sync should dispatch"),
+            RepoSyncDispatchKind::WindowsPowershellGit
+        );
+        assert_eq!(
+            repo_sync_dispatch_kind_for_target(&linux_target, RepoSyncMode::LocalSource)
+                .expect("linux local-source sync should dispatch"),
+            RepoSyncDispatchKind::PosixLocalArchive
+        );
+        assert_eq!(
+            repo_sync_dispatch_kind_for_target(&windows_target, RepoSyncMode::LocalSource)
+                .expect("windows local-source sync should dispatch"),
+            RepoSyncDispatchKind::WindowsZipLocalArchive
+        );
+
+        cleanup_temp_inventory(linux_inventory.as_path());
+        cleanup_temp_inventory(windows_inventory.as_path());
+    }
+
+    #[test]
+    fn mixed_platform_repo_sync_scripts_do_not_cross_dispatch() {
+        let (linux_inventory, linux_target) = resolve_platform_remote_target("linux");
+        let (windows_inventory, windows_target) = resolve_windows_remote_target();
+
+        let linux_script = build_repo_sync_script_for_target(
+            &linux_target,
+            "git@github.com:iwanteague/Rustyfin.git",
+            "/home/debian/Rustynet",
+            "main",
+            "origin",
+        )
+        .expect("linux repo sync script should build");
+        assert!(linux_script.starts_with("set -eu;"));
+        assert!(!linux_script.contains("Set-StrictMode -Version Latest;"));
+
+        let windows_script = build_repo_sync_script_for_target(
+            &windows_target,
+            "git@github.com:iwanteague/Rustyfin.git",
+            r"C:\Rustynet",
+            "main",
+            "origin",
+        )
+        .expect("windows repo sync script should build");
+        assert!(windows_script.contains("Set-StrictMode -Version Latest;"));
+        assert!(!windows_script.contains("set -eu;"));
+
+        cleanup_temp_inventory(linux_inventory.as_path());
+        cleanup_temp_inventory(windows_inventory.as_path());
+    }
+
+    #[test]
     fn helper_script_staging_path_construction_uses_remote_temp_dir() {
         let (inventory, target) = resolve_windows_remote_target();
         assert_eq!(
@@ -13361,9 +14143,158 @@ mod tests {
     fn windows_diagnostics_helper_selection_uses_windows_script_path() {
         assert!(
             windows_diagnostics_helper_script_local_path().ends_with(Path::new(
-                "scripts/vm_lab/windows/Collect-RustyNetWindowsDiagnostics.ps1"
+                "scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1"
             ))
         );
+    }
+
+    #[test]
+    fn windows_bootstrap_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_bootstrap_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_service_install_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_service_install_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_verify_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_verify_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_compatibility_shims_remain_under_vm_lab_root() {
+        let install_shim =
+            workspace_root_path().join("scripts/vm_lab/windows/Install-RustyNetWindows.ps1");
+        let diagnostics_shim = workspace_root_path()
+            .join("scripts/vm_lab/windows/Collect-RustyNetWindowsDiagnostics.ps1");
+        assert!(
+            install_shim.is_file(),
+            "missing Windows install compatibility shim: {}",
+            install_shim.display()
+        );
+        assert!(
+            diagnostics_shim.is_file(),
+            "missing Windows diagnostics compatibility shim: {}",
+            diagnostics_shim.display()
+        );
+    }
+
+    #[test]
+    fn utm_windows_capture_wrapper_script_encodes_body_before_scriptblock_creation() {
+        let wrapper = super::build_utm_windows_capture_wrapper_script(
+            r"C:\ProgramData\Rustynet\vm-lab\capture",
+            r"C:\ProgramData\Rustynet\vm-lab\capture\stdout.txt",
+            r"C:\ProgramData\Rustynet\vm-lab\capture\rc.txt",
+            "Write-Output 'hello from { braces }'; exit 7",
+        )
+        .expect("wrapper script should build");
+        assert!(wrapper.contains("FromBase64String"));
+        assert!(wrapper.contains("[ScriptBlock]::Create($body)"));
+        assert!(!wrapper.contains("hello from { braces }"));
+    }
+
+    #[test]
+    fn bootstrap_phase_registry_preserves_underscore_phase_compatibility() {
+        assert_eq!(
+            super::bootstrap::BootstrapPhase::parse("build_release")
+                .expect("underscored phase name should normalize")
+                .as_str(),
+            "build-release"
+        );
+    }
+
+    #[test]
+    fn bootstrap_phase_registry_routes_linux_to_legacy_executor() {
+        let (inventory, target) = resolve_platform_remote_target("linux");
+        let context = super::bootstrap::BootstrapPhaseContext {
+            ssh_user: target.ssh_user.as_deref(),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            workdir: "/home/debian/Rustynet",
+            repo_url: None,
+            branch: "main",
+            remote: "origin",
+            timeout: Duration::from_secs(1),
+        };
+        let err =
+            super::bootstrap::execute_bootstrap_phase_for_target("sync-source", &target, &context)
+                .expect_err("linux legacy executor should require repo_url");
+        assert!(err.contains("bootstrap phase sync-source requires --repo-url"));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn bootstrap_phase_registry_routes_windows_to_windows_provider() {
+        let (inventory, target) = resolve_windows_remote_target();
+        let context = super::bootstrap::BootstrapPhaseContext {
+            ssh_user: target.ssh_user.as_deref(),
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            workdir: r"C:\Rustynet",
+            repo_url: None,
+            branch: "main",
+            remote: "origin",
+            timeout: Duration::from_secs(1),
+        };
+        let err = super::bootstrap::execute_bootstrap_phase_for_target("all", &target, &context)
+            .expect_err("windows provider should require repo_url before attempting all");
+        assert!(err.contains("Windows bootstrap phase sync-source requires --repo-url"));
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn bootstrap_phase_registry_rejects_macos_and_mobile_scaffolds() {
+        for (platform, phase, expected) in [
+            (
+                "macos",
+                "sync-source",
+                "not yet implemented for macOS targets in the provider layer",
+            ),
+            (
+                "ios",
+                "sync-source",
+                "intentionally scaffold-only for platform ios",
+            ),
+            (
+                "android",
+                "sync-source",
+                "intentionally scaffold-only for platform android",
+            ),
+        ] {
+            let (inventory, target) = resolve_platform_remote_target(platform);
+            let context = super::bootstrap::BootstrapPhaseContext {
+                ssh_user: target.ssh_user.as_deref(),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                workdir: "/tmp/rustynet-unsupported",
+                repo_url: None,
+                branch: "main",
+                remote: "origin",
+                timeout: Duration::from_secs(1),
+            };
+            let err =
+                super::bootstrap::execute_bootstrap_phase_for_target(phase, &target, &context)
+                    .expect_err("scaffold-only platforms must fail closed");
+            assert!(
+                err.contains(expected),
+                "unexpected error for {platform}: {err}"
+            );
+            cleanup_temp_inventory(inventory.as_path());
+        }
     }
 
     #[test]
@@ -13783,6 +14714,26 @@ mod tests {
         ));
         assert!(script.contains("mv -- '/home/debian/Rustynet.offline' \"$backup_path\";"));
         assert!(script.contains("rm -f -- '/tmp/rn-vm-lab-source-123.tar'"));
+    }
+
+    #[test]
+    fn windows_local_source_extract_script_uses_expand_archive() {
+        let script = build_windows_local_source_extract_script(
+            r"C:\Rustynet.offline",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-123.zip",
+        )
+        .expect("Windows extract script should build");
+        assert!(script.contains("$dest = 'C:\\Rustynet.offline';"));
+        assert!(
+            script.contains(
+                "$archive = 'C:\\ProgramData\\Rustynet\\vm-lab\\rn-vm-lab-source-123.zip';"
+            )
+        );
+        assert!(
+            script.contains("Expand-Archive -LiteralPath $archive -DestinationPath $dest -Force;")
+        );
+        assert!(script.contains("Remove-Item -LiteralPath $archive -Force;"));
+        assert!(!script.contains("tar -xf"));
     }
 
     #[test]
@@ -14367,47 +15318,21 @@ REPORT_DIR=\"artifacts/live_lab/test\"\n",
 
         let profile = load_live_lab_profile(profile_path.as_path()).expect("profile should parse");
         assert_eq!(
-            profile,
-            LiveLabProfile {
-                values: BTreeMap::from([
-                    ("AUX_TARGET".to_string(), "debian@aux-host".to_string()),
-                    (
-                        "CLIENT_TARGET".to_string(),
-                        "debian@client-host".to_string()
-                    ),
-                    ("ENTRY_TARGET".to_string(), "debian@entry-host".to_string()),
-                    ("EXIT_TARGET".to_string(), "debian@exit-host".to_string()),
-                    ("EXTRA_TARGET".to_string(), "debian@extra-host".to_string()),
-                    ("FIFTH_CLIENT_TARGET".to_string(), String::new()),
-                    (
-                        "REPORT_DIR".to_string(),
-                        "artifacts/live_lab/test".to_string()
-                    ),
-                    (
-                        "RUSTYNET_BACKEND".to_string(),
-                        "linux-wireguard-userspace-shared".to_string()
-                    ),
-                    ("SOURCE_MODE".to_string(), "working-tree".to_string()),
-                    (
-                        "SSH_IDENTITY_FILE".to_string(),
-                        profile_path
-                            .parent()
-                            .expect("profile parent should exist")
-                            .join("id_ed25519")
-                            .display()
-                            .to_string()
-                    ),
-                    (
-                        "SSH_KNOWN_HOSTS_FILE".to_string(),
-                        profile_path
-                            .parent()
-                            .expect("profile parent should exist")
-                            .join("known_hosts")
-                            .display()
-                            .to_string()
-                    ),
-                ]),
-            }
+            profile.optional("EXIT_TARGET").as_deref(),
+            Some("debian@exit-host")
+        );
+        assert_eq!(
+            profile.optional("CLIENT_TARGET").as_deref(),
+            Some("debian@client-host")
+        );
+        assert_eq!(profile.optional("EXIT_PLATFORM").as_deref(), Some("linux"));
+        assert_eq!(
+            profile.optional("CLIENT_PLATFORM").as_deref(),
+            Some("linux")
+        );
+        assert_eq!(
+            profile.optional("EXIT_REMOTE_SHELL").as_deref(),
+            Some("posix")
         );
         let targets = profile.configured_targets().expect("targets should render");
         assert_eq!(targets.len(), 5);
@@ -14515,6 +15440,58 @@ REPO_REF=\"HEAD\"\n",
         assert!(summary.contains("target.entry=debian@entry-host"));
         assert!(summary.contains("target.extra=debian@extra-host"));
         let _ = fs::remove_dir_all(profile_path.parent().expect("profile dir should exist"));
+    }
+
+    #[test]
+    fn validate_live_lab_profile_requires_platform_metadata_for_configured_targets() {
+        let unique = super::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("rustynet-live-lab-profile-{unique}.dir"));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let identity = dir.join("id_ed25519");
+        fs::write(&identity, "dummy-key").expect("identity file should write");
+        let profile_path = dir.join("profile.env");
+        fs::write(
+            &profile_path,
+            format!(
+                "EXIT_TARGET=\"debian@exit-host\"\nCLIENT_TARGET=\"debian@client-host\"\nSSH_IDENTITY_FILE=\"{}\"\n",
+                identity.display()
+            ),
+        )
+        .expect("profile should write");
+
+        let err = execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+            profile_path: profile_path.clone(),
+            expected_backend: None,
+            expected_source_mode: None,
+            require_five_node: false,
+        })
+        .expect_err("missing platform metadata must fail closed");
+
+        assert!(err.contains("missing required key EXIT_PLATFORM"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_live_lab_profile_rejects_non_linux_stage_targets() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"debian@client-host\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+        );
+
+        let err = execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+            profile_path: profile_path.clone(),
+            expected_backend: None,
+            expected_source_mode: None,
+            require_five_node: false,
+        })
+        .expect_err("non-linux live-lab targets must fail closed");
+
+        assert!(err.contains(
+            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
+        ));
+        assert!(err.contains("platform=windows"));
+
+        cleanup_temp_path(profile_path.as_path());
     }
 
     #[test]
@@ -14951,6 +15928,26 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
 
     #[test]
     fn build_suite_command_renders_direct_suite_arguments() {
+        let inventory_path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "exit-vm",
+      "ssh_target": "debian@exit-host",
+      "ssh_user": "debian",
+      "platform": "linux"
+    },
+    {
+      "alias": "client-vm",
+      "ssh_target": "debian@client-host",
+      "ssh_user": "debian",
+      "platform": "linux"
+    }
+  ]
+}"#,
+        );
+        let inventory = load_inventory(inventory_path.as_path()).expect("inventory should load");
         let topology = parse_vm_lab_topology(json!({
             "version": 1,
             "suite": "direct-remote-exit",
@@ -14983,6 +15980,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let command = build_suite_command(
             "direct-remote-exit",
             &topology,
+            inventory.as_slice(),
             Path::new("/Users/iwanteague/.ssh/rustynet_lab_ed25519"),
             Some("baseline_lan"),
             Some("none"),
@@ -14997,6 +15995,262 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(command.rendered.contains("--client-host"));
         assert!(command.rendered.contains("debian@client-host"));
         assert!(command.rendered.contains("--exit-network-id"));
+
+        cleanup_temp_inventory(inventory_path.as_path());
+    }
+
+    #[test]
+    fn build_suite_command_rejects_windows_targets_for_linux_only_suites() {
+        let inventory_path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "exit-vm",
+      "ssh_target": "debian@exit-host",
+      "ssh_user": "debian",
+      "platform": "linux"
+    },
+    {
+      "alias": "client-vm",
+      "ssh_target": "Administrator@windows-host",
+      "ssh_user": "Administrator",
+      "platform": "windows",
+      "remote_shell": "powershell",
+      "guest_exec_mode": "windows_powershell",
+      "service_manager": "windows_service",
+      "remote_temp_dir": "C:\\ProgramData\\Rustynet\\vm-lab"
+    }
+  ]
+}"#,
+        );
+        let inventory = load_inventory(inventory_path.as_path()).expect("inventory should load");
+        let topology = parse_vm_lab_topology(json!({
+            "version": 1,
+            "suite": "direct-remote-exit",
+            "roles": {
+                "exit": "exit-vm",
+                "client": "client-vm"
+            },
+            "nodes": [
+                {
+                    "alias": "exit-vm",
+                    "normalized_target": "debian@exit-host",
+                    "node_id": "exit-1",
+                    "lab_role": "exit",
+                    "network_id": "net-a",
+                    "exit_capable": true,
+                    "relay_capable": false
+                },
+                {
+                    "alias": "client-vm",
+                    "normalized_target": "Administrator@windows-host",
+                    "node_id": "client-1",
+                    "lab_role": "client",
+                    "network_id": "net-b",
+                    "exit_capable": false,
+                    "relay_capable": false
+                }
+            ]
+        }))
+        .expect("topology should parse");
+
+        let err = build_suite_command(
+            "direct-remote-exit",
+            &topology,
+            inventory.as_slice(),
+            Path::new("/Users/iwanteague/.ssh/rustynet_lab_ed25519"),
+            Some("baseline_lan"),
+            Some("none"),
+            Path::new("/tmp/vm-lab-report"),
+        )
+        .expect_err("windows targets must be blocked from linux live-lab shell helpers");
+
+        assert!(err.contains("blocked targets"));
+        assert!(err.contains("platform=windows"));
+
+        cleanup_temp_inventory(inventory_path.as_path());
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_run_live_lab_rejects_windows_profile_before_linux_shell_helper() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+        );
+        let unique = super::unique_suffix();
+        let script_dir = std::env::temp_dir().join(format!("rustynet-vm-lab-run-{unique}.dir"));
+        fs::create_dir_all(&script_dir).expect("script dir should exist");
+        let script_path = script_dir.join("mock-live-lab.sh");
+        let marker_path = script_dir.join("executed.marker");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf 'executed\\n' > {}\nexit 0\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should write");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("script metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("script should be executable");
+
+        let report_dir =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-run-report-{unique}.dir"));
+        let result = super::execute_ops_vm_lab_run_live_lab(VmLabRunLiveLabConfig {
+            profile_path: profile_path.clone(),
+            script_path: script_path.clone(),
+            dry_run: false,
+            skip_setup: false,
+            skip_gates: false,
+            skip_soak: false,
+            skip_cross_network: false,
+            source_mode: None,
+            repo_ref: None,
+            report_dir: Some(report_dir.clone()),
+            timeout_secs: 30,
+        });
+
+        let err = result.expect_err("windows profile must be blocked before shell invocation");
+        assert!(err.contains(
+            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
+        ));
+        assert!(err.contains("platform=windows"));
+        assert!(
+            !marker_path.exists(),
+            "shell helper should not have executed"
+        );
+
+        let _ = fs::remove_dir_all(script_dir);
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_path(profile_path.as_path());
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_setup_live_lab_rejects_windows_profile_before_linux_shell_helper() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+        );
+        let profile_dir = profile_path
+            .parent()
+            .expect("profile dir should exist")
+            .to_path_buf();
+        let identity_path = profile_dir.join("id_ed25519");
+        let inventory_path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "dummy-linux",
+      "ssh_target": "debian@192.168.64.10",
+      "ssh_user": "debian",
+      "platform": "linux"
+    }
+  ]
+}"#,
+        );
+        let unique = super::unique_suffix();
+        let script_dir = std::env::temp_dir().join(format!("rustynet-vm-lab-setup-{unique}.dir"));
+        fs::create_dir_all(&script_dir).expect("script dir should exist");
+        let script_path = script_dir.join("mock-live-lab.sh");
+        let marker_path = script_dir.join("executed.marker");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf 'executed\\n' > {}\nexit 0\n",
+                marker_path.display()
+            ),
+        )
+        .expect("script should write");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("script metadata should read")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("script should be executable");
+
+        let report_dir =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-setup-report-{unique}.dir"));
+        let result = super::execute_ops_vm_lab_setup_live_lab(VmLabSetupLiveLabConfig {
+            inventory_path: inventory_path.clone(),
+            profile_path: Some(profile_path.clone()),
+            profile_output_path: None,
+            exit_vm: None,
+            client_vm: None,
+            entry_vm: None,
+            aux_vm: None,
+            extra_vm: None,
+            fifth_client_vm: None,
+            ssh_identity_file: identity_path,
+            known_hosts_path: None,
+            require_same_network: false,
+            script_path: script_path.clone(),
+            report_dir: report_dir.clone(),
+            source_mode: None,
+            repo_ref: None,
+            resume_from: None,
+            rerun_stage: None,
+            max_parallel_node_workers: None,
+            timeout_secs: 30,
+            dry_run: false,
+        });
+
+        let err =
+            result.expect_err("windows profile must be blocked before setup shell invocation");
+        assert!(err.contains(
+            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
+        ));
+        assert!(err.contains("platform=windows"));
+        assert!(
+            !marker_path.exists(),
+            "shell helper should not have executed"
+        );
+
+        let _ = fs::remove_dir_all(script_dir);
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_inventory(inventory_path.as_path());
+        cleanup_temp_path(profile_path.as_path());
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_diagnose_live_lab_failure_rejects_windows_profile_before_diagnostics() {
+        let profile_path = write_temp_live_lab_profile(
+            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"debian@client-host\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+        );
+        let inventory_path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": []
+}"#,
+        );
+        let report_dir = write_temp_report_dir();
+        let output_dir = report_dir.join("diagnostics-output");
+
+        let err = super::execute_ops_vm_lab_diagnose_live_lab_failure(
+            super::VmLabDiagnoseLiveLabFailureConfig {
+                inventory_path: inventory_path.clone(),
+                profile_path: profile_path.clone(),
+                report_dir: report_dir.clone(),
+                stage: None,
+                output_dir: Some(output_dir.clone()),
+                collect_artifacts: true,
+                timeout_secs: 30,
+            },
+        )
+        .expect_err("windows live-lab diagnostics must fail closed before collection starts");
+
+        assert!(err.contains(
+            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
+        ));
+        assert!(err.contains("platform=windows"));
+        assert!(
+            !output_dir.exists(),
+            "diagnostics output should not be created before the Linux-only guard passes"
+        );
+
+        let _ = fs::remove_dir_all(report_dir);
+        cleanup_temp_inventory(inventory_path.as_path());
+        cleanup_temp_path(profile_path.as_path());
     }
 
     #[test]

@@ -11760,7 +11760,7 @@ fn help_text() -> String {
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-dns-zone-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
-        "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, install, and diagnostics; Linux UTM targets continue to use the existing shell path.",
+        "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, build, and diagnostics; the Windows bootstrap-phase surface is only partially implemented on the current branch, and install/restart/verify/all must not be treated as runtime-capable proof; the Linux live-lab setup/run/orchestrate/iterate, suite, and diagnose wrappers are intentionally fail-closed for Windows targets before any live_linux_* stage runs; Linux UTM targets continue to use the existing shell path.",
     ]
     .join("\n")
 }
