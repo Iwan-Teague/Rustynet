@@ -20,7 +20,7 @@ Primary Rustynet live validators currently used by the skill:
 - `scripts/e2e/live_linux_endpoint_hijack_test.sh`
 
 Canonical runner:
-- `tools/skills/rustynet-security-auditor/scripts/run_rustynet_live_validations.py`
+- `rustynet ops run-live-lab-validations`
 - runner preflight requirements:
   - pinned `known_hosts` file
   - host-key presence for every targeted host
@@ -37,15 +37,15 @@ Canonical runner:
 ## Rustynet Comparative Coverage
 
 Primary comparative exploit tooling:
-- `tools/skills/rustynet-security-auditor/scripts/generate_comparative_exploit_coverage.py`
+- `rustynet ops generate-comparative-exploit-coverage`
 
 Expected comparative report location:
 - `documents/operations/RustynetComparativeVpnExploitCoverage_<date>.md`
 
 Current live-evidence promotion helpers:
-- `tools/skills/rustynet-security-auditor/scripts/validate_live_lab_reports.py`
-- `tools/skills/rustynet-security-auditor/scripts/generate_live_lab_findings.py`
-- `tools/skills/rustynet-security-auditor/scripts/evaluate_live_coverage_promotion.py`
+- `rustynet ops validate-live-lab-reports`
+- `rustynet ops generate-live-lab-findings`
+- `rustynet ops evaluate-live-coverage-promotion`
 
 ## Rustynet Artifact Paths
 

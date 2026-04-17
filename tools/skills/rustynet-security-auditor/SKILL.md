@@ -56,7 +56,7 @@ If the live lab is not explicitly authorized, stop at code audit and comparative
 ### 2. Rustynet Comparative Baseline
 
 When the user wants exploit comparison or weakness discovery:
-1. run `scripts/generate_comparative_exploit_coverage.py`
+1. run `rustynet ops generate-comparative-exploit-coverage`
 2. if useful, add `--run-local-tests`
 3. inspect every `future_surface_gap` and `partially_covered` item
 4. do not claim `covered` from local tests alone where the comparative mapping still requires live evidence
@@ -67,7 +67,7 @@ Default output path:
 ### 3. Rustynet Live-Lab Validation
 
 For Rustynet live-lab work, use one hardened execution path only:
-- `scripts/run_rustynet_live_validations.py`
+- `rustynet ops run-live-lab-validations`
 
 Do not hand-stitch validator runs unless you are debugging the runner itself.
 
@@ -81,6 +81,8 @@ The runner is the canonical path because it:
 - generates prioritized findings
 - evaluates whether comparative coverage can be promoted
 
+The schema, promotion, matrix, findings, comparative coverage, and live-runner logic now live in `rustynet-cli` ops commands. The older Python entrypoints have been retired from the repo.
+
 Default validation set for the currently partially covered exploit classes:
 - `control_surface_exposure`
 - `server_ip_bypass`
@@ -89,7 +91,7 @@ Default validation set for the currently partially covered exploit classes:
 ### 4. Rustynet Findings And Correlation
 
 After live execution:
-1. read the generated findings markdown from `scripts/generate_live_lab_findings.py`
+1. read the generated findings markdown from `rustynet ops generate-live-lab-findings`
 2. use `references/live-lab-correlation-map.md`
 3. confirm the likely Rustynet enforcement points in source
 4. check the relevant gates and tests before proposing fixes
@@ -107,7 +109,7 @@ Only promote a comparative exploit class from `partially_covered` to `covered` i
 - report schema validation passed
 - the report status is `pass`
 - every mandatory check passed
-- the promotion gate `scripts/evaluate_live_coverage_promotion.py` returns success
+- the promotion gate `rustynet ops evaluate-live-coverage-promotion` returns success
 
 If any of those conditions fail, keep the exploit class at `partially_covered`.
 
@@ -129,21 +131,21 @@ Include:
 - fail-open vs fail-closed result
 - remediation with one hardened path only
 
-## Bundled Scripts
+## Bundled Commands
 
-- `scripts/generate_comparative_exploit_coverage.py`
+- `rustynet ops generate-comparative-exploit-coverage`
   Generate the Rustynet exploit coverage baseline from historical VPN incidents.
-- `scripts/run_rustynet_live_validations.py`
+- `rustynet ops run-live-lab-validations`
   Canonical Rustynet live-lab runner.
-- `scripts/validate_live_lab_reports.py`
+- `rustynet ops validate-live-lab-reports`
   Enforce the shared Rustynet live-report schema.
-- `scripts/generate_live_lab_findings.py`
+- `rustynet ops generate-live-lab-findings`
   Convert live report failures into prioritized Rustynet findings.
-- `scripts/evaluate_live_coverage_promotion.py`
+- `rustynet ops evaluate-live-coverage-promotion`
   Fail closed on exploit coverage promotion unless required live evidence is strong.
-- `scripts/generate_attack_matrix.py`
+- `rustynet ops generate-attack-matrix`
   Create canonical attack matrices.
-- `scripts/generate_assessment_from_matrix.py`
+- `rustynet ops generate-assessment-from-matrix`
   Produce a markdown scaffold from the matrix.
 
 ## Non-Negotiable Constraints

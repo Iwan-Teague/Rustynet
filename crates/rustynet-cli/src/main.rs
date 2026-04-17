@@ -12,7 +12,10 @@ mod ops_network_discovery;
 mod ops_peer_store;
 mod ops_phase1;
 mod ops_phase9;
+mod ops_security_audit;
+mod ops_security_audit_workflows;
 mod ops_write_daemon_env;
+mod security_audit_catalog;
 mod vm_lab;
 
 use std::collections::{HashMap, HashSet};
@@ -330,6 +333,27 @@ enum OpsCommand {
     },
     RunPhase3Baseline,
     RunFuzzSmoke,
+    GenerateAttackMatrix {
+        config: ops_security_audit::GenerateAttackMatrixConfig,
+    },
+    GenerateAssessmentFromMatrix {
+        config: ops_security_audit::GenerateAssessmentFromMatrixConfig,
+    },
+    ValidateLiveLabReports {
+        config: ops_security_audit::ValidateLiveLabReportsConfig,
+    },
+    EvaluateLiveCoveragePromotion {
+        config: ops_security_audit::EvaluateLiveCoveragePromotionConfig,
+    },
+    GenerateLiveLabFindings {
+        config: ops_security_audit_workflows::GenerateLiveLabFindingsConfig,
+    },
+    GenerateComparativeExploitCoverage {
+        config: ops_security_audit_workflows::GenerateComparativeExploitCoverageConfig,
+    },
+    RunLiveLabValidations {
+        config: ops_security_audit_workflows::RunLiveLabValidationsConfig,
+    },
     CheckNoUnsafeRustSources {
         config: ops_phase1::CheckNoUnsafeRustSourcesConfig,
     },
@@ -928,6 +952,143 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::RunFuzzSmoke)
         }
+        "generate-attack-matrix" => Ok(OpsCommand::GenerateAttackMatrix {
+            config: ops_security_audit::GenerateAttackMatrixConfig {
+                attacks: parser.required("--attacks")?,
+                nodes: parser.required("--nodes")?,
+                output: parser.required_path("--output")?,
+                format: parser
+                    .value("--format")
+                    .unwrap_or_else(|| ops_security_audit::default_attack_matrix_format().into()),
+            },
+        }),
+        "generate-assessment-from-matrix" => Ok(OpsCommand::GenerateAssessmentFromMatrix {
+            config: ops_security_audit::GenerateAssessmentFromMatrixConfig {
+                project: parser.required("--project")?,
+                matrix_json: parser.required_path("--matrix-json")?,
+                output: parser.required_path("--output")?,
+                topology: parser.value("--topology"),
+                authorization: parser
+                    .value("--authorization")
+                    .unwrap_or_else(|| "[yes/no]".to_string()),
+            },
+        }),
+        "validate-live-lab-reports" => Ok(OpsCommand::ValidateLiveLabReports {
+            config: ops_security_audit::ValidateLiveLabReportsConfig {
+                reports: parser
+                    .value("--reports")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(PathBuf::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                report_dir: parser.optional_path("--report-dir"),
+                output: parser.optional_path("--output"),
+            },
+        }),
+        "evaluate-live-coverage-promotion" => Ok(OpsCommand::EvaluateLiveCoveragePromotion {
+            config: ops_security_audit::EvaluateLiveCoveragePromotionConfig {
+                reports: parser
+                    .value("--reports")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(PathBuf::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                report_dir: parser.optional_path("--report-dir"),
+                targets: parser
+                    .value("--targets")
+                    .unwrap_or_else(|| "all".to_string()),
+                output: parser.required_path("--output")?,
+            },
+        }),
+        "generate-live-lab-findings" => Ok(OpsCommand::GenerateLiveLabFindings {
+            config: ops_security_audit_workflows::GenerateLiveLabFindingsConfig {
+                reports: parser
+                    .value("--reports")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(PathBuf::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                report_dir: parser.optional_path("--report-dir"),
+                output: parser.required_path("--output")?,
+            },
+        }),
+        "generate-comparative-exploit-coverage" => {
+            Ok(OpsCommand::GenerateComparativeExploitCoverage {
+                config: ops_security_audit_workflows::GenerateComparativeExploitCoverageConfig {
+                    workspace: parser
+                        .value("--workspace")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                    output: parser.required_path("--output")?,
+                    format: parser.value("--format").unwrap_or_else(|| {
+                        ops_security_audit_workflows::default_comparative_format().to_string()
+                    }),
+                    projects: parser
+                        .value("--projects")
+                        .unwrap_or_else(|| "all".to_string()),
+                    attack_families: parser
+                        .value("--attack-families")
+                        .unwrap_or_else(|| "all".to_string()),
+                    run_local_tests: parser.has_flag("--run-local-tests"),
+                    max_output_chars: parser
+                        .value("--max-output-chars")
+                        .map(|value| {
+                            value.parse::<usize>().map_err(|err| {
+                                format!("invalid value for --max-output-chars: {err}")
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or(1200),
+                },
+            })
+        }
+        "run-live-lab-validations" => Ok(OpsCommand::RunLiveLabValidations {
+            config: ops_security_audit_workflows::RunLiveLabValidationsConfig {
+                repo_root: parser.required_path("--repo-root")?,
+                ssh_password_file: parser.required_path("--ssh-password-file")?,
+                sudo_password_file: parser.required_path("--sudo-password-file")?,
+                ssh_known_hosts_file: parser.optional_path("--ssh-known-hosts-file"),
+                validations: parser
+                    .value("--validations")
+                    .unwrap_or_else(|| "all".to_string()),
+                report_dir: parser.optional_path("--report-dir"),
+                findings_output: parser.optional_path("--findings-output"),
+                schema_output: parser.optional_path("--schema-output"),
+                promotion_output: parser.optional_path("--promotion-output"),
+                summary_output: parser.optional_path("--summary-output"),
+                dry_run: parser.has_flag("--dry-run"),
+                skip_ssh_reachability_preflight: parser
+                    .has_flag("--skip-ssh-reachability-preflight"),
+                exit_host: parser.value("--exit-host"),
+                client_host: parser.value("--client-host"),
+                entry_host: parser.value("--entry-host"),
+                aux_host: parser.value("--aux-host"),
+                extra_host: parser.value("--extra-host"),
+                probe_host: parser.value("--probe-host"),
+                dns_bind_addr: parser.value("--dns-bind-addr"),
+                ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
+                probe_port: parser.value("--probe-port"),
+                rogue_endpoint_ip: parser.value("--rogue-endpoint-ip"),
+                socket_path: parser.value("--socket-path"),
+                assignment_path: parser.value("--assignment-path"),
+                connect_timeout_secs: parser.parse_u64_or_default("--connect-timeout-secs", 15)?,
+            },
+        }),
         "check-no-unsafe-rust-sources" => Ok(OpsCommand::CheckNoUnsafeRustSources {
             config: ops_phase1::CheckNoUnsafeRustSourcesConfig {
                 root: parser
@@ -3999,6 +4160,29 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::RunPhase3Baseline => ops_ci_release_perf::execute_ops_run_phase3_baseline(),
         OpsCommand::RunFuzzSmoke => ops_ci_release_perf::execute_ops_run_fuzz_smoke(),
+        OpsCommand::GenerateAttackMatrix { config } => {
+            ops_security_audit::execute_ops_generate_attack_matrix(config)
+        }
+        OpsCommand::GenerateAssessmentFromMatrix { config } => {
+            ops_security_audit::execute_ops_generate_assessment_from_matrix(config)
+        }
+        OpsCommand::ValidateLiveLabReports { config } => {
+            ops_security_audit::execute_ops_validate_live_lab_reports(config)
+        }
+        OpsCommand::EvaluateLiveCoveragePromotion { config } => {
+            ops_security_audit::execute_ops_evaluate_live_coverage_promotion(config)
+        }
+        OpsCommand::GenerateLiveLabFindings { config } => {
+            ops_security_audit_workflows::execute_ops_generate_live_lab_findings(config)
+        }
+        OpsCommand::GenerateComparativeExploitCoverage { config } => {
+            ops_security_audit_workflows::execute_ops_generate_comparative_exploit_coverage(
+                config,
+            )
+        }
+        OpsCommand::RunLiveLabValidations { config } => {
+            ops_security_audit_workflows::execute_ops_run_live_lab_validations(config)
+        }
         OpsCommand::CheckNoUnsafeRustSources { config } => {
             ops_phase1::execute_ops_check_no_unsafe_rust_sources(config)
         }
@@ -11641,6 +11825,13 @@ fn help_text() -> String {
         "  ops state-refresh-if-socket-present",
         "  ops collect-phase1-measured-input",
         "  ops run-phase1-baseline",
+        "  ops generate-attack-matrix --attacks <csv> --nodes <csv> --output <path> [--format <md|json>]",
+        "  ops generate-assessment-from-matrix --project <name> --matrix-json <path> --output <path> [--topology <text>] [--authorization <text>]",
+        "  ops validate-live-lab-reports [--reports <path[,path...]>] [--report-dir <path>] [--output <path>]",
+        "  ops evaluate-live-coverage-promotion [--reports <path[,path...]>] [--report-dir <path>] --output <path> [--targets <all|csv>]",
+        "  ops generate-live-lab-findings [--reports <path[,path...]>] [--report-dir <path>] --output <path>",
+        "  ops generate-comparative-exploit-coverage --output <path> [--workspace <path>] [--format <md|json>] [--projects <all|csv>] [--attack-families <all|csv>] [--run-local-tests] [--max-output-chars <n>]",
+        "  ops run-live-lab-validations --repo-root <path> --ssh-password-file <path> --sudo-password-file <path> [--ssh-known-hosts-file <path>] [--validations <all|csv>] [--report-dir <path>] [--findings-output <path>] [--schema-output <path>] [--promotion-output <path>] [--summary-output <path>] [--dry-run] [--skip-ssh-reachability-preflight] [--exit-host <user@host>] [--client-host <user@host>] [--entry-host <user@host>] [--aux-host <user@host>] [--extra-host <user@host>] [--probe-host <user@host>] [--dns-bind-addr <host:port>] [--ssh-allow-cidrs <cidr[,cidr...]>] [--probe-port <port>] [--rogue-endpoint-ip <ipv4>] [--socket-path <path>] [--assignment-path <path>] [--connect-timeout-secs <secs>]",
         "  ops check-no-unsafe-rust-sources [--root <path>]",
         "  ops check-dependency-exceptions [--path <path>]",
         "  ops check-perf-regression [--phase1-report <path>] [--phase3-report <path>]",
@@ -12490,6 +12681,105 @@ mod tests {
 
         let run_phase1 = parse_command(&["ops".to_string(), "run-phase1-baseline".to_string()]);
         assert!(format!("{run_phase1:?}").contains("RunPhase1Baseline"));
+
+        let generate_attack_matrix = parse_command(&[
+            "ops".to_string(),
+            "generate-attack-matrix".to_string(),
+            "--attacks".to_string(),
+            "control-plane-replay,route-hijack".to_string(),
+            "--nodes".to_string(),
+            "admin:admin,client1:client".to_string(),
+            "--output".to_string(),
+            "/tmp/attack-matrix.md".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ]);
+        assert!(format!("{generate_attack_matrix:?}").contains("GenerateAttackMatrix"));
+
+        let generate_assessment_from_matrix = parse_command(&[
+            "ops".to_string(),
+            "generate-assessment-from-matrix".to_string(),
+            "--project".to_string(),
+            "Rustynet".to_string(),
+            "--matrix-json".to_string(),
+            "/tmp/attack-matrix.json".to_string(),
+            "--output".to_string(),
+            "/tmp/assessment.md".to_string(),
+            "--authorization".to_string(),
+            "approved".to_string(),
+        ]);
+        assert!(
+            format!("{generate_assessment_from_matrix:?}").contains("GenerateAssessmentFromMatrix")
+        );
+
+        let validate_live_lab_reports = parse_command(&[
+            "ops".to_string(),
+            "validate-live-lab-reports".to_string(),
+            "--reports".to_string(),
+            "artifacts/live_lab/report-a.json,artifacts/live_lab/report-b.json".to_string(),
+            "--output".to_string(),
+            "/tmp/live_lab_schema_validation.md".to_string(),
+        ]);
+        assert!(format!("{validate_live_lab_reports:?}").contains("ValidateLiveLabReports"));
+
+        let evaluate_live_coverage_promotion = parse_command(&[
+            "ops".to_string(),
+            "evaluate-live-coverage-promotion".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab".to_string(),
+            "--targets".to_string(),
+            "control_surface_exposure,endpoint_hijack".to_string(),
+            "--output".to_string(),
+            "/tmp/live_lab_coverage_promotion.md".to_string(),
+        ]);
+        assert!(
+            format!("{evaluate_live_coverage_promotion:?}")
+                .contains("EvaluateLiveCoveragePromotion")
+        );
+
+        let generate_live_lab_findings = parse_command(&[
+            "ops".to_string(),
+            "generate-live-lab-findings".to_string(),
+            "--report-dir".to_string(),
+            "artifacts/live_lab".to_string(),
+            "--output".to_string(),
+            "/tmp/live_lab_findings.md".to_string(),
+        ]);
+        assert!(format!("{generate_live_lab_findings:?}").contains("GenerateLiveLabFindings"));
+
+        let generate_comparative_exploit_coverage = parse_command(&[
+            "ops".to_string(),
+            "generate-comparative-exploit-coverage".to_string(),
+            "--workspace".to_string(),
+            ".".to_string(),
+            "--output".to_string(),
+            "/tmp/comparative.md".to_string(),
+            "--projects".to_string(),
+            "tailscale".to_string(),
+            "--attack-families".to_string(),
+            "route-hijack".to_string(),
+            "--run-local-tests".to_string(),
+        ]);
+        assert!(
+            format!("{generate_comparative_exploit_coverage:?}")
+                .contains("GenerateComparativeExploitCoverage")
+        );
+
+        let run_live_lab_validations = parse_command(&[
+            "ops".to_string(),
+            "run-live-lab-validations".to_string(),
+            "--repo-root".to_string(),
+            "/tmp/rustynet".to_string(),
+            "--ssh-password-file".to_string(),
+            "/tmp/ssh.pass".to_string(),
+            "--sudo-password-file".to_string(),
+            "/tmp/sudo.pass".to_string(),
+            "--dry-run".to_string(),
+            "--skip-ssh-reachability-preflight".to_string(),
+            "--client-host".to_string(),
+            "debian@192.0.2.10".to_string(),
+        ]);
+        assert!(format!("{run_live_lab_validations:?}").contains("RunLiveLabValidations"));
 
         let prepare_advisory_db = parse_command(&[
             "ops".to_string(),
@@ -14257,6 +14547,18 @@ mod tests {
         assert!(help.contains("ops vm-lab-orchestrate-live-lab"));
         assert!(help.contains("ops vm-lab-run-live-lab --profile <path>"));
         assert!(help.contains("[--skip-setup]"));
+    }
+
+    #[test]
+    fn help_text_lists_security_audit_ops_commands() {
+        let help = help_text();
+        assert!(help.contains("ops generate-attack-matrix --attacks <csv> --nodes <csv>"));
+        assert!(help.contains("ops generate-assessment-from-matrix --project <name>"));
+        assert!(help.contains("ops validate-live-lab-reports"));
+        assert!(help.contains("ops evaluate-live-coverage-promotion"));
+        assert!(help.contains("ops generate-live-lab-findings"));
+        assert!(help.contains("ops generate-comparative-exploit-coverage"));
+        assert!(help.contains("ops run-live-lab-validations"));
     }
 
     #[test]

@@ -137,6 +137,7 @@ Related format-hardening plan:
 - Phase G progress: `live_lab_common.sh` and `live_linux_role_switch_matrix_test.sh` no longer execute inline Python for local mode checks or role-switch report mutation/generation; both flows now dispatch to Rust ops (`check-local-file-mode`, `update-role-switch-host-result`, `write-role-switch-matrix-report`) to keep one hardened trust/report path.
 - Phase G progress: `live_linux_server_ip_bypass_test.sh` and `live_linux_control_surface_exposure_test.sh` now generate and enforce report status through Rust ops (`write-live-linux-server-ip-bypass-report`, `write-live-linux-control-surface-report`) and no longer use inline Python report/schema builders in active paths.
 - Phase G progress: `live_linux_endpoint_hijack_test.sh` now validates endpoint IP, mutates assignment peer endpoints for tamper simulation, and writes/enforces report status through Rust ops (`validate-ipv4-address`, `rewrite-assignment-peer-endpoint-ip`, `write-live-linux-endpoint-hijack-report`) with fail-closed parsing and no inline Python in its active mutation/report path.
+- Phase G progress: the remaining security-auditor Python workflows are now Rust-backed too; matrix/assessment/report-validation/promotion/findings/comparative/live-runner paths execute through Rust ops (`generate-attack-matrix`, `generate-assessment-from-matrix`, `validate-live-lab-reports`, `evaluate-live-coverage-promotion`, `generate-live-lab-findings`, `generate-comparative-exploit-coverage`, `run-live-lab-validations`), and the Python entrypoints under `tools/skills/rustynet-security-auditor/scripts/` are retired from the active repo path.
 
 ## 2) Current Risk Inventory (Impact-First)
 High-impact scripts by privilege + secret handling + size:
@@ -516,4 +517,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-
