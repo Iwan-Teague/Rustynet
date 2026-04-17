@@ -42,6 +42,10 @@ Supporting active implementation plan for the remaining production shared-transp
 Supporting active implementation delta for the remaining Linux live-lab blocker:
 - [active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 
+Supporting active implementation plan for the remaining Windows VM-lab
+access/orchestration blocker:
+- [active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+
 Current phase-local hardening checklist:
 - [active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
@@ -53,6 +57,7 @@ Current phase-local hardening checklist:
 - [active/VmLabCapabilityCookbook_2026-04-14.md](./active/VmLabCapabilityCookbook_2026-04-14.md)
 - [active/VmLabCapabilityReportingPlan_2026-04-14.md](./active/VmLabCapabilityReportingPlan_2026-04-14.md)
 - [active/VmLabCapabilitySources_2026-04-14.md](./active/VmLabCapabilitySources_2026-04-14.md)
+- [active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 
 ## High-Value Evergreen References
 

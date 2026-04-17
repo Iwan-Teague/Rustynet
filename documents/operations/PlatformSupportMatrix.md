@@ -7,21 +7,30 @@ Purpose: provide a single current-state view of platform capability, security po
 - This matrix reflects **current implementation behavior**, not phase-plan scope text.
 - For historical phase boundaries, see `documents/phase10.md`.
 - Traversal architecture requirements are defined in `documents/Requirements.md` (section `3.2` + section `6`) and `documents/phase10.md`.
-- Windows notes in this document are scoped explicitly as VM-lab bootstrap truth
-  unless a row or note says otherwise. They are not a release-gate claim.
+- Windows notes in this document are scoped explicitly as VM-lab/runtime-host
+  truth unless a row or note says otherwise. They are not a release-gate
+  claim.
 
 ## Windows VM-Lab Guest Truth
 
-- `bootstrap-capable/scaffolded only`: `ops vm-lab-discover-local-utm`,
+- `runtime-host-capable only`: `ops vm-lab-discover-local-utm`,
   `ops vm-lab-start`, `ops vm-lab-restart`, `ops vm-lab-sync-repo`, the
   PowerShell-first access bootstrap helper under
   `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`, and the canonical
   helper root under `scripts/bootstrap/windows/` all dispatch through
   Windows-specific PowerShell/ZIP/helper paths for `platform=windows`
-  inventory targets.
-- `partial Windows bootstrap-phase coverage`: `sync-source` and
-  `build-release` are the current helper-backed Windows phases. `build-release`
-  still depends on verified MSVC/toolchain availability or explicit bootstrap
+  inventory targets. The direct smoke helper
+  `scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1` validates
+  the reviewed `rustynetd --windows-service --env-file` SCM host path and
+  intentionally reports `blocked` while the backend label remains
+  `windows-unsupported`.
+- `Windows bootstrap-phase entrypoints exist`: `sync-source`, `build-release`,
+  `smoke-service-host`, `install-release`, `restart-runtime`, `verify-runtime`,
+  and `all` route into Windows-specific helper/provider paths.
+  `smoke-service-host` validates the reviewed SCM host path and succeeds
+  in-scope when the helper reports `host_surface_validated=true` together with
+  the explicit `windows-unsupported` backend blocker. `build-release` still
+  depends on verified MSVC/toolchain availability or explicit bootstrap
   configuration.
 - `live-lab wrapper boundary is fail-closed`: `ops vm-lab-validate-live-lab-profile`,
   `ops vm-lab-setup-live-lab`, `ops vm-lab-run-live-lab`,
@@ -31,11 +40,14 @@ Purpose: provide a single current-state view of platform capability, security po
   metadata or any configured target that is not
   `platform=linux`/`remote_shell=posix`/`guest_exec_mode=linux_bash`/`service_manager=systemd`
   before any `live_linux_*` stage runs.
-- `not runtime-capable`: `install-release` is still a protective service-install
-  stub, and `restart-runtime`, `verify-runtime`, and `all` must not be treated
-  as Windows runtime-capable proof until `rustynetd` exposes a real Windows
-  service/config host surface. Helper-script parity is not treated as runtime
-  parity.
+- `not dataplane-capable`: `rustynetd` now exposes a reviewed Windows
+  service/config host surface, but the only reviewed Windows backend label is
+  `windows-unsupported`. Helper entrypoints therefore fail closed for the
+  supported backend scope instead of claiming transport/runtime success.
+- `not fresh-install evidenced`: the latest Mac + UTM validation for current
+  `HEAD` still fails at the local Windows guest exec/output boundary
+  (`UTM Windows capture output was missing rc marker`), so there is no clean
+  Windows install/runtime/service evidence to promote into the release gate.
 - `not release-gated and evidenced`: Windows is intentionally excluded from the
   current fresh-install OS matrix and Phase10 release gate because measured
   Windows install/runtime/role-switch evidence does not yet exist.

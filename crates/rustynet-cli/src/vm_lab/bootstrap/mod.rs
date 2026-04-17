@@ -8,6 +8,7 @@ pub(super) mod windows;
 pub(super) enum BootstrapPhase {
     SyncSource,
     BuildRelease,
+    SmokeServiceHost,
     InstallRelease,
     RestartRuntime,
     VerifyRuntime,
@@ -19,12 +20,13 @@ impl BootstrapPhase {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "sync-source" => Ok(Self::SyncSource),
             "build-release" => Ok(Self::BuildRelease),
+            "smoke-service-host" => Ok(Self::SmokeServiceHost),
             "install-release" => Ok(Self::InstallRelease),
             "restart-runtime" => Ok(Self::RestartRuntime),
             "verify-runtime" => Ok(Self::VerifyRuntime),
             "all" => Ok(Self::All),
             other => Err(format!(
-                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|install-release|restart-runtime|verify-runtime|all)"
+                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|all)"
             )),
         }
     }
@@ -33,6 +35,7 @@ impl BootstrapPhase {
         match self {
             Self::SyncSource => "sync-source",
             Self::BuildRelease => "build-release",
+            Self::SmokeServiceHost => "smoke-service-host",
             Self::InstallRelease => "install-release",
             Self::RestartRuntime => "restart-runtime",
             Self::VerifyRuntime => "verify-runtime",

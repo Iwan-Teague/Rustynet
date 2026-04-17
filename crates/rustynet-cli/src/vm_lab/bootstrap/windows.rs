@@ -16,6 +16,43 @@ pub(super) struct WindowsBootstrapProvider;
 
 pub(super) static WINDOWS_BOOTSTRAP_PROVIDER: WindowsBootstrapProvider = WindowsBootstrapProvider;
 
+fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
+    matches!(
+        phase,
+        BootstrapPhase::InstallRelease
+            | BootstrapPhase::RestartRuntime
+            | BootstrapPhase::VerifyRuntime
+    )
+}
+
+fn render_windows_access_gate_error(
+    phase: BootstrapPhase,
+    target_label: &str,
+    cause: &str,
+) -> String {
+    format!(
+        "Windows phase {} requires proven access for {}: {}",
+        phase.as_str(),
+        target_label,
+        cause.trim()
+    )
+}
+
+fn format_windows_phase_failure_with_diagnostics(
+    err: &str,
+    target_label: &str,
+    diagnostics: Result<String, String>,
+) -> String {
+    match diagnostics {
+        Ok(output_root) => {
+            format!("{err}; Windows diagnostics_output_root={output_root} target={target_label}")
+        }
+        Err(diag_err) => format!(
+            "{err}; Windows diagnostics collection also failed for {target_label}: {diag_err}"
+        ),
+    }
+}
+
 fn build_bootstrap_script_invocation(
     phase: BootstrapPhase,
     target_label: &str,
@@ -46,6 +83,13 @@ fn build_bootstrap_script_invocation(
             args.push(repo_url.to_string());
         }
         BootstrapPhase::BuildRelease => {}
+        BootstrapPhase::SmokeServiceHost => {
+            return Err(format!(
+                "bootstrap script invocation is not used for Windows phase {} on {}",
+                phase.as_str(),
+                target_label
+            ));
+        }
         BootstrapPhase::InstallRelease
         | BootstrapPhase::RestartRuntime
         | BootstrapPhase::VerifyRuntime
@@ -80,6 +124,23 @@ fn build_windows_service_install_invocation(
             WINDOWS_STATE_ROOT.to_string(),
             "-ServiceName".to_string(),
             WINDOWS_SERVICE_NAME.to_string(),
+        ],
+    }
+}
+
+fn build_windows_service_host_smoke_invocation(
+    context: &BootstrapPhaseContext<'_>,
+) -> WindowsHelperScriptSpec {
+    WindowsHelperScriptSpec {
+        helper_file_name: WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE,
+        remote_file_name: WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE,
+        args: vec![
+            "-RustyNetRoot".to_string(),
+            context.workdir.to_string(),
+            "-StateRoot".to_string(),
+            WINDOWS_STATE_ROOT.to_string(),
+            "-ServiceName".to_string(),
+            "RustyNetSmoke".to_string(),
         ],
     }
 }
@@ -131,91 +192,194 @@ fn build_windows_restart_runtime_script() -> Result<String, String> {
          $serviceName = {service_name}; \
          $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; \
          if (-not $service) {{ throw \"Windows runtime service is not installed: $serviceName\" }}; \
-         if ($service.Status -eq 'Running') {{ Restart-Service -Name $serviceName -ErrorAction Stop }} else {{ Start-Service -Name $serviceName -ErrorAction Stop }}; \
-         $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30)); \
+         try {{ \
+           if ($service.Status -eq 'Running') {{ Restart-Service -Name $serviceName -ErrorAction Stop }} else {{ Start-Service -Name $serviceName -ErrorAction Stop }} \
+         }} catch {{ \
+           Write-Output (\"service-control-error=\" + $_.Exception.Message) \
+         }}; \
+         Start-Sleep -Seconds 3; \
          $refreshed = Get-Service -Name $serviceName -ErrorAction Stop; \
-         if ($refreshed.Status -ne 'Running') {{ throw \"Windows runtime service failed to reach Running state: $serviceName ($($refreshed.Status))\" }}",
+         Write-Output (\"service-status=\" + [string]$refreshed.Status)",
         service_name = powershell_quote(WINDOWS_SERVICE_NAME)?,
     ))
 }
 
-fn parse_windows_verify_output(output: &str, target_label: &str) -> Result<(), String> {
+fn parse_windows_runtime_report_output(
+    output: &str,
+    helper_label: &str,
+    target_label: &str,
+) -> Result<(), String> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "Windows verify helper produced no output for {}",
+            "{helper_label} produced no output for {}",
             target_label
         ));
     }
     let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
         format!(
-            "Windows verify helper did not emit valid JSON for {}: {err}",
+            "{helper_label} did not emit valid JSON for {}: {err}",
             target_label
         )
     })?;
-
-    let bool_field = |name: &str| {
-        parsed
-            .get(name)
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-    };
+    let status = parsed
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("fail");
+    if status == "pass" {
+        return Ok(());
+    }
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
     let service_status = parsed
         .get("service_status")
         .and_then(|value| value.as_str())
-        .unwrap_or("missing");
-    let mut failures = Vec::new();
-    for field in [
-        "daemon_present",
-        "cli_present",
-        "config_present",
-        "log_root_present",
-        "trust_root_present",
-        "openssh_host_key_present",
-    ] {
-        if !bool_field(field) {
-            failures.push(format!("{field}=false"));
-        }
+        .filter(|value| !value.trim().is_empty());
+    let backend_label = parsed
+        .get("backend_label")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    let start_error = parsed
+        .get("start_error")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    let notes = parsed
+        .get("notes")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|notes| !notes.is_empty());
+    let mut details = Vec::new();
+    if let Some(reason) = reason {
+        details.push(format!("reason={reason}"));
     }
-    if !bool_field("runtime_flags_present") {
-        failures.push("runtime_flags_present=false".to_string());
+    if let Some(service_status) = service_status {
+        details.push(format!("service_status={service_status}"));
     }
-    if !bool_field("service_present") {
-        failures.push("service_present=false".to_string());
-    } else if service_status != "Running" {
-        failures.push(format!("service_status={service_status}"));
+    if let Some(backend_label) = backend_label {
+        details.push(format!("backend_label={backend_label}"));
     }
-    if !failures.is_empty() {
-        let reason = parsed
-            .get("reason")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty());
-        let notes = parsed
-            .get("notes")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|value| value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|notes| !notes.is_empty());
-        let reason_suffix = reason
-            .map(|reason| format!(" reason={reason}"))
-            .unwrap_or_default();
-        let note_suffix = notes
-            .map(|notes| format!(" notes={notes}"))
-            .unwrap_or_default();
+    if let Some(start_error) = start_error {
+        details.push(format!("start_error={start_error}"));
+    }
+    if let Some(notes) = notes {
+        details.push(format!("notes={notes}"));
+    }
+    let detail_suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", details.join(" "))
+    };
+    Err(format!(
+        "{helper_label} reported status={status} for {}{}",
+        target_label, detail_suffix
+    ))
+}
+
+fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> Result<(), String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
         return Err(format!(
-            "Windows verify helper reported {} for {}{}{}",
-            failures.join(", "),
-            target_label,
-            reason_suffix,
-            note_suffix
+            "Windows service-host smoke helper produced no output for {}",
+            target_label
         ));
     }
-    Ok(())
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!(
+            "Windows service-host smoke helper did not emit valid JSON for {}: {err}",
+            target_label
+        )
+    })?;
+    let status = parsed
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("fail");
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let backend_label = parsed
+        .get("backend_label")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let host_surface_validated = parsed
+        .get("host_surface_validated")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let cleanup_status = parsed
+        .get("cleanup_status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if !host_surface_validated {
+        return Err(format!(
+            "Windows service-host smoke helper reported status={status} reason={reason} host_surface_validated=false for {target_label}"
+        ));
+    }
+    if cleanup_status != "removed" {
+        return Err(format!(
+            "Windows service-host smoke helper reported status={status} cleanup_status={cleanup_status} for {target_label}"
+        ));
+    }
+    if status == "pass" {
+        return Ok(());
+    }
+    if status == "blocked"
+        && reason == "windows-runtime-backend-explicitly-unsupported"
+        && backend_label == "windows-unsupported"
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Windows service-host smoke helper reported status={status} reason={reason} backend_label={backend_label} for {target_label}"
+    ))
+}
+
+fn build_windows_service_host_smoke_validation_script(
+    remote_path: &str,
+    args: &[String],
+    remote_result_path: &str,
+) -> Result<String, String> {
+    let mut helper_args = args.to_vec();
+    helper_args.push("-OutputPath".to_string());
+    helper_args.push(remote_result_path.to_string());
+    let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $resultPath = {result_path}; \
+         $resultParent = Split-Path -Path $resultPath -Parent; \
+         if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
+           New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
+         }}; \
+         if (Test-Path -LiteralPath $resultPath) {{ \
+           Remove-Item -LiteralPath $resultPath -Force \
+         }}; \
+         {helper_command}; \
+         if (-not (Test-Path -LiteralPath $resultPath)) {{ \
+           throw ('Windows service-host smoke helper did not write result file: {{0}}' -f $resultPath) \
+         }}; \
+         $report = Get-Content -Raw -LiteralPath $resultPath -Encoding UTF8 | ConvertFrom-Json; \
+         if (-not $report.host_surface_validated) {{ \
+           throw 'Windows service-host smoke helper reported host_surface_validated=false' \
+         }}; \
+         if ($report.cleanup_status -ne 'removed') {{ \
+           throw ('Windows service-host smoke helper left cleanup_status={{0}}' -f [string]$report.cleanup_status) \
+         }}; \
+         if ($report.status -eq 'pass') {{ exit 0 }}; \
+         if ($report.status -eq 'blocked' -and $report.reason -eq 'windows-runtime-backend-explicitly-unsupported' -and $report.backend_label -eq 'windows-unsupported') {{ exit 0 }}; \
+         throw ('Windows service-host smoke helper reported status={{0}} reason={{1}} backend_label={{2}}' -f [string]$report.status, [string]$report.reason, [string]$report.backend_label)",
+        result_path = powershell_quote(remote_result_path)?,
+        helper_command = helper_command,
+    ))
 }
 
 impl WindowsBootstrapProvider {
@@ -302,17 +466,31 @@ impl WindowsBootstrapProvider {
             if err.contains("requires --repo-url") {
                 return err;
             }
-            match self.collect_failure_diagnostics(phase, target, context) {
-                Ok(output_root) => format!(
-                    "{err}; Windows diagnostics_output_root={output_root} target={}",
-                    target.label
-                ),
-                Err(diag_err) => format!(
-                    "{err}; Windows diagnostics collection also failed for {}: {diag_err}",
-                    target.label
-                ),
-            }
+            format_windows_phase_failure_with_diagnostics(
+                err.as_str(),
+                target.label.as_str(),
+                self.collect_failure_diagnostics(phase, target, context),
+            )
         })
+    }
+
+    fn ensure_proven_access_for_phase(
+        &self,
+        phase: BootstrapPhase,
+        target: &RemoteTarget,
+        context: &BootstrapPhaseContext<'_>,
+    ) -> Result<(), String> {
+        if !phase_requires_proven_access(phase) {
+            return Ok(());
+        }
+        ensure_windows_runtime_access_ready_for_target(
+            target,
+            context.ssh_user,
+            context.ssh_identity_file,
+            context.known_hosts_path,
+            context.timeout,
+        )
+        .map_err(|err| render_windows_access_gate_error(phase, target.label.as_str(), err.as_str()))
     }
 
     fn execute_single_phase(
@@ -321,6 +499,7 @@ impl WindowsBootstrapProvider {
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
     ) -> Result<(), String> {
+        self.ensure_proven_access_for_phase(phase, target, context)?;
         match phase {
             BootstrapPhase::SyncSource => {
                 let invocation =
@@ -342,17 +521,85 @@ impl WindowsBootstrapProvider {
                     "Windows bootstrap build-release",
                 )
             }
+            BootstrapPhase::SmokeServiceHost => {
+                let invocation = build_windows_service_host_smoke_invocation(context);
+                match windows_local_utm_execution_authority(target, false) {
+                    Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile) => {
+                        let helper_context = self.helper_context(target, context);
+                        let local_path = windows_service_host_smoke_helper_script_local_path();
+                        let remote_path = stage_windows_helper_script_from_path_with_phase(
+                            &helper_context,
+                            local_path.as_path(),
+                            invocation.remote_file_name,
+                            RemoteTransportPhase::AccessEstablishment,
+                        )?;
+                        let remote_result_name = format!(
+                            "{}.result.{}.json",
+                            sanitize_label_for_path(invocation.remote_file_name),
+                            unique_suffix()
+                        );
+                        let remote_result_path = windows_helper_script_remote_path(
+                            helper_context.target,
+                            remote_result_name.as_str(),
+                        )?;
+                        let validation_script = build_windows_service_host_smoke_validation_script(
+                            remote_path.as_str(),
+                            invocation.args.as_slice(),
+                            remote_result_path.as_str(),
+                        )?;
+                        let status = run_remote_shell_command_for_target_with_phase(
+                            helper_context.target,
+                            helper_context.ssh_user_override,
+                            helper_context.ssh_identity_file,
+                            helper_context.known_hosts_path,
+                            validation_script.as_str(),
+                            helper_context.timeout,
+                            RemoteTransportPhase::AccessEstablishment,
+                        )
+                        .map_err(|err| {
+                            format!(
+                                "Windows service-host smoke helper failed for {}: {err}",
+                                target.label
+                            )
+                        })?;
+                        let _ = best_effort_remove_windows_local_utm_guest_file(
+                            remote_target_local_utm(helper_context.target)
+                                .expect("validated local UTM target")
+                                .0,
+                            remote_result_path.as_str(),
+                            Duration::from_secs(20),
+                        );
+                        ensure_success_status(status, "Windows service-host smoke helper")
+                    }
+                    _ => {
+                        let output = self.capture_helper_output(
+                            target,
+                            context,
+                            invocation,
+                            "Windows service-host smoke helper",
+                        )?;
+                        parse_windows_service_host_smoke_output(
+                            output.as_str(),
+                            target.label.as_str(),
+                        )
+                    }
+                }
+            }
             BootstrapPhase::InstallRelease => {
-                let invocation = build_windows_service_install_invocation(context);
-                self.invoke_helper_status(
+                let output = self.capture_helper_output(
                     target,
                     context,
-                    invocation,
+                    build_windows_service_install_invocation(context),
                     "Windows service install helper",
+                )?;
+                parse_windows_runtime_report_output(
+                    output.as_str(),
+                    "Windows service install helper",
+                    target.label.as_str(),
                 )
             }
             BootstrapPhase::RestartRuntime => {
-                let status = run_remote_shell_command_for_target(
+                capture_remote_shell_command_for_target(
                     target,
                     context.ssh_user,
                     context.ssh_identity_file,
@@ -363,7 +610,17 @@ impl WindowsBootstrapProvider {
                 .map_err(|err| {
                     format!("Windows restart-runtime failed for {}: {err}", target.label)
                 })?;
-                ensure_success_status(status, "Windows restart-runtime")
+                let output = self.capture_helper_output(
+                    target,
+                    context,
+                    build_windows_verify_invocation(context),
+                    "Windows verify helper after restart-runtime",
+                )?;
+                parse_windows_runtime_report_output(
+                    output.as_str(),
+                    "Windows verify helper after restart-runtime",
+                    target.label.as_str(),
+                )
             }
             BootstrapPhase::VerifyRuntime => {
                 let output = self.capture_helper_output(
@@ -372,12 +629,17 @@ impl WindowsBootstrapProvider {
                     build_windows_verify_invocation(context),
                     "Windows verify helper",
                 )?;
-                parse_windows_verify_output(output.as_str(), target.label.as_str())
+                parse_windows_runtime_report_output(
+                    output.as_str(),
+                    "Windows verify helper",
+                    target.label.as_str(),
+                )
             }
             BootstrapPhase::All => {
                 for subphase in [
                     BootstrapPhase::SyncSource,
                     BootstrapPhase::BuildRelease,
+                    BootstrapPhase::SmokeServiceHost,
                     BootstrapPhase::InstallRelease,
                     BootstrapPhase::RestartRuntime,
                     BootstrapPhase::VerifyRuntime,
@@ -485,28 +747,91 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_host_smoke_invocation_uses_canonical_helper_and_runtime_roots() {
+        let invocation = build_windows_service_host_smoke_invocation(&sample_context(None));
+        assert_eq!(
+            invocation.helper_file_name,
+            WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE
+        );
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-RustyNetRoot",
+                r"C:\Rustynet",
+                "-StateRoot",
+                WINDOWS_STATE_ROOT,
+                "-ServiceName",
+                "RustyNetSmoke",
+            ]
+        );
+    }
+
+    #[test]
     fn windows_verify_output_parser_rejects_missing_service() {
-        let err = parse_windows_verify_output(
+        let err = parse_windows_runtime_report_output(
             r#"{
-                "daemon_present": true,
-                "cli_present": true,
-                "config_present": true,
-                "log_root_present": true,
-                "trust_root_present": true,
-                "service_present": false,
-                "service_status": "missing",
-                "openssh_host_key_present": true,
-                "runtime_flags_present": false,
+                "status": "fail",
                 "reason": "windows-runtime-service-host-not-yet-implemented",
+                "service_status": "missing",
                 "notes": ["windows-service-flags-missing","service-missing"]
             }"#,
+            "Windows verify helper",
             "windows-utm-1",
         )
         .expect_err("missing service must fail closed");
-        assert!(err.contains("service_present=false"));
-        assert!(err.contains("runtime_flags_present=false"));
+        assert!(err.contains("status=fail"));
         assert!(err.contains("reason=windows-runtime-service-host-not-yet-implemented"));
         assert!(err.contains("windows-service-flags-missing"));
+    }
+
+    #[test]
+    fn windows_runtime_report_parser_surfaces_explicit_backend_blocker() {
+        let err = parse_windows_runtime_report_output(
+            r#"{
+                "status": "blocked",
+                "reason": "windows-runtime-backend-explicitly-unsupported",
+                "service_status": "Stopped",
+                "backend_label": "windows-unsupported",
+                "notes": ["service-start-error"]
+            }"#,
+            "Windows service install helper",
+            "windows-utm-1",
+        )
+        .expect_err("explicit backend blocker must fail closed");
+        assert!(err.contains("status=blocked"));
+        assert!(err.contains("reason=windows-runtime-backend-explicitly-unsupported"));
+        assert!(err.contains("backend_label=windows-unsupported"));
+    }
+
+    #[test]
+    fn windows_service_host_smoke_parser_accepts_explicit_backend_blocker() {
+        parse_windows_service_host_smoke_output(
+            r#"{
+                "status": "blocked",
+                "reason": "windows-runtime-backend-explicitly-unsupported",
+                "backend_label": "windows-unsupported",
+                "host_surface_validated": true,
+                "cleanup_status": "removed"
+            }"#,
+            "windows-utm-1",
+        )
+        .expect("reviewed explicit backend blocker should count as smoke success");
+    }
+
+    #[test]
+    fn windows_service_host_smoke_parser_rejects_unvalidated_host_surface() {
+        let err = parse_windows_service_host_smoke_output(
+            r#"{
+                "status": "blocked",
+                "reason": "windows-runtime-backend-explicitly-unsupported",
+                "backend_label": "windows-unsupported",
+                "host_surface_validated": false,
+                "cleanup_status": "removed"
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("unvalidated host surface must fail closed");
+        assert!(err.contains("host_surface_validated=false"));
     }
 
     #[test]
@@ -515,6 +840,8 @@ mod tests {
             build_windows_restart_runtime_script().expect("restart-runtime script should build");
         assert!(script.contains("Restart-Service -Name $serviceName -ErrorAction Stop"));
         assert!(script.contains("Start-Service -Name $serviceName -ErrorAction Stop"));
+        assert!(script.contains("service-status="));
+        assert!(!script.contains("WaitForStatus('Running'"));
         assert!(!script.contains("systemctl"));
     }
 
@@ -540,5 +867,42 @@ mod tests {
         assert!(invocation.args[1].starts_with(
             r"C:\ProgramData\Rustynet\vm-lab\diagnostics\bootstrap-windows-utm-1-install-release-"
         ));
+    }
+
+    #[test]
+    fn windows_runtime_phases_require_proven_access() {
+        assert!(!phase_requires_proven_access(BootstrapPhase::SyncSource));
+        assert!(!phase_requires_proven_access(BootstrapPhase::BuildRelease));
+        assert!(!phase_requires_proven_access(
+            BootstrapPhase::SmokeServiceHost
+        ));
+        assert!(phase_requires_proven_access(BootstrapPhase::InstallRelease));
+        assert!(phase_requires_proven_access(BootstrapPhase::RestartRuntime));
+        assert!(phase_requires_proven_access(BootstrapPhase::VerifyRuntime));
+        assert!(!phase_requires_proven_access(BootstrapPhase::All));
+    }
+
+    #[test]
+    fn windows_access_gate_error_carries_phase_and_root_cause() {
+        let rendered = render_windows_access_gate_error(
+            BootstrapPhase::VerifyRuntime,
+            "windows-utm-1",
+            "ssh-access-not-ready: ssh-host-key-not-ready: Host key verification failed.",
+        );
+        assert!(rendered.contains("phase verify-runtime"));
+        assert!(rendered.contains("windows-utm-1"));
+        assert!(rendered.contains("ssh-host-key-not-ready"));
+    }
+
+    #[test]
+    fn windows_failure_diagnostics_formatter_preserves_output_root() {
+        let rendered = format_windows_phase_failure_with_diagnostics(
+            "Windows phase verify-runtime requires proven access for windows-utm-1: ssh-access-not-ready: ssh-auth-rejected",
+            "windows-utm-1",
+            Ok(r"C:\ProgramData\RustyNet\vm-lab\diagnostics\bootstrap-windows-utm-1-verify-runtime-1".to_string()),
+        );
+        assert!(rendered.contains("diagnostics_output_root="));
+        assert!(rendered.contains("windows-utm-1"));
+        assert!(rendered.contains("verify-runtime"));
     }
 }

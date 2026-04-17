@@ -31,6 +31,72 @@ function Test-RustyNetWindowsRuntimeSupport {
     }
 }
 
+function Get-FirstExistingPath {
+    param([string[]]$Candidates)
+    return $Candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Test-PathPinnedToBinary {
+    param(
+        [string]$ImagePath,
+        [string]$BinaryPath
+    )
+    if (-not $ImagePath -or -not $BinaryPath) {
+        return $false
+    }
+    return $ImagePath.IndexOf($BinaryPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Test-ImagePathContainsToken {
+    param(
+        [string]$ImagePath,
+        [string]$Token
+    )
+    if (-not $ImagePath -or -not $Token) {
+        return $false
+    }
+    return $ImagePath.IndexOf($Token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Get-ServiceImagePath {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    $serviceRegPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $ServiceName
+    if (-not (Test-Path -LiteralPath $serviceRegPath)) {
+        return ''
+    }
+    return [string](Get-ItemProperty -Path $serviceRegPath -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+}
+
+function Get-ServiceRuntimeState {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $serviceStatus = if ($service) { [string]$service.Status } else { 'missing' }
+    $cimService = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") -ErrorAction SilentlyContinue
+    $imagePath = Get-ServiceImagePath -ServiceName $ServiceName
+    return [ordered]@{
+        present = [bool]$service
+        status = $serviceStatus
+        state = if ($cimService) { [string]$cimService.State } else { 'missing' }
+        start_mode = if ($cimService) { [string]$cimService.StartMode } else { '' }
+        exit_code = if ($cimService) { [int]$cimService.ExitCode } else { $null }
+        process_id = if ($cimService) { [int]$cimService.ProcessId } else { $null }
+        image_path = $imagePath
+    }
+}
+
+function Build-ReviewedDaemonArgsJson {
+    return (@('--backend', 'windows-unsupported') | ConvertTo-Json -Compress)
+}
+
+function Write-ReviewedEnvFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    @(
+        '# Reviewed RustyNet Windows service host configuration'
+        '# The current branch only provides windows-unsupported as an explicit fail-closed backend label.'
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson))
+    ) | Out-File -Encoding ascii $Path
+}
+
 Ensure-Directory -Path $InstallRoot
 Ensure-Directory -Path (Join-Path $InstallRoot 'bin')
 Ensure-Directory -Path $StateRoot
@@ -48,11 +114,11 @@ $cliCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe'
 )
 
-$daemonSource = $daemonCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$daemonSource = Get-FirstExistingPath -Candidates $daemonCandidates
 if (-not $daemonSource) {
     throw 'rustynetd.exe was not found under the Windows release output directory'
 }
-$cliSource = $cliCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$cliSource = Get-FirstExistingPath -Candidates $cliCandidates
 
 $daemonDest = Join-Path $InstallRoot 'bin\rustynetd.exe'
 Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force
@@ -61,17 +127,158 @@ if ($cliSource) {
 }
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
-if (-not (Test-Path -LiteralPath $configPath)) {
-    @(
-        '# Populate this file with Windows-specific RustyNet runtime environment'
-        '# Windows runtime install will remain blocked until rustynetd exposes a real Windows service host and --env-file support'
-    ) | Out-File -Encoding ascii $configPath
-}
+Write-ReviewedEnvFile -Path $configPath
 
-Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
-if (-not $runtimeSignals.has_windows_service -or -not $runtimeSignals.has_env_file) {
-    throw 'Blocked: windows-runtime-service-host-not-yet-implemented: rustynetd.exe does not advertise both --windows-service and --env-file support on the current branch. Refusing to create a fake Windows service wrapper; Windows runtime install remains blocked until rustynetd exposes a real Windows service/config host path.'
+$serviceConfigError = ''
+$serviceStartAttempted = $false
+$startError = ''
+
+if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
+    $quotedDaemon = '"' + $daemonDest + '"'
+    $quotedConfig = '"' + $configPath + '"'
+    $quotedServiceName = '"' + $ServiceName + '"'
+    $binPath = "$quotedDaemon --windows-service --service-name $quotedServiceName --env-file $quotedConfig"
+    try {
+        $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($existing) {
+            $scOutput = (& sc.exe config $ServiceName binPath= $binPath start= auto 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+                throw "sc.exe config failed: $scOutput"
+            }
+        }
+        else {
+            $scOutput = (& sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= 'RustyNet' 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+                throw "sc.exe create failed: $scOutput"
+            }
+        }
+        $descriptionOutput = (& sc.exe description $ServiceName 'RustyNet secure mesh runtime service host' 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "sc.exe description failed: $descriptionOutput"
+        }
+    }
+    catch {
+        $serviceConfigError = $_.Exception.Message
+    }
+
+    if (-not $serviceConfigError) {
+        $serviceStartAttempted = $true
+        try {
+            $service = Get-Service -Name $ServiceName -ErrorAction Stop
+            if ($service.Status -eq 'Running') {
+                Restart-Service -Name $ServiceName -ErrorAction Stop
+            }
+            else {
+                Start-Service -Name $ServiceName -ErrorAction Stop
+            }
+        }
+        catch {
+            $startError = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 3
+    }
 }
 
-throw 'Blocked: windows-runtime-service-host-not-yet-implemented: Windows runtime service installation remains disabled on the current branch until rustynetd exposes a reviewed Windows service/config host path with dedicated tests. Refusing to create or update a Windows service wrapper from bootstrap.'
+$serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
+$imagePath = [string]$serviceRuntime.image_path
+$serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--windows-service'
+$serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--env-file'
+$serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $imagePath -Token $configPath
+$backendLabel = 'windows-unsupported'
+$notes = @()
+if ($serviceConfigError) {
+    $notes += 'service-config-error'
+}
+if ($startError) {
+    $notes += 'service-start-error'
+}
+if (-not $runtimeSignals.has_windows_service) {
+    $notes += 'windows-service-flag-missing'
+}
+if (-not $runtimeSignals.has_env_file) {
+    $notes += 'env-file-flag-missing'
+}
+if (-not $serviceRuntime.present) {
+    $notes += 'service-missing'
+}
+elseif (-not $serviceImagePathUsesWindowsService) {
+    $notes += 'service-binpath-missing-windows-service-flag'
+}
+elseif (-not $serviceImagePathUsesEnvFile) {
+    $notes += 'service-binpath-missing-env-file-flag'
+}
+elseif (-not $serviceEnvFilePinned) {
+    $notes += 'service-binpath-env-file-not-pinned'
+}
+
+$reason = ''
+$status = 'fail'
+if (-not (Test-Path -LiteralPath $daemonDest) -or -not $cliSource) {
+    $reason = 'install-artifacts-missing'
+}
+elseif (-not $runtimeSignals.has_windows_service -or -not $runtimeSignals.has_env_file) {
+    $reason = 'windows-runtime-service-host-not-yet-implemented'
+}
+elseif ($serviceConfigError) {
+    $reason = 'windows-service-install-failed'
+}
+elseif (-not (Test-Path -LiteralPath $configPath)) {
+    $reason = 'config-missing'
+}
+elseif (-not $serviceRuntime.present) {
+    $reason = 'windows-service-not-installed'
+}
+elseif (-not (Test-PathPinnedToBinary -ImagePath $imagePath -BinaryPath $daemonDest)) {
+    $reason = 'windows-service-binary-path-not-pinned-to-install-root'
+}
+elseif (-not $serviceImagePathUsesWindowsService -or -not $serviceImagePathUsesEnvFile -or -not $serviceEnvFilePinned) {
+    $reason = 'windows-service-host-path-not-reviewed'
+}
+elseif ($backendLabel -eq 'windows-unsupported') {
+    $status = 'blocked'
+    $reason = 'windows-runtime-backend-explicitly-unsupported'
+}
+elseif ($serviceRuntime.status -ne 'Running') {
+    $reason = 'windows-service-not-running'
+}
+else {
+    $status = 'pass'
+}
+
+$report = [ordered]@{
+    schema_version = 1
+    captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    platform = 'windows'
+    rustynet_root = $RustyNetRoot
+    install_root = $InstallRoot
+    state_root = $StateRoot
+    service_name = $ServiceName
+    status = $status
+    reason = $reason
+    backend_label = $backendLabel
+    runtime_supported = $false
+    service_verified = ($status -eq 'pass')
+    start_attempted = $serviceStartAttempted
+    start_error = $startError
+    daemon_present = Test-Path -LiteralPath $daemonDest
+    cli_present = [bool]$cliSource
+    config_present = Test-Path -LiteralPath $configPath
+    log_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'logs')
+    trust_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'trust')
+    service_present = $serviceRuntime.present
+    service_status = $serviceRuntime.status
+    service_state = $serviceRuntime.state
+    service_start_mode = $serviceRuntime.start_mode
+    service_exit_code = $serviceRuntime.exit_code
+    service_process_id = $serviceRuntime.process_id
+    service_image_path = $imagePath
+    service_image_path_uses_windows_service_flag = $serviceImagePathUsesWindowsService
+    service_image_path_uses_env_file = $serviceImagePathUsesEnvFile
+    service_env_file_pinned = $serviceEnvFilePinned
+    service_binary_path_pinned_to_install_root = Test-PathPinnedToBinary -ImagePath $imagePath -BinaryPath $daemonDest
+    runtime_flags_present = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
+    notes = $notes
+}
+
+$report | ConvertTo-Json -Depth 6 | Write-Output

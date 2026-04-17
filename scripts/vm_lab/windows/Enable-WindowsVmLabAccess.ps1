@@ -1,56 +1,58 @@
 param(
     [string]$AutomationPublicKey = "",
+    [string]$ResultPath = "",
     [switch]$SetDefaultShellToPowerShell
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+trap {
+    Write-Error $_
+    exit 1
+}
 
-function Get-LocalizedAccountName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Security.Principal.WellKnownSidType]$SidType
+function Resolve-CanonicalBootstrapScript {
+    $candidates = @(
+        (Join-Path $PSScriptRoot 'Bootstrap-RustyNetWindows.ps1'),
+        (Join-Path $PSScriptRoot '..\..\bootstrap\windows\Bootstrap-RustyNetWindows.ps1')
     )
-
-    $sid = [System.Security.Principal.SecurityIdentifier]::new($SidType, $null)
-    return $sid.Translate([System.Security.Principal.NTAccount]).Value
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Resolve-Path -LiteralPath $candidate -ErrorAction Stop)
+        }
+    }
+    throw 'Bootstrap-RustyNetWindows.ps1 is not available on this host path'
 }
 
-$adminAccount = Get-LocalizedAccountName -SidType ([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid)
-$systemAccount = Get-LocalizedAccountName -SidType ([System.Security.Principal.WellKnownSidType]::LocalSystemSid)
-
-$sshCapability = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
-if (-not $sshCapability -or $sshCapability.State -ne 'Installed') {
-    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
-}
-
-Start-Service sshd
-Set-Service -Name sshd -StartupType Automatic
-
-$firewallRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-if (-not $firewallRule) {
-    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (vm-lab)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-}
-
-New-Item -ItemType Directory -Force -Path 'C:\ProgramData\Rustynet\vm-lab' | Out-Null
-New-Item -ItemType Directory -Force -Path 'C:\ProgramData\ssh' | Out-Null
+$canonicalScript = (Resolve-CanonicalBootstrapScript).Path
+$trimmedAutomationPublicKey = $AutomationPublicKey.Trim()
+$trimmedResultPath = $ResultPath.Trim()
 
 if ($SetDefaultShellToPowerShell) {
-    New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
-    New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -PropertyType String -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Force | Out-Null
+    if ($trimmedAutomationPublicKey.Length -gt 0 -and $trimmedResultPath.Length -gt 0) {
+        & $canonicalScript -Phase 'prepare-transport' -AutomationPublicKey $trimmedAutomationPublicKey -ResultPath $trimmedResultPath -SetDefaultShellToPowerShell
+    }
+    elseif ($trimmedAutomationPublicKey.Length -gt 0) {
+        & $canonicalScript -Phase 'prepare-transport' -AutomationPublicKey $trimmedAutomationPublicKey -SetDefaultShellToPowerShell
+    }
+    elseif ($trimmedResultPath.Length -gt 0) {
+        & $canonicalScript -Phase 'prepare-transport' -ResultPath $trimmedResultPath -SetDefaultShellToPowerShell
+    }
+    else {
+        & $canonicalScript -Phase 'prepare-transport' -SetDefaultShellToPowerShell
+    }
 }
-
-if ($AutomationPublicKey -and $AutomationPublicKey.Trim().Length -gt 0) {
-    $adminKeys = 'C:\ProgramData\ssh\administrators_authorized_keys'
-    Set-Content -LiteralPath $adminKeys -Encoding ascii -Value ($AutomationPublicKey.Trim() + "`r`n")
-    & icacls $adminKeys /inheritance:r | Out-Null
-    & icacls $adminKeys /grant "$adminAccount:F" "$systemAccount:F" | Out-Null
+elseif ($trimmedAutomationPublicKey.Length -gt 0 -and $trimmedResultPath.Length -gt 0) {
+    & $canonicalScript -Phase 'prepare-transport' -AutomationPublicKey $trimmedAutomationPublicKey -ResultPath $trimmedResultPath
 }
-
-$hostKeyPath = 'C:\ProgramData\ssh\ssh_host_ed25519_key.pub'
-if (Test-Path -LiteralPath $hostKeyPath) {
-    Get-Content -LiteralPath $hostKeyPath
-} else {
-    Write-Output 'host-key-unavailable'
+elseif ($trimmedAutomationPublicKey.Length -gt 0) {
+    & $canonicalScript -Phase 'prepare-transport' -AutomationPublicKey $trimmedAutomationPublicKey
 }
+elseif ($trimmedResultPath.Length -gt 0) {
+    & $canonicalScript -Phase 'prepare-transport' -ResultPath $trimmedResultPath
+}
+else {
+    & $canonicalScript -Phase 'prepare-transport'
+}
+exit $LASTEXITCODE

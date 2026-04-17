@@ -47,13 +47,38 @@ function Get-HashEntries {
     $entries = @()
     foreach ($path in $Paths) {
         if (Test-Path -LiteralPath $path) {
-            $entries += [ordered]@{
-                path = $path
-                sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            try {
+                $entries += [ordered]@{
+                    path = $path
+                    sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+                }
+            }
+            catch {
+                $entries += [ordered]@{
+                    path = $path
+                    sha256 = $null
+                    error = [string]::Concat('hash-unavailable: ', $_.Exception.Message)
+                }
             }
         }
     }
     return $entries
+}
+
+function Write-ReadableFileSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+    if (-not (Test-Path -LiteralPath $SourcePath)) {
+        return
+    }
+    try {
+        Get-Content -LiteralPath $SourcePath -ErrorAction Stop | Set-Content -Encoding utf8 -LiteralPath $DestinationPath
+    }
+    catch {
+        Write-Utf8File -Path $DestinationPath -Content ([string]::Concat('read-unavailable: ', $_.Exception.Message))
+    }
 }
 
 function Write-AclSnapshot {
@@ -92,6 +117,18 @@ Write-CommandOutput -Path (Join-Path $OutputRoot 'firewall.txt') -Script {
         Where-Object { $_.DisplayName -like '*RustyNet*' -or $_.DisplayName -like '*OpenSSH*' } |
         Format-Table -AutoSize
 }
+Write-CommandOutput -Path (Join-Path $OutputRoot 'ssh-services.txt') -Script {
+    Get-Service -Name sshd, ssh-agent -ErrorAction SilentlyContinue | Format-List *
+}
+Write-CommandOutput -Path (Join-Path $OutputRoot 'ssh-listeners.txt') -Script {
+    Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | Format-List *
+}
+Write-CommandOutput -Path (Join-Path $OutputRoot 'ssh-firewall-openssh.txt') -Script {
+    Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Format-List *
+}
+Write-CommandOutput -Path (Join-Path $OutputRoot 'sshd-config-test.txt') -Script {
+    & (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe') -t 2>&1
+}
 Write-CommandOutput -Path (Join-Path $OutputRoot 'events-system.txt') -Script {
     Get-WinEvent -LogName System -MaxEvents 100 | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
 }
@@ -104,9 +141,21 @@ if ($service) {
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-qc.txt') -Script {
         & sc.exe qc $ServiceName
     }
+    Write-CommandOutput -Path (Join-Path $OutputRoot 'service-queryex.txt') -Script {
+        & sc.exe queryex $ServiceName
+    }
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-qfailure.txt') -Script {
         & sc.exe qfailure $ServiceName
     }
+    Write-CommandOutput -Path (Join-Path $OutputRoot 'service-cim.txt') -Script {
+        Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") | Format-List *
+    }
+}
+
+Write-CommandOutput -Path (Join-Path $OutputRoot 'events-service-control-manager-rustynet.txt') -Script {
+    Get-WinEvent -LogName System -MaxEvents 200 |
+        Where-Object { $_.ProviderName -eq 'Service Control Manager' -and $_.Message -like "*$ServiceName*" } |
+        Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
 }
 
 $toolingLines = @()
@@ -147,9 +196,22 @@ foreach ($path in @(
     Write-AclSnapshot -TargetPath $path -OutputDirectory $OutputRoot
 }
 
-if (Test-Path -LiteralPath 'C:\ProgramData\ssh\sshd_config') {
-    Get-Content -LiteralPath 'C:\ProgramData\ssh\sshd_config' | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'sshd_config.txt')
+Write-ReadableFileSnapshot -SourcePath 'C:\ProgramData\ssh\sshd_config' -DestinationPath (Join-Path $OutputRoot 'sshd_config.txt')
+
+$sshdService = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
+$openSshFirewallRule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
+$sshListener = Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+$sshAccessState = [ordered]@{
+    openssh_installed = (Test-Path -LiteralPath (Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'))
+    service_present = ($null -ne $sshdService)
+    service_running = ($null -ne $sshdService -and $sshdService.Status -eq 'Running')
+    firewall_rule_present = ($null -ne $openSshFirewallRule)
+    firewall_rule_enabled = ($null -ne $openSshFirewallRule -and $openSshFirewallRule.Enabled -eq 'True' -and $openSshFirewallRule.Direction -eq 'Inbound' -and $openSshFirewallRule.Action -eq 'Allow')
+    host_key_present = (Test-Path -LiteralPath 'C:\ProgramData\ssh\ssh_host_ed25519_key.pub')
+    authorized_keys_present = (Test-Path -LiteralPath 'C:\ProgramData\ssh\administrators_authorized_keys')
+    listener_ready = ($null -ne $sshListener)
 }
+$sshAccessState | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'ssh_access_state.json')
 
 $manifest = [ordered]@{
     schema_version = 1

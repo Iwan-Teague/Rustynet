@@ -10,7 +10,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddrV4;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+#[cfg(not(windows))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(not(windows))]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,9 +61,32 @@ use crate::traversal::{
     EndpointMonitor, TraversalCandidate as ProbeTraversalCandidate, TraversalEngine,
     TraversalEngineConfig, VerifiedTraversalIndex, VerifiedTraversalRecord,
 };
+use crate::windows_backend_gate::{
+    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WindowsBackendMode, require_supported_windows_backend,
+};
+#[cfg(windows)]
+use crate::windows_ipc::{
+    DEFAULT_WINDOWS_DAEMON_PIPE_PATH, WindowsLocalIpcRole, validate_windows_pipe_path,
+    windows_ipc_blocker_reason,
+};
+#[cfg(windows)]
+use crate::windows_paths::{
+    DEFAULT_WINDOWS_AUTO_TUNNEL_BUNDLE_PATH, DEFAULT_WINDOWS_AUTO_TUNNEL_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH, DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH,
+    DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH, DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH,
+    DEFAULT_WINDOWS_STATE_PATH, DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH,
+    DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH,
+    DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH, DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+    DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, validate_windows_runtime_file_path,
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(target_os = "linux")]
 use nix::ifaddrs;
+#[cfg(not(windows))]
 use nix::sys::socket::getsockopt;
 #[cfg(any(
     target_os = "macos",
@@ -73,6 +98,7 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
+#[cfg(not(windows))]
 use nix::unistd::{Gid, Uid};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
@@ -105,34 +131,90 @@ use rustynet_policy::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(not(windows))]
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+#[cfg(windows)]
+pub const DEFAULT_SOCKET_PATH: &str = DEFAULT_WINDOWS_DAEMON_PIPE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
+#[cfg(windows)]
+pub const DEFAULT_STATE_PATH: &str = DEFAULT_WINDOWS_STATE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
+#[cfg(windows)]
+pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.pub";
+#[cfg(windows)]
+pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_TRUST_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.trust.watermark";
+#[cfg(windows)]
+pub const DEFAULT_TRUST_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRUST_WATERMARK_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = "/var/lib/rustynet/membership.snapshot";
+#[cfg(windows)]
+pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
+#[cfg(windows)]
+pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
+#[cfg(windows)]
+pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
+#[cfg(windows)]
+pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
+#[cfg(windows)]
+pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = DEFAULT_WINDOWS_AUTO_TUNNEL_BUNDLE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/assignment.pub";
+#[cfg(windows)]
+pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str =
+    DEFAULT_WINDOWS_AUTO_TUNNEL_VERIFIER_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.assignment.watermark";
+#[cfg(windows)]
+pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH;
 pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
 const ASSIGNMENT_SIGNING_SECRET_ENV: &str = "RUSTYNET_ASSIGNMENT_SIGNING_SECRET";
 const ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV: &str =
     "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE";
+#[cfg(not(windows))]
 pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
+#[cfg(windows)]
+pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/traversal.pub";
+#[cfg(windows)]
+pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
+#[cfg(windows)]
+pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH;
 pub const DEFAULT_TRAVERSAL_MAX_AGE_SECS: u64 = 120;
 const DEFAULT_RELAY_SESSION_TOKEN_TTL_SECS: u64 = 120;
 const DEFAULT_RELAY_SESSION_REFRESH_MARGIN_SECS: u64 = 15;
 const DEFAULT_RELAY_SESSION_IDLE_TIMEOUT_SECS: u64 = 30;
+#[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
+#[cfg(windows)]
+pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH: &str = "/etc/rustynet/dns-zone.pub";
+#[cfg(windows)]
+pub const DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone.watermark";
+#[cfg(windows)]
+pub const DEFAULT_DNS_ZONE_WATERMARK_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH;
 pub const DEFAULT_DNS_ZONE_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_DNS_ZONE_NAME: &str = "rustynet";
 pub const DEFAULT_DNS_RESOLVER_BIND_ADDR: &str = "127.0.0.1:53535";
@@ -154,10 +236,23 @@ const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS: usize = 10;
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS: u64 = 100;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
+#[cfg(not(windows))]
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
+#[cfg(windows)]
+pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
+#[cfg(windows)]
+pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
+    DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
+#[cfg(windows)]
+pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH;
+#[cfg(not(windows))]
 pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub";
+#[cfg(windows)]
+pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH;
 pub const DEFAULT_EGRESS_INTERFACE: &str = "auto";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
@@ -603,7 +698,11 @@ fn write_secure_staged_artifact(
             attempt
         ));
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
+        options.write(true).create_new(true);
+        #[cfg(not(windows))]
+        {
+            options.mode(0o600);
+        }
         match options.open(&candidate) {
             Ok(mut file) => {
                 file.write_all(body).map_err(|err| {
@@ -651,6 +750,7 @@ pub enum DaemonBackendMode {
     LinuxWireguardUserspaceShared,
     MacosWireguard,
     MacosWireguardUserspaceShared,
+    WindowsUnsupported,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -664,12 +764,27 @@ impl Default for DaemonBackendMode {
         {
             return DaemonBackendMode::MacosWireguard;
         }
+        #[cfg(windows)]
+        {
+            return DaemonBackendMode::WindowsUnsupported;
+        }
         #[allow(unreachable_code)]
         DaemonBackendMode::LinuxWireguard
     }
 }
 
 impl DaemonBackendMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DaemonBackendMode::InMemory => "in-memory",
+            DaemonBackendMode::LinuxWireguard => "linux-wireguard",
+            DaemonBackendMode::LinuxWireguardUserspaceShared => "linux-wireguard-userspace-shared",
+            DaemonBackendMode::MacosWireguard => "macos-wireguard",
+            DaemonBackendMode::MacosWireguardUserspaceShared => "macos-wireguard-userspace-shared",
+            DaemonBackendMode::WindowsUnsupported => WINDOWS_UNSUPPORTED_BACKEND_LABEL,
+        }
+    }
+
     fn userspace_shared_blocker(self) -> Option<&'static str> {
         match self {
             DaemonBackendMode::MacosWireguardUserspaceShared => Some(
@@ -686,6 +801,82 @@ impl DaemonBackendMode {
                 | DaemonBackendMode::LinuxWireguardUserspaceShared
                 | DaemonBackendMode::MacosWireguard
         )
+    }
+}
+
+#[cfg(not(windows))]
+fn validate_control_socket_path(path: &Path) -> Result<(), DaemonError> {
+    if !path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "socket path must be absolute".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_control_socket_path(path: &Path) -> Result<(), DaemonError> {
+    validate_windows_pipe_path(path, WindowsLocalIpcRole::DaemonControl)
+        .map_err(DaemonError::InvalidConfig)
+}
+
+#[cfg(not(windows))]
+fn validate_privileged_helper_control_path(path: &Path) -> Result<(), DaemonError> {
+    if !path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(
+            "privileged helper socket path must be absolute".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_privileged_helper_control_path(path: &Path) -> Result<(), DaemonError> {
+    validate_windows_pipe_path(path, WindowsLocalIpcRole::PrivilegedHelper)
+        .map_err(DaemonError::InvalidConfig)
+}
+
+#[cfg(not(windows))]
+fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonError> {
+    if !path.is_absolute() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} path must be absolute"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonError> {
+    validate_windows_runtime_file_path(path, label).map_err(DaemonError::InvalidConfig)
+}
+
+#[cfg(not(windows))]
+fn validate_backend_supported_on_current_host(
+    backend_mode: DaemonBackendMode,
+) -> Result<(), DaemonError> {
+    if matches!(backend_mode, DaemonBackendMode::WindowsUnsupported) {
+        return Err(DaemonError::InvalidConfig(format!(
+            "backend '{}' is only valid on Windows daemon hosts and remains fail-closed because no reviewed Windows dataplane/backend exists on the current branch",
+            backend_mode.as_str()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_backend_supported_on_current_host(
+    backend_mode: DaemonBackendMode,
+) -> Result<(), DaemonError> {
+    match backend_mode {
+        DaemonBackendMode::WindowsUnsupported => {
+            require_supported_windows_backend(WindowsBackendMode::Unsupported)
+                .map_err(DaemonError::InvalidConfig)
+        }
+        _ => Err(DaemonError::InvalidConfig(format!(
+            "backend '{}' is not supported on Windows daemon hosts; the Windows service/config host is present, but reviewed backend/dataplane support remains unavailable on the current branch",
+            backend_mode.as_str()
+        ))),
     }
 }
 
@@ -1890,6 +2081,10 @@ impl DaemonBackend {
                     .userspace_shared_blocker()
                     .expect("macos shared backend blocker should exist")
                     .to_string(),
+            )),
+            DaemonBackendMode::WindowsUnsupported => Err(DaemonError::InvalidConfig(
+                require_supported_windows_backend(WindowsBackendMode::Unsupported)
+                    .expect_err("windows unsupported backend must fail closed"),
             )),
         }
     }
@@ -5645,6 +5840,12 @@ impl DaemonRuntime {
                         .expect("macos shared backend blocker should exist")
                         .to_string());
                 }
+                DaemonBackendMode::WindowsUnsupported => {
+                    return Err(
+                        require_supported_windows_backend(WindowsBackendMode::Unsupported)
+                            .expect_err("windows unsupported backend must fail closed"),
+                    );
+                }
                 DaemonBackendMode::InMemory => {
                     return Err("interface down is not supported for in-memory backend".to_string());
                 }
@@ -5659,6 +5860,7 @@ impl DaemonRuntime {
                 DaemonBackendMode::MacosWireguardUserspaceShared => {
                     "macos-wireguard-userspace-shared blocked"
                 }
+                DaemonBackendMode::WindowsUnsupported => "windows-unsupported blocked",
                 DaemonBackendMode::InMemory => "interface down",
             };
             return Err(format!(
@@ -6771,154 +6973,169 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     runtime.bootstrap();
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
 
-    if let Some(parent) = config.socket_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
-        match fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                let metadata = fs::metadata(parent).map_err(|meta_err| {
-                    DaemonError::Io(format!(
-                        "inspect socket parent after chmod denial failed: {meta_err}"
-                    ))
-                })?;
-                let mode = metadata.permissions().mode() & 0o777;
-                let owner_uid = metadata.uid();
-                let expected_uid = Uid::effective().as_raw();
-                let root_managed_shared_runtime = owner_uid == 0 && mode == 0o770;
-                if !root_managed_shared_runtime || owner_uid == expected_uid {
+    #[cfg(windows)]
+    {
+        drop(runtime);
+        return Err(DaemonError::InvalidConfig(windows_ipc_blocker_reason(
+            WindowsLocalIpcRole::DaemonControl,
+        )));
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = config.socket_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
+            match fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    let metadata = fs::metadata(parent).map_err(|meta_err| {
+                        DaemonError::Io(format!(
+                            "inspect socket parent after chmod denial failed: {meta_err}"
+                        ))
+                    })?;
+                    let mode = metadata.permissions().mode() & 0o777;
+                    let owner_uid = metadata.uid();
+                    let expected_uid = Uid::effective().as_raw();
+                    let root_managed_shared_runtime = owner_uid == 0 && mode == 0o770;
+                    if !root_managed_shared_runtime || owner_uid == expected_uid {
+                        return Err(DaemonError::Io(err.to_string()));
+                    }
+                }
+                Err(err) => {
                     return Err(DaemonError::Io(err.to_string()));
                 }
             }
-            Err(err) => {
-                return Err(DaemonError::Io(err.to_string()));
-            }
         }
-    }
 
-    if config.socket_path.exists() {
-        fs::remove_file(&config.socket_path).map_err(|err| DaemonError::Io(err.to_string()))?;
-    }
-
-    let listener = UnixListener::bind(&config.socket_path)
-        .map_err(|err| DaemonError::Io(format!("bind failed: {err}")))?;
-    fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|err| DaemonError::Io(err.to_string()))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|err| DaemonError::Io(format!("socket nonblocking failed: {err}")))?;
-    let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
-        .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
-    dns_socket
-        .set_nonblocking(true)
-        .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
-
-    let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
-
-    let mut processed = 0usize;
-    let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
-    let mut next_reconcile = Instant::now() + reconcile_interval;
-    let mut dns_buffer = [0u8; 1536];
-
-    loop {
-        let mut processed_io = false;
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .map_err(|err| DaemonError::Io(format!("socket read-timeout failed: {err}")))?;
-                let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
-                    CommandEnvelope::Local(parsed) => {
-                        let authorized = if parsed.is_mutating() {
-                            match (peer_uid(&stream), peer_gid(&stream)) {
-                                (Some(peer_uid), Some(peer_gid)) => {
-                                    // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)
-                                    peer_uid == 0
-                                        || peer_uid == socket_owner_uid
-                                        || peer_gid
-                                            == socket_owner_gid(&config.socket_path).unwrap_or(0)
-                                }
-                                (Some(peer_uid), None) => {
-                                    peer_uid == 0 || peer_uid == socket_owner_uid
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            true
-                        };
-
-                        if authorized {
-                            runtime.handle_command(parsed)
-                        } else {
-                            IpcResponse::err("unauthorized mutation request")
-                        }
-                    }
-                    CommandEnvelope::Remote(remote_envelope) => {
-                        let now_unix = unix_now();
-                        match runtime.authorize_remote_command(&remote_envelope, now_unix) {
-                            Ok(parsed) => runtime.handle_command(parsed),
-                            Err(err) => {
-                                IpcResponse::err(format!("remote ops authorization failed: {err}"))
-                            }
-                        }
-                    }
-                };
-
-                write_response(stream, response).map_err(DaemonError::Io)?;
-                processed = processed.saturating_add(1);
-                processed_io = true;
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {}
-            Err(err) => return Err(DaemonError::Io(format!("accept failed: {err}"))),
+        if config.socket_path.exists() {
+            fs::remove_file(&config.socket_path).map_err(|err| DaemonError::Io(err.to_string()))?;
         }
+
+        let listener = UnixListener::bind(&config.socket_path)
+            .map_err(|err| DaemonError::Io(format!("bind failed: {err}")))?;
+        fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| DaemonError::Io(err.to_string()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::Io(format!("socket nonblocking failed: {err}")))?;
+        let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
+            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
+        dns_socket
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+
+        let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
+
+        let mut processed = 0usize;
+        let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
+        let mut next_reconcile = Instant::now() + reconcile_interval;
+        let mut dns_buffer = [0u8; 1536];
+
         loop {
-            match dns_socket.recv_from(&mut dns_buffer) {
-                Ok((length, peer_addr)) => {
-                    if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length]) {
-                        dns_socket.send_to(&response, peer_addr).map_err(|err| {
-                            DaemonError::Io(format!("dns resolver send failed: {err}"))
+            let mut processed_io = false;
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|err| {
+                            DaemonError::Io(format!("socket read-timeout failed: {err}"))
                         })?;
-                    }
+                    let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
+                        CommandEnvelope::Local(parsed) => {
+                            let authorized = if parsed.is_mutating() {
+                                match (peer_uid(&stream), peer_gid(&stream)) {
+                                    (Some(peer_uid), Some(peer_gid)) => {
+                                        // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)
+                                        peer_uid == 0
+                                            || peer_uid == socket_owner_uid
+                                            || peer_gid
+                                                == socket_owner_gid(&config.socket_path)
+                                                    .unwrap_or(0)
+                                    }
+                                    (Some(peer_uid), None) => {
+                                        peer_uid == 0 || peer_uid == socket_owner_uid
+                                    }
+                                    _ => false,
+                                }
+                            } else {
+                                true
+                            };
+
+                            if authorized {
+                                runtime.handle_command(parsed)
+                            } else {
+                                IpcResponse::err("unauthorized mutation request")
+                            }
+                        }
+                        CommandEnvelope::Remote(remote_envelope) => {
+                            let now_unix = unix_now();
+                            match runtime.authorize_remote_command(&remote_envelope, now_unix) {
+                                Ok(parsed) => runtime.handle_command(parsed),
+                                Err(err) => IpcResponse::err(format!(
+                                    "remote ops authorization failed: {err}"
+                                )),
+                            }
+                        }
+                    };
+
+                    write_response(stream, response).map_err(DaemonError::Io)?;
                     processed = processed.saturating_add(1);
                     processed_io = true;
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => return Err(DaemonError::Io(format!("accept failed: {err}"))),
+            }
+            loop {
+                match dns_socket.recv_from(&mut dns_buffer) {
+                    Ok((length, peer_addr)) => {
+                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        {
+                            dns_socket.send_to(&response, peer_addr).map_err(|err| {
+                                DaemonError::Io(format!("dns resolver send failed: {err}"))
+                            })?;
+                        }
+                        processed = processed.saturating_add(1);
+                        processed_io = true;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => {
+                        return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if now >= next_reconcile {
+                runtime.reconcile();
+                next_reconcile = now + reconcile_interval;
+            }
+            let now_unix = unix_now();
+            runtime.poll_stun_results();
+            runtime.maybe_preexpiry_refresh_traversal(now_unix);
+            runtime.poll_endpoint_monitor_and_maybe_refresh();
+            runtime.maybe_trigger_endpoint_change_refresh();
+
+            if config
+                .max_requests
+                .map(|max| processed >= max.get())
+                .unwrap_or(false)
+            {
+                break;
+            }
+
+            if !processed_io {
+                let sleep_for = next_reconcile
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25));
+                if !sleep_for.is_zero() {
+                    sleep(sleep_for);
                 }
             }
         }
 
-        let now = Instant::now();
-        if now >= next_reconcile {
-            runtime.reconcile();
-            next_reconcile = now + reconcile_interval;
-        }
-        let now_unix = unix_now();
-        runtime.poll_stun_results();
-        runtime.maybe_preexpiry_refresh_traversal(now_unix);
-        runtime.poll_endpoint_monitor_and_maybe_refresh();
-        runtime.maybe_trigger_endpoint_change_refresh();
-
-        if config
-            .max_requests
-            .map(|max| processed >= max.get())
-            .unwrap_or(false)
-        {
-            break;
-        }
-
-        if !processed_io {
-            let sleep_for = next_reconcile
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(25));
-            if !sleep_for.is_zero() {
-                sleep(sleep_for);
-            }
-        }
+        scrub_runtime_wireguard_key_after_bootstrap(&config)?;
+        Ok(())
     }
-
-    scrub_runtime_wireguard_key_after_bootstrap(&config)?;
-    Ok(())
 }
 
 const DNS_HEADER_BYTES: usize = 12;
@@ -7237,111 +7454,38 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         ));
     }
 
-    if !config.socket_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "socket path must be absolute".to_string(),
-        ));
-    }
-    if !config.state_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "state path must be absolute".to_string(),
-        ));
-    }
+    validate_control_socket_path(&config.socket_path)?;
+    validate_runtime_file_path(&config.state_path, "state")?;
     if let Some(path) = config.privileged_helper_socket_path.as_ref() {
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "privileged helper socket path must be absolute".to_string(),
-            ));
-        }
+        validate_privileged_helper_control_path(path)?;
     }
-    if !config.trust_evidence_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "trust evidence path must be absolute".to_string(),
-        ));
-    }
-    if !config.trust_verifier_key_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "trust verifier key path must be absolute".to_string(),
-        ));
-    }
-    if !config.trust_watermark_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "trust watermark path must be absolute".to_string(),
-        ));
-    }
-    if !config.membership_snapshot_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "membership snapshot path must be absolute".to_string(),
-        ));
-    }
-    if !config.membership_log_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "membership log path must be absolute".to_string(),
-        ));
-    }
-    if !config.membership_watermark_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "membership watermark path must be absolute".to_string(),
-        ));
-    }
+    validate_runtime_file_path(&config.trust_evidence_path, "trust evidence")?;
+    validate_runtime_file_path(&config.trust_verifier_key_path, "trust verifier key")?;
+    validate_runtime_file_path(&config.trust_watermark_path, "trust watermark")?;
+    validate_runtime_file_path(&config.membership_snapshot_path, "membership snapshot")?;
+    validate_runtime_file_path(&config.membership_log_path, "membership log")?;
+    validate_runtime_file_path(&config.membership_watermark_path, "membership watermark")?;
     if let Some(path) = config.remote_ops_token_verifier_key_path.as_ref() {
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "remote ops token verifier key path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "remote ops token verifier key")?;
     }
     if let Some(path) = config.auto_tunnel_bundle_path.as_ref() {
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "auto tunnel bundle path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "auto tunnel bundle")?;
     }
     if let Some(path) = config.auto_tunnel_verifier_key_path.as_ref() {
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "auto tunnel verifier key path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "auto tunnel verifier key")?;
     }
     if let Some(path) = config.auto_tunnel_watermark_path.as_ref() {
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "auto tunnel watermark path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "auto tunnel watermark")?;
     }
-    if !config.dns_zone_bundle_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "dns zone bundle path must be absolute".to_string(),
-        ));
-    }
-    if !config.dns_zone_verifier_key_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "dns zone verifier key path must be absolute".to_string(),
-        ));
-    }
-    if !config.dns_zone_watermark_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "dns zone watermark path must be absolute".to_string(),
-        ));
-    }
-    if !config.traversal_bundle_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "traversal bundle path must be absolute".to_string(),
-        ));
-    }
-    if !config.traversal_verifier_key_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "traversal verifier key path must be absolute".to_string(),
-        ));
-    }
-    if !config.traversal_watermark_path.is_absolute() {
-        return Err(DaemonError::InvalidConfig(
-            "traversal watermark path must be absolute".to_string(),
-        ));
-    }
+    validate_runtime_file_path(&config.dns_zone_bundle_path, "dns zone bundle")?;
+    validate_runtime_file_path(&config.dns_zone_verifier_key_path, "dns zone verifier key")?;
+    validate_runtime_file_path(&config.dns_zone_watermark_path, "dns zone watermark")?;
+    validate_runtime_file_path(&config.traversal_bundle_path, "traversal bundle")?;
+    validate_runtime_file_path(
+        &config.traversal_verifier_key_path,
+        "traversal verifier key",
+    )?;
+    validate_runtime_file_path(&config.traversal_watermark_path, "traversal watermark")?;
     if config.traversal_probe_max_candidates.get() > MAX_TRAVERSAL_CANDIDATE_COUNT {
         return Err(DaemonError::InvalidConfig(format!(
             "traversal probe max candidates must be at most {MAX_TRAVERSAL_CANDIDATE_COUNT}"
@@ -7478,11 +7622,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
                 "relay session signing secret path must not be empty".to_string(),
             ));
         }
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "relay session signing secret path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "relay session signing secret")?;
     }
     if let Some(path) = config.relay_session_signing_secret_passphrase_path.as_ref() {
         if path.as_os_str().is_empty() {
@@ -7490,11 +7630,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
                 "relay session signing secret passphrase path must not be empty".to_string(),
             ));
         }
-        if !path.is_absolute() {
-            return Err(DaemonError::InvalidConfig(
-                "relay session signing secret passphrase path must be absolute".to_string(),
-            ));
-        }
+        validate_runtime_file_path(path, "relay session signing secret passphrase")?;
     }
     if config.relay_session_signing_secret_path.is_some()
         && config
@@ -7533,32 +7669,16 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         .requires_runtime_wireguard_key_material()
     {
         if let Some(path) = config.wg_private_key_path.as_ref() {
-            if !path.is_absolute() {
-                return Err(DaemonError::InvalidConfig(
-                    "wg private key path must be absolute".to_string(),
-                ));
-            }
+            validate_runtime_file_path(path, "wg private key")?;
         }
         if let Some(path) = config.wg_encrypted_private_key_path.as_ref() {
-            if !path.is_absolute() {
-                return Err(DaemonError::InvalidConfig(
-                    "wg encrypted private key path must be absolute".to_string(),
-                ));
-            }
+            validate_runtime_file_path(path, "wg encrypted private key")?;
         }
         if let Some(path) = config.wg_key_passphrase_path.as_ref() {
-            if !path.is_absolute() {
-                return Err(DaemonError::InvalidConfig(
-                    "wg key passphrase path must be absolute".to_string(),
-                ));
-            }
+            validate_runtime_file_path(path, "wg key passphrase")?;
         }
         if let Some(path) = config.wg_public_key_path.as_ref() {
-            if !path.is_absolute() {
-                return Err(DaemonError::InvalidConfig(
-                    "wg public key path must be absolute".to_string(),
-                ));
-            }
+            validate_runtime_file_path(path, "wg public key")?;
         }
         if config.wg_encrypted_private_key_path.is_some() && config.wg_key_passphrase_path.is_none()
         {
@@ -7605,6 +7725,8 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
                 .to_string(),
         ));
     }
+
+    validate_backend_supported_on_current_host(config.backend_mode)?;
 
     Ok(())
 }
@@ -10651,6 +10773,7 @@ fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonErro
     validate_file_security(path, "trust verifier key", 0o022, true)
 }
 
+#[cfg(not(windows))]
 fn validate_file_security(
     path: &Path,
     label: &str,
@@ -10699,6 +10822,38 @@ fn validate_file_security(
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_file_security(
+    path: &Path,
+    label: &str,
+    _disallowed_mode_mask: u32,
+    _allow_root_owner: bool,
+) -> Result<(), DaemonError> {
+    validate_windows_runtime_file_path(path, label).map_err(DaemonError::InvalidConfig)?;
+    let link_metadata = fs::symlink_metadata(path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("{label} metadata read failed: {err}"))
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} must not be a symlink"
+        )));
+    }
+    if !link_metadata.file_type().is_file() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} must be a regular file"
+        )));
+    }
+    fs::File::open(path).map_err(|err| {
+        DaemonError::InvalidConfig(format!(
+            "{label} is not readable by the current service identity: {err}"
+        ))
+    })?;
+    Err(DaemonError::InvalidConfig(format!(
+        "{label} Windows ACL validation is not yet implemented; refusing to treat filesystem presence as a secure authorization check"
+    )))
+}
+
+#[cfg(not(windows))]
 fn validate_parent_directory_security(
     path: &Path,
     label: &str,
@@ -10748,6 +10903,36 @@ fn validate_parent_directory_security(
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_parent_directory_security(
+    path: &Path,
+    label: &str,
+    _allow_root_owner: bool,
+) -> Result<(), DaemonError> {
+    let parent = path.parent().ok_or_else(|| {
+        DaemonError::InvalidConfig(format!(
+            "{label} path must include a parent directory: {}",
+            path.display()
+        ))
+    })?;
+    validate_windows_runtime_file_path(parent, label).map_err(DaemonError::InvalidConfig)?;
+    let metadata = fs::symlink_metadata(parent).map_err(|err| {
+        DaemonError::InvalidConfig(format!(
+            "{label} parent directory metadata read failed for {}: {err}",
+            parent.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{label} parent directory must be a non-symlink directory: {}",
+            parent.display()
+        )));
+    }
+    Err(DaemonError::InvalidConfig(format!(
+        "{label} parent directory ACL validation is not yet implemented for Windows runtime paths"
+    )))
+}
+
 #[cfg(target_os = "linux")]
 fn is_root_managed_shared_runtime_parent(
     parent: &Path,
@@ -10773,6 +10958,7 @@ fn is_root_managed_shared_runtime_parent(
     false
 }
 
+#[cfg(not(windows))]
 fn read_command_envelope(stream: &UnixStream) -> Result<CommandEnvelope, String> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -10781,22 +10967,26 @@ fn read_command_envelope(stream: &UnixStream) -> Result<CommandEnvelope, String>
     ipc_read_command_envelope(reader).map_err(|e| e.to_string())
 }
 
+#[cfg(not(windows))]
 fn write_response(mut stream: UnixStream, response: IpcResponse) -> Result<(), String> {
     stream
         .write_all(format!("{}\n", response.to_wire()).as_bytes())
         .map_err(|err| format!("write failed: {err}"))
 }
 
+#[cfg(not(windows))]
 fn socket_owner_uid(path: &Path) -> Result<u32, DaemonError> {
     let metadata = fs::metadata(path).map_err(|err| DaemonError::Io(err.to_string()))?;
     Ok(metadata.uid())
 }
 
+#[cfg(not(windows))]
 fn socket_owner_gid(path: &Path) -> Result<u32, DaemonError> {
     let metadata = fs::metadata(path).map_err(|err| DaemonError::Io(err.to_string()))?;
     Ok(metadata.gid())
 }
 
+#[cfg(not(windows))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -10822,6 +11012,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     None
 }
 
+#[cfg(not(windows))]
 fn peer_gid(_stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -10865,7 +11056,7 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
     directory
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
@@ -13044,6 +13235,21 @@ mod tests {
         assert!(message.contains("macos-wireguard-userspace-shared backend is not implemented"));
         assert!(message.contains("backend-owned Rust userspace WireGuard engine"));
         assert!(message.contains("authoritative peer UDP socket"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_daemon_config_rejects_windows_explicit_unsupported_backend_on_non_windows_hosts() {
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsUnsupported,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("windows-unsupported backend must fail closed on non-windows hosts");
+        assert!(
+            err.to_string()
+                .contains("backend 'windows-unsupported' is only valid on Windows daemon hosts")
+        );
     }
 
     #[test]

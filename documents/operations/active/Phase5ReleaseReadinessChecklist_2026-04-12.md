@@ -53,6 +53,12 @@ Objective: make the critical release gates reproducible, keep the operator secur
 - The top-level release gate now validates the current `phase5_gate_report.json` before it can claim success.
 - The operator docs state the live-lab trust and credential posture explicitly.
 - The final readiness summary and bundle exist.
+- Windows remains outside the fresh-install/release-gate OS set.
+- The latest Windows VM-lab validation on 2026-04-15 did not produce
+  fresh-install evidence for current `HEAD`; the Mac + UTM guest path still
+  fails at `UTM Windows capture output was missing rc marker`.
 - The repo is still not release-ready because:
   - fresh-install evidence is not yet regenerated for a clean current commit
   - canonical cross-network evidence is not yet regenerated for a clean current commit
+  - the current release-gate path also stops on workspace test failures in this
+    environment before any Windows evidence question can change gate posture

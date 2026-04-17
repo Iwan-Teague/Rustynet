@@ -5,13 +5,22 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(not(windows))]
+use std::os::unix::net::{UnixListener, UnixStream};
+
+#[cfg(windows)]
+use crate::windows_ipc::{
+    DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH, WindowsLocalIpcRole, validate_windows_pipe_path,
+    windows_ipc_blocker_reason,
+};
+#[cfg(not(windows))]
 use nix::sys::socket::getsockopt;
 #[cfg(any(
     target_os = "macos",
@@ -23,12 +32,16 @@ use nix::sys::socket::getsockopt;
 use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
+#[cfg(not(windows))]
 use nix::unistd::{Gid, Group, Uid, chown};
 use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
 };
 
+#[cfg(not(windows))]
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
+#[cfg(windows)]
+pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH;
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
 
 const HELPER_FRAME_MAGIC: [u8; 4] = *b"RNHF";
@@ -145,6 +158,11 @@ impl PrivilegedCommandClient {
         if socket_path.as_os_str().is_empty() {
             return Err("privileged helper socket path must not be empty".to_string());
         }
+        #[cfg(windows)]
+        {
+            validate_windows_pipe_path(&socket_path, WindowsLocalIpcRole::PrivilegedHelper)?;
+        }
+        #[cfg(not(windows))]
         if !socket_path.is_absolute() {
             return Err("privileged helper socket path must be absolute".to_string());
         }
@@ -160,42 +178,56 @@ impl PrivilegedCommandClient {
         args: &[&str],
     ) -> Result<PrivilegedCommandOutput, String> {
         validate_request(program, args)?;
-        validate_privileged_helper_socket_security(&self.socket_path)?;
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
-            format!(
-                "privileged helper connect failed ({}): {err}",
-                self.socket_path.display()
-            )
-        })?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|err| format!("privileged helper read-timeout failed: {err}"))?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(|err| format!("privileged helper write-timeout failed: {err}"))?;
-
-        let request = HelperRequest {
-            program: program.as_str().to_string(),
-            args: args
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>(),
-        };
-        write_request_frame(&mut stream, &request)?;
-        let response = read_response_frame(&mut stream)?;
-        if !response.ok {
-            return Err(response
-                .error
-                .unwrap_or_else(|| "privileged helper reported an unknown failure".to_string()));
+        #[cfg(windows)]
+        {
+            validate_windows_pipe_path(&self.socket_path, WindowsLocalIpcRole::PrivilegedHelper)?;
+            let _ = program;
+            let _ = args;
+            let _ = self.timeout;
+            return Err(windows_ipc_blocker_reason(
+                WindowsLocalIpcRole::PrivilegedHelper,
+            ));
         }
-        Ok(PrivilegedCommandOutput {
-            status: response.status.unwrap_or(-1),
-            stdout: response.stdout.unwrap_or_default(),
-            stderr: response.stderr.unwrap_or_default(),
-        })
+        #[cfg(not(windows))]
+        {
+            validate_privileged_helper_socket_security(&self.socket_path)?;
+            let mut stream = UnixStream::connect(&self.socket_path).map_err(|err| {
+                format!(
+                    "privileged helper connect failed ({}): {err}",
+                    self.socket_path.display()
+                )
+            })?;
+            stream
+                .set_read_timeout(Some(self.timeout))
+                .map_err(|err| format!("privileged helper read-timeout failed: {err}"))?;
+            stream
+                .set_write_timeout(Some(self.timeout))
+                .map_err(|err| format!("privileged helper write-timeout failed: {err}"))?;
+
+            let request = HelperRequest {
+                program: program.as_str().to_string(),
+                args: args
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>(),
+            };
+            write_request_frame(&mut stream, &request)?;
+            let response = read_response_frame(&mut stream)?;
+            if !response.ok {
+                return Err(response.error.unwrap_or_else(|| {
+                    "privileged helper reported an unknown failure".to_string()
+                }));
+            }
+            Ok(PrivilegedCommandOutput {
+                status: response.status.unwrap_or(-1),
+                stdout: response.stdout.unwrap_or_default(),
+                stderr: response.stderr.unwrap_or_default(),
+            })
+        }
     }
 }
 
+#[cfg(not(windows))]
 fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
     if !path.starts_with("/run/rustynet") {
         return None;
@@ -206,6 +238,7 @@ fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
         .map(|group| group.gid.as_raw())
 }
 
+#[cfg(not(windows))]
 fn validate_privileged_helper_socket_security(path: &Path) -> Result<(), String> {
     let expected_uid = Uid::effective().as_raw();
     let allowed_owner_uids = [expected_uid, 0];
@@ -249,110 +282,128 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
     if config.socket_path.as_os_str().is_empty() {
         return Err("privileged helper socket path must not be empty".to_string());
     }
+    #[cfg(windows)]
+    {
+        validate_windows_pipe_path(&config.socket_path, WindowsLocalIpcRole::PrivilegedHelper)?;
+        let _ = config.allowed_uid;
+        let _ = config.allowed_gid;
+        let _ = config.io_timeout;
+        return Err(windows_ipc_blocker_reason(
+            WindowsLocalIpcRole::PrivilegedHelper,
+        ));
+    }
+    #[cfg(not(windows))]
     if !config.socket_path.is_absolute() {
         return Err("privileged helper socket path must be absolute".to_string());
     }
 
-    if let Some(parent) = config.socket_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "create privileged helper socket parent {} failed: {err}",
-                parent.display()
-            )
-        })?;
-        if let Some(gid) = config.allowed_gid {
-            chown(parent, None, Some(Gid::from_raw(gid))).map_err(|err| {
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = config.socket_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
                 format!(
-                    "set privileged helper socket parent group {} failed: {err}",
+                    "create privileged helper socket parent {} failed: {err}",
                     parent.display()
                 )
             })?;
+            if let Some(gid) = config.allowed_gid {
+                chown(parent, None, Some(Gid::from_raw(gid))).map_err(|err| {
+                    format!(
+                        "set privileged helper socket parent group {} failed: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let parent_mode = if config.allowed_gid.is_some() {
+                0o770
+            } else {
+                0o700
+            };
+            fs::set_permissions(parent, fs::Permissions::from_mode(parent_mode)).map_err(
+                |err| {
+                    format!(
+                        "set privileged helper socket parent permissions {} failed: {err}",
+                        parent.display()
+                    )
+                },
+            )?;
         }
-        let parent_mode = if config.allowed_gid.is_some() {
-            0o770
-        } else {
-            0o700
-        };
-        fs::set_permissions(parent, fs::Permissions::from_mode(parent_mode)).map_err(|err| {
-            format!(
-                "set privileged helper socket parent permissions {} failed: {err}",
-                parent.display()
-            )
-        })?;
-    }
 
-    if config.socket_path.exists() {
-        let metadata = fs::symlink_metadata(&config.socket_path).map_err(|err| {
+        if config.socket_path.exists() {
+            let metadata = fs::symlink_metadata(&config.socket_path).map_err(|err| {
+                format!(
+                    "inspect existing privileged helper socket {} failed: {err}",
+                    config.socket_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err("privileged helper socket path must not be a symlink".to_string());
+            }
+            if !metadata.file_type().is_socket() {
+                return Err(format!(
+                    "privileged helper socket path exists but is not a socket: {}",
+                    config.socket_path.display()
+                ));
+            }
+            fs::remove_file(&config.socket_path).map_err(|err| {
+                format!(
+                    "remove existing privileged helper socket {} failed: {err}",
+                    config.socket_path.display()
+                )
+            })?;
+        }
+
+        let listener = UnixListener::bind(&config.socket_path).map_err(|err| {
             format!(
-                "inspect existing privileged helper socket {} failed: {err}",
+                "bind privileged helper socket {} failed: {err}",
                 config.socket_path.display()
             )
         })?;
-        if metadata.file_type().is_symlink() {
-            return Err("privileged helper socket path must not be a symlink".to_string());
-        }
-        if !metadata.file_type().is_socket() {
-            return Err(format!(
-                "privileged helper socket path exists but is not a socket: {}",
-                config.socket_path.display()
-            ));
-        }
-        fs::remove_file(&config.socket_path).map_err(|err| {
-            format!(
-                "remove existing privileged helper socket {} failed: {err}",
-                config.socket_path.display()
-            )
-        })?;
-    }
-
-    let listener = UnixListener::bind(&config.socket_path).map_err(|err| {
-        format!(
-            "bind privileged helper socket {} failed: {err}",
-            config.socket_path.display()
-        )
-    })?;
-    fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o660)).map_err(|err| {
-        format!(
-            "set privileged helper socket permissions {} failed: {err}",
-            config.socket_path.display()
-        )
-    })?;
-    if let Some(gid) = config.allowed_gid {
-        chown(&config.socket_path, None, Some(Gid::from_raw(gid))).map_err(|err| {
-            format!(
-                "set privileged helper socket group {} failed: {err}",
-                config.socket_path.display()
-            )
-        })?;
-    }
-
-    loop {
-        let (mut stream, _) = listener
-            .accept()
-            .map_err(|err| format!("accept privileged helper connection failed: {err}"))?;
-        stream
-            .set_read_timeout(Some(config.io_timeout))
-            .map_err(|err| format!("set privileged helper read-timeout failed: {err}"))?;
-        stream
-            .set_write_timeout(Some(config.io_timeout))
-            .map_err(|err| format!("set privileged helper write-timeout failed: {err}"))?;
-
-        let authorized = peer_uid(&stream)
-            .map(|uid| uid == config.allowed_uid || uid == 0)
-            .unwrap_or(false);
-        if !authorized {
-            let _ = write_response(
-                &mut stream,
-                HelperResponse::error("unauthorized privileged helper peer".to_string()),
-            );
-            continue;
+        fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o660)).map_err(
+            |err| {
+                format!(
+                    "set privileged helper socket permissions {} failed: {err}",
+                    config.socket_path.display()
+                )
+            },
+        )?;
+        if let Some(gid) = config.allowed_gid {
+            chown(&config.socket_path, None, Some(Gid::from_raw(gid))).map_err(|err| {
+                format!(
+                    "set privileged helper socket group {} failed: {err}",
+                    config.socket_path.display()
+                )
+            })?;
         }
 
-        let response = match read_request(&mut stream) {
-            Ok(request) => handle_request_with_timeout(request, config.io_timeout),
-            Err(err) => HelperResponse::error(err),
-        };
-        let _ = write_response(&mut stream, response);
+        loop {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|err| format!("accept privileged helper connection failed: {err}"))?;
+            stream
+                .set_read_timeout(Some(config.io_timeout))
+                .map_err(|err| format!("set privileged helper read-timeout failed: {err}"))?;
+            stream
+                .set_write_timeout(Some(config.io_timeout))
+                .map_err(|err| format!("set privileged helper write-timeout failed: {err}"))?;
+
+            let authorized = peer_uid(&stream)
+                .map(|uid| uid == config.allowed_uid || uid == 0)
+                .unwrap_or(false);
+            if !authorized {
+                let _ = write_response(
+                    &mut stream,
+                    HelperResponse::error("unauthorized privileged helper peer".to_string()),
+                );
+                continue;
+            }
+
+            let response = match read_request(&mut stream) {
+                Ok(request) => handle_request_with_timeout(request, config.io_timeout),
+                Err(err) => HelperResponse::error(err),
+            };
+            let _ = write_response(&mut stream, response);
+        }
     }
 }
 
@@ -393,17 +444,20 @@ impl HelperResponse {
     }
 }
 
+#[cfg(not(windows))]
 fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, String> {
     let request_bytes = read_frame(stream, HELPER_FRAME_TYPE_REQUEST)?;
     decode_helper_request(&request_bytes).map_err(|err| format!("request decode failed: {err}"))
 }
 
+#[cfg(not(windows))]
 fn write_response(stream: &mut UnixStream, response: HelperResponse) -> Result<(), String> {
     let response_bytes = encode_helper_response(&response)
         .map_err(|err| format!("encode response failed: {err}"))?;
     write_frame(stream, HELPER_FRAME_TYPE_RESPONSE, &response_bytes)
 }
 
+#[cfg(not(windows))]
 fn write_request_frame(stream: &mut UnixStream, request: &HelperRequest) -> Result<(), String> {
     let request_bytes = encode_helper_request(request)
         .map_err(|err| format!("privileged helper request encode failed: {err}"))?;
@@ -411,6 +465,7 @@ fn write_request_frame(stream: &mut UnixStream, request: &HelperRequest) -> Resu
         .map_err(|err| format!("privileged helper request write failed: {err}"))
 }
 
+#[cfg(not(windows))]
 fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String> {
     let response_bytes = read_frame(stream, HELPER_FRAME_TYPE_RESPONSE)
         .map_err(|err| format!("privileged helper response read failed: {err}"))?;
@@ -418,6 +473,7 @@ fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String
         .map_err(|err| format!("privileged helper response decode failed: {err}"))
 }
 
+#[cfg(not(windows))]
 fn write_frame(stream: &mut UnixStream, message_type: u8, payload: &[u8]) -> Result<(), String> {
     if payload.is_empty() {
         return Err("frame payload must not be empty".to_string());
@@ -446,6 +502,7 @@ fn write_frame(stream: &mut UnixStream, message_type: u8, payload: &[u8]) -> Res
         .map_err(|err| format!("shutdown frame writer failed: {err}"))
 }
 
+#[cfg(not(windows))]
 fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<u8>, String> {
     let mut header = [0u8; HELPER_FRAME_HEADER_BYTES];
     stream
@@ -741,6 +798,7 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
     }
 }
 
+#[cfg(not(windows))]
 fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!(
@@ -779,6 +837,14 @@ fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBu
         ));
     }
     Ok(canonical)
+}
+
+#[cfg(windows)]
+fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let _ = path;
+    Err(format!(
+        "{label} privileged helper binary validation is Unix-only; Windows helper execution remains blocked until reviewed named-pipe IPC and backend support are implemented"
+    ))
 }
 
 fn run_privileged_subprocess(
@@ -1515,6 +1581,7 @@ fn validate_kill_args(args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[cfg(not(windows))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -1546,7 +1613,7 @@ impl fmt::Display for PrivilegedCommandProgram {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::io::Write;
     use std::net::Shutdown;

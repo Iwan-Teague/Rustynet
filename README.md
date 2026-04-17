@@ -151,15 +151,18 @@ of the flow:
 
 Current VM-lab Windows truth on this branch:
 
-- Windows UTM guests are `bootstrap-capable/scaffolded only` in the current
+- Windows UTM guests are `runtime-host-capable only` in the current
   `ops vm-lab-*` surface.
 - Windows-safe helper surfaces currently include `vm-lab-discover-local-utm`,
   `vm-lab-start`, `vm-lab-restart`, `vm-lab-sync-repo`, the PowerShell-first
   access bootstrap under
   `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`, diagnostics via
-  `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`, and
-  partial `vm-lab-bootstrap-phase` coverage for `sync-source` and
-  `build-release`.
+  `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`, the
+  direct SCM host-surface smoke helper
+  `scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1`, and Windows
+  `vm-lab-bootstrap-phase` entrypoints for `sync-source`, `build-release`,
+  `smoke-service-host`, `install-release`, `restart-runtime`, `verify-runtime`,
+  and `all`.
 - Mixed Linux/Windows inventories dispatch bootstrap helpers by target platform;
   Windows targets are not sent into the Linux `live_linux_*` stage scripts.
 - The live-lab wrapper family `vm-lab-validate-live-lab-profile`,
@@ -168,11 +171,14 @@ Current VM-lab Windows truth on this branch:
   `vm-lab-run-suite`, and `vm-lab-diagnose-live-lab-failure` remains
   Linux-runtime only and fails closed on missing or incompatible target
   metadata.
-- On the current branch, `build-release` is still conditional on verified
-  Windows/MSVC tooling being present. `install-release` is a protective service
-  install stub, and `restart-runtime`, `verify-runtime`, and `all` must not be
-  treated as runtime-capable proof until `rustynetd` exposes a real Windows
-  service/config host path with dedicated tests.
+- On the current branch, `rustynetd` exposes a reviewed Windows
+  `--windows-service --env-file` host path and the only reviewed Windows
+  backend label is `windows-unsupported`. `build-release` is still conditional
+  on verified Windows/MSVC tooling being present, and the Windows
+  install/restart/verify entrypoints must not be treated as dataplane-capable
+  or release-gated proof. The latest Mac + UTM validation is still blocked at
+  the local Windows guest exec/output boundary, so there is no fresh
+  Windows runtime evidence for current `HEAD`.
 - Windows is not `release-gated and evidenced` on the current branch. The
   required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
   Mint, and macOS until measured Windows evidence exists.

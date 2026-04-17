@@ -13,3 +13,7 @@ pub mod relay_client;
 pub mod resilience;
 pub mod stun_client;
 pub mod traversal;
+pub mod windows_backend_gate;
+pub mod windows_ipc;
+pub mod windows_paths;
+pub mod windows_service;

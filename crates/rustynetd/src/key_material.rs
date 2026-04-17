@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use crate::windows_paths::validate_windows_runtime_file_path;
 #[cfg(unix)]
 use nix::unistd::Uid;
 #[cfg(unix)]
@@ -281,10 +283,32 @@ fn validate_secret_file_security(
     }
     #[cfg(not(unix))]
     {
-        let metadata =
-            fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
-        if !metadata.is_file() {
-            return Err(format!("{label} must be a regular file"));
+        #[cfg(windows)]
+        {
+            validate_windows_runtime_file_path(path, label)?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|err| format!("{label} metadata read failed: {err}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("{label} must not be a symlink"));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(format!("{label} must be a regular file"));
+            }
+            fs::File::open(path).map_err(|err| {
+                format!("{label} is not readable by the current service identity: {err}")
+            })?;
+            return Err(format!(
+                "{label} Windows ACL validation is not yet implemented; refusing to accept filesystem presence as a secure secret-custody check"
+            ));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let metadata =
+                fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
+            if !metadata.is_file() {
+                return Err(format!("{label} must be a regular file"));
+            }
         }
     }
     Ok(())

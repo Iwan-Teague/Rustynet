@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SocketSecurityFacts {
@@ -14,6 +16,7 @@ struct SocketSecurityFacts {
     parent_gid: u32,
 }
 
+#[cfg(unix)]
 fn validate_socket_basics(path: &Path, label: &str) -> Result<fs::Metadata, String> {
     if !path.is_absolute() {
         return Err(format!("{label} path must be absolute: {}", path.display()));
@@ -29,6 +32,7 @@ fn validate_socket_basics(path: &Path, label: &str) -> Result<fs::Metadata, Stri
     Ok(metadata)
 }
 
+#[cfg(unix)]
 fn validate_parent_basics(path: &Path, label: &str) -> Result<fs::Metadata, String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
@@ -55,6 +59,7 @@ fn owner_allowed(owner_uid: u32, allowed_owner_uids: &[u32]) -> bool {
     allowed_owner_uids.contains(&owner_uid)
 }
 
+#[cfg(unix)]
 fn inspect_socket_security_facts(path: &Path, label: &str) -> Result<SocketSecurityFacts, String> {
     let socket = validate_socket_basics(path, label)?;
     let parent = validate_parent_basics(path, label)?;
@@ -111,14 +116,31 @@ pub fn validate_owner_only_socket(
     allowed_socket_owner_uids: &[u32],
     allowed_parent_owner_uids: &[u32],
 ) -> Result<(), String> {
-    let facts = inspect_socket_security_facts(path, label)?;
-    validate_owner_only_socket_facts(
-        path,
-        label,
-        facts,
-        allowed_socket_owner_uids,
-        allowed_parent_owner_uids,
-    )
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            path,
+            label,
+            allowed_socket_owner_uids,
+            allowed_parent_owner_uids,
+        );
+        return Err(
+            "owner-only socket validation is available only on Unix sockets; Windows must use named-pipe IPC validation"
+                .to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let facts = inspect_socket_security_facts(path, label)?;
+        validate_owner_only_socket_facts(
+            path,
+            label,
+            facts,
+            allowed_socket_owner_uids,
+            allowed_parent_owner_uids,
+        )
+    }
 }
 
 fn validate_root_managed_shared_runtime_socket_facts(
@@ -190,18 +212,36 @@ pub fn validate_root_managed_shared_runtime_socket(
     allowed_parent_owner_uids: &[u32],
     expected_gid: u32,
 ) -> Result<(), String> {
-    let facts = inspect_socket_security_facts(path, label)?;
-    validate_root_managed_shared_runtime_socket_facts(
-        path,
-        label,
-        facts,
-        allowed_socket_owner_uids,
-        allowed_parent_owner_uids,
-        expected_gid,
-    )
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            path,
+            label,
+            allowed_socket_owner_uids,
+            allowed_parent_owner_uids,
+            expected_gid,
+        );
+        return Err(
+            "root-managed shared runtime socket validation is available only on Unix sockets; Windows must use named-pipe IPC validation"
+                .to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let facts = inspect_socket_security_facts(path, label)?;
+        validate_root_managed_shared_runtime_socket_facts(
+            path,
+            label,
+            facts,
+            allowed_socket_owner_uids,
+            allowed_parent_owner_uids,
+            expected_gid,
+        )
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         SocketSecurityFacts, validate_owner_only_socket, validate_owner_only_socket_facts,

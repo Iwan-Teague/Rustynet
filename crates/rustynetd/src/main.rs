@@ -26,6 +26,13 @@ use rustynetd::key_material::{
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
+use rustynetd::windows_backend_gate::{
+    WINDOWS_UNSUPPORTED_BACKEND_LABEL, parse_windows_backend_mode,
+};
+use rustynetd::windows_service::{
+    HostEntrySelection, run_windows_service_host, select_host_entry, windows_service_help_line,
+    windows_service_help_note,
+};
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 
@@ -46,20 +53,23 @@ fn run() -> Result<(), String> {
         return Err(help_text());
     }
 
-    match args.as_slice() {
-        [flag, output_path] if flag == "--emit-phase1-baseline" => {
-            perf::write_phase1_baseline_report(output_path)?;
-            println!("phase1 baseline report emitted: {output_path}");
-            Ok(())
-        }
-        [cmd, rest @ ..] if cmd == "daemon" => {
-            let config = parse_daemon_config(rest)?;
-            run_daemon(config).map_err(|err| err.to_string())
-        }
-        [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
-        [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
-        [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
-        _ => Err(help_text()),
+    match select_host_entry(&args)? {
+        HostEntrySelection::WindowsService(options) => run_windows_service_host(options),
+        HostEntrySelection::Standard(selected_args) => match selected_args.as_slice() {
+            [flag, output_path] if flag == "--emit-phase1-baseline" => {
+                perf::write_phase1_baseline_report(output_path)?;
+                println!("phase1 baseline report emitted: {output_path}");
+                Ok(())
+            }
+            [cmd, rest @ ..] if cmd == "daemon" => {
+                let config = parse_daemon_config(rest)?;
+                run_daemon(config).map_err(|err| err.to_string())
+            }
+            [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
+            [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
+            [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
+            _ => Err(help_text()),
+        },
     }
 }
 
@@ -656,8 +666,14 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     "macos-wireguard-userspace-shared" => {
                         DaemonBackendMode::MacosWireguardUserspaceShared
                     }
+                    WINDOWS_UNSUPPORTED_BACKEND_LABEL => {
+                        parse_windows_backend_mode(value.as_str())?;
+                        DaemonBackendMode::WindowsUnsupported
+                    }
                     _ => {
-                        return Err("invalid backend value: expected linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or macos-wireguard-userspace-shared".to_string());
+                        return Err(format!(
+                            "invalid backend value: expected linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, macos-wireguard-userspace-shared, or {WINDOWS_UNSUPPORTED_BACKEND_LABEL}"
+                        ));
                     }
                 };
                 index += 2;
@@ -1211,7 +1227,8 @@ fn read_hostname_short() -> String {
 fn help_text() -> String {
     [
         "rustynetd usage:",
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        windows_service_help_line(),
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -1286,19 +1303,50 @@ fn help_text() -> String {
         &format!("  max_reconcile_failures={DEFAULT_MAX_RECONCILE_FAILURES}"),
         &format!("  fail_closed_ssh_allow={DEFAULT_FAIL_CLOSED_SSH_ALLOW}"),
         "  fail_closed_ssh_allow_cidrs=<empty>",
+        windows_service_help_note(),
     ]
     .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_daemon_config;
+    use super::{help_text, parse_daemon_config};
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
         DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
         DEFAULT_DNS_ZONE_WATERMARK_PATH, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DaemonBackendMode,
     };
     use rustynetd::phase10::ManagementCidr;
+    use rustynetd::windows_service::{
+        HostEntrySelection, WindowsServiceOptions, select_host_entry,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn help_text_advertises_windows_service_host_flags() {
+        let help = help_text();
+        assert!(help.contains("--windows-service"));
+        assert!(help.contains("--env-file"));
+        assert!(help.contains("RUSTYNETD_DAEMON_ARGS_JSON"));
+        assert!(help.contains("windows-unsupported"));
+    }
+
+    #[test]
+    fn select_host_entry_routes_windows_service_mode_before_daemon_dispatch() {
+        let selection = select_host_entry(&[
+            "--windows-service".to_string(),
+            "--env-file".to_string(),
+            "/tmp/rustynetd.env".to_string(),
+        ])
+        .expect("windows service entry should parse");
+        assert_eq!(
+            selection,
+            HostEntrySelection::WindowsService(WindowsServiceOptions {
+                service_name: "RustyNet".to_string(),
+                env_file: PathBuf::from("/tmp/rustynetd.env"),
+            })
+        );
+    }
 
     #[test]
     fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_value_is_omitted() {
@@ -1503,6 +1551,22 @@ mod tests {
             macos.backend_mode,
             DaemonBackendMode::MacosWireguardUserspaceShared
         );
+    }
+
+    #[test]
+    fn parse_daemon_config_accepts_windows_explicit_unsupported_backend_value() {
+        let windows =
+            parse_daemon_config(&["--backend".to_string(), "windows-unsupported".to_string()])
+                .expect("windows explicit unsupported backend should parse");
+        assert_eq!(windows.backend_mode, DaemonBackendMode::WindowsUnsupported);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_unknown_windows_backend_value() {
+        let err =
+            parse_daemon_config(&["--backend".to_string(), "windows-wireguard-nt".to_string()])
+                .expect_err("unknown windows backend should fail");
+        assert!(err.contains("windows-unsupported"));
     }
 
     #[test]
