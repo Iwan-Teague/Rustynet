@@ -5,8 +5,8 @@ use rustynet_backend_api::{
     SocketEndpoint, TunnelBackend,
 };
 use rustynet_backend_wireguard::{
-    LinuxUserspaceSharedBackend, LinuxWireguardBackend, MacosWireguardBackend, WireguardBackend,
-    WireguardCommandOutput, WireguardCommandRunner,
+    LinuxUserspaceSharedBackend, LinuxWireguardBackend, MacosWireguardBackend,
+    WindowsWireguardBackend, WireguardBackend, WireguardCommandOutput, WireguardCommandRunner,
 };
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
@@ -36,7 +36,7 @@ fn sample_peer(name: &str) -> PeerConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct StubRunner;
 
 impl WireguardCommandRunner for StubRunner {
@@ -242,6 +242,28 @@ fn command_only_macos_backend_blocker_remains_unchanged() {
         backend.transport_socket_identity_blocker(),
         Some(
             "macos wireguard backend is a command-only adapter over wireguard-go and its OS-managed UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string()
+        )
+    );
+}
+
+#[test]
+fn command_only_windows_backend_blocker_remains_explicit() {
+    let backend = WindowsWireguardBackend::new(
+        StubRunner,
+        "rustynet0",
+        "/tmp/rustynet0.conf.dpapi",
+        "/tmp/wg.key",
+        "/tmp/wireguard.exe",
+        "/tmp/wg.exe",
+        "/tmp/netsh.exe",
+        51820,
+    )
+    .expect("windows backend should construct");
+
+    assert_eq!(
+        backend.transport_socket_identity_blocker(),
+        Some(
+            "windows wireguard backend is a command-only adapter over the official WireGuard for Windows tunnel service and its OS-managed WireGuardNT UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string()
         )
     );
 }

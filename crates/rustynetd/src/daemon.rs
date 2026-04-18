@@ -62,12 +62,12 @@ use crate::traversal::{
     TraversalEngineConfig, VerifiedTraversalIndex, VerifiedTraversalRecord,
 };
 use crate::windows_backend_gate::{
-    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WindowsBackendMode, require_supported_windows_backend,
+    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL, WindowsBackendMode,
+    require_supported_windows_backend,
 };
 #[cfg(windows)]
 use crate::windows_ipc::{
     DEFAULT_WINDOWS_DAEMON_PIPE_PATH, WindowsLocalIpcRole, validate_windows_pipe_path,
-    windows_ipc_blocker_reason,
 };
 #[cfg(windows)]
 use crate::windows_paths::{
@@ -81,7 +81,8 @@ use crate::windows_paths::{
     DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH, DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH,
     DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
     DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, validate_windows_runtime_file_path,
+    DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, default_windows_tunnel_service_config_path,
+    validate_windows_runtime_acl, validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(target_os = "linux")]
@@ -112,7 +113,12 @@ use rustynet_backend_wireguard::MacosWireguardBackend;
 #[cfg(test)]
 use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperation;
 use rustynet_backend_wireguard::WireguardBackend;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(windows)]
+use rustynet_backend_wireguard::{
+    DEFAULT_WINDOWS_NETSH_EXE_PATH, DEFAULT_WINDOWS_WG_EXE_PATH,
+    DEFAULT_WINDOWS_WIREGUARD_EXE_PATH, WindowsWireguardBackend,
+};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
@@ -750,6 +756,7 @@ pub enum DaemonBackendMode {
     LinuxWireguardUserspaceShared,
     MacosWireguard,
     MacosWireguardUserspaceShared,
+    WindowsWireguardNt,
     WindowsUnsupported,
 }
 
@@ -781,6 +788,7 @@ impl DaemonBackendMode {
             DaemonBackendMode::LinuxWireguardUserspaceShared => "linux-wireguard-userspace-shared",
             DaemonBackendMode::MacosWireguard => "macos-wireguard",
             DaemonBackendMode::MacosWireguardUserspaceShared => "macos-wireguard-userspace-shared",
+            DaemonBackendMode::WindowsWireguardNt => WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
             DaemonBackendMode::WindowsUnsupported => WINDOWS_UNSUPPORTED_BACKEND_LABEL,
         }
     }
@@ -800,6 +808,7 @@ impl DaemonBackendMode {
             DaemonBackendMode::LinuxWireguard
                 | DaemonBackendMode::LinuxWireguardUserspaceShared
                 | DaemonBackendMode::MacosWireguard
+                | DaemonBackendMode::WindowsWireguardNt
         )
     }
 }
@@ -855,9 +864,12 @@ fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonErro
 fn validate_backend_supported_on_current_host(
     backend_mode: DaemonBackendMode,
 ) -> Result<(), DaemonError> {
-    if matches!(backend_mode, DaemonBackendMode::WindowsUnsupported) {
+    if matches!(
+        backend_mode,
+        DaemonBackendMode::WindowsUnsupported | DaemonBackendMode::WindowsWireguardNt
+    ) {
         return Err(DaemonError::InvalidConfig(format!(
-            "backend '{}' is only valid on Windows daemon hosts and remains fail-closed because no reviewed Windows dataplane/backend exists on the current branch",
+            "backend '{}' is only valid on Windows daemon hosts and remains outside non-Windows daemon support",
             backend_mode.as_str()
         )));
     }
@@ -871,6 +883,10 @@ fn validate_backend_supported_on_current_host(
     match backend_mode {
         DaemonBackendMode::WindowsUnsupported => {
             require_supported_windows_backend(WindowsBackendMode::Unsupported)
+                .map_err(DaemonError::InvalidConfig)
+        }
+        DaemonBackendMode::WindowsWireguardNt => {
+            require_supported_windows_backend(WindowsBackendMode::WireguardNt)
                 .map_err(DaemonError::InvalidConfig)
         }
         _ => Err(DaemonError::InvalidConfig(format!(
@@ -1853,6 +1869,8 @@ enum DaemonBackend {
     Linux(LinuxWireguardBackend<PrivilegedHelperWireguardRunner>),
     #[cfg(target_os = "macos")]
     Macos(MacosWireguardBackend<PrivilegedHelperWireguardRunner>),
+    #[cfg(windows)]
+    Windows(WindowsWireguardBackend<WindowsHostWireguardRunner>),
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1860,6 +1878,10 @@ enum DaemonBackend {
 struct PrivilegedHelperWireguardRunner {
     helper_client: PrivilegedCommandClient,
 }
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Default)]
+struct WindowsHostWireguardRunner;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PrivilegedHelperWireguardRunner {
@@ -1924,6 +1946,40 @@ impl WireguardCommandRunner for PrivilegedHelperWireguardRunner {
             "privileged helper {program} exited with status {}: {stderr}",
             output.status
         )))
+    }
+}
+
+#[cfg(windows)]
+impl WireguardCommandRunner for WindowsHostWireguardRunner {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+        let _ = self.run_capture(program, args)?;
+        Ok(())
+    }
+
+    fn run_capture(
+        &mut self,
+        program: &str,
+        args: &[String],
+    ) -> Result<WireguardCommandOutput, BackendError> {
+        let program_path = Path::new(program);
+        if !program_path.is_absolute() {
+            return Err(BackendError::invalid_input(
+                "windows backend command path must be absolute",
+            ));
+        }
+        let output = Command::new(program_path)
+            .args(args)
+            .output()
+            .map_err(|err| {
+                BackendError::internal(format!(
+                    "windows backend command spawn failed ({}): {err}",
+                    program_path.display()
+                ))
+            })?;
+        Ok(WireguardCommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
     }
 }
 
@@ -2082,6 +2138,39 @@ impl DaemonBackend {
                     .expect("macos shared backend blocker should exist")
                     .to_string(),
             )),
+            DaemonBackendMode::WindowsWireguardNt => {
+                #[cfg(windows)]
+                {
+                    let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
+                        DaemonError::InvalidConfig(
+                            "wg private key path is required for windows-wireguard-nt backend"
+                                .to_string(),
+                        )
+                    })?;
+                    validate_private_key_permissions(private_key)?;
+                    let config_path =
+                        default_windows_tunnel_service_config_path(config.wg_interface.as_str());
+                    validate_runtime_file_path(config_path.as_path(), "windows tunnel config")?;
+                    let backend = WindowsWireguardBackend::new(
+                        WindowsHostWireguardRunner,
+                        config.wg_interface.clone(),
+                        config_path.to_string_lossy().to_string(),
+                        private_key.to_string_lossy().to_string(),
+                        DEFAULT_WINDOWS_WIREGUARD_EXE_PATH,
+                        DEFAULT_WINDOWS_WG_EXE_PATH,
+                        DEFAULT_WINDOWS_NETSH_EXE_PATH,
+                        config.wg_listen_port,
+                    )
+                    .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                    Ok(Self::Windows(backend))
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "windows-wireguard-nt backend is only supported on Windows".to_string(),
+                    ))
+                }
+            }
             DaemonBackendMode::WindowsUnsupported => Err(DaemonError::InvalidConfig(
                 require_supported_windows_backend(WindowsBackendMode::Unsupported)
                     .expect_err("windows unsupported backend must fail closed"),
@@ -2099,6 +2188,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.name(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.name(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.name(),
         }
     }
 
@@ -2110,6 +2201,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.capabilities(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.capabilities(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.capabilities(),
         }
     }
 
@@ -5840,6 +5933,12 @@ impl DaemonRuntime {
                         .expect("macos shared backend blocker should exist")
                         .to_string());
                 }
+                DaemonBackendMode::WindowsWireguardNt => {
+                    return Err(
+                        "interface down is not supported for windows-wireguard-nt backend; use backend shutdown or Windows service stop"
+                            .to_string(),
+                    );
+                }
                 DaemonBackendMode::WindowsUnsupported => {
                     return Err(
                         require_supported_windows_backend(WindowsBackendMode::Unsupported)
@@ -5860,6 +5959,7 @@ impl DaemonRuntime {
                 DaemonBackendMode::MacosWireguardUserspaceShared => {
                     "macos-wireguard-userspace-shared blocked"
                 }
+                DaemonBackendMode::WindowsWireguardNt => "windows-wireguard-nt blocked",
                 DaemonBackendMode::WindowsUnsupported => "windows-unsupported blocked",
                 DaemonBackendMode::InMemory => "interface down",
             };
@@ -6926,7 +7026,24 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Macos(system))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        #[cfg(test)]
+        if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
+            return Ok(RuntimeSystem::DryRun(
+                crate::phase10::DryRunSystem::default(),
+            ));
+        }
+
+        let system = crate::phase10::WindowsCommandSystem::new(
+            config.wg_interface.clone(),
+            config.egress_interface.clone(),
+            config.dns_resolver_bind_addr,
+        )
+        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        Ok(RuntimeSystem::Windows(system))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
             #[cfg(test)]
@@ -6937,8 +7054,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             }
         }
         Err(DaemonError::InvalidConfig(
-            "daemon dataplane requires a linux or macos host with a supported wireguard backend"
-                .to_string(),
+            "daemon dataplane requires a supported host/runtime combination".to_string(),
         ))
     }
 }
@@ -6975,10 +7091,69 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
     #[cfg(windows)]
     {
-        drop(runtime);
-        return Err(DaemonError::InvalidConfig(windows_ipc_blocker_reason(
-            WindowsLocalIpcRole::DaemonControl,
-        )));
+        let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
+            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
+        dns_socket
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+
+        let mut processed = 0usize;
+        let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
+        let mut next_reconcile = Instant::now() + reconcile_interval;
+        let mut dns_buffer = [0u8; 1536];
+
+        loop {
+            let mut processed_io = false;
+            loop {
+                match dns_socket.recv_from(&mut dns_buffer) {
+                    Ok((length, peer_addr)) => {
+                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        {
+                            dns_socket.send_to(&response, peer_addr).map_err(|err| {
+                                DaemonError::Io(format!("dns resolver send failed: {err}"))
+                            })?;
+                        }
+                        processed = processed.saturating_add(1);
+                        processed_io = true;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => {
+                        return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if now >= next_reconcile {
+                runtime.reconcile();
+                next_reconcile = now + reconcile_interval;
+            }
+            let now_unix = unix_now();
+            runtime.poll_stun_results();
+            runtime.maybe_preexpiry_refresh_traversal(now_unix);
+            runtime.poll_endpoint_monitor_and_maybe_refresh();
+            runtime.maybe_trigger_endpoint_change_refresh();
+
+            if config
+                .max_requests
+                .map(|max| processed >= max.get())
+                .unwrap_or(false)
+            {
+                break;
+            }
+
+            if !processed_io {
+                let sleep_for = next_reconcile
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25));
+                if !sleep_for.is_zero() {
+                    sleep(sleep_for);
+                }
+            }
+        }
+
+        scrub_runtime_wireguard_key_after_bootstrap(&config)?;
+        return Ok(());
     }
 
     #[cfg(not(windows))]
@@ -7393,7 +7568,7 @@ fn prepare_runtime_wireguard_key_material(
     }
 
     let runtime_path = runtime_path.ok_or_else(|| {
-        "wg private key path is required for linux-wireguard or macos-wireguard backend".to_string()
+        "wg private key path is required for linux-wireguard, macos-wireguard, or windows-wireguard-nt backend".to_string()
     })?;
 
     if let Some(encrypted_path) = encrypted_private_key_path {
@@ -7699,10 +7874,11 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         DaemonBackendMode::LinuxWireguard
             | DaemonBackendMode::LinuxWireguardUserspaceShared
             | DaemonBackendMode::MacosWireguard
+            | DaemonBackendMode::WindowsWireguardNt
     ) && config.wg_private_key_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, or macos-wireguard backend"
+            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or windows-wireguard-nt backend"
                 .to_string(),
         ));
     }
@@ -10848,9 +11024,7 @@ fn validate_file_security(
             "{label} is not readable by the current service identity: {err}"
         ))
     })?;
-    Err(DaemonError::InvalidConfig(format!(
-        "{label} Windows ACL validation is not yet implemented; refusing to treat filesystem presence as a secure authorization check"
-    )))
+    validate_windows_runtime_acl(path, label).map_err(DaemonError::InvalidConfig)
 }
 
 #[cfg(not(windows))]
@@ -10928,9 +11102,7 @@ fn validate_parent_directory_security(
             parent.display()
         )));
     }
-    Err(DaemonError::InvalidConfig(format!(
-        "{label} parent directory ACL validation is not yet implemented for Windows runtime paths"
-    )))
+    validate_windows_runtime_acl(parent, label).map_err(DaemonError::InvalidConfig)
 }
 
 #[cfg(target_os = "linux")]
@@ -13249,6 +13421,21 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("backend 'windows-unsupported' is only valid on Windows daemon hosts")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_daemon_config_rejects_windows_wireguard_nt_backend_on_non_windows_hosts() {
+        let config = DaemonConfig {
+            backend_mode: DaemonBackendMode::WindowsWireguardNt,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("windows-wireguard-nt backend must fail closed on non-windows hosts");
+        assert!(
+            err.to_string()
+                .contains("backend 'windows-wireguard-nt' is only valid on Windows daemon hosts")
         );
     }
 

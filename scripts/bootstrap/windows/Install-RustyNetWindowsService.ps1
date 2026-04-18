@@ -84,6 +84,62 @@ function Get-ServiceRuntimeState {
     }
 }
 
+function Get-LocalizedAccountNameFromSid {
+    param([Parameter(Mandatory = $true)][string]$Sid)
+    return (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+}
+
+function Get-ServiceIdentityName {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    return ('NT SERVICE\' + $ServiceName)
+}
+
+function Invoke-Sc {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $output = (& sc.exe @Arguments 2>&1 | Out-String)
+    return [ordered]@{
+        exit_code = $LASTEXITCODE
+        output = $output.Trim()
+    }
+}
+
+function Ensure-ServiceSidTypeUnrestricted {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    $result = Invoke-Sc -Arguments @('sidtype', $ServiceName, 'unrestricted')
+    if ($result.exit_code -ne 0) {
+        throw "sc.exe sidtype failed: $($result.output)"
+    }
+}
+
+function Repair-RustyNetRuntimeAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AdministratorsName,
+        [Parameter(Mandatory = $true)][string]$LocalSystemName,
+        [Parameter(Mandatory = $true)][string]$ServiceIdentity,
+        [switch]$Directory
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    & icacls $Path /setowner $AdministratorsName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /setowner failed for $Path"
+    }
+    & icacls $Path /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /inheritance:r failed for $Path"
+    }
+
+    $serviceGrant = if ($Directory) { "$ServiceIdentity`:(OI)(CI)(M)" } else { "$ServiceIdentity`:M" }
+    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" $serviceGrant | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /grant:r failed for $Path"
+    }
+}
+
 function Build-ReviewedDaemonArgsJson {
     return (@('--backend', 'windows-unsupported') | ConvertTo-Json -Compress)
 }
@@ -105,6 +161,8 @@ Ensure-Directory -Path (Join-Path $StateRoot 'logs')
 Ensure-Directory -Path (Join-Path $StateRoot 'trust')
 Ensure-Directory -Path (Join-Path $StateRoot 'keys')
 Ensure-Directory -Path (Join-Path $StateRoot 'membership')
+Ensure-Directory -Path (Join-Path $StateRoot 'secrets')
+Ensure-Directory -Path (Join-Path $StateRoot 'secrets\key-custody')
 
 $daemonCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynetd.exe'
@@ -131,6 +189,8 @@ Write-ReviewedEnvFile -Path $configPath
 
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
 $serviceConfigError = ''
+$serviceSidConfigured = $false
+$runtimeAclApplied = $false
 $serviceStartAttempted = $false
 $startError = ''
 
@@ -157,6 +217,26 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
         if ($LASTEXITCODE -ne 0) {
             throw "sc.exe description failed: $descriptionOutput"
         }
+        Ensure-ServiceSidTypeUnrestricted -ServiceName $ServiceName
+        $serviceSidConfigured = $true
+
+        $administratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-544'
+        $localSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
+        $serviceIdentity = Get-ServiceIdentityName -ServiceName $ServiceName
+        foreach ($directoryPath in @(
+                $StateRoot,
+                (Join-Path $StateRoot 'config'),
+                (Join-Path $StateRoot 'logs'),
+                (Join-Path $StateRoot 'trust'),
+                (Join-Path $StateRoot 'keys'),
+                (Join-Path $StateRoot 'membership'),
+                (Join-Path $StateRoot 'secrets'),
+                (Join-Path $StateRoot 'secrets\key-custody')
+            )) {
+            Repair-RustyNetRuntimeAcl -Path $directoryPath -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity -Directory
+        }
+        Repair-RustyNetRuntimeAcl -Path $configPath -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity
+        $runtimeAclApplied = $true
     }
     catch {
         $serviceConfigError = $_.Exception.Message
@@ -189,6 +269,12 @@ $backendLabel = 'windows-unsupported'
 $notes = @()
 if ($serviceConfigError) {
     $notes += 'service-config-error'
+}
+if (-not $serviceSidConfigured) {
+    $notes += 'service-sid-not-configured'
+}
+if (-not $runtimeAclApplied) {
+    $notes += 'runtime-acl-not-applied'
 }
 if ($startError) {
     $notes += 'service-start-error'
@@ -235,6 +321,12 @@ elseif (-not (Test-PathPinnedToBinary -ImagePath $imagePath -BinaryPath $daemonD
 elseif (-not $serviceImagePathUsesWindowsService -or -not $serviceImagePathUsesEnvFile -or -not $serviceEnvFilePinned) {
     $reason = 'windows-service-host-path-not-reviewed'
 }
+elseif (-not $serviceSidConfigured) {
+    $reason = 'windows-service-sid-not-configured'
+}
+elseif (-not $runtimeAclApplied) {
+    $reason = 'windows-runtime-acl-not-applied'
+}
 elseif ($backendLabel -eq 'windows-unsupported') {
     $status = 'blocked'
     $reason = 'windows-runtime-backend-explicitly-unsupported'
@@ -266,6 +358,9 @@ $report = [ordered]@{
     config_present = Test-Path -LiteralPath $configPath
     log_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'logs')
     trust_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'trust')
+    secrets_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'secrets')
+    service_sid_configured = $serviceSidConfigured
+    runtime_acl_applied = $runtimeAclApplied
     service_present = $serviceRuntime.present
     service_status = $serviceRuntime.status
     service_state = $serviceRuntime.state

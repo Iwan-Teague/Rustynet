@@ -54,9 +54,21 @@ Objective: make the critical release gates reproducible, keep the operator secur
 - The operator docs state the live-lab trust and credential posture explicitly.
 - The final readiness summary and bundle exist.
 - Windows remains outside the fresh-install/release-gate OS set.
-- The latest Windows VM-lab validation on 2026-04-15 did not produce
-  fresh-install evidence for current `HEAD`; the Mac + UTM guest path still
-  fails at `UTM Windows capture output was missing rc marker`.
+- The latest measured Windows VM-lab attempt on 2026-04-17 still did not
+  produce fresh-install evidence for current `HEAD`.
+- Current measured truth:
+  - current `HEAD` resynced and rebuilt on the local Windows UTM guest
+  - `smoke-service-host` completed on that guest
+  - the guest was recovered back onto the shared subnet as `192.168.64.14`,
+    but discovery still reported `execution_ready=false` because the Windows
+    local-UTM callback/readiness probe timed out
+  - `install-release` failed closed on that same callback timeout before
+    install/runtime proof
+  - guest-side SSH state still remained absent:
+    `host_key_file_exists=True`, `sshd_service_count=0`,
+    `sshd_registry_present=False`, `ssh_listener_count=0`
+  - diagnostics collection on that blocked path still hit
+    `UTM Windows capture output was missing rc marker`
 - The repo is still not release-ready because:
   - fresh-install evidence is not yet regenerated for a clean current commit
   - canonical cross-network evidence is not yet regenerated for a clean current commit

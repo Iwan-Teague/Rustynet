@@ -46,6 +46,15 @@ These explain architecture, phase boundaries, and longer-running design work.
 - [MembershipConsensus.md](./MembershipConsensus.md)
 - [MembershipImplementationPlan.md](./MembershipImplementationPlan.md)
 
+## Mobile Planning Documents
+
+These hold future mobile-client architecture and roadmap material.
+
+- [mobile/README.md](./mobile/README.md)
+- [RustynetMobileArchitectureDesign_2026-04-17.md](./mobile/RustynetMobileArchitectureDesign_2026-04-17.md)
+- [RustynetMobileRoadmap_2026-04-17.md](./mobile/RustynetMobileRoadmap_2026-04-17.md)
+- [Imported mobile bundle index](./mobile/imported/rustynet_mobile_docs_bundle_2026-04-17/00_BundleIndex_2026-04-17.md)
+
 ## Primary Execution Ledgers
 
 These are the first active work documents to check for current status and remaining work.
@@ -80,6 +89,7 @@ The active-work folder contains the current implementation and hardening plans.
 - [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](./operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./operations/active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+- [WindowsWorkingNodePlan_2026-04-17.md](./operations/active/WindowsWorkingNodePlan_2026-04-17.md)
 
 Related active machine-readable lab asset:
 - `documents/operations/active/vm_lab_inventory.json`
@@ -109,6 +119,7 @@ Release-signoff guardrail:
 These folders are for evidence and retrospective reference, not live implementation truth.
 
 - [archive/README.md](./archive/README.md)
+- [archive/DownloadsResearchImportLedger_2026-04-17.md](./archive/DownloadsResearchImportLedger_2026-04-17.md)
 - [operations/done/README.md](./operations/done/README.md)
 
 Rule:

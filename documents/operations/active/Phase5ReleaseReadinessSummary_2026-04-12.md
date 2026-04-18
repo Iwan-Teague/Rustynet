@@ -1,10 +1,10 @@
 # Phase 5 Release Readiness Summary
 
 Prepared: 2026-04-12
-Updated: 2026-04-15
+Updated: 2026-04-17
 Repository root: `/Users/iwan/Desktop/Rustynet`
 Overall readiness: **not release-ready**
-Current authoritative target commit: `7dd8cf3a585a24adac92a142cf9e4f25a201e179`
+Current authoritative target commit: `eacab4563a074d6d53b406e9c29d391c5e4eed63`
 
 ## Decision
 
@@ -70,13 +70,25 @@ Why it fails:
 2. Windows fresh-install evidence is still absent for current `HEAD`
    - Windows remains intentionally outside the required OS/scenario set in
      `documents/operations/FreshInstallOSMatrixReleaseGate.md`.
-   - The latest Windows VM-lab validation on 2026-04-15 did not produce clean
-     current-`HEAD` evidence:
-     - discovery matched `windows-utm`, but did not establish an authoritative
-       live IP or SSH-ready state
-     - `verify-runtime`, `install-release`, and `restart-runtime` all failed on
-       the local UTM guest path with:
-       - `UTM Windows capture output was missing rc marker`
+   - The latest measured Windows VM-lab attempt on 2026-04-17 still did not
+     produce clean current-`HEAD` evidence:
+     - the local UTM guest was first recovered from link-local IPv4 back onto
+       the shared subnet as `192.168.64.14`
+     - `sync-source`, `build-release`, and `smoke-service-host` completed for
+       current `HEAD`, which proves only the reviewed host surface
+     - discovery with both the repo inventory and a Windows temp inventory
+       still reported `execution_ready=false` because the Windows local-UTM
+       callback/readiness probe timed out waiting for a guest POST back to the
+       host
+     - `install-release` then failed closed on the same callback/access
+       bootstrap timeout before install/runtime proof
+     - guest-side SSH state still remained absent on that same run:
+       `host_key_file_exists=True`, `sshd_service_count=0`,
+       `sshd_registry_present=False`, `ssh_listener_count=0`
+     - diagnostics collection on that blocked path still also hit
+       `UTM Windows capture output was missing rc marker`
+     - measured command transcript and discovery artifacts live under
+       `artifacts/windows_phase4/20260417T174942Z/`
    - That means there are still no dated Windows clean-install/runtime artifacts
      that could justify adding `windows` to the release-gated OS matrix.
 
@@ -183,15 +195,21 @@ Missing for current `HEAD`.
 
 Current dated Windows validation facts:
 
-- 2026-04-15 local UTM discovery report:
-  - `/tmp/rustynet-win-phase4-discovery`
+- 2026-04-17 local UTM evidence bundle:
+  - `/Users/iwan/Desktop/Rustynet/artifacts/windows_phase4/20260417T174942Z/phase4_evidence_summary.md`
 - current branch truth:
   - Windows runtime host/config wiring exists
-  - Windows backend truth remains `windows-unsupported`
+  - the explicit fail-closed label `windows-unsupported` and the opt-in
+    reviewed label `windows-wireguard-nt` both exist in code, but neither is
+    release-gated by documentation or measured node proof
+  - the latest measured guest was recovered onto `192.168.64.14`, but the
+    Windows local-UTM callback/readiness probe still timed out and guest-side
+    SSH state remained absent (`sshd_service_count=0`,
+    `sshd_registry_present=False`, `ssh_listener_count=0`)
   - no clean-install Windows artifact set exists for current `HEAD`
 
-The 2026-04-15 Windows VM-lab attempts are not fresh-install release evidence.
-They are blocker evidence only.
+The 2026-04-17 Windows VM-lab attempt is not fresh-install release evidence.
+It is blocker evidence only.
 
 ## Full Release-Gate Evidence
 
@@ -209,8 +227,9 @@ Current blocker state:
    - blocked by missing current-`HEAD` fresh-install artifacts
    - Windows specifically remains outside the release gate because there is no
      clean-install Windows runtime evidence for current `HEAD`
-   - the latest Windows UTM attempt is blocked at the guest exec/output layer,
-     so it cannot be promoted into release evidence
+   - the latest Windows UTM attempt is blocked at the local-UTM
+     callback/access-bootstrap layer and still never reaches install/runtime
+     proof, so it cannot be promoted into release evidence
 
 2. Canonical cross-network evidence
    - not exercised in the current top-level gate run because `phase5_gates`

@@ -7,6 +7,10 @@ authors.workspace = true
 
 [dependencies]
 rustynet-backend-api = { path = "../rustynet-backend-api" }
+rustynet-windows-native = { path = "../rustynet-windows-native" }
 base64 = "0.22"
 boringtun = { path = "../../third_party/boringtun" }
 rustynet-tun = { path = "../../third_party/rustynet-tun" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -80,6 +80,73 @@ function Get-ServiceRuntimeState {
     }
 }
 
+function Invoke-Sc {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $output = (& sc.exe @Arguments 2>&1 | Out-String)
+    return [ordered]@{
+        exit_code = $LASTEXITCODE
+        output = $output.Trim()
+    }
+}
+
+function Get-WindowsTargetFacts {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $buildNumber = if ($os) { [int]$os.BuildNumber } else { 0 }
+    return [ordered]@{
+        caption = if ($os) { [string]$os.Caption } else { '' }
+        version = if ($os) { [string]$os.Version } else { '' }
+        build_number = $buildNumber
+        architecture = if ($os) { [string]$os.OSArchitecture } elseif ($computer) { [string]$computer.SystemType } else { '' }
+        windows_11_target = [bool]($buildNumber -ge 22000)
+        elevated_admin = [bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+}
+
+function Get-ServiceSidType {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    $result = Invoke-Sc -Arguments @('qsidtype', $ServiceName)
+    if ($result.exit_code -ne 0) {
+        return ''
+    }
+    $match = [regex]::Match($result.output, 'SERVICE_SID_TYPE:\s+\d+\s+(\S+)')
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return $result.output
+}
+
+function Invoke-WindowsRuntimeBoundaryCheck {
+    param(
+        [Parameter(Mandatory = $true)][string]$DaemonPath,
+        [Parameter(Mandatory = $true)][string]$StateRoot
+    )
+    if (-not (Test-Path -LiteralPath $DaemonPath)) {
+        return $null
+    }
+    $output = (& $DaemonPath windows-runtime-boundary-check --state-root $StateRoot 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        return [ordered]@{
+            status = 'fail'
+            reason = $output.Trim()
+        }
+    }
+    try {
+        $parsed = $output | ConvertFrom-Json -ErrorAction Stop
+        return [ordered]@{
+            status = 'pass'
+            report = $parsed
+        }
+    }
+    catch {
+        return [ordered]@{
+            status = 'fail'
+            reason = ('invalid-runtime-boundary-json: ' + $_.Exception.Message)
+            raw = $output.Trim()
+        }
+    }
+}
+
 function Get-ReviewedBackendState {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -164,10 +231,14 @@ $cliInstallPath = Get-FirstExistingPath -Candidates @(
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $logRoot = Join-Path $StateRoot 'logs'
 $trustRoot = Join-Path $StateRoot 'trust'
+$secretRoot = Join-Path $StateRoot 'secrets'
+$keyCustodyRoot = Join-Path $secretRoot 'key-custody'
 $hostKeyPath = 'C:\ProgramData\ssh\ssh_host_ed25519_key.pub'
 
 $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
 $serviceImagePath = [string]$serviceRuntime.image_path
+$windowsFacts = Get-WindowsTargetFacts
+$serviceSidType = Get-ServiceSidType -ServiceName $ServiceName
 $runtimeFlagsPresent = $false
 if (Test-Path -LiteralPath $daemonInstallPath) {
     $helpText = (& $daemonInstallPath --help 2>&1 | Out-String)
@@ -175,11 +246,14 @@ if (Test-Path -LiteralPath $daemonInstallPath) {
         $runtimeFlagsPresent = $true
     }
 }
+$runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
 
 $backendState = Get-ReviewedBackendState -ConfigPath $configPath
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token '--windows-service'
 $serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token '--env-file'
 $serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token $configPath
+$serviceSidConfigured = [bool]($serviceSidType -match 'UNRESTRICTED')
+$runtimeBoundaryPassed = [bool]($runtimeBoundary -and $runtimeBoundary.status -eq 'pass')
 
 $checks = [ordered]@{
     git_present = Test-CommandPresent -Name 'git.exe'
@@ -195,6 +269,8 @@ $checks = [ordered]@{
     config_present = Test-Path -LiteralPath $configPath
     log_root_present = Test-Path -LiteralPath $logRoot
     trust_root_present = Test-Path -LiteralPath $trustRoot
+    secrets_root_present = Test-Path -LiteralPath $secretRoot
+    key_custody_root_present = Test-Path -LiteralPath $keyCustodyRoot
     service_present = $serviceRuntime.present
     service_running = [bool]($serviceRuntime.present -and $serviceRuntime.status -eq 'Running')
     service_status = $serviceRuntime.status
@@ -211,6 +287,16 @@ $checks = [ordered]@{
     runtime_flags_present = $runtimeFlagsPresent
     backend_label = $backendState.backend_label
     backend_reason = $backendState.backend_reason
+    windows_11_target = $windowsFacts.windows_11_target
+    windows_caption = $windowsFacts.caption
+    windows_version = $windowsFacts.version
+    windows_build_number = $windowsFacts.build_number
+    windows_architecture = $windowsFacts.architecture
+    elevated_admin = $windowsFacts.elevated_admin
+    service_sid_type = $serviceSidType
+    service_sid_configured = $serviceSidConfigured
+    runtime_boundary_status = if ($runtimeBoundary) { [string]$runtimeBoundary.status } else { 'not-run' }
+    runtime_boundary_validated = $runtimeBoundaryPassed
 }
 
 $notes = @()
@@ -229,8 +315,20 @@ if (-not $checks.log_root_present) {
 if (-not $checks.trust_root_present) {
     $notes += 'trust-root-missing'
 }
+if (-not $checks.secrets_root_present) {
+    $notes += 'secrets-root-missing'
+}
+if (-not $checks.key_custody_root_present) {
+    $notes += 'key-custody-root-missing'
+}
 if (-not $checks.runtime_flags_present) {
     $notes += 'windows-service-flags-missing'
+}
+if (-not $checks.windows_11_target) {
+    $notes += 'windows-11-required'
+}
+if (-not $checks.elevated_admin) {
+    $notes += 'admin-elevation-required'
 }
 if (-not $checks.service_present) {
     $notes += 'service-missing'
@@ -250,6 +348,12 @@ elseif (-not $checks.service_env_file_pinned) {
 if (-not $checks.openssh_host_key_present) {
     $notes += 'openssh-host-key-missing'
 }
+if (-not $checks.service_sid_configured) {
+    $notes += 'service-sid-not-configured'
+}
+if (-not $checks.runtime_boundary_validated) {
+    $notes += 'runtime-boundary-check-failed'
+}
 if (-not $checks.backend_label) {
     $notes += 'backend-label-missing'
 }
@@ -267,6 +371,15 @@ elseif (-not $checks.runtime_flags_present) {
 elseif (-not $checks.config_present) {
     $reason = 'config-missing'
 }
+elseif (-not $checks.log_root_present -or -not $checks.trust_root_present -or -not $checks.secrets_root_present -or -not $checks.key_custody_root_present) {
+    $reason = 'windows-runtime-layout-incomplete'
+}
+elseif (-not $checks.windows_11_target) {
+    $reason = 'windows-11-required'
+}
+elseif (-not $checks.elevated_admin) {
+    $reason = 'windows-bootstrap-must-run-elevated'
+}
 elseif (-not $checks.service_present) {
     $reason = 'windows-service-not-installed'
 }
@@ -275,6 +388,17 @@ elseif (-not $checks.service_binary_path_pinned_to_install_root) {
 }
 elseif (-not $checks.service_image_path_uses_windows_service_flag -or -not $checks.service_image_path_uses_env_file -or -not $checks.service_env_file_pinned) {
     $reason = 'windows-service-host-path-not-reviewed'
+}
+elseif (-not $checks.service_sid_configured) {
+    $reason = 'windows-service-sid-not-configured'
+}
+elseif (-not $checks.runtime_boundary_validated) {
+    if ($runtimeBoundary -and $runtimeBoundary.reason) {
+        $reason = 'windows-runtime-boundary-check-failed'
+    }
+    else {
+        $reason = 'windows-runtime-boundary-check-not-run'
+    }
 }
 elseif (-not $checks.backend_label) {
     $reason = $checks.backend_reason
@@ -296,7 +420,7 @@ else {
 }
 
 $report = [ordered]@{
-    schema_version = 2
+    schema_version = 3
     captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
     platform = 'windows'
     rustynet_root = $RustyNetRoot
@@ -312,6 +436,8 @@ $report = [ordered]@{
     config_present = $checks.config_present
     log_root_present = $checks.log_root_present
     trust_root_present = $checks.trust_root_present
+    secrets_root_present = $checks.secrets_root_present
+    key_custody_root_present = $checks.key_custody_root_present
     service_present = $checks.service_present
     service_status = $checks.service_status
     service_state = $checks.service_state
@@ -328,6 +454,17 @@ $report = [ordered]@{
     cargo_present = $checks.cargo_present
     rustup_present = $checks.rustup_present
     runtime_flags_present = $checks.runtime_flags_present
+    windows_11_target = $checks.windows_11_target
+    windows_caption = $checks.windows_caption
+    windows_version = $checks.windows_version
+    windows_build_number = $checks.windows_build_number
+    windows_architecture = $checks.windows_architecture
+    elevated_admin = $checks.elevated_admin
+    service_sid_type = $checks.service_sid_type
+    service_sid_configured = $checks.service_sid_configured
+    runtime_boundary_status = $checks.runtime_boundary_status
+    runtime_boundary_validated = $checks.runtime_boundary_validated
+    runtime_boundary = $runtimeBoundary
     notes = $notes
     checks = $checks
 }

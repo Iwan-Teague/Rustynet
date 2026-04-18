@@ -7,7 +7,11 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
-use crate::windows_paths::validate_windows_runtime_file_path;
+use crate::windows_paths::{
+    validate_windows_local_secret_acl, validate_windows_local_secret_input_path,
+    validate_windows_runtime_acl, validate_windows_runtime_file_path,
+    validate_windows_secret_blob_path,
+};
 #[cfg(unix)]
 use nix::unistd::Uid;
 #[cfg(unix)]
@@ -22,6 +26,8 @@ use rustynet_crypto::{
 use rustynet_crypto::{
     OsStoreFallbackPolicy, load_macos_generic_password, store_macos_generic_password,
 };
+#[cfg(windows)]
+use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -44,17 +50,31 @@ const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 #[cfg(target_os = "macos")]
 const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
+#[cfg(windows)]
+const WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC: &[u8; 8] = b"RNYDPAPI";
+#[cfg(windows)]
+const WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION: u8 = 1;
+#[cfg(windows)]
+const WINDOWS_DPAPI_PASSPHRASE_DESCRIPTION: &str = "RustyNet WireGuard passphrase";
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     #[cfg(target_os = "macos")]
     if let Some(account) = resolve_macos_keychain_account_from_env()? {
         return read_passphrase_from_macos_keychain(&account);
     }
+    #[cfg(windows)]
+    {
+        return read_windows_runtime_passphrase_source(path);
+    }
     let source_path = resolve_passphrase_source(path)?;
     read_passphrase_from_source(&source_path)
 }
 
 pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, String> {
+    #[cfg(windows)]
+    {
+        return read_windows_explicit_passphrase_source(path);
+    }
     read_passphrase_from_source(path)
 }
 
@@ -81,13 +101,26 @@ pub fn store_passphrase_in_os_secure_store(
         .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
         Ok(())
     }
+    #[cfg(windows)]
+    {
+        if keychain_account.is_some() {
+            return Err(
+                "Windows passphrase secure-store provisioning does not accept --keychain-account"
+                    .to_string(),
+            );
+        }
+        let passphrase = read_passphrase_file_explicit(passphrase_path)?;
+        store_windows_dpapi_passphrase_blob(passphrase_path, passphrase.as_bytes())
+    }
     #[cfg(not(target_os = "macos"))]
+    #[cfg(not(windows))]
     {
         let _ = (passphrase_path, keychain_account);
         Err("passphrase secure-store provisioning is only supported on macOS".to_string())
     }
 }
 
+#[cfg(not(windows))]
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
     validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
@@ -119,6 +152,171 @@ fn parse_passphrase_bytes(
     let value = Zeroizing::new(trimmed.to_string());
     raw.zeroize();
     Ok(value)
+}
+
+#[cfg(windows)]
+fn read_windows_runtime_passphrase_source(path: &Path) -> Result<Zeroizing<String>, String> {
+    validate_windows_secret_blob_path(path, "passphrase file")?;
+    validate_secret_file_security(path, "passphrase file", false)?;
+    validate_windows_runtime_acl(path, "passphrase file")?;
+    let raw = fs::read(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    decode_windows_dpapi_passphrase_blob(raw, "passphrase file")
+}
+
+#[cfg(windows)]
+fn read_windows_explicit_passphrase_source(path: &Path) -> Result<Zeroizing<String>, String> {
+    validate_windows_local_secret_input_path(path, "passphrase file")?;
+    validate_secret_file_security(path, "passphrase file", false)?;
+    let raw = fs::read(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    if looks_like_windows_dpapi_passphrase_blob(raw.as_slice()) {
+        decode_windows_dpapi_passphrase_blob(raw, "passphrase file")
+    } else {
+        parse_passphrase_bytes(raw, "passphrase file")
+    }
+}
+
+#[cfg(windows)]
+fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<(), String> {
+    use std::fs::OpenOptions;
+
+    validate_windows_secret_blob_path(path, "passphrase file")?;
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "passphrase file path must include a parent directory: {}",
+            path.display()
+        )
+    })?;
+    validate_windows_runtime_file_path(parent, "passphrase file parent directory")?;
+    validate_windows_runtime_acl(parent, "passphrase file parent directory")?;
+    if path.exists() {
+        validate_secret_file_security(path, "passphrase file", false)?;
+    }
+
+    let mut protected = dpapi_protect(
+        plaintext,
+        WindowsDpapiScope::CurrentUser,
+        WINDOWS_DPAPI_PASSPHRASE_DESCRIPTION,
+    )
+    .map_err(|err| format!("protect Windows DPAPI passphrase blob failed: {err}"))?;
+    let mut blob = encode_windows_dpapi_passphrase_blob(protected.as_slice())?;
+    protected.zeroize();
+
+    let candidate = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("passphrase"),
+        std::process::id()
+    ));
+    if candidate.exists() {
+        remove_file_if_present(candidate.as_path())?;
+    }
+
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(candidate.as_path())
+            .map_err(|err| {
+                format!(
+                    "create Windows DPAPI passphrase blob failed ({}): {err}",
+                    candidate.display()
+                )
+            })?;
+        file.write_all(blob.as_slice()).map_err(|err| {
+            format!(
+                "write Windows DPAPI passphrase blob failed ({}): {err}",
+                candidate.display()
+            )
+        })?;
+        file.flush().map_err(|err| {
+            format!(
+                "flush Windows DPAPI passphrase blob failed ({}): {err}",
+                candidate.display()
+            )
+        })?;
+        if path.exists() {
+            remove_file_if_present(path)?;
+        }
+        fs::rename(candidate.as_path(), path).map_err(|err| {
+            format!(
+                "persist Windows DPAPI passphrase blob failed ({} -> {}): {err}",
+                candidate.display(),
+                path.display()
+            )
+        })?;
+        validate_secret_file_security(path, "passphrase file", false)?;
+        validate_windows_runtime_acl(path, "passphrase file")
+    })();
+    if write_result.is_err() {
+        let _ = remove_file_if_present(candidate.as_path());
+    }
+    blob.zeroize();
+    write_result
+}
+
+#[cfg(windows)]
+fn encode_windows_dpapi_passphrase_blob(protected: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    let blob_len = u32::try_from(protected.len())
+        .map_err(|_| "Windows DPAPI passphrase blob exceeds u32".to_string())?;
+    let mut encoded = Zeroizing::new(Vec::with_capacity(
+        WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len() + 1 + 1 + 4 + protected.len(),
+    ));
+    encoded.extend_from_slice(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC);
+    encoded.push(WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION);
+    encoded.push(0);
+    encoded.extend_from_slice(&blob_len.to_be_bytes());
+    encoded.extend_from_slice(protected);
+    Ok(encoded)
+}
+
+#[cfg(windows)]
+fn decode_windows_dpapi_passphrase_blob(
+    mut blob: Vec<u8>,
+    source_label: &str,
+) -> Result<Zeroizing<String>, String> {
+    if !looks_like_windows_dpapi_passphrase_blob(blob.as_slice()) {
+        blob.zeroize();
+        return Err(format!(
+            "{source_label} is not a reviewed Windows DPAPI passphrase blob",
+        ));
+    }
+    let version = blob[WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len()];
+    if version != WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION {
+        blob.zeroize();
+        return Err(format!(
+            "{source_label} uses unsupported Windows DPAPI blob version {version}",
+        ));
+    }
+    let length_offset = WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len() + 2;
+    let protected_len = u32::from_be_bytes([
+        blob[length_offset],
+        blob[length_offset + 1],
+        blob[length_offset + 2],
+        blob[length_offset + 3],
+    ]) as usize;
+    let protected = blob
+        .get(length_offset + 4..)
+        .ok_or_else(|| format!("truncated {source_label} Windows DPAPI blob"))?;
+    if protected.len() != protected_len {
+        blob.zeroize();
+        return Err(format!(
+            "{source_label} Windows DPAPI blob length mismatch (declared {protected_len}, actual {})",
+            protected.len()
+        ));
+    }
+    let mut plaintext = dpapi_unprotect(protected)
+        .map_err(|err| format!("unprotect Windows DPAPI passphrase blob failed: {err}"))?;
+    blob.zeroize();
+    let result = parse_passphrase_bytes(std::mem::take(&mut plaintext), source_label);
+    plaintext.zeroize();
+    result
+}
+
+#[cfg(windows)]
+fn looks_like_windows_dpapi_passphrase_blob(blob: &[u8]) -> bool {
+    let header_len = WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len() + 1 + 1 + 4;
+    blob.len() >= header_len && blob.starts_with(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC)
 }
 
 #[cfg(target_os = "macos")]
@@ -243,6 +441,8 @@ fn key_custody_manager(
     );
     #[cfg(target_os = "macos")]
     let manager = manager.with_fallback_policy(OsStoreFallbackPolicy::RequireOsSecureStore);
+    #[cfg(target_os = "windows")]
+    let manager = manager.with_fallback_policy(OsStoreFallbackPolicy::RequireOsSecureStore);
     Ok(manager)
 }
 
@@ -285,7 +485,7 @@ fn validate_secret_file_security(
     {
         #[cfg(windows)]
         {
-            validate_windows_runtime_file_path(path, label)?;
+            validate_windows_local_secret_input_path(path, label)?;
             let metadata = fs::symlink_metadata(path)
                 .map_err(|err| format!("{label} metadata read failed: {err}"))?;
             if metadata.file_type().is_symlink() {
@@ -294,12 +494,10 @@ fn validate_secret_file_security(
             if !metadata.file_type().is_file() {
                 return Err(format!("{label} must be a regular file"));
             }
-            fs::File::open(path).map_err(|err| {
-                format!("{label} is not readable by the current service identity: {err}")
-            })?;
-            return Err(format!(
-                "{label} Windows ACL validation is not yet implemented; refusing to accept filesystem presence as a secure secret-custody check"
-            ));
+            validate_windows_local_secret_acl(path, label)?;
+            fs::File::open(path)
+                .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
+            return Ok(());
         }
 
         #[cfg(not(windows))]
@@ -315,6 +513,17 @@ fn validate_secret_file_security(
 }
 
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        validate_windows_secret_blob_path(configured_path, "passphrase file")?;
+        if configured_path.exists() {
+            return Ok(configured_path.to_path_buf());
+        }
+        return Err(format!(
+            "Windows passphrase source must be a reviewed DPAPI blob at {}",
+            configured_path.display()
+        ));
+    }
     let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
     let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())

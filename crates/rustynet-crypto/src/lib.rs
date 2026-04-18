@@ -14,13 +14,20 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
+#[cfg(target_os = "windows")]
+use rustynet_windows_native::{
+    WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
+};
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_DPAPI_KEY_CUSTODY_ROOT: &str = r"C:\ProgramData\RustyNet\secrets\key-custody";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicKey([u8; 32]);
@@ -291,7 +298,11 @@ impl OsSecureStore for PlatformOsSecureStore {
         {
             store_in_linux_secret_service(key_id, key_material)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            store_in_windows_dpapi(key_id, key_material)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = (key_id, key_material);
             Err(CryptoError::OsStoreUnavailable)
@@ -307,7 +318,11 @@ impl OsSecureStore for PlatformOsSecureStore {
         {
             load_from_linux_secret_service(key_id)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            load_from_windows_dpapi(key_id)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = key_id;
             Err(CryptoError::OsStoreUnavailable)
@@ -527,6 +542,124 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> 
     };
     value.zeroize();
     decoded
+}
+
+#[cfg(target_os = "windows")]
+fn store_in_windows_dpapi(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+    let root = windows_dpapi_root()?;
+    validate_windows_dpapi_root(root.as_path())?;
+    let path = windows_dpapi_file_path(root.as_path(), key_id)?;
+    if path.exists() {
+        validate_windows_dpapi_file(path.as_path())?;
+    }
+    let mut protected = dpapi_protect(
+        key_material,
+        WindowsDpapiScope::CurrentUser,
+        &format!("RustyNet key {key_id}"),
+    )
+    .map_err(|_| CryptoError::EncryptionFailed)?;
+    let write_result = write_windows_dpapi_blob(path.as_path(), &protected);
+    protected.zeroize();
+    write_result
+}
+
+#[cfg(target_os = "windows")]
+fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    let root = windows_dpapi_root()?;
+    validate_windows_dpapi_root(root.as_path())?;
+    let path = windows_dpapi_file_path(root.as_path(), key_id)?;
+    validate_windows_dpapi_file(path.as_path())?;
+    let mut protected = std::fs::read(path.as_path()).map_err(|_| CryptoError::Io)?;
+    let result = dpapi_unprotect(&protected).map_err(|_| CryptoError::DecryptionFailed);
+    protected.zeroize();
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn windows_dpapi_root() -> Result<PathBuf, CryptoError> {
+    let root = PathBuf::from(WINDOWS_DPAPI_KEY_CUSTODY_ROOT);
+    if !root.exists() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    Ok(root)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_dpapi_file_path(root: &Path, key_id: &str) -> Result<PathBuf, CryptoError> {
+    if !is_valid_key_identifier(key_id) {
+        return Err(CryptoError::InvalidLength);
+    }
+    Ok(root.join(format!("{key_id}.dpapi")))
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_dpapi_root(root: &Path) -> Result<(), CryptoError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|_| CryptoError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CryptoError::PermissionDenied);
+    }
+    let sddl = inspect_file_sddl(root).map_err(|_| CryptoError::PermissionValidationUnavailable)?;
+    if !sddl.contains("D:P")
+        || sddl.contains(";;;WD)")
+        || sddl.contains(";;;AU)")
+        || sddl.contains(";;;BU)")
+    {
+        return Err(CryptoError::PermissionDenied);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_dpapi_file(path: &Path) -> Result<(), CryptoError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| CryptoError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CryptoError::PermissionDenied);
+    }
+    let sddl = inspect_file_sddl(path).map_err(|_| CryptoError::PermissionValidationUnavailable)?;
+    if !sddl.contains("D:")
+        || sddl.contains(";;;WD)")
+        || sddl.contains(";;;AU)")
+        || sddl.contains(";;;BU)")
+    {
+        return Err(CryptoError::PermissionDenied);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_dpapi_blob(path: &Path, bytes: &[u8]) -> Result<(), CryptoError> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let parent = path.parent().ok_or(CryptoError::Io)?;
+    validate_windows_dpapi_root(parent)?;
+    let candidate = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("key"),
+        std::process::id()
+    ));
+    if candidate.exists() {
+        let metadata =
+            std::fs::symlink_metadata(candidate.as_path()).map_err(|_| CryptoError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CryptoError::PermissionDenied);
+        }
+        std::fs::remove_file(candidate.as_path()).map_err(|_| CryptoError::Io)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(candidate.as_path())
+        .map_err(|_| CryptoError::Io)?;
+    file.write_all(bytes).map_err(|_| CryptoError::Io)?;
+    file.flush().map_err(|_| CryptoError::Io)?;
+    if path.exists() {
+        validate_windows_dpapi_file(path)?;
+        std::fs::remove_file(path).map_err(|_| CryptoError::Io)?;
+    }
+    std::fs::rename(candidate.as_path(), path).map_err(|_| CryptoError::Io)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

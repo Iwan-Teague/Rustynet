@@ -1,6 +1,6 @@
 # Rustynet Platform Support Matrix (Current Implementation)
 
-Date verified: 2026-04-15
+Date verified: 2026-04-17
 Purpose: provide a single current-state view of platform capability, security posture, and evidence depth.
 
 ## Scope
@@ -32,6 +32,15 @@ Purpose: provide a single current-state view of platform capability, security po
   the explicit `windows-unsupported` backend blocker. `build-release` still
   depends on verified MSVC/toolchain availability or explicit bootstrap
   configuration.
+- `runtime-boundary-capable only`: reviewed Windows runtime paths are pinned
+  under `C:\ProgramData\RustyNet\{config,logs,trust,membership,keys,secrets}`,
+  the installer now provisions `secrets\key-custody` with protected ACLs plus
+  an unrestricted service SID, and reviewed runtime passphrase custody uses
+  DPAPI `.dpapi` blobs instead of plaintext long-lived files. The local
+  privileged IPC surface is limited to reviewed `\\.\pipe\RustyNet\...`
+  named-pipe probe/ACL-inspection requests, and
+  `rustynetd windows-runtime-boundary-check` is the authoritative self-check
+  that the Windows verify/diagnostics helpers call.
 - `live-lab wrapper boundary is fail-closed`: `ops vm-lab-validate-live-lab-profile`,
   `ops vm-lab-setup-live-lab`, `ops vm-lab-run-live-lab`,
   `ops vm-lab-orchestrate-live-lab`, `ops vm-lab-iterate-live-lab`,
@@ -41,13 +50,23 @@ Purpose: provide a single current-state view of platform capability, security po
   `platform=linux`/`remote_shell=posix`/`guest_exec_mode=linux_bash`/`service_manager=systemd`
   before any `live_linux_*` stage runs.
 - `not dataplane-capable`: `rustynetd` now exposes a reviewed Windows
-  service/config host surface, but the only reviewed Windows backend label is
-  `windows-unsupported`. Helper entrypoints therefore fail closed for the
-  supported backend scope instead of claiming transport/runtime success.
-- `not fresh-install evidenced`: the latest Mac + UTM validation for current
-  `HEAD` still fails at the local Windows guest exec/output boundary
-  (`UTM Windows capture output was missing rc marker`), so there is no clean
-  Windows install/runtime/service evidence to promote into the release gate.
+  service/config host surface and carries the opt-in reviewed backend label
+  `windows-wireguard-nt`, but current measured VM-lab proof still stops before
+  install/runtime/node evidence and reviewed unsupported operations remain
+  explicit fail-closed blockers. Windows therefore still must not be described
+  as a supported dataplane target.
+- `not fresh-install evidenced`: the latest measured local Windows UTM attempt
+  for current `HEAD` on 2026-04-17 first recovered the guest to the shared
+  subnet as `192.168.64.14`, then resynced/build current `HEAD` and passed
+  `smoke-service-host`, but discovery still reported `execution_ready=false`
+  because the Windows local-UTM callback/readiness probe timed out. On the
+  same guest state, `install-release` failed closed on that callback timeout,
+  guest-side SSH state remained absent (`sshd_service_count=0`,
+  `sshd_registry_present=False`, `ssh_listener_count=0`), and diagnostics on
+  the blocked path still hit `UTM Windows capture output was missing rc
+  marker`. There is still no clean Windows install/runtime/service evidence to
+  promote into the release gate. See
+  `artifacts/windows_phase4/20260417T174942Z/phase4_evidence_summary.md`.
 - `not release-gated and evidenced`: Windows is intentionally excluded from the
   current fresh-install OS matrix and Phase10 release gate because measured
   Windows install/runtime/role-switch evidence does not yet exist.

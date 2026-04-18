@@ -77,6 +77,7 @@ const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
 const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
+const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
@@ -86,6 +87,7 @@ const DEFAULT_ROUTE_BINARY_PATH: &str = "/sbin/route";
 const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
 const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
+const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManagementCidr {
@@ -2471,11 +2473,179 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsCommandSystem {
+    interface_name: String,
+    egress_interface: String,
+    dns_resolver_bind_addr: SocketAddr,
+    generation: u64,
+    dns_protected: bool,
+}
+
+impl WindowsCommandSystem {
+    pub fn new(
+        interface_name: impl Into<String>,
+        egress_interface: impl Into<String>,
+        dns_resolver_bind_addr: SocketAddr,
+    ) -> Result<Self, SystemError> {
+        let interface_name = interface_name.into();
+        let egress_interface = egress_interface.into();
+        validate_windows_interface_alias(interface_name.as_str())
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        validate_windows_interface_alias(egress_interface.as_str())
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+        if !dns_resolver_bind_addr.ip().is_loopback() {
+            return Err(SystemError::PrerequisiteCheckFailed(
+                "Windows DNS resolver bind addr must stay on loopback".to_string(),
+            ));
+        }
+        Ok(Self {
+            interface_name,
+            egress_interface,
+            dns_resolver_bind_addr,
+            generation: 0,
+            dns_protected: false,
+        })
+    }
+
+    fn resolve_netsh_binary() -> Result<PathBuf, SystemError> {
+        let configured = std::env::var(WINDOWS_NETSH_BINARY_PATH_ENV).ok();
+        let raw = configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_WINDOWS_NETSH_BINARY_PATH);
+        validate_windows_binary_path(raw, "netsh")?;
+        Ok(PathBuf::from(raw))
+    }
+
+    fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
+        let binary = Self::resolve_netsh_binary()?;
+        let output = Command::new(&binary).args(args).output().map_err(|err| {
+            SystemError::Io(format!("netsh spawn failed ({}): {err}", binary.display()))
+        })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    fn run_netsh_success(&self, args: &[String]) -> Result<(), SystemError> {
+        let output = self.run_netsh(args)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(SystemError::Io(format!(
+            "netsh exited unsuccessfully: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
+    fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
+        validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
+        let args = windows_dns_set_args(
+            self.interface_name.as_str(),
+            self.dns_resolver_bind_addr.ip(),
+        )?;
+        self.run_netsh_success(&args)
+            .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        self.dns_protected = true;
+        Ok(())
+    }
+
+    fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
+        let args = windows_dns_clear_args(self.interface_name.as_str());
+        self.run_netsh_success(&args)
+            .map_err(|err| SystemError::RollbackFailed(err.to_string()))?;
+        self.dns_protected = false;
+        Ok(())
+    }
+
+    fn firewall_blocker(&self, operation: &str) -> String {
+        format!(
+            "windows fail-closed firewall operation '{operation}' is not yet reviewed; windows-wireguard-nt stays security-first and must block before claiming a protected Windows dataplane"
+        )
+    }
+
+    fn nat_blocker(&self) -> String {
+        "windows exit-node NAT/forwarding is not yet reviewed; Windows must fail closed instead of advertising unsupported exit-serving behavior".to_string()
+    }
+}
+
+impl DataplaneSystem for WindowsCommandSystem {
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
+    fn check_prerequisites(&mut self) -> Result<(), SystemError> {
+        let _ = Self::resolve_netsh_binary()?;
+        let _ = &self.egress_interface;
+        Ok(())
+    }
+
+    fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn rollback_routes(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
+        Err(SystemError::FirewallApplyFailed(
+            self.firewall_blocker("apply_firewall_killswitch"),
+        ))
+    }
+
+    fn rollback_firewall(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        Err(SystemError::NatApplyFailed(self.nat_blocker()))
+    }
+
+    fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        self.apply_dns_loopback()
+    }
+
+    fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        if !self.dns_protected {
+            return Ok(());
+        }
+        self.clear_dns_loopback()
+    }
+
+    fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
+        Err(SystemError::FirewallApplyFailed(
+            self.firewall_blocker("hard_disable_ipv6_egress"),
+        ))
+    }
+
+    fn assert_killswitch(&mut self) -> Result<(), SystemError> {
+        Err(SystemError::KillSwitchAssertionFailed(
+            self.firewall_blocker("assert_killswitch"),
+        ))
+    }
+
+    fn block_all_egress(&mut self) -> Result<(), SystemError> {
+        Err(SystemError::BlockEgressFailed(
+            self.firewall_blocker("block_all_egress"),
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub enum RuntimeSystem {
     DryRun(DryRunSystem),
     Linux(LinuxCommandSystem),
     Macos(MacosCommandSystem),
+    Windows(WindowsCommandSystem),
 }
 
 impl DataplaneSystem for RuntimeSystem {
@@ -2484,6 +2654,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.set_generation(generation),
             RuntimeSystem::Linux(system) => system.set_generation(generation),
             RuntimeSystem::Macos(system) => system.set_generation(generation),
+            RuntimeSystem::Windows(system) => system.set_generation(generation),
         }
     }
 
@@ -2492,6 +2663,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.set_relay_forwarding(enabled),
             RuntimeSystem::Linux(system) => system.set_relay_forwarding(enabled),
             RuntimeSystem::Macos(system) => system.set_relay_forwarding(enabled),
+            RuntimeSystem::Windows(system) => system.set_relay_forwarding(enabled),
         }
     }
 
@@ -2500,6 +2672,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.prune_owned_tables(),
             RuntimeSystem::Linux(system) => system.prune_owned_tables(),
             RuntimeSystem::Macos(system) => system.prune_owned_tables(),
+            RuntimeSystem::Windows(system) => system.prune_owned_tables(),
         }
     }
 
@@ -2508,6 +2681,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.check_prerequisites(),
             RuntimeSystem::Linux(system) => system.check_prerequisites(),
             RuntimeSystem::Macos(system) => system.check_prerequisites(),
+            RuntimeSystem::Windows(system) => system.check_prerequisites(),
         }
     }
 
@@ -2519,6 +2693,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.apply_peer_endpoint_bypass_routes(peers),
             RuntimeSystem::Linux(system) => system.apply_peer_endpoint_bypass_routes(peers),
             RuntimeSystem::Macos(system) => system.apply_peer_endpoint_bypass_routes(peers),
+            RuntimeSystem::Windows(system) => system.apply_peer_endpoint_bypass_routes(peers),
         }
     }
 
@@ -2527,6 +2702,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.apply_routes(routes),
             RuntimeSystem::Linux(system) => system.apply_routes(routes),
             RuntimeSystem::Macos(system) => system.apply_routes(routes),
+            RuntimeSystem::Windows(system) => system.apply_routes(routes),
         }
     }
 
@@ -2535,6 +2711,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.rollback_routes(),
             RuntimeSystem::Linux(system) => system.rollback_routes(),
             RuntimeSystem::Macos(system) => system.rollback_routes(),
+            RuntimeSystem::Windows(system) => system.rollback_routes(),
         }
     }
 
@@ -2543,6 +2720,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.apply_firewall_killswitch(),
             RuntimeSystem::Linux(system) => system.apply_firewall_killswitch(),
             RuntimeSystem::Macos(system) => system.apply_firewall_killswitch(),
+            RuntimeSystem::Windows(system) => system.apply_firewall_killswitch(),
         }
     }
 
@@ -2551,6 +2729,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.rollback_firewall(),
             RuntimeSystem::Linux(system) => system.rollback_firewall(),
             RuntimeSystem::Macos(system) => system.rollback_firewall(),
+            RuntimeSystem::Windows(system) => system.rollback_firewall(),
         }
     }
 
@@ -2559,6 +2738,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.apply_nat_forwarding(),
             RuntimeSystem::Linux(system) => system.apply_nat_forwarding(),
             RuntimeSystem::Macos(system) => system.apply_nat_forwarding(),
+            RuntimeSystem::Windows(system) => system.apply_nat_forwarding(),
         }
     }
 
@@ -2567,6 +2747,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.rollback_nat_forwarding(),
             RuntimeSystem::Linux(system) => system.rollback_nat_forwarding(),
             RuntimeSystem::Macos(system) => system.rollback_nat_forwarding(),
+            RuntimeSystem::Windows(system) => system.rollback_nat_forwarding(),
         }
     }
 
@@ -2575,6 +2756,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.apply_dns_protection(),
             RuntimeSystem::Linux(system) => system.apply_dns_protection(),
             RuntimeSystem::Macos(system) => system.apply_dns_protection(),
+            RuntimeSystem::Windows(system) => system.apply_dns_protection(),
         }
     }
 
@@ -2583,6 +2765,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.rollback_dns_protection(),
             RuntimeSystem::Linux(system) => system.rollback_dns_protection(),
             RuntimeSystem::Macos(system) => system.rollback_dns_protection(),
+            RuntimeSystem::Windows(system) => system.rollback_dns_protection(),
         }
     }
 
@@ -2591,6 +2774,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.hard_disable_ipv6_egress(),
             RuntimeSystem::Linux(system) => system.hard_disable_ipv6_egress(),
             RuntimeSystem::Macos(system) => system.hard_disable_ipv6_egress(),
+            RuntimeSystem::Windows(system) => system.hard_disable_ipv6_egress(),
         }
     }
 
@@ -2599,6 +2783,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.rollback_ipv6_egress(),
             RuntimeSystem::Linux(system) => system.rollback_ipv6_egress(),
             RuntimeSystem::Macos(system) => system.rollback_ipv6_egress(),
+            RuntimeSystem::Windows(system) => system.rollback_ipv6_egress(),
         }
     }
 
@@ -2607,6 +2792,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.assert_killswitch(),
             RuntimeSystem::Linux(system) => system.assert_killswitch(),
             RuntimeSystem::Macos(system) => system.assert_killswitch(),
+            RuntimeSystem::Windows(system) => system.assert_killswitch(),
         }
     }
 
@@ -2615,6 +2801,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.assert_exit_policy(exit_mode),
             RuntimeSystem::Linux(system) => system.assert_exit_policy(exit_mode),
             RuntimeSystem::Macos(system) => system.assert_exit_policy(exit_mode),
+            RuntimeSystem::Windows(system) => system.assert_exit_policy(exit_mode),
         }
     }
 
@@ -2623,6 +2810,7 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::DryRun(system) => system.block_all_egress(),
             RuntimeSystem::Linux(system) => system.block_all_egress(),
             RuntimeSystem::Macos(system) => system.block_all_egress(),
+            RuntimeSystem::Windows(system) => system.block_all_egress(),
         }
     }
 }
@@ -3733,6 +3921,75 @@ fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn validate_windows_interface_alias(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > 32 {
+        return Err("Windows interface alias length must be between 1 and 32 characters");
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '='))
+    {
+        return Err("Windows interface alias contains invalid characters");
+    }
+    Ok(())
+}
+
+fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must be absolute: {raw}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_windows_dns_bind_addr(addr: SocketAddr) -> Result<(), SystemError> {
+    if !addr.ip().is_loopback() {
+        return Err(SystemError::DnsApplyFailed(
+            "Windows DNS protection requires a loopback resolver bind address".to_string(),
+        ));
+    }
+    if addr.port() != 53 {
+        return Err(SystemError::DnsApplyFailed(
+            "Windows DNS protection requires rustynetd to bind the reviewed local resolver on 127.0.0.1:53 because Windows interface DNS settings cannot encode a non-default port".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn windows_dns_set_args(
+    interface_name: &str,
+    dns_server: IpAddr,
+) -> Result<Vec<String>, SystemError> {
+    if !dns_server.is_loopback() {
+        return Err(SystemError::DnsApplyFailed(
+            "Windows DNS protection only supports reviewed loopback resolvers".to_string(),
+        ));
+    }
+    Ok(vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "dnsservers".to_string(),
+        format!("name={interface_name}"),
+        "source=static".to_string(),
+        format!("address={dns_server}"),
+        "validate=no".to_string(),
+    ])
+}
+
+fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
+    vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "delete".to_string(),
+        "dnsservers".to_string(),
+        format!("name={interface_name}"),
+        "all".to_string(),
+    ]
+}
+
 pub fn write_state_transition_audit(
     path: impl AsRef<Path>,
     transitions: &[TransitionEvent],
@@ -3909,6 +4166,43 @@ mod tests {
     use rustynet_policy::{ContextualPolicyRule, RuleAction};
 
     use super::*;
+
+    #[test]
+    fn windows_dns_bind_addr_requires_loopback_port_53() {
+        let err = validate_windows_dns_bind_addr("127.0.0.1:53535".parse().expect("valid addr"))
+            .expect_err("non-default resolver port should fail closed on Windows");
+        assert!(matches!(err, SystemError::DnsApplyFailed(_)));
+    }
+
+    #[test]
+    fn windows_dns_helpers_render_reviewed_netsh_args() {
+        let args = windows_dns_set_args("rustynet0", "127.0.0.1".parse().expect("valid ip"))
+            .expect("loopback DNS args should render");
+        assert_eq!(
+            args,
+            vec![
+                "interface".to_string(),
+                "ipv4".to_string(),
+                "set".to_string(),
+                "dnsservers".to_string(),
+                "name=rustynet0".to_string(),
+                "source=static".to_string(),
+                "address=127.0.0.1".to_string(),
+                "validate=no".to_string(),
+            ]
+        );
+        assert_eq!(
+            windows_dns_clear_args("rustynet0"),
+            vec![
+                "interface".to_string(),
+                "ipv4".to_string(),
+                "delete".to_string(),
+                "dnsservers".to_string(),
+                "name=rustynet0".to_string(),
+                "all".to_string(),
+            ]
+        );
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum StartBehavior {

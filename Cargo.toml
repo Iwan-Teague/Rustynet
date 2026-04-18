@@ -8,6 +8,7 @@ members = [
   "crates/rustynet-relay",
   "crates/rustynet-policy",
   "crates/rustynet-crypto",
+  "crates/rustynet-windows-native",
   "crates/rustynet-backend-api",
   "crates/rustynet-backend-wireguard",
   "crates/rustynet-backend-stub",

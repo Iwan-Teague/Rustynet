@@ -921,6 +921,8 @@ dependencies = [
  "boringtun",
  "rustynet-backend-api",
  "rustynet-tun",
+ "rustynet-windows-native",
+ "tempfile",
 ]
 
 [[package]]
@@ -971,6 +973,7 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "rand",
+ "rustynet-windows-native",
  "security-framework",
  "sha2",
  "subtle",
@@ -1014,6 +1017,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-windows-native"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rustynetd"
 version = "0.1.0"
 dependencies = [
@@ -1029,6 +1039,7 @@ dependencies = [
  "rustynet-local-security",
  "rustynet-policy",
  "rustynet-relay",
+ "rustynet-windows-native",
  "serde",
  "serde_json",
  "sha2",

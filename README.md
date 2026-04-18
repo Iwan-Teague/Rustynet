@@ -172,13 +172,30 @@ Current VM-lab Windows truth on this branch:
   Linux-runtime only and fails closed on missing or incompatible target
   metadata.
 - On the current branch, `rustynetd` exposes a reviewed Windows
-  `--windows-service --env-file` host path and the only reviewed Windows
-  backend label is `windows-unsupported`. `build-release` is still conditional
-  on verified Windows/MSVC tooling being present, and the Windows
+  `--windows-service --env-file` host path and now carries both the explicit
+  fail-closed backend label `windows-unsupported` and the opt-in reviewed
+  backend label `windows-wireguard-nt` behind the stable backend abstraction.
+  The reviewed Windows runtime boundary now pins service/runtime state under
+  `C:\ProgramData\RustyNet\{config,logs,trust,membership,keys,secrets}`,
+  requires a protected `secrets\key-custody` root, stores reviewed runtime
+  passphrase material as DPAPI-protected `.dpapi` blobs, and only permits
+  reviewed local named-pipe IPC under `\\.\pipe\RustyNet\...` for probe and
+  ACL-inspection self-check requests. The install/verify/diagnostics helpers
+  now make Windows 11, elevation, service SID, and runtime-boundary state
+  explicit without claiming backend capability. `build-release` is still
+  conditional on verified Windows/MSVC tooling being present, and the Windows
   install/restart/verify entrypoints must not be treated as dataplane-capable
-  or release-gated proof. The latest Mac + UTM validation is still blocked at
-  the local Windows guest exec/output boundary, so there is no fresh
-  Windows runtime evidence for current `HEAD`.
+  or release-gated proof. The latest measured local Windows UTM attempt on
+  2026-04-17 first recovered the guest from link-local IPv4 back onto the
+  shared subnet as `192.168.64.14`, then resynced current `HEAD`, rebuilt it,
+  and passed `smoke-service-host`. `install-release` still failed closed
+  because the reviewed Windows local-UTM callback/access-bootstrap path timed
+  out before authoritative transport proof, guest-side SSH state remained
+  absent (`sshd_service_count=0`, `ssh_listener_count=0`), and diagnostics on
+  that blocked path still hit `UTM Windows capture output was missing rc
+  marker`. There is still no fresh Windows install/runtime/node evidence for
+  current `HEAD`. See
+  `artifacts/windows_phase4/20260417T174942Z/phase4_evidence_summary.md`.
 - Windows is not `release-gated and evidenced` on the current branch. The
   required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
   Mint, and macOS until measured Windows evidence exists.

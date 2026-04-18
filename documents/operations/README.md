@@ -46,6 +46,10 @@ Supporting active implementation plan for the remaining Windows VM-lab
 access/orchestration blocker:
 - [active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 
+Supporting active implementation plan for taking Windows from
+`runtime-host-capable only` to a real working node:
+- [active/WindowsWorkingNodePlan_2026-04-17.md](./active/WindowsWorkingNodePlan_2026-04-17.md)
+
 Current phase-local hardening checklist:
 - [active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)

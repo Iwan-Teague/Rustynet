@@ -1,9 +1,10 @@
 #![allow(clippy::result_large_err)]
 
 use crate::windows_backend_gate::{
-    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WindowsBackendMode, parse_windows_backend_mode,
-    require_supported_windows_backend,
+    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL, WindowsBackendMode,
+    parse_windows_backend_mode, require_supported_windows_backend,
 };
+use crate::windows_paths::validate_windows_runtime_file_path;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,21 +37,25 @@ pub enum WindowsBackendRequest {
     Missing,
     NonWindows(String),
     ExplicitUnsupported(WindowsBackendMode),
+    Reviewed(WindowsBackendMode),
     Unknown(String),
 }
 
 impl WindowsBackendRequest {
-    pub fn blocker_reason(&self) -> String {
+    pub fn blocker_reason(&self) -> Option<String> {
         match self {
-            Self::Missing => "windows-runtime-backend-not-configured: Windows service host loaded reviewed config, but the env-file did not specify --backend in RUSTYNETD_DAEMON_ARGS_JSON. Windows backend/dataplane support remains unavailable on the current branch.".to_string(),
-            Self::NonWindows(label) => format!(
+            Self::Missing => Some("windows-runtime-backend-not-configured: Windows service host loaded reviewed config, but the env-file did not specify --backend in RUSTYNETD_DAEMON_ARGS_JSON. Windows backend/dataplane support remains unavailable until an operator selects a reviewed Windows backend label.".to_string()),
+            Self::NonWindows(label) => Some(format!(
                 "windows-runtime-backend-not-supported: backend '{label}' is not valid for the Windows service host. Linux and macOS backend modes remain platform-specific and Windows dataplane support is still unavailable on the current branch."
+            )),
+            Self::ExplicitUnsupported(mode) => Some(
+                require_supported_windows_backend(*mode)
+                    .expect_err("explicit Windows unsupported mode must fail closed"),
             ),
-            Self::ExplicitUnsupported(mode) => require_supported_windows_backend(*mode)
-                .expect_err("explicit Windows unsupported mode must fail closed"),
-            Self::Unknown(label) => format!(
-                "windows-runtime-backend-not-recognized: backend '{label}' is not a reviewed Windows backend label on the current branch. Expected {WINDOWS_UNSUPPORTED_BACKEND_LABEL}."
-            ),
+            Self::Reviewed(_) => None,
+            Self::Unknown(label) => Some(format!(
+                "windows-runtime-backend-not-recognized: backend '{label}' is not a reviewed Windows backend label on the current branch. Expected {WINDOWS_UNSUPPORTED_BACKEND_LABEL} or {WINDOWS_WIREGUARD_NT_BACKEND_LABEL}."
+            )),
         }
     }
 }
@@ -62,6 +67,8 @@ pub struct PreparedWindowsServiceHost {
     pub daemon_args: Vec<String>,
     pub backend_request: WindowsBackendRequest,
 }
+
+pub type WindowsDaemonArgsRunner = fn(&[String]) -> Result<(), String>;
 
 pub fn select_host_entry(args: &[String]) -> Result<HostEntrySelection, String> {
     let (remaining, service) = strip_windows_service_args(args)?;
@@ -140,12 +147,7 @@ pub fn strip_windows_service_args(
 pub fn prepare_windows_service_host(
     options: &WindowsServiceOptions,
 ) -> Result<PreparedWindowsServiceHost, String> {
-    if !options.env_file.is_absolute() {
-        return Err(format!(
-            "windows service env-file path must be absolute: {}",
-            options.env_file.display()
-        ));
-    }
+    validate_windows_runtime_file_path(&options.env_file, "windows service env-file")?;
 
     let runtime_input = load_windows_service_runtime_input(&options.env_file)?;
     let backend_request = classify_windows_backend_request(&runtime_input.daemon_args)?;
@@ -238,7 +240,10 @@ pub fn classify_windows_backend_request(args: &[String]) -> Result<WindowsBacken
     }
 
     match parse_windows_backend_mode(backend.as_str()) {
-        Ok(mode) => Ok(WindowsBackendRequest::ExplicitUnsupported(mode)),
+        Ok(WindowsBackendMode::Unsupported) => Ok(WindowsBackendRequest::ExplicitUnsupported(
+            WindowsBackendMode::Unsupported,
+        )),
+        Ok(mode) => Ok(WindowsBackendRequest::Reviewed(mode)),
         Err(_) => Ok(WindowsBackendRequest::Unknown(backend)),
     }
 }
@@ -305,27 +310,36 @@ pub fn windows_service_help_line() -> &'static str {
 }
 
 pub fn windows_service_help_note() -> &'static str {
-    "  windows_service_env=requires RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-unsupported\",...] in the reviewed env-file; windows-unsupported is the only reviewed Windows backend label on the current branch and it remains fail-closed until real Windows dataplane support exists"
+    "  windows_service_env=requires RUSTYNETD_DAEMON_ARGS_JSON=[\"--backend\",\"windows-unsupported\"|\"windows-wireguard-nt\",...] in the reviewed env-file; windows-unsupported remains the explicit fail-closed label, while windows-wireguard-nt is opt-in and still outside release-gated support until measured evidence exists"
 }
 
-pub fn run_windows_service_host(options: WindowsServiceOptions) -> Result<(), String> {
+pub fn run_windows_service_host(
+    options: WindowsServiceOptions,
+    daemon_runner: WindowsDaemonArgsRunner,
+) -> Result<(), String> {
     let prepared = prepare_windows_service_host(&options)?;
-    run_windows_service_host_impl(prepared)
+    run_windows_service_host_impl(prepared, daemon_runner)
 }
 
 #[cfg(not(windows))]
-fn run_windows_service_host_impl(_prepared: PreparedWindowsServiceHost) -> Result<(), String> {
+fn run_windows_service_host_impl(
+    _prepared: PreparedWindowsServiceHost,
+    _daemon_runner: WindowsDaemonArgsRunner,
+) -> Result<(), String> {
     Err("--windows-service is only supported on Windows SCM hosts".to_string())
 }
 
 #[cfg(windows)]
-fn run_windows_service_host_impl(prepared: PreparedWindowsServiceHost) -> Result<(), String> {
-    windows_only::dispatch(prepared)
+fn run_windows_service_host_impl(
+    prepared: PreparedWindowsServiceHost,
+    daemon_runner: WindowsDaemonArgsRunner,
+) -> Result<(), String> {
+    windows_only::dispatch(prepared, daemon_runner)
 }
 
 #[cfg(windows)]
 mod windows_only {
-    use super::PreparedWindowsServiceHost;
+    use super::{PreparedWindowsServiceHost, WindowsDaemonArgsRunner};
     use std::ffi::OsString;
     use std::sync::OnceLock;
     use std::time::Duration;
@@ -336,14 +350,25 @@ mod windows_only {
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
 
-    static WINDOWS_SERVICE_HOST: OnceLock<PreparedWindowsServiceHost> = OnceLock::new();
+    struct WindowsServiceHostState {
+        prepared: PreparedWindowsServiceHost,
+        daemon_runner: WindowsDaemonArgsRunner,
+    }
+
+    static WINDOWS_SERVICE_HOST: OnceLock<WindowsServiceHostState> = OnceLock::new();
 
     define_windows_service!(ffi_windows_service_main, windows_service_main);
 
-    pub(super) fn dispatch(prepared: PreparedWindowsServiceHost) -> Result<(), String> {
+    pub(super) fn dispatch(
+        prepared: PreparedWindowsServiceHost,
+        daemon_runner: WindowsDaemonArgsRunner,
+    ) -> Result<(), String> {
         let service_name = prepared.service_name.clone();
         WINDOWS_SERVICE_HOST
-            .set(prepared)
+            .set(WindowsServiceHostState {
+                prepared,
+                daemon_runner,
+            })
             .map_err(|_| "windows service host already initialized in this process".to_string())?;
         service_dispatcher::start(service_name.as_str(), ffi_windows_service_main)
             .map_err(|err| format!("failed to dispatch Windows service host: {err}"))
@@ -356,9 +381,10 @@ mod windows_only {
     }
 
     fn run_service_main() -> Result<(), String> {
-        let prepared = WINDOWS_SERVICE_HOST
+        let state = WINDOWS_SERVICE_HOST
             .get()
             .ok_or_else(|| "missing Windows service host configuration".to_string())?;
+        let prepared = &state.prepared;
         let status_handle = service_control_handler::register(
             prepared.service_name.as_str(),
             move |control_event| match control_event {
@@ -384,20 +410,48 @@ mod windows_only {
                 format!("failed to report Windows service start-pending status: {err}")
             })?;
 
-        let blocker = prepared.backend_request.blocker_reason();
+        if let Some(blocker) = prepared.backend_request.blocker_reason() {
+            status_handle
+                .set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(1),
+                    checkpoint: 0,
+                    wait_hint: Duration::default(),
+                    process_id: None,
+                })
+                .map_err(|err| format!("failed to report Windows service stopped status: {err}"))?;
+            return Err(blocker);
+        }
+
+        status_handle
+            .set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })
+            .map_err(|err| format!("failed to report Windows service running status: {err}"))?;
+
+        let result = (state.daemon_runner)(&prepared.daemon_args);
+        let exit_code = if result.is_ok() { 0 } else { 1 };
         status_handle
             .set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Stopped,
                 controls_accepted: ServiceControlAccept::empty(),
-                exit_code: ServiceExitCode::Win32(1),
+                exit_code: ServiceExitCode::Win32(exit_code),
                 checkpoint: 0,
                 wait_hint: Duration::default(),
                 process_id: None,
             })
             .map_err(|err| format!("failed to report Windows service stopped status: {err}"))?;
 
-        Err(blocker)
+        result
     }
 }
 
@@ -526,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_windows_backend_request_marks_unknown_windows_label_as_unreviewed() {
+    fn classify_windows_backend_request_accepts_reviewed_wireguard_nt_label() {
         let request = classify_windows_backend_request(&[
             "--backend".to_string(),
             "windows-wireguard-nt".to_string(),
@@ -534,7 +588,7 @@ mod tests {
         .expect("backend classification should parse");
         assert_eq!(
             request,
-            WindowsBackendRequest::Unknown("windows-wireguard-nt".to_string())
+            WindowsBackendRequest::Reviewed(WindowsBackendMode::WireguardNt)
         );
     }
 
@@ -553,7 +607,7 @@ mod tests {
             env_file: PathBuf::from("relative.env"),
         })
         .expect_err("relative env-file path should fail");
-        assert!(err.contains("must be absolute"));
+        assert!(err.contains("absolute Windows path"));
     }
 
     #[test]

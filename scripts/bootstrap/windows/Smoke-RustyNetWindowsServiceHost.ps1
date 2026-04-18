@@ -126,7 +126,7 @@ function Remove-SmokeService {
     throw "service ${ServiceName} is still present after delete"
 }
 
-$smokeRoot = Join-Path $StateRoot 'smoke-host'
+$smokeRoot = Join-Path (Join-Path $StateRoot 'config') 'smoke-host'
 $serviceSmokeRoot = Join-Path $smokeRoot $ServiceName
 $daemonPath = Join-Path $RustyNetRoot 'target\release\rustynetd.exe'
 $configPath = Join-Path $serviceSmokeRoot 'rustynetd.env'

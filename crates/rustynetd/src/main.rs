@@ -27,8 +27,11 @@ use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
 use rustynetd::windows_backend_gate::{
-    WINDOWS_UNSUPPORTED_BACKEND_LABEL, parse_windows_backend_mode,
+    WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
+    parse_windows_backend_mode,
 };
+#[cfg(windows)]
+use rustynetd::windows_runtime_boundary::run_windows_runtime_boundary_check;
 use rustynetd::windows_service::{
     HostEntrySelection, run_windows_service_host, select_host_entry, windows_service_help_line,
     windows_service_help_note,
@@ -54,7 +57,9 @@ fn run() -> Result<(), String> {
     }
 
     match select_host_entry(&args)? {
-        HostEntrySelection::WindowsService(options) => run_windows_service_host(options),
+        HostEntrySelection::WindowsService(options) => {
+            run_windows_service_host(options, run_service_daemon_args)
+        }
         HostEntrySelection::Standard(selected_args) => match selected_args.as_slice() {
             [flag, output_path] if flag == "--emit-phase1-baseline" => {
                 perf::write_phase1_baseline_report(output_path)?;
@@ -68,9 +73,17 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
             [cmd, rest @ ..] if cmd == "key" => run_key_command(rest),
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
+            [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
+                run_windows_runtime_boundary_check_command(rest)
+            }
             _ => Err(help_text()),
         },
     }
+}
+
+fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
+    let config = parse_daemon_config(args)?;
+    run_daemon(config).map_err(|err| err.to_string())
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
@@ -138,6 +151,53 @@ fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {
     run_privileged_helper(config)
 }
 
+fn run_windows_runtime_boundary_check_command(args: &[String]) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        return Err(
+            "windows-runtime-boundary-check is only available on Windows hosts".to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        let mut state_root = PathBuf::from(r"C:\ProgramData\RustyNet");
+        let mut index = 0usize;
+        while index < args.len() {
+            match args.get(index).map(String::as_str) {
+                Some("--state-root") => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--state-root requires a value".to_string())?;
+                    state_root = PathBuf::from(value);
+                    index += 2;
+                }
+                Some(flag) => {
+                    return Err(format!(
+                        "unknown windows-runtime-boundary-check argument: {flag}"
+                    ));
+                }
+                None => break,
+            }
+        }
+        let report = run_windows_runtime_boundary_check(state_root.as_path())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|err| format!("serialize runtime-boundary report failed: {err}"))?
+        );
+        Ok(())
+    }
+}
+
+fn ensure_cli_path_absolute(path: &str, label: &str) -> Result<(), String> {
+    if std::path::Path::new(path).is_absolute() {
+        return Ok(());
+    }
+    Err(format!("{label} must be absolute: {path}"))
+}
+
 fn run_key_init(args: &[String]) -> Result<(), String> {
     let mut runtime_path = DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH.to_string();
     let mut encrypted_path = DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string();
@@ -185,16 +245,10 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
         }
     }
 
-    for path in [
-        &runtime_path,
-        &encrypted_path,
-        &public_path,
-        &passphrase_path,
-    ] {
-        if !path.starts_with('/') {
-            return Err(format!("path must be absolute: {path}"));
-        }
-    }
+    ensure_cli_path_absolute(&runtime_path, "path")?;
+    ensure_cli_path_absolute(&encrypted_path, "path")?;
+    ensure_cli_path_absolute(&public_path, "path")?;
+    ensure_cli_path_absolute(&passphrase_path, "path")?;
 
     initialize_encrypted_key_material(
         std::path::Path::new(&runtime_path),
@@ -270,17 +324,11 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
         return Err("--existing-private-key is required".to_string());
     }
 
-    for path in [
-        &existing_private_key_path,
-        &runtime_path,
-        &encrypted_path,
-        &public_path,
-        &passphrase_path,
-    ] {
-        if !path.starts_with('/') {
-            return Err(format!("path must be absolute: {path}"));
-        }
-    }
+    ensure_cli_path_absolute(&existing_private_key_path, "path")?;
+    ensure_cli_path_absolute(&runtime_path, "path")?;
+    ensure_cli_path_absolute(&encrypted_path, "path")?;
+    ensure_cli_path_absolute(&public_path, "path")?;
+    ensure_cli_path_absolute(&passphrase_path, "path")?;
 
     migrate_existing_private_key_material(
         std::path::Path::new(&existing_private_key_path),
@@ -327,9 +375,7 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
     if passphrase_path.is_empty() {
         return Err("--passphrase-file is required".to_string());
     }
-    if !passphrase_path.starts_with('/') {
-        return Err(format!("path must be absolute: {passphrase_path}"));
-    }
+    ensure_cli_path_absolute(&passphrase_path, "path")?;
 
     store_passphrase_in_os_secure_store(
         std::path::Path::new(&passphrase_path),
@@ -666,13 +712,17 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     "macos-wireguard-userspace-shared" => {
                         DaemonBackendMode::MacosWireguardUserspaceShared
                     }
-                    WINDOWS_UNSUPPORTED_BACKEND_LABEL => {
+                    WINDOWS_UNSUPPORTED_BACKEND_LABEL | WINDOWS_WIREGUARD_NT_BACKEND_LABEL => {
                         parse_windows_backend_mode(value.as_str())?;
-                        DaemonBackendMode::WindowsUnsupported
+                        if value == WINDOWS_UNSUPPORTED_BACKEND_LABEL {
+                            DaemonBackendMode::WindowsUnsupported
+                        } else {
+                            DaemonBackendMode::WindowsWireguardNt
+                        }
                     }
                     _ => {
                         return Err(format!(
-                            "invalid backend value: expected linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, macos-wireguard-userspace-shared, or {WINDOWS_UNSUPPORTED_BACKEND_LABEL}"
+                            "invalid backend value: expected linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, macos-wireguard-userspace-shared, {WINDOWS_UNSUPPORTED_BACKEND_LABEL}, or {WINDOWS_WIREGUARD_NT_BACKEND_LABEL}"
                         ));
                     }
                 };
@@ -1000,31 +1050,20 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         }
     }
 
-    if !snapshot_path.starts_with('/') {
-        return Err(format!("snapshot path must be absolute: {snapshot_path}"));
-    }
-    if !log_path.starts_with('/') {
-        return Err(format!("log path must be absolute: {log_path}"));
-    }
-    if !watermark_path.starts_with('/') {
-        return Err(format!("watermark path must be absolute: {watermark_path}"));
-    }
-    if !owner_signing_key_path.starts_with('/') {
-        return Err(format!(
-            "owner signing key path must be absolute: {owner_signing_key_path}"
-        ));
-    }
+    ensure_cli_path_absolute(&snapshot_path, "snapshot path")?;
+    ensure_cli_path_absolute(&log_path, "log path")?;
+    ensure_cli_path_absolute(&watermark_path, "watermark path")?;
+    ensure_cli_path_absolute(&owner_signing_key_path, "owner signing key path")?;
     let owner_signing_key_passphrase_path =
         owner_signing_key_passphrase_path.ok_or_else(|| {
             format!(
                 "owner signing key passphrase path is required; pass --owner-signing-key-passphrase-file or set {MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV}",
             )
         })?;
-    if !owner_signing_key_passphrase_path.starts_with('/') {
-        return Err(format!(
-            "owner signing key passphrase path must be absolute: {owner_signing_key_passphrase_path}"
-        ));
-    }
+    ensure_cli_path_absolute(
+        &owner_signing_key_passphrase_path,
+        "owner signing key passphrase path",
+    )?;
 
     if !force
         && (std::path::Path::new(&snapshot_path).exists()
@@ -1228,12 +1267,13 @@ fn help_text() -> String {
     [
         "rustynetd usage:",
         windows_service_help_line(),
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
+        "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
@@ -1329,6 +1369,7 @@ mod tests {
         assert!(help.contains("--env-file"));
         assert!(help.contains("RUSTYNETD_DAEMON_ARGS_JSON"));
         assert!(help.contains("windows-unsupported"));
+        assert!(help.contains("windows-wireguard-nt"));
     }
 
     #[test]
@@ -1562,11 +1603,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_daemon_config_rejects_unknown_windows_backend_value() {
-        let err =
+    fn parse_daemon_config_accepts_windows_wireguard_nt_backend_value() {
+        let windows =
             parse_daemon_config(&["--backend".to_string(), "windows-wireguard-nt".to_string()])
-                .expect_err("unknown windows backend should fail");
+                .expect("reviewed windows backend should parse");
+        assert_eq!(windows.backend_mode, DaemonBackendMode::WindowsWireguardNt);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_unknown_windows_backend_value() {
+        let err = parse_daemon_config(&[
+            "--backend".to_string(),
+            "windows-wireguard-nt-typo".to_string(),
+        ])
+        .expect_err("unknown windows backend should fail");
         assert!(err.contains("windows-unsupported"));
+        assert!(err.contains("windows-wireguard-nt"));
     }
 
     #[test]

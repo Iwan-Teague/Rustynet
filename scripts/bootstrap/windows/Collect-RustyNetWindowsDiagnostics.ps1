@@ -42,6 +42,14 @@ function Write-CommandOutput {
     Write-Utf8File -Path $Path -Content $content
 }
 
+function Write-JsonFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Value
+    )
+    $Value | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath $Path
+}
+
 function Get-HashEntries {
     param([string[]]$Paths)
     $entries = @()
@@ -95,11 +103,73 @@ function Write-AclSnapshot {
     }
 }
 
+function Invoke-Sc {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $output = (& sc.exe @Arguments 2>&1 | Out-String)
+    return [ordered]@{
+        exit_code = $LASTEXITCODE
+        output = $output.Trim()
+    }
+}
+
+function Get-WindowsTargetFacts {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $buildNumber = if ($os) { [int]$os.BuildNumber } else { 0 }
+    return [ordered]@{
+        caption = if ($os) { [string]$os.Caption } else { '' }
+        version = if ($os) { [string]$os.Version } else { '' }
+        build_number = $buildNumber
+        architecture = if ($os) { [string]$os.OSArchitecture } elseif ($computer) { [string]$computer.SystemType } else { '' }
+        windows_11_target = [bool]($buildNumber -ge 22000)
+        elevated_admin = [bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+}
+
+function Invoke-WindowsRuntimeBoundaryCheck {
+    param(
+        [Parameter(Mandatory = $true)][string]$DaemonPath,
+        [Parameter(Mandatory = $true)][string]$StateRoot
+    )
+    if (-not (Test-Path -LiteralPath $DaemonPath)) {
+        return [ordered]@{
+            status = 'not-run'
+            reason = 'daemon-missing'
+        }
+    }
+    $output = (& $DaemonPath windows-runtime-boundary-check --state-root $StateRoot 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        return [ordered]@{
+            status = 'fail'
+            reason = $output.Trim()
+        }
+    }
+    try {
+        return [ordered]@{
+            status = 'pass'
+            report = ($output | ConvertFrom-Json -ErrorAction Stop)
+        }
+    }
+    catch {
+        return [ordered]@{
+            status = 'fail'
+            reason = ('invalid-runtime-boundary-json: ' + $_.Exception.Message)
+            raw = $output.Trim()
+        }
+    }
+}
+
 Ensure-Directory -Path $OutputRoot
+
+$daemonInstallPath = Join-Path $InstallRoot 'bin\rustynetd.exe'
+$configPath = Join-Path $StateRoot 'config\rustynetd.env'
+$runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
+$windowsFacts = Get-WindowsTargetFacts
 
 Write-CommandOutput -Path (Join-Path $OutputRoot 'services.txt') -Script {
     Get-Service | Sort-Object Name | Format-Table -AutoSize
 }
+Write-JsonFile -Path (Join-Path $OutputRoot 'windows_target_facts.json') -Value $windowsFacts
 Write-CommandOutput -Path (Join-Path $OutputRoot 'net-ip.txt') -Script {
     Get-NetIPConfiguration | Format-List *
 }
@@ -135,6 +205,19 @@ Write-CommandOutput -Path (Join-Path $OutputRoot 'events-system.txt') -Script {
 Write-CommandOutput -Path (Join-Path $OutputRoot 'events-application.txt') -Script {
     Get-WinEvent -LogName Application -MaxEvents 100 | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message
 }
+Write-CommandOutput -Path (Join-Path $OutputRoot 'computer-system.txt') -Script {
+    Get-CimInstance -ClassName Win32_ComputerSystem | Format-List *
+}
+Write-CommandOutput -Path (Join-Path $OutputRoot 'operating-system.txt') -Script {
+    Get-CimInstance -ClassName Win32_OperatingSystem | Format-List *
+}
+
+if (Test-Path -LiteralPath $daemonInstallPath) {
+    Write-CommandOutput -Path (Join-Path $OutputRoot 'rustynetd-help.txt') -Script {
+        & $daemonInstallPath --help 2>&1
+    }
+}
+Write-JsonFile -Path (Join-Path $OutputRoot 'runtime-boundary-check.json') -Value $runtimeBoundary
 
 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($service) {
@@ -146,6 +229,9 @@ if ($service) {
     }
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-qfailure.txt') -Script {
         & sc.exe qfailure $ServiceName
+    }
+    Write-CommandOutput -Path (Join-Path $OutputRoot 'service-qsidtype.txt') -Script {
+        & sc.exe qsidtype $ServiceName
     }
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-cim.txt') -Script {
         Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") | Format-List *
@@ -191,7 +277,15 @@ foreach ($path in @(
     'C:\ProgramData\ssh\ssh_host_ed25519_key.pub',
     $InstallRoot,
     (Join-Path $InstallRoot 'bin'),
-    $StateRoot
+    $StateRoot,
+    (Join-Path $StateRoot 'config'),
+    (Join-Path $StateRoot 'logs'),
+    (Join-Path $StateRoot 'trust'),
+    (Join-Path $StateRoot 'keys'),
+    (Join-Path $StateRoot 'membership'),
+    (Join-Path $StateRoot 'secrets'),
+    (Join-Path $StateRoot 'secrets\key-custody'),
+    $configPath
 )) {
     Write-AclSnapshot -TargetPath $path -OutputDirectory $OutputRoot
 }
@@ -214,12 +308,14 @@ $sshAccessState = [ordered]@{
 $sshAccessState | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'ssh_access_state.json')
 
 $manifest = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
     output_root = $OutputRoot
     install_root = $InstallRoot
     state_root = $StateRoot
     service_name = $ServiceName
+    windows_target_facts = $windowsFacts
+    runtime_boundary_status = $runtimeBoundary.status
     omitted_secret_material = @(
         (Join-Path $StateRoot 'config\rustynetd.env'),
         'C:\ProgramData\ssh\ssh_host_ed25519_key'
