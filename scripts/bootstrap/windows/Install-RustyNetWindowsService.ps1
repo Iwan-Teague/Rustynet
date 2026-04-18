@@ -2,7 +2,8 @@ param(
     [string]$RustyNetRoot = 'C:\Rustynet',
     [string]$InstallRoot = 'C:\Program Files\RustyNet',
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
-    [string]$ServiceName = 'RustyNet'
+    [string]$ServiceName = 'RustyNet',
+    [string]$OutputPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -376,4 +377,12 @@ $report = [ordered]@{
     notes = $notes
 }
 
-$report | ConvertTo-Json -Depth 6 | Write-Output
+$json = $report | ConvertTo-Json -Depth 6
+if ($OutputPath) {
+    $outputDirectory = Split-Path -Parent $OutputPath
+    if ($outputDirectory) {
+        Ensure-Directory -Path $outputDirectory
+    }
+    $json | Set-Content -Encoding utf8 -LiteralPath $OutputPath
+}
+$json | Write-Output

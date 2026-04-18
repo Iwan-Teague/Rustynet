@@ -12631,11 +12631,51 @@ fn utm_exec_windows_raw(
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
+        .arg("-OutputFormat")
+        .arg("Text")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-EncodedCommand")
         .arg(encoded);
     run_status_with_timeout(&mut command, timeout)
+}
+
+fn utm_exec_windows_raw_with_output(
+    utm_name: &str,
+    powershell_script: &str,
+    timeout: Duration,
+) -> Result<(ExitStatus, String), String> {
+    ensure_no_control_chars("UTM exec command", powershell_script)?;
+    let encoded = encode_powershell_command(powershell_script)?;
+    let utmctl_path = utmctl_binary_path()?;
+    let mut command = Command::new(utmctl_path);
+    command
+        .arg("exec")
+        .arg(utm_name)
+        .arg("--cmd")
+        .arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-OutputFormat")
+        .arg("Text")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-EncodedCommand")
+        .arg(encoded);
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("UTM Windows stdout was not valid UTF-8: {err}"))?;
+    let stderr = String::from_utf8(output.stderr)
+        .map_err(|err| format!("UTM Windows stderr was not valid UTF-8: {err}"))?;
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    Ok((output.status, combined))
 }
 
 fn execute_utm_remote_powershell_capture(
@@ -12659,16 +12699,28 @@ fn execute_utm_remote_powershell_capture(
         .arg("-NoLogo")
         .arg("-NoProfile")
         .arg("-NonInteractive")
+        .arg("-OutputFormat")
+        .arg("Text")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-EncodedCommand")
         .arg(encoded);
     let output = run_output_with_timeout(&mut command, timeout)?;
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(output.stdout.as_slice())
+            .trim()
+            .to_string();
         let stderr = String::from_utf8_lossy(output.stderr.as_slice())
             .trim()
             .to_string();
-        if stderr.is_empty() {
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            String::new()
+        };
+        if detail.is_empty() {
             return Err(format!(
                 "UTM Windows PowerShell wrapper exited with status {}",
                 status_code(output.status)
@@ -12677,12 +12729,21 @@ fn execute_utm_remote_powershell_capture(
         return Err(format!(
             "UTM Windows PowerShell wrapper exited with status {}: {}",
             status_code(output.status),
-            stderr
+            detail
         ));
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|err| format!("UTM Windows stdout was not valid UTF-8: {err}"))?;
-    parse_utm_windows_capture_output(stdout.as_str())
+    let stderr = String::from_utf8(output.stderr)
+        .map_err(|err| format!("UTM Windows stderr was not valid UTF-8: {err}"))?;
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    parse_utm_windows_capture_output(combined.as_str())
 }
 
 fn build_utm_windows_capture_wrapper_script(powershell_script: &str) -> Result<String, String> {
@@ -12690,6 +12751,7 @@ fn build_utm_windows_capture_wrapper_script(powershell_script: &str) -> Result<S
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
          $rc = 0; \
          $captured = ''; \
          try {{ \
@@ -12835,7 +12897,6 @@ fn build_windows_result_file_helper_invocation_script(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $resultPath = {result_path}; \
-         if (Test-Path -LiteralPath $resultPath) {{ Remove-Item -LiteralPath $resultPath -Force }}; \
          $helperExit = 0; \
          try {{ \
            {helper_command}; \
@@ -15514,6 +15575,7 @@ mod tests {
             "Write-Output 'hello from { braces }'; exit 7",
         )
         .expect("wrapper script should build");
+        assert!(wrapper.contains("$ProgressPreference = 'SilentlyContinue'"));
         assert!(wrapper.contains("FromBase64String"));
         assert!(wrapper.contains("[ScriptBlock]::Create($body)"));
         assert!(wrapper.contains("__RUSTYNET_CAPTURE_RC__="));
@@ -15539,6 +15601,22 @@ mod tests {
         let err = super::parse_utm_windows_capture_output("missing markers")
             .expect_err("missing markers must fail closed");
         assert!(err.contains("missing rc marker"));
+    }
+
+    #[test]
+    fn utm_windows_capture_output_parser_tolerates_non_marker_lines() {
+        use base64::Engine as _;
+
+        let encoded = super::BASE64_STANDARD.encode("{\"status\":\"blocked\"}");
+        let parsed = super::parse_utm_windows_capture_output(
+            format!(
+                "#< CLIXML\nnoise\n__RUSTYNET_CAPTURE_RC__=1\n__RUSTYNET_CAPTURE_STDOUT_BASE64__={encoded}\n"
+            )
+            .as_str(),
+        )
+        .expect("capture output with noise should still parse");
+        assert_eq!(parsed.0, 1);
+        assert_eq!(parsed.1, "{\"status\":\"blocked\"}");
     }
 
     #[test]
@@ -15701,6 +15779,7 @@ mod tests {
         .expect("result-file helper invocation script should build");
         assert!(script.contains("Windows service-host smoke helper did not write result file"));
         assert!(script.contains("Windows service-host smoke helper wrote empty result file"));
+        assert!(!script.contains("Remove-Item -LiteralPath $resultPath -Force"));
     }
 
     #[test]

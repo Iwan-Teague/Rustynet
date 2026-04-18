@@ -38,6 +38,16 @@ fn render_windows_access_gate_error(
     )
 }
 
+fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &RemoteTarget) -> bool {
+    matches!(
+        windows_local_utm_execution_authority(target, false),
+        Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
+    ) && matches!(
+        phase,
+        BootstrapPhase::InstallRelease | BootstrapPhase::VerifyRuntime
+    )
+}
+
 fn format_windows_phase_failure_with_diagnostics(
     err: &str,
     target_label: &str,
@@ -382,6 +392,85 @@ fn build_windows_service_host_smoke_validation_script(
     ))
 }
 
+fn build_windows_runtime_report_validation_script(
+    remote_path: &str,
+    args: &[String],
+    remote_result_path: &str,
+    helper_label: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("Windows runtime helper label", helper_label)?;
+    let mut helper_args = args.to_vec();
+    helper_args.push("-OutputPath".to_string());
+    helper_args.push(remote_result_path.to_string());
+    let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $validationRc = 1; \
+         $validationMessage = ''; \
+         $resultPath = {result_path}; \
+         $resultParent = Split-Path -Path $resultPath -Parent; \
+         if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
+           New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
+         }}; \
+         if (Test-Path -LiteralPath $resultPath) {{ \
+           Remove-Item -LiteralPath $resultPath -Force \
+         }}; \
+         try {{ \
+           {helper_command}; \
+           if (-not (Test-Path -LiteralPath $resultPath)) {{ \
+             $validationMessage = ('{helper_label} did not write result file: {{0}}' -f $resultPath) \
+           }} else {{ \
+             $body = Get-Content -Raw -LiteralPath $resultPath -Encoding UTF8; \
+             if ([string]::IsNullOrWhiteSpace($body)) {{ \
+               $validationMessage = ('{helper_label} wrote empty result file: {{0}}' -f $resultPath) \
+             }} else {{ \
+               $report = $body | ConvertFrom-Json; \
+               if ($report.status -eq 'pass') {{ \
+                 $validationRc = 0 \
+               }} else {{ \
+                 $validationMessage = ('{helper_label} reported status={{0}} reason={{1}} backend_label={{2}} service_status={{3}} start_error={{4}} result_path={{5}}' -f [string]$report.status, [string]$report.reason, [string]$report.backend_label, [string]$report.service_status, [string]$report.start_error, $resultPath) \
+               }} \
+             }} \
+           }} \
+         }} catch {{ \
+           $validationMessage = (($_ | Out-String).Trim()) \
+         }}; \
+         if (-not [string]::IsNullOrWhiteSpace($validationMessage)) {{ Write-Output $validationMessage }}; \
+         Write-Output ('__RUSTYNET_VM_LAB_RC__={{0}}' -f $validationRc); \
+         exit 0",
+        result_path = powershell_quote(remote_result_path)?,
+        helper_command = helper_command,
+        helper_label = helper_label,
+    ))
+}
+
+fn build_windows_diagnostics_validation_script(
+    remote_path: &str,
+    args: &[String],
+    output_root: &str,
+) -> Result<String, String> {
+    let helper_command = build_windows_helper_command(remote_path, args)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $outputRoot = {output_root}; \
+         {helper_command}; \
+         if (-not (Test-Path -LiteralPath $outputRoot)) {{ \
+           throw ('Windows diagnostics helper did not create output root: {{0}}' -f $outputRoot) \
+         }}; \
+         $manifestPath = Join-Path $outputRoot 'manifest.json'; \
+         if (-not (Test-Path -LiteralPath $manifestPath)) {{ \
+           throw ('Windows diagnostics helper did not create manifest: {{0}}' -f $manifestPath) \
+         }}; \
+         $null = Get-Content -Raw -LiteralPath $manifestPath -Encoding UTF8 | ConvertFrom-Json; \
+         exit 0",
+        output_root = powershell_quote(output_root)?,
+        helper_command = helper_command,
+    ))
+}
+
 impl WindowsBootstrapProvider {
     fn helper_context<'a>(
         &self,
@@ -433,12 +522,154 @@ impl WindowsBootstrapProvider {
         .map_err(|err| format!("{label} failed for {}: {err}", target.label))
     }
 
+    fn run_helper_via_local_utm_result_file(
+        &self,
+        target: &RemoteTarget,
+        context: &BootstrapPhaseContext<'_>,
+        invocation: WindowsHelperScriptSpec,
+        label: &str,
+    ) -> Result<(), String> {
+        let helper_context = self.helper_context(target, context);
+        let (utm_name, _) = remote_target_local_utm(helper_context.target).ok_or_else(|| {
+            format!(
+                "{label} requested local UTM result-file mode for non-UTM target {}",
+                target.label
+            )
+        })?;
+        let local_path = windows_helper_script_local_path(invocation.helper_file_name);
+        let remote_path = stage_windows_helper_script_from_path_with_phase(
+            &helper_context,
+            local_path.as_path(),
+            invocation.remote_file_name,
+            RemoteTransportPhase::AccessEstablishment,
+        )?;
+        let remote_result_name = format!(
+            "{}.result.{}.json",
+            sanitize_label_for_path(invocation.remote_file_name),
+            unique_suffix()
+        );
+        let remote_result_path =
+            windows_helper_script_remote_path(helper_context.target, remote_result_name.as_str())?;
+        let validation_script = build_windows_runtime_report_validation_script(
+            remote_path.as_str(),
+            invocation.args.as_slice(),
+            remote_result_path.as_str(),
+            label,
+        )?;
+        let (status, output) = utm_exec_windows_raw_with_output(
+            utm_name,
+            validation_script.as_str(),
+            helper_context.timeout,
+        )
+        .map_err(|err| format!("{label} failed for {}: {err}", target.label))?;
+        let _ = best_effort_remove_windows_local_utm_guest_file(
+            utm_name,
+            remote_result_path.as_str(),
+            Duration::from_secs(20),
+        );
+        let mut validation_rc = None::<i32>;
+        let detail = output
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                if line.is_empty() || line.starts_with("#< CLIXML") {
+                    return None;
+                }
+                if let Some(value) = line.strip_prefix("__RUSTYNET_VM_LAB_RC__=") {
+                    validation_rc = value.trim().parse::<i32>().ok();
+                    return None;
+                }
+                Some(line)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        match validation_rc {
+            Some(0) => Ok(()),
+            Some(_) if !detail.is_empty() => Err(format!(
+                "{label} failed for {}: {} (result_path={})",
+                target.label, detail, remote_result_path
+            )),
+            Some(rc) => Err(format!(
+                "{label} failed for {} with validation rc {} (result_path={})",
+                target.label, rc, remote_result_path
+            )),
+            None if !status.success() => Err(format!(
+                "{label} failed for {} with host status {} and missing validation rc marker (result_path={})",
+                target.label,
+                status_code(status),
+                remote_result_path
+            )),
+            None if !detail.is_empty() => Err(format!(
+                "{label} failed for {} without validation rc marker: {} (result_path={})",
+                target.label, detail, remote_result_path
+            )),
+            None => Err(format!(
+                "{label} failed for {} without validation rc marker (result_path={})",
+                target.label, remote_result_path
+            )),
+        }
+    }
+
     fn collect_failure_diagnostics(
         &self,
         phase: BootstrapPhase,
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
     ) -> Result<String, String> {
+        if matches!(
+            windows_local_utm_execution_authority(target, false),
+            Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
+        ) {
+            let helper_context = self.helper_context(target, context);
+            let invocation = build_windows_diagnostics_invocation(target, phase)?;
+            let remote_path = stage_windows_helper_script_from_path_with_phase(
+                &helper_context,
+                windows_diagnostics_helper_script_local_path().as_path(),
+                invocation.remote_file_name,
+                RemoteTransportPhase::AccessEstablishment,
+            )?;
+            let output_root = invocation
+                .args
+                .chunks(2)
+                .find_map(|chunk| match chunk {
+                    [flag, value] if flag == "-OutputRoot" => Some(value.as_str()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Windows diagnostics invocation did not provide -OutputRoot for {}",
+                        target.label
+                    )
+                })?;
+            let validation_script = build_windows_diagnostics_validation_script(
+                remote_path.as_str(),
+                invocation.args.as_slice(),
+                output_root,
+            )?;
+            let status = run_remote_shell_command_for_target_with_phase(
+                helper_context.target,
+                helper_context.ssh_user_override,
+                helper_context.ssh_identity_file,
+                helper_context.known_hosts_path,
+                validation_script.as_str(),
+                helper_context.timeout,
+                RemoteTransportPhase::AccessEstablishment,
+            )
+            .map_err(|err| {
+                format!(
+                    "Windows diagnostics helper failed for {}: {err}",
+                    target.label
+                )
+            })?;
+            if !status.success() {
+                return Err(format!(
+                    "Windows diagnostics helper failed for {} with status {} (output_root={output_root})",
+                    target.label,
+                    status_code(status)
+                ));
+            }
+            return Ok(output_root.to_string());
+        }
         let invocation = build_windows_diagnostics_invocation(target, phase)?;
         let output =
             self.capture_helper_output(target, context, invocation, "Windows diagnostics helper")?;
@@ -480,7 +711,9 @@ impl WindowsBootstrapProvider {
         target: &RemoteTarget,
         context: &BootstrapPhaseContext<'_>,
     ) -> Result<(), String> {
-        if !phase_requires_proven_access(phase) {
+        if !phase_requires_proven_access(phase)
+            || local_utm_result_file_supported_for_phase(phase, target)
+        {
             return Ok(());
         }
         ensure_windows_runtime_access_ready_for_target(
@@ -586,17 +819,28 @@ impl WindowsBootstrapProvider {
                 }
             }
             BootstrapPhase::InstallRelease => {
-                let output = self.capture_helper_output(
-                    target,
-                    context,
-                    build_windows_service_install_invocation(context),
-                    "Windows service install helper",
-                )?;
-                parse_windows_runtime_report_output(
-                    output.as_str(),
-                    "Windows service install helper",
-                    target.label.as_str(),
-                )
+                let invocation = build_windows_service_install_invocation(context);
+                if local_utm_result_file_supported_for_phase(BootstrapPhase::InstallRelease, target)
+                {
+                    self.run_helper_via_local_utm_result_file(
+                        target,
+                        context,
+                        invocation,
+                        "Windows service install helper",
+                    )
+                } else {
+                    let output = self.capture_helper_output(
+                        target,
+                        context,
+                        invocation,
+                        "Windows service install helper",
+                    )?;
+                    parse_windows_runtime_report_output(
+                        output.as_str(),
+                        "Windows service install helper",
+                        target.label.as_str(),
+                    )
+                }
             }
             BootstrapPhase::RestartRuntime => {
                 capture_remote_shell_command_for_target(
@@ -623,17 +867,28 @@ impl WindowsBootstrapProvider {
                 )
             }
             BootstrapPhase::VerifyRuntime => {
-                let output = self.capture_helper_output(
-                    target,
-                    context,
-                    build_windows_verify_invocation(context),
-                    "Windows verify helper",
-                )?;
-                parse_windows_runtime_report_output(
-                    output.as_str(),
-                    "Windows verify helper",
-                    target.label.as_str(),
-                )
+                let invocation = build_windows_verify_invocation(context);
+                if local_utm_result_file_supported_for_phase(BootstrapPhase::VerifyRuntime, target)
+                {
+                    self.run_helper_via_local_utm_result_file(
+                        target,
+                        context,
+                        invocation,
+                        "Windows verify helper",
+                    )
+                } else {
+                    let output = self.capture_helper_output(
+                        target,
+                        context,
+                        invocation,
+                        "Windows verify helper",
+                    )?;
+                    parse_windows_runtime_report_output(
+                        output.as_str(),
+                        "Windows verify helper",
+                        target.label.as_str(),
+                    )
+                }
             }
             BootstrapPhase::All => {
                 for subphase in [
@@ -880,6 +1135,75 @@ mod tests {
         assert!(phase_requires_proven_access(BootstrapPhase::RestartRuntime));
         assert!(phase_requires_proven_access(BootstrapPhase::VerifyRuntime));
         assert!(!phase_requires_proven_access(BootstrapPhase::All));
+    }
+
+    #[test]
+    fn local_utm_result_file_support_is_limited_to_install_and_verify() {
+        let target = RemoteTarget {
+            label: "windows-utm-1".to_string(),
+            ssh_target: "192.168.64.14".to_string(),
+            ssh_user: Some("Administrator".to_string()),
+            controller: Some(VmController::LocalUtm {
+                utm_name: "Windows".to_string(),
+                bundle_path: std::path::PathBuf::from("/tmp/Windows.utm"),
+            }),
+            platform_profile: default_platform_profile(VmGuestPlatform::Windows),
+            rustynet_src_dir: Some(r"C:\Rustynet".to_string()),
+            remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
+        };
+
+        assert!(local_utm_result_file_supported_for_phase(
+            BootstrapPhase::InstallRelease,
+            &target
+        ));
+        assert!(local_utm_result_file_supported_for_phase(
+            BootstrapPhase::VerifyRuntime,
+            &target
+        ));
+        assert!(!local_utm_result_file_supported_for_phase(
+            BootstrapPhase::RestartRuntime,
+            &target
+        ));
+    }
+
+    #[test]
+    fn windows_diagnostics_validation_script_requires_manifest() {
+        let script = build_windows_diagnostics_validation_script(
+            r"C:\ProgramData\Rustynet\vm-lab\Collect-RustyNetWindowsDiagnostics.ps1",
+            &[
+                "-OutputRoot".to_string(),
+                r"C:\ProgramData\Rustynet\vm-lab\diagnostics\run-1".to_string(),
+            ],
+            r"C:\ProgramData\Rustynet\vm-lab\diagnostics\run-1",
+        )
+        .expect("diagnostics validation script should build");
+
+        assert!(script.contains("manifest.json"));
+        assert!(script.contains("ConvertFrom-Json"));
+        assert!(script.contains("did not create output root"));
+    }
+
+    #[test]
+    fn windows_runtime_report_validation_script_uses_output_path_and_plaintext_errors() {
+        let script = build_windows_runtime_report_validation_script(
+            r"C:\ProgramData\Rustynet\vm-lab\Install-RustyNetWindowsService.ps1",
+            &[
+                "-RustyNetRoot".to_string(),
+                r"C:\Rustynet".to_string(),
+                "-InstallRoot".to_string(),
+                r"C:\Program Files\RustyNet".to_string(),
+            ],
+            r"C:\ProgramData\Rustynet\vm-lab\install-report.json",
+            "Windows service install helper",
+        )
+        .expect("runtime report validation script should build");
+
+        assert!(script.contains("$ProgressPreference = 'SilentlyContinue'"));
+        assert!(script.contains("-OutputPath"));
+        assert!(script.contains("did not write result file"));
+        assert!(script.contains("reported status={0} reason={1} backend_label={2}"));
+        assert!(script.contains("Write-Output"));
+        assert!(script.contains("__RUSTYNET_VM_LAB_RC__="));
     }
 
     #[test]
