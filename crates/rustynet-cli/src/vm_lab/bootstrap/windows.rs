@@ -44,7 +44,9 @@ fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &Rem
         Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
     ) && matches!(
         phase,
-        BootstrapPhase::InstallRelease | BootstrapPhase::VerifyRuntime
+        BootstrapPhase::InstallRelease
+            | BootstrapPhase::RestartRuntime
+            | BootstrapPhase::VerifyRuntime
     )
 }
 
@@ -556,10 +558,14 @@ impl WindowsBootstrapProvider {
             remote_result_path.as_str(),
             label,
         )?;
-        let (status, output) = utm_exec_windows_raw_with_output(
-            utm_name,
+        let output = capture_remote_shell_command_for_target_with_phase(
+            helper_context.target,
+            helper_context.ssh_user_override,
+            helper_context.ssh_identity_file,
+            helper_context.known_hosts_path,
             validation_script.as_str(),
             helper_context.timeout,
+            RemoteTransportPhase::AccessEstablishment,
         )
         .map_err(|err| format!("{label} failed for {}: {err}", target.label))?;
         let _ = best_effort_remove_windows_local_utm_guest_file(
@@ -592,12 +598,6 @@ impl WindowsBootstrapProvider {
             Some(rc) => Err(format!(
                 "{label} failed for {} with validation rc {} (result_path={})",
                 target.label, rc, remote_result_path
-            )),
-            None if !status.success() => Err(format!(
-                "{label} failed for {} with host status {} and missing validation rc marker (result_path={})",
-                target.label,
-                status_code(status),
-                remote_result_path
             )),
             None if !detail.is_empty() => Err(format!(
                 "{label} failed for {} without validation rc marker: {} (result_path={})",
@@ -843,13 +843,22 @@ impl WindowsBootstrapProvider {
                 }
             }
             BootstrapPhase::RestartRuntime => {
-                capture_remote_shell_command_for_target(
+                let phase = if local_utm_result_file_supported_for_phase(
+                    BootstrapPhase::RestartRuntime,
+                    target,
+                ) {
+                    RemoteTransportPhase::AccessEstablishment
+                } else {
+                    RemoteTransportPhase::PostBootstrap
+                };
+                capture_remote_shell_command_for_target_with_phase(
                     target,
                     context.ssh_user,
                     context.ssh_identity_file,
                     context.known_hosts_path,
                     build_windows_restart_runtime_script()?.as_str(),
                     context.timeout,
+                    phase,
                 )
                 .map_err(|err| {
                     format!("Windows restart-runtime failed for {}: {err}", target.label)
@@ -1138,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn local_utm_result_file_support_is_limited_to_install_and_verify() {
+    fn local_utm_result_file_support_covers_runtime_phases_on_windows_local_utm() {
         let target = RemoteTarget {
             label: "windows-utm-1".to_string(),
             ssh_target: "192.168.64.14".to_string(),
@@ -1157,11 +1166,11 @@ mod tests {
             &target
         ));
         assert!(local_utm_result_file_supported_for_phase(
-            BootstrapPhase::VerifyRuntime,
+            BootstrapPhase::RestartRuntime,
             &target
         ));
-        assert!(!local_utm_result_file_supported_for_phase(
-            BootstrapPhase::RestartRuntime,
+        assert!(local_utm_result_file_supported_for_phase(
+            BootstrapPhase::VerifyRuntime,
             &target
         ));
     }

@@ -8,10 +8,27 @@ use crate::windows_paths::validate_windows_runtime_file_path;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_WINDOWS_SERVICE_NAME: &str = "RustyNet";
 const WINDOWS_SERVICE_DAEMON_ARGS_ENV: &str = "RUSTYNETD_DAEMON_ARGS_JSON";
 const MAX_WINDOWS_ENV_FILE_BYTES: usize = 64 * 1024;
+#[cfg_attr(not(windows), allow(dead_code))]
+static WINDOWS_SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn reset_windows_service_stop_requested() {
+    WINDOWS_SERVICE_STOP_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn request_windows_service_stop() {
+    WINDOWS_SERVICE_STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn windows_service_stop_requested() -> bool {
+    WINDOWS_SERVICE_STOP_REQUESTED.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsServiceOptions {
@@ -385,10 +402,16 @@ mod windows_only {
             .get()
             .ok_or_else(|| "missing Windows service host configuration".to_string())?;
         let prepared = &state.prepared;
+        super::reset_windows_service_stop_requested();
         let status_handle = service_control_handler::register(
             prepared.service_name.as_str(),
             move |control_event| match control_event {
                 windows_service::service::ServiceControl::Interrogate => {
+                    ServiceControlHandlerResult::NoError
+                }
+                windows_service::service::ServiceControl::Stop
+                | windows_service::service::ServiceControl::Shutdown => {
+                    super::request_windows_service_stop();
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -429,7 +452,7 @@ mod windows_only {
             .set_service_status(ServiceStatus {
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: ServiceState::Running,
-                controls_accepted: ServiceControlAccept::empty(),
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
                 exit_code: ServiceExitCode::Win32(0),
                 checkpoint: 0,
                 wait_hint: Duration::default(),
@@ -437,7 +460,33 @@ mod windows_only {
             })
             .map_err(|err| format!("failed to report Windows service running status: {err}"))?;
 
-        let result = (state.daemon_runner)(&prepared.daemon_args);
+        let daemon_runner = state.daemon_runner;
+        let daemon_args = prepared.daemon_args.clone();
+        let daemon_thread = std::thread::spawn(move || daemon_runner(&daemon_args));
+        let mut stop_pending_reported = false;
+        while !daemon_thread.is_finished() {
+            if super::windows_service_stop_requested() && !stop_pending_reported {
+                status_handle
+                    .set_service_status(ServiceStatus {
+                        service_type: ServiceType::OWN_PROCESS,
+                        current_state: ServiceState::StopPending,
+                        controls_accepted: ServiceControlAccept::empty(),
+                        exit_code: ServiceExitCode::Win32(0),
+                        checkpoint: 1,
+                        wait_hint: Duration::from_secs(20),
+                        process_id: None,
+                    })
+                    .map_err(|err| {
+                        format!("failed to report Windows service stop-pending status: {err}")
+                    })?;
+                stop_pending_reported = true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        let result = daemon_thread
+            .join()
+            .map_err(|_| "rustynetd Windows service daemon thread panicked".to_string())?;
         let exit_code = if result.is_ok() { 0 } else { 1 };
         status_handle
             .set_service_status(ServiceStatus {
@@ -614,5 +663,15 @@ mod tests {
     fn windows_service_help_strings_are_present() {
         assert!(windows_service_help_line().contains("--windows-service"));
         assert!(windows_service_help_note().contains(WINDOWS_SERVICE_DAEMON_ARGS_ENV));
+    }
+
+    #[test]
+    fn windows_service_stop_flag_round_trips() {
+        reset_windows_service_stop_requested();
+        assert!(!windows_service_stop_requested());
+        request_windows_service_stop();
+        assert!(windows_service_stop_requested());
+        reset_windows_service_stop_requested();
+        assert!(!windows_service_stop_requested());
     }
 }

@@ -7103,6 +7103,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         let mut dns_buffer = [0u8; 1536];
 
         loop {
+            if crate::windows_service::windows_service_stop_requested() {
+                runtime.controller.shutdown().map_err(|err| {
+                    DaemonError::State(format!(
+                        "windows service stop-triggered shutdown failed: {err}"
+                    ))
+                })?;
+                break;
+            }
+
             let mut processed_io = false;
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {

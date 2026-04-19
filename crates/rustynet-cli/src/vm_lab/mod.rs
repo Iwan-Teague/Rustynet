@@ -5,13 +5,11 @@ mod bootstrap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +17,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::env_file::{format_env_assignment, parse_env_value};
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use base64::prelude::*;
-use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -57,10 +54,6 @@ const WINDOWS_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsServic
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
-const WINDOWS_LOCAL_UTM_CALLBACK_PATH: &str = "/rustynet/windows-local-utm-result";
-const WINDOWS_LOCAL_UTM_CALLBACK_BODY_MAX_BYTES: usize = 128 * 1024;
-const WINDOWS_LOCAL_UTM_CALLBACK_GRACE_SECS: u64 = 5;
-const WINDOWS_LOCAL_UTM_CALLBACK_POLL_MILLIS: u64 = 50;
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
 const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
@@ -2180,20 +2173,11 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 Some(ProbeState::Missing {
                     reason: "process-not-ready".to_string(),
                 })
-            } else if let Some(ip) = live_ip.as_deref() {
-                match ip.parse::<Ipv4Addr>() {
-                    Ok(ipv4) => Some(probe_windows_local_utm_ssh_readiness(
-                        utm_name.as_str(),
-                        ipv4,
-                        timeout,
-                    )),
-                    Err(err) => Some(ProbeState::Error {
-                        reason: format!(
-                            "Windows SSH readiness probe requires an IPv4 live IP for {}: {err}",
-                            utm_name
-                        ),
-                    }),
-                }
+            } else if live_ip.is_some() {
+                Some(probe_windows_local_utm_ssh_readiness(
+                    utm_name.as_str(),
+                    timeout,
+                ))
             } else {
                 Some(ProbeState::Missing {
                     reason: "live-ip-not-authoritative".to_string(),
@@ -6693,410 +6677,117 @@ fn windows_discovery_known_hosts_state(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct WindowsLocalUtmHttpRequest {
-    token: String,
-    body: Vec<u8>,
-}
-
-struct WindowsLocalUtmCallbackServer {
-    callback_url: String,
-    callback_token: String,
-    receiver: mpsc::Receiver<Result<String, String>>,
-    join_handle: thread::JoinHandle<()>,
-}
-
-impl WindowsLocalUtmCallbackServer {
-    fn start(guest_ip: Ipv4Addr, label: &str, timeout: Duration) -> Result<Self, String> {
-        let callback_host_ip = resolve_windows_local_utm_callback_host_ipv4(guest_ip)?;
-        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-            .map_err(|err| format!("bind Windows local UTM callback listener failed: {err}"))?;
-        listener.set_nonblocking(true).map_err(|err| {
-            format!("configure Windows local UTM callback listener failed: {err}")
-        })?;
-        let callback_port = listener
-            .local_addr()
-            .map_err(|err| {
-                format!("read Windows local UTM callback listener address failed: {err}")
-            })?
-            .port();
-        let callback_token = generate_windows_local_utm_callback_token()?;
-        let callback_url = format!(
-            "http://{}:{}{}",
-            callback_host_ip, callback_port, WINDOWS_LOCAL_UTM_CALLBACK_PATH
-        );
-        let label = label.to_string();
-        let callback_token_for_thread = callback_token.clone();
-        let callback_url_for_thread = callback_url.clone();
-        let (sender, receiver) = mpsc::channel();
-        let join_handle = thread::spawn(move || {
-            let deadline = Instant::now() + timeout;
-            let result = wait_for_windows_local_utm_callback_request(
-                listener,
-                callback_token_for_thread.as_str(),
-                callback_url_for_thread.as_str(),
-                deadline,
-                label.as_str(),
-            );
-            let _ = sender.send(result);
-        });
-        Ok(Self {
-            callback_url,
-            callback_token,
-            receiver,
-            join_handle,
-        })
-    }
-
-    fn callback_url(&self) -> &str {
-        self.callback_url.as_str()
-    }
-
-    fn callback_token(&self) -> &str {
-        self.callback_token.as_str()
-    }
-
-    fn wait(self, grace: Duration) -> Result<String, String> {
-        let WindowsLocalUtmCallbackServer {
-            callback_url,
-            receiver,
-            join_handle,
-            ..
-        } = self;
-        let recv_result = receiver.recv_timeout(grace).map_err(|err| match err {
-            mpsc::RecvTimeoutError::Timeout => format!(
-                "timed out waiting for Windows local UTM callback at {}",
-                callback_url
-            ),
-            mpsc::RecvTimeoutError::Disconnected => format!(
-                "Windows local UTM callback listener stopped before a result arrived: {}",
-                callback_url
-            ),
-        })?;
-        let _ = join_handle.join();
-        recv_result
-    }
-}
-
-fn generate_windows_local_utm_callback_token() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|err| format!("generate Windows local UTM callback token failed: {err}"))?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut token, "{byte:02x}")
-            .map_err(|err| format!("render Windows local UTM callback token failed: {err}"))?;
-    }
-    Ok(token)
-}
-
-fn resolve_windows_local_utm_guest_ipv4(target: &RemoteTarget) -> Result<Ipv4Addr, String> {
-    if let Some((utm_name, _)) = remote_target_local_utm(target) {
-        let utmctl_path = default_utmctl_path();
-        if let Some(ip) =
-            resolve_local_utm_live_host_by_name(utm_name, None, None, utmctl_path.as_path())
-            && let Ok(ipv4) = ip.parse::<Ipv4Addr>()
-        {
-            return Ok(ipv4);
-        }
-    }
-    ssh_target_host(target.ssh_target.as_str())
-        .parse::<Ipv4Addr>()
-        .map_err(|err| {
-            format!(
-                "resolve Windows local UTM guest IPv4 failed for {} (target={}): {err}",
-                target.label, target.ssh_target
-            )
-        })
-}
-
-fn resolve_windows_local_utm_callback_host_ipv4(guest_ip: Ipv4Addr) -> Result<Ipv4Addr, String> {
-    match guest_ip.octets() {
-        [192, 168, 64, _] => Ok(Ipv4Addr::new(192, 168, 64, 1)),
-        _ => Err(format!(
-            "Windows local UTM callback requires the shared 192.168.64.0/24 guest subnet, got {guest_ip}"
-        )),
-    }
-}
-
-fn find_http_header_terminator(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn parse_windows_local_utm_http_request(
-    request_bytes: &[u8],
-    max_body_bytes: usize,
-) -> Result<WindowsLocalUtmHttpRequest, String> {
-    let header_end = find_http_header_terminator(request_bytes)
-        .ok_or_else(|| "HTTP request was missing a header terminator".to_string())?;
-    let header_text = std::str::from_utf8(&request_bytes[..header_end])
-        .map_err(|err| format!("HTTP request headers were not valid UTF-8: {err}"))?;
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "HTTP request was missing a request line".to_string())?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or_default();
-    let path = request_parts.next().unwrap_or_default();
-    if method != "POST" {
-        return Err(format!("HTTP request used unsupported method {method}"));
-    }
-    if path != WINDOWS_LOCAL_UTM_CALLBACK_PATH {
-        return Err(format!("HTTP request used unexpected callback path {path}"));
-    }
-    let mut content_length = None;
-    let mut token = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let lowered = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match lowered.as_str() {
-            "content-length" => {
-                content_length = Some(value.parse::<usize>().map_err(|err| {
-                    format!("HTTP request content-length was not a valid integer: {err}")
-                })?);
-            }
-            "x-rustynet-token" => {
-                token = Some(value.to_string());
-            }
-            _ => {}
-        }
-    }
-    let content_length =
-        content_length.ok_or_else(|| "HTTP request was missing content-length".to_string())?;
-    if content_length == 0 {
-        return Err("HTTP request body was empty".to_string());
-    }
-    if content_length > max_body_bytes {
-        return Err(format!(
-            "HTTP request body exceeded the {max_body_bytes}-byte limit"
-        ));
-    }
-    let body_start = header_end + 4;
-    let body_end = body_start + content_length;
-    if request_bytes.len() < body_end {
-        return Err("HTTP request body was truncated".to_string());
-    }
-    let token =
-        token.ok_or_else(|| "HTTP request was missing X-RustyNet-Token header".to_string())?;
-    Ok(WindowsLocalUtmHttpRequest {
-        token,
-        body: request_bytes[body_start..body_end].to_vec(),
-    })
-}
-
-fn read_windows_local_utm_http_request(
-    stream: &mut TcpStream,
-    max_body_bytes: usize,
-) -> Result<WindowsLocalUtmHttpRequest, String> {
-    let mut request_bytes = Vec::with_capacity(4096);
-    let mut header_end = None;
-    while header_end.is_none() {
-        let mut chunk = [0u8; 1024];
-        let read_size = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("read Windows local UTM callback request failed: {err}"))?;
-        if read_size == 0 {
-            return Err(
-                "Windows local UTM callback connection closed before request headers arrived"
-                    .to_string(),
-            );
-        }
-        request_bytes.extend_from_slice(&chunk[..read_size]);
-        if request_bytes.len() > 32 * 1024 {
-            return Err(
-                "Windows local UTM callback headers exceeded the 32768-byte limit".to_string(),
-            );
-        }
-        header_end = find_http_header_terminator(&request_bytes);
-    }
-    let header_end = header_end.expect("header_end just checked");
-    let header_text = std::str::from_utf8(&request_bytes[..header_end]).map_err(|err| {
-        format!("Windows local UTM callback request headers were not valid UTF-8: {err}")
-    })?;
-    let content_length = header_text
-        .split("\r\n")
-        .skip(1)
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                Some(value.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| "Windows local UTM callback request was missing content-length".to_string())?
-        .parse::<usize>()
-        .map_err(|err| {
-            format!("Windows local UTM callback request content-length was invalid: {err}")
-        })?;
-    if content_length > max_body_bytes {
-        return Err(format!(
-            "Windows local UTM callback body exceeded the {max_body_bytes}-byte limit"
-        ));
-    }
-    let expected_total = header_end + 4 + content_length;
-    while request_bytes.len() < expected_total {
-        let mut chunk = [0u8; 1024];
-        let read_size = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("read Windows local UTM callback body failed: {err}"))?;
-        if read_size == 0 {
-            return Err(
-                "Windows local UTM callback connection closed before request body arrived"
-                    .to_string(),
-            );
-        }
-        request_bytes.extend_from_slice(&chunk[..read_size]);
-    }
-    parse_windows_local_utm_http_request(request_bytes.as_slice(), max_body_bytes)
-}
-
-fn write_windows_local_utm_http_response(
-    stream: &mut TcpStream,
-    status_line: &str,
-    body: &str,
-) -> Result<(), String> {
-    let response = format!(
-        "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream
-        .write_all(response.as_bytes())
-        .map_err(|err| format!("write Windows local UTM callback response failed: {err}"))?;
-    stream
-        .flush()
-        .map_err(|err| format!("flush Windows local UTM callback response failed: {err}"))
-}
-
-fn wait_for_windows_local_utm_callback_request(
-    listener: TcpListener,
-    expected_token: &str,
-    callback_url: &str,
-    deadline: Instant,
+fn pull_windows_local_utm_guest_file_with_retry(
+    utm_name: &str,
+    remote_path: &str,
+    local_path: &Path,
+    timeout: Duration,
     label: &str,
-) -> Result<String, String> {
-    let mut last_malformed_request_error = None::<String>;
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                match read_windows_local_utm_http_request(
-                    &mut stream,
-                    WINDOWS_LOCAL_UTM_CALLBACK_BODY_MAX_BYTES,
-                ) {
-                    Ok(request) if request.token != expected_token => {
-                        let _ = write_windows_local_utm_http_response(
-                            &mut stream,
-                            "HTTP/1.1 403 Forbidden",
-                            "forbidden",
-                        );
-                        continue;
-                    }
-                    Ok(request) => {
-                        let _ = write_windows_local_utm_http_response(
-                            &mut stream,
-                            "HTTP/1.1 200 OK",
-                            "ok",
-                        );
-                        let body = String::from_utf8(request.body).map_err(|err| {
-                            format!(
-                                "{label} callback body from {callback_url} was not valid UTF-8: {err}"
-                            )
-                        })?;
-                        if body.trim().is_empty() {
-                            return Err(format!(
-                                "{label} callback body from {callback_url} was empty"
-                            ));
-                        }
-                        return Ok(body);
-                    }
-                    Err(err) => {
-                        last_malformed_request_error = Some(err);
-                        let _ = write_windows_local_utm_http_response(
-                            &mut stream,
-                            "HTTP/1.1 400 Bad Request",
-                            "bad-request",
-                        );
-                        if Instant::now() >= deadline {
-                            return Err(format!(
-                                "{label} callback at {callback_url} received malformed requests before timeout: {}",
-                                last_malformed_request_error
-                                    .as_deref()
-                                    .unwrap_or("unknown-callback-parse-error")
-                            ));
-                        }
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    if let Some(last_err) = last_malformed_request_error {
-                        return Err(format!(
-                            "{label} callback at {callback_url} rejected guest callback requests before timeout: {last_err}"
-                        ));
-                    }
-                    return Err(format!(
-                        "{label} callback timed out waiting for a guest POST at {callback_url}"
-                    ));
-                }
-                thread::sleep(Duration::from_millis(
-                    WINDOWS_LOCAL_UTM_CALLBACK_POLL_MILLIS,
+) -> Result<(), String> {
+    let max_attempts = timeout.as_secs().max(10);
+    let pull_timeout = timeout.min(Duration::from_secs(20));
+    let mut last_error = None::<String>;
+    for attempt in 1..=max_attempts {
+        let _ = fs::remove_file(local_path);
+        match utm_pull_raw(utm_name, remote_path, local_path, pull_timeout) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = Some(format!(
+                    "{label} file pull exited unsuccessfully for {utm_name}:{remote_path}"
                 ));
+                if !status.success() && attempt == max_attempts {
+                    break;
+                }
             }
             Err(err) => {
-                return Err(format!(
-                    "{label} callback listener failed while waiting on {callback_url}: {err}"
+                last_error = Some(format!(
+                    "{label} file pull failed for {utm_name}:{remote_path}: {err}"
                 ));
             }
         }
+        if attempt < max_attempts {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| format!("{label} file pull failed for {utm_name}:{remote_path}")))
+}
+
+fn read_windows_local_utm_utf8_file(path: &Path, label: &str) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|err| format!("{label} read failed ({}): {err}", path.display()))?;
+    let text =
+        String::from_utf8(bytes).map_err(|err| format!("{label} was not valid UTF-8: {err}"))?;
+    Ok(text.trim_start_matches('\u{feff}').to_string())
+}
+
+fn format_windows_local_utm_result_pull_failure(
+    probe_label: &str,
+    utm_name: &str,
+    host_status: &Result<ExitStatus, String>,
+    pull_error: &str,
+) -> String {
+    match host_status {
+        Err(err) => format!("{probe_label} transport failed for {utm_name}: {err}; {pull_error}"),
+        Ok(status) if !status.success() => {
+            format!("{probe_label} wrapper failed for {utm_name}; {pull_error}")
+        }
+        Ok(_) => format!("{probe_label} result retrieval failed for {utm_name}: {pull_error}"),
     }
 }
 
-fn build_windows_http_json_callback_post_script(
-    callback_url: &str,
-    callback_token: &str,
-    body_expression: &str,
-) -> Result<String, String> {
-    ensure_no_control_chars("Windows local UTM callback URL", callback_url)?;
-    ensure_no_control_chars("Windows local UTM callback token", callback_token)?;
-    Ok(format!(
-        "$callbackUri = {callback_url}; \
-         $callbackToken = {callback_token}; \
-         $callbackBodyText = [string]({body_expression}); \
-         $callbackHeaders = @{{ 'X-RustyNet-Token' = $callbackToken }}; \
-         $null = Invoke-WebRequest -UseBasicParsing -Method POST -Headers $callbackHeaders -ContentType 'application/json; charset=utf-8' -Body $callbackBodyText -TimeoutSec 15 -Uri $callbackUri",
-        callback_url = powershell_quote(callback_url)?,
-        callback_token = powershell_quote(callback_token)?,
-        body_expression = body_expression,
-    ))
-}
-
-fn build_windows_result_file_callback_post_script(
+fn execute_windows_local_utm_result_file_probe<F>(
+    utm_name: &str,
+    probe_label: &str,
+    timeout: Duration,
     remote_result_path: &str,
-    callback_url: &str,
-    callback_token: &str,
-) -> Result<String, String> {
-    Ok(format!(
-        "Set-StrictMode -Version Latest; \
-         $ErrorActionPreference = 'Stop'; \
-         $resultPath = {result_path}; \
-         if (-not (Test-Path -LiteralPath $resultPath)) {{ \
-           throw ('Windows callback result file did not exist: {{0}}' -f $resultPath) \
-         }}; \
-         $body = Get-Content -Raw -LiteralPath $resultPath -Encoding UTF8; \
-         if ([string]::IsNullOrWhiteSpace($body)) {{ \
-           throw ('Windows callback result file was empty: {{0}}' -f $resultPath) \
-         }}; \
-         {callback_post}",
-        result_path = powershell_quote(remote_result_path)?,
-        callback_post =
-            build_windows_http_json_callback_post_script(callback_url, callback_token, "$body")?,
-    ))
+    build_result_script: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
+    let local_root = std::env::temp_dir().join(format!(
+        "rustynet-vm-lab-windows-result-{}",
+        unique_suffix()
+    ));
+    fs::create_dir_all(local_root.as_path()).map_err(|err| {
+        format!(
+            "create local Windows UTM result dir failed ({}): {err}",
+            local_root.display()
+        )
+    })?;
+    let local_result_path = local_root.join("result.json");
+    let result_script = build_result_script(remote_result_path)?;
+    let host_status = utm_exec_windows_raw(utm_name, result_script.as_str(), timeout);
+    let pull_result = pull_windows_local_utm_guest_file_with_retry(
+        utm_name,
+        remote_result_path,
+        local_result_path.as_path(),
+        timeout,
+        probe_label,
+    );
+    let output = match pull_result {
+        Ok(()) => read_windows_local_utm_utf8_file(local_result_path.as_path(), probe_label),
+        Err(pull_error) => Err(format_windows_local_utm_result_pull_failure(
+            probe_label,
+            utm_name,
+            &host_status,
+            pull_error.as_str(),
+        )),
+    };
+    let _ = best_effort_remove_windows_local_utm_guest_file(
+        utm_name,
+        remote_result_path,
+        Duration::from_secs(20),
+    );
+    let _ = fs::remove_dir_all(local_root.as_path());
+    let output = output?;
+    if output.trim().is_empty() {
+        return Err(format!(
+            "{probe_label} result file was empty for {utm_name}: {remote_result_path}"
+        ));
+    }
+    Ok(output)
 }
 
 fn build_windows_ssh_readiness_probe_script() -> String {
@@ -7145,8 +6836,9 @@ fn build_windows_ssh_readiness_result_script(remote_result_path: &str) -> Result
            $decoded = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
            $scriptBlock = [ScriptBlock]::Create($decoded); \
            $body = (& $scriptBlock *>&1 | Out-String); \
-           if ($LASTEXITCODE -ne $null) {{ \
-             $probeExit = [int]$LASTEXITCODE \
+           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
+           if ($null -ne $lastExitCode) {{ \
+             $probeExit = [int]$lastExitCode.Value \
            }} elseif (-not $?) {{ \
              $probeExit = 1 \
            }} \
@@ -7198,46 +6890,6 @@ fn parse_windows_ssh_readiness_probe_output(
     })
 }
 
-fn execute_windows_local_utm_callback_via_result_file<F>(
-    utm_name: &str,
-    guest_ip: Ipv4Addr,
-    probe_label: &str,
-    timeout: Duration,
-    remote_result_path: &str,
-    build_result_script: F,
-) -> Result<String, String>
-where
-    F: FnOnce(&str) -> Result<String, String>,
-{
-    let callback_server = WindowsLocalUtmCallbackServer::start(guest_ip, probe_label, timeout)?;
-    let result_script = build_result_script(remote_result_path)?;
-    let result_status = utm_exec_windows_raw(utm_name, result_script.as_str(), timeout)
-        .map_err(|err| format!("{probe_label} transport failed for {utm_name}: {err}"))?;
-    let callback_script = build_windows_result_file_callback_post_script(
-        remote_result_path,
-        callback_server.callback_url(),
-        callback_server.callback_token(),
-    )?;
-    let callback_status = utm_exec_windows_raw(utm_name, callback_script.as_str(), timeout)
-        .map_err(|err| format!("{probe_label} callback transport failed for {utm_name}: {err}"))?;
-    let callback_wait = callback_server
-        .wait(Duration::from_secs(WINDOWS_LOCAL_UTM_CALLBACK_GRACE_SECS).min(timeout));
-    match callback_wait {
-        Ok(body) => Ok(body),
-        Err(_) if !callback_status.success() => Err(format!(
-            "{probe_label} callback wrapper failed with status {} for {utm_name}",
-            status_code(callback_status)
-        )),
-        Err(_) if !result_status.success() => Err(format!(
-            "{probe_label} wrapper failed with status {} for {utm_name}",
-            status_code(result_status)
-        )),
-        Err(err) => Err(format!(
-            "{probe_label} callback failed for {utm_name}: {err}"
-        )),
-    }
-}
-
 fn best_effort_remove_windows_local_utm_guest_file(
     utm_name: &str,
     remote_path: &str,
@@ -7254,16 +6906,14 @@ fn best_effort_remove_windows_local_utm_guest_file(
 
 fn probe_windows_local_utm_ssh_readiness(
     utm_name: &str,
-    guest_ip: Ipv4Addr,
     timeout: Duration,
 ) -> ProbeState<WindowsSshReadinessProbe> {
     let remote_result_path = format!(
         r"C:\ProgramData\Rustynet\vm-lab\windows-ssh-readiness.{}.json",
         unique_suffix()
     );
-    let output = match execute_windows_local_utm_callback_via_result_file(
+    let output = match execute_windows_local_utm_result_file_probe(
         utm_name,
-        guest_ip,
         "Windows SSH readiness probe",
         timeout,
         remote_result_path.as_str(),
@@ -11666,7 +11316,8 @@ fn run_remote_shell_command_for_target_with_phase(
                 target,
                 phase,
                 "UTM guest exec",
-                utm_exec_windows_raw(utm_name, remote_script, timeout),
+                execute_utm_remote_powershell_capture(utm_name, remote_script, timeout)
+                    .map(|(rc, _output)| synthetic_exit_status(rc)),
                 |utm_err| {
                     fallback_remote_shell_command_to_ssh(
                         target,
@@ -12529,8 +12180,7 @@ fn build_remote_argv_powershell_script(
         script.push(' ');
         script.push_str(powershell_quote(arg.as_str())?.as_str());
     }
-    script
-        .push_str("; if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }");
+    script.push_str("; $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -ne $lastExitCode -and [int]$lastExitCode.Value -ne 0) { exit [int]$lastExitCode.Value }");
     Ok(script)
 }
 
@@ -12640,42 +12290,75 @@ fn utm_exec_windows_raw(
     run_status_with_timeout(&mut command, timeout)
 }
 
-fn utm_exec_windows_raw_with_output(
+fn best_effort_remove_windows_local_utm_guest_files(
     utm_name: &str,
-    powershell_script: &str,
+    remote_paths: &[&str],
     timeout: Duration,
-) -> Result<(ExitStatus, String), String> {
-    ensure_no_control_chars("UTM exec command", powershell_script)?;
-    let encoded = encode_powershell_command(powershell_script)?;
-    let utmctl_path = utmctl_binary_path()?;
-    let mut command = Command::new(utmctl_path);
-    command
-        .arg("exec")
-        .arg(utm_name)
-        .arg("--cmd")
-        .arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-OutputFormat")
-        .arg("Text")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-EncodedCommand")
-        .arg(encoded);
-    let output = run_output_with_timeout(&mut command, timeout)?;
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|err| format!("UTM Windows stdout was not valid UTF-8: {err}"))?;
-    let stderr = String::from_utf8(output.stderr)
-        .map_err(|err| format!("UTM Windows stderr was not valid UTF-8: {err}"))?;
-    let combined = if stderr.trim().is_empty() {
-        stdout
-    } else if stdout.trim().is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-    Ok((output.status, combined))
+) -> Result<(), String> {
+    if remote_paths.is_empty() {
+        return Ok(());
+    }
+    let quoted_paths = remote_paths
+        .iter()
+        .map(|path| powershell_quote(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cleanup_script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         foreach ($path in @({})) {{ \
+           if (Test-Path -LiteralPath $path) {{ Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }} \
+         }}",
+        quoted_paths.join(", ")
+    );
+    let _ = utm_exec_windows_raw(utm_name, cleanup_script.as_str(), timeout);
+    Ok(())
+}
+
+fn build_utm_windows_result_file_wrapper_script(
+    powershell_script: &str,
+    remote_output_path: &str,
+    remote_rc_path: &str,
+) -> Result<String, String> {
+    let encoded_body = encode_powershell_command(powershell_script)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $outputPath = {output_path}; \
+         $rcPath = {rc_path}; \
+         foreach ($path in @($outputPath, $rcPath)) {{ \
+           $parent = Split-Path -Path $path -Parent; \
+           if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ \
+             New-Item -ItemType Directory -Path $parent -Force | Out-Null \
+           }}; \
+           if (Test-Path -LiteralPath $path) {{ \
+             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue \
+           }} \
+         }}; \
+         $rc = 0; \
+         $captured = ''; \
+         try {{ \
+           $body = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
+           $scriptBlock = [ScriptBlock]::Create($body); \
+           $captured = (& $scriptBlock *>&1 | Out-String); \
+           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
+           if ($null -ne $lastExitCode) {{ \
+             $rc = [int]$lastExitCode.Value \
+           }} elseif (-not $?) {{ \
+             $rc = 1 \
+           }} \
+         }} catch {{ \
+           $captured = ($_ | Out-String); \
+           $rc = 1 \
+         }}; \
+         if ($null -eq $captured) {{ $captured = '' }}; \
+         Set-Content -LiteralPath $outputPath -Value ([string]$captured) -Encoding utf8; \
+         Set-Content -LiteralPath $rcPath -Value ([string]$rc) -Encoding ascii; \
+         exit 0",
+        encoded_body = powershell_quote(encoded_body.as_str())?,
+        output_path = powershell_quote(remote_output_path)?,
+        rc_path = powershell_quote(remote_rc_path)?,
+    ))
 }
 
 fn execute_utm_remote_powershell_capture(
@@ -12687,118 +12370,110 @@ fn execute_utm_remote_powershell_capture(
         return Err("UTM remote PowerShell script contains unsupported NUL byte".to_string());
     }
 
-    let wrapped_script = build_utm_windows_capture_wrapper_script(powershell_script)?;
-    let encoded = encode_powershell_command(wrapped_script.as_str())?;
-    let utmctl_path = utmctl_binary_path()?;
-    let mut command = Command::new(utmctl_path);
-    command
-        .arg("exec")
-        .arg(utm_name)
-        .arg("--cmd")
-        .arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-OutputFormat")
-        .arg("Text")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-EncodedCommand")
-        .arg(encoded);
-    let output = run_output_with_timeout(&mut command, timeout)?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(output.stdout.as_slice())
-            .trim()
-            .to_string();
-        let stderr = String::from_utf8_lossy(output.stderr.as_slice())
-            .trim()
-            .to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            String::new()
-        };
-        if detail.is_empty() {
-            return Err(format!(
-                "UTM Windows PowerShell wrapper exited with status {}",
-                status_code(output.status)
-            ));
-        }
-        return Err(format!(
-            "UTM Windows PowerShell wrapper exited with status {}: {}",
-            status_code(output.status),
-            detail
+    let local_root =
+        std::env::temp_dir().join(format!("rustynet-vm-lab-windows-exec-{}", unique_suffix()));
+    fs::create_dir_all(local_root.as_path()).map_err(|err| {
+        format!(
+            "create local Windows UTM exec dir failed ({}): {err}",
+            local_root.display()
+        )
+    })?;
+    let local_output_path = local_root.join("output.txt");
+    let local_rc_path = local_root.join("rc.txt");
+    let remote_base = format!(
+        r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.{}",
+        unique_suffix()
+    );
+    let remote_output_path = format!(r"{remote_base}.out");
+    let remote_rc_path = format!(r"{remote_base}.rc");
+    let wrapped_script = build_utm_windows_result_file_wrapper_script(
+        powershell_script,
+        remote_output_path.as_str(),
+        remote_rc_path.as_str(),
+    )?;
+    let host_status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout);
+    let rc_pull = pull_windows_local_utm_guest_file_with_retry(
+        utm_name,
+        remote_rc_path.as_str(),
+        local_rc_path.as_path(),
+        timeout,
+        "UTM Windows rc",
+    );
+    if let Err(pull_error) = rc_pull {
+        let _ = best_effort_remove_windows_local_utm_guest_files(
+            utm_name,
+            &[remote_output_path.as_str(), remote_rc_path.as_str()],
+            Duration::from_secs(20),
+        );
+        let _ = fs::remove_dir_all(local_root.as_path());
+        return Err(format_windows_local_utm_result_pull_failure(
+            "UTM Windows PowerShell capture",
+            utm_name,
+            &host_status,
+            pull_error.as_str(),
         ));
     }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|err| format!("UTM Windows stdout was not valid UTF-8: {err}"))?;
-    let stderr = String::from_utf8(output.stderr)
-        .map_err(|err| format!("UTM Windows stderr was not valid UTF-8: {err}"))?;
-    let combined = if stderr.trim().is_empty() {
-        stdout
-    } else if stdout.trim().is_empty() {
-        stderr
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-    parse_utm_windows_capture_output(combined.as_str())
-}
-
-fn build_utm_windows_capture_wrapper_script(powershell_script: &str) -> Result<String, String> {
-    let encoded_body = encode_powershell_command(powershell_script)?;
-    Ok(format!(
-        "Set-StrictMode -Version Latest; \
-         $ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         $rc = 0; \
-         $captured = ''; \
-         try {{ \
-           $body = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
-           $scriptBlock = [ScriptBlock]::Create($body); \
-           $captured = (& $scriptBlock *>&1 | Out-String); \
-           if ($LASTEXITCODE -ne $null) {{ \
-             $rc = [int]$LASTEXITCODE \
-           }} elseif (-not $?) {{ \
-             $rc = 1 \
-           }} \
-         }} catch {{ \
-           $captured = ($_ | Out-String); \
-           $rc = 1 \
-         }}; \
-         $encodedOutput = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($captured)); \
-         [Console]::Out.WriteLine(\"__RUSTYNET_CAPTURE_RC__={{0}}\" -f $rc); \
-         [Console]::Out.WriteLine(\"__RUSTYNET_CAPTURE_STDOUT_BASE64__={{0}}\" -f $encodedOutput); \
-         exit 0",
-        encoded_body = powershell_quote(encoded_body.as_str())?,
-    ))
-}
-
-fn parse_utm_windows_capture_output(output: &str) -> Result<(i32, String), String> {
-    let mut rc = None;
-    let mut stdout_base64 = None;
-    for line in output.lines() {
-        if let Some(value) = line.strip_prefix("__RUSTYNET_CAPTURE_RC__=") {
-            rc =
-                Some(value.trim().parse::<i32>().map_err(|_| {
-                    format!("UTM Windows capture rc was not a valid integer: {value}")
-                })?);
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("__RUSTYNET_CAPTURE_STDOUT_BASE64__=") {
-            stdout_base64 = Some(value.trim().to_string());
-        }
+    let rc_text = read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc")
+        .map_err(|err| {
+            let _ = best_effort_remove_windows_local_utm_guest_files(
+                utm_name,
+                &[remote_output_path.as_str(), remote_rc_path.as_str()],
+                Duration::from_secs(20),
+            );
+            let _ = fs::remove_dir_all(local_root.as_path());
+            err
+        })?;
+    let rc = rc_text.trim().parse::<i32>().map_err(|_| {
+        let _ = best_effort_remove_windows_local_utm_guest_files(
+            utm_name,
+            &[remote_output_path.as_str(), remote_rc_path.as_str()],
+            Duration::from_secs(20),
+        );
+        let _ = fs::remove_dir_all(local_root.as_path());
+        format!(
+            "UTM Windows rc was not a valid integer for {utm_name}: {}",
+            rc_text.trim()
+        )
+    })?;
+    let output_pull = pull_windows_local_utm_guest_file_with_retry(
+        utm_name,
+        remote_output_path.as_str(),
+        local_output_path.as_path(),
+        timeout,
+        "UTM Windows output",
+    );
+    if let Err(pull_error) = output_pull {
+        let _ = best_effort_remove_windows_local_utm_guest_files(
+            utm_name,
+            &[remote_output_path.as_str(), remote_rc_path.as_str()],
+            Duration::from_secs(20),
+        );
+        let _ = fs::remove_dir_all(local_root.as_path());
+        return Err(format_windows_local_utm_result_pull_failure(
+            "UTM Windows PowerShell capture",
+            utm_name,
+            &host_status,
+            pull_error.as_str(),
+        ));
     }
-    let rc = rc.ok_or_else(|| "UTM Windows capture output was missing rc marker".to_string())?;
-    let stdout_base64 = stdout_base64
-        .ok_or_else(|| "UTM Windows capture output was missing stdout marker".to_string())?;
-    let stdout_bytes = BASE64_STANDARD
-        .decode(stdout_base64.as_bytes())
-        .map_err(|err| format!("UTM Windows capture stdout was not valid base64: {err}"))?;
-    let stdout = String::from_utf8(stdout_bytes)
-        .map_err(|err| format!("UTM Windows capture stdout was not valid UTF-8: {err}"))?;
-    Ok((rc, stdout))
+    let output =
+        read_windows_local_utm_utf8_file(local_output_path.as_path(), "UTM Windows output")
+            .map_err(|err| {
+                let _ = best_effort_remove_windows_local_utm_guest_files(
+                    utm_name,
+                    &[remote_output_path.as_str(), remote_rc_path.as_str()],
+                    Duration::from_secs(20),
+                );
+                let _ = fs::remove_dir_all(local_root.as_path());
+                err
+            })?;
+    let _ = best_effort_remove_windows_local_utm_guest_files(
+        utm_name,
+        &[remote_output_path.as_str(), remote_rc_path.as_str()],
+        Duration::from_secs(20),
+    );
+    let _ = fs::remove_dir_all(local_root.as_path());
+    Ok((rc, output))
 }
 
 fn stage_windows_helper_script_from_path(
@@ -12806,12 +12481,12 @@ fn stage_windows_helper_script_from_path(
     local_path: &Path,
     remote_file_name: &str,
 ) -> Result<String, String> {
-    stage_windows_helper_script_from_path_with_phase(
-        context,
-        local_path,
-        remote_file_name,
-        RemoteTransportPhase::PostBootstrap,
-    )
+    let phase = if windows_local_utm_execution_authority(context.target, false).is_some() {
+        RemoteTransportPhase::AccessEstablishment
+    } else {
+        RemoteTransportPhase::PostBootstrap
+    };
+    stage_windows_helper_script_from_path_with_phase(context, local_path, remote_file_name, phase)
 }
 
 fn stage_windows_helper_script_from_path_with_phase(
@@ -12881,7 +12556,7 @@ fn build_windows_helper_invocation_script(
     let mut script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; {helper_command}"
     );
-    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; if ($LASTEXITCODE -ne $null -and [int]$LASTEXITCODE -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$LASTEXITCODE) }");
+    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -ne $lastExitCode -and [int]$lastExitCode.Value -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$lastExitCode.Value) }");
     Ok(script)
 }
 
@@ -12900,8 +12575,9 @@ fn build_windows_result_file_helper_invocation_script(
          $helperExit = 0; \
          try {{ \
            {helper_command}; \
-           if ($LASTEXITCODE -ne $null) {{ \
-             $helperExit = [int]$LASTEXITCODE \
+           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
+           if ($null -ne $lastExitCode) {{ \
+             $helperExit = [int]$lastExitCode.Value \
            }} elseif (-not $?) {{ \
              $helperExit = 1 \
            }} \
@@ -12994,15 +12670,26 @@ fn capture_windows_helper_script_output_from_path(
     remote_file_name: &str,
     args: &[String],
 ) -> Result<String, String> {
-    let remote_path = stage_windows_helper_script_from_path(context, local_path, remote_file_name)?;
+    let phase = if windows_local_utm_execution_authority(context.target, false).is_some() {
+        RemoteTransportPhase::AccessEstablishment
+    } else {
+        RemoteTransportPhase::PostBootstrap
+    };
+    let remote_path = stage_windows_helper_script_from_path_with_phase(
+        context,
+        local_path,
+        remote_file_name,
+        phase,
+    )?;
     let script = build_windows_helper_invocation_script(remote_path.as_str(), args)?;
-    capture_remote_shell_command_for_target(
+    capture_remote_shell_command_for_target_with_phase(
         context.target,
         context.ssh_user_override,
         context.ssh_identity_file,
         context.known_hosts_path,
         script.as_str(),
         context.timeout,
+        phase,
     )
 }
 
@@ -13028,6 +12715,11 @@ fn invoke_windows_helper_script_for_target(
     context: &RemoteFallbackContext<'_>,
     invocation: WindowsHelperInvocation<'_>,
 ) -> Result<ExitStatus, String> {
+    let phase = if windows_local_utm_execution_authority(context.target, false).is_some() {
+        RemoteTransportPhase::AccessEstablishment
+    } else {
+        RemoteTransportPhase::PostBootstrap
+    };
     stage_windows_helper_support_files(context, invocation.helper_file_name)?;
     let local_path = match invocation.helper_file_name {
         WINDOWS_BOOTSTRAP_HELPER_FILE => windows_bootstrap_helper_script_local_path(),
@@ -13048,13 +12740,14 @@ fn invoke_windows_helper_script_for_target(
         invocation.remote_file_name,
     )?;
     let script = build_windows_helper_invocation_script(remote_path.as_str(), invocation.args)?;
-    run_remote_shell_command_for_target(
+    run_remote_shell_command_for_target_with_phase(
         context.target,
         context.ssh_user_override,
         context.ssh_identity_file,
         context.known_hosts_path,
         script.as_str(),
         context.timeout,
+        phase,
     )
 }
 
@@ -13203,10 +12896,8 @@ fn bootstrap_windows_access_for_target(
                 automation_public_key,
                 Some(&remote_result_path),
             )?;
-            let guest_ip = resolve_windows_local_utm_guest_ipv4(context.target)?;
-            let report_output = execute_windows_local_utm_callback_via_result_file(
+            let report_output = execute_windows_local_utm_result_file_probe(
                 utm_name,
-                guest_ip,
                 "Windows access bootstrap probe",
                 context.timeout,
                 remote_result_path.as_str(),
@@ -15570,53 +15261,35 @@ mod tests {
     }
 
     #[test]
-    fn utm_windows_capture_wrapper_script_encodes_body_before_scriptblock_creation() {
-        let wrapper = super::build_utm_windows_capture_wrapper_script(
+    fn utm_windows_result_file_wrapper_script_encodes_body_and_writes_guest_files() {
+        let wrapper = super::build_utm_windows_result_file_wrapper_script(
             "Write-Output 'hello from { braces }'; exit 7",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.out",
+            r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.rc",
         )
         .expect("wrapper script should build");
         assert!(wrapper.contains("$ProgressPreference = 'SilentlyContinue'"));
         assert!(wrapper.contains("FromBase64String"));
         assert!(wrapper.contains("[ScriptBlock]::Create($body)"));
-        assert!(wrapper.contains("__RUSTYNET_CAPTURE_RC__="));
-        assert!(wrapper.contains("__RUSTYNET_CAPTURE_STDOUT_BASE64__="));
-        assert!(wrapper.contains("ToBase64String"));
+        assert!(wrapper.contains("Set-Content -LiteralPath $outputPath"));
+        assert!(wrapper.contains("Set-Content -LiteralPath $rcPath"));
+        assert!(wrapper.contains(r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.out"));
+        assert!(wrapper.contains(r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.rc"));
         assert!(wrapper.contains("exit 0"));
         assert!(!wrapper.contains("hello from { braces }"));
     }
 
     #[test]
-    fn utm_windows_capture_output_parser_requires_markers_and_decodes_payload() {
-        use base64::Engine as _;
-
-        let encoded = super::BASE64_STANDARD.encode("line one\nline two");
-        let parsed = super::parse_utm_windows_capture_output(
-            format!("__RUSTYNET_CAPTURE_RC__=7\n__RUSTYNET_CAPTURE_STDOUT_BASE64__={encoded}\n")
-                .as_str(),
-        )
-        .expect("capture output should parse");
-        assert_eq!(parsed.0, 7);
-        assert_eq!(parsed.1, "line one\nline two");
-
-        let err = super::parse_utm_windows_capture_output("missing markers")
-            .expect_err("missing markers must fail closed");
-        assert!(err.contains("missing rc marker"));
-    }
-
-    #[test]
-    fn utm_windows_capture_output_parser_tolerates_non_marker_lines() {
-        use base64::Engine as _;
-
-        let encoded = super::BASE64_STANDARD.encode("{\"status\":\"blocked\"}");
-        let parsed = super::parse_utm_windows_capture_output(
-            format!(
-                "#< CLIXML\nnoise\n__RUSTYNET_CAPTURE_RC__=1\n__RUSTYNET_CAPTURE_STDOUT_BASE64__={encoded}\n"
-            )
-            .as_str(),
-        )
-        .expect("capture output with noise should still parse");
-        assert_eq!(parsed.0, 1);
-        assert_eq!(parsed.1, "{\"status\":\"blocked\"}");
+    fn windows_local_utm_result_pull_failure_prefers_transport_detail() {
+        let rendered = super::format_windows_local_utm_result_pull_failure(
+            "Windows SSH readiness probe",
+            "Windows",
+            &Err("timed out after 30 seconds".to_string()),
+            "result file pull failed",
+        );
+        assert!(rendered.contains("transport failed"));
+        assert!(rendered.contains("timed out after 30 seconds"));
+        assert!(rendered.contains("result file pull failed"));
     }
 
     #[test]
@@ -15710,27 +15383,6 @@ mod tests {
         .expect("non-Windows fallback behavior should remain unchanged");
         assert!(ssh_fallback_called.get());
         assert!(status.success());
-    }
-
-    #[test]
-    fn windows_local_utm_callback_request_parser_reads_token_and_body() {
-        let request = b"POST /rustynet/windows-local-utm-result HTTP/1.1\r\nHost: 192.168.64.1\r\nX-RustyNet-Token: abc123\r\nContent-Length: 17\r\n\r\n{\"status\":\"pass\"}";
-        let parsed = super::parse_windows_local_utm_http_request(request, 1024)
-            .expect("callback request should parse");
-        assert_eq!(parsed.token, "abc123");
-        assert_eq!(
-            String::from_utf8(parsed.body).expect("request body should be valid UTF-8"),
-            "{\"status\":\"pass\"}"
-        );
-    }
-
-    #[test]
-    fn windows_local_utm_callback_request_parser_rejects_wrong_path() {
-        let request =
-            b"POST /wrong HTTP/1.1\r\nHost: 192.168.64.1\r\nX-RustyNet-Token: abc123\r\nContent-Length: 2\r\n\r\n{}";
-        let err = super::parse_windows_local_utm_http_request(request, 1024)
-            .expect_err("unexpected callback path must fail closed");
-        assert!(err.contains("unexpected callback path"));
     }
 
     #[test]
