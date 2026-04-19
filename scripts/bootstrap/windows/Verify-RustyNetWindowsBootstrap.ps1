@@ -9,7 +9,58 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+function New-FailClosedVerifyReport {
+    param([Parameter(Mandatory = $true)][string]$FailureReason)
+    return [ordered]@{
+        schema_version = 1
+        captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        platform = 'windows'
+        rustynet_root = $RustyNetRoot
+        install_root = $InstallRoot
+        state_root = $StateRoot
+        service_name = $ServiceName
+        status = 'fail'
+        reason = $FailureReason
+        backend_label = ''
+        runtime_supported = $false
+        service_verified = $false
+        service_present = $false
+        service_running = $false
+        service_status = 'missing'
+        notes = @('verify-helper-trap')
+    }
+}
+
+function Write-FailClosedVerifyReportIfRequested {
+    param([Parameter(Mandatory = $true)][string]$FailureReason)
+    if (-not $OutputPath -or $OutputPath.Trim().Length -eq 0) {
+        return
+    }
+    try {
+        $outputDirectory = Split-Path -Parent $OutputPath
+        if ($outputDirectory) {
+            New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
+        }
+        (New-FailClosedVerifyReport -FailureReason $FailureReason | ConvertTo-Json -Depth 8) |
+            Set-Content -Encoding utf8 -LiteralPath $OutputPath
+    }
+    catch {
+        # Preserve the original failure as the dominant root cause.
+    }
+}
+
 trap {
+    $failureReason = if ($_.Exception -and $_.Exception.Message) {
+        $_.Exception.Message.Trim()
+    }
+    else {
+        ($_ | Out-String).Trim()
+    }
+    if (-not $failureReason) {
+        $failureReason = 'windows-verify-exception'
+    }
+    Write-FailClosedVerifyReportIfRequested -FailureReason $failureReason
     Write-Error $_
     exit 1
 }

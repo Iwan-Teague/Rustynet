@@ -9,6 +9,38 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 trap {
+    $failureReason = if ($_.Exception -and $_.Exception.Message) {
+        $_.Exception.Message.Trim()
+    }
+    else {
+        ($_ | Out-String).Trim()
+    }
+    if (-not $failureReason) {
+        $failureReason = 'windows-diagnostics-exception'
+    }
+    try {
+        if ($OutputRoot -and $OutputRoot.Trim().Length -gt 0) {
+            if (-not (Test-Path -LiteralPath $OutputRoot)) {
+                New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+            }
+            $failureManifest = [ordered]@{
+                schema_version = 2
+                captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+                output_root = $OutputRoot
+                install_root = $InstallRoot
+                state_root = $StateRoot
+                service_name = $ServiceName
+                status = 'fail'
+                reason = $failureReason
+                files = @()
+            }
+            $failureManifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'manifest.json')
+            $failureReason | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'diagnostics-error.txt')
+        }
+    }
+    catch {
+        # Preserve the original failure as the dominant root cause.
+    }
     Write-Error $_
     exit 1
 }

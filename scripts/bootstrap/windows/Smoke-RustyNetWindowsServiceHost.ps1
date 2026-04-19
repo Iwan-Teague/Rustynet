@@ -9,6 +9,58 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+function New-FailClosedSmokeReport {
+    param([Parameter(Mandatory = $true)][string]$FailureReason)
+    return [ordered]@{
+        schema_version = 1
+        captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        platform = 'windows'
+        rustynet_root = $RustyNetRoot
+        state_root = $StateRoot
+        service_name = $ServiceName
+        status = 'fail'
+        reason = $FailureReason
+        backend_label = ''
+        runtime_supported = $false
+        host_surface_validated = $false
+        cleanup_status = 'failed'
+        notes = @('smoke-helper-trap')
+    }
+}
+
+function Write-FailClosedSmokeReportIfRequested {
+    param([Parameter(Mandatory = $true)][string]$FailureReason)
+    if (-not $OutputPath -or $OutputPath.Trim().Length -eq 0) {
+        return
+    }
+    try {
+        $outputDirectory = Split-Path -Parent $OutputPath
+        if ($outputDirectory) {
+            Ensure-Directory -Path $outputDirectory
+        }
+        (New-FailClosedSmokeReport -FailureReason $FailureReason | ConvertTo-Json -Depth 6) |
+            Set-Content -Encoding utf8 -LiteralPath $OutputPath
+    }
+    catch {
+        # Preserve the original failure as the dominant root cause.
+    }
+}
+
+trap {
+    $failureReason = if ($_.Exception -and $_.Exception.Message) {
+        $_.Exception.Message.Trim()
+    }
+    else {
+        ($_ | Out-String).Trim()
+    }
+    if (-not $failureReason) {
+        $failureReason = 'windows-service-host-smoke-exception'
+    }
+    Write-FailClosedSmokeReportIfRequested -FailureReason $failureReason
+    Write-Error $_
+    exit 1
+}
+
 function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {

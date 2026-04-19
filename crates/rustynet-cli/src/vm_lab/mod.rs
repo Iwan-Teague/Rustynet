@@ -9957,16 +9957,102 @@ fn build_windows_local_source_extract_script(
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
          $dest = {dest}; \
          $archive = {archive}; \
          $parent = Split-Path -Parent $dest; \
+         $staging = Join-Path $parent ('rn-vm-lab-source-' + [guid]::NewGuid().ToString('N')); \
+         $currentScriptPath = ''; \
+         if ($PSCommandPath) {{ \
+           try {{ $currentScriptPath = (Resolve-Path -LiteralPath $PSCommandPath -ErrorAction Stop).Path }} catch {{ $currentScriptPath = $PSCommandPath }} \
+         }}; \
          if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Force -Path $parent | Out-Null }}; \
-         if (Test-Path -LiteralPath $dest) {{ Remove-Item -LiteralPath $dest -Recurse -Force }}; \
-         New-Item -ItemType Directory -Force -Path $dest | Out-Null; \
-         Expand-Archive -LiteralPath $archive -DestinationPath $dest -Force; \
-         Remove-Item -LiteralPath $archive -Force;",
+         if (-not (Test-Path -LiteralPath $archive)) {{ throw ('Windows local source archive is missing: {{0}}' -f $archive) }}; \
+         if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}; \
+         try {{ \
+           if (-not (Test-Path -LiteralPath $dest)) {{ New-Item -ItemType Directory -Force -Path $dest | Out-Null }}; \
+           Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
+           $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
+           if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
+           foreach ($existing in @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue)) {{ \
+             $existingPath = $existing.FullName; \
+             if ($currentScriptPath -and $existingPath.Equals($currentScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}; \
+             if ($existing.Name -like 'utm_*.ps1') {{ continue }}; \
+             Remove-Item -LiteralPath $existingPath -Recurse -Force \
+           }}; \
+           foreach ($entry in $stagedEntries) {{ \
+             Move-Item -LiteralPath $entry.FullName -Destination $dest -Force \
+           }}; \
+         }} catch {{ \
+           $detail = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }}; \
+           if (-not $detail) {{ $detail = 'windows-local-source-extract-failed' }}; \
+           Write-Output ('windows-local-source-extract-error=' + $detail); \
+           throw \
+         }} finally {{ \
+           if (Test-Path -LiteralPath $archive) {{ Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue }}; \
+           if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }} \
+         }};",
         dest = powershell_quote(dest_dir)?,
         archive = powershell_quote(remote_archive_path)?,
+    ))
+}
+
+fn build_windows_local_source_extract_result_script(
+    dest_dir: &str,
+    remote_archive_path: &str,
+    remote_result_path: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("destination directory", dest_dir)?;
+    ensure_no_control_chars("remote archive path", remote_archive_path)?;
+    ensure_no_control_chars("Windows extract result path", remote_result_path)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $dest = {dest}; \
+         $archive = {archive}; \
+         $resultPath = {result_path}; \
+         $resultParent = Split-Path -Path $resultPath -Parent; \
+         if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ New-Item -ItemType Directory -Force -Path $resultParent | Out-Null }}; \
+         if (Test-Path -LiteralPath $resultPath) {{ Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue }}; \
+         $parent = Split-Path -Parent $dest; \
+         $staging = Join-Path $parent ('rn-vm-lab-source-' + [guid]::NewGuid().ToString('N')); \
+         $currentScriptPath = ''; \
+         if ($PSCommandPath) {{ \
+           try {{ $currentScriptPath = (Resolve-Path -LiteralPath $PSCommandPath -ErrorAction Stop).Path }} catch {{ $currentScriptPath = $PSCommandPath }} \
+         }}; \
+         if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ New-Item -ItemType Directory -Force -Path $parent | Out-Null }}; \
+         $report = $null; \
+         try {{ \
+           if (-not (Test-Path -LiteralPath $archive)) {{ throw ('Windows local source archive is missing: {{0}}' -f $archive) }}; \
+           if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force }}; \
+           if (-not (Test-Path -LiteralPath $dest)) {{ New-Item -ItemType Directory -Force -Path $dest | Out-Null }}; \
+           Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force; \
+           $stagedEntries = @(Get-ChildItem -LiteralPath $staging -Force -ErrorAction SilentlyContinue); \
+           if ($stagedEntries.Count -eq 0) {{ throw ('Windows local source archive extracted no files: {{0}}' -f $archive) }}; \
+           foreach ($existing in @(Get-ChildItem -LiteralPath $dest -Force -ErrorAction SilentlyContinue)) {{ \
+             $existingPath = $existing.FullName; \
+             if ($currentScriptPath -and $existingPath.Equals($currentScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}; \
+             if ($existing.Name -like 'utm_*.ps1') {{ continue }}; \
+             Remove-Item -LiteralPath $existingPath -Recurse -Force \
+           }}; \
+           foreach ($entry in $stagedEntries) {{ \
+             Move-Item -LiteralPath $entry.FullName -Destination $dest -Force \
+           }}; \
+           $report = [ordered]@{{ status = 'pass'; dest = $dest }} \
+         }} catch {{ \
+           $detail = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }}; \
+           if (-not $detail) {{ $detail = 'windows-local-source-extract-failed' }}; \
+           $report = [ordered]@{{ status = 'fail'; reason = $detail; dest = $dest }} \
+         }} finally {{ \
+           if (Test-Path -LiteralPath $archive) {{ Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue }}; \
+           if (Test-Path -LiteralPath $staging) {{ Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }} \
+         }}; \
+         $report | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultPath -Encoding UTF8; \
+         if ($report.status -ne 'pass') {{ exit 1 }}",
+        dest = powershell_quote(dest_dir)?,
+        archive = powershell_quote(remote_archive_path)?,
+        result_path = powershell_quote(remote_result_path)?,
     ))
 }
 
@@ -10625,6 +10711,41 @@ fn sync_local_source_archive_to_target(
             )?,
             "copy local ZIP source archive to Windows remote",
         )?;
+        if remote_target_local_utm(target).is_some() {
+            let (utm_name, _) = remote_target_local_utm(target).expect("validated local UTM");
+            let remote_result_path = format!(r"{remote_archive}.result.json");
+            let output = execute_windows_local_utm_result_file_probe(
+                utm_name,
+                "Windows local source extract",
+                timeout,
+                remote_result_path.as_str(),
+                |remote_result_path| {
+                    build_windows_local_source_extract_result_script(
+                        dest_dir,
+                        remote_archive.as_str(),
+                        remote_result_path,
+                    )
+                },
+            )?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(output.as_str()).map_err(|err| {
+                    format!("Windows local source extract returned invalid JSON: {err}")
+                })?;
+            let status = parsed
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("fail");
+            if status == "pass" {
+                return Ok(());
+            }
+            let reason = parsed
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("windows-local-source-extract-failed");
+            return Err(format!(
+                "extract local ZIP source archive on Windows remote failed: {reason}"
+            ));
+        }
         let extract_script =
             build_windows_local_source_extract_script(dest_dir, remote_archive.as_str())?;
         let status = run_remote_shell_command_for_target(
@@ -12337,10 +12458,10 @@ fn build_utm_windows_result_file_wrapper_script(
          }}; \
          $rc = 0; \
          $captured = ''; \
+         $psExe = Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; \
+         if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
          try {{ \
-           $body = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String({encoded_body})); \
-           $scriptBlock = [ScriptBlock]::Create($body); \
-           $captured = (& $scriptBlock *>&1 | Out-String); \
+           $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded_body} *>&1 | Out-String); \
            $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
            if ($null -ne $lastExitCode) {{ \
              $rc = [int]$lastExitCode.Value \
@@ -12556,7 +12677,7 @@ fn build_windows_helper_invocation_script(
     let mut script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; {helper_command}"
     );
-    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -ne $lastExitCode -and [int]$lastExitCode.Value -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$lastExitCode.Value) }");
+    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -ne $lastExitCode) { $lastExitValue = $lastExitCode.Value; if ($lastExitValue -is [System.Management.Automation.PSVariable]) { $lastExitValue = $lastExitValue.Value }; if ($null -ne $lastExitValue -and [string]$lastExitValue -match '^-?[0-9]+$' -and [int]$lastExitValue -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$lastExitValue) } }");
     Ok(script)
 }
 
@@ -12566,30 +12687,82 @@ fn build_windows_result_file_helper_invocation_script(
     remote_result_path: &str,
     helper_label: &str,
 ) -> Result<String, String> {
-    let helper_command = build_windows_helper_command(remote_path, args)?;
+    let mut helper_args = args.to_vec();
+    let has_output_path = helper_args.windows(2).any(|pair| pair[0] == "-OutputPath");
+    if !has_output_path {
+        helper_args.push("-OutputPath".to_string());
+        helper_args.push(remote_result_path.to_string());
+    }
+    let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
     ensure_no_control_chars("Windows result helper label", helper_label)?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $resultPath = {result_path}; \
          $helperExit = 0; \
+         $failureMessage = ''; \
          try {{ \
            {helper_command}; \
            $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
            if ($null -ne $lastExitCode) {{ \
-             $helperExit = [int]$lastExitCode.Value \
+             $lastExitValue = $lastExitCode.Value; \
+             if ($lastExitValue -is [System.Management.Automation.PSVariable]) {{ $lastExitValue = $lastExitValue.Value }}; \
+             if ($null -ne $lastExitValue -and [string]$lastExitValue -match '^-?[0-9]+$') {{ \
+               $helperExit = [int]$lastExitValue \
+             }} else {{ \
+               $helperExit = 1 \
+             }} \
            }} elseif (-not $?) {{ \
              $helperExit = 1 \
            }} \
          }} catch {{ \
+           $failureMessage = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }}; \
            $helperExit = 1 \
          }}; \
          if (-not (Test-Path -LiteralPath $resultPath)) {{ \
-           throw ('{helper_label} did not write result file: {{0}}' -f $resultPath) \
+           if ([string]::IsNullOrWhiteSpace($failureMessage)) {{ \
+             $failureMessage = ('{helper_label} did not write result file: {{0}}' -f $resultPath) \
+           }}; \
+           ([ordered]@{{ \
+             status = 'fail'; \
+             reason = $failureMessage; \
+             backend_label = ''; \
+             notes = @('helper-wrapper-fallback'); \
+             service_status = 'missing'; \
+             start_error = $failureMessage; \
+             host_surface_validated = $false; \
+             cleanup_status = 'failed'; \
+             openssh_installed = $false; \
+             service_running = $false; \
+             firewall_rule_enabled = $false; \
+             authorized_keys_applied = $false; \
+             host_key_present = $false; \
+             listener_ready = $false; \
+             default_shell_configured = $false; \
+             host_key = '' \
+           }} | ConvertTo-Json -Compress) | Set-Content -LiteralPath $resultPath -Encoding UTF8 \
          }}; \
          $body = Get-Content -Raw -LiteralPath $resultPath -Encoding UTF8; \
          if ([string]::IsNullOrWhiteSpace($body)) {{ \
-           throw ('{helper_label} wrote empty result file: {{0}}' -f $resultPath) \
+           $failureMessage = ('{helper_label} wrote empty result file: {{0}}' -f $resultPath); \
+           ([ordered]@{{ \
+             status = 'fail'; \
+             reason = $failureMessage; \
+             backend_label = ''; \
+             notes = @('helper-wrapper-empty-result'); \
+             service_status = 'missing'; \
+             start_error = $failureMessage; \
+             host_surface_validated = $false; \
+             cleanup_status = 'failed'; \
+             openssh_installed = $false; \
+             service_running = $false; \
+             firewall_rule_enabled = $false; \
+             authorized_keys_applied = $false; \
+             host_key_present = $false; \
+             listener_ready = $false; \
+             default_shell_configured = $false; \
+             host_key = '' \
+           }} | ConvertTo-Json -Compress) | Set-Content -LiteralPath $resultPath -Encoding UTF8 \
          }}; \
          exit $helperExit",
         result_path = powershell_quote(remote_result_path)?,
@@ -15269,8 +15442,8 @@ mod tests {
         )
         .expect("wrapper script should build");
         assert!(wrapper.contains("$ProgressPreference = 'SilentlyContinue'"));
-        assert!(wrapper.contains("FromBase64String"));
-        assert!(wrapper.contains("[ScriptBlock]::Create($body)"));
+        assert!(wrapper.contains("-EncodedCommand"));
+        assert!(wrapper.contains("$psExe = Join-Path $env:WINDIR"));
         assert!(wrapper.contains("Set-Content -LiteralPath $outputPath"));
         assert!(wrapper.contains("Set-Content -LiteralPath $rcPath"));
         assert!(wrapper.contains(r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.out"));
@@ -15432,6 +15605,25 @@ mod tests {
         assert!(script.contains("Windows service-host smoke helper did not write result file"));
         assert!(script.contains("Windows service-host smoke helper wrote empty result file"));
         assert!(!script.contains("Remove-Item -LiteralPath $resultPath -Force"));
+    }
+
+    #[test]
+    fn windows_result_file_helper_invocation_script_injects_output_path_when_missing() {
+        let script = super::build_windows_result_file_helper_invocation_script(
+            r"C:\ProgramData\Rustynet\vm-lab\Verify-RustyNetWindowsBootstrap.ps1",
+            &[
+                "-RustyNetRoot".to_string(),
+                r"C:\Rustynet".to_string(),
+                "-InstallRoot".to_string(),
+                r"C:\Program Files\RustyNet".to_string(),
+            ],
+            r"C:\ProgramData\Rustynet\vm-lab\verify.json",
+            "Windows verify helper",
+        )
+        .expect("result-file helper invocation script should inject output path");
+        assert!(script.contains(
+            "& 'C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1' '-RustyNetRoot' 'C:\\Rustynet' '-InstallRoot' 'C:\\Program Files\\RustyNet' '-OutputPath' 'C:\\ProgramData\\Rustynet\\vm-lab\\verify.json'"
+        ));
     }
 
     #[test]
@@ -16170,9 +16362,13 @@ mod tests {
             )
         );
         assert!(
-            script.contains("Expand-Archive -LiteralPath $archive -DestinationPath $dest -Force;")
+            script
+                .contains("Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force;")
         );
-        assert!(script.contains("Remove-Item -LiteralPath $archive -Force;"));
+        assert!(script.contains("windows-local-source-extract-error="));
+        assert!(script.contains("$currentScriptPath = '';"));
+        assert!(script.contains("if ($existing.Name -like 'utm_*.ps1') { continue };"));
+        assert!(script.contains("foreach ($entry in $stagedEntries) {"));
         assert!(!script.contains("tar -xf"));
     }
 
