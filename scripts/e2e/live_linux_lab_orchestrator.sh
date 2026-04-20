@@ -4982,10 +4982,91 @@ assert_no_dns_zone_stale_status() {
 assert_client_dns_zone_valid_in_log() {
   local log_path="$1"
   local label="$2"
-  local client_node_id pattern
+  local client_node_id
   client_node_id="$(node_id_for_label client)"
-  pattern="node_id=${client_node_id} .*dns_zone_state=valid .*dns_zone_error=none"
-  assert_log_contains_pattern "$log_path" "$label" "$pattern"
+  if [[ ! -f "$log_path" ]]; then
+    printf '%s log missing: %s\n' "$label" "$log_path" >&2
+    return 1
+  fi
+  if ! awk -v node_id="$client_node_id" '
+    index($0, "node_id=" node_id) && index($0, "dns_zone_state=valid") && index($0, "dns_zone_error=none") { found=1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$log_path"; then
+    printf '%s log missing required client DNS validity fields on one line (node_id=%s, dns_zone_state=valid, dns_zone_error=none): %s\n' "$label" "$client_node_id" "$log_path" >&2
+    rg -n -- "node_id=${client_node_id}" "$log_path" >&2 || true
+    return 1
+  fi
+}
+
+soak_sleep_with_backoff_jitter() {
+  local attempt="$1"
+  local base_sleep_secs="${2:-1}"
+  local max_sleep_secs="${3:-8}"
+  local sleep_secs jitter_millis sleep_for
+
+  sleep_secs=$(( base_sleep_secs << (attempt - 1) ))
+  if (( sleep_secs > max_sleep_secs )); then
+    sleep_secs="$max_sleep_secs"
+  fi
+  jitter_millis=$(( RANDOM % 1000 ))
+  printf -v sleep_for '%d.%03d' "$sleep_secs" "$jitter_millis"
+  sleep "$sleep_for"
+}
+
+soak_wait_for_node_security_convergence() {
+  local label="$1"
+  local stage_label="$2"
+  local attempts="${SOAK_SECURITY_MAX_ATTEMPTS:-8}"
+  local base_sleep_secs="${SOAK_SECURITY_BASE_SLEEP_SECS:-1}"
+  local max_sleep_secs="${SOAK_SECURITY_MAX_SLEEP_SECS:-8}"
+  local zone_name="${RUSTYNET_DNS_ZONE_NAME:-rustynet}"
+  local signed_max_age_secs="${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}"
+  local max_clock_skew_secs="${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}"
+  local target node_id role
+  local attempt dns_zone_snapshot signed_state_snapshot
+
+  if ! has_label "$label"; then
+    return 0
+  fi
+  target="$(node_target_for_label "$label")"
+  node_id="$(node_id_for_label "$label")"
+  role="$(node_role_for_label "$label")"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    dns_zone_snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name" || true)"
+    signed_state_snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$signed_max_age_secs" "$max_clock_skew_secs" || true)"
+    if [[ -n "$dns_zone_snapshot" ]] && live_lab_assert_dns_zone_health \
+      "$dns_zone_snapshot" \
+      "$node_id" \
+      "$target" >/dev/null 2>&1 \
+      && [[ -n "$signed_state_snapshot" ]] && live_lab_assert_signed_state_health \
+      "$signed_state_snapshot" \
+      "$node_id" \
+      "$target" >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      soak_sleep_with_backoff_jitter "$attempt" "$base_sleep_secs" "$max_sleep_secs"
+    fi
+  done
+
+  printf '%s security convergence did not complete for %s (%s)\n' "$stage_label" "$label" "$target" >&2
+  if [[ -n "$dns_zone_snapshot" ]]; then
+    printf '%s\n' "$dns_zone_snapshot" >&2
+  fi
+  if [[ -n "$signed_state_snapshot" ]]; then
+    printf '%s\n' "$signed_state_snapshot" >&2
+  fi
+  return 1
+}
+
+assert_soak_cluster_security_convergence() {
+  local stage_label="$1"
+  shift
+  local label
+  for label in "$@"; do
+    soak_wait_for_node_security_convergence "$label" "$stage_label" || return 1
+  done
 }
 
 stage_run_cross_network_direct_remote_exit() {
@@ -5634,6 +5715,7 @@ stage_run_extended_soak() {
   local reboot_report="$REPORT_DIR/live_linux_reboot_recovery_report.json"
   local reboot_log="$REPORT_DIR/live_linux_reboot_recovery.log"
   run_periodic_managed_dns_refresh "soak_pre_two_hop" || return 1
+  assert_soak_cluster_security_convergence "extended soak pre-two-hop refresh" exit client entry aux || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
@@ -5653,6 +5735,7 @@ stage_run_extended_soak() {
   assert_no_managed_dns_service_errors "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
   assert_no_dns_zone_stale_status "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
   assert_client_dns_zone_valid_in_log "$two_hop_pre_log" "extended soak pre-reboot two-hop" || return 1
+  assert_soak_cluster_security_convergence "extended soak pre-reboot two-hop" exit client entry aux || return 1
 
   run_periodic_managed_dns_refresh "soak_pre_exit_handoff" || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
@@ -5675,6 +5758,7 @@ stage_run_extended_soak() {
   assert_no_managed_dns_service_errors "$handoff_log" "extended soak exit handoff" || return 1
   assert_no_dns_zone_stale_status "$handoff_log" "extended soak exit handoff" || return 1
   assert_client_dns_zone_valid_in_log "$handoff_log" "extended soak exit handoff" || return 1
+  assert_soak_cluster_security_convergence "extended soak exit handoff" exit client entry || return 1
 
   run_periodic_managed_dns_refresh "soak_pre_lan_toggle" || return 1
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
@@ -5693,11 +5777,13 @@ stage_run_extended_soak() {
   assert_no_managed_dns_service_errors "$lan_log" "extended soak lan toggle" || return 1
   assert_no_dns_zone_stale_status "$lan_log" "extended soak lan toggle" || return 1
   assert_client_dns_zone_valid_in_log "$lan_log" "extended soak lan toggle" || return 1
+  assert_soak_cluster_security_convergence "extended soak lan toggle" exit client aux || return 1
 
   run_periodic_managed_dns_refresh "soak_pre_reboot_recovery" || return 1
   stage_run_reboot_recovery_report || return 1
   assert_json_report_status_pass "$reboot_report" "extended soak reboot recovery" || return 1
   assert_no_managed_dns_service_errors "$reboot_log" "extended soak reboot recovery" || return 1
+  assert_soak_cluster_security_convergence "extended soak reboot recovery" exit client entry aux || return 1
 
   if [[ -f "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" ]]; then
     assert_no_managed_dns_service_errors "$REPORT_DIR/live_linux_two_hop_soak_post_exit_reboot.log" "extended soak post-exit-reboot two-hop" || return 1

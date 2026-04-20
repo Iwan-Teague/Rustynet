@@ -671,6 +671,15 @@ fn run() -> Result<(), String> {
     } else {
         "fail"
     };
+    let check_managed_dns_fresh_all_nodes = if managed_dns_state_is_valid(&client_status)
+        && managed_dns_state_is_valid(&entry_status)
+        && managed_dns_state_is_valid(&final_exit_status)
+        && managed_dns_state_is_valid(&second_client_status)
+    {
+        "pass"
+    } else {
+        "fail"
+    };
     let check_entry_managed_peer_endpoints_visible = if managed_peer_endpoints_include(
         &entry_managed_peer_endpoints,
         &entry_managed_peer_endpoints_error,
@@ -700,6 +709,7 @@ fn run() -> Result<(), String> {
         check_final_exit_serves,
         check_client_route_rustynet,
         check_second_client_route_rustynet,
+        check_managed_dns_fresh_all_nodes,
         check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
     ]
@@ -716,7 +726,7 @@ fn run() -> Result<(), String> {
     });
 
     let report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\"\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
+        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\"\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
         captured_at_utc,
         captured_at_unix,
         git_commit,
@@ -731,6 +741,7 @@ fn run() -> Result<(), String> {
         check_final_exit_serves,
         check_client_route_rustynet,
         check_second_client_route_rustynet,
+        check_managed_dns_fresh_all_nodes,
         check_entry_managed_peer_endpoints_visible,
         check_entry_managed_peer_endpoints_visible,
         check_no_plaintext_passphrases,
@@ -981,6 +992,12 @@ fn status_field(status_line: &str, key: &str) -> Option<String> {
         .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
 }
 
+fn managed_dns_state_is_valid(status: &str) -> bool {
+    status_field(status, "dns_zone_state") == Some("valid")
+        && status_field(status, "dns_zone_error") == Some("none")
+        && status_field(status, "dns_alarm_state") == Some("ok")
+}
+
 fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
     run_root(
         identity,
@@ -1001,11 +1018,15 @@ fn two_hop_runtime_ready(
 ) -> bool {
     client_status.contains(&format!("exit_node={}", config.entry_node_id))
         && client_status.contains("state=ExitActive")
+        && managed_dns_state_is_valid(client_status)
         && entry_status.contains(&format!("exit_node={}", config.final_exit_node_id))
         && entry_status.contains("serving_exit_node=true")
+        && managed_dns_state_is_valid(entry_status)
         && final_exit_status.contains("serving_exit_node=true")
+        && managed_dns_state_is_valid(final_exit_status)
         && second_client_status.contains(&format!("exit_node={}", config.final_exit_node_id))
         && second_client_status.contains("state=ExitActive")
+        && managed_dns_state_is_valid(second_client_status)
         && client_route.contains("dev rustynet0")
         && second_client_route.contains("dev rustynet0")
 }
@@ -1116,6 +1137,19 @@ mod tests {
     }
 
     #[test]
+    fn managed_dns_state_is_valid_requires_valid_none_ok() {
+        assert!(super::managed_dns_state_is_valid(
+            "dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok"
+        ));
+        assert!(!super::managed_dns_state_is_valid(
+            "dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error"
+        ));
+        assert!(!super::managed_dns_state_is_valid(
+            "dns_zone_state=valid dns_zone_error=none dns_alarm_state=error"
+        ));
+    }
+
+    #[test]
     fn two_hop_runtime_ready_requires_expected_exit_chain_and_routes() {
         let config = super::Config {
             ssh_identity_file: std::path::PathBuf::from("/tmp/key"),
@@ -1136,21 +1170,30 @@ mod tests {
 
         assert!(super::two_hop_runtime_ready(
             &config,
-            "node_role=client state=ExitActive exit_node=client-2",
-            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true",
-            "node_role=admin state=ExitActive serving_exit_node=true",
-            "node_role=client state=ExitActive exit_node=exit-1",
+            "node_role=client state=ExitActive exit_node=client-2 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=admin state=ExitActive serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=client state=ExitActive exit_node=exit-1 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
             "1.1.1.1 dev rustynet0",
             "1.1.1.1 dev rustynet0",
         ));
         assert!(!super::two_hop_runtime_ready(
             &config,
-            "node_role=client state=ExitActive exit_node=client-2",
-            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true",
-            "node_role=admin state=ExitActive serving_exit_node=true",
-            "node_role=client state=ExitActive exit_node=exit-1",
+            "node_role=client state=ExitActive exit_node=client-2 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=admin state=ExitActive serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=client state=ExitActive exit_node=exit-1 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
             "1.1.1.1 dev rustynet0",
             "1.1.1.1 via 192.168.64.1 dev enp0s1",
+        ));
+        assert!(!super::two_hop_runtime_ready(
+            &config,
+            "node_role=client state=ExitActive exit_node=client-2 dns_zone_state=invalid dns_zone_error=dns_zone_bundle_is_stale dns_alarm_state=error",
+            "node_role=admin state=ExitActive exit_node=exit-1 serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=admin state=ExitActive serving_exit_node=true dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "node_role=client state=ExitActive exit_node=exit-1 dns_zone_state=valid dns_zone_error=none dns_alarm_state=ok",
+            "1.1.1.1 dev rustynet0",
+            "1.1.1.1 dev rustynet0",
         ));
     }
 }
