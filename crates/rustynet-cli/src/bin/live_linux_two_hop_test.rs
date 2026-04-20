@@ -13,8 +13,8 @@ use live_lab_support::{
     ensure_pinned_known_hosts_file, ensure_safe_spec, ensure_safe_token, git_head_commit,
     issue_assignment_bundles_from_env, issue_traversal_bundles_from_env,
     load_home_known_hosts_path, no_plaintext_passphrase_check, remote_src_dir, require_command,
-    resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, status, unix_now,
-    wait_for_daemon_socket, write_assignment_refresh_env, write_file,
+    resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, ssh_status, status,
+    status_code, unix_now, wait_for_daemon_socket, write_assignment_refresh_env, write_file,
 };
 
 fn main() {
@@ -411,6 +411,107 @@ fn run() -> Result<(), String> {
         &config.second_client_host,
         &traversal_pub_local,
         &second_client_traversal_local,
+    )?;
+
+    let dns_zone_name =
+        env::var("RUSTYNET_DNS_ZONE_NAME").unwrap_or_else(|_| "rustynet".to_string());
+    ensure_safe_token("dns-zone-name", dns_zone_name.as_str())?;
+    let dns_zone_env = workspace.path().join("rn_issue_twohop_dns_zone.env");
+    write_file(&dns_zone_env, "")?;
+    append_env_assignment(&dns_zone_env, "NODES_SPEC", &nodes_spec)?;
+    append_env_assignment(&dns_zone_env, "ALLOW_SPEC", &allow_spec)?;
+    append_env_assignment(&dns_zone_env, "DNS_ZONE_NAME", &dns_zone_name)?;
+
+    logger.line("[two-hop] issuing signed DNS zone bundles for two-hop topology")?;
+    issue_dns_zone_bundles_from_env(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &dns_zone_env,
+        "/tmp/rn_issue_twohop_dns_zone.env",
+    )?;
+
+    let dns_zone_pub_local = workspace.path().join("dns-zone.pub");
+    let final_exit_dns_zone_local = workspace.path().join("dns-zone-final-exit");
+    let client_dns_zone_local = workspace.path().join("dns-zone-client");
+    let entry_dns_zone_local = workspace.path().join("dns-zone-entry");
+    let second_client_dns_zone_local = workspace.path().join("dns-zone-second-client");
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        "/run/rustynet/dns-zone-issue/rn-dns-zone.pub",
+        &dns_zone_pub_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/dns-zone-issue/rn-dns-zone-{}.dns-zone",
+            config.final_exit_node_id
+        ),
+        &final_exit_dns_zone_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/dns-zone-issue/rn-dns-zone-{}.dns-zone",
+            config.client_node_id
+        ),
+        &client_dns_zone_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/dns-zone-issue/rn-dns-zone-{}.dns-zone",
+            config.entry_node_id
+        ),
+        &entry_dns_zone_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/dns-zone-issue/rn-dns-zone-{}.dns-zone",
+            config.second_client_node_id
+        ),
+        &second_client_dns_zone_local,
+    )?;
+
+    logger.line("[two-hop] distributing signed DNS zone bundles")?;
+    install_dns_zone_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &dns_zone_pub_local,
+        &final_exit_dns_zone_local,
+    )?;
+    install_dns_zone_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+        &dns_zone_pub_local,
+        &client_dns_zone_local,
+    )?;
+    install_dns_zone_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+        &dns_zone_pub_local,
+        &entry_dns_zone_local,
+    )?;
+    install_dns_zone_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.second_client_host,
+        &dns_zone_pub_local,
+        &second_client_dns_zone_local,
     )?;
 
     logger.line("[two-hop] enforcing runtime roles")?;
@@ -977,6 +1078,74 @@ fn install_traversal_bundle(
         known_hosts,
         target,
         "install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle",
+    )
+}
+
+fn install_dns_zone_bundle(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+    dns_zone_pub_local: &Path,
+    dns_zone_bundle_local: &Path,
+) -> Result<(), String> {
+    scp_to(
+        identity,
+        known_hosts,
+        dns_zone_pub_local,
+        target,
+        "/tmp/rn-dns-zone.pub",
+    )?;
+    scp_to(
+        identity,
+        known_hosts,
+        dns_zone_bundle_local,
+        target,
+        "/tmp/rn-dns-zone.bundle",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
+    )?;
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
+    )
+}
+
+fn issue_dns_zone_bundles_from_env(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+    env_local: &Path,
+    remote_env_path: &str,
+) -> Result<(), String> {
+    scp_to(identity, known_hosts, env_local, target, remote_env_path)?;
+    let command = format!(
+        "sudo -n rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file {}",
+        shell_quote(remote_env_path)
+    );
+    let status = ssh_status(identity, known_hosts, target, &command)?;
+    if !status.success() {
+        let _ = run_root(
+            identity,
+            known_hosts,
+            target,
+            &format!("rm -f {}", shell_quote(remote_env_path)),
+        );
+        return Err(format!(
+            "issue dns zone bundles from env failed for {target} with status {}",
+            status_code(status)
+        ));
+    }
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        &format!("rm -f {}", shell_quote(remote_env_path)),
     )
 }
 
