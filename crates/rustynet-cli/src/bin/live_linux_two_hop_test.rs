@@ -993,9 +993,9 @@ fn status_field(status_line: &str, key: &str) -> Option<String> {
 }
 
 fn managed_dns_state_is_valid(status: &str) -> bool {
-    status_field(status, "dns_zone_state") == Some("valid")
-        && status_field(status, "dns_zone_error") == Some("none")
-        && status_field(status, "dns_alarm_state") == Some("ok")
+    status_field(status, "dns_zone_state").as_deref() == Some("valid")
+        && status_field(status, "dns_zone_error").as_deref() == Some("none")
+        && status_field(status, "dns_alarm_state").as_deref() == Some("ok")
 }
 
 fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
