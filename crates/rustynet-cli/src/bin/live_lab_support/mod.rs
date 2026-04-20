@@ -6,6 +6,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::Ipv4Addr;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use nix::unistd::Uid;
 use serde_json::Value;
 
@@ -296,16 +298,38 @@ pub fn read_text(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|err| format!("failed to read {}: {err}", path.display()))
 }
 
+fn configure_owner_only_file_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+}
+
+fn set_path_mode(path: &Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(path)
+            .map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)
+            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
 pub fn write_secure_text(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    configure_owner_only_file_open_options(options.create(true).truncate(true).write(true));
+    let mut file = options
         .open(path)
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     file.write_all(contents.as_bytes())
@@ -319,11 +343,9 @@ pub fn write_secure_json(path: &Path, value: &Value) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    configure_owner_only_file_open_options(options.create(true).truncate(true).write(true));
+    let file = options
         .open(path)
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     serde_json::to_writer_pretty(file, value)
@@ -333,12 +355,7 @@ pub fn write_secure_json(path: &Path, value: &Value) -> Result<(), String> {
 pub fn ensure_dir_secure(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path)
         .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions)
-        .map_err(|err| format!("failed to secure {}: {err}", path.display()))
+    set_path_mode(path, 0o700)
 }
 
 pub fn require_local_file_mode(path: &Path, policy: &str, label: &str) -> Result<(), String> {
@@ -353,40 +370,48 @@ pub fn require_local_file_mode(path: &Path, policy: &str, label: &str) -> Result
             path.display()
         ));
     }
-    let current_uid = Uid::current().as_raw();
-    if metadata.uid() != current_uid {
-        return Err(format!(
-            "{label} must be owned by the current user (path: {}, owner uid: {}, current uid: {})",
-            path.display(),
-            metadata.uid(),
-            current_uid
-        ));
+    #[cfg(not(unix))]
+    {
+        let _ = policy;
+        return Ok(());
     }
-    let mode = metadata.mode() & 0o777;
-    match policy {
-        "owner-only" => {
-            if mode & 0o077 != 0 {
-                return Err(format!(
-                    "{label} must be owner-only (mode {:o}, path: {})",
-                    mode,
-                    path.display()
-                ));
+    #[cfg(unix)]
+    {
+        let current_uid = Uid::current().as_raw();
+        if metadata.uid() != current_uid {
+            return Err(format!(
+                "{label} must be owned by the current user (path: {}, owner uid: {}, current uid: {})",
+                path.display(),
+                metadata.uid(),
+                current_uid
+            ));
+        }
+        let mode = metadata.mode() & 0o777;
+        match policy {
+            "owner-only" => {
+                if mode & 0o077 != 0 {
+                    return Err(format!(
+                        "{label} must be owner-only (mode {:o}, path: {})",
+                        mode,
+                        path.display()
+                    ));
+                }
+            }
+            "no-group-world-write" => {
+                if mode & 0o022 != 0 {
+                    return Err(format!(
+                        "{label} must not be group/world-writable (mode {:o}, path: {})",
+                        mode,
+                        path.display()
+                    ));
+                }
+            }
+            other => {
+                return Err(format!("unsupported local file policy: {other}"));
             }
         }
-        "no-group-world-write" => {
-            if mode & 0o022 != 0 {
-                return Err(format!(
-                    "{label} must not be group/world-writable (mode {:o}, path: {})",
-                    mode,
-                    path.display()
-                ));
-            }
-        }
-        other => {
-            return Err(format!("unsupported local file policy: {other}"));
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn shell_single_quote(value: &str) -> String {
@@ -498,8 +523,7 @@ impl LiveLabContext {
                 pinned_known_hosts_file.display()
             )
         })?;
-        fs::set_permissions(&known_hosts_file, fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("failed to secure {}: {err}", known_hosts_file.display()))?;
+        set_path_mode(&known_hosts_file, 0o600)?;
 
         Ok(Self {
             root_dir,
@@ -959,8 +983,7 @@ fn create_unique_work_dir(prefix: &str) -> Result<PathBuf, String> {
         let candidate = base.join(format!("{prefix}.{pid}.{timestamp}.{counter}.{salt}"));
         match fs::create_dir(&candidate) {
             Ok(()) => {
-                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
-                    .map_err(|err| format!("failed to secure {}: {err}", candidate.display()))?;
+                set_path_mode(&candidate, 0o700)?;
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,

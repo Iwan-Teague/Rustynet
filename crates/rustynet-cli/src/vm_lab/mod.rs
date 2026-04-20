@@ -12817,7 +12817,16 @@ fn build_windows_helper_command(remote_path: &str, args: &[String]) -> Result<St
     for arg in args {
         ensure_no_control_chars("Windows helper arg", arg.as_str())?;
         command.push(' ');
-        command.push_str(powershell_quote(arg.as_str())?.as_str());
+        if arg.starts_with('-')
+            && arg
+                .chars()
+                .skip(1)
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            command.push_str(arg.as_str());
+        } else {
+            command.push_str(powershell_quote(arg.as_str())?.as_str());
+        }
     }
     Ok(command)
 }
@@ -15622,7 +15631,7 @@ mod tests {
         )
         .expect("result-file helper invocation script should inject output path");
         assert!(script.contains(
-            "& 'C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1' '-RustyNetRoot' 'C:\\Rustynet' '-InstallRoot' 'C:\\Program Files\\RustyNet' '-OutputPath' 'C:\\ProgramData\\Rustynet\\vm-lab\\verify.json'"
+            "& 'C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1' -RustyNetRoot 'C:\\Rustynet' -InstallRoot 'C:\\Program Files\\RustyNet' -OutputPath 'C:\\ProgramData\\Rustynet\\vm-lab\\verify.json'"
         ));
     }
 

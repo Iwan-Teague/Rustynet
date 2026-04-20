@@ -9,6 +9,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:VerifyFailureStep = 'init'
+$script:VerifyRuntimeSignals = $null
 
 function New-FailClosedVerifyReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
@@ -28,6 +30,8 @@ function New-FailClosedVerifyReport {
         service_present = $false
         service_running = $false
         service_status = 'missing'
+        failure_step = $script:VerifyFailureStep
+        runtime_signals = $script:VerifyRuntimeSignals
         notes = @('verify-helper-trap')
     }
 }
@@ -151,6 +155,60 @@ function Get-WindowsTargetFacts {
         architecture = if ($os) { [string]$os.OSArchitecture } elseif ($computer) { [string]$computer.SystemType } else { '' }
         windows_11_target = [bool]($buildNumber -ge 22000)
         elevated_admin = [bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+}
+
+function Get-NativeCommandText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Arguments = @()
+    )
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $Path @Arguments 2>&1 | Out-String)
+        if ($null -eq $output) {
+            return ''
+        }
+        return [string]$output
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Test-RustyNetWindowsRuntimeSupport {
+    param([Parameter(Mandatory = $true)][string]$DaemonPath)
+
+    if (-not (Test-Path -LiteralPath $DaemonPath)) {
+        return [ordered]@{
+            has_windows_service = $false
+            has_env_file = $false
+            probe_mode = 'missing-daemon'
+            probe_excerpt = ''
+        }
+    }
+
+    $helpText = Get-NativeCommandText -Path $DaemonPath -Arguments @('--help')
+    $probeText = [string]$helpText
+    $probeMode = 'help'
+    $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not ($hasWindowsService -and $hasEnvFile)) {
+        $usageText = Get-NativeCommandText -Path $DaemonPath
+        if (-not [string]::IsNullOrWhiteSpace($usageText)) {
+            $probeText = (($helpText.TrimEnd()) + "`r`n" + ($usageText.Trim())).Trim()
+            $probeMode = 'help+bare'
+            $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }
+    }
+
+    return [ordered]@{
+        has_windows_service = $hasWindowsService
+        has_env_file = $hasEnvFile
+        probe_mode = $probeMode
+        probe_excerpt = if ($probeText.Length -gt 512) { $probeText.Substring(0, 512) } else { $probeText }
     }
 }
 
@@ -290,15 +348,14 @@ $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
 $serviceImagePath = [string]$serviceRuntime.image_path
 $windowsFacts = Get-WindowsTargetFacts
 $serviceSidType = Get-ServiceSidType -ServiceName $ServiceName
-$runtimeFlagsPresent = $false
-if (Test-Path -LiteralPath $daemonInstallPath) {
-    $helpText = (& $daemonInstallPath --help 2>&1 | Out-String)
-    if (($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1) -and $helpText -match '--windows-service' -and $helpText -match '--env-file') {
-        $runtimeFlagsPresent = $true
-    }
-}
+$script:VerifyFailureStep = 'probe-runtime-support'
+$runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonInstallPath
+$script:VerifyRuntimeSignals = $runtimeSignals
+$runtimeFlagsPresent = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
+$script:VerifyFailureStep = 'runtime-boundary-check'
 $runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
 
+$script:VerifyFailureStep = 'review-backend-state'
 $backendState = Get-ReviewedBackendState -ConfigPath $configPath
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token '--windows-service'
 $serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token '--env-file'
@@ -353,9 +410,6 @@ $checks = [ordered]@{
 $notes = @()
 if (-not $checks.installed_rustynetd) {
     $notes += 'daemon-binary-missing'
-}
-if (-not $checks.installed_rustynet_cli) {
-    $notes += 'cli-binary-missing'
 }
 if (-not $checks.config_present) {
     $notes += 'config-missing'
@@ -413,7 +467,7 @@ $status = 'fail'
 $reason = ''
 $runtimeSupported = $false
 $serviceVerified = $false
-if (-not $checks.installed_rustynetd -or -not $checks.installed_rustynet_cli) {
+if (-not $checks.installed_rustynetd) {
     $reason = 'install-artifacts-missing'
 }
 elseif (-not $checks.runtime_flags_present) {
@@ -484,6 +538,7 @@ $report = [ordered]@{
     backend_label = $checks.backend_label
     daemon_present = $checks.installed_rustynetd
     cli_present = $checks.installed_rustynet_cli
+    cli_optional = $true
     config_present = $checks.config_present
     log_root_present = $checks.log_root_present
     trust_root_present = $checks.trust_root_present
@@ -516,6 +571,8 @@ $report = [ordered]@{
     runtime_boundary_status = $checks.runtime_boundary_status
     runtime_boundary_validated = $checks.runtime_boundary_validated
     runtime_boundary = $runtimeBoundary
+    failure_step = $script:VerifyFailureStep
+    runtime_signals = $runtimeSignals
     notes = $notes
     checks = $checks
 }

@@ -9,6 +9,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:InstallFailureStep = 'init'
+$script:InstallRuntimeSignals = $null
 
 function New-FailClosedInstallReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
@@ -27,6 +29,8 @@ function New-FailClosedInstallReport {
         service_verified = $false
         service_present = $false
         service_status = 'missing'
+        failure_step = $script:InstallFailureStep
+        runtime_signals = $script:InstallRuntimeSignals
         notes = @('install-helper-trap')
     }
 }
@@ -71,20 +75,68 @@ function Ensure-Directory {
     }
 }
 
-function Test-RustyNetWindowsRuntimeSupport {
-    param([Parameter(Mandatory = $true)][string]$DaemonPath)
-    $helpText = (& $DaemonPath --help 2>&1 | Out-String)
-    $hasWindowsService = $helpText -match '--windows-service'
-    $hasEnvFile = $helpText -match '--env-file'
-    return [ordered]@{
-        has_windows_service = $hasWindowsService
-        has_env_file = $hasEnvFile
+function Get-NativeCommandText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Arguments = @()
+    )
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $Path @Arguments 2>&1 | Out-String)
+        if ($null -eq $output) {
+            return ''
+        }
+        return [string]$output
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
     }
 }
 
-function Get-FirstExistingPath {
-    param([string[]]$Candidates)
-    return $Candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+function Test-RustyNetWindowsRuntimeSupport {
+    param([Parameter(Mandatory = $true)][string]$DaemonPath)
+    $helpText = Get-NativeCommandText -Path $DaemonPath -Arguments @('--help')
+    $probeText = [string]$helpText
+    $probeMode = 'help'
+    $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not ($hasWindowsService -and $hasEnvFile)) {
+        $usageText = Get-NativeCommandText -Path $DaemonPath
+        if (-not [string]::IsNullOrWhiteSpace($usageText)) {
+            $probeText = (($helpText.TrimEnd()) + "`r`n" + ($usageText.Trim())).Trim()
+            $probeMode = 'help+bare'
+            $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }
+    }
+    return [ordered]@{
+        has_windows_service = $hasWindowsService
+        has_env_file = $hasEnvFile
+        probe_mode = $probeMode
+        probe_excerpt = if ($probeText.Length -gt 512) { $probeText.Substring(0, 512) } else { $probeText }
+    }
+}
+
+function Ensure-RustyNetRuntimeLayout {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)][string]$StateRoot
+    )
+    foreach ($path in @(
+            $InstallRoot,
+            (Join-Path $InstallRoot 'bin'),
+            $StateRoot,
+            (Join-Path $StateRoot 'config'),
+            (Join-Path $StateRoot 'logs'),
+            (Join-Path $StateRoot 'trust'),
+            (Join-Path $StateRoot 'keys'),
+            (Join-Path $StateRoot 'membership'),
+            (Join-Path $StateRoot 'secrets'),
+            (Join-Path $StateRoot 'secrets\key-custody')
+        )) {
+        Ensure-Directory -Path $path
+    }
 }
 
 function Test-PathPinnedToBinary {
@@ -204,17 +256,10 @@ function Write-ReviewedEnvFile {
     ) | Out-File -Encoding ascii $Path
 }
 
-Ensure-Directory -Path $InstallRoot
-Ensure-Directory -Path (Join-Path $InstallRoot 'bin')
-Ensure-Directory -Path $StateRoot
-Ensure-Directory -Path (Join-Path $StateRoot 'config')
-Ensure-Directory -Path (Join-Path $StateRoot 'logs')
-Ensure-Directory -Path (Join-Path $StateRoot 'trust')
-Ensure-Directory -Path (Join-Path $StateRoot 'keys')
-Ensure-Directory -Path (Join-Path $StateRoot 'membership')
-Ensure-Directory -Path (Join-Path $StateRoot 'secrets')
-Ensure-Directory -Path (Join-Path $StateRoot 'secrets\key-custody')
+$script:InstallFailureStep = 'ensure-runtime-layout'
+Ensure-RustyNetRuntimeLayout -InstallRoot $InstallRoot -StateRoot $StateRoot
 
+$script:InstallFailureStep = 'locate-build-artifacts'
 $daemonCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynetd.exe'
 )
@@ -223,22 +268,36 @@ $cliCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe'
 )
 
-$daemonSource = Get-FirstExistingPath -Candidates $daemonCandidates
+$daemonSource = $daemonCandidates[0]
 if (-not $daemonSource) {
     throw 'rustynetd.exe was not found under the Windows release output directory'
 }
-$cliSource = Get-FirstExistingPath -Candidates $cliCandidates
+if (-not (Test-Path -LiteralPath $daemonSource)) {
+    throw 'rustynetd.exe was not found under the Windows release output directory'
+}
+$cliSource = $null
+foreach ($candidate in $cliCandidates) {
+    if (Test-Path -LiteralPath $candidate) {
+        $cliSource = $candidate
+        break
+    }
+}
 
 $daemonDest = Join-Path $InstallRoot 'bin\rustynetd.exe'
+$script:InstallFailureStep = 'copy-daemon-binary'
 Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force
 if ($cliSource) {
+    $script:InstallFailureStep = 'copy-cli-binary'
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'bin\rustynet.exe') -Force
 }
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
+$script:InstallFailureStep = 'write-reviewed-env-file'
 Write-ReviewedEnvFile -Path $configPath
 
+$script:InstallFailureStep = 'probe-runtime-support'
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
+$script:InstallRuntimeSignals = $runtimeSignals
 $serviceConfigError = ''
 $serviceSidConfigured = $false
 $runtimeAclApplied = $false
@@ -251,6 +310,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     $quotedServiceName = '"' + $ServiceName + '"'
     $binPath = "$quotedDaemon --windows-service --service-name $quotedServiceName --env-file $quotedConfig"
     try {
+        $script:InstallFailureStep = 'configure-service-registration'
         $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($existing) {
             $scOutput = (& sc.exe config $ServiceName binPath= $binPath start= auto 2>&1 | Out-String)
@@ -268,9 +328,11 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
         if ($LASTEXITCODE -ne 0) {
             throw "sc.exe description failed: $descriptionOutput"
         }
+        $script:InstallFailureStep = 'configure-service-sid'
         Ensure-ServiceSidTypeUnrestricted -ServiceName $ServiceName
         $serviceSidConfigured = $true
 
+        $script:InstallFailureStep = 'repair-runtime-acls'
         $administratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-544'
         $localSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
         $serviceIdentity = Get-ServiceIdentityName -ServiceName $ServiceName
@@ -296,6 +358,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     if (-not $serviceConfigError) {
         $serviceStartAttempted = $true
         try {
+            $script:InstallFailureStep = 'start-runtime-service'
             $service = Get-Service -Name $ServiceName -ErrorAction Stop
             if ($service.Status -eq 'Running') {
                 Restart-Service -Name $ServiceName -ErrorAction Stop
@@ -311,6 +374,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     }
 }
 
+$script:InstallFailureStep = 'observe-runtime-service'
 $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
 $imagePath = [string]$serviceRuntime.image_path
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--windows-service'
@@ -351,7 +415,7 @@ elseif (-not $serviceEnvFilePinned) {
 
 $reason = ''
 $status = 'fail'
-if (-not (Test-Path -LiteralPath $daemonDest) -or -not $cliSource) {
+if (-not (Test-Path -LiteralPath $daemonDest)) {
     $reason = 'install-artifacts-missing'
 }
 elseif (-not $runtimeSignals.has_windows_service -or -not $runtimeSignals.has_env_file) {
@@ -402,6 +466,7 @@ $report = [ordered]@{
     backend_label = $backendLabel
     runtime_supported = $false
     service_verified = ($status -eq 'pass')
+    cli_optional = $true
     start_attempted = $serviceStartAttempted
     start_error = $startError
     daemon_present = Test-Path -LiteralPath $daemonDest
@@ -424,6 +489,8 @@ $report = [ordered]@{
     service_env_file_pinned = $serviceEnvFilePinned
     service_binary_path_pinned_to_install_root = Test-PathPinnedToBinary -ImagePath $imagePath -BinaryPath $daemonDest
     runtime_flags_present = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
+    failure_step = $script:InstallFailureStep
+    runtime_signals = $runtimeSignals
     notes = $notes
 }
 

@@ -44,10 +44,140 @@ fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &Rem
         Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
     ) && matches!(
         phase,
-        BootstrapPhase::InstallRelease
+        BootstrapPhase::BuildRelease
+            | BootstrapPhase::InstallRelease
             | BootstrapPhase::RestartRuntime
             | BootstrapPhase::VerifyRuntime
     )
+}
+
+fn build_windows_build_release_report_paths(
+    target: &RemoteTarget,
+) -> Result<(String, String, String), String> {
+    let remote_root = target
+        .remote_temp_dir
+        .clone()
+        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile));
+    ensure_no_control_chars("Windows build-release report root", remote_root.as_str())?;
+    let report_root = format!(
+        r"{}\build-release\bootstrap-{}-build-release-{}",
+        remote_root.trim_end_matches(['\\', '/']),
+        sanitize_label_for_path(target.label.as_str()),
+        unique_suffix()
+    );
+    Ok((
+        report_root.clone(),
+        format!(r"{report_root}\manifest.json"),
+        format!(r"{report_root}\probe.json"),
+    ))
+}
+
+fn build_windows_bootstrap_build_release_result_script(
+    remote_path: &str,
+    args: &[String],
+    remote_manifest_path: &str,
+    remote_probe_path: &str,
+) -> Result<String, String> {
+    let mut helper_args = args.to_vec();
+    helper_args.push("-ResultPath".to_string());
+    helper_args.push(remote_manifest_path.to_string());
+    let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $manifestPath = {manifest_path}; \
+         $probePath = {probe_path}; \
+         $reportRoot = Split-Path -Path $manifestPath -Parent; \
+         $stdoutPath = Join-Path $reportRoot 'stdout.txt'; \
+         $stderrPath = Join-Path $reportRoot 'stderr.txt'; \
+         $exitCodePath = Join-Path $reportRoot 'exit_code.txt'; \
+         $toolchainPath = Join-Path $reportRoot 'toolchain.txt'; \
+         $markerPath = Join-Path $reportRoot 'complete.marker'; \
+         $probeParent = Split-Path -Path $probePath -Parent; \
+         if ($probeParent -and -not (Test-Path -LiteralPath $probeParent)) {{ \
+           New-Item -ItemType Directory -Path $probeParent -Force | Out-Null \
+         }}; \
+         if (Test-Path -LiteralPath $probePath) {{ \
+           Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue \
+         }}; \
+         $helperFailure = ''; \
+         try {{ \
+           {helper_command}; \
+         }} catch {{ \
+           $helperFailure = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }} \
+         }}; \
+         $body = ''; \
+         $validationFailure = ''; \
+         if (-not (Test-Path -LiteralPath $manifestPath)) {{ \
+           if ([string]::IsNullOrWhiteSpace($helperFailure)) {{ \
+             $validationFailure = ('Windows bootstrap build-release helper did not write manifest: {{0}}' -f $manifestPath) \
+           }} else {{ \
+             $validationFailure = $helperFailure \
+           }} \
+         }} elseif (-not (Test-Path -LiteralPath $markerPath)) {{ \
+           if ([string]::IsNullOrWhiteSpace($helperFailure)) {{ \
+             $validationFailure = ('Windows bootstrap build-release helper did not write complete.marker: {{0}}' -f $markerPath) \
+           }} else {{ \
+             $validationFailure = $helperFailure \
+           }} \
+         }} else {{ \
+           try {{ \
+             $body = Get-Content -Raw -LiteralPath $manifestPath -Encoding UTF8; \
+             if ([string]::IsNullOrWhiteSpace($body)) {{ \
+               throw ('Windows bootstrap build-release helper wrote empty manifest: {{0}}' -f $manifestPath) \
+             }}; \
+             $report = $body | ConvertFrom-Json -ErrorAction Stop; \
+             foreach ($requiredField in @('phase', 'status', 'reason', 'report_root', 'stdout_path', 'stderr_path', 'exit_code_path', 'toolchain_path', 'manifest_path', 'complete_marker_path')) {{ \
+               $value = $report.$requiredField; \
+               if ($null -eq $value -or ([string]$value).Trim().Length -eq 0) {{ \
+                 throw ('Windows bootstrap build-release manifest missing field: {{0}}' -f $requiredField) \
+               }} \
+             }}; \
+             if ([string]$report.phase -ne 'build-release') {{ \
+               throw ('Windows bootstrap build-release manifest reported unexpected phase: {{0}}' -f [string]$report.phase) \
+             }}; \
+             if ([string]$report.report_root -ne $reportRoot) {{ \
+               throw ('Windows bootstrap build-release manifest reported unexpected report_root: {{0}}' -f [string]$report.report_root) \
+             }}; \
+             if ([string]$report.manifest_path -ne $manifestPath) {{ \
+               throw ('Windows bootstrap build-release manifest reported unexpected manifest_path: {{0}}' -f [string]$report.manifest_path) \
+             }}; \
+             if ([string]$report.complete_marker_path -ne $markerPath) {{ \
+               throw ('Windows bootstrap build-release manifest reported unexpected complete_marker_path: {{0}}' -f [string]$report.complete_marker_path) \
+             }}; \
+             foreach ($requiredPath in @($stdoutPath, $stderrPath, $exitCodePath, $toolchainPath, $markerPath)) {{ \
+               if (-not (Test-Path -LiteralPath $requiredPath)) {{ \
+                 throw ('Windows bootstrap build-release missing report file: {{0}}' -f $requiredPath) \
+               }} \
+             }}; \
+           }} catch {{ \
+             $validationFailure = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }} \
+           }} \
+         }}; \
+         if (-not [string]::IsNullOrWhiteSpace($validationFailure)) {{ \
+           $body = ([ordered]@{{ \
+             phase = 'build-release'; \
+             status = 'fail'; \
+             reason = $validationFailure; \
+             report_root = $reportRoot; \
+             stdout_path = $stdoutPath; \
+             stderr_path = $stderrPath; \
+             exit_code_path = $exitCodePath; \
+             toolchain_path = $toolchainPath; \
+             manifest_path = $manifestPath; \
+             complete_marker_path = $markerPath; \
+             exit_code = 1; \
+             stderr_tail = ''; \
+             notes = @('build-release-wrapper-fallback') \
+           }} | ConvertTo-Json -Compress) \
+         }}; \
+         Set-Content -LiteralPath $probePath -Value $body -Encoding UTF8; \
+         if (-not [string]::IsNullOrWhiteSpace($validationFailure)) {{ exit 1 }}",
+        manifest_path = powershell_quote(remote_manifest_path)?,
+        probe_path = powershell_quote(remote_probe_path)?,
+        helper_command = helper_command,
+    ))
 }
 
 fn format_windows_phase_failure_with_diagnostics(
@@ -216,6 +346,68 @@ fn build_windows_restart_runtime_script() -> Result<String, String> {
     ))
 }
 
+fn parse_windows_build_release_report_output(
+    output: &str,
+    target_label: &str,
+) -> Result<(), String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Windows bootstrap build-release produced no report for {}",
+            target_label
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!(
+            "Windows bootstrap build-release did not emit valid JSON for {}: {err}",
+            target_label
+        )
+    })?;
+    let status = parsed
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("fail");
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("windows-build-release-failed");
+    let report_root = parsed
+        .get("report_root")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Windows bootstrap build-release report was missing report_root for {}",
+                target_label
+            )
+        })?;
+    let exit_code = parsed
+        .get("exit_code")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let stderr_tail = parsed
+        .get("stderr_tail")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    if status == "pass" {
+        return Ok(());
+    }
+    let mut details = vec![
+        format!("reason={reason}"),
+        format!("report_root={report_root}"),
+    ];
+    details.push(format!("exit_code={exit_code}"));
+    if let Some(stderr_tail) = stderr_tail {
+        details.push(format!("stderr_tail={stderr_tail}"));
+    }
+    Err(format!(
+        "Windows bootstrap build-release reported status={status} for {} {}",
+        target_label,
+        details.join(" ")
+    ))
+}
+
 fn parse_windows_runtime_report_output(
     output: &str,
     helper_label: &str,
@@ -257,6 +449,22 @@ fn parse_windows_runtime_report_output(
         .get("start_error")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty());
+    let failure_step = parsed
+        .get("failure_step")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    let runtime_probe_mode = parsed
+        .get("runtime_signals")
+        .and_then(|value| value.get("probe_mode"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    let runtime_probe_excerpt = parsed
+        .get("runtime_signals")
+        .and_then(|value| value.get("probe_excerpt"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect::<String>());
     let notes = parsed
         .get("notes")
         .and_then(|value| value.as_array())
@@ -280,6 +488,15 @@ fn parse_windows_runtime_report_output(
     }
     if let Some(start_error) = start_error {
         details.push(format!("start_error={start_error}"));
+    }
+    if let Some(failure_step) = failure_step {
+        details.push(format!("failure_step={failure_step}"));
+    }
+    if let Some(runtime_probe_mode) = runtime_probe_mode {
+        details.push(format!("runtime_probe_mode={runtime_probe_mode}"));
+    }
+    if let Some(runtime_probe_excerpt) = runtime_probe_excerpt {
+        details.push(format!("runtime_probe_excerpt={runtime_probe_excerpt}"));
     }
     if let Some(notes) = notes {
         details.push(format!("notes={notes}"));
@@ -325,6 +542,23 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
         .get("host_surface_validated")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let failure_step = parsed
+        .get("failure_step")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let runtime_probe_mode = parsed
+        .get("runtime_signals")
+        .and_then(|value| value.get("probe_mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let runtime_probe_excerpt = parsed
+        .get("runtime_signals")
+        .and_then(|value| value.get("probe_excerpt"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(160).collect::<String>())
+        .unwrap_or_default();
     let cleanup_status = parsed
         .get("cleanup_status")
         .and_then(|value| value.as_str())
@@ -332,7 +566,7 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
 
     if !host_surface_validated {
         return Err(format!(
-            "Windows service-host smoke helper reported status={status} reason={reason} host_surface_validated=false for {target_label}"
+            "Windows service-host smoke helper reported status={status} reason={reason} host_surface_validated=false failure_step={failure_step} runtime_probe_mode={runtime_probe_mode} runtime_probe_excerpt={runtime_probe_excerpt} for {target_label}"
         ));
     }
     if cleanup_status != "removed" {
@@ -351,7 +585,7 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
     }
 
     Err(format!(
-        "Windows service-host smoke helper reported status={status} reason={reason} backend_label={backend_label} for {target_label}"
+        "Windows service-host smoke helper reported status={status} reason={reason} backend_label={backend_label} failure_step={failure_step} runtime_probe_mode={runtime_probe_mode} runtime_probe_excerpt={runtime_probe_excerpt} for {target_label}"
     ))
 }
 
@@ -627,6 +861,52 @@ impl WindowsBootstrapProvider {
         parse_windows_runtime_report_output(output.as_str(), label, target.label.as_str())
     }
 
+    fn run_build_release_via_local_utm_report(
+        &self,
+        target: &RemoteTarget,
+        context: &BootstrapPhaseContext<'_>,
+        invocation: WindowsHelperScriptSpec,
+    ) -> Result<(), String> {
+        let helper_context = self.helper_context(target, context);
+        let (utm_name, _) = remote_target_local_utm(helper_context.target).ok_or_else(|| {
+            format!(
+                "Windows bootstrap build-release requested local UTM report mode for non-UTM target {}",
+                target.label
+            )
+        })?;
+        stage_windows_helper_support_files(&helper_context, invocation.helper_file_name)?;
+        let remote_path = stage_windows_helper_script_from_path_with_phase(
+            &helper_context,
+            windows_bootstrap_helper_script_local_path().as_path(),
+            invocation.remote_file_name,
+            RemoteTransportPhase::AccessEstablishment,
+        )?;
+        let (_report_root, remote_manifest_path, remote_probe_path) =
+            build_windows_build_release_report_paths(helper_context.target)?;
+        let manifest_path = remote_manifest_path.clone();
+        let output = execute_windows_local_utm_result_file_probe(
+            utm_name,
+            "Windows bootstrap build-release",
+            helper_context.timeout,
+            remote_probe_path.as_str(),
+            |remote_probe_path| {
+                build_windows_bootstrap_build_release_result_script(
+                    remote_path.as_str(),
+                    invocation.args.as_slice(),
+                    manifest_path.as_str(),
+                    remote_probe_path,
+                )
+            },
+        )
+        .map_err(|err| {
+            format!(
+                "Windows bootstrap build-release failed for {}: {err}",
+                target.label
+            )
+        })?;
+        parse_windows_build_release_report_output(output.as_str(), target.label.as_str())
+    }
+
     fn collect_failure_diagnostics(
         &self,
         phase: BootstrapPhase,
@@ -789,12 +1069,16 @@ impl WindowsBootstrapProvider {
             BootstrapPhase::BuildRelease => {
                 let invocation =
                     build_bootstrap_script_invocation(phase, target.label.as_str(), context)?;
-                self.invoke_helper_status(
-                    target,
-                    context,
-                    invocation,
-                    "Windows bootstrap build-release",
-                )
+                if local_utm_result_file_supported_for_phase(BootstrapPhase::BuildRelease, target) {
+                    self.run_build_release_via_local_utm_report(target, context, invocation)
+                } else {
+                    self.invoke_helper_status(
+                        target,
+                        context,
+                        invocation,
+                        "Windows bootstrap build-release",
+                    )
+                }
             }
             BootstrapPhase::SmokeServiceHost => {
                 let invocation = build_windows_service_host_smoke_invocation(context);
@@ -1077,6 +1361,7 @@ mod tests {
                 "status": "fail",
                 "reason": "windows-runtime-service-host-not-yet-implemented",
                 "service_status": "missing",
+                "failure_step": "probe-runtime-support",
                 "notes": ["windows-service-flags-missing","service-missing"]
             }"#,
             "Windows verify helper",
@@ -1085,6 +1370,7 @@ mod tests {
         .expect_err("missing service must fail closed");
         assert!(err.contains("status=fail"));
         assert!(err.contains("reason=windows-runtime-service-host-not-yet-implemented"));
+        assert!(err.contains("failure_step=probe-runtime-support"));
         assert!(err.contains("windows-service-flags-missing"));
     }
 
@@ -1130,12 +1416,14 @@ mod tests {
                 "reason": "windows-runtime-backend-explicitly-unsupported",
                 "backend_label": "windows-unsupported",
                 "host_surface_validated": false,
+                "failure_step": "probe-runtime-support",
                 "cleanup_status": "removed"
             }"#,
             "windows-utm-1",
         )
         .expect_err("unvalidated host surface must fail closed");
         assert!(err.contains("host_surface_validated=false"));
+        assert!(err.contains("failure_step=probe-runtime-support"));
     }
 
     #[test]
@@ -1187,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn local_utm_result_file_support_covers_runtime_phases_on_windows_local_utm() {
+    fn local_utm_result_file_support_covers_build_and_runtime_phases_on_windows_local_utm() {
         let target = RemoteTarget {
             label: "windows-utm-1".to_string(),
             ssh_target: "192.168.64.14".to_string(),
@@ -1201,6 +1489,10 @@ mod tests {
             remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
         };
 
+        assert!(local_utm_result_file_supported_for_phase(
+            BootstrapPhase::BuildRelease,
+            &target
+        ));
         assert!(local_utm_result_file_supported_for_phase(
             BootstrapPhase::InstallRelease,
             &target
@@ -1272,6 +1564,46 @@ mod tests {
         assert!(script.contains("manifest.json"));
         assert!(script.contains("ConvertFrom-Json"));
         assert!(script.contains("did not create output root"));
+    }
+
+    #[test]
+    fn windows_build_release_result_script_requires_complete_marker_and_report_files() {
+        let script = build_windows_bootstrap_build_release_result_script(
+            r"C:\ProgramData\Rustynet\vm-lab\Bootstrap-RustyNetWindows.ps1",
+            &[
+                "-Phase".to_string(),
+                "build-release".to_string(),
+                "-RustyNetRoot".to_string(),
+                r"C:\Rustynet".to_string(),
+            ],
+            r"C:\ProgramData\Rustynet\vm-lab\build-release\run-1\manifest.json",
+            r"C:\ProgramData\Rustynet\vm-lab\build-release\run-1\probe.json",
+        )
+        .expect("build-release result script should build");
+
+        assert!(script.contains("-ResultPath"));
+        assert!(script.contains("complete.marker"));
+        assert!(script.contains("manifest missing field"));
+        assert!(script.contains("missing report file"));
+        assert!(script.contains("probe.json"));
+    }
+
+    #[test]
+    fn windows_build_release_report_parser_surfaces_reason_and_report_root() {
+        let err = parse_windows_build_release_report_output(
+            r#"{
+                "status": "fail",
+                "reason": "cargo build failed for Windows build-release (exit_code=101)",
+                "report_root": "C:\\ProgramData\\Rustynet\\vm-lab\\build-release\\bootstrap-windows-utm-1-build-release-1",
+                "exit_code": 101,
+                "stderr_tail": "error: linker `link.exe` not found"
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("failing build-release report must fail closed");
+        assert!(err.contains("reason=cargo build failed for Windows build-release"));
+        assert!(err.contains(r"report_root=C:\ProgramData\Rustynet\vm-lab\build-release"));
+        assert!(err.contains("stderr_tail=error: linker `link.exe` not found"));
     }
 
     #[test]

@@ -16,7 +16,8 @@ param(
     [string]$ResultPath = '',
     [switch]$InstallPowerShell7,
     [switch]$SetDefaultShellToPowerShell,
-    [switch]$SetDefaultShellToPowerShell7
+    [switch]$SetDefaultShellToPowerShell7,
+    [switch]$InteractiveBuildBootstrapChild
 )
 
 Set-StrictMode -Version Latest
@@ -83,19 +84,27 @@ function Write-FailClosedPhaseResultIfRequested {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
 
     $trimmedResultPath = $ResultPath.Trim()
-    if ($Phase -ne 'prepare-transport' -or $trimmedResultPath.Length -eq 0) {
+    if ($trimmedResultPath.Length -eq 0) {
         return
     }
-    try {
-        $report = New-PrepareTransportFailureReport -Reason $FailureReason
-        $parent = Split-Path -Path $trimmedResultPath -Parent
-        if ($parent -and $parent.Trim().Length -gt 0) {
-            Ensure-Directory -Path $parent
+
+    if ($Phase -eq 'prepare-transport') {
+        try {
+            $report = New-PrepareTransportFailureReport -Reason $FailureReason
+            $parent = Split-Path -Path $trimmedResultPath -Parent
+            if ($parent -and $parent.Trim().Length -gt 0) {
+                Ensure-Directory -Path $parent
+            }
+            $report | ConvertTo-Json -Compress | Set-Content -LiteralPath $trimmedResultPath -Encoding utf8
         }
-        $report | ConvertTo-Json -Compress | Set-Content -LiteralPath $trimmedResultPath -Encoding utf8
+        catch {
+            # Preserve the original failure as the dominant root cause.
+        }
+        return
     }
-    catch {
-        # Preserve the original failure as the dominant root cause.
+
+    if ($Phase -eq 'build-release') {
+        Write-FailClosedBuildReleaseReportIfRequested -FailureReason $FailureReason
     }
 }
 
@@ -114,6 +123,159 @@ function Write-JsonPhaseResult {
     Write-Output $json
 }
 
+function Write-TextFileAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [ValidateSet('utf8', 'ascii')]
+        [string]$Encoding = 'utf8'
+    )
+
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent -and $parent.Trim().Length -gt 0) {
+        Ensure-Directory -Path $parent
+    }
+    $leaf = Split-Path -Path $Path -Leaf
+    $tempPath = Join-Path $parent ([string]::Concat($leaf, '.tmp.', [guid]::NewGuid().ToString('N')))
+    Set-Content -LiteralPath $tempPath -Value $Content -Encoding $Encoding
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
+}
+
+function Get-FileTailOrEmpty {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$LineCount = 20
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return ''
+    }
+    try {
+        return ((Get-Content -LiteralPath $Path -Tail $LineCount -ErrorAction Stop) -join "`n").Trim()
+    }
+    catch {
+        return ''
+    }
+}
+
+function Get-BuildReleaseReportLayout {
+    param([string]$ManifestPath = '')
+
+    $trimmedManifestPath = $ManifestPath.Trim()
+    if ($trimmedManifestPath.Length -eq 0) {
+        return $null
+    }
+
+    $reportRoot = Split-Path -Path $trimmedManifestPath -Parent
+    if (-not $reportRoot -or $reportRoot.Trim().Length -eq 0) {
+        throw "build-release result path must have a parent directory: $trimmedManifestPath"
+    }
+
+    return [ordered]@{
+        report_root = $reportRoot
+        manifest_path = $trimmedManifestPath
+        stdout_path = (Join-Path $reportRoot 'stdout.txt')
+        stderr_path = (Join-Path $reportRoot 'stderr.txt')
+        exit_code_path = (Join-Path $reportRoot 'exit_code.txt')
+        toolchain_path = (Join-Path $reportRoot 'toolchain.txt')
+        complete_marker_path = (Join-Path $reportRoot 'complete.marker')
+    }
+}
+
+function New-BuildReleaseReport {
+    param(
+        [Parameter(Mandatory = $true)]$Layout,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [AllowEmptyString()][string]$StderrTail = ''
+    )
+
+    return [ordered]@{
+        schema_version = 1
+        phase = 'build-release'
+        captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        status = $Status
+        reason = $Reason
+        rustynet_root = $RustyNetRoot
+        report_root = $Layout.report_root
+        stdout_path = $Layout.stdout_path
+        stderr_path = $Layout.stderr_path
+        exit_code_path = $Layout.exit_code_path
+        toolchain_path = $Layout.toolchain_path
+        manifest_path = $Layout.manifest_path
+        complete_marker_path = $Layout.complete_marker_path
+        exit_code = $ExitCode
+        stderr_tail = $StderrTail
+        notes = @('guest-authored-build-report')
+    }
+}
+
+function Write-BuildReleaseReport {
+    param(
+        [Parameter(Mandatory = $true)]$Layout,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [AllowEmptyString()][string]$StderrTail = ''
+    )
+
+    Ensure-Directory -Path $Layout.report_root
+    if (-not (Test-Path -LiteralPath $Layout.stdout_path)) {
+        Write-TextFileAtomically -Path $Layout.stdout_path -Content ''
+    }
+    if (-not (Test-Path -LiteralPath $Layout.stderr_path)) {
+        Write-TextFileAtomically -Path $Layout.stderr_path -Content ''
+    }
+    if (-not (Test-Path -LiteralPath $Layout.toolchain_path)) {
+        Write-TextFileAtomically -Path $Layout.toolchain_path -Content ''
+    }
+    Write-TextFileAtomically -Path $Layout.exit_code_path -Content ([string]$ExitCode) -Encoding ascii
+    $manifest = New-BuildReleaseReport -Layout $Layout -Status $Status -Reason $Reason -ExitCode $ExitCode -StderrTail $StderrTail
+    if (Test-Path -LiteralPath $Layout.complete_marker_path) {
+        Remove-Item -LiteralPath $Layout.complete_marker_path -Force -ErrorAction SilentlyContinue
+    }
+    Write-TextFileAtomically -Path $Layout.manifest_path -Content ($manifest | ConvertTo-Json -Depth 6)
+    Write-TextFileAtomically -Path $Layout.complete_marker_path -Content 'complete' -Encoding ascii
+}
+
+function Write-BuildReleaseToolchainReport {
+    param([Parameter(Mandatory = $true)]$Layout)
+
+    $toolingState = Get-WindowsBootstrapToolingState
+    $content = Format-WindowsBootstrapToolingStateReport -State $toolingState
+    Write-TextFileAtomically -Path $Layout.toolchain_path -Content $content
+}
+
+function Write-FailClosedBuildReleaseReportIfRequested {
+    param([Parameter(Mandatory = $true)][string]$FailureReason)
+
+    try {
+        $layout = Get-BuildReleaseReportLayout -ManifestPath $ResultPath
+        if ($null -eq $layout) {
+            return
+        }
+        if ((Test-Path -LiteralPath $layout.manifest_path) -and (Test-Path -LiteralPath $layout.complete_marker_path)) {
+            return
+        }
+        Ensure-Directory -Path $layout.report_root
+        if (-not (Test-Path -LiteralPath $layout.stdout_path)) {
+            Write-TextFileAtomically -Path $layout.stdout_path -Content ''
+        }
+        if (-not (Test-Path -LiteralPath $layout.stderr_path)) {
+            Write-TextFileAtomically -Path $layout.stderr_path -Content $FailureReason
+        }
+        if (-not (Test-Path -LiteralPath $layout.toolchain_path)) {
+            Write-BuildReleaseToolchainReport -Layout $layout
+        }
+        $stderrTail = Get-FileTailOrEmpty -Path $layout.stderr_path
+        Write-BuildReleaseReport -Layout $layout -Status 'fail' -Reason $FailureReason -ExitCode 1 -StderrTail $stderrTail
+    }
+    catch {
+        # Preserve the original failure as the dominant root cause.
+    }
+}
+
 function Get-LocalizedAccountNameFromSid {
     param([Parameter(Mandatory = $true)][string]$Sid)
     try {
@@ -124,9 +286,290 @@ function Get-LocalizedAccountNameFromSid {
     }
 }
 
+function Get-CurrentInteractiveUserName {
+    try {
+        return [string]((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName)
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-SystemExecutionContext {
+    return [string]::Equals($env:USERNAME, 'SYSTEM', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-SystemProfileExecutionContext {
+    if (-not $env:USERPROFILE) {
+        return $false
+    }
+    return $env:USERPROFILE.IndexOf('\systemprofile', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Resolve-BootstrapScriptSelfPath {
+    if ($PSCommandPath -and $PSCommandPath.Trim().Length -gt 0) {
+        return $PSCommandPath
+    }
+    if ($MyInvocation.MyCommand.Path -and $MyInvocation.MyCommand.Path.Trim().Length -gt 0) {
+        return $MyInvocation.MyCommand.Path
+    }
+    throw 'failed to resolve Bootstrap-RustyNetWindows.ps1 self path'
+}
+
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    return ([string]::Concat("'", $Value.Replace("'", "''"), "'"))
+}
+
+function Get-WindowsBootstrapToolingState {
+    $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
+    $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    $rustcCommand = Get-Command rustc.exe -ErrorAction SilentlyContinue
+    $rustupCommand = Get-Command rustup.exe -ErrorAction SilentlyContinue
+    $vsDevCmdPath = Resolve-VsDevCmdPath
+    $pwshPath = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    $interactiveUser = Get-CurrentInteractiveUserName
+    $appInstallerPackages = @(
+        Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue
+    )
+    $windowsAppsMatches = @()
+    if (Test-Path -LiteralPath 'C:\Program Files\WindowsApps') {
+        $windowsAppsMatches = @(
+            Get-ChildItem -LiteralPath 'C:\Program Files\WindowsApps' -Filter 'Microsoft.DesktopAppInstaller*' -ErrorAction SilentlyContinue |
+                Select-Object -First 10 -ExpandProperty FullName
+        )
+    }
+    return [ordered]@{
+        os_caption = (Get-CimInstance Win32_OperatingSystem).Caption
+        os_version = (Get-CimInstance Win32_OperatingSystem).Version
+        ps_version = $PSVersionTable.PSVersion.ToString()
+        current_username = $env:USERNAME
+        current_userdomain = $env:USERDOMAIN
+        current_userprofile = $env:USERPROFILE
+        interactive_user = $interactiveUser
+        interactive_user_present = ($interactiveUser.Trim().Length -gt 0)
+        system_execution_context = (Test-SystemExecutionContext)
+        systemprofile_execution_context = (Test-SystemProfileExecutionContext)
+        interactive_build_bootstrap_child = [bool]$InteractiveBuildBootstrapChild
+        path = $env:PATH
+        winget_command_present = [bool]$wingetCommand
+        winget_command_source = if ($wingetCommand) { $wingetCommand.Source } else { '' }
+        appinstaller_present = ($appInstallerPackages.Count -gt 0)
+        appinstaller_packages = @(
+            $appInstallerPackages | ForEach-Object {
+                [ordered]@{
+                    Name = $_.Name
+                    PackageFullName = $_.PackageFullName
+                    PackageFamilyName = $_.PackageFamilyName
+                    Version = $_.Version.ToString()
+                    Status = $_.Status.ToString()
+                }
+            }
+        )
+        windowsapps_matches = @($windowsAppsMatches)
+        cargo_present = [bool]$cargoCommand
+        cargo_source = if ($cargoCommand) { $cargoCommand.Source } else { '' }
+        rustc_present = [bool]$rustcCommand
+        rustc_source = if ($rustcCommand) { $rustcCommand.Source } else { '' }
+        rustup_present = [bool]$rustupCommand
+        rustup_source = if ($rustupCommand) { $rustupCommand.Source } else { '' }
+        powershell7_present = (Test-Path -LiteralPath $pwshPath)
+        powershell7_path = if (Test-Path -LiteralPath $pwshPath) { $pwshPath } else { '' }
+        vsdevcmd_present = [bool]$vsDevCmdPath
+        vsdevcmd_path = if ($vsDevCmdPath) { $vsDevCmdPath } else { '' }
+    }
+}
+
+function Try-Register-WingetFromAppInstaller {
+    $registration = [ordered]@{
+        attempted = $false
+        succeeded = $false
+        reason = ''
+    }
+    $appInstallerPackages = @(
+        Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue
+    )
+    if ($appInstallerPackages.Count -eq 0) {
+        $registration.reason = 'appinstaller-package-missing'
+        return $registration
+    }
+
+    $registration.attempted = $true
+    try {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe' -ErrorAction Stop | Out-Null
+        Start-Sleep -Seconds 2
+    }
+    catch {
+        $registration.reason = $_.Exception.Message.Trim()
+        return $registration
+    }
+
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        $registration.succeeded = $true
+        return $registration
+    }
+
+    $registration.reason = 'winget-command-still-missing-after-registration'
+    return $registration
+}
+
 function Require-Winget {
-    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-        throw 'winget.exe is not available; install App Installer or use a pre-baked Windows lab template'
+    $state = Get-WindowsBootstrapToolingState
+    if ($state.winget_command_present) {
+        return $state
+    }
+
+    $registration = Try-Register-WingetFromAppInstaller
+    $state = Get-WindowsBootstrapToolingState
+    if ($state.winget_command_present) {
+        return $state
+    }
+
+    $reasons = @()
+    if (-not $state.appinstaller_present) {
+        $reasons += 'App Installer package is not installed on this Windows image'
+    }
+    else {
+        $reasons += 'App Installer package is present but winget.exe is not registered for this user or session'
+    }
+    if ($registration.attempted -and $registration.reason) {
+        $reasons += ('registration_attempt=' + $registration.reason)
+    }
+    throw ('winget.exe is not available; ' + ($reasons -join '; ') + '; install App Installer or use a pre-baked Windows lab template')
+}
+
+function Format-WindowsBootstrapToolingStateReport {
+    param([Parameter(Mandatory = $true)]$State)
+
+    $lines = @(
+        '## bootstrap-tooling-state',
+        ($State | ConvertTo-Json -Depth 6),
+        ''
+    )
+    foreach ($commandText in @(
+        'where.exe winget',
+        'where.exe cargo',
+        'where.exe rustc',
+        'where.exe cl',
+        'cargo.exe --version',
+        'rustc.exe --version',
+        'rustup.exe show active-toolchain'
+    )) {
+        $lines += "## $commandText"
+        try {
+            $lines += (cmd.exe /c $commandText 2>&1 | Out-String).TrimEnd()
+        }
+        catch {
+            $lines += ($_ | Out-String).TrimEnd()
+        }
+        $lines += ''
+    }
+    return ($lines -join "`r`n")
+}
+
+function Invoke-BuildReleaseViaInteractiveUserTask {
+    param([Parameter(Mandatory = $true)]$Layout)
+
+    $interactiveUser = (Get-CurrentInteractiveUserName).Trim()
+    if ($interactiveUser.Length -eq 0) {
+        throw 'interactive Windows user session is not available; log into the guest as an administrator or use a pre-baked Windows lab template'
+    }
+
+    $taskName = [string]::Concat('RustyNet-BuildRelease-', [guid]::NewGuid().ToString('N'))
+    $taskScriptPath = Join-Path $Layout.report_root 'build-release-interactive-task.ps1'
+    $bootstrapScriptPath = Resolve-BootstrapScriptSelfPath
+    $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) {
+        $psExe = 'powershell.exe'
+    }
+
+    $taskLines = @(
+        'Set-StrictMode -Version Latest'
+        "$ErrorActionPreference = 'Stop'"
+        "$ProgressPreference = 'SilentlyContinue'"
+    )
+    $invocation = @(
+        '&',
+        (ConvertTo-PowerShellSingleQuotedLiteral $bootstrapScriptPath),
+        '-Phase', "'build-release'",
+        '-RustyNetRoot', (ConvertTo-PowerShellSingleQuotedLiteral $RustyNetRoot),
+        '-InstallRoot', (ConvertTo-PowerShellSingleQuotedLiteral $InstallRoot),
+        '-StateRoot', (ConvertTo-PowerShellSingleQuotedLiteral $StateRoot),
+        '-ServiceName', (ConvertTo-PowerShellSingleQuotedLiteral $ServiceName),
+        '-ResultPath', (ConvertTo-PowerShellSingleQuotedLiteral $Layout.manifest_path),
+        '-InteractiveBuildBootstrapChild'
+    )
+    if ($WingetConfigPath -and $WingetConfigPath.Trim().Length -gt 0) {
+        $invocation += @('-WingetConfigPath', (ConvertTo-PowerShellSingleQuotedLiteral $WingetConfigPath))
+    }
+    if ($VsConfigPath -and $VsConfigPath.Trim().Length -gt 0) {
+        $invocation += @('-VsConfigPath', (ConvertTo-PowerShellSingleQuotedLiteral $VsConfigPath))
+    }
+    if ($InstallPowerShell7) {
+        $invocation += '-InstallPowerShell7'
+    }
+    $taskLines += ($invocation -join ' ')
+    $taskLines += 'exit $LASTEXITCODE'
+    Write-TextFileAtomically -Path $taskScriptPath -Content ($taskLines -join "`r`n")
+
+    $quotedTaskScriptPath = [string]::Concat('"', $taskScriptPath.Replace('"', '""'), '"')
+    $action = New-ScheduledTaskAction `
+        -Execute $psExe `
+        -Argument ([string]::Concat('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ', $quotedTaskScriptPath))
+    $principal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+
+    $finishedWithoutReportCount = 0
+    $lastTaskResult = $null
+    try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+
+        $deadline = (Get-Date).AddHours(4)
+        while ((Get-Date) -lt $deadline) {
+            if ((Test-Path -LiteralPath $Layout.manifest_path) -and (Test-Path -LiteralPath $Layout.complete_marker_path)) {
+                return
+            }
+
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($taskInfo) {
+                $lastTaskResult = [int]$taskInfo.LastTaskResult
+            }
+            if ($task -and $task.State -ne 'Running' -and $taskInfo -and $taskInfo.LastRunTime -gt [datetime]::MinValue) {
+                $finishedWithoutReportCount += 1
+                if ($finishedWithoutReportCount -ge 3) {
+                    break
+                }
+            }
+            else {
+                $finishedWithoutReportCount = 0
+            }
+
+            Start-Sleep -Seconds 2
+        }
+
+        $lastTaskResultSuffix = if ($null -ne $lastTaskResult) {
+            [string]::Concat(' last_task_result=', [string]$lastTaskResult)
+        }
+        else {
+            ''
+        }
+        throw ([string]::Concat(
+            'interactive build bootstrap task did not write a complete build report for ',
+            $interactiveUser,
+            ': ',
+            $Layout.manifest_path,
+            $lastTaskResultSuffix
+        ))
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Remove-Item -LiteralPath $taskScriptPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -135,7 +578,7 @@ function Invoke-WingetInstall {
         [Parameter(Mandatory = $true)][string]$Id,
         [string]$Override = ''
     )
-    Require-Winget
+    Require-Winget | Out-Null
     $args = @(
         'install',
         '--accept-package-agreements',
@@ -460,8 +903,8 @@ function Ensure-WingetConfigurationDependencies {
     if (-not (Test-Path -LiteralPath $candidate)) {
         throw "WinGet configuration file not found: $candidate"
     }
-    Require-Winget
-    & winget configure --file $candidate --accept-configuration-agreements
+    Require-Winget | Out-Null
+    & winget configure --file $candidate --accept-configuration-agreements --disable-interactivity
     if ($LASTEXITCODE -ne 0) {
         throw 'winget configure failed for RustyNet bootstrap configuration'
     }
@@ -481,9 +924,22 @@ function Require-Command {
     }
 }
 
+function Test-CommandPresent {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Resolve-VsDevCmdPath {
+    $candidates = @(
+        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
 function Ensure-BuildTools {
     param([string]$ConfigPath = '')
-    if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
+    if (Resolve-VsDevCmdPath) {
         return
     }
     $effectiveConfig = Resolve-VsConfigPath -ConfigPath $ConfigPath
@@ -491,14 +947,13 @@ function Ensure-BuildTools {
         throw "Visual Studio build tools config not found: $effectiveConfig"
     }
     Invoke-WingetInstall -Id 'Microsoft.VisualStudio.2022.BuildTools' -Override "--passive --wait --config `"$effectiveConfig`""
+    if (-not (Resolve-VsDevCmdPath)) {
+        throw 'VsDevCmd.bat not found after Build Tools installation attempt'
+    }
 }
 
 function Enter-VsBuildEnvironment {
-    $candidates = @(
-        'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
-        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
-    )
-    $devCmd = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $devCmd = Resolve-VsDevCmdPath
     if (-not $devCmd) {
         throw 'VsDevCmd.bat not found; Build Tools do not appear to be installed correctly'
     }
@@ -576,23 +1031,79 @@ function Sync-SourceArchive {
 }
 
 function Build-RustyNet {
-    Ensure-WingetConfigurationDependencies -ConfigPath $WingetConfigPath
+    $buildReportLayout = Get-BuildReleaseReportLayout -ManifestPath $ResultPath
+    if ($null -ne $buildReportLayout) {
+        Ensure-Directory -Path $buildReportLayout.report_root
+        foreach ($path in @(
+            $buildReportLayout.manifest_path,
+            $buildReportLayout.complete_marker_path,
+            $buildReportLayout.stdout_path,
+            $buildReportLayout.stderr_path,
+            $buildReportLayout.exit_code_path,
+            $buildReportLayout.toolchain_path
+        )) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    Ensure-CargoOnPath
+    if ($null -ne $buildReportLayout) {
+        Write-BuildReleaseToolchainReport -Layout $buildReportLayout
+    }
+    $cargoPresent = Test-CommandPresent -Name cargo.exe
+    $rustcPresent = Test-CommandPresent -Name rustc.exe
+    $buildToolsPresent = [bool](Resolve-VsDevCmdPath)
+    $systemScopedContext = (Test-SystemExecutionContext) -or (Test-SystemProfileExecutionContext)
+    if (-not $InteractiveBuildBootstrapChild -and $null -ne $buildReportLayout -and $systemScopedContext -and (-not ($cargoPresent -and $rustcPresent -and $buildToolsPresent))) {
+        Invoke-BuildReleaseViaInteractiveUserTask -Layout $buildReportLayout
+        return
+    }
+    if (-not ($cargoPresent -and $rustcPresent -and $buildToolsPresent)) {
+        Ensure-WingetConfigurationDependencies -ConfigPath $WingetConfigPath
+    }
     Ensure-CargoOnPath
     Ensure-BuildTools -ConfigPath $VsConfigPath
     Ensure-CargoOnPath
     Require-Command -Name cargo.exe
+    Require-Command -Name rustc.exe
     Enter-VsBuildEnvironment
+    if ($null -ne $buildReportLayout) {
+        Write-BuildReleaseToolchainReport -Layout $buildReportLayout
+    }
 
     if (-not (Test-Path -LiteralPath (Join-Path $RustyNetRoot 'Cargo.toml'))) {
         throw "RustyNet source tree is missing Cargo.toml: $RustyNetRoot"
     }
 
+    $cargoCommand = (Get-Command cargo.exe -ErrorAction Stop).Source
     Push-Location $RustyNetRoot
     try {
-        cargo build --locked --release -p rustynetd -p rustynet-cli
-        if ($LASTEXITCODE -ne 0) {
-            throw 'cargo build failed for Windows build-release'
+        if ($null -eq $buildReportLayout) {
+            cargo build --locked --release -p rustynetd
+            if ($LASTEXITCODE -ne 0) {
+                throw 'cargo build failed for Windows build-release'
+            }
+            return
         }
+
+        $buildProcess = Start-Process -FilePath $cargoCommand `
+            -ArgumentList @('build', '--locked', '--release', '-p', 'rustynetd') `
+            -WorkingDirectory $RustyNetRoot `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $buildReportLayout.stdout_path `
+            -RedirectStandardError $buildReportLayout.stderr_path
+        $exitCode = [int]$buildProcess.ExitCode
+        $stderrTail = Get-FileTailOrEmpty -Path $buildReportLayout.stderr_path
+        if ($exitCode -eq 0) {
+            Write-BuildReleaseReport -Layout $buildReportLayout -Status 'pass' -Reason 'ok' -ExitCode $exitCode -StderrTail $stderrTail
+            return
+        }
+        $failureReason = ('cargo build failed for Windows build-release (exit_code={0})' -f $exitCode)
+        Write-BuildReleaseReport -Layout $buildReportLayout -Status 'fail' -Reason $failureReason -ExitCode $exitCode -StderrTail $stderrTail
+        throw $failureReason
     }
     finally {
         Pop-Location

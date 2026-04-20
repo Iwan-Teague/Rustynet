@@ -183,19 +183,20 @@ Current VM-lab Windows truth on this branch:
   ACL-inspection self-check requests. The install/verify/diagnostics helpers
   now make Windows 11, elevation, service SID, and runtime-boundary state
   explicit without claiming backend capability. `build-release` is still
-  conditional on verified Windows/MSVC tooling being present, and the Windows
-  install/restart/verify entrypoints must not be treated as dataplane-capable
-  or release-gated proof. The latest measured local Windows UTM attempt on
-  2026-04-17 first recovered the guest from link-local IPv4 back onto the
-  shared subnet as `192.168.64.14`, then resynced current `HEAD`, rebuilt it,
-  and passed `smoke-service-host`. `install-release` still failed closed
-  because the reviewed Windows local-UTM callback/access-bootstrap path timed
-  out before authoritative transport proof, guest-side SSH state remained
-  absent (`sshd_service_count=0`, `ssh_listener_count=0`), and diagnostics on
-  that blocked path still hit `UTM Windows capture output was missing rc
-  marker`. There is still no fresh Windows install/runtime/node evidence for
-  current `HEAD`. See
-  `artifacts/windows_phase4/20260417T174942Z/phase4_evidence_summary.md`.
+  conditional on verified Windows/MSVC tooling being present. On the current
+  branch, when local Windows UTM execution lands in the service-style/system
+  profile context and per-user tooling is missing there, the Windows bootstrap
+  helper now hands off `build-release` to a one-shot interactive scheduled
+  task under the logged-in Windows user and waits for the same guest-authored
+  build report. That path fails closed if there is no logged-in interactive
+  administrator session or if the user-scoped App Installer/WinGet bootstrap
+  still cannot be proven. The Windows install/restart/verify entrypoints must
+  not be treated as dataplane-capable or release-gated proof. The latest
+  measured local Windows UTM attempt on 2026-04-19 showed App Installer
+  present on the guest but no interactive Windows user session available, so
+  `build-release` now fails honestly on that prerequisite instead of reporting
+  a generic missing-`winget.exe` state from Local System. There is still no
+  fresh Windows install/runtime/node evidence for current `HEAD`.
 - Windows is not `release-gated and evidenced` on the current branch. The
   required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
   Mint, and macOS until measured Windows evidence exists.

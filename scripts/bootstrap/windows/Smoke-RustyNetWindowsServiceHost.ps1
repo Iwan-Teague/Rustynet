@@ -8,6 +8,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:SmokeFailureStep = 'init'
+$script:SmokeRuntimeSignals = $null
 
 function New-FailClosedSmokeReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
@@ -24,6 +26,8 @@ function New-FailClosedSmokeReport {
         runtime_supported = $false
         host_surface_validated = $false
         cleanup_status = 'failed'
+        failure_step = $script:SmokeFailureStep
+        runtime_signals = $script:SmokeRuntimeSignals
         notes = @('smoke-helper-trap')
     }
 }
@@ -68,14 +72,46 @@ function Ensure-Directory {
     }
 }
 
+function Get-NativeCommandText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Arguments = @()
+    )
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $Path @Arguments 2>&1 | Out-String)
+        if ($null -eq $output) {
+            return ''
+        }
+        return [string]$output
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Test-RustyNetWindowsRuntimeSupport {
     param([Parameter(Mandatory = $true)][string]$DaemonPath)
-    $helpText = (& $DaemonPath --help 2>&1 | Out-String)
-    $hasWindowsService = $helpText -match '--windows-service'
-    $hasEnvFile = $helpText -match '--env-file'
+    $helpText = Get-NativeCommandText -Path $DaemonPath -Arguments @('--help')
+    $probeText = [string]$helpText
+    $probeMode = 'help'
+    $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if (-not ($hasWindowsService -and $hasEnvFile)) {
+        $usageText = Get-NativeCommandText -Path $DaemonPath
+        if (-not [string]::IsNullOrWhiteSpace($usageText)) {
+            $probeText = (($helpText.TrimEnd()) + "`r`n" + ($usageText.Trim())).Trim()
+            $probeMode = 'help+bare'
+            $hasWindowsService = $probeText.IndexOf('--windows-service', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            $hasEnvFile = $probeText.IndexOf('--env-file', [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }
+    }
     return [ordered]@{
         has_windows_service = $hasWindowsService
         has_env_file = $hasEnvFile
+        probe_mode = $probeMode
+        probe_excerpt = if ($probeText.Length -gt 512) { $probeText.Substring(0, 512) } else { $probeText }
     }
 }
 
@@ -219,18 +255,24 @@ $notes = New-Object System.Collections.Generic.List[string]
 $fatalError = ''
 
 try {
+    $script:SmokeFailureStep = 'ensure-smoke-root'
     Ensure-Directory -Path $serviceSmokeRoot
+    $script:SmokeFailureStep = 'write-smoke-env-file'
     Write-SmokeEnvFile -Path $configPath
 
     if (-not (Test-Path -LiteralPath $daemonPath)) {
         throw 'rustynetd.exe was not found under the Windows release output directory'
     }
 
+    $script:SmokeFailureStep = 'probe-runtime-support'
     $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonPath
+    $script:SmokeRuntimeSignals = $runtimeSignals
     $runtimeFlagsPresent = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
 
+    $script:SmokeFailureStep = 'remove-preexisting-smoke-service'
     Remove-SmokeService -ServiceName $ServiceName
 
+    $script:SmokeFailureStep = 'create-smoke-service'
     $createResult = Invoke-Sc -Arguments @(
         'create',
         $ServiceName,
@@ -245,6 +287,7 @@ try {
         throw "sc.exe create failed: $($createResult.output)"
     }
 
+    $script:SmokeFailureStep = 'describe-smoke-service'
     $descriptionResult = Invoke-Sc -Arguments @(
         'description',
         $ServiceName,
@@ -256,6 +299,7 @@ try {
 
     $serviceConfigured = $true
     $startAttempted = $true
+    $script:SmokeFailureStep = 'start-smoke-service'
     $startResult = Invoke-Sc -Arguments @('start', $ServiceName)
     $startExitCode = [int]$startResult.exit_code
     $startOutput = $startResult.output
@@ -263,12 +307,14 @@ try {
         $startError = $startOutput
     }
     Start-Sleep -Seconds 3
+    $script:SmokeFailureStep = 'observe-smoke-service'
     $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
 }
 catch {
     $fatalError = $_.Exception.Message
 }
 finally {
+    $script:SmokeFailureStep = 'cleanup-smoke-service'
     if (-not $serviceRuntime.present) {
         $serviceRuntime = Get-ServiceRuntimeState -ServiceName $ServiceName
     }
@@ -420,6 +466,8 @@ $report = [ordered]@{
     cleanup_status = $cleanupStatus
     cleanup_error = $cleanupError
     fatal_error = $fatalError
+    failure_step = $script:SmokeFailureStep
+    runtime_signals = $runtimeSignals
     notes = $notes
 }
 

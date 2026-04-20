@@ -38,6 +38,8 @@ use rustynetd::windows_service::{
 };
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+#[cfg(windows)]
+use std::path::PathBuf;
 
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
     "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
@@ -977,6 +979,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         persist_membership_snapshot,
     };
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zeroize::Zeroize;
@@ -1146,7 +1149,9 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("failed to write membership snapshot: {e}"))?;
 
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
         let mut log_file = opts
             .open(&log_path)
             .map_err(|e| format!("failed to create membership log: {e}"))?;

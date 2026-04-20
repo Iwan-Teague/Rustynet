@@ -19,13 +19,13 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[cfg(any(target_os = "macos", windows))]
+use rustynet_crypto::OsStoreFallbackPolicy;
 use rustynet_crypto::{
     KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
 };
 #[cfg(target_os = "macos")]
-use rustynet_crypto::{
-    OsStoreFallbackPolicy, load_macos_generic_password, store_macos_generic_password,
-};
+use rustynet_crypto::{load_macos_generic_password, store_macos_generic_password};
 #[cfg(windows)]
 use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect};
 use sha2::{Digest, Sha256};
@@ -66,8 +66,11 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     {
         return read_windows_runtime_passphrase_source(path);
     }
-    let source_path = resolve_passphrase_source(path)?;
-    read_passphrase_from_source(&source_path)
+    #[cfg(not(windows))]
+    {
+        let source_path = resolve_passphrase_source(path)?;
+        return read_passphrase_from_source(&source_path);
+    }
 }
 
 pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, String> {
@@ -75,7 +78,10 @@ pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, S
     {
         return read_windows_explicit_passphrase_source(path);
     }
-    read_passphrase_from_source(path)
+    #[cfg(not(windows))]
+    {
+        return read_passphrase_from_source(path);
+    }
 }
 
 pub fn store_passphrase_in_os_secure_store(
@@ -295,19 +301,22 @@ fn decode_windows_dpapi_passphrase_blob(
         blob[length_offset + 2],
         blob[length_offset + 3],
     ]) as usize;
-    let protected = blob
-        .get(length_offset + 4..)
+    let data_offset = length_offset + 4;
+    let actual_len = blob
+        .len()
+        .checked_sub(data_offset)
         .ok_or_else(|| format!("truncated {source_label} Windows DPAPI blob"))?;
-    if protected.len() != protected_len {
+    if actual_len != protected_len {
         blob.zeroize();
         return Err(format!(
             "{source_label} Windows DPAPI blob length mismatch (declared {protected_len}, actual {})",
-            protected.len()
+            actual_len
         ));
     }
-    let mut plaintext = dpapi_unprotect(protected)
-        .map_err(|err| format!("unprotect Windows DPAPI passphrase blob failed: {err}"))?;
+    let mut protected = Zeroizing::new(blob.split_off(data_offset));
     blob.zeroize();
+    let mut plaintext = dpapi_unprotect(protected.as_slice())
+        .map_err(|err| format!("unprotect Windows DPAPI passphrase blob failed: {err}"))?;
     let result = parse_passphrase_bytes(std::mem::take(&mut plaintext), source_label);
     plaintext.zeroize();
     result

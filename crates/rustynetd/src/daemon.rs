@@ -2214,6 +2214,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.start(context),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.start(context),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.start(context),
         }
     }
 
@@ -2225,6 +2227,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.configure_peer(peer),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.configure_peer(peer),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.configure_peer(peer),
         }
     }
 
@@ -2242,6 +2246,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.update_peer_endpoint(node_id, endpoint),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.update_peer_endpoint(node_id, endpoint),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.update_peer_endpoint(node_id, endpoint),
         }
     }
 
@@ -2256,6 +2262,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.current_peer_endpoint(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.current_peer_endpoint(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.current_peer_endpoint(node_id),
         }
     }
 
@@ -2274,6 +2282,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.peer_latest_handshake_unix(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.peer_latest_handshake_unix(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.peer_latest_handshake_unix(node_id),
         }
     }
 
@@ -2285,6 +2295,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.remove_peer(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.remove_peer(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.remove_peer(node_id),
         }
     }
 
@@ -2296,6 +2308,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.apply_routes(routes),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.apply_routes(routes),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.apply_routes(routes),
         }
     }
 
@@ -2307,6 +2321,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.set_exit_mode(mode),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.set_exit_mode(mode),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.set_exit_mode(mode),
         }
     }
 
@@ -2318,6 +2334,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.stats(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.stats(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.stats(),
         }
     }
 
@@ -2333,6 +2351,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.authoritative_transport_identity(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.authoritative_transport_identity(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.authoritative_transport_identity(),
         }
     }
 
@@ -2355,6 +2375,10 @@ impl TunnelBackend for DaemonBackend {
             }
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => {
                 backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
             }
         }
@@ -2380,6 +2404,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Macos(backend) => {
                 backend.authoritative_transport_send(remote_addr, payload)
             }
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
         }
     }
 
@@ -2393,6 +2421,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.transport_socket_identity_blocker(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.transport_socket_identity_blocker(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.transport_socket_identity_blocker(),
         }
     }
 
@@ -2404,6 +2434,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.shutdown(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.shutdown(),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.shutdown(),
         }
     }
 }
