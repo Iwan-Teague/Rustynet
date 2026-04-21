@@ -2154,6 +2154,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
                 dry_run: parser.has_flag("--dry-run"),
+                // Direct CLI invocation: the report dir must be fully fresh.
+                orchestrated: false,
             },
         }),
         "vm-lab-orchestrate-live-lab" => Ok(OpsCommand::VmLabOrchestrateLiveLab {
