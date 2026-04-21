@@ -224,6 +224,11 @@ pub struct VmLabSetupLiveLabConfig {
     pub max_parallel_node_workers: Option<usize>,
     pub timeout_secs: u64,
     pub dry_run: bool,
+    /// Set to `true` when called from `vm-lab-orchestrate-live-lab`. Signals that the
+    /// orchestrator has already claimed the report dir and written pre-setup discovery
+    /// metadata into the `orchestration/` top-level subdirectory. The freshness check
+    /// will exempt that directory so setup does not refuse the orchestrator's own metadata.
+    pub orchestrated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1402,6 +1407,76 @@ fn ensure_report_dir_fresh(report_dir: &Path, command_name: &str) -> Result<(), 
         return Ok(());
     }
     if report_dir_contains_regular_entries(report_dir)? {
+        return Err(format!(
+            "{command_name} refuses to reuse non-empty report dir {}; use a new report dir or the matching provenance-bound resume path",
+            report_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Like `report_dir_contains_regular_entries`, but skips named top-level subdirectories of
+/// `report_dir` when deciding whether the directory is "non-empty". Subdirectories deeper than
+/// the first level are still fully checked.
+fn report_dir_contains_regular_entries_except(
+    report_dir: &Path,
+    exempt_top_level_names: &[&str],
+) -> Result<bool, String> {
+    if !report_dir.exists() {
+        return Ok(false);
+    }
+    if !report_dir.is_dir() {
+        return Err(format!(
+            "report directory path is not a directory: {}",
+            report_dir.display()
+        ));
+    }
+    let exempt_paths: Vec<PathBuf> = exempt_top_level_names
+        .iter()
+        .map(|name| report_dir.join(name))
+        .collect();
+    let mut pending = vec![report_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)
+            .map_err(|err| format!("read report directory failed ({}): {err}", dir.display()))?
+        {
+            let entry = entry.map_err(|err| {
+                format!("iterate report directory failed ({}): {err}", dir.display())
+            })?;
+            let entry_path = entry.path();
+            // Only exempt entries that are direct children of the root report dir.
+            if dir == report_dir && exempt_paths.contains(&entry_path) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|err| {
+                format!(
+                    "read report directory entry type failed ({}): {err}",
+                    entry_path.display()
+                )
+            })?;
+            if file_type.is_dir() {
+                pending.push(entry_path);
+            } else {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Like `ensure_report_dir_fresh`, but exempts the named top-level subdirectories from the
+/// non-empty check. Used when an outer command (e.g. `vm-lab-orchestrate-live-lab`) has
+/// already claimed the report dir and populated a specific metadata subdirectory before
+/// invoking this command.
+fn ensure_report_dir_fresh_except(
+    report_dir: &Path,
+    command_name: &str,
+    exempt_top_level_names: &[&str],
+) -> Result<(), String> {
+    if !report_dir.exists() {
+        return Ok(());
+    }
+    if report_dir_contains_regular_entries_except(report_dir, exempt_top_level_names)? {
         return Err(format!(
             "{command_name} refuses to reuse non-empty report dir {}; use a new report dir or the matching provenance-bound resume path",
             report_dir.display()
@@ -3788,6 +3863,15 @@ pub fn execute_ops_vm_lab_setup_live_lab(
                 report_dir.display()
             ));
         }
+    } else if config.orchestrated {
+        // Called from vm-lab-orchestrate-live-lab, which has already claimed this report dir
+        // and written pre-setup discovery metadata into the `orchestration/` subdirectory.
+        // Exempt that directory from the freshness check; every other entry still blocks reuse.
+        ensure_report_dir_fresh_except(
+            report_dir.as_path(),
+            "vm-lab-setup-live-lab",
+            &["orchestration"],
+        )?;
     } else {
         ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-setup-live-lab")?;
     }
@@ -4418,6 +4502,10 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         max_parallel_node_workers: config.max_parallel_node_workers,
         timeout_secs: config.timeout_secs,
         dry_run: config.dry_run,
+        // This call comes from the orchestrator, which has already written pre-setup
+        // discovery metadata into report_dir/orchestration/. Tell setup to exempt that
+        // directory from its freshness check.
+        orchestrated: true,
     };
     let setup_result_path = orchestration_dir.join("setup_result.json");
     match execute_ops_vm_lab_setup_live_lab(setup_config) {
@@ -17974,6 +18062,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             max_parallel_node_workers: None,
             timeout_secs: 30,
             dry_run: false,
+            orchestrated: false,
         });
 
         let err =
@@ -18383,6 +18472,56 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             super::ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")
                 .expect_err("non-empty report dir must fail closed");
 
+        assert!(err.contains("refuses to reuse non-empty report dir"));
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn ensure_report_dir_fresh_except_permits_exempt_top_level_subdir() {
+        // Simulate the orchestrator case: report_dir contains only an "orchestration/"
+        // subdirectory with files in it. The exempted-dir variant must pass; the strict
+        // variant must still reject.
+        let report_dir = write_temp_report_dir();
+        let orch_dir = report_dir.join("orchestration");
+        fs::create_dir_all(&orch_dir).expect("orchestration dir should create");
+        fs::write(orch_dir.join("discover_initial.json"), "{}\n")
+            .expect("discover_initial.json should write");
+
+        // Exempt variant: must accept (orchestrator pre-setup metadata is allowed)
+        super::ensure_report_dir_fresh_except(
+            report_dir.as_path(),
+            "vm-lab-setup-live-lab",
+            &["orchestration"],
+        )
+        .expect("orchestration-only report dir must be accepted when orchestrated=true");
+
+        // Strict variant: must reject (no exceptions)
+        let err = super::ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-setup-live-lab")
+            .expect_err("non-empty report dir must fail closed under strict check");
+        assert!(err.contains("refuses to reuse non-empty report dir"));
+
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn ensure_report_dir_fresh_except_rejects_non_exempt_files() {
+        // report_dir has an "orchestration/" (exempt) AND an extra stale file outside it.
+        // The exempt variant must still reject in this case.
+        let report_dir = write_temp_report_dir();
+        let orch_dir = report_dir.join("orchestration");
+        fs::create_dir_all(&orch_dir).expect("orchestration dir should create");
+        fs::write(orch_dir.join("discover_initial.json"), "{}\n")
+            .expect("discover_initial.json should write");
+        fs::write(report_dir.join("stale_artifact.json"), "{}\n")
+            .expect("stale artifact should write");
+
+        let err = super::ensure_report_dir_fresh_except(
+            report_dir.as_path(),
+            "vm-lab-setup-live-lab",
+            &["orchestration"],
+        )
+        .expect_err("report dir with stale files outside orchestration/ must fail closed");
         assert!(err.contains("refuses to reuse non-empty report dir"));
 
         let _ = fs::remove_dir_all(report_dir);
