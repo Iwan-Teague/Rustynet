@@ -12929,7 +12929,14 @@ fn utm_exec_windows_raw(
         .arg("Bypass")
         .arg("-EncodedCommand")
         .arg(encoded);
-    run_status_with_timeout(&mut command, timeout)
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(format!(
+            "UTM Windows exec reported error for {utm_name}: {stderr}"
+        ));
+    }
+    Ok(output.status)
 }
 
 fn best_effort_remove_windows_local_utm_guest_files(
@@ -13209,21 +13216,35 @@ fn build_windows_result_file_helper_invocation_script(
     helper_label: &str,
 ) -> Result<String, String> {
     let mut helper_args = args.to_vec();
-    let has_output_path = helper_args.windows(2).any(|pair| pair[0] == "-OutputPath");
-    if !has_output_path {
+    let has_result_path = helper_args
+        .windows(2)
+        .any(|pair| pair[0] == "-OutputPath" || pair[0] == "-ResultPath");
+    if !has_result_path {
         helper_args.push("-OutputPath".to_string());
         helper_args.push(remote_result_path.to_string());
     }
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
+    let helper_command_literal = powershell_quote(helper_command.as_str())?;
     ensure_no_control_chars("Windows result helper label", helper_label)?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $resultPath = {result_path}; \
+         $resultParent = Split-Path -Path $resultPath -Parent; \
+         if ($resultParent -and -not (Test-Path -LiteralPath $resultParent)) {{ \
+           New-Item -ItemType Directory -Path $resultParent -Force | Out-Null \
+         }}; \
+         if (Test-Path -LiteralPath $resultPath) {{ \
+           Remove-Item -LiteralPath $resultPath -Force \
+         }}; \
          $helperExit = 0; \
+         $captured = ''; \
          $failureMessage = ''; \
+         $helperCommand = {helper_command}; \
+         $psExe = Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; \
+         if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
          try {{ \
-           {helper_command}; \
+           $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -Command $helperCommand *>&1 | Out-String); \
            $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
            if ($null -ne $lastExitCode) {{ \
              $lastExitValue = $lastExitCode.Value; \
@@ -13239,6 +13260,9 @@ fn build_windows_result_file_helper_invocation_script(
          }} catch {{ \
            $failureMessage = if ($_.Exception -and $_.Exception.Message) {{ $_.Exception.Message.Trim() }} else {{ ($_ | Out-String).Trim() }}; \
            $helperExit = 1 \
+         }}; \
+         if ([string]::IsNullOrWhiteSpace($failureMessage) -and -not [string]::IsNullOrWhiteSpace($captured)) {{ \
+           $failureMessage = $captured.Trim() \
          }}; \
          if (-not (Test-Path -LiteralPath $resultPath)) {{ \
            if ([string]::IsNullOrWhiteSpace($failureMessage)) {{ \
@@ -13287,7 +13311,7 @@ fn build_windows_result_file_helper_invocation_script(
          }}; \
          exit $helperExit",
         result_path = powershell_quote(remote_result_path)?,
-        helper_command = helper_command,
+        helper_command = helper_command_literal,
         helper_label = helper_label,
     ))
 }
@@ -16119,7 +16143,13 @@ mod tests {
         .expect("access bootstrap result script should build");
         assert!(script.contains("Get-Content -Raw -LiteralPath $resultPath -Encoding UTF8"));
         assert!(script.contains("Windows access bootstrap helper did not write result file"));
+        assert!(script.contains("New-Item -ItemType Directory -Path $resultParent -Force"));
         assert!(!script.contains("Invoke-WebRequest"));
+        assert!(
+            !script.contains(
+                "-OutputPath 'C:\\ProgramData\\Rustynet\\vm-lab\\prepare-transport.json'"
+            )
+        );
     }
 
     #[test]
@@ -16138,7 +16168,8 @@ mod tests {
         .expect("result-file helper invocation script should build");
         assert!(script.contains("Windows service-host smoke helper did not write result file"));
         assert!(script.contains("Windows service-host smoke helper wrote empty result file"));
-        assert!(!script.contains("Remove-Item -LiteralPath $resultPath -Force"));
+        assert!(script.contains("Remove-Item -LiteralPath $resultPath -Force"));
+        assert!(script.contains("-Command $helperCommand"));
     }
 
     #[test]
@@ -16155,9 +16186,12 @@ mod tests {
             "Windows verify helper",
         )
         .expect("result-file helper invocation script should inject output path");
-        assert!(script.contains(
-            "& 'C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1' -RustyNetRoot 'C:\\Rustynet' -InstallRoot 'C:\\Program Files\\RustyNet' -OutputPath 'C:\\ProgramData\\Rustynet\\vm-lab\\verify.json'"
-        ));
+        assert!(
+            script
+                .contains("C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1")
+        );
+        assert!(script.contains("-OutputPath ''C:\\ProgramData\\Rustynet\\vm-lab\\verify.json''"));
+        assert!(script.contains("-Command $helperCommand"));
     }
 
     #[test]

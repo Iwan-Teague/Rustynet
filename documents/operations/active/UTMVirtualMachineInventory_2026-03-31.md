@@ -1,13 +1,14 @@
 # UTM Virtual Machine Inventory
 
 Last updated:
-`2026-04-07T16:20:45Z`
+`2026-04-21T16:20:45Z`
 
 Repository root:
 `/Users/iwan/Desktop/Rustynet`
 
 Purpose:
-- keep a last-known local record of the UTM Debian headless lab VMs on this Mac,
+- keep a last-known local record of the UTM Debian headless lab VMs and the
+  local Windows 11 validation guest on this Mac,
 - record parent-device context,
 - record current SSH operator key material by path and fingerprint,
 - avoid storing private key contents in the document.
@@ -17,8 +18,8 @@ Purpose:
 
 ## Parent Device
 
-- Parent device: `iwan’s MacBook Air`
-- Local host name: `iwans-MacBook-Air`
+- Parent device: `iwan’s MacBook Pro`
+- Local host name: `Iwans-MacBook-Pro`
 - Hostname: `Mac`
 - OS: `macOS 26.3.1 (a)` build `25D771280a`
 - Architecture: `arm64`
@@ -52,8 +53,10 @@ Security note:
 
 ## Inventory Notes
 
-- All five VMs are UTM `QEMU` guests.
-- All five are configured as `aarch64` Debian/Linux guests with `2048 MB` memory.
+- The five Debian lab nodes and the local Windows 11 validation guest are all
+  UTM `QEMU` guests.
+- The Debian lab nodes are configured as `aarch64` Debian/Linux guests with
+  `2048 MB` memory.
 - UTM currently reports one shared network interface per VM in the configuration record.
 - Live guest-agent verification was performed with UTM `query ip` on `2026-04-07`; live SSH reachability was rechecked in this pass over the IPv4 SSH endpoints because they were the stable SSH form on this host.
 - The per-VM IPv4s below are live-confirmed from the running guests, not inferred from hostname history.
@@ -289,7 +292,7 @@ cargo run -q -p rustynet-cli -- \
 
 ### Parent Device Context For All Entries
 
-- Parent device: `iwan’s MacBook Air`
+- Parent device: `iwan’s MacBook Pro`
 - Parent last known network IP: `192.168.0.20/24`
 - Parent last known SSID: `unknown/unavailable from local unprivileged query`
 
@@ -419,6 +422,32 @@ cargo run -q -p rustynet-cli -- \
 - Suggested connect template:
   `ssh -i ~/.ssh/rustynet_lab_ed25519 debian@192.168.64.7`
 
+### VM 6
+
+- Display name: `Windows`
+- Inventory alias: `windows-utm-1`
+- Bundle path:
+  `/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Windows.utm`
+- UTM UUID: `2CAECCF7-92FF-44E8-99B6-18C0FC9D9235`
+- Guest OS family: `Windows 11`
+- Backend: `QEMU`
+- Last-known guest IP: `192.168.64.14`
+- Last-known network: `utm-shared-192.168.64.0/24`
+- Inventory network group: `utm-shared-192.168.64.0/24`
+- Inventory lab role: `windows_client`
+- Inventory platform metadata:
+  - `platform=windows`
+  - `remote_shell=powershell`
+  - `guest_exec_mode=windows_powershell`
+  - `service_manager=windows_service`
+- Last-known Rustynet source dir: `C:\Rustynet`
+- Inventory SSH user: `Administrator`
+- Inventory SSH target: `192.168.64.14`
+- Operator note:
+  this guest is tracked for Windows bootstrap/service validation and optional
+  `--windows-vm` sidecar orchestration, not as one of the five Linux live-lab
+  nodes.
+
 ## Historical IP Evidence Used In This Pass
 
 Current live guest IPs from UTM `query ip`:
@@ -428,6 +457,7 @@ Current live guest IPs from UTM `query ip`:
 - `192.168.64.5`
 - `192.168.64.6`
 - `192.168.64.7`
+- `192.168.64.14`
 
 Historical UTM-style guest IPs retained from older host-key history:
 
@@ -439,13 +469,13 @@ Historical UTM-style guest IPs retained from older host-key history:
 - `192.168.64.29`
 
 Interpretation:
-- `192.168.64.3`, `192.168.64.4`, `192.168.64.5`, `192.168.64.6`, and `192.168.64.7` are the current live guest IPv4 addresses confirmed by UTM on `2026-04-07`.
+- `192.168.64.3`, `192.168.64.4`, `192.168.64.5`, `192.168.64.6`, `192.168.64.7`, and `192.168.64.14` are the current tracked local-UTM guest IPv4 addresses confirmed by repo evidence.
 - `192.168.64.22`, `192.168.64.24`, `192.168.64.26`, `192.168.64.28`, and `192.168.64.29` are stale historical snapshot addresses and should not be used for current lab runs.
 - `192.168.64.18` remains an unmatched historical UTM-style guest address from SSH host-key history.
 
 ## Recommended Next Steps
 
-1. Refresh this inventory whenever the UTM live query output changes or the VMs are reimaged.
+1. Refresh this inventory whenever the UTM live query output changes, the VMs are reimaged, or the Windows validation guest is rebuilt.
 2. If the Debian login user changes from `debian`, update the connect templates and lab profiles accordingly.
 3. If desired, create a dedicated SSH config stanza per VM using the existing lab key.
 4. If desired, generate a fresh dedicated keypair for this UTM VM set and update this inventory with:
