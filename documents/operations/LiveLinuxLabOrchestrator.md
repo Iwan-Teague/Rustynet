@@ -105,6 +105,14 @@ cargo run --quiet -p rustynet-cli -- ops vm-lab-orchestrate-live-lab \
 Add `--stop-after-ready` when you want the wrapper to prove UTM recovery and
 inventory freshness without continuing into setup.
 
+Operator feedback note:
+
+- `ops vm-lab-orchestrate-live-lab` now emits terminal progress lines as each
+  orchestrated stage is recorded as `PASS`, `FAIL`, or `SKIP`.
+- When the command finishes, it prints the final
+  `orchestration/orchestrate_result.json` path so the operator can inspect the
+  authoritative report artifact immediately.
+
 Mixed-platform note:
 
 - Mixed Linux/Windows inventories are safe only for the platform-aware

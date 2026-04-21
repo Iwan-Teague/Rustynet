@@ -3517,19 +3517,71 @@ fn stage_outcome(
     }
 }
 
-fn append_unique_stage_outcomes(
+fn vm_lab_stage_status_progress_label(status: &VmLabStageStatus) -> &'static str {
+    match status {
+        VmLabStageStatus::Pass => "PASS",
+        VmLabStageStatus::Fail => "FAIL",
+        VmLabStageStatus::Skipped => "SKIP",
+    }
+}
+
+fn vm_lab_command_status_progress_label(status: &VmLabCommandOverallStatus) -> &'static str {
+    match status {
+        VmLabCommandOverallStatus::Pass => "PASS",
+        VmLabCommandOverallStatus::Fail => "FAIL",
+        VmLabCommandOverallStatus::Partial => "PARTIAL",
+    }
+}
+
+fn render_vm_lab_progress_outcome_line(command: &str, outcome: &VmLabStageOutcome) -> String {
+    format!(
+        "[{command}] {} {}: {}",
+        vm_lab_stage_status_progress_label(&outcome.status),
+        outcome.stage,
+        outcome.summary
+    )
+}
+
+fn render_vm_lab_progress_complete_line(
+    command: &str,
+    status: &VmLabCommandOverallStatus,
+    report_json_path: &Path,
+    report_dir: &Path,
+) -> String {
+    format!(
+        "[{command}] COMPLETE overall_status={} report_json={} report_dir={}",
+        vm_lab_command_status_progress_label(status),
+        report_json_path.display(),
+        report_dir.display()
+    )
+}
+
+fn emit_vm_lab_progress_outcome(command: &str, outcome: &VmLabStageOutcome) {
+    eprintln!("{}", render_vm_lab_progress_outcome_line(command, outcome));
+}
+
+fn emit_vm_lab_progress_outcomes(command: &str, outcomes: &[VmLabStageOutcome]) {
+    for outcome in outcomes {
+        emit_vm_lab_progress_outcome(command, outcome);
+    }
+}
+
+fn append_unique_stage_outcomes_collect_new(
     outcomes: &mut Vec<VmLabStageOutcome>,
     additional: &[VmLabStageOutcome],
-) {
+) -> Vec<VmLabStageOutcome> {
     let mut seen = outcomes
         .iter()
         .map(|outcome| outcome.stage.clone())
         .collect::<HashSet<_>>();
+    let mut appended = Vec::new();
     for outcome in additional {
         if seen.insert(outcome.stage.clone()) {
             outcomes.push(outcome.clone());
+            appended.push(outcome.clone());
         }
     }
+    appended
 }
 
 fn write_orchestration_artifact(path: &Path, contents: &str) -> Result<(), String> {
@@ -3545,6 +3597,87 @@ fn write_orchestration_artifact(path: &Path, contents: &str) -> Result<(), Strin
         format!(
             "write orchestration artifact failed ({}): {err}",
             path.display()
+        )
+    })
+}
+
+fn create_orchestration_staging_dir() -> Result<PathBuf, String> {
+    let dir =
+        std::env::temp_dir().join(format!("rustynet-vm-lab-orchestration-{}", unique_suffix()));
+    fs::create_dir_all(dir.as_path()).map_err(|err| {
+        format!(
+            "create orchestration staging dir failed ({}): {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn materialize_orchestration_staging_dir(
+    staging_dir: &Path,
+    orchestration_dir: &Path,
+) -> Result<(), String> {
+    if !staging_dir.exists() {
+        return Ok(());
+    }
+    let mut pending = vec![(staging_dir.to_path_buf(), orchestration_dir.to_path_buf())];
+    while let Some((source_dir, destination_dir)) = pending.pop() {
+        fs::create_dir_all(destination_dir.as_path()).map_err(|err| {
+            format!(
+                "create orchestration destination dir failed ({}): {err}",
+                destination_dir.display()
+            )
+        })?;
+        for entry in fs::read_dir(source_dir.as_path()).map_err(|err| {
+            format!(
+                "read orchestration staging dir failed ({}): {err}",
+                source_dir.display()
+            )
+        })? {
+            let entry = entry.map_err(|err| {
+                format!(
+                    "iterate orchestration staging dir failed ({}): {err}",
+                    source_dir.display()
+                )
+            })?;
+            let source_path = entry.path();
+            let destination_path = destination_dir.join(entry.file_name());
+            let file_type = entry.file_type().map_err(|err| {
+                format!(
+                    "read orchestration staging entry type failed ({}): {err}",
+                    source_path.display()
+                )
+            })?;
+            if file_type.is_dir() {
+                pending.push((source_path, destination_path));
+            } else if file_type.is_file() {
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        format!(
+                            "create orchestration artifact parent dir failed ({}): {err}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::copy(source_path.as_path(), destination_path.as_path()).map_err(|err| {
+                    format!(
+                        "copy orchestration artifact failed ({} -> {}): {err}",
+                        source_path.display(),
+                        destination_path.display()
+                    )
+                })?;
+            } else {
+                return Err(format!(
+                    "unsupported orchestration staging entry type: {}",
+                    source_path.display()
+                ));
+            }
+        }
+    }
+    fs::remove_dir_all(staging_dir).map_err(|err| {
+        format!(
+            "remove orchestration staging dir failed ({}): {err}",
+            staging_dir.display()
         )
     })
 }
@@ -3590,6 +3723,15 @@ fn finalize_vm_lab_orchestration_result(
         orchestration_dir.join("orchestrate_result.json").as_path(),
         rendered.as_str(),
     )?;
+    eprintln!(
+        "{}",
+        render_vm_lab_progress_complete_line(
+            command,
+            &overall_status,
+            orchestration_dir.join("orchestrate_result.json").as_path(),
+            report_dir,
+        )
+    );
     match overall_status {
         VmLabCommandOverallStatus::Fail => Err(rendered),
         VmLabCommandOverallStatus::Pass | VmLabCommandOverallStatus::Partial => Ok(rendered),
@@ -4170,12 +4312,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         )
     })?;
     let orchestration_dir = report_dir.join("orchestration");
-    fs::create_dir_all(orchestration_dir.as_path()).map_err(|err| {
-        format!(
-            "create orchestration state directory failed ({}): {err}",
-            orchestration_dir.display()
-        )
-    })?;
+    let pre_setup_orchestration_dir = create_orchestration_staging_dir()?;
     let inventory_path = resolve_absolute_path(config.inventory_path.as_path())?;
     let selected_aliases = resolve_live_lab_vm_aliases(
         inventory_path.as_path(),
@@ -4224,13 +4361,18 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     };
     let initial_discovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
     let initial_discovery_path = orchestration_dir.join("discover_initial.json");
-    write_orchestration_artifact(initial_discovery_path.as_path(), initial_discovery.as_str())?;
+    write_orchestration_artifact(
+        pre_setup_orchestration_dir
+            .join("discover_initial.json")
+            .as_path(),
+        initial_discovery.as_str(),
+    )?;
     let initial_readiness =
         selected_local_utm_readiness_from_report(initial_discovery.as_str(), &selected_aliases)?;
     let mut final_readiness = initial_readiness.clone();
     let mut final_readiness_artifact = initial_discovery_path.clone();
     let unready_aliases = not_execution_ready_aliases(&initial_readiness);
-    outcomes.push(stage_outcome(
+    let discovery_outcome = stage_outcome(
         "discover_local_utm",
         VmLabStageStatus::Pass,
         format!(
@@ -4238,7 +4380,9 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             render_selected_local_utm_readiness(&initial_readiness)
         ),
         vec![initial_discovery_path.clone()],
-    ));
+    );
+    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &discovery_outcome);
+    outcomes.push(discovery_outcome);
 
     if !unready_aliases.is_empty() {
         warnings.push(format!(
@@ -4246,7 +4390,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             unready_aliases.join(", ")
         ));
         if config.dry_run {
-            outcomes.push(stage_outcome(
+            let restart_outcome = stage_outcome(
                 "restart_unready_vms",
                 VmLabStageStatus::Skipped,
                 format!(
@@ -4254,7 +4398,9 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                     unready_aliases.join(", ")
                 ),
                 vec![initial_discovery_path.clone()],
-            ));
+            );
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+            outcomes.push(restart_outcome);
         } else {
             let restart_output = execute_ops_vm_lab_restart(VmLabRestartConfig {
                 inventory_path: inventory_path.clone(),
@@ -4274,32 +4420,50 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 known_hosts_path: config.known_hosts_path.clone(),
                 timeout_secs: config.timeout_secs,
                 json_output: false,
-                report_dir: Some(orchestration_dir.clone()),
+                report_dir: Some(pre_setup_orchestration_dir.clone()),
             });
             let restart_path = orchestration_dir.join("restart_unready_vms.txt");
             match restart_output {
                 Ok(output) => {
-                    write_orchestration_artifact(restart_path.as_path(), output.as_str())?;
-                    outcomes.push(stage_outcome(
+                    write_orchestration_artifact(
+                        pre_setup_orchestration_dir
+                            .join("restart_unready_vms.txt")
+                            .as_path(),
+                        output.as_str(),
+                    )?;
+                    let restart_outcome = stage_outcome(
                         "restart_unready_vms",
                         VmLabStageStatus::Pass,
                         format!("restarted aliases {}", unready_aliases.join(", ")),
                         vec![restart_path.clone()],
-                    ));
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                    outcomes.push(restart_outcome);
                 }
                 Err(err) => {
-                    write_orchestration_artifact(restart_path.as_path(), err.as_str())?;
-                    outcomes.push(stage_outcome(
+                    write_orchestration_artifact(
+                        pre_setup_orchestration_dir
+                            .join("restart_unready_vms.txt")
+                            .as_path(),
+                        err.as_str(),
+                    )?;
+                    let restart_outcome = stage_outcome(
                         "restart_unready_vms",
                         VmLabStageStatus::Fail,
                         format!("restart failed for aliases {}", unready_aliases.join(", ")),
                         vec![initial_discovery_path.clone(), restart_path],
-                    ));
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
+                    outcomes.push(restart_outcome);
                     next_actions.push(format!(
                         "Inspect {} and {}",
                         initial_discovery_path.display(),
                         orchestration_dir.join("restart_unready_vms.txt").display()
                     ));
+                    materialize_orchestration_staging_dir(
+                        pre_setup_orchestration_dir.as_path(),
+                        orchestration_dir.as_path(),
+                    )?;
                     return finalize_vm_lab_orchestration_result(
                         "vm-lab-orchestrate-live-lab",
                         report_dir.as_path(),
@@ -4313,7 +4477,12 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
 
             let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
             let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
-            write_orchestration_artifact(rediscovery_path.as_path(), rediscovery.as_str())?;
+            write_orchestration_artifact(
+                pre_setup_orchestration_dir
+                    .join("discover_post_restart.json")
+                    .as_path(),
+                rediscovery.as_str(),
+            )?;
             let post_restart_readiness =
                 selected_local_utm_readiness_from_report(rediscovery.as_str(), &selected_aliases)?;
             final_readiness = post_restart_readiness.clone();
@@ -4324,7 +4493,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             } else {
                 VmLabStageStatus::Fail
             };
-            outcomes.push(stage_outcome(
+            let rediscovery_outcome = stage_outcome(
                 "rediscover_local_utm",
                 rediscovery_status.clone(),
                 format!(
@@ -4332,12 +4501,18 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                     render_selected_local_utm_readiness(&post_restart_readiness)
                 ),
                 vec![rediscovery_path.clone()],
-            ));
+            );
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &rediscovery_outcome);
+            outcomes.push(rediscovery_outcome);
             if rediscovery_status == VmLabStageStatus::Fail {
                 next_actions.push(format!(
                     "Inspect {} for remaining readiness blockers",
                     rediscovery_path.display()
                 ));
+                materialize_orchestration_staging_dir(
+                    pre_setup_orchestration_dir.as_path(),
+                    orchestration_dir.as_path(),
+                )?;
                 return finalize_vm_lab_orchestration_result(
                     "vm-lab-orchestrate-live-lab",
                     report_dir.as_path(),
@@ -4367,7 +4542,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 report_dir.display()
             ));
         }
-        outcomes.push(stage_outcome(
+        let stop_after_ready_outcome = stage_outcome(
             "stop_after_ready",
             if readiness_complete {
                 VmLabStageStatus::Pass
@@ -4379,7 +4554,13 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 render_selected_local_utm_readiness(&final_readiness)
             ),
             vec![final_readiness_artifact],
-        ));
+        );
+        emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &stop_after_ready_outcome);
+        outcomes.push(stop_after_ready_outcome);
+        materialize_orchestration_staging_dir(
+            pre_setup_orchestration_dir.as_path(),
+            orchestration_dir.as_path(),
+        )?;
         return finalize_vm_lab_orchestration_result(
             "vm-lab-orchestrate-live-lab",
             report_dir.as_path(),
@@ -4419,30 +4600,46 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         timeout_secs: config.timeout_secs,
         dry_run: config.dry_run,
     };
+    let setup_result = execute_ops_vm_lab_setup_live_lab(setup_config);
+    materialize_orchestration_staging_dir(
+        pre_setup_orchestration_dir.as_path(),
+        orchestration_dir.as_path(),
+    )?;
     let setup_result_path = orchestration_dir.join("setup_result.json");
-    match execute_ops_vm_lab_setup_live_lab(setup_config) {
+    match setup_result {
         Ok(rendered) => {
             write_orchestration_artifact(setup_result_path.as_path(), rendered.as_str())?;
             let result = parse_vm_lab_command_result(rendered.as_str())?;
-            append_unique_stage_outcomes(&mut outcomes, result.outcomes.as_slice());
+            let appended =
+                append_unique_stage_outcomes_collect_new(&mut outcomes, result.outcomes.as_slice());
+            emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
             warnings.extend(result.warnings);
         }
         Err(err) => {
             write_orchestration_artifact(setup_result_path.as_path(), err.as_str())?;
             match parse_vm_lab_command_result(err.as_str()) {
                 Ok(result) => {
-                    append_unique_stage_outcomes(&mut outcomes, result.outcomes.as_slice());
+                    let appended = append_unique_stage_outcomes_collect_new(
+                        &mut outcomes,
+                        result.outcomes.as_slice(),
+                    );
+                    emit_vm_lab_progress_outcomes(
+                        "vm-lab-orchestrate-live-lab",
+                        appended.as_slice(),
+                    );
                     warnings.extend(result.warnings);
                     next_actions.extend(result.next_actions);
                 }
                 Err(parse_err) => {
                     warnings.push(parse_err);
-                    outcomes.push(stage_outcome(
+                    let setup_outcome = stage_outcome(
                         "vm_lab_setup_live_lab",
                         VmLabStageStatus::Fail,
                         err,
                         vec![setup_result_path.clone()],
-                    ));
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &setup_outcome);
+                    outcomes.push(setup_outcome);
                 }
             }
             if !config.skip_diagnose_on_failure
@@ -4466,7 +4663,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                         write_orchestration_artifact(diagnose_path.as_path(), rendered.as_str())?;
                         let result = parse_vm_lab_command_result(rendered.as_str())?;
                         diagnosis_artifact = Some(PathBuf::from(result.report_dir.clone()));
-                        outcomes.push(stage_outcome(
+                        let diagnose_outcome = stage_outcome(
                             "diagnose_live_lab_failure",
                             VmLabStageStatus::Pass,
                             "collected failure diagnostics after setup failure",
@@ -4476,7 +4673,12 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                                 .flat_map(|outcome| outcome.artifacts)
                                 .map(PathBuf::from)
                                 .collect(),
-                        ));
+                        );
+                        emit_vm_lab_progress_outcome(
+                            "vm-lab-orchestrate-live-lab",
+                            &diagnose_outcome,
+                        );
+                        outcomes.push(diagnose_outcome);
                         warnings.extend(result.warnings);
                     }
                     Err(err) => {
@@ -4526,7 +4728,9 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         Ok(rendered) => {
             write_orchestration_artifact(run_result_path.as_path(), rendered.as_str())?;
             let result = parse_vm_lab_command_result(rendered.as_str())?;
-            append_unique_stage_outcomes(&mut outcomes, result.outcomes.as_slice());
+            let appended =
+                append_unique_stage_outcomes_collect_new(&mut outcomes, result.outcomes.as_slice());
+            emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
             warnings.extend(result.warnings);
             finalize_vm_lab_orchestration_result(
                 "vm-lab-orchestrate-live-lab",
@@ -4541,18 +4745,27 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             write_orchestration_artifact(run_result_path.as_path(), err.as_str())?;
             match parse_vm_lab_command_result(err.as_str()) {
                 Ok(result) => {
-                    append_unique_stage_outcomes(&mut outcomes, result.outcomes.as_slice());
+                    let appended = append_unique_stage_outcomes_collect_new(
+                        &mut outcomes,
+                        result.outcomes.as_slice(),
+                    );
+                    emit_vm_lab_progress_outcomes(
+                        "vm-lab-orchestrate-live-lab",
+                        appended.as_slice(),
+                    );
                     warnings.extend(result.warnings);
                     next_actions.extend(result.next_actions);
                 }
                 Err(parse_err) => {
                     warnings.push(parse_err);
-                    outcomes.push(stage_outcome(
+                    let run_outcome = stage_outcome(
                         "vm_lab_run_live_lab",
                         VmLabStageStatus::Fail,
                         err,
                         vec![run_result_path.clone()],
-                    ));
+                    );
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &run_outcome);
+                    outcomes.push(run_outcome);
                 }
             }
             if !config.skip_diagnose_on_failure && report_dir.join("state/stages.tsv").exists() {
@@ -4573,7 +4786,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                         write_orchestration_artifact(diagnose_path.as_path(), rendered.as_str())?;
                         let result = parse_vm_lab_command_result(rendered.as_str())?;
                         diagnosis_artifact = Some(PathBuf::from(result.report_dir.clone()));
-                        outcomes.push(stage_outcome(
+                        let diagnose_outcome = stage_outcome(
                             "diagnose_live_lab_failure",
                             VmLabStageStatus::Pass,
                             "collected failure diagnostics after run failure",
@@ -4583,7 +4796,12 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                                 .flat_map(|outcome| outcome.artifacts)
                                 .map(PathBuf::from)
                                 .collect(),
-                        ));
+                        );
+                        emit_vm_lab_progress_outcome(
+                            "vm-lab-orchestrate-live-lab",
+                            &diagnose_outcome,
+                        );
+                        outcomes.push(diagnose_outcome);
                         warnings.extend(result.warnings);
                     }
                     Err(err) => {
@@ -14466,32 +14684,36 @@ mod tests {
     use super::{
         LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState, RepoSyncDispatchKind,
         RepoSyncMode, UtmReadinessInputs, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
-        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
-        VmLabSetupLiveLabConfig, VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig,
-        VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe, build_assignment_refresh_env,
-        build_local_source_extract_script, build_remote_argv_script,
+        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
+        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
+        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
+        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_script,
-        collect_live_lab_stage_local_bundle, default_inventory_path,
-        default_live_lab_iteration_profile_path, default_live_lab_iteration_report_dir,
-        default_live_lab_orchestrator_path, default_platform_profile, default_utmctl_path,
-        discover_local_utm_bundle_paths, encode_powershell_command,
-        ensure_inventory_entries_share_network, execute_ops_vm_lab_diff_live_lab_runs,
-        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
+        collect_live_lab_stage_local_bundle, create_orchestration_staging_dir,
+        default_inventory_path, default_live_lab_iteration_profile_path,
+        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
+        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
+        encode_powershell_command, ensure_inventory_entries_share_network,
+        execute_ops_vm_lab_diff_live_lab_runs, execute_ops_vm_lab_discover_local_utm,
+        execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         live_lab_stage_forensics_notes, load_inventory, load_live_lab_profile,
         local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
-        parse_live_lab_stage_records, parse_local_utm_list_started_status,
-        parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
-        persist_local_utm_ready_states_to_inventory, privileged_rustynet_cli_script,
-        remote_copy_destination_for_target, remote_script_for_ssh_transport,
-        render_live_lab_iteration_summary, render_live_lab_stage_forensics_review,
-        render_local_utm_discovery_summary, repo_sync_dispatch_kind_for_target,
-        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
-        resolve_repo_sync_source, resolve_start_targets, resolved_inventory_ssh_target_with_utmctl,
-        rewrite_ssh_target_host, select_inventory_entries, select_live_ssh_host_from_utm_output,
+        materialize_orchestration_staging_dir, parse_live_lab_stage_records,
+        parse_local_utm_list_started_status, parse_vm_lab_iteration_validation_step_spec,
+        parse_vm_lab_topology, persist_local_utm_ready_states_to_inventory,
+        privileged_rustynet_cli_script, remote_copy_destination_for_target,
+        remote_script_for_ssh_transport, render_live_lab_iteration_summary,
+        render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
+        render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
+        repo_sync_dispatch_kind_for_target, resolve_iteration_source_selection,
+        resolve_live_lab_vm_aliases, resolve_remote_targets, resolve_repo_sync_source,
+        resolve_start_targets, resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
+        select_inventory_entries, select_live_ssh_host_from_utm_output,
         selected_local_utm_readiness_from_report, ssh_auth_probe_command,
         summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
         validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
@@ -18395,6 +18617,116 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(err.contains("refuses to reuse non-empty report dir"));
 
         let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn append_unique_stage_outcomes_collects_only_new_entries() {
+        let mut outcomes = vec![VmLabStageOutcome {
+            stage: "discover_local_utm".to_string(),
+            status: VmLabStageStatus::Pass,
+            summary: "initial discovery passed".to_string(),
+            artifacts: vec!["/tmp/discover.json".to_string()],
+        }];
+
+        let appended = append_unique_stage_outcomes_collect_new(
+            &mut outcomes,
+            &[
+                VmLabStageOutcome {
+                    stage: "discover_local_utm".to_string(),
+                    status: VmLabStageStatus::Pass,
+                    summary: "duplicate".to_string(),
+                    artifacts: Vec::new(),
+                },
+                VmLabStageOutcome {
+                    stage: "vm_lab_setup_live_lab".to_string(),
+                    status: VmLabStageStatus::Fail,
+                    summary: "setup failed".to_string(),
+                    artifacts: vec!["/tmp/setup.json".to_string()],
+                },
+            ],
+        );
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].stage, "vm_lab_setup_live_lab");
+        assert_eq!(appended[0].status, VmLabStageStatus::Fail);
+    }
+
+    #[test]
+    fn render_vm_lab_progress_outcome_line_includes_status_and_stage() {
+        let rendered = render_vm_lab_progress_outcome_line(
+            "vm-lab-orchestrate-live-lab",
+            &VmLabStageOutcome {
+                stage: "vm_lab_setup_live_lab".to_string(),
+                status: VmLabStageStatus::Pass,
+                summary: "setup completed".to_string(),
+                artifacts: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            rendered,
+            "[vm-lab-orchestrate-live-lab] PASS vm_lab_setup_live_lab: setup completed"
+        );
+    }
+
+    #[test]
+    fn render_vm_lab_progress_complete_line_reports_result_artifact_path() {
+        let report_dir = PathBuf::from("/tmp/live-lab-report");
+        let report_json = report_dir
+            .join("orchestration")
+            .join("orchestrate_result.json");
+
+        let rendered = render_vm_lab_progress_complete_line(
+            "vm-lab-orchestrate-live-lab",
+            &VmLabCommandOverallStatus::Partial,
+            report_json.as_path(),
+            report_dir.as_path(),
+        );
+
+        assert_eq!(
+            rendered,
+            "[vm-lab-orchestrate-live-lab] COMPLETE overall_status=PARTIAL report_json=/tmp/live-lab-report/orchestration/orchestrate_result.json report_dir=/tmp/live-lab-report"
+        );
+    }
+
+    #[test]
+    fn materialize_orchestration_staging_dir_copies_nested_artifacts() {
+        let staging_dir = create_orchestration_staging_dir().expect("staging dir should create");
+        let destination_root = write_temp_report_dir();
+        let destination_dir = destination_root.join("orchestration");
+
+        fs::create_dir_all(staging_dir.join("nested")).expect("nested staging dir should exist");
+        fs::write(staging_dir.join("discover_initial.json"), "{\"ok\":true}\n")
+            .expect("top-level staging file should write");
+        fs::write(
+            staging_dir
+                .join("nested")
+                .join("vm_lab_restart_result.json"),
+            "{}\n",
+        )
+        .expect("nested staging file should write");
+
+        materialize_orchestration_staging_dir(staging_dir.as_path(), destination_dir.as_path())
+            .expect("staging dir should materialize");
+
+        assert!(!staging_dir.exists());
+        assert_eq!(
+            fs::read_to_string(destination_dir.join("discover_initial.json"))
+                .expect("top-level destination file should read"),
+            "{\"ok\":true}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                destination_dir
+                    .join("nested")
+                    .join("vm_lab_restart_result.json")
+            )
+            .expect("nested destination file should read"),
+            "{}\n"
+        );
+
+        let _ = fs::remove_dir_all(destination_root);
     }
 
     #[test]

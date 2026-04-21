@@ -132,6 +132,9 @@ then run the standard workflow in one shot, use:
   not `readiness.execution_ready`, reruns discovery, then proceeds through
   setup, full live-lab execution, and diagnose-on-failure using the same report
   directory.
+- It now writes stage pass/fail progress lines to the terminal during the run
+  and prints the final `orchestrate_result.json` path when the command
+  completes.
 - The orchestration wrapper requires a fresh report directory and refuses to
   write into a populated one.
 - Add `--stop-after-ready` when you want it to stop after proving VM
