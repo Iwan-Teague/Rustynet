@@ -6,7 +6,18 @@
       "Bash(cargo fmt:*)",
       "Bash(git stash:*)",
       "Bash(cargo check:*)",
-      "Bash(rustfmt:*)"
+      "Bash(rustfmt:*)",
+      "Bash(ssh:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(node --version:*)",
+      "Bash(git clone:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File \"$TEMP/caveman-install/hooks/install.ps1\")"
     ]
   }
 }

@@ -2170,6 +2170,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 aux_vm: parser.value("--aux-vm"),
                 extra_vm: parser.value("--extra-vm"),
                 fifth_client_vm: parser.value("--fifth-client-vm"),
+                windows_vm: parser.value("--windows-vm"),
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 require_same_network: parser.has_flag("--require-same-network"),

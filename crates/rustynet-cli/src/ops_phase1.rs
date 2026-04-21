@@ -1753,10 +1753,7 @@ fn extract_secret_assignment_excerpt(line: &str) -> Option<String> {
                     // (e.g. "passphrase hygiene result:") not a key-value assignment
                     // (e.g. "passphrase: abc" or "\"passphrase\": \"abc\"").
                     let gap = &line[keyword_index + keyword.len()..delimiter_index];
-                    if gap
-                        .chars()
-                        .any(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
+                    if gap.chars().any(|c| c.is_ascii_alphanumeric() || c == '_') {
                         continue;
                     }
                     let mut value = line[delimiter_index + 1..].trim_start();

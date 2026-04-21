@@ -263,6 +263,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub skip_diagnose_on_failure: bool,
     pub stop_after_ready: bool,
     pub dry_run: bool,
+    /// Alias of an optional Windows 11 UTM VM to bootstrap and validate as a client node.
+    /// When set, the orchestrator includes this VM in UTM discovery/restart, then runs
+    /// Windows-specific bootstrap and validation stages after all Linux stages pass.
+    pub windows_vm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4407,6 +4411,14 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         config.extra_vm.as_deref(),
         config.fifth_client_vm.as_deref(),
     )?;
+    // Build discovery alias list: Linux nodes + optional Windows node.
+    // selected_aliases (Linux only) continues to be used for profile/setup.
+    let mut discovery_aliases = selected_aliases.clone();
+    if let Some(ref windows_alias) = config.windows_vm {
+        if !discovery_aliases.contains(windows_alias) {
+            discovery_aliases.push(windows_alias.clone());
+        }
+    }
     let effective_profile_path = match config.profile_path.clone() {
         Some(path) => resolve_absolute_path(path.as_path())?,
         None => config
@@ -4452,7 +4464,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         initial_discovery.as_str(),
     )?;
     let initial_readiness =
-        selected_local_utm_readiness_from_report(initial_discovery.as_str(), &selected_aliases)?;
+        selected_local_utm_readiness_from_report(initial_discovery.as_str(), &discovery_aliases)?;
     let mut final_readiness = initial_readiness.clone();
     let mut final_readiness_artifact = initial_discovery_path.clone();
     let unready_aliases = not_execution_ready_aliases(&initial_readiness);
@@ -4568,7 +4580,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 rediscovery.as_str(),
             )?;
             let post_restart_readiness =
-                selected_local_utm_readiness_from_report(rediscovery.as_str(), &selected_aliases)?;
+                selected_local_utm_readiness_from_report(rediscovery.as_str(), &discovery_aliases)?;
             final_readiness = post_restart_readiness.clone();
             final_readiness_artifact = rediscovery_path.clone();
             let still_unready = not_execution_ready_aliases(&post_restart_readiness);
@@ -4820,6 +4832,23 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 append_unique_stage_outcomes_collect_new(&mut outcomes, result.outcomes.as_slice());
             emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
             warnings.extend(result.warnings);
+            if let Some(ref windows_alias) = config.windows_vm {
+                let windows_outcomes = run_windows_orchestration_stages(
+                    windows_alias.as_str(),
+                    inventory_path.as_path(),
+                    config.ssh_identity_file.as_path(),
+                    config.known_hosts_path.as_deref(),
+                    config.ssh_port,
+                    config.utm_documents_root.as_deref(),
+                    config.utmctl_path.as_deref(),
+                    config.dry_run,
+                    report_dir.as_path(),
+                );
+                for outcome in &windows_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(windows_outcomes);
+            }
             finalize_vm_lab_orchestration_result(
                 "vm-lab-orchestrate-live-lab",
                 report_dir.as_path(),
@@ -4920,6 +4949,192 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             )
         }
     }
+}
+
+fn run_windows_orchestration_stages(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    ssh_port: u16,
+    _utm_documents_root: Option<&Path>,
+    _utmctl_path: Option<&Path>,
+    dry_run: bool,
+    report_dir: &Path,
+) -> Vec<VmLabStageOutcome> {
+    let logs_dir = report_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let bootstrap_log_path = logs_dir.join("bootstrap_windows_host.log");
+    let validate_log_path = logs_dir.join("validate_windows_client_install.log");
+
+    // Stage 1: bootstrap_windows_host
+    let bootstrap_outcome = if dry_run {
+        stage_outcome(
+            "bootstrap_windows_host",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would bootstrap Windows host {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let targets =
+                resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])?;
+            let target = targets
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("no target resolved for alias {windows_alias}"))?;
+            if target.platform_profile.platform != VmGuestPlatform::Windows {
+                return Err(format!(
+                    "alias {windows_alias} resolved to non-Windows platform: {}",
+                    target.platform_profile.platform.as_str()
+                ));
+            }
+            let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+            let host_key = bootstrap_windows_access_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                None,
+                ssh_port,
+                timeout,
+            )?;
+            let inventory = load_inventory(inventory_path)?;
+            let workdir = inventory
+                .iter()
+                .find(|e| e.alias == windows_alias)
+                .and_then(|e| e.rustynet_src_dir.clone())
+                .ok_or_else(|| format!("no rustynet_src_dir in inventory for {windows_alias}"))?;
+            let context = bootstrap::BootstrapPhaseContext {
+                ssh_user: target.ssh_user.as_deref(),
+                ssh_identity_file: Some(ssh_identity_file),
+                known_hosts_path,
+                workdir: workdir.as_str(),
+                repo_url: None,
+                branch: "main",
+                remote: "origin",
+                timeout,
+            };
+            for phase in &[
+                bootstrap::BootstrapPhase::InstallRelease,
+                bootstrap::BootstrapPhase::RestartRuntime,
+                bootstrap::BootstrapPhase::VerifyRuntime,
+            ] {
+                execute_bootstrap_phase_for_target(phase.as_str(), &target, &context)?;
+            }
+            Ok(format!(
+                "Windows host {windows_alias} bootstrapped; host_key={host_key}"
+            ))
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&bootstrap_log_path, summary.as_str());
+                stage_outcome(
+                    "bootstrap_windows_host",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![bootstrap_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&bootstrap_log_path, err.as_str());
+                stage_outcome(
+                    "bootstrap_windows_host",
+                    VmLabStageStatus::Fail,
+                    format!("Windows host bootstrap failed for {windows_alias}: {err}"),
+                    vec![bootstrap_log_path.clone()],
+                )
+            }
+        }
+    };
+    let bootstrap_passed = bootstrap_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 2: validate_windows_client_install
+    let validate_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_client_install",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Windows client install on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_client_install",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let targets =
+                resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])?;
+            let target = targets
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("no target resolved for alias {windows_alias}"))?;
+            let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+            let service_script = build_ssh_powershell_encoded_invocation(
+                "Get-Service -Name RustyNet | Select-Object -ExpandProperty Status",
+            )?;
+            let service_output = capture_remote_shell_command_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                service_script.as_str(),
+                timeout,
+            )?;
+            let service_status = service_output.trim().to_string();
+            if service_status != "Running" {
+                return Err(format!(
+                    "RustyNet service is not Running on {windows_alias}: status={service_status:?}"
+                ));
+            }
+            let adapter_script = build_ssh_powershell_encoded_invocation(
+                "Get-NetAdapter | Where-Object { $_.Name -match 'wg' } | Select-Object Name,Status | ConvertTo-Json -Compress",
+            )?;
+            let adapter_output = capture_remote_shell_command_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                adapter_script.as_str(),
+                timeout,
+            )?;
+            Ok(format!("service=Running adapters={adapter_output}"))
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&validate_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_windows_client_install",
+                    VmLabStageStatus::Pass,
+                    format!("Windows client install validated on {windows_alias}: {summary}"),
+                    vec![validate_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&validate_log_path, err.as_str());
+                stage_outcome(
+                    "validate_windows_client_install",
+                    VmLabStageStatus::Fail,
+                    format!("Windows client install validation failed for {windows_alias}: {err}"),
+                    vec![validate_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    // Stage 3: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
+    let mesh_join_outcome = stage_outcome(
+        "validate_windows_mesh_join",
+        VmLabStageStatus::Skipped,
+        "Windows mesh join validation requires membership/assignment distribution to Windows \
+         nodes (not yet implemented in Linux shell orchestrator); bootstrap stages passed",
+        vec![],
+    );
+
+    vec![bootstrap_outcome, validate_outcome, mesh_join_outcome]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

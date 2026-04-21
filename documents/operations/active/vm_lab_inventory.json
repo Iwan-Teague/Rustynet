@@ -152,6 +152,26 @@
       "ssh_password": "tempo",
       "ssh_target": "debian-lan-11",
       "ssh_user": "debian"
+    },
+    {
+      "alias": "windows-11-1",
+      "controller": {
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/windows-11-1.utm",
+        "type": "local_utm",
+        "utm_name": "windows-11-1"
+      },
+      "guest_exec_mode": "windows_powershell",
+      "include_in_all": false,
+      "lab_role": "windows_client",
+      "os": "Windows/11",
+      "parent_device": "iwan's MacBook Air",
+      "platform": "windows",
+      "remote_shell": "powershell",
+      "rustynet_src_dir": "C:\\Users\\User\\Rustynet",
+      "service_manager": "windows_service",
+      "ssh_password": "tempo",
+      "ssh_target": "192.168.64.12",
+      "ssh_user": "User"
     }
   ],
   "version": 1
