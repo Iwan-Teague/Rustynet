@@ -1748,6 +1748,17 @@ fn extract_secret_assignment_excerpt(line: &str) -> Option<String> {
             for delimiter in [':', '='] {
                 if let Some(offset) = line[keyword_index..delimiter_window_end].find(delimiter) {
                     let delimiter_index = keyword_index + offset;
+                    // Reject matches where word characters appear between the keyword and the
+                    // delimiter: that means this is a natural-language sentence
+                    // (e.g. "passphrase hygiene result:") not a key-value assignment
+                    // (e.g. "passphrase: abc" or "\"passphrase\": \"abc\"").
+                    let gap = &line[keyword_index + keyword.len()..delimiter_index];
+                    if gap
+                        .chars()
+                        .any(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
                     let mut value = line[delimiter_index + 1..].trim_start();
                     if value.starts_with('"') || value.starts_with('\'') {
                         value = &value[1..];
@@ -2457,6 +2468,29 @@ mod tests {
             "1118 |         let mut token = RelaySessionToken::sign(&sk, \"node-a\", \"node-b\",";
         let excerpt = extract_secret_assignment_excerpt(line);
         assert!(excerpt.is_none());
+    }
+
+    #[test]
+    fn secrets_assignment_excerpt_ignores_natural_language_sentence() {
+        // "passphrase" appears in a human-readable diagnostic sentence, not as a key.
+        // Word characters exist between the keyword and the colon, so this must not fire.
+        let line = "  \"summary\": \"Expected plaintext-passphrase hygiene result: no-plaintext-passphrase-files.\",";
+        let excerpt = extract_secret_assignment_excerpt(line);
+        assert!(
+            excerpt.is_none(),
+            "diagnostic sentence must not be flagged as a secret assignment; got: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn secrets_assignment_excerpt_still_detects_passphrase_key_value() {
+        // Genuine YAML/JSON passphrase assignment must still be caught.
+        let line = "  \"passphrase\": \"hunter2supersecretlongvalue\"";
+        let excerpt = extract_secret_assignment_excerpt(line);
+        assert!(
+            excerpt.is_some(),
+            "passphrase key-value assignment must be detected"
+        );
     }
 
     #[test]

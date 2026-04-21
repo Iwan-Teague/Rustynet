@@ -13,8 +13,9 @@ use live_lab_support::{
     ensure_pinned_known_hosts_file, ensure_safe_spec, ensure_safe_token, git_head_commit,
     issue_assignment_bundles_from_env, issue_traversal_bundles_from_env,
     load_home_known_hosts_path, no_plaintext_passphrase_check, remote_src_dir, require_command,
-    resolved_target_address, run_root, scp_to, seed_known_hosts, shell_quote, ssh_status, status,
-    status_code, unix_now, wait_for_daemon_socket, write_assignment_refresh_env, write_file,
+    resolved_target_address, retry_root, run_root, scp_to, seed_known_hosts, shell_quote,
+    ssh_status, status, status_code, unix_now, wait_for_daemon_socket,
+    write_assignment_refresh_env, write_file,
 };
 
 fn main() {
@@ -1102,17 +1103,24 @@ fn install_dns_zone_bundle(
         target,
         "/tmp/rn-dns-zone.bundle",
     )?;
-    run_root(
+    // Use retry_root for the install commands: the soak drives rapid rustynetd restarts on
+    // the same hosts immediately before this stage, which can cause transient SSH status 255
+    // (connection-level failure) if the daemon restart briefly disrupts host networking.
+    retry_root(
         identity,
         known_hosts,
         target,
         "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
+        3,
+        5,
     )?;
-    run_root(
+    retry_root(
         identity,
         known_hosts,
         target,
         "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
+        3,
+        5,
     )
 }
 
