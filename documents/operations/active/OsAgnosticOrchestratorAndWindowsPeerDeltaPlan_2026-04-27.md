@@ -1102,9 +1102,60 @@ conservatively.
     - Same pre-existing baseline workspace-clippy posture as W1.x
       and W2.x — no new lints introduced; the open vm_lab/mod.rs
       format-string drift is unchanged by this slice.
-- [ ] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
+- [~] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
       traits with Linux + Windows impls and macOS/iOS/Android `Unsupported`
-      stubs
+      stubs (partial — `RuntimePaths` landed; other three pending)
+  - [x] W3.2a `RuntimePaths` trait + Linux/Windows impls + macOS/iOS/Android
+        `Unsupported` stubs
+    - Changed files:
+      - `crates/rustynet-cli/src/vm_lab/mod.rs` — added the
+        `RuntimePathRole` enum (Install / State / Config / Logs /
+        Trust / Membership / Keys / Secrets), the `RuntimePaths`
+        trait with a single dispatch method (`path_for(role)`) plus
+        per-role convenience getters, the `LinuxRuntimePaths` and
+        `WindowsRuntimePaths` real impls (paths match the
+        daemon-side constants in `crates/rustynetd/src/daemon.rs`
+        and `crates/rustynetd/src/windows_paths.rs` so the
+        orchestrator and the daemon agree on canonical roots), the
+        `UnsupportedRuntimePaths` stub with `macos()` / `ios()` /
+        `android()` constructors that fail every role lookup with a
+        clear blocker reason citing the missing layout, and a
+        `runtime_paths_for(VmGuestPlatform)` factory that hands out
+        the right boxed impl per platform.
+    - Verification:
+      - `cargo fmt -p rustynet-cli -p rustynetd -- --check` clean.
+      - `cargo build -p rustynet-cli` clean (1 pre-existing dead-
+        code warning on the unrelated `run_host_reboot` helper, not
+        introduced here; new items carry
+        `#[cfg_attr(not(test), allow(dead_code))]` because the
+        `RustOrchestrator` consumer is W3.3 — these annotations
+        come off the moment that slice lands).
+      - `cargo test -p rustynet-cli --bin rustynet-cli` — 407 / 407
+        pass (was 399). +8 new tests in `vm_lab::tests`:
+        `linux_runtime_paths_match_reviewed_fhs_layout`,
+        `windows_runtime_paths_match_reviewed_program_data_layout`,
+        `unsupported_runtime_paths_macos_rejects_every_role_with_blocker_reason`,
+        `unsupported_runtime_paths_ios_rejects_every_role_with_blocker_reason`,
+        `unsupported_runtime_paths_android_rejects_every_role_with_blocker_reason`,
+        `unsupported_runtime_paths_default_getters_propagate_blocker`,
+        `runtime_paths_for_dispatches_to_right_impl_per_platform`,
+        `runtime_path_role_label_round_trips`.
+    - Residual risk:
+      - Trait + impls are infrastructure ahead of W3.3
+        (`RustOrchestrator`); they are not yet called from
+        production code paths. The `#[cfg_attr(not(test),
+        allow(dead_code))]` annotations come off when W3.3 wires
+        them in. Tests exercise every method of every impl,
+        including all eight roles on all three stub platforms.
+      - The Linux logs root is canonicalized as `/var/log/rustynet`
+        even though today's daemon writes through journald; this is
+        the directory the orchestrator's log-root permission stage
+        will reference. Daemon-side log path remains an open follow-
+        up; the trait surface does not assume daemon log file
+        layout, only the directory root.
+  - [ ] W3.2b `ServiceManager` trait + Linux/Windows impls + stubs
+  - [ ] W3.2c `RemoteExec` trait + Linux/Windows impls + stubs
+  - [ ] W3.2d `DaemonProbe` trait + Linux/Windows impls + stubs
 - [ ] W3.3 `RustOrchestrator` impl with parity proof on Linux runs
 - [ ] W3.4 Mandatory gates + full Linux live-lab regression
 

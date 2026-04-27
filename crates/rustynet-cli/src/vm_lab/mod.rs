@@ -4413,6 +4413,219 @@ impl StageOrchestrator for LinuxBashOrchestrator {
     }
 }
 
+/// Per-OS canonical runtime path roots consumed by the orchestrator and
+/// the daemon-side validators. Each method returns `Ok(&Path)` on a
+/// supported OS or `Err` carrying a clear blocker reason on a stub
+/// platform — never a silently fabricated path. The
+/// `RuntimePathRole` enum drives a single `path_for(role)` dispatch
+/// that callers prefer when they want to pick a root by tag instead of
+/// hardcoding the per-method getter; the typed getters stay around for
+/// readability at call sites that already know which root they need.
+///
+/// Reviewed roots are intentionally limited to the set the OS-agnostic
+/// orchestrator needs to drive bootstrap, validator, and lifecycle
+/// stages. File-level constants under
+/// `crates/rustynetd/src/daemon.rs` (Linux) and
+/// `crates/rustynetd/src/windows_paths.rs` (Windows) remain the truth
+/// for individual file paths; this trait gives the orchestrator a
+/// stable, OS-agnostic surface to compose those file paths from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum RuntimePathRole {
+    /// Where rustynetd / rustynet-cli binaries are installed.
+    Install,
+    /// Top-level mutable runtime state directory.
+    State,
+    /// Where reviewed configuration + verifier public keys live.
+    Config,
+    /// Where the daemon writes log files.
+    Logs,
+    /// Where signed trust state (evidence + watermark) lives.
+    Trust,
+    /// Where signed membership snapshot + log + watermark live.
+    Membership,
+    /// Where WireGuard / mesh keys live.
+    Keys,
+    /// Where DPAPI / encrypted-at-rest secrets live.
+    Secrets,
+}
+
+impl RuntimePathRole {
+    /// Stable, lowercase, hyphen-separated label suitable for log
+    /// lines and error messages.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimePathRole::Install => "install",
+            RuntimePathRole::State => "state",
+            RuntimePathRole::Config => "config",
+            RuntimePathRole::Logs => "logs",
+            RuntimePathRole::Trust => "trust",
+            RuntimePathRole::Membership => "membership",
+            RuntimePathRole::Keys => "keys",
+            RuntimePathRole::Secrets => "secrets",
+        }
+    }
+}
+
+/// Adapter over the canonical runtime path roots a RustyNet host
+/// publishes to the orchestrator. Implementations are platform-
+/// specific; macOS / iOS / Android are intentionally `Unsupported`
+/// stubs that fail closed per CLAUDE.md §10 ("stubs must reject
+/// explicitly with a clear blocker reason; no silent no-op success").
+#[allow(dead_code)]
+pub trait RuntimePaths {
+    fn path_for(&self, role: RuntimePathRole) -> Result<&Path, String>;
+
+    fn install_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Install)
+    }
+    fn state_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::State)
+    }
+    fn config_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Config)
+    }
+    fn logs_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Logs)
+    }
+    fn trust_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Trust)
+    }
+    fn membership_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Membership)
+    }
+    fn keys_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Keys)
+    }
+    fn secrets_root(&self) -> Result<&Path, String> {
+        self.path_for(RuntimePathRole::Secrets)
+    }
+
+    /// Platform label used in error messages and log lines.
+    fn platform_label(&self) -> &'static str;
+}
+
+/// Linux runtime path layout. Paths chosen to match the existing
+/// daemon-side constants under `crates/rustynetd/src/daemon.rs`
+/// (e.g. `/etc/rustynet`, `/var/lib/rustynet`) and the systemd-style
+/// FHS conventions Rustynet's Linux installs already follow. Logs
+/// are placed under `/var/log/rustynet` as the canonical root even
+/// though the running daemon currently writes through the journal —
+/// the orchestrator stage that asserts log-root permissions still
+/// needs a stable directory root to verify.
+pub struct LinuxRuntimePaths;
+
+impl RuntimePaths for LinuxRuntimePaths {
+    fn path_for(&self, role: RuntimePathRole) -> Result<&Path, String> {
+        Ok(match role {
+            RuntimePathRole::Install => Path::new("/usr/local"),
+            RuntimePathRole::State => Path::new("/var/lib/rustynet"),
+            RuntimePathRole::Config => Path::new("/etc/rustynet"),
+            RuntimePathRole::Logs => Path::new("/var/log/rustynet"),
+            RuntimePathRole::Trust => Path::new("/var/lib/rustynet"),
+            RuntimePathRole::Membership => Path::new("/var/lib/rustynet"),
+            RuntimePathRole::Keys => Path::new("/etc/rustynet"),
+            RuntimePathRole::Secrets => Path::new("/etc/rustynet/secrets"),
+        })
+    }
+
+    fn platform_label(&self) -> &'static str {
+        "linux"
+    }
+}
+
+/// Windows runtime path layout. Paths match the daemon-side
+/// constants under `crates/rustynetd/src/windows_paths.rs` (the same
+/// `C:\ProgramData\RustyNet` subtree that W1.1 / W1.2b lock down with
+/// SYSTEM + Builtin Administrators ACLs and that the install helper
+/// mirrors at `C:\Program Files\RustyNet`).
+pub struct WindowsRuntimePaths;
+
+impl RuntimePaths for WindowsRuntimePaths {
+    fn path_for(&self, role: RuntimePathRole) -> Result<&Path, String> {
+        Ok(match role {
+            RuntimePathRole::Install => Path::new(r"C:\Program Files\RustyNet"),
+            RuntimePathRole::State => Path::new(r"C:\ProgramData\RustyNet"),
+            RuntimePathRole::Config => Path::new(r"C:\ProgramData\RustyNet\config"),
+            RuntimePathRole::Logs => Path::new(r"C:\ProgramData\RustyNet\logs"),
+            RuntimePathRole::Trust => Path::new(r"C:\ProgramData\RustyNet\trust"),
+            RuntimePathRole::Membership => Path::new(r"C:\ProgramData\RustyNet\membership"),
+            RuntimePathRole::Keys => Path::new(r"C:\ProgramData\RustyNet\keys"),
+            RuntimePathRole::Secrets => Path::new(r"C:\ProgramData\RustyNet\secrets"),
+        })
+    }
+
+    fn platform_label(&self) -> &'static str {
+        "windows"
+    }
+}
+
+/// `RuntimePaths` stub that fails every lookup with a typed blocker
+/// reason. Used for OS variants the orchestrator must still
+/// instantiate (so callers do not silently fabricate a host-shaped
+/// answer for an unsupported platform) but for which RustyNet has
+/// not yet defined a reviewed runtime layout. Per CLAUDE.md §10 the
+/// stub MUST reject every method with a clear blocker reason — never
+/// a "no-op success" that lets downstream stages run against an
+/// undefined layout.
+pub struct UnsupportedRuntimePaths {
+    platform_label: &'static str,
+}
+
+impl UnsupportedRuntimePaths {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn macos() -> Self {
+        Self {
+            platform_label: "macos",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ios() -> Self {
+        Self {
+            platform_label: "ios",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn android() -> Self {
+        Self {
+            platform_label: "android",
+        }
+    }
+
+    fn blocker(&self, role: RuntimePathRole) -> String {
+        format!(
+            "RustyNet runtime path role '{}' is not yet defined for platform '{}'; orchestrator dispatch cannot fabricate an undefined layout — see WindowsWorkingNodePlan_2026-04-17.md and the OS-agnostic delta plan for the supported-OS roadmap",
+            role.as_str(),
+            self.platform_label
+        )
+    }
+}
+
+impl RuntimePaths for UnsupportedRuntimePaths {
+    fn path_for(&self, role: RuntimePathRole) -> Result<&Path, String> {
+        Err(self.blocker(role))
+    }
+
+    fn platform_label(&self) -> &'static str {
+        self.platform_label
+    }
+}
+
+/// Pick the right `RuntimePaths` impl for a target's platform
+/// profile. Returns a boxed trait object so the orchestrator can hold
+/// either a real or a stub without monomorphisation churn.
+#[allow(dead_code)]
+fn runtime_paths_for(platform: VmGuestPlatform) -> Box<dyn RuntimePaths> {
+    match platform {
+        VmGuestPlatform::Linux => Box::new(LinuxRuntimePaths),
+        VmGuestPlatform::Windows => Box::new(WindowsRuntimePaths),
+        VmGuestPlatform::Macos => Box::new(UnsupportedRuntimePaths::macos()),
+        VmGuestPlatform::Ios => Box::new(UnsupportedRuntimePaths::ios()),
+        VmGuestPlatform::Android => Box::new(UnsupportedRuntimePaths::android()),
+    }
+}
+
 pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<String, String> {
     ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
@@ -16302,13 +16515,13 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::{
         LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState, RepoSyncDispatchKind,
-        RepoSyncMode, StageOrchestrator as _, UtmReadinessInputs, VmGuestExecMode, VmGuestPlatform,
-        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
-        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
-        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
-        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
-        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
-        build_local_source_extract_script, build_remote_argv_script,
+        RepoSyncMode, RuntimePaths as _, StageOrchestrator as _, UtmReadinessInputs,
+        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
+        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
+        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
+        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
@@ -21244,6 +21457,211 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             orchestrator.script_path(),
             std::path::Path::new("/path/to/orch.sh")
         );
+    }
+
+    #[test]
+    fn linux_runtime_paths_match_reviewed_fhs_layout() {
+        let paths = super::LinuxRuntimePaths;
+        assert_eq!(paths.platform_label(), "linux");
+        assert_eq!(
+            paths.install_root().expect("install root"),
+            std::path::Path::new("/usr/local")
+        );
+        assert_eq!(
+            paths.state_root().expect("state root"),
+            std::path::Path::new("/var/lib/rustynet")
+        );
+        assert_eq!(
+            paths.config_root().expect("config root"),
+            std::path::Path::new("/etc/rustynet")
+        );
+        assert_eq!(
+            paths.logs_root().expect("logs root"),
+            std::path::Path::new("/var/log/rustynet")
+        );
+        assert_eq!(
+            paths.secrets_root().expect("secrets root"),
+            std::path::Path::new("/etc/rustynet/secrets")
+        );
+    }
+
+    #[test]
+    fn windows_runtime_paths_match_reviewed_program_data_layout() {
+        let paths = super::WindowsRuntimePaths;
+        assert_eq!(paths.platform_label(), "windows");
+        assert_eq!(
+            paths.install_root().expect("install root"),
+            std::path::Path::new(r"C:\Program Files\RustyNet")
+        );
+        assert_eq!(
+            paths.state_root().expect("state root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet")
+        );
+        assert_eq!(
+            paths.config_root().expect("config root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\config")
+        );
+        assert_eq!(
+            paths.logs_root().expect("logs root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\logs")
+        );
+        assert_eq!(
+            paths.trust_root().expect("trust root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\trust")
+        );
+        assert_eq!(
+            paths.membership_root().expect("membership root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\membership")
+        );
+        assert_eq!(
+            paths.keys_root().expect("keys root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\keys")
+        );
+        assert_eq!(
+            paths.secrets_root().expect("secrets root"),
+            std::path::Path::new(r"C:\ProgramData\RustyNet\secrets")
+        );
+    }
+
+    #[test]
+    fn unsupported_runtime_paths_macos_rejects_every_role_with_blocker_reason() {
+        let paths = super::UnsupportedRuntimePaths::macos();
+        assert_eq!(paths.platform_label(), "macos");
+        for role in [
+            super::RuntimePathRole::Install,
+            super::RuntimePathRole::State,
+            super::RuntimePathRole::Config,
+            super::RuntimePathRole::Logs,
+            super::RuntimePathRole::Trust,
+            super::RuntimePathRole::Membership,
+            super::RuntimePathRole::Keys,
+            super::RuntimePathRole::Secrets,
+        ] {
+            let err = paths
+                .path_for(role)
+                .expect_err("macos stub must reject every role");
+            assert!(
+                err.contains("not yet defined for platform 'macos'") && err.contains(role.as_str()),
+                "blocker reason for role={:?} must name role + macos: {err}",
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_runtime_paths_ios_rejects_every_role_with_blocker_reason() {
+        let paths = super::UnsupportedRuntimePaths::ios();
+        assert_eq!(paths.platform_label(), "ios");
+        for role in [
+            super::RuntimePathRole::Install,
+            super::RuntimePathRole::State,
+            super::RuntimePathRole::Config,
+            super::RuntimePathRole::Logs,
+        ] {
+            let err = paths
+                .path_for(role)
+                .expect_err("ios stub must reject every role");
+            assert!(
+                err.contains("not yet defined for platform 'ios'"),
+                "blocker reason must name ios: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_runtime_paths_android_rejects_every_role_with_blocker_reason() {
+        let paths = super::UnsupportedRuntimePaths::android();
+        assert_eq!(paths.platform_label(), "android");
+        for role in [
+            super::RuntimePathRole::Install,
+            super::RuntimePathRole::State,
+            super::RuntimePathRole::Config,
+            super::RuntimePathRole::Logs,
+        ] {
+            let err = paths
+                .path_for(role)
+                .expect_err("android stub must reject every role");
+            assert!(
+                err.contains("not yet defined for platform 'android'"),
+                "blocker reason must name android: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_runtime_paths_default_getters_propagate_blocker() {
+        // The trait's per-role default getters are convenience wrappers
+        // around `path_for`; when the impl is `Unsupported`, every
+        // convenience getter must propagate the same blocker error so
+        // callers cannot accidentally bypass the stub by reaching for
+        // a typed getter instead of `path_for`.
+        let paths = super::UnsupportedRuntimePaths::macos();
+        for getter_result in [
+            paths.install_root(),
+            paths.state_root(),
+            paths.config_root(),
+            paths.logs_root(),
+            paths.trust_root(),
+            paths.membership_root(),
+            paths.keys_root(),
+            paths.secrets_root(),
+        ] {
+            let err = getter_result.expect_err("typed getter on macos stub must reject");
+            assert!(
+                err.contains("not yet defined for platform 'macos'"),
+                "stub getter must propagate blocker: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_paths_for_dispatches_to_right_impl_per_platform() {
+        // Linux + Windows return real impls; the three stub OS variants
+        // each return an Unsupported impl whose every method rejects.
+        // Catches any silent dispatch regression.
+        let linux = super::runtime_paths_for(super::VmGuestPlatform::Linux);
+        assert_eq!(linux.platform_label(), "linux");
+        assert!(linux.config_root().is_ok());
+
+        let windows = super::runtime_paths_for(super::VmGuestPlatform::Windows);
+        assert_eq!(windows.platform_label(), "windows");
+        assert!(windows.config_root().is_ok());
+
+        for (platform, expected_label) in [
+            (super::VmGuestPlatform::Macos, "macos"),
+            (super::VmGuestPlatform::Ios, "ios"),
+            (super::VmGuestPlatform::Android, "android"),
+        ] {
+            let stub = super::runtime_paths_for(platform);
+            assert_eq!(stub.platform_label(), expected_label);
+            let err = stub
+                .config_root()
+                .expect_err("stub platform config_root must reject");
+            assert!(
+                err.contains(expected_label),
+                "stub blocker must mention platform: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_path_role_label_round_trips() {
+        // Lock down the stable string identifiers used in error
+        // messages and log lines — downstream stages rely on these
+        // for grep / parse stability.
+        let pairs: &[(super::RuntimePathRole, &str)] = &[
+            (super::RuntimePathRole::Install, "install"),
+            (super::RuntimePathRole::State, "state"),
+            (super::RuntimePathRole::Config, "config"),
+            (super::RuntimePathRole::Logs, "logs"),
+            (super::RuntimePathRole::Trust, "trust"),
+            (super::RuntimePathRole::Membership, "membership"),
+            (super::RuntimePathRole::Keys, "keys"),
+            (super::RuntimePathRole::Secrets, "secrets"),
+        ];
+        for (role, label) in pairs {
+            assert_eq!(role.as_str(), *label);
+        }
     }
 
     #[test]
