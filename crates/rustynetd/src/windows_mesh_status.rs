@@ -1,0 +1,395 @@
+#![allow(clippy::result_large_err)]
+
+//! Windows mesh-status verifier (W4.2 daemon-side support).
+//!
+//! Reads the daemon's persisted session snapshot at the canonical Windows
+//! state path and emits a typed JSON report the orchestrator can parse to
+//! confirm the Windows guest joined the mesh and observes the expected
+//! peers. The orchestrator's `validate_windows_mesh_join` stage dispatches
+//! the `windows-mesh-status-check` subcommand here.
+//!
+//! This is a "what does the daemon currently see?" diagnostic. It does not
+//! cause any state mutation. A live runtime IPC server for the daemon's
+//! observed state is out of scope for this slice; reading the persisted
+//! snapshot is sufficient because the daemon writes it on every reconcile.
+
+use crate::resilience::{ResilienceError, load_session_snapshot};
+use crate::windows_paths::DEFAULT_WINDOWS_STATE_PATH;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "load_status", rename_all = "snake_case")]
+pub enum WindowsMeshSnapshotLoad {
+    Ok {
+        timestamp_unix: u64,
+        age_seconds: i64,
+        peer_ids: Vec<String>,
+        selected_exit_node: Option<String>,
+        lan_access_enabled: bool,
+    },
+    Missing {
+        reason: String,
+    },
+    IntegrityMismatch {
+        reason: String,
+    },
+    InvalidFormat {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsMeshStatusReport {
+    pub schema_version: u32,
+    pub state_path: String,
+    pub overall_ok: bool,
+    pub snapshot: WindowsMeshSnapshotLoad,
+    pub expected_peer_ids: Vec<String>,
+    pub max_age_seconds: Option<i64>,
+    pub drift_reasons: Vec<String>,
+}
+
+/// Knobs the orchestrator can pass through the subcommand. All optional.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WindowsMeshStatusOptions {
+    pub state_path: Option<PathBuf>,
+    /// Peer IDs the orchestrator expects to find in the snapshot. When
+    /// provided, missing peers count as drift.
+    pub expected_peer_ids: Vec<String>,
+    /// If set, snapshots older than this many seconds count as drift. Useful
+    /// when the orchestrator wants to confirm the daemon reconciled
+    /// post-distribution. `None` disables the freshness check.
+    pub max_age_seconds: Option<i64>,
+}
+
+/// Inspect the runtime snapshot at the configured (or default) state path
+/// and return a typed report. Mirrors the W1.2 / W2.4 / W2.1 reporting shape
+/// so the orchestrator can drive every Windows security-check subcommand
+/// through the same evaluator pattern.
+pub fn collect_windows_mesh_status_report(
+    options: &WindowsMeshStatusOptions,
+) -> WindowsMeshStatusReport {
+    let state_path: PathBuf = options
+        .state_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WINDOWS_STATE_PATH));
+    let state_path_str = state_path.display().to_string();
+    let now_unix = current_unix_seconds();
+    let snapshot = match load_session_snapshot(state_path.as_path()) {
+        Ok(snap) => {
+            let age = now_unix.saturating_sub(snap.timestamp_unix as i64);
+            WindowsMeshSnapshotLoad::Ok {
+                timestamp_unix: snap.timestamp_unix,
+                age_seconds: age,
+                peer_ids: snap.peer_ids,
+                selected_exit_node: snap.selected_exit_node,
+                lan_access_enabled: snap.lan_access_enabled,
+            }
+        }
+        Err(ResilienceError::Io) => WindowsMeshSnapshotLoad::Missing {
+            reason: format!("runtime state path is unreadable on this host: {state_path_str}"),
+        },
+        Err(ResilienceError::IntegrityMismatch) => WindowsMeshSnapshotLoad::IntegrityMismatch {
+            reason: format!("runtime state file failed integrity verification: {state_path_str}"),
+        },
+        Err(ResilienceError::InvalidFormat) => WindowsMeshSnapshotLoad::InvalidFormat {
+            reason: format!(
+                "runtime state file does not match the expected on-disk format: {state_path_str}"
+            ),
+        },
+    };
+    let drift_reasons = evaluate_windows_mesh_status(
+        &snapshot,
+        options.expected_peer_ids.as_slice(),
+        options.max_age_seconds,
+    );
+    let overall_ok = drift_reasons.is_empty();
+    WindowsMeshStatusReport {
+        schema_version: 1,
+        state_path: state_path_str,
+        overall_ok,
+        snapshot,
+        expected_peer_ids: options.expected_peer_ids.clone(),
+        max_age_seconds: options.max_age_seconds,
+        drift_reasons,
+    }
+}
+
+/// Pure evaluator over a snapshot-load result + expectations. Returns the
+/// list of drift reasons (empty = ok). Cross-platform unit-testable.
+pub fn evaluate_windows_mesh_status(
+    snapshot: &WindowsMeshSnapshotLoad,
+    expected_peer_ids: &[String],
+    max_age_seconds: Option<i64>,
+) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    match snapshot {
+        WindowsMeshSnapshotLoad::Missing { reason } => {
+            reasons.push(format!("state snapshot missing: {reason}"));
+        }
+        WindowsMeshSnapshotLoad::IntegrityMismatch { reason } => {
+            reasons.push(format!("state snapshot integrity mismatch: {reason}"));
+        }
+        WindowsMeshSnapshotLoad::InvalidFormat { reason } => {
+            reasons.push(format!("state snapshot invalid format: {reason}"));
+        }
+        WindowsMeshSnapshotLoad::Ok {
+            age_seconds,
+            peer_ids,
+            ..
+        } => {
+            if let Some(max_age) = max_age_seconds {
+                if *age_seconds > max_age {
+                    reasons.push(format!(
+                        "state snapshot is stale: age={age_seconds}s exceeds max_age={max_age}s"
+                    ));
+                }
+                if *age_seconds < 0 {
+                    reasons.push(format!(
+                        "state snapshot has future timestamp: age={age_seconds}s (clock skew or tampered file)"
+                    ));
+                }
+            }
+            for expected in expected_peer_ids {
+                if !peer_ids.iter().any(|p| p == expected) {
+                    reasons.push(format!(
+                        "expected peer {expected} not present in snapshot peer_ids"
+                    ));
+                }
+            }
+        }
+    }
+    reasons
+}
+
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+fn ensure_state_path_under_reviewed_root(path: &Path) -> Result<(), String> {
+    crate::windows_paths::validate_windows_runtime_file_path(path, "mesh status state path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn evaluator_accepts_fresh_snapshot_with_expected_peers() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 30,
+            peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            selected_exit_node: Some("peer-a".to_string()),
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(
+            &snap,
+            &["peer-a".to_string(), "peer-b".to_string()],
+            Some(300),
+        );
+        assert!(reasons.is_empty(), "fresh snapshot must pass: {reasons:?}");
+    }
+
+    #[test]
+    fn evaluator_rejects_missing_expected_peer() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 30,
+            peer_ids: vec!["peer-a".to_string()],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(
+            &snap,
+            &["peer-a".to_string(), "peer-b".to_string()],
+            None,
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("expected peer peer-b")),
+            "missing peer must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_stale_snapshot() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 600,
+            peer_ids: vec![],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], Some(300));
+        assert!(
+            reasons.iter().any(|r| r.contains("snapshot is stale")),
+            "stale snapshot must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_future_timestamp_when_freshness_enforced() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: -42,
+            peer_ids: vec![],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], Some(300));
+        assert!(
+            reasons.iter().any(|r| r.contains("future timestamp")),
+            "future-timestamp snapshot must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_skips_freshness_when_threshold_unset() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 999_999,
+            peer_ids: vec!["peer-a".to_string()],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], None);
+        assert!(
+            reasons.is_empty(),
+            "freshness check must skip when threshold None: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_surfaces_missing_state_load() {
+        let snap = WindowsMeshSnapshotLoad::Missing {
+            reason: "no such file".to_string(),
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], None);
+        assert!(
+            reasons.iter().any(|r| r.contains("state snapshot missing")),
+            "missing state must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_surfaces_integrity_mismatch() {
+        let snap = WindowsMeshSnapshotLoad::IntegrityMismatch {
+            reason: "checksum failed".to_string(),
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], None);
+        assert!(
+            reasons.iter().any(|r| r.contains("integrity mismatch")),
+            "integrity mismatch must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_surfaces_invalid_format() {
+        let snap = WindowsMeshSnapshotLoad::InvalidFormat {
+            reason: "missing field".to_string(),
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], None);
+        assert!(
+            reasons.iter().any(|r| r.contains("invalid format")),
+            "invalid format must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_aggregates_multiple_drift_reasons() {
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 600,
+            peer_ids: vec![],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(
+            &snap,
+            &["peer-a".to_string(), "peer-b".to_string()],
+            Some(300),
+        );
+        assert!(
+            reasons.len() >= 3,
+            "expected stale + 2 missing peers: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn collect_report_returns_missing_for_nonexistent_path() {
+        let bogus = PathBuf::from("/tmp/rustynet-mesh-status-test-nonexistent");
+        let _ = fs::remove_file(bogus.as_path());
+        let options = WindowsMeshStatusOptions {
+            state_path: Some(bogus),
+            expected_peer_ids: vec!["peer-a".to_string()],
+            max_age_seconds: Some(300),
+        };
+        let report = collect_windows_mesh_status_report(&options);
+        assert_eq!(report.schema_version, 1);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::Missing { .. }
+        ));
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("state snapshot missing")),
+            "missing-state reason must propagate: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn report_serializes_with_load_status_tag_and_round_trips() {
+        let report = WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            overall_ok: true,
+            snapshot: WindowsMeshSnapshotLoad::Ok {
+                timestamp_unix: 1_700_000_000,
+                age_seconds: 30,
+                peer_ids: vec!["peer-a".to_string()],
+                selected_exit_node: Some("peer-a".to_string()),
+                lan_access_enabled: false,
+            },
+            expected_peer_ids: vec!["peer-a".to_string()],
+            max_age_seconds: Some(300),
+            drift_reasons: vec![],
+        };
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        assert!(serialized.contains("\"load_status\":\"ok\""));
+        let restored: WindowsMeshStatusReport =
+            serde_json::from_str(serialized.as_str()).expect("deserialize");
+        assert_eq!(restored, report);
+    }
+
+    #[test]
+    fn report_serializes_missing_load_with_status_tag() {
+        let report = WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::Missing {
+                reason: "no such file".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: vec!["state snapshot missing: no such file".to_string()],
+        };
+        let serialized = serde_json::to_string(&report).expect("serialize");
+        assert!(serialized.contains("\"load_status\":\"missing\""));
+        let restored: WindowsMeshStatusReport =
+            serde_json::from_str(serialized.as_str()).expect("deserialize");
+        assert_eq!(restored, report);
+    }
+}

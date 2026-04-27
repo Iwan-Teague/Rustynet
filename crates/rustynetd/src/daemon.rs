@@ -7105,6 +7105,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     }
     resolve_configured_egress_interface(&mut config)?;
     validate_daemon_config(&config)?;
+    #[cfg(windows)]
+    {
+        crate::windows_paths::validate_windows_runtime_startup_acls()
+            .map_err(DaemonError::InvalidConfig)?;
+    }
     prepare_runtime_wireguard_key(&config)?;
     if let Err(err) = run_preflight_checks(&config) {
         let _ = scrub_runtime_wireguard_key_after_bootstrap(&config);

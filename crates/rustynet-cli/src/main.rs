@@ -523,6 +523,9 @@ enum OpsCommand {
     VmLabOrchestrateLiveLab {
         config: vm_lab::VmLabOrchestrateLiveLabConfig,
     },
+    VmLabValidateWindowsSecurity {
+        config: vm_lab::VmLabValidateWindowsSecurityConfig,
+    },
     VmLabValidateLiveLabProfile {
         config: vm_lab::VmLabValidateLiveLabProfileConfig,
     },
@@ -2201,6 +2204,25 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 skip_diagnose_on_failure: parser.has_flag("--skip-diagnose-on-failure"),
                 stop_after_ready: parser.has_flag("--stop-after-ready"),
                 dry_run: parser.has_flag("--dry-run"),
+            },
+        }),
+        "vm-lab-validate-windows-security" => Ok(OpsCommand::VmLabValidateWindowsSecurity {
+            config: vm_lab::VmLabValidateWindowsSecurityConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                windows_vm: parser
+                    .value("--windows-vm")
+                    .ok_or_else(|| "--windows-vm <alias> is required".to_string())?,
+                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                utm_documents_root: parser.optional_path("--utm-documents-root"),
+                utmctl_path: parser.optional_path("--utmctl-path"),
+                report_dir: parser.required_path("--report-dir")?,
+                dry_run: parser.has_flag("--dry-run"),
+                skip_access_bootstrap: parser.has_flag("--skip-access-bootstrap"),
+                skip_install: parser.has_flag("--skip-install"),
             },
         }),
         "vm-lab-validate-live-lab-profile" => Ok(OpsCommand::VmLabValidateLiveLabProfile {
@@ -4364,6 +4386,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabOrchestrateLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_orchestrate_live_lab(config)
+        }
+        OpsCommand::VmLabValidateWindowsSecurity { config } => {
+            vm_lab::run_validate_windows_security(&config)
         }
         OpsCommand::VmLabValidateLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_validate_live_lab_profile(config)
@@ -11896,6 +11921,7 @@ fn help_text() -> String {
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
         "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run]",
+        "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",

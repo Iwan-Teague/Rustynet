@@ -661,17 +661,22 @@ function Repair-SshProtectedFileAcl {
         return
     }
 
-    & icacls $Path /setowner $AdministratorsName | Out-Null
+    # icacls /setowner needs SeRestorePrivilege which a UAC-filtered
+    # Administrator token doesn't have. Best-effort: try to flip ownership
+    # to BUILTIN\Administrators (so admins can manage the file later) but
+    # keep going on failure — sshd validates the DACL, not the owner, so
+    # leaving ownership as the current user is acceptable.
+    # 2>$null (discard stderr) — see comment in Ensure-AuthorizedKeys for
+    # why merging stderr into the pipeline would mask our $LASTEXITCODE
+    # gates.
+    & icacls $Path /setowner $AdministratorsName 2>$null | Out-Null
+    & icacls $Path /inheritance:r 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "icacls /setowner failed for $Path"
+        throw "[E6-repair-inheritance] icacls /inheritance:r failed for $Path (LASTEXITCODE=$LASTEXITCODE)"
     }
-    & icacls $Path /inheritance:r | Out-Null
+    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "icacls /inheritance:r failed for $Path"
-    }
-    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "icacls /grant:r failed for $Path"
+        throw "[E7-repair-grant] icacls /grant:r failed for $Path (LASTEXITCODE=$LASTEXITCODE)"
     }
 }
 
@@ -687,10 +692,76 @@ function Ensure-AuthorizedKeys {
         return $false
     }
     $adminKeys = 'C:\ProgramData\ssh\administrators_authorized_keys'
-    Set-Content -LiteralPath $adminKeys -Encoding ascii -Value ($trimmedKey + "`r`n")
+    $sshDir = Split-Path -Parent $adminKeys
+    if (-not (Test-Path -LiteralPath $sshDir)) {
+        New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+    }
+    # 1. Release any sshd-held file lock on administrators_authorized_keys.
+    #    sshd can keep the file open in shared mode after a previous run; a
+    #    truncate-write from this script then trips "Access is denied". The
+    #    later sshd restart (Set-Service / Start-Service) re-reads the new
+    #    contents on its next accept().
+    try {
+        $existingService = Get-Service -Name 'sshd' -ErrorAction SilentlyContinue
+        if ($null -ne $existingService -and $existingService.Status -eq 'Running') {
+            Stop-Service -Name 'sshd' -Force -ErrorAction Stop
+        }
+    } catch {
+        throw "[E1-stop-sshd] stop pre-existing sshd before authorized_keys write failed: $($_.Exception.Message)"
+    }
+    # 2. Make sure Administrators has Modify on the parent dir. /grant only
+    #    needs WRITE_DAC on the target — Administrators already has that on
+    #    the OpenSSH-installed dir — so no SeRestorePrivilege required and
+    #    this works from a UAC-filtered Administrator token. We deliberately
+    #    skip icacls /setowner because that DOES need SeRestorePrivilege
+    #    which the filtered token lacks; the existing
+    #    Repair-SshProtectedFileAcl below re-tightens the DACL to the
+    #    OpenSSH-default once we're done writing.
+    # Discard stderr instead of `2>&1`. With $ErrorActionPreference='Stop',
+    # merging stderr into the pipeline lets PowerShell raise a terminating
+    # error from native-command stderr text BEFORE the $LASTEXITCODE check
+    # below runs — masking our own throw with bare icacls output. 2>$null
+    # discards stderr entirely so the gate is just the exit code.
+    & icacls $sshDir /grant "${AdministratorsName}:(OI)(CI)M" /C 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "[E2-grant-dir] icacls /grant Administrators:M on ${sshDir} failed (LASTEXITCODE=${LASTEXITCODE})"
+    }
+    # 3. Remove any pre-existing file. We've now got Modify on the dir, so
+    #    delete works. This also drops a sticky restrictive ACL the file
+    #    might have inherited from a prior failed bootstrap.
+    if (Test-Path -LiteralPath $adminKeys) {
+        try {
+            Remove-Item -LiteralPath $adminKeys -Force -ErrorAction Stop
+        } catch {
+            throw "[E3-remove-file] remove pre-existing ${adminKeys} failed: $($_.Exception.Message)"
+        }
+    }
+    # 4. Write the new content fresh.
+    try {
+        Set-Content -LiteralPath $adminKeys -Encoding ascii -Value ($trimmedKey + "`r`n") -ErrorAction Stop
+    } catch {
+        throw "[E4-set-content] Set-Content ${adminKeys} failed: $($_.Exception.Message)"
+    }
+    # 5. Read back BEFORE tightening the DACL. With a UAC-filtered
+    #    Administrator token, Administrators is a deny-only SID — the
+    #    post-Repair DACL of "SYSTEM:F + Administrators:F" then locks the
+    #    current process out of its own freshly-written file. Verify content
+    #    here while we still own the file and Modify is granted.
+    $actual = ''
+    try {
+        $actual = (Get-Content -LiteralPath $adminKeys -Raw -ErrorAction Stop).Trim()
+    } catch {
+        throw "[E5-readback] readback of ${adminKeys} failed: $($_.Exception.Message)"
+    }
+    if ($actual -ne $trimmedKey) {
+        return $false
+    }
+    # 6. Now tighten the file DACL to the hardened
+    #    SYSTEM+Administrators-only profile expected by sshd. The /setowner
+    #    inside Repair-SshProtectedFileAcl is best-effort; the /grant:r
+    #    DACL update is what sshd actually validates.
     Repair-SshProtectedFileAcl -Path $adminKeys -AdministratorsName $AdministratorsName -LocalSystemName $LocalSystemName
-    $actual = (Get-Content -LiteralPath $adminKeys -Raw -ErrorAction Stop).Trim()
-    return ($actual -eq $trimmedKey)
+    return $true
 }
 
 function Ensure-OpenSshFirewallRule {

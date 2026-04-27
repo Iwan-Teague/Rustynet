@@ -26,15 +26,24 @@ use rustynetd::key_material::{
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
+use rustynetd::windows_authenticode::inspect_authenticode_signature;
 use rustynetd::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
     parse_windows_backend_mode,
 };
+use rustynetd::windows_key_custody::collect_windows_key_custody_snapshot;
+use rustynetd::windows_mesh_status::{
+    WindowsMeshStatusOptions, collect_windows_mesh_status_report,
+};
+use rustynetd::windows_paths::collect_windows_runtime_acl_report;
 #[cfg(windows)]
 use rustynetd::windows_runtime_boundary::run_windows_runtime_boundary_check;
 use rustynetd::windows_service::{
     HostEntrySelection, run_windows_service_host, select_host_entry, windows_service_help_line,
     windows_service_help_note,
+};
+use rustynetd::windows_service_hardening::{
+    build_windows_service_hardening_report, collect_windows_service_hardening_snapshot,
 };
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -77,6 +86,21 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "membership" => run_membership_command(rest),
             [cmd, rest @ ..] if cmd == "windows-runtime-boundary-check" => {
                 run_windows_runtime_boundary_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-runtime-acls-check" => {
+                run_windows_runtime_acls_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-service-hardening-check" => {
+                run_windows_service_hardening_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-key-custody-check" => {
+                run_windows_key_custody_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-authenticode-check" => {
+                run_windows_authenticode_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-mesh-status-check" => {
+                run_windows_mesh_status_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -191,6 +215,222 @@ fn run_windows_runtime_boundary_check_command(args: &[String]) -> Result<(), Str
         );
         Ok(())
     }
+}
+
+fn run_windows_mesh_status_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut state_path: Option<std::path::PathBuf> = None;
+    let mut expected_peer_ids: Vec<String> = Vec::new();
+    let mut max_age_seconds: Option<i64> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--state-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                state_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            Some("--expected-peer-id") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                expected_peer_ids.push(value.clone());
+                index += 2;
+            }
+            Some("--max-age-seconds") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                let parsed: i64 = value
+                    .parse()
+                    .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
+                if parsed < 0 {
+                    return Err("--max-age-seconds must be non-negative".to_string());
+                }
+                max_age_seconds = Some(parsed);
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-mesh-status-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let options = WindowsMeshStatusOptions {
+        state_path,
+        expected_peer_ids,
+        max_age_seconds,
+    };
+    let report = collect_windows_mesh_status_report(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize mesh-status report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(format!(
+            "windows-mesh-status-check failed for {}: {}",
+            report.state_path,
+            if report.drift_reasons.is_empty() {
+                "no drift_reasons recorded".to_string()
+            } else {
+                report.drift_reasons.join("; ")
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn run_windows_authenticode_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut binary_path: Option<std::path::PathBuf> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--binary-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--binary-path requires a value".to_string())?;
+                binary_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-authenticode-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let target_path = binary_path
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files\RustyNet\rustynetd.exe"));
+    let report = inspect_authenticode_signature(target_path.as_path());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize authenticode report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(format!(
+            "windows-authenticode-check failed for {}: {}",
+            report.binary_path,
+            if report.drift_reasons.is_empty() {
+                "no signature present".to_string()
+            } else {
+                report.drift_reasons.join("; ")
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn run_windows_key_custody_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-key-custody-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_windows_key_custody_snapshot();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize key-custody report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-key-custody-check reported drift in the live RustyNet key custody state"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_service_hardening_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-service-hardening-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let snapshot = collect_windows_service_hardening_snapshot()?;
+    let report = build_windows_service_hardening_report(snapshot);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize service-hardening report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-service-hardening-check reported drift in the live RustyNet service registration"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-runtime-acls-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_windows_runtime_acl_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize runtime-acls report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn ensure_cli_path_absolute(path: &str, label: &str) -> Result<(), String> {
@@ -1279,6 +1519,11 @@ fn help_text() -> String {
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
+        "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
+        "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
+        "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
+        "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
+        "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
@@ -1355,7 +1600,11 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_text, parse_daemon_config};
+    use super::{
+        help_text, parse_daemon_config, run_windows_authenticode_check_command,
+        run_windows_key_custody_check_command, run_windows_mesh_status_check_command,
+        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+    };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
         DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
@@ -1375,6 +1624,230 @@ mod tests {
         assert!(help.contains("RUSTYNETD_DAEMON_ARGS_JSON"));
         assert!(help.contains("windows-unsupported"));
         assert!(help.contains("windows-wireguard-nt"));
+    }
+
+    #[test]
+    fn help_text_advertises_windows_runtime_acls_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-runtime-acls-check"),
+            "help text must advertise windows-runtime-acls-check subcommand"
+        );
+        assert!(
+            help.contains("--no-fail-on-drift"),
+            "help text must advertise --no-fail-on-drift flag"
+        );
+    }
+
+    #[test]
+    fn run_windows_runtime_acls_check_command_rejects_unknown_flags() {
+        let err = run_windows_runtime_acls_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-runtime-acls-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_runtime_acls_check_command_fails_closed_off_windows() {
+        let err = run_windows_runtime_acls_check_command(&[])
+            .expect_err("non-Windows host must fail with drift");
+        assert!(
+            err.contains("reported drift on at least one reviewed runtime root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_runtime_acls_check_command_no_fail_on_drift_returns_ok_off_windows() {
+        run_windows_runtime_acls_check_command(&["--no-fail-on-drift".to_string()])
+            .expect("--no-fail-on-drift must allow report-only execution off Windows");
+    }
+
+    #[test]
+    fn help_text_advertises_windows_service_hardening_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-service-hardening-check"),
+            "help text must advertise windows-service-hardening-check subcommand"
+        );
+    }
+
+    #[test]
+    fn run_windows_service_hardening_check_command_rejects_unknown_flags() {
+        let err = run_windows_service_hardening_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-service-hardening-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_service_hardening_check_command_fails_closed_off_windows() {
+        let err = run_windows_service_hardening_check_command(&[])
+            .expect_err("non-Windows host must fail with collector blocker");
+        assert!(
+            err.contains("only available on Windows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_windows_key_custody_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-key-custody-check"),
+            "help text must advertise windows-key-custody-check subcommand"
+        );
+    }
+
+    #[test]
+    fn run_windows_key_custody_check_command_rejects_unknown_flags() {
+        let err = run_windows_key_custody_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-key-custody-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_key_custody_check_command_fails_closed_off_windows() {
+        let err = run_windows_key_custody_check_command(&[])
+            .expect_err("non-Windows host must fail with drift");
+        assert!(err.contains("reported drift"), "unexpected error: {err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_key_custody_check_command_no_fail_on_drift_returns_ok_off_windows() {
+        run_windows_key_custody_check_command(&["--no-fail-on-drift".to_string()])
+            .expect("--no-fail-on-drift must allow report-only execution off Windows");
+    }
+
+    #[test]
+    fn help_text_advertises_windows_authenticode_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-authenticode-check"),
+            "help text must advertise windows-authenticode-check subcommand"
+        );
+        assert!(
+            help.contains("--binary-path"),
+            "help text must advertise --binary-path flag"
+        );
+    }
+
+    #[test]
+    fn run_windows_authenticode_check_command_rejects_unknown_flags() {
+        let err = run_windows_authenticode_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-authenticode-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_authenticode_check_command_rejects_missing_binary_path_value() {
+        let err = run_windows_authenticode_check_command(&["--binary-path".to_string()])
+            .expect_err("missing value must be rejected");
+        assert!(
+            err.contains("--binary-path requires a value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_authenticode_check_command_fails_closed_for_missing_binary() {
+        let err = run_windows_authenticode_check_command(&[
+            "--binary-path".to_string(),
+            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_string(),
+        ])
+        .expect_err("missing binary must fail with read error");
+        assert!(
+            err.contains("read binary failed") || err.contains("windows-authenticode-check failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_windows_mesh_status_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-mesh-status-check"),
+            "help text must advertise windows-mesh-status-check subcommand"
+        );
+        assert!(
+            help.contains("--expected-peer-id"),
+            "help text must advertise --expected-peer-id"
+        );
+        assert!(
+            help.contains("--max-age-seconds"),
+            "help text must advertise --max-age-seconds"
+        );
+    }
+
+    #[test]
+    fn run_windows_mesh_status_check_command_rejects_unknown_flags() {
+        let err = run_windows_mesh_status_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-mesh-status-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_mesh_status_check_command_rejects_negative_max_age() {
+        let err = run_windows_mesh_status_check_command(&[
+            "--max-age-seconds".to_string(),
+            "-30".to_string(),
+        ])
+        .expect_err("negative max-age must be rejected");
+        assert!(
+            err.contains("--max-age-seconds must be non-negative"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_mesh_status_check_command_fails_for_missing_state_file() {
+        let err = run_windows_mesh_status_check_command(&[
+            "--state-path".to_string(),
+            "/tmp/rustynet-mesh-status-bin-missing".to_string(),
+        ])
+        .expect_err("missing state must fail-closed");
+        assert!(
+            err.contains("windows-mesh-status-check failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_mesh_status_check_command_no_fail_on_drift_allows_missing_state_run() {
+        run_windows_mesh_status_check_command(&[
+            "--no-fail-on-drift".to_string(),
+            "--state-path".to_string(),
+            "/tmp/rustynet-mesh-status-bin-missing".to_string(),
+        ])
+        .expect("--no-fail-on-drift must allow report-only execution");
+    }
+
+    #[test]
+    fn run_windows_authenticode_check_command_no_fail_on_drift_allows_missing_binary_run() {
+        run_windows_authenticode_check_command(&[
+            "--no-fail-on-drift".to_string(),
+            "--binary-path".to_string(),
+            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_string(),
+        ])
+        .expect("--no-fail-on-drift must allow report-only execution even on read failure");
     }
 
     #[test]

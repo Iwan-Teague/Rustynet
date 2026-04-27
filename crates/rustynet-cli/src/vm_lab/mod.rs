@@ -231,6 +231,90 @@ pub struct VmLabSetupLiveLabConfig {
     pub orchestrated: bool,
 }
 
+/// Standalone Windows-only security validation. Skips the Linux fleet entirely
+/// and runs the Windows orchestration stages (bootstrap + the W1.2/W2.2/W2.4/
+/// W2.1 security verifiers) against a single Windows UTM guest. Useful for
+/// iterating on Windows-side security checks without spinning up the full
+/// 5-Linux + 1-Windows live-lab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabValidateWindowsSecurityConfig {
+    pub inventory_path: PathBuf,
+    pub windows_vm: String,
+    pub ssh_identity_file: PathBuf,
+    pub known_hosts_path: Option<PathBuf>,
+    pub ssh_port: u16,
+    pub utm_documents_root: Option<PathBuf>,
+    pub utmctl_path: Option<PathBuf>,
+    pub report_dir: PathBuf,
+    pub dry_run: bool,
+    pub skip_access_bootstrap: bool,
+    pub skip_install: bool,
+}
+
+pub fn run_validate_windows_security(
+    config: &VmLabValidateWindowsSecurityConfig,
+) -> Result<String, String> {
+    std::fs::create_dir_all(&config.report_dir).map_err(|err| {
+        format!(
+            "create report dir {} failed: {err}",
+            config.report_dir.display()
+        )
+    })?;
+    let outcomes = run_windows_orchestration_stages_with_options(
+        config.windows_vm.as_str(),
+        config.inventory_path.as_path(),
+        config.ssh_identity_file.as_path(),
+        config.known_hosts_path.as_deref(),
+        config.ssh_port,
+        config.utm_documents_root.as_deref(),
+        config.utmctl_path.as_deref(),
+        config.dry_run,
+        config.report_dir.as_path(),
+        WindowsOrchestrationOptions {
+            skip_access_bootstrap: config.skip_access_bootstrap,
+            skip_install: config.skip_install,
+        },
+    );
+    let summary_path = config.report_dir.join("windows_security_validation.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "windows_vm": config.windows_vm,
+        "dry_run": config.dry_run,
+        "stages": outcomes
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "stage": o.stage,
+                    "status": format!("{:?}", o.status).to_ascii_lowercase(),
+                    "summary": o.summary,
+                    "artifacts": o.artifacts.clone(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("serialize Windows security validation report failed: {err}"))?;
+    std::fs::write(summary_path.as_path(), serialized.as_str()).map_err(|err| {
+        format!(
+            "write Windows security validation report to {} failed: {err}",
+            summary_path.display()
+        )
+    })?;
+    println!("{serialized}");
+    let any_failed = outcomes.iter().any(|o| o.status == VmLabStageStatus::Fail);
+    if any_failed {
+        return Err(format!(
+            "Windows security validation reported one or more stage failures; report at {}",
+            summary_path.display()
+        ));
+    }
+    Ok(format!(
+        "Windows security validation passed for {}; report at {}",
+        config.windows_vm,
+        summary_path.display()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabOrchestrateLiveLabConfig {
     pub inventory_path: PathBuf,
@@ -4962,17 +5046,73 @@ fn run_windows_orchestration_stages(
     dry_run: bool,
     report_dir: &Path,
 ) -> Vec<VmLabStageOutcome> {
+    run_windows_orchestration_stages_with_options(
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        ssh_port,
+        _utm_documents_root,
+        _utmctl_path,
+        dry_run,
+        report_dir,
+        WindowsOrchestrationOptions::default(),
+    )
+}
+
+/// Per-run knobs for `run_windows_orchestration_stages`. Defaults match the
+/// historical full-bootstrap behavior for the `vm-lab-orchestrate-live-lab`
+/// path. The standalone `vm-lab-validate-windows-security` subcommand exposes
+/// these flags so iteration loops can skip already-completed phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowsOrchestrationOptions {
+    /// Skip the UTM-result-file access bootstrap step. Use when SSH +
+    /// authorized_keys are already set up on the guest, and utmctl is
+    /// unavailable in the calling shell. Subsequent SSH-based stages still
+    /// run unchanged.
+    pub skip_access_bootstrap: bool,
+    /// Skip InstallRelease/RestartRuntime/VerifyRuntime. Use when the binary
+    /// at the reviewed install path is already current and you only want to
+    /// re-run the security validation stages.
+    pub skip_install: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_windows_orchestration_stages_with_options(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    ssh_port: u16,
+    _utm_documents_root: Option<&Path>,
+    _utmctl_path: Option<&Path>,
+    dry_run: bool,
+    report_dir: &Path,
+    options: WindowsOrchestrationOptions,
+) -> Vec<VmLabStageOutcome> {
     let logs_dir = report_dir.join("logs");
     let _ = std::fs::create_dir_all(&logs_dir);
     let bootstrap_log_path = logs_dir.join("bootstrap_windows_host.log");
     let validate_log_path = logs_dir.join("validate_windows_client_install.log");
+    let acls_log_path = logs_dir.join("validate_windows_runtime_acls.log");
+    let hardening_log_path = logs_dir.join("validate_windows_service_hardening.log");
+    let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
+    let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
 
     // Stage 1: bootstrap_windows_host
     let bootstrap_outcome = if dry_run {
+        let summary = if options.skip_access_bootstrap || options.skip_install {
+            format!(
+                "dry-run: would bootstrap Windows host {windows_alias} (skip_access_bootstrap={}, skip_install={})",
+                options.skip_access_bootstrap, options.skip_install
+            )
+        } else {
+            format!("dry-run: would bootstrap Windows host {windows_alias}")
+        };
         stage_outcome(
             "bootstrap_windows_host",
             VmLabStageStatus::Skipped,
-            format!("dry-run: would bootstrap Windows host {windows_alias}"),
+            summary,
             vec![],
         )
     } else {
@@ -4990,41 +5130,55 @@ fn run_windows_orchestration_stages(
                 ));
             }
             let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
-            let host_key = bootstrap_windows_access_for_target(
-                &target,
-                None,
-                Some(ssh_identity_file),
-                known_hosts_path,
-                None,
-                ssh_port,
-                timeout,
-            )?;
-            let inventory = load_inventory(inventory_path)?;
-            let workdir = inventory
-                .iter()
-                .find(|e| e.alias == windows_alias)
-                .and_then(|e| e.rustynet_src_dir.clone())
-                .ok_or_else(|| format!("no rustynet_src_dir in inventory for {windows_alias}"))?;
-            let context = bootstrap::BootstrapPhaseContext {
-                ssh_user: target.ssh_user.as_deref(),
-                ssh_identity_file: Some(ssh_identity_file),
-                known_hosts_path,
-                workdir: workdir.as_str(),
-                repo_url: None,
-                branch: "main",
-                remote: "origin",
-                timeout,
+            let host_key = if options.skip_access_bootstrap {
+                "skipped-access-bootstrap".to_string()
+            } else {
+                bootstrap_windows_access_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    None,
+                    ssh_port,
+                    timeout,
+                )?
             };
-            for phase in &[
-                bootstrap::BootstrapPhase::InstallRelease,
-                bootstrap::BootstrapPhase::RestartRuntime,
-                bootstrap::BootstrapPhase::VerifyRuntime,
-            ] {
-                execute_bootstrap_phase_for_target(phase.as_str(), &target, &context)?;
+            if !options.skip_install {
+                let inventory = load_inventory(inventory_path)?;
+                let workdir = inventory
+                    .iter()
+                    .find(|e| e.alias == windows_alias)
+                    .and_then(|e| e.rustynet_src_dir.clone())
+                    .ok_or_else(|| {
+                        format!("no rustynet_src_dir in inventory for {windows_alias}")
+                    })?;
+                let context = bootstrap::BootstrapPhaseContext {
+                    ssh_user: target.ssh_user.as_deref(),
+                    ssh_identity_file: Some(ssh_identity_file),
+                    known_hosts_path,
+                    workdir: workdir.as_str(),
+                    repo_url: None,
+                    branch: "main",
+                    remote: "origin",
+                    timeout,
+                };
+                for phase in &[
+                    bootstrap::BootstrapPhase::InstallRelease,
+                    bootstrap::BootstrapPhase::RestartRuntime,
+                    bootstrap::BootstrapPhase::VerifyRuntime,
+                ] {
+                    execute_bootstrap_phase_for_target(phase.as_str(), &target, &context)?;
+                }
             }
-            Ok(format!(
-                "Windows host {windows_alias} bootstrapped; host_key={host_key}"
-            ))
+            let mut summary = format!("Windows host {windows_alias} bootstrapped");
+            if options.skip_access_bootstrap {
+                summary.push_str(" (access bootstrap skipped)");
+            }
+            if options.skip_install {
+                summary.push_str(" (install phases skipped)");
+            }
+            summary.push_str(&format!("; host_key={host_key}"));
+            Ok(summary)
         })();
         match result {
             Ok(summary) => {
@@ -5125,7 +5279,303 @@ fn run_windows_orchestration_stages(
         }
     };
 
-    // Stage 3: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
+    let validate_passed = validate_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 3: validate_windows_runtime_acls
+    // Dispatches `rustynetd windows-runtime-acls-check --no-fail-on-drift` on
+    // the live Windows guest, parses the typed JSON drift report, and fails
+    // the live-lab run if any reviewed runtime root is missing or drifted.
+    let acls_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_runtime_acls",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows runtime ACLs on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_runtime_acls",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_runtime_acls",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_runtime_acls_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&acls_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_runtime_acls",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![acls_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&acls_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_runtime_acls",
+                    VmLabStageStatus::Fail,
+                    format!("Windows runtime ACL validation failed for {windows_alias}: {reason}"),
+                    vec![acls_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    let acls_passed = acls_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 4: validate_windows_service_hardening
+    // Dispatches `rustynetd windows-service-hardening-check --no-fail-on-drift`
+    // on the live Windows guest, parses the typed JSON report, and fails the
+    // live-lab run if any reviewed-profile invariant drifted (binary path,
+    // argv shape, account, service SID type, interactive-process flag,
+    // failure actions, binary ACL).
+    let hardening_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_service_hardening",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows service hardening on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_service_hardening",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_service_hardening",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_service_hardening",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_service_hardening_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&hardening_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_service_hardening",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![hardening_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&hardening_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_service_hardening",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Windows service hardening validation failed for {windows_alias}: {reason}"
+                    ),
+                    vec![hardening_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    let hardening_passed = hardening_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 5: validate_windows_key_custody
+    // Dispatches `rustynetd windows-key-custody-check --no-fail-on-drift` on
+    // the live Windows guest, parses the typed JSON report, and fails the
+    // live-lab run if any reviewed key-custody artifact is missing, has a
+    // drifted ACL, uses the wrong on-disk format, or if the plaintext
+    // runtime private key file is present at rest.
+    let custody_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_key_custody",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows key custody on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_key_custody",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_key_custody",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_key_custody",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_key_custody",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_key_custody_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&custody_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_key_custody",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![custody_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&custody_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_key_custody",
+                    VmLabStageStatus::Fail,
+                    format!("Windows key custody validation failed for {windows_alias}: {reason}"),
+                    vec![custody_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    let custody_passed = custody_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 6: validate_windows_authenticode
+    // Dispatches `rustynetd windows-authenticode-check --no-fail-on-drift` on
+    // the live Windows guest, parses the typed JSON report, and fails the
+    // live-lab run if the installed `rustynetd.exe` lacks a PKCS-signed
+    // Authenticode certificate. Presence-only check today (chain validation
+    // tracked as W2.1b in the OS-agnostic delta plan).
+    let authenticode_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would verify Windows binary Authenticode signature on {windows_alias}"
+            ),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !custody_passed {
+        stage_outcome(
+            "validate_windows_authenticode",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_key_custody did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_authenticode_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&authenticode_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_authenticode",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![authenticode_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&authenticode_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_authenticode",
+                    VmLabStageStatus::Fail,
+                    format!("Windows Authenticode validation failed for {windows_alias}: {reason}"),
+                    vec![authenticode_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    // Stage 7: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
     let mesh_join_outcome = stage_outcome(
         "validate_windows_mesh_join",
         VmLabStageStatus::Skipped,
@@ -5134,7 +5584,453 @@ fn run_windows_orchestration_stages(
         vec![],
     );
 
-    vec![bootstrap_outcome, validate_outcome, mesh_join_outcome]
+    vec![
+        bootstrap_outcome,
+        validate_outcome,
+        acls_outcome,
+        hardening_outcome,
+        custody_outcome,
+        authenticode_outcome,
+        mesh_join_outcome,
+    ]
+}
+
+/// Path of the installed `rustynetd.exe` on Windows guests, mirroring
+/// `crate::windows_paths::DEFAULT_WINDOWS_INSTALL_ROOT` from the daemon.
+const WINDOWS_RUSTYNETD_EXE_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
+
+/// Build the PowerShell script body that invokes one of the security-check
+/// subcommands on the live Windows guest. Centralizes argv-only discipline so
+/// every stage helper goes through the same audited path: the binary path and
+/// every additional argument is quoted via `powershell_quote`, the subcommand
+/// name and well-formed flags pass through unquoted, and any value carrying a
+/// PowerShell metacharacter or control byte is rejected at construction.
+fn build_windows_security_check_invocation(
+    subcommand: &str,
+    extra_args: &[String],
+) -> Result<String, String> {
+    ensure_no_control_chars("Windows security-check subcommand", subcommand)?;
+    if subcommand.is_empty()
+        || !subcommand
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return Err(format!(
+            "Windows security-check subcommand must be ASCII-alphanumeric+hyphen: {subcommand:?}"
+        ));
+    }
+    let mut script = format!(
+        "& {exe} {subcommand} --no-fail-on-drift",
+        exe = powershell_quote(WINDOWS_RUSTYNETD_EXE_PATH)?,
+    );
+    for arg in extra_args {
+        ensure_no_control_chars("Windows security-check arg", arg.as_str())?;
+        script.push(' ');
+        if arg.starts_with("--")
+            && arg
+                .chars()
+                .skip(2)
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            // Well-formed long-flag: alphanumeric/hyphen only after `--`.
+            // Safe to emit unquoted (PowerShell parser treats these as tokens).
+            script.push_str(arg.as_str());
+        } else {
+            script.push_str(powershell_quote(arg.as_str())?.as_str());
+        }
+    }
+    Ok(script)
+}
+
+fn run_validate_windows_runtime_acls_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-runtime-acls-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-runtime-acls-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_runtime_acls_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of
+/// `rustynetd windows-runtime-acls-check`. Returns a one-line success summary
+/// or a precise drift reason. Callable in tests without SSH/IO.
+fn evaluate_windows_runtime_acls_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_paths::WindowsRuntimeAclReport = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse windows-runtime-acls-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-runtime-acls-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.roots.is_empty() {
+        return Err(
+            "windows-runtime-acls-check returned an empty roots list; expected the canonical \
+             Windows runtime root set"
+                .to_string(),
+        );
+    }
+    if !report.overall_ok {
+        let drifted = report
+            .roots
+            .iter()
+            .filter_map(|entry| match &entry.status {
+                rustynetd::windows_paths::WindowsRuntimeAclRootStatus::Ok => None,
+                rustynetd::windows_paths::WindowsRuntimeAclRootStatus::Missing { reason } => {
+                    Some(format!("{} missing: {reason}", entry.label))
+                }
+                rustynetd::windows_paths::WindowsRuntimeAclRootStatus::Drifted { reason } => {
+                    Some(format!("{} drifted: {reason}", entry.label))
+                }
+            })
+            .collect::<Vec<_>>();
+        let drifted_summary = if drifted.is_empty() {
+            "report set overall_ok=false but every per-root entry is Ok; output is inconsistent"
+                .to_string()
+        } else {
+            drifted.join("; ")
+        };
+        return Err(format!(
+            "Windows runtime ACL drift detected: {drifted_summary}"
+        ));
+    }
+    if report.roots.iter().any(|entry| {
+        !matches!(
+            entry.status,
+            rustynetd::windows_paths::WindowsRuntimeAclRootStatus::Ok
+        )
+    }) {
+        return Err(
+            "report set overall_ok=true but at least one per-root entry is not Ok; output is \
+             inconsistent"
+                .to_string(),
+        );
+    }
+    let inspected_count = report.roots.len();
+    Ok(format!(
+        "Windows runtime ACLs verified on {windows_alias}: {inspected_count} reviewed roots passed"
+    ))
+}
+
+fn run_validate_windows_service_hardening_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-service-hardening-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-service-hardening-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_service_hardening_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of
+/// `rustynetd windows-service-hardening-check`. Returns a one-line success
+/// summary or a precise drift reason. Callable in tests without SSH/IO.
+fn evaluate_windows_service_hardening_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_service_hardening::WindowsServiceHardeningReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse windows-service-hardening-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-service-hardening-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!(
+            "Windows service hardening drift detected: {reasons}"
+        ));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Windows service hardening verified on {windows_alias} (service={}, sid_type={}, failure_actions={})",
+        report.snapshot.service_name,
+        report.snapshot.service_sid_type,
+        report.snapshot.failure_action_count
+    ))
+}
+
+fn run_validate_windows_key_custody_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-key-custody-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-key-custody-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_key_custody_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd windows-key-custody-check`.
+fn evaluate_windows_key_custody_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_key_custody::WindowsKeyCustodyReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse windows-key-custody-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-key-custody-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.entries.is_empty() {
+        return Err(
+            "windows-key-custody-check returned an empty entries list; expected the canonical \
+             custody artifact set"
+                .to_string(),
+        );
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Windows key custody drift detected: {reasons}"));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Windows key custody verified on {windows_alias}: {} reviewed artifacts inspected",
+        report.entries.len()
+    ))
+}
+
+fn run_validate_windows_authenticode_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation(
+        "windows-authenticode-check",
+        &[
+            "--binary-path".to_string(),
+            WINDOWS_RUSTYNETD_EXE_PATH.to_string(),
+        ],
+    )
+    .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-authenticode-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_authenticode_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd windows-authenticode-check`.
+fn evaluate_windows_authenticode_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_authenticode::WindowsAuthenticodeReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse windows-authenticode-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-authenticode-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!(
+            "Windows Authenticode signature drift detected: {reasons}"
+        ));
+    }
+    if !report.signature_present {
+        return Err(format!(
+            "Windows Authenticode report marked overall_ok=true but signature_present=false for {}; output is inconsistent",
+            report.binary_path
+        ));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Windows Authenticode signature present on {windows_alias} ({}, {} certificate entries, {} bytes)",
+        report.binary_path,
+        report.certificates.len(),
+        report.binary_size_bytes
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19205,6 +20101,668 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert_eq!(
             report.observed_pass_stages.len(),
             super::FULL_RELEASE_GATE_REQUIRED_STAGES.len()
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_accepts_all_ok_payload() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "roots": [
+                {"label": "state root", "path": "C:\\ProgramData\\RustyNet", "status": "ok"},
+                {"label": "config root", "path": "C:\\ProgramData\\RustyNet\\config", "status": "ok"}
+            ]
+        });
+        let summary =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect("all-ok payload must validate");
+        assert!(
+            summary.contains("windows-utm-1") && summary.contains("2 reviewed roots passed"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_drifted_root_with_specific_reason() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": false,
+            "roots": [
+                {"label": "state root", "path": "C:\\ProgramData\\RustyNet", "status": "ok"},
+                {
+                    "label": "config root",
+                    "path": "C:\\ProgramData\\RustyNet\\config",
+                    "status": "drifted",
+                    "reason": "config root ACL must grant LocalSystem access: C:\\ProgramData\\RustyNet\\config"
+                }
+            ]
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("drifted root must fail");
+        assert!(
+            err.contains("config root drifted") && err.contains("must grant LocalSystem access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_missing_root_with_specific_reason() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": false,
+            "roots": [
+                {
+                    "label": "key-custody root",
+                    "path": "C:\\ProgramData\\RustyNet\\secrets\\key-custody",
+                    "status": "missing",
+                    "reason": "key-custody root must exist before rustynetd starts on Windows"
+                }
+            ]
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("missing root must fail");
+        assert!(
+            err.contains("key-custody root missing")
+                && err.contains("must exist before rustynetd starts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_unknown_schema_version() {
+        let json = serde_json::json!({
+            "schema_version": 99,
+            "overall_ok": true,
+            "roots": [
+                {"label": "state root", "path": "C:\\ProgramData\\RustyNet", "status": "ok"}
+            ]
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_empty_roots_list() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "roots": []
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("empty roots list must fail");
+        assert!(err.contains("empty roots list"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_inconsistent_overall_ok_true_with_drifted_root()
+    {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "roots": [
+                {"label": "state root", "path": "C:\\ProgramData\\RustyNet", "status": "ok"},
+                {
+                    "label": "config root",
+                    "path": "C:\\ProgramData\\RustyNet\\config",
+                    "status": "drifted",
+                    "reason": "drift"
+                }
+            ]
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("inconsistent overall_ok=true must fail");
+        assert!(
+            err.contains("overall_ok=true but at least one per-root entry is not Ok"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_inconsistent_overall_ok_false_with_all_ok() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": false,
+            "roots": [
+                {"label": "state root", "path": "C:\\ProgramData\\RustyNet", "status": "ok"}
+            ]
+        });
+        let err =
+            super::evaluate_windows_runtime_acls_report("windows-utm-1", json.to_string().as_str())
+                .expect_err("inconsistent overall_ok=false must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_runtime_acls_report_rejects_malformed_json() {
+        let err = super::evaluate_windows_runtime_acls_report("windows-utm-1", "{not valid json")
+            .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-runtime-acls-check JSON output failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn reviewed_service_hardening_payload() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "snapshot": {
+                "schema_version": 1,
+                "service_name": "RustyNet",
+                "binary_image_path": "\"C:\\Program Files\\RustyNet\\rustynetd.exe\" --windows-service --env-file C:\\ProgramData\\RustyNet\\config\\rustynetd.env",
+                "binary_image_argv": [
+                    "C:\\Program Files\\RustyNet\\rustynetd.exe",
+                    "--windows-service",
+                    "--env-file",
+                    "C:\\ProgramData\\RustyNet\\config\\rustynetd.env"
+                ],
+                "start_name": "LocalSystem",
+                "service_sid_type": "unrestricted",
+                "start_type": "auto_start",
+                "interactive_process": false,
+                "failure_action_count": 3,
+                "binary_path_acl_sddl": "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+            },
+            "drift_reasons": []
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_service_hardening_report(
+            "windows-utm-1",
+            reviewed_service_hardening_payload().to_string().as_str(),
+        )
+        .expect("reviewed payload must validate");
+        assert!(
+            summary.contains("windows-utm-1")
+                && summary.contains("service=RustyNet")
+                && summary.contains("sid_type=unrestricted")
+                && summary.contains("failure_actions=3"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_rejects_drift_with_specific_reasons() {
+        let mut payload = reviewed_service_hardening_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["drift_reasons"] = serde_json::json!([
+            "service must not carry SERVICE_INTERACTIVE_PROCESS; the hardened profile is non-interactive",
+            "service binary ACL drift: service binary ACL must grant LocalSystem access"
+        ]);
+        let err = super::evaluate_windows_service_hardening_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("drift payload must fail");
+        assert!(
+            err.contains("SERVICE_INTERACTIVE_PROCESS")
+                && err.contains("must grant LocalSystem access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_rejects_unknown_schema_version() {
+        let mut payload = reviewed_service_hardening_payload();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err = super::evaluate_windows_service_hardening_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_rejects_inconsistent_overall_ok_false_no_reasons()
+    {
+        let mut payload = reviewed_service_hardening_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_windows_service_hardening_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_rejects_inconsistent_overall_ok_true_with_reasons()
+    {
+        let mut payload = reviewed_service_hardening_payload();
+        payload["drift_reasons"] = serde_json::json!(["bogus drift"]);
+        let err = super::evaluate_windows_service_hardening_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with non-empty drift_reasons must fail");
+        assert!(err.contains("bogus drift"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_service_hardening_report_rejects_malformed_json() {
+        let err =
+            super::evaluate_windows_service_hardening_report("windows-utm-1", "{not valid json")
+                .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-service-hardening-check JSON output failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn reviewed_key_custody_payload() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {
+                    "label": "wg key passphrase blob",
+                    "path": "C:\\ProgramData\\RustyNet\\secrets\\wireguard.passphrase.dpapi",
+                    "requirement": "present",
+                    "status": "ok",
+                    "acl_sddl": "O:S-1-5-80-9999D:P(A;;FA;;;SY)"
+                },
+                {
+                    "label": "wg encrypted private key",
+                    "path": "C:\\ProgramData\\RustyNet\\keys\\wireguard.key.enc",
+                    "requirement": "present",
+                    "status": "ok",
+                    "acl_sddl": "O:S-1-5-80-9999D:P(A;;FA;;;SY)"
+                },
+                {
+                    "label": "wg public key",
+                    "path": "C:\\ProgramData\\RustyNet\\keys\\wireguard.pub",
+                    "requirement": "present",
+                    "status": "ok",
+                    "acl_sddl": "O:S-1-5-80-9999D:P(A;;FA;;;SY)"
+                },
+                {
+                    "label": "wg plaintext runtime private key",
+                    "path": "C:\\ProgramData\\RustyNet\\keys\\wireguard.key",
+                    "requirement": "absent",
+                    "status": "absent_as_expected"
+                }
+            ],
+            "drift_reasons": []
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            reviewed_key_custody_payload().to_string().as_str(),
+        )
+        .expect("reviewed payload must validate");
+        assert!(
+            summary.contains("windows-utm-1") && summary.contains("4 reviewed artifacts"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_drift_with_specific_reasons() {
+        let mut payload = reviewed_key_custody_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["drift_reasons"] = serde_json::json!([
+            "wg plaintext runtime private key present but must be absent: present"
+        ]);
+        let err = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("drift payload must fail");
+        assert!(
+            err.contains("plaintext runtime private key present but must be absent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_unknown_schema_version() {
+        let mut payload = reviewed_key_custody_payload();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_empty_entries() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [],
+            "drift_reasons": []
+        });
+        let err = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("empty entries must fail");
+        assert!(
+            err.contains("empty entries list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_inconsistent_overall_ok_false_no_reasons() {
+        let mut payload = reviewed_key_custody_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_inconsistent_overall_ok_true_with_reasons() {
+        let mut payload = reviewed_key_custody_payload();
+        payload["drift_reasons"] = serde_json::json!(["bogus drift"]);
+        let err = super::evaluate_windows_key_custody_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with non-empty drift_reasons must fail");
+        assert!(err.contains("bogus drift"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_key_custody_report_rejects_malformed_json() {
+        let err = super::evaluate_windows_key_custody_report("windows-utm-1", "{not valid json")
+            .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-key-custody-check JSON output failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn signed_authenticode_payload() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "binary_path": "C:\\Program Files\\RustyNet\\rustynetd.exe",
+            "binary_size_bytes": 1234567,
+            "overall_ok": true,
+            "signature_present": true,
+            "certificate_table_offset": 4096,
+            "certificate_table_size": 512,
+            "certificates": [
+                { "length": 504, "revision": 512, "certificate_type": 2 }
+            ],
+            "drift_reasons": []
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_accepts_signed_payload() {
+        let summary = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            signed_authenticode_payload().to_string().as_str(),
+        )
+        .expect("signed payload must validate");
+        assert!(
+            summary.contains("windows-utm-1")
+                && summary.contains("rustynetd.exe")
+                && summary.contains("1 certificate entries"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_unsigned_binary() {
+        let mut payload = signed_authenticode_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["signature_present"] = serde_json::Value::Bool(false);
+        payload["drift_reasons"] = serde_json::json!([
+            "PE has an empty Certificate Table directory entry; binary is unsigned"
+        ]);
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unsigned binary must fail");
+        assert!(
+            err.contains("binary is unsigned"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_unknown_schema_version() {
+        let mut payload = signed_authenticode_payload();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_inconsistent_overall_ok_true_signature_absent()
+    {
+        let mut payload = signed_authenticode_payload();
+        payload["signature_present"] = serde_json::Value::Bool(false);
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=true with signature_present=false must fail");
+        assert!(
+            err.contains("signature_present=false"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_inconsistent_overall_ok_false_no_reasons() {
+        let mut payload = signed_authenticode_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["signature_present"] = serde_json::Value::Bool(false);
+        // drift_reasons stays empty
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_malformed_json() {
+        let err = super::evaluate_windows_authenticode_report("windows-utm-1", "{not valid json")
+            .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-authenticode-check JSON output failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_validate_windows_security_dry_run_emits_skipped_stages_and_writes_report() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let report_dir = temp.path().to_path_buf();
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{"entries":[{
+                "alias":"windows-utm-1",
+                "controller":{"type":"local_utm","utm_name":"Windows","bundle_path":"/dev/null"},
+                "platform":"windows",
+                "remote_shell":"powershell",
+                "guest_exec_mode":"windows_powershell",
+                "service_manager":"windows_service",
+                "os":"Windows 11",
+                "ssh_target":"192.168.64.14",
+                "ssh_user":"Administrator",
+                "rustynet_src_dir":"C:\\Rustynet",
+                "include_in_all":false
+            }]}"#,
+        )
+        .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let config = super::VmLabValidateWindowsSecurityConfig {
+            inventory_path: inventory,
+            windows_vm: "windows-utm-1".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            ssh_port: 22,
+            utm_documents_root: None,
+            utmctl_path: None,
+            report_dir: report_dir.clone(),
+            dry_run: true,
+            skip_access_bootstrap: false,
+            skip_install: false,
+        };
+        let summary = super::run_validate_windows_security(&config).expect("dry-run must succeed");
+        assert!(summary.contains("windows-utm-1"));
+        let report_path = report_dir.join("windows_security_validation.json");
+        let report_text = std::fs::read_to_string(report_path.as_path()).expect("read report");
+        let report: serde_json::Value =
+            serde_json::from_str(report_text.as_str()).expect("report parses as JSON");
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["windows_vm"], "windows-utm-1");
+        let stages = report["stages"].as_array().expect("stages array");
+        let stage_names: Vec<&str> = stages
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        assert!(stage_names.contains(&"validate_windows_runtime_acls"));
+        assert!(stage_names.contains(&"validate_windows_service_hardening"));
+        assert!(stage_names.contains(&"validate_windows_key_custody"));
+        assert!(stage_names.contains(&"validate_windows_authenticode"));
+        assert!(
+            stages.iter().all(|s| s["status"] == "skipped"),
+            "every dry-run stage must be skipped: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_emits_quoted_exe_and_subcommand() {
+        let script =
+            super::build_windows_security_check_invocation("windows-runtime-acls-check", &[])
+                .expect("well-formed invocation must build");
+        assert!(
+            script.starts_with("& 'C:\\Program Files\\RustyNet\\rustynetd.exe' "),
+            "script must start with quoted exe path: {script:?}"
+        );
+        assert!(
+            script.ends_with("windows-runtime-acls-check --no-fail-on-drift"),
+            "script must end with subcommand + fail-closed flag: {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_rejects_subcommand_with_shell_metacharacters() {
+        for bad in [
+            "windows-runtime-acls-check; Stop-Service RustyNet",
+            "windows-runtime-acls-check`whoami`",
+            "windows-runtime-acls-check$",
+            "windows runtime acls check",
+            "windows-runtime-acls-check'; Remove-Item",
+            "",
+        ] {
+            let err = super::build_windows_security_check_invocation(bad, &[])
+                .expect_err("metacharacter subcommand must be rejected");
+            assert!(
+                err.contains("Windows security-check subcommand"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_quotes_extra_arg_with_apostrophe() {
+        let script = super::build_windows_security_check_invocation(
+            "windows-authenticode-check",
+            &[
+                "--binary-path".to_string(),
+                "C:\\path\\with'apostrophe\\rustynetd.exe".to_string(),
+            ],
+        )
+        .expect("apostrophe arg must quote, not break out");
+        assert!(
+            script.contains("--binary-path 'C:\\path\\with''apostrophe\\rustynetd.exe'"),
+            "apostrophe must be PS-escaped via doubling: {script:?}"
+        );
+        // Total apostrophe count must be even so PowerShell sees a balanced
+        // single-quoted literal — odd would mean the user payload broke out
+        // of the literal context.
+        let apostrophes = script.chars().filter(|ch| *ch == '\'').count();
+        assert_eq!(
+            apostrophes % 2,
+            0,
+            "apostrophe count must remain even (balanced quoting): {apostrophes} in {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_rejects_control_chars_in_args() {
+        let err = super::build_windows_security_check_invocation(
+            "windows-runtime-acls-check",
+            &["--binary-path".to_string(), "evil\nrm -rf".to_string()],
+        )
+        .expect_err("control-char arg must be rejected");
+        assert!(
+            err.contains("Windows security-check arg") || err.contains("control"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_passes_long_flag_unquoted() {
+        let script = super::build_windows_security_check_invocation(
+            "windows-authenticode-check",
+            &["--no-fail-on-drift".to_string()],
+        )
+        .expect("well-formed long flag must build");
+        // Long flag is emitted unquoted (no surrounding apostrophes around the
+        // flag token itself).
+        assert!(
+            script.contains(" --no-fail-on-drift --no-fail-on-drift"),
+            "expected the auto-injected --no-fail-on-drift followed by the explicit one: {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_windows_security_check_invocation_quotes_short_or_value_args() {
+        let script = super::build_windows_security_check_invocation(
+            "windows-authenticode-check",
+            &["positional-value".to_string()],
+        )
+        .expect("non-flag arg must quote");
+        assert!(
+            script.contains("'positional-value'"),
+            "non-flag arg must be wrapped in PowerShell quotes: {script:?}"
         );
     }
 }
