@@ -198,8 +198,7 @@ pub fn validate_windows_privileged_request(
         WindowsPrivilegedRequest::Probe { protocol_version } => {
             if *protocol_version != WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION {
                 return Err(format!(
-                    "unsupported Windows privileged IPC protocol version {}; expected {}",
-                    protocol_version, WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION
+                    "unsupported Windows privileged IPC protocol version {protocol_version}; expected {WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION}",
                 ));
             }
         }

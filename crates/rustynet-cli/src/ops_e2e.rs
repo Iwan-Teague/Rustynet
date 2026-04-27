@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -5623,7 +5623,11 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     }
 }
 
-pub fn wait_for_daemon_socket_locally(socket_path: &str, attempts: usize, sleep_secs: u64) -> Result<(), String> {
+pub fn wait_for_daemon_socket_locally(
+    socket_path: &str,
+    attempts: usize,
+    sleep_secs: u64,
+) -> Result<(), String> {
     for i in 1..=attempts {
         if Path::new(socket_path).exists() {
             if let Ok(metadata) = std::fs::metadata(socket_path) {
@@ -5699,11 +5703,14 @@ pub fn execute_ops_e2e_worker_enforce_runtime(
     src_dir: PathBuf,
     ssh_allow_cidrs: String,
 ) -> Result<String, String> {
-    println!("[runtime-enforce] {} {} ({} {})", label, target, node_id, role);
+    println!(
+        "[runtime-enforce] {} {} ({} {})",
+        label, target, node_id, role
+    );
     ensure_running_as_root()?;
-    
+
     execute_ops_e2e_enforce_host(role, node_id.clone(), src_dir, ssh_allow_cidrs)?;
     wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
-    
+
     Ok(format!("runtime enforced for {}", node_id))
 }

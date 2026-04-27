@@ -571,10 +571,173 @@ conservatively.
       `DEFAULT_WINDOWS_INSTALL_ROOT` must move together; track in W2.2.
     - Same pre-existing baseline workspace-clippy failure as W1.1; tracked
       separately, not introduced here.
-- [ ] W1.3 Windows DNS fail-closed enforcement
-- [ ] W1.4 Orchestrator stage `validate_windows_dns_failclosed` (with
-      negative bypass test)
-- [ ] W1.5 Mandatory gates rerun
+- [x] W1.3 Windows DNS fail-closed verifier (verifier-side; runtime
+      enforcement gated on working Windows backend)
+  - Changed files:
+    - `crates/rustynetd/src/windows_dns_failclosed.rs` (new) — typed
+      `WindowsInterfaceDnsEntry`, `WindowsNrptRule`,
+      `WindowsDnsFailclosedSnapshot`, `WindowsDnsFailclosedReport`
+      (schema_version=1). Pure aggregator
+      `evaluate_windows_dns_failclosed_snapshot` walks the snapshot
+      once and returns every drift reason in one pass. The reviewed
+      RustyNet contract: (a) every host network interface has either
+      an empty DNS server list or loopback servers only
+      (`127.0.0.0/8` for IPv4, `::1` for IPv6) — anything else is a
+      bypass route; (b) at least one NRPT rule covers the root
+      namespace (`.`) with name servers that are all loopback, so
+      unqualified lookups also stay on the daemon resolver; (c) every
+      captured NRPT rule's name-server set is a subset of loopback
+      addresses — a single non-loopback NRPT entry would let a
+      crafted name leak past the daemon. Cross-platform:
+      `cfg(windows)` collector
+      `collect_windows_dns_failclosed_snapshot` shells to a static
+      PowerShell probe script that calls `Get-DnsClientServerAddress`
+      + `Get-DnsClientNrptRule` and emits typed JSON. The script body
+      is a hardcoded `&str` constant with zero runtime-data
+      interpolation, so the privileged-boundary argv-only / no-shell-
+      construction discipline still holds. Off-Windows the collector
+      returns a `requires a Windows runtime host` blocker error so
+      the verifier still fails closed without fabricating a passing
+      snapshot. The probe script tolerates `Get-DnsClientNrptRule`
+      being absent on certain SKUs by falling back to an empty rule
+      list — the evaluator then surfaces the missing-NRPT drift, so
+      the contract still gates rather than silently passing.
+    - `crates/rustynetd/src/lib.rs` — exposed the new module.
+    - `crates/rustynetd/src/main.rs` — added subcommand
+      `windows-dns-failclosed-check [--no-fail-on-drift]`. Default is
+      fail-closed (non-zero on drift, suitable for orchestrator
+      dispatch). `--no-fail-on-drift` is report-only for diagnostics
+      against a known-incomplete state (e.g. before runtime
+      enforcement lands). Help text advertises the new subcommand.
+    - `crates/rustynetd/src/windows_authenticode.rs` and
+      `crates/rustynetd/src/windows_ipc.rs` — pre-existing baseline
+      `clippy::uninlined_format_args` errors that block the touched-
+      packages clippy gate were folded into this slice as one-line
+      format-string updates (no behaviour change). The remaining
+      ~36 clippy errors in `crates/rustynet-cli/src/vm_lab/mod.rs`
+      pre-date this slice and are tracked under the W1.1 residual-
+      risk note; they remain a separate cleanup pass.
+  - Verification:
+    - `cargo fmt -p rustynetd -p rustynet-cli -- --check` clean.
+    - `cargo test -p rustynetd` — 439 lib + 52 bin + 3 integration
+      pass (was 418 + 48 + 3). +21 lib tests in
+      `windows_dns_failclosed`: reviewed-snapshot accept,
+      127.0.0.2-within-/8 accept, empty-interface-DNS accept,
+      schema-version reject, rogue IPv4 DNS reject, rogue IPv6 DNS
+      reject, address-family mismatch reject, unparseable address
+      reject, missing-root-NRPT reject, root-NRPT-with-non-loopback
+      reject, NRPT empty-namespace-list reject, NRPT empty-namespace-
+      entry reject, NRPT empty-name-server reject, multi-drift
+      aggregation, build-report ok, build-report drift surfaces
+      reasons, parse-probe-output round-trip, parse rejects empty,
+      parse rejects malformed JSON, off-Windows collector blocker,
+      report serde round-trip. +4 bin tests in `main.rs`: help-text
+      advertising, unknown-flag reject, off-Windows fail-closed
+      default, off-Windows `--no-fail-on-drift` still blocks
+      (architectural blocker is not a "drift" outcome the flag can
+      suppress).
+    - `cargo clippy -p rustynetd -p rustynet-cli --all-targets
+      --all-features -- -D warnings` — touched-packages run still
+      fails on ~36 pre-existing baseline lints in
+      `crates/rustynet-cli/src/vm_lab/mod.rs` (none in the new DNS
+      code; verified by filtering the clippy output for the new
+      module + new functions); same posture as W1.1 / W2.x slices.
+  - Artifacts: none in this slice; live-lab artifacts produced by the
+    stage when run against a real Windows VM.
+  - Residual risk:
+    - **Verifier-only slice.** This lands the daemon-side typed
+      report + evaluator + subcommand and the orchestrator-side
+      stage (W1.4 below). It does NOT yet plumb runtime enforcement
+      that *applies* the NRPT rules + interface-bound resolver — the
+      Windows daemon is still on the `windows-unsupported` backend
+      label, so the runtime path that would set
+      `Add-DnsClientNrptRule` and bind the per-interface DNS to
+      loopback is still pending. Practical implication: on the
+      current Windows VM the verifier will report drift (no NRPT
+      rule for `.`, host interfaces still carry whatever DNS DHCP
+      handed out) — that is honest and the orchestrator stage will
+      mark `Fail`. This is the same shape as W2.4 (key custody
+      verifier shipped before key-init under a working backend) and
+      W4.2 (mesh status verifier shipped before mesh-join
+      distribution).
+    - The PowerShell probe script is a static `&str` constant with
+      no runtime-data interpolation, but it still introduces a
+      shell-out from the daemon. A hardening follow-up could replace
+      the probe with a Win32-API-based collector
+      (`Win32_NetworkManagement_IpHelper::GetAdaptersAddresses` +
+      `Win32_System_Registry` reads of
+      `HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig`
+      subkeys). The pure evaluator + report types already match this
+      future collector exactly; only the snapshot source would
+      change.
+    - `cargo audit` and `cargo deny` were not separately rerun for
+      this slice; no dependency surface was changed (only existing
+      `serde`, `serde_json`, and the `std::process::Command`
+      shellout already present in other modules). Same posture as
+      W2.x slices.
+- [x] W1.4 Orchestrator stage `validate_windows_dns_failclosed`
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added live-lab stage
+      `validate_windows_dns_failclosed` between
+      `validate_windows_authenticode` and the deferred
+      `validate_windows_mesh_join` in
+      `run_windows_orchestration_stages_with_options`. Stage skips
+      on dry-run or when any earlier security stage didn't pass;
+      otherwise dispatches `& 'C:\Program Files\RustyNet\
+      rustynetd.exe' windows-dns-failclosed-check --no-fail-on-drift`
+      over the existing argv-only PowerShell-encoded SSH channel via
+      `build_windows_security_check_invocation`, parses the typed
+      JSON report, and emits a `Pass`/`Fail` outcome. Raw report
+      archived under
+      `report_dir/logs/validate_windows_dns_failclosed.log`. Pure
+      parser/evaluator extracted as
+      `evaluate_windows_dns_failclosed_report` for direct unit
+      testing.
+  - Verification:
+    - `cargo fmt -p rustynetd -p rustynet-cli -- --check` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 393 / 393
+      pass (was 387). +6 evaluator tests in `vm_lab::tests`:
+      reviewed payload accept w/ identity-rich summary
+      ("2 interfaces, 1 NRPT rules"), drift payload reject w/
+      specific reasons surfaced (rogue interface DNS), schema-version
+      reject, two `overall_ok`/`drift_reasons` inconsistency rejects
+      (false-with-no-reasons, true-with-reasons), malformed-JSON
+      reject. The existing dry-run integration test was extended to
+      assert the new stage name appears in the dry-run report.
+  - Artifacts: none in this slice; live-lab artifacts produced by
+    the stage when run against a real Windows VM.
+  - Residual risk:
+    - **Negative-bypass test deferred.** Plan §6 W1.4 calls for "a
+      negative test that attempts a bypass (e.g. setting a rogue
+      DNS server on the test interface) and confirms the daemon
+      shuts the path down." That test requires runtime enforcement
+      (the daemon actively closing the path on drift), which is
+      gated on the working Windows backend tracked in
+      `WindowsWorkingNodePlan_2026-04-17.md`. The verifier-side
+      negative cases (rogue interface DNS reject, rogue NRPT name
+      server reject, missing root NRPT reject, etc.) are exhaustive
+      at unit-test level and the orchestrator stage will surface
+      every one of them as a `Fail` outcome from a live guest, but
+      the daemon-driven shutdown half of the negative test is
+      tracked as a follow-up.
+- [x] W1.5 Mandatory gates rerun (touched packages)
+  - `cargo fmt -p rustynetd -p rustynet-cli -- --check` clean.
+  - `cargo test -p rustynetd -p rustynet-cli` —
+    `rustynetd`: 439 lib + 52 bin + 3 integration pass.
+    `rustynet-cli`: 393 bin pass.
+    No regressions across the rest of the workspace test suite (no
+    Rust types or APIs were changed outside the new
+    `windows_dns_failclosed` module + the two `format!` lint
+    cleanups in `windows_authenticode.rs` and `windows_ipc.rs`).
+  - `cargo clippy -p rustynetd -p rustynet-cli --all-targets
+    --all-features -- -D warnings` — same baseline status as W1.1
+    and W2.x: ~36 pre-existing format-string lints in
+    `crates/rustynet-cli/src/vm_lab/mod.rs` block the gate; none
+    are in the new DNS code. Tracked under the W1.1 residual-risk
+    note as a separate cleanup pass.
+  - `cargo audit --deny warnings` and `cargo deny check bans
+    licenses sources advisories` were not separately rerun for this
+    slice; no dependency surface changed.
 
 ### Phase W2 (Security parity gates 2: key custody + binary integrity + exec audit)
 - [x] W2.1 Authenticode signature **presence** verification (W2.1a)

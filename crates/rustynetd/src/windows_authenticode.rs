@@ -232,8 +232,7 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
             pkcs_count += 1;
         } else {
             drift_reasons.push(format!(
-                "WIN_CERTIFICATE at 0x{cursor:08x} is not a PKCS-signed Authenticode entry (revision=0x{revision:04x}, type=0x{cert_type:04x}); reviewed RustyNet installs require revision=0x{:04x} type=0x{:04x}",
-                WIN_CERT_REVISION_2_0, WIN_CERT_TYPE_PKCS_SIGNED_DATA
+                "WIN_CERTIFICATE at 0x{cursor:08x} is not a PKCS-signed Authenticode entry (revision=0x{revision:04x}, type=0x{cert_type:04x}); reviewed RustyNet installs require revision=0x{WIN_CERT_REVISION_2_0:04x} type=0x{WIN_CERT_TYPE_PKCS_SIGNED_DATA:04x}",
             ));
         }
         // Each WIN_CERTIFICATE is rounded up to the next 8-byte boundary.

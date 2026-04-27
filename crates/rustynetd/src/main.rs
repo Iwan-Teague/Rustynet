@@ -31,6 +31,9 @@ use rustynetd::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
     parse_windows_backend_mode,
 };
+use rustynetd::windows_dns_failclosed::{
+    build_windows_dns_failclosed_report, collect_windows_dns_failclosed_snapshot,
+};
 use rustynetd::windows_key_custody::collect_windows_key_custody_snapshot;
 use rustynetd::windows_mesh_status::{
     WindowsMeshStatusOptions, collect_windows_mesh_status_report,
@@ -101,6 +104,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "windows-mesh-status-check" => {
                 run_windows_mesh_status_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-dns-failclosed-check" => {
+                run_windows_dns_failclosed_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -425,6 +431,39 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-dns-failclosed-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let snapshot = collect_windows_dns_failclosed_snapshot()?;
+    let report = build_windows_dns_failclosed_report(snapshot);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize dns-failclosed report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed state"
                 .to_string(),
         );
     }
@@ -1522,6 +1561,7 @@ fn help_text() -> String {
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
+        "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
@@ -1600,8 +1640,9 @@ fn help_text() -> String {
 mod tests {
     use super::{
         help_text, parse_daemon_config, run_windows_authenticode_check_command,
-        run_windows_key_custody_check_command, run_windows_mesh_status_check_command,
-        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+        run_windows_dns_failclosed_check_command, run_windows_key_custody_check_command,
+        run_windows_mesh_status_check_command, run_windows_runtime_acls_check_command,
+        run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -1846,6 +1887,52 @@ mod tests {
             "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_string(),
         ])
         .expect("--no-fail-on-drift must allow report-only execution even on read failure");
+    }
+
+    #[test]
+    fn help_text_advertises_windows_dns_failclosed_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-dns-failclosed-check"),
+            "help text must advertise windows-dns-failclosed-check subcommand"
+        );
+    }
+
+    #[test]
+    fn run_windows_dns_failclosed_check_command_rejects_unknown_flags() {
+        let err = run_windows_dns_failclosed_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-dns-failclosed-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_dns_failclosed_check_command_fails_closed_off_windows() {
+        let err = run_windows_dns_failclosed_check_command(&[])
+            .expect_err("non-Windows host must fail closed");
+        assert!(
+            err.contains("requires a Windows runtime host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_dns_failclosed_check_command_no_fail_on_drift_still_blocks_off_windows() {
+        // Off-Windows the collector itself returns a blocker error
+        // (not a "drift" outcome), so --no-fail-on-drift cannot
+        // smuggle a passing exit out of a host that physically
+        // cannot run the probe. This is the difference between an
+        // architectural "cannot probe" and a contractual "drift".
+        let err = run_windows_dns_failclosed_check_command(&["--no-fail-on-drift".to_string()])
+            .expect_err("collector blocker must surface even with --no-fail-on-drift");
+        assert!(
+            err.contains("requires a Windows runtime host"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

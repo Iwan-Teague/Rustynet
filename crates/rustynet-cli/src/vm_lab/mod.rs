@@ -1308,17 +1308,22 @@ pub fn run_host_reboot(target: &str) -> Result<(), String> {
     let mut cmd = Command::new("ssh");
     cmd.arg(target);
     cmd.arg("sudo -n systemctl reboot");
-    
+
     // Execute the command with a timeout of 20 seconds
-    let output = run_output_with_timeout(&mut cmd, timeout_or_default(20, DEFAULT_RUN_TIMEOUT_SECS))
-        .map_err(|e| format!("Failed to execute reboot command: {}", e))?;
-    
+    let output =
+        run_output_with_timeout(&mut cmd, timeout_or_default(20, DEFAULT_RUN_TIMEOUT_SECS))
+            .map_err(|e| format!("Failed to execute reboot command: {}", e))?;
+
     // The command may fail (e.g., if host is unreachable), but we don't want to fail the entire process
     // as reboot is expected to fail immediately
     if !output.status.success() {
-        eprintln!("Warning: Reboot command failed for target {}: {}", target, String::from_utf8_lossy(&output.stderr));
+        eprintln!(
+            "Warning: Reboot command failed for target {}: {}",
+            target,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    
+
     Ok(())
 }
 
@@ -5177,6 +5182,7 @@ fn run_windows_orchestration_stages_with_options(
     let hardening_log_path = logs_dir.join("validate_windows_service_hardening.log");
     let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
+    let dns_failclosed_log_path = logs_dir.join("validate_windows_dns_failclosed.log");
 
     // Stage 1: bootstrap_windows_host
     let bootstrap_outcome = if dry_run {
@@ -5667,7 +5673,102 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
-    // Stage 7: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
+    let authenticode_passed = authenticode_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 7: validate_windows_dns_failclosed
+    // Dispatches `rustynetd windows-dns-failclosed-check --no-fail-on-drift`
+    // on the live Windows guest, parses the typed JSON report, and fails the
+    // live-lab run if any host interface advertises a non-loopback DNS server
+    // or if no NRPT rule covers the root namespace with loopback name servers.
+    // The verifier checks the runtime DNS posture; the daemon-side enforcement
+    // that lays down NRPT rules + interface-bound loopback resolver is gated
+    // behind the working Windows backend tracked in `WindowsWorkingNodePlan`.
+    let dns_failclosed_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows DNS fail-closed posture on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !custody_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_key_custody did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !authenticode_passed {
+        stage_outcome(
+            "validate_windows_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_authenticode did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_dns_failclosed_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&dns_failclosed_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_dns_failclosed",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![dns_failclosed_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&dns_failclosed_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_dns_failclosed",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Windows DNS fail-closed validation failed for {windows_alias}: {reason}"
+                    ),
+                    vec![dns_failclosed_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    // Stage 8: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
     let mesh_join_outcome = stage_outcome(
         "validate_windows_mesh_join",
         VmLabStageStatus::Skipped,
@@ -5683,6 +5784,7 @@ fn run_windows_orchestration_stages_with_options(
         hardening_outcome,
         custody_outcome,
         authenticode_outcome,
+        dns_failclosed_outcome,
         mesh_join_outcome,
     ]
 }
@@ -6122,6 +6224,93 @@ fn evaluate_windows_authenticode_report(
         report.binary_path,
         report.certificates.len(),
         report.binary_size_bytes
+    ))
+}
+
+fn run_validate_windows_dns_failclosed_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-dns-failclosed-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-dns-failclosed-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_dns_failclosed_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd windows-dns-failclosed-check`.
+/// Returns a one-line success summary or a precise drift reason. Callable in
+/// tests without SSH/IO.
+fn evaluate_windows_dns_failclosed_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_dns_failclosed::WindowsDnsFailclosedReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse windows-dns-failclosed-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-dns-failclosed-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Windows DNS fail-closed drift detected: {reasons}"));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    Ok(format!(
+        "Windows DNS fail-closed verified on {windows_alias} ({} interfaces, {} NRPT rules)",
+        report.snapshot.interfaces.len(),
+        report.snapshot.nrpt_rules.len()
     ))
 }
 
@@ -20720,6 +20909,125 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    fn reviewed_dns_failclosed_payload() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "snapshot": {
+                "schema_version": 1,
+                "interfaces": [
+                    {
+                        "interface_alias": "Ethernet",
+                        "interface_index": 12,
+                        "address_family": "ipv4",
+                        "server_addresses": ["127.0.0.1"]
+                    },
+                    {
+                        "interface_alias": "Ethernet",
+                        "interface_index": 12,
+                        "address_family": "ipv6",
+                        "server_addresses": ["::1"]
+                    }
+                ],
+                "nrpt_rules": [
+                    {
+                        "name": "{rustynet-root-rule}",
+                        "namespace": ["."],
+                        "name_servers": ["127.0.0.1"]
+                    }
+                ]
+            },
+            "drift_reasons": []
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            reviewed_dns_failclosed_payload().to_string().as_str(),
+        )
+        .expect("reviewed payload must validate");
+        assert!(
+            summary.contains("windows-utm-1")
+                && summary.contains("2 interfaces")
+                && summary.contains("1 NRPT rules"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_rejects_rogue_interface_dns() {
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        payload["snapshot"]["interfaces"][0]["server_addresses"] = serde_json::json!(["8.8.8.8"]);
+        payload["drift_reasons"] = serde_json::json!([
+            "interface Ethernet (Ipv4) has non-loopback DNS server 8.8.8.8; fail-closed posture forbids any off-loopback resolver on a host interface"
+        ]);
+        let err = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("rogue interface DNS must fail");
+        assert!(
+            err.contains("non-loopback DNS server 8.8.8.8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_rejects_unknown_schema_version() {
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_rejects_inconsistent_overall_ok_false_no_reasons() {
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        // drift_reasons stays empty
+        let err = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_rejects_inconsistent_overall_ok_true_with_reasons() {
+        let mut payload = reviewed_dns_failclosed_payload();
+        payload["drift_reasons"] = serde_json::json!(["lingering drift entry"]);
+        let err = super::evaluate_windows_dns_failclosed_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with non-empty drift_reasons must fail");
+        assert!(
+            err.contains("overall_ok=true but drift_reasons is non-empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_dns_failclosed_report_rejects_malformed_json() {
+        let err = super::evaluate_windows_dns_failclosed_report("windows-utm-1", "{not valid json")
+            .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-dns-failclosed-check JSON output failed"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn run_validate_windows_security_dry_run_emits_skipped_stages_and_writes_report() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -20774,6 +21082,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"validate_windows_service_hardening"));
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
+        assert!(stage_names.contains(&"validate_windows_dns_failclosed"));
         assert!(
             stages.iter().all(|s| s["status"] == "skipped"),
             "every dry-run stage must be skipped: {stages:?}"
