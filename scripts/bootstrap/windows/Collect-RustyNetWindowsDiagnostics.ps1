@@ -193,7 +193,7 @@ function Invoke-WindowsRuntimeBoundaryCheck {
 
 Ensure-Directory -Path $OutputRoot
 
-$daemonInstallPath = Join-Path $InstallRoot 'bin\rustynetd.exe'
+$daemonInstallPath = Join-Path $InstallRoot 'rustynetd.exe'
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
 $windowsFacts = Get-WindowsTargetFacts
@@ -295,9 +295,9 @@ foreach ($commandText in @(
 Write-Utf8File -Path (Join-Path $OutputRoot 'tooling.txt') -Content ($toolingLines -join "`r`n")
 
 $hashEntries = Get-HashEntries -Paths @(
-    (Join-Path $InstallRoot 'bin\rustynetd.exe'),
-    (Join-Path $InstallRoot 'bin\rustynet.exe'),
-    (Join-Path $InstallRoot 'bin\rustynet-cli.exe'),
+    (Join-Path $InstallRoot 'rustynetd.exe'),
+    (Join-Path $InstallRoot 'rustynet.exe'),
+    (Join-Path $InstallRoot 'rustynet-cli.exe'),
     'C:\ProgramData\ssh\ssh_host_ed25519_key.pub',
     'C:\ProgramData\ssh\administrators_authorized_keys'
 )
@@ -308,7 +308,6 @@ foreach ($path in @(
     'C:\ProgramData\ssh\ssh_host_ed25519_key',
     'C:\ProgramData\ssh\ssh_host_ed25519_key.pub',
     $InstallRoot,
-    (Join-Path $InstallRoot 'bin'),
     $StateRoot,
     (Join-Path $StateRoot 'config'),
     (Join-Path $StateRoot 'logs'),

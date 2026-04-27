@@ -125,7 +125,6 @@ function Ensure-RustyNetRuntimeLayout {
     )
     foreach ($path in @(
             $InstallRoot,
-            (Join-Path $InstallRoot 'bin'),
             $StateRoot,
             (Join-Path $StateRoot 'config'),
             (Join-Path $StateRoot 'logs'),
@@ -158,7 +157,8 @@ function Test-WireGuardDriverPresence {
         return [ordered]@{ present = $true; path = $canonicalExe; detection = 'canonical-path' }
     }
     # Fallback: wireguard.exe on PATH (e.g. chocolatey or custom install).
-    $inPath = (Get-Command wireguard.exe -ErrorAction SilentlyContinue)?.Source
+    $wgCommand = Get-Command wireguard.exe -ErrorAction SilentlyContinue
+    $inPath = if ($wgCommand) { $wgCommand.Source } else { $null }
     if ($inPath) {
         return [ordered]@{ present = $true; path = $inPath; detection = 'path-search' }
     }
@@ -263,6 +263,58 @@ function Repair-RustyNetRuntimeAcl {
     }
 }
 
+# Binary install-root files inherit Builtin Users (BU) read+execute from
+# `C:\Program Files`. The W2.2 service-hardening verifier rejects any binary
+# ACL that exposes a broader-than-reviewed Windows principal (WD/AU/BU). Lock
+# the binary down to SYSTEM+Administrators full plus the service identity at
+# read+execute only — the runtime never modifies its own image, so write
+# access on the binary is denied even to the service principal.
+function Repair-RustyNetServiceBinaryAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AdministratorsName,
+        [Parameter(Mandatory = $true)][string]$LocalSystemName,
+        [Parameter(Mandatory = $true)][string]$ServiceIdentity
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Repair-RustyNetServiceBinaryAcl: $Path does not exist"
+    }
+
+    & icacls $Path /setowner $AdministratorsName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /setowner failed for $Path"
+    }
+    & icacls $Path /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /inheritance:r failed for $Path"
+    }
+    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" "$ServiceIdentity`:RX" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /grant:r failed for binary $Path"
+    }
+}
+
+# SCM recovery actions: restart the daemon up to three times after a 60s back-
+# off. After a 24h failure-free window the counter resets. The W2.2 hardening
+# verifier rejects services with zero failure actions because an unattended
+# crash would otherwise leave the runtime fail-closed silently. sc.exe failure
+# args are slash-separated tokens with no embedded spaces or quotes, so the
+# PS5.1 native-arg quoting bug that pushed New-Service over sc.exe create does
+# not apply here.
+function Set-RustyNetServiceFailureActions {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    $result = Invoke-Sc -Arguments @(
+        'failure',
+        $ServiceName,
+        'reset=', '86400',
+        'actions=', 'restart/60000/restart/60000/restart/60000'
+    )
+    if ($result.exit_code -ne 0) {
+        throw "sc.exe failure failed: $($result.output)"
+    }
+}
+
 function Build-ReviewedDaemonArgsJson {
     return (@('--backend', 'windows-unsupported') | ConvertTo-Json -Compress)
 }
@@ -289,8 +341,8 @@ $daemonCandidates = @(
     Join-Path $RustyNetRoot 'target\release\rustynetd.exe'
 )
 $cliCandidates = @(
-    Join-Path $RustyNetRoot 'target\release\rustynet.exe',
-    Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe'
+    (Join-Path $RustyNetRoot 'target\release\rustynet.exe'),
+    (Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe')
 )
 
 $daemonSource = $daemonCandidates[0]
@@ -308,12 +360,12 @@ foreach ($candidate in $cliCandidates) {
     }
 }
 
-$daemonDest = Join-Path $InstallRoot 'bin\rustynetd.exe'
+$daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
 $script:InstallFailureStep = 'copy-daemon-binary'
 Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force
 if ($cliSource) {
     $script:InstallFailureStep = 'copy-cli-binary'
-    Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'bin\rustynet.exe') -Force
+    Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
@@ -330,29 +382,37 @@ $serviceStartAttempted = $false
 $startError = ''
 
 if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
+    # Service binPath is built from a fixed daemon-flag template plus three operator-controlled
+    # values: the install-root daemon path, the reviewed env-file path, and the service name.
+    # PowerShell 5.1 mangles native-command quoting when sc.exe is invoked with an argv that
+    # contains spaces and embedded double quotes (sc.exe sees the value tokenized and exits
+    # 1639 ERROR_INVALID_COMMAND_LINE). Use the New-Service / Set-Service cmdlets instead so
+    # binPath crosses into the SCM as a single SCM-API string with no shell tokenization in
+    # between. Description and start mode go through the same cmdlet path.
     $quotedDaemon = '"' + $daemonDest + '"'
     $quotedConfig = '"' + $configPath + '"'
     $quotedServiceName = '"' + $ServiceName + '"'
     $binPath = "$quotedDaemon --windows-service --service-name $quotedServiceName --env-file $quotedConfig"
+    $serviceDescription = 'RustyNet secure mesh runtime service host'
     try {
         $script:InstallFailureStep = 'configure-service-registration'
         $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($existing) {
-            $scOutput = (& sc.exe config $ServiceName binPath= $binPath start= auto 2>&1 | Out-String)
+            if ($existing.Status -eq 'Running') {
+                Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+            }
+            $deleteOutput = (& sc.exe delete $ServiceName 2>&1 | Out-String)
             if ($LASTEXITCODE -ne 0) {
-                throw "sc.exe config failed: $scOutput"
+                throw "sc.exe delete failed: $deleteOutput"
+            }
+            # SCM marks deleted services pending until all handles drop. Wait briefly so the
+            # next New-Service does not collide with the still-cached entry.
+            $deadline = (Get-Date).AddSeconds(10)
+            while ((Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+                Start-Sleep -Milliseconds 250
             }
         }
-        else {
-            $scOutput = (& sc.exe create $ServiceName binPath= $binPath start= auto DisplayName= 'RustyNet' 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                throw "sc.exe create failed: $scOutput"
-            }
-        }
-        $descriptionOutput = (& sc.exe description $ServiceName 'RustyNet secure mesh runtime service host' 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) {
-            throw "sc.exe description failed: $descriptionOutput"
-        }
+        New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName 'RustyNet' -Description $serviceDescription -StartupType Automatic -ErrorAction Stop | Out-Null
         $script:InstallFailureStep = 'configure-service-sid'
         Ensure-ServiceSidTypeUnrestricted -ServiceName $ServiceName
         $serviceSidConfigured = $true
@@ -374,7 +434,13 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             Repair-RustyNetRuntimeAcl -Path $directoryPath -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity -Directory
         }
         Repair-RustyNetRuntimeAcl -Path $configPath -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity
+
+        $script:InstallFailureStep = 'repair-binary-acl'
+        Repair-RustyNetServiceBinaryAcl -Path $daemonDest -AdministratorsName $administratorsName -LocalSystemName $localSystemName -ServiceIdentity $serviceIdentity
         $runtimeAclApplied = $true
+
+        $script:InstallFailureStep = 'configure-failure-actions'
+        Set-RustyNetServiceFailureActions -ServiceName $ServiceName
     }
     catch {
         $serviceConfigError = $_.Exception.Message

@@ -332,10 +332,10 @@ $cliBuildPath = Get-FirstExistingPath -Candidates @(
     (Join-Path $releaseRoot 'rustynet.exe'),
     (Join-Path $releaseRoot 'rustynet-cli.exe')
 )
-$daemonInstallPath = Join-Path $InstallRoot 'bin\rustynetd.exe'
+$daemonInstallPath = Join-Path $InstallRoot 'rustynetd.exe'
 $cliInstallPath = Get-FirstExistingPath -Candidates @(
-    (Join-Path $InstallRoot 'bin\rustynet.exe'),
-    (Join-Path $InstallRoot 'bin\rustynet-cli.exe')
+    (Join-Path $InstallRoot 'rustynet.exe'),
+    (Join-Path $InstallRoot 'rustynet-cli.exe')
 )
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $logRoot = Join-Path $StateRoot 'logs'

@@ -925,6 +925,117 @@ conservatively.
       otherwise the security-validation subcommands run against a stale
       binary. The flag is meant for fast iteration on the validators,
       not for production gating.
+- [x] Live-lab proof against UTM `windows-utm-1` (2026-04-27)
+  - Context: drove a fresh end-to-end install + validator run against the
+    live UTM Windows 11 guest at `192.168.64.14` over SSH. The orchestrator
+    `vm-lab-orchestrate-live-lab` BuildRelease/InstallRelease phases route
+    through `utmctl file push <vm> <dst>` to pull the report file back, and
+    `utmctl` returns OSStatus `-1743` from any non-Terminal.app shell
+    context (per W1/W2 supporting-tooling entry above). To unblock the
+    live-validator proof in this session the helper scripts were invoked
+    directly via SSH; once UTM access stabilises the same scripts will run
+    via the orchestrator without modification.
+  - Bugs surfaced and patched in helper scripts (each is fail-closed
+    drift the W2.2 verifier was designed to catch, plus three pre-existing
+    PS-shell bugs that prevented any live install from completing):
+    - `scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1`
+      - `$cliCandidates` array was constructed with a trailing comma after
+        the first `Join-Path`, which PS5.1 binds as a single Join-Path call
+        with `-ChildPath` = array. The cmdlet rejected the array with
+        `ParameterBindingException: Cannot convert 'System.Object[]' to the
+        type 'System.String'. Specified method is not supported.` Wrapped
+        each `Join-Path` in parens so the `@()` literal sees independent
+        elements.
+      - `(Get-Command wireguard.exe …)?.Source` used the PS7-only null-
+        conditional operator. The orchestrator dispatches via
+        `powershell.exe` (PS5.1 baseline) which fails the parser. Replaced
+        with a `Get-Command` + `if ($cmd) { $cmd.Source } else { $null }`
+        pattern. Same fix applied to
+        `Smoke-RustyNetWindowsServiceHost.ps1`.
+      - `$daemonDest` and the optional CLI dest were copied to
+        `C:\Program Files\RustyNet\bin\rustynetd.exe`, but the orchestrator
+        constant `WINDOWS_RUSTYNETD_EXE_PATH` and the `rustynetd
+        windows-authenticode-check --binary-path` default both pin to
+        `C:\Program Files\RustyNet\rustynetd.exe` (no `bin\` subdir). Moved
+        install dest to the install-root directly (per the W1.2b residual-
+        risk note that flagged this would need reconciling). Also dropped
+        the ensure-runtime-layout pre-creation of the `bin\` subdir, and
+        reconciled `Verify-RustyNetWindowsBootstrap.ps1` (3 paths) and
+        `Collect-RustyNetWindowsDiagnostics.ps1` (3 hash-list paths + the
+        inspect-list `bin\` entry) to match.
+      - Service binPath construction sent to `sc.exe create` failed with
+        `1639 ERROR_INVALID_COMMAND_LINE` because PS5.1 mangles native-
+        command argument quoting when the value contains both spaces and
+        embedded double quotes. Switched the create/config path to the PS-
+        native `New-Service` cmdlet (with `Stop-Service` + `sc.exe delete`
+        + brief SCM settle for the existing-service replace case), so the
+        binPath crosses into the SCM API as a single string with no shell
+        tokenization. `sc.exe failure` and `sc.exe sidtype` are kept on
+        the native path because their args are slash-separated tokens with
+        no spaces or quotes — the PS5.1 quoting bug does not trigger.
+    - Hardening gaps caught by `windows-service-hardening-check` and
+      patched in the same script:
+      - `failure_action_count = 0` — the W2.2 verifier rejects services
+        with no SCM recovery actions, but the previous install never set
+        any. Added `Set-RustyNetServiceFailureActions` that runs
+        `sc.exe failure RustyNet reset= 86400 actions=
+        restart/60000/restart/60000/restart/60000` after `New-Service`.
+      - `binary ACL grants a broader-than-reviewed Windows principal
+        (BU)` — `C:\Program Files\RustyNet\rustynetd.exe` was inheriting
+        Builtin-Users `read+execute` from `C:\Program Files`. Added
+        `Repair-RustyNetServiceBinaryAcl` that sets owner to
+        Administrators, disables inheritance, and grants only
+        SYSTEM:Full + Administrators:Full + `NT SERVICE\<svc>:RX`. The
+        runtime never modifies its own image, so the service identity
+        gets read+execute only — write access is denied even to the
+        service principal. Wired into the install flow after the existing
+        runtime-ACL repair loop and before the service start attempt.
+  - Verification (live, against `windows-utm-1` at `192.168.64.14`):
+    - `windows-runtime-acls-check`: `overall_ok=true` over all 8 reviewed
+      roots (`state`, `config`, `logs`, `trust`, `membership`, `keys`,
+      `secrets`, `secrets\key-custody`). **W1.2 live-guest evidence
+      now captured** — closes the residual-risk note in W1.2b.
+    - `windows-service-hardening-check`: `overall_ok=true`,
+      `failure_action_count=3`, `binary_path_acl_sddl =
+      O:BAD:PAI(A;;0x1200a9;;;S-1-5-80-…)(A;;FA;;;SY)(A;;FA;;;BA)` (no
+      BU/WD/AU), service runs as `LocalSystem` with `service_sid_type =
+      unrestricted`, binary path pinned to install root, argv contains
+      `--windows-service` + `--env-file` and no inline daemon flags.
+      **W2.2 live-guest evidence now captured** — closes the residual-
+      risk note in W2.2.
+    - `windows-key-custody-check`: `overall_ok=false`. Three required
+      artefacts (`wireguard.passphrase.dpapi`, `wireguard.key.enc`,
+      `wireguard.pub`) reported missing; `wireguard.key` correctly
+      `absent_as_expected`. Expected on this run because the
+      `windows-unsupported` backend exits before key-init. Tracked under
+      the existing W2.4 + W2.4-followup entries; no validator change
+      needed.
+    - `windows-authenticode-check`: `overall_ok=false`,
+      `signature_present=false`, `drift_reasons = ["PE has an empty
+      Certificate Table directory entry; binary is unsigned"]`. Expected
+      because `cargo build --release` produces an unsigned PE; W2.1a is
+      a presence-only gate (full WinVerifyTrust chain validation is
+      tracked under W2.1b). No validator change.
+    - `windows-mesh-status-check`: `overall_ok=false`,
+      `load_status=missing` (no `rustynetd.state` because the daemon
+      never ran). Expected; no validator change.
+  - Artifacts: `artifacts/windows_live_20260427T215938Z/` (initial run
+    with the two W2.2 hardening drift reasons surfacing) and
+    `artifacts/windows_live_20260427T220349Z/` (post-fix run with W2.2
+    passing). Each archive carries the typed JSON output of all five
+    validator subcommands plus per-stage stderr.
+  - Residual risk:
+    - The `windows-utm-1` guest's daemon backend is still
+      `windows-unsupported` (per `WindowsWorkingNodePlan_2026-04-17.md`),
+      so `windows-key-custody-check` and `windows-mesh-status-check`
+      will keep reporting their expected fail-closed gaps until a
+      reviewed Windows backend ships. Today's run proves the validators
+      observe the live state honestly; it does not yet prove the
+      controls fully active under a working backend.
+    - Live-lab access still requires manual UTM-side SSH bootstrap or a
+      Terminal.app-driven `vm-lab-validate-windows-security` invocation
+      because `utmctl` does not work from headless shells. Tracked in
+      the pre-existing access-orchestration entry above.
 
 ### Phase W5 (Stretch: heterogeneous topologies)
 - [ ] W5.1 5×Windows run

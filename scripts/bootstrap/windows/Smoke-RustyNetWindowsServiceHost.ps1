@@ -131,7 +131,8 @@ function Test-WireGuardDriverPresence {
     if (Test-Path -LiteralPath $canonicalExe) {
         return [ordered]@{ present = $true; path = $canonicalExe; detection = 'canonical-path' }
     }
-    $inPath = (Get-Command wireguard.exe -ErrorAction SilentlyContinue)?.Source
+    $wgCommand = Get-Command wireguard.exe -ErrorAction SilentlyContinue
+    $inPath = if ($wgCommand) { $wgCommand.Source } else { $null }
     if ($inPath) {
         return [ordered]@{ present = $true; path = $inPath; detection = 'path-search' }
     }
