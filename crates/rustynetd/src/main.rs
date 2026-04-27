@@ -157,9 +157,7 @@ fn run_windows_runtime_boundary_check_command(args: &[String]) -> Result<(), Str
     #[cfg(not(windows))]
     {
         let _ = args;
-        return Err(
-            "windows-runtime-boundary-check is only available on Windows hosts".to_string(),
-        );
+        Err("windows-runtime-boundary-check is only available on Windows hosts".to_string())
     }
 
     #[cfg(windows)]

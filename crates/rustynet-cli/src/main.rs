@@ -589,6 +589,7 @@ enum OpsCommand {
     GeneratePlatformParityReport,
     CollectPlatformParityBundle,
     InstallSystemd,
+    InstallWindowsService,
     PrepareSystemDirs,
     RestartRuntimeService,
     StopRuntimeService,
@@ -659,6 +660,29 @@ enum OpsCommand {
     E2eEnforceHost {
         role: String,
         node_id: String,
+        src_dir: PathBuf,
+        ssh_allow_cidrs: String,
+    },
+    E2eWorkerRefreshTrustEvidence {
+        label: String,
+        target: String,
+        node_id: String,
+    },
+    E2eWorkerRefreshRuntimeState {
+        label: String,
+        target: String,
+        node_id: String,
+    },
+    E2eWorkerRefreshSignedState {
+        label: String,
+        target: String,
+        node_id: String,
+    },
+    E2eWorkerEnforceRuntime {
+        label: String,
+        target: String,
+        node_id: String,
+        role: String,
         src_dir: PathBuf,
         ssh_allow_cidrs: String,
     },
@@ -2201,6 +2225,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 skip_diagnose_on_failure: parser.has_flag("--skip-diagnose-on-failure"),
                 stop_after_ready: parser.has_flag("--stop-after-ready"),
                 dry_run: parser.has_flag("--dry-run"),
+                windows_only: parser.has_flag("--windows-only"),
             },
         }),
         "vm-lab-validate-live-lab-profile" => Ok(OpsCommand::VmLabValidateLiveLabProfile {
@@ -2660,6 +2685,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::InstallSystemd)
         }
+        "install-windows-service" => {
+            if args.len() != 1 {
+                return Err("ops install-windows-service does not accept options".to_string());
+            }
+            Ok(OpsCommand::InstallWindowsService)
+        }
         "prepare-system-dirs" => {
             if args.len() != 1 {
                 return Err("ops prepare-system-dirs does not accept options".to_string());
@@ -2899,6 +2930,29 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "e2e-enforce-host" => Ok(OpsCommand::E2eEnforceHost {
             role: parser.required("--role")?,
             node_id: parser.required("--node-id")?,
+            src_dir: parser.required_path("--src-dir")?,
+            ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
+        }),
+        "e2e-worker-refresh-trust-evidence" => Ok(OpsCommand::E2eWorkerRefreshTrustEvidence {
+            label: parser.required("--label")?,
+            target: parser.required("--target")?,
+            node_id: parser.required("--node-id")?,
+        }),
+        "e2e-worker-refresh-runtime-state" => Ok(OpsCommand::E2eWorkerRefreshRuntimeState {
+            label: parser.required("--label")?,
+            target: parser.required("--target")?,
+            node_id: parser.required("--node-id")?,
+        }),
+        "e2e-worker-refresh-signed-state" => Ok(OpsCommand::E2eWorkerRefreshSignedState {
+            label: parser.required("--label")?,
+            target: parser.required("--target")?,
+            node_id: parser.required("--node-id")?,
+        }),
+        "e2e-worker-enforce-runtime" => Ok(OpsCommand::E2eWorkerEnforceRuntime {
+            label: parser.required("--label")?,
+            target: parser.required("--target")?,
+            node_id: parser.required("--node-id")?,
+            role: parser.required("--role")?,
             src_dir: parser.required_path("--src-dir")?,
             ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
         }),
@@ -4427,6 +4481,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::GeneratePlatformParityReport => execute_ops_generate_platform_parity_report(),
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
+        OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
         OpsCommand::RestartRuntimeService => execute_ops_restart_runtime_service(),
         OpsCommand::StopRuntimeService => execute_ops_stop_runtime_service(),
@@ -4525,6 +4580,29 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             src_dir,
             ssh_allow_cidrs,
         } => ops_e2e::execute_ops_e2e_enforce_host(role, node_id, src_dir, ssh_allow_cidrs),
+        OpsCommand::E2eWorkerRefreshTrustEvidence {
+            label,
+            target,
+            node_id,
+        } => ops_e2e::execute_ops_e2e_worker_refresh_trust_evidence(label, target, node_id),
+        OpsCommand::E2eWorkerRefreshRuntimeState {
+            label,
+            target,
+            node_id,
+        } => ops_e2e::execute_ops_e2e_worker_refresh_runtime_state(label, target, node_id),
+        OpsCommand::E2eWorkerRefreshSignedState {
+            label,
+            target,
+            node_id,
+        } => ops_e2e::execute_ops_e2e_worker_refresh_signed_state(label, target, node_id),
+        OpsCommand::E2eWorkerEnforceRuntime {
+            label,
+            target,
+            node_id,
+            role,
+            src_dir,
+            ssh_allow_cidrs,
+        } => ops_e2e::execute_ops_e2e_worker_enforce_runtime(label, target, node_id, role, src_dir, ssh_allow_cidrs),
         OpsCommand::E2eMembershipAdd {
             client_node_id,
             client_pubkey_hex,
@@ -11923,6 +12001,7 @@ fn help_text() -> String {
         "  ops generate-platform-parity-report",
         "  ops collect-platform-parity-bundle",
         "  ops install-systemd",
+        "  ops install-windows-service",
         "  ops prepare-system-dirs",
         "  ops restart-runtime-service",
         "  ops stop-runtime-service",
@@ -13798,6 +13877,10 @@ mod tests {
 
         let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));
+
+        let windows_installer =
+            parse_command(&["ops".to_string(), "install-windows-service".to_string()]);
+        assert!(format!("{windows_installer:?}").contains("InstallWindowsService"));
 
         let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));

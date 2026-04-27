@@ -126,6 +126,22 @@ function Test-PathPinnedToBinary {
     return $ImagePath.IndexOf($BinaryPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
+function Test-WireGuardDriverPresence {
+    $canonicalExe = 'C:\Program Files\WireGuard\wireguard.exe'
+    if (Test-Path -LiteralPath $canonicalExe) {
+        return [ordered]@{ present = $true; path = $canonicalExe; detection = 'canonical-path' }
+    }
+    $inPath = (Get-Command wireguard.exe -ErrorAction SilentlyContinue)?.Source
+    if ($inPath) {
+        return [ordered]@{ present = $true; path = $inPath; detection = 'path-search' }
+    }
+    $wgSvc = Get-Service -Name WireGuardManager -ErrorAction SilentlyContinue
+    if ($wgSvc) {
+        return [ordered]@{ present = $true; path = ''; detection = 'service-manager' }
+    }
+    return [ordered]@{ present = $false; path = ''; detection = 'not-found' }
+}
+
 function Test-ImagePathContainsToken {
     param(
         [string]$ImagePath,
@@ -253,6 +269,7 @@ $status = 'fail'
 $reason = ''
 $notes = New-Object System.Collections.Generic.List[string]
 $fatalError = ''
+$wireGuardProbe = [ordered]@{ present = $false; path = ''; detection = 'not-checked' }
 
 try {
     $script:SmokeFailureStep = 'ensure-smoke-root'
@@ -268,6 +285,9 @@ try {
     $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonPath
     $script:SmokeRuntimeSignals = $runtimeSignals
     $runtimeFlagsPresent = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
+
+    $script:SmokeFailureStep = 'check-wireguard-driver'
+    $wireGuardProbe = Test-WireGuardDriverPresence
 
     $script:SmokeFailureStep = 'remove-preexisting-smoke-service'
     Remove-SmokeService -ServiceName $ServiceName
@@ -466,6 +486,8 @@ $report = [ordered]@{
     cleanup_status = $cleanupStatus
     cleanup_error = $cleanupError
     fatal_error = $fatalError
+    wireguard_driver_present = $wireGuardProbe.present
+    wireguard_driver_probe = $wireGuardProbe
     failure_step = $script:SmokeFailureStep
     runtime_signals = $runtimeSignals
     notes = $notes

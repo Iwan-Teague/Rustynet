@@ -29,3 +29,10 @@ properties:
       settings:
         id: Rustlang.Rustup
         source: winget
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: wireguard
+      directives:
+        description: Install WireGuard (includes the wgnt kernel driver used by rustynetd)
+      settings:
+        id: WireGuard.WireGuard
+        source: winget

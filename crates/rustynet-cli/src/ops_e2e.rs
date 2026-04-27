@@ -1,3 +1,5 @@
+use std::time::Duration;
+use std::os::unix::fs::FileTypeExt;
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(windows))]
 use nix::unistd::Uid;
 use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::{
@@ -592,6 +595,11 @@ pub fn execute_ops_e2e_bootstrap_host(
     ))
 }
 
+/// Enforce baseline runtime configuration on the local host.
+///
+/// On Linux, delegates to `rustynet ops install-systemd`.
+/// On Windows, delegates to `rustynet ops install-windows-service`.
+#[cfg(not(windows))]
 pub fn execute_ops_e2e_enforce_host(
     role: String,
     node_id: String,
@@ -649,6 +657,139 @@ pub fn execute_ops_e2e_enforce_host(
     Ok(format!(
         "e2e enforce host complete: role={role} node_id={node_id}",
     ))
+}
+
+/// Enforce baseline runtime configuration on the local Windows host.
+///
+/// Delegates to `rustynet ops install-windows-service`, which runs the
+/// `Install-RustyNetWindowsService.ps1` PowerShell helper from `src_dir`.
+#[cfg(windows)]
+pub fn execute_ops_e2e_enforce_host(
+    role: String,
+    node_id: String,
+    src_dir: PathBuf,
+    ssh_allow_cidrs: String,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    ensure_safe_token("role", role.as_str())?;
+    ensure_safe_token("node-id", node_id.as_str())?;
+    ensure_safe_token("ssh-allow-cidrs", ssh_allow_cidrs.as_str())?;
+    if !src_dir.is_absolute() {
+        return Err(format!("--src-dir must be absolute: {}", src_dir.display()));
+    }
+    let src_dir_text = src_dir.display().to_string();
+    // Windows paths contain backslashes; skip safe-token check and rely on is_absolute guard.
+    let config_dir = Path::new(r"C:\ProgramData\RustyNet\config");
+    let auto_refresh = config_dir.join("trust-evidence.key").is_file();
+    let assignment_auto_refresh = config_dir.join("assignment.signing.secret").is_file()
+        && config_dir.join("assignment-refresh.env").is_file();
+    let backend_mode = e2e_backend_mode_from_env()?;
+
+    let mut install_env = vec![
+        ("RUSTYNET_NODE_ID", node_id.as_str()),
+        ("RUSTYNET_NODE_ROLE", role.as_str()),
+        (
+            "RUSTYNET_TRUST_AUTO_REFRESH",
+            if auto_refresh { "true" } else { "false" },
+        ),
+        (
+            "RUSTYNET_ASSIGNMENT_AUTO_REFRESH",
+            if assignment_auto_refresh {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        ("RUSTYNET_AUTO_TUNNEL_ENFORCE", "true"),
+        ("RUSTYNET_WG_LISTEN_PORT", "51820"),
+        ("RUSTYNET_INSTALL_SOURCE_ROOT", src_dir_text.as_str()),
+    ];
+    if let Some(value) = backend_mode.as_deref() {
+        install_env.push(("RUSTYNET_BACKEND", value));
+    }
+    run_status(
+        "rustynet",
+        &["ops", "install-windows-service"],
+        install_env.as_slice(),
+        "install-windows-service enforce pass failed",
+    )?;
+
+    Ok(format!(
+        "e2e enforce host complete: role={role} node_id={node_id}",
+    ))
+}
+
+/// Install the `rustynetd` Windows service.
+///
+/// Runs `Install-RustyNetWindowsService.ps1` from the source root resolved via
+/// `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_install_windows_service() -> Result<String, String> {
+    Err("ops install-windows-service is only supported on Windows hosts".to_string())
+}
+
+/// Install the `rustynetd` Windows service.
+///
+/// Runs `Install-RustyNetWindowsService.ps1` from the source root resolved via
+/// `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+#[cfg(windows)]
+pub fn execute_ops_install_windows_service() -> Result<String, String> {
+    ensure_running_as_root()?;
+    let source_root = resolve_windows_install_source_root()?;
+    let script_path = source_root
+        .join("scripts")
+        .join("bootstrap")
+        .join("windows")
+        .join("Install-RustyNetWindowsService.ps1");
+    if !script_path.is_file() {
+        return Err(format!(
+            "Windows service install script not found at {}; \
+             ensure RUSTYNET_INSTALL_SOURCE_ROOT points to the repo root",
+            script_path.display()
+        ));
+    }
+    let script_str = script_path.to_string_lossy().to_string();
+    let source_root_str = source_root.to_string_lossy().to_string();
+    run_status(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_str.as_str(),
+            "-RustyNetRoot",
+            source_root_str.as_str(),
+            "-InstallRoot",
+            r"C:\Program Files\RustyNet",
+            "-StateRoot",
+            r"C:\ProgramData\RustyNet",
+            "-ServiceName",
+            "RustyNet",
+        ],
+        &[],
+        "Windows service install script failed",
+    )?;
+    Ok("RustyNet Windows service installed and started".to_string())
+}
+
+#[cfg(windows)]
+fn resolve_windows_install_source_root() -> Result<PathBuf, String> {
+    if let Ok(candidate) = std::env::var("RUSTYNET_INSTALL_SOURCE_ROOT") {
+        let path = PathBuf::from(candidate);
+        if !path.is_absolute() {
+            return Err(format!(
+                "RUSTYNET_INSTALL_SOURCE_ROOT must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    std::env::current_dir().map_err(|err| format!("failed to resolve working directory: {err}"))
 }
 
 pub fn execute_ops_e2e_membership_add(
@@ -3361,16 +3502,7 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
 
 fn e2e_backend_mode_from_env() -> Result<Option<String>, String> {
     match std::env::var("RUSTYNET_BACKEND") {
-        Ok(value) => match value.as_str() {
-            "" => Ok(None),
-            "linux-wireguard"
-            | "linux-wireguard-userspace-shared"
-            | "macos-wireguard"
-            | "macos-wireguard-userspace-shared" => Ok(Some(value)),
-            _ => Err(format!(
-                "unsupported RUSTYNET_BACKEND for e2e bootstrap/enforce: {value}"
-            )),
-        },
+        Ok(value) => parse_e2e_backend_mode_value(value.as_str()).map(|ok| ok.map(str::to_owned)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             Err("RUSTYNET_BACKEND must be valid UTF-8".to_string())
@@ -3378,11 +3510,42 @@ fn e2e_backend_mode_from_env() -> Result<Option<String>, String> {
     }
 }
 
+/// Validates and returns the backend label from a raw env-var value.
+/// Returns `None` for empty string (no backend override).
+fn parse_e2e_backend_mode_value(value: &str) -> Result<Option<&str>, String> {
+    match value {
+        "" => Ok(None),
+        "linux-wireguard"
+        | "linux-wireguard-userspace-shared"
+        | "macos-wireguard"
+        | "macos-wireguard-userspace-shared"
+        | "windows-wireguard-nt" => Ok(Some(value)),
+        _ => Err(format!(
+            "unsupported RUSTYNET_BACKEND for e2e bootstrap/enforce: {value}"
+        )),
+    }
+}
+
+#[cfg(not(windows))]
 fn ensure_running_as_root() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
     }
     Err("this operation requires root".to_string())
+}
+
+/// On Windows, `net session` succeeds only when the caller holds a local
+/// Administrator token.  This is the standard zero-dependency elevation check.
+#[cfg(windows)]
+fn ensure_running_as_root() -> Result<(), String> {
+    let output = Command::new("net")
+        .args(["session"])
+        .output()
+        .map_err(|err| format!("admin privilege check failed: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err("this operation requires Administrator privileges on Windows".to_string())
 }
 
 fn run_status(
@@ -5412,4 +5575,133 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
 
         assert!(err.contains("candidate endpoint is invalid"));
     }
+
+    #[test]
+    fn e2e_backend_mode_value_parser_accepts_windows_wireguard_nt() {
+        assert_eq!(
+            super::parse_e2e_backend_mode_value("windows-wireguard-nt").unwrap(),
+            Some("windows-wireguard-nt")
+        );
+    }
+
+    #[test]
+    fn e2e_backend_mode_value_parser_rejects_unknown_backend() {
+        assert!(super::parse_e2e_backend_mode_value("unknown-backend").is_err());
+    }
+
+    #[test]
+    fn e2e_backend_mode_value_parser_accepts_all_known_linux_macos_backends() {
+        for backend in &[
+            "linux-wireguard",
+            "linux-wireguard-userspace-shared",
+            "macos-wireguard",
+            "macos-wireguard-userspace-shared",
+        ] {
+            assert!(
+                super::parse_e2e_backend_mode_value(backend).is_ok(),
+                "backend {backend} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_backend_mode_value_parser_returns_none_for_empty() {
+        assert_eq!(super::parse_e2e_backend_mode_value("").unwrap(), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_windows_service_returns_error_on_non_windows() {
+        let err = super::execute_ops_install_windows_service()
+            .expect_err("must fail on non-Windows hosts");
+        assert!(
+            err.contains("only supported on Windows"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+pub fn wait_for_daemon_socket_locally(socket_path: &str, attempts: usize, sleep_secs: u64) -> Result<(), String> {
+    for i in 1..=attempts {
+        if Path::new(socket_path).exists() {
+            if let Ok(metadata) = std::fs::metadata(socket_path) {
+                if metadata.file_type().is_socket() {
+                    return Ok(());
+                }
+            }
+        }
+        if i < attempts {
+            std::thread::sleep(Duration::from_secs(sleep_secs));
+        }
+    }
+    Err(format!("daemon socket not ready after {attempts} attempts"))
+}
+
+pub fn execute_ops_e2e_worker_refresh_trust_evidence(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[trust-refresh] {} {} ({})", label, target, node_id);
+    ensure_running_as_root()?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    run_status(
+        "rustynet",
+        &["ops", "refresh-signed-trust"],
+        &[],
+        "failed to refresh signed trust",
+    )?;
+    Ok(format!("trust evidence refreshed for {}", node_id))
+}
+
+pub fn execute_ops_e2e_worker_refresh_runtime_state(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[runtime-refresh] {} {} ({})", label, target, node_id);
+    ensure_running_as_root()?;
+    run_status(
+        "rustynet",
+        &["ops", "force-local-assignment-refresh-now"],
+        &[],
+        "failed to force local assignment refresh",
+    )?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    Ok(format!("runtime state refreshed for {}", node_id))
+}
+
+pub fn execute_ops_e2e_worker_refresh_signed_state(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[signed-state-refresh] {} {} ({})", label, target, node_id);
+    ensure_running_as_root()?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    // The bash script does: env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh
+    run_status(
+        "rustynet",
+        &["state", "refresh"],
+        &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
+        "failed to refresh signed state",
+    )?;
+    Ok(format!("signed state refreshed for {}", node_id))
+}
+
+pub fn execute_ops_e2e_worker_enforce_runtime(
+    label: String,
+    target: String,
+    node_id: String,
+    role: String,
+    src_dir: PathBuf,
+    ssh_allow_cidrs: String,
+) -> Result<String, String> {
+    println!("[runtime-enforce] {} {} ({} {})", label, target, node_id, role);
+    ensure_running_as_root()?;
+    
+    execute_ops_e2e_enforce_host(role, node_id.clone(), src_dir, ssh_allow_cidrs)?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    
+    Ok(format!("runtime enforced for {}", node_id))
 }

@@ -183,10 +183,10 @@ pub fn build_named_pipe_security_sddl(
     if policy.allow_builtin_administrators {
         aces.push("(A;;GA;;;BA)".to_string());
     }
-    if policy.allow_service_identity {
-        if let Some(sid) = service_sid {
-            aces.push(format!("(A;;GA;;;{sid})"));
-        }
+    if policy.allow_service_identity
+        && let Some(sid) = service_sid
+    {
+        aces.push(format!("(A;;GA;;;{sid})"));
     }
     format!("O:SYG:SYD:P{}", aces.join(""))
 }
@@ -329,9 +329,77 @@ pub fn windows_ipc_probe(
     }
 }
 
+/// Maximum bytes for a single daemon control pipe message.
+/// Matches `MAX_COMMAND_BYTES` in `ipc.rs` so that the full command wire format always fits.
+pub const MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES: usize = 4096;
+
+/// Serve exactly one daemon control pipe connection.
+///
+/// The handler receives the raw request bytes (newline-terminated command wire format, e.g.
+/// `b"status\n"`) and must return raw response bytes (newline-terminated response wire format,
+/// e.g. `b"ok|...\n"`).
+///
+/// Path validation and SDDL construction are applied on every call so the server loop thread
+/// can call this in a tight loop without holding external state between iterations.
+pub fn serve_windows_daemon_control_request_once<F>(
+    pipe_path: &Path,
+    service_sid: Option<&str>,
+    handler: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String>,
+{
+    validate_windows_pipe_path(pipe_path, WindowsLocalIpcRole::DaemonControl)?;
+    let sddl = build_named_pipe_security_sddl(WindowsLocalIpcRole::DaemonControl, service_sid);
+    serve_named_pipe_one_message(
+        pipe_path.to_string_lossy().as_ref(),
+        sddl.as_str(),
+        MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+        handler,
+    )
+}
+
+/// Send a daemon control command over the named pipe and return the raw response wire string.
+///
+/// `request_wire` is the IPC command in wire format (e.g. `"status"` or `"state refresh"`).
+/// A trailing newline is appended automatically if absent.
+/// The returned string is the response wire format (e.g. `"ok|..."` or `"err|..."`).
+///
+/// This is the low-level client call used by the CLI on Windows.
+pub fn call_windows_daemon_control_raw(
+    pipe_path: &Path,
+    request_wire: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    validate_windows_pipe_path(pipe_path, WindowsLocalIpcRole::DaemonControl)?;
+    let mut request_bytes = request_wire.as_bytes().to_vec();
+    if !request_bytes.ends_with(b"\n") {
+        request_bytes.push(b'\n');
+    }
+    if request_bytes.len() > MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES {
+        return Err(format!(
+            "daemon control request exceeds maximum size ({} > {MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES} bytes)",
+            request_bytes.len()
+        ));
+    }
+    let response_bytes = call_named_pipe(
+        pipe_path.to_string_lossy().as_ref(),
+        &request_bytes,
+        MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+        timeout,
+    )?;
+    String::from_utf8(response_bytes)
+        .map_err(|err| format!("daemon control response is not valid UTF-8: {err}"))
+}
+
 pub fn windows_ipc_blocker_reason(role: WindowsLocalIpcRole) -> String {
     match role {
-        WindowsLocalIpcRole::DaemonControl => "daemon control pipe remains unimplemented on Windows; windows-wireguard-nt now provides an opt-in reviewed backend label, but local daemon-control IPC still stays fail-closed until a reviewed named-pipe control server exists".to_string(),
+        WindowsLocalIpcRole::DaemonControl => {
+            // Daemon control is now implemented via serve_windows_daemon_control_request_once /
+            // call_windows_daemon_control_raw. This path is retained only as a fallback message
+            // for callers that still reference the blocker API directly.
+            "daemon control pipe is implemented on Windows; use serve_windows_daemon_control_request_once and call_windows_daemon_control_raw instead of this legacy blocker path".to_string()
+        }
         WindowsLocalIpcRole::PrivilegedHelper => "privileged helper shell-command execution remains blocked on Windows; use the reviewed named-pipe probe and ACL inspection request shapes only until a real Windows backend defines native privileged operations".to_string(),
     }
 }
@@ -449,5 +517,61 @@ mod tests {
         assert!(sddl.contains("(A;;GA;;;SY)"));
         assert!(sddl.contains("(A;;GA;;;BA)"));
         assert!(sddl.starts_with("O:SYG:SYD:P"));
+    }
+
+    #[test]
+    fn max_windows_daemon_control_message_bytes_is_nonzero() {
+        // Compile-time guard: the constant must be positive so pipe I/O is never attempted
+        // with a zero-size buffer. The value is a compile-time constant so the runtime
+        // assertion would always be true — use const { assert! } to catch regressions at
+        // compile time instead.
+        const _: () = assert!(
+            MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES > 0,
+            "max daemon control message size must be positive"
+        );
+    }
+
+    #[test]
+    fn call_windows_daemon_control_raw_rejects_invalid_pipe_path() {
+        let err = call_windows_daemon_control_raw(
+            Path::new("/run/rustynet/rustynetd.sock"),
+            "status",
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("linux path must be rejected before any I/O attempt");
+        assert!(err.contains("must not use Linux runtime roots on Windows"));
+    }
+
+    #[test]
+    fn call_windows_daemon_control_raw_rejects_oversized_request() {
+        let huge = "x".repeat(MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES + 1);
+        let err = call_windows_daemon_control_raw(
+            Path::new(DEFAULT_WINDOWS_DAEMON_PIPE_PATH),
+            &huge,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("oversized request must be rejected before I/O");
+        assert!(err.contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn serve_windows_daemon_control_request_once_rejects_invalid_pipe_path() {
+        let err = serve_windows_daemon_control_request_once(
+            Path::new(r"\\.\pipe\RustyNet\other"),
+            None,
+            Ok,
+        )
+        .expect_err("unreviewed leaf must be rejected before I/O");
+        assert!(err.contains("must pin the reviewed pipe leaf"));
+    }
+
+    #[test]
+    fn daemon_control_blocker_reason_reflects_implementation_status() {
+        let reason = super::windows_ipc_blocker_reason(WindowsLocalIpcRole::DaemonControl);
+        // The message must acknowledge that the pipe IS now implemented.
+        assert!(
+            reason.contains("implemented"),
+            "blocker reason should acknowledge implemented status: {reason}"
+        );
     }
 }

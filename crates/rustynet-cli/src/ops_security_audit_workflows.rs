@@ -803,6 +803,7 @@ fn run_validation(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_live_validation_summary(
     results: &[ValidationRunResult],
     known_hosts_path: &Path,

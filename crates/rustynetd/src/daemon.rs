@@ -67,7 +67,8 @@ use crate::windows_backend_gate::{
 };
 #[cfg(windows)]
 use crate::windows_ipc::{
-    DEFAULT_WINDOWS_DAEMON_PIPE_PATH, WindowsLocalIpcRole, validate_windows_pipe_path,
+    DEFAULT_WINDOWS_DAEMON_PIPE_PATH, MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+    WindowsLocalIpcRole, build_named_pipe_security_sddl, validate_windows_pipe_path,
 };
 #[cfg(windows)]
 use crate::windows_paths::{
@@ -135,6 +136,8 @@ use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet, Decision,
     MembershipDirectory, MembershipStatus, Protocol, RuleAction, TrafficContext,
 };
+#[cfg(windows)]
+use rustynet_windows_native::serve_named_pipe_one_message;
 use sha2::{Digest, Sha256};
 
 #[cfg(not(windows))]
@@ -7123,11 +7126,47 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
     #[cfg(windows)]
     {
+        use std::sync::mpsc;
+
         let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
             .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
         dns_socket
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+
+        // Daemon control pipe: spawn a background thread that accepts one named-pipe connection
+        // at a time. The thread forwards (request_bytes, response_sender) to the main loop via
+        // an mpsc channel so DaemonRuntime stays single-threaded.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<(Vec<u8>, mpsc::SyncSender<Vec<u8>>)>();
+        let pipe_path_str = config.socket_path.to_string_lossy().to_string();
+        let control_sddl = build_named_pipe_security_sddl(WindowsLocalIpcRole::DaemonControl, None);
+
+        std::thread::Builder::new()
+            .name("rustynetd-control-pipe".to_string())
+            .spawn(move || {
+                loop {
+                    let (resp_tx, resp_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+                    let cmd_tx_clone = cmd_tx.clone();
+                    if let Err(err) = serve_named_pipe_one_message(
+                        pipe_path_str.as_str(),
+                        control_sddl.as_str(),
+                        MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+                        |request_bytes| {
+                            cmd_tx_clone.send((request_bytes, resp_tx)).map_err(|e| {
+                                format!("control pipe cmd channel send failed: {e}")
+                            })?;
+                            resp_rx
+                                .recv()
+                                .map_err(|e| format!("control pipe resp channel recv failed: {e}"))
+                        },
+                    ) {
+                        log::warn!("daemon control pipe iteration error: {err}");
+                    }
+                }
+            })
+            .map_err(|err| {
+                DaemonError::Io(format!("failed to spawn control pipe thread: {err}"))
+            })?;
 
         let mut processed = 0usize;
         let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
@@ -7145,6 +7184,29 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             }
 
             let mut processed_io = false;
+
+            // Handle one pending daemon control pipe command per loop iteration.
+            if let Ok((request_bytes, response_tx)) = cmd_rx.try_recv() {
+                let response = match ipc_read_command_envelope(std::io::Cursor::new(&request_bytes))
+                {
+                    Ok(CommandEnvelope::Local(command)) => runtime.handle_command(command),
+                    Ok(CommandEnvelope::Remote(remote_envelope)) => {
+                        let now_unix = unix_now();
+                        match runtime.authorize_remote_command(&remote_envelope, now_unix) {
+                            Ok(parsed) => runtime.handle_command(parsed),
+                            Err(err) => {
+                                IpcResponse::err(format!("remote ops authorization failed: {err}"))
+                            }
+                        }
+                    }
+                    Err(err) => IpcResponse::err(format!("command parse failed: {err}")),
+                };
+                let response_bytes = format!("{}\n", response.to_wire()).into_bytes();
+                let _ = response_tx.send(response_bytes);
+                processed = processed.saturating_add(1);
+                processed_io = true;
+            }
+
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {
                     Ok((length, peer_addr)) => {

@@ -150,6 +150,26 @@ function Test-PathPinnedToBinary {
     return $ImagePath.IndexOf($BinaryPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
+function Test-WireGuardDriverPresence {
+    # WireGuard for Windows installs wireguard.exe at this canonical path.
+    # The wgnt kernel driver is packaged with this executable.
+    $canonicalExe = 'C:\Program Files\WireGuard\wireguard.exe'
+    if (Test-Path -LiteralPath $canonicalExe) {
+        return [ordered]@{ present = $true; path = $canonicalExe; detection = 'canonical-path' }
+    }
+    # Fallback: wireguard.exe on PATH (e.g. chocolatey or custom install).
+    $inPath = (Get-Command wireguard.exe -ErrorAction SilentlyContinue)?.Source
+    if ($inPath) {
+        return [ordered]@{ present = $true; path = $inPath; detection = 'path-search' }
+    }
+    # Fallback: WireGuard tunnel manager service registered by the installer.
+    $wgSvc = Get-Service -Name WireGuardManager -ErrorAction SilentlyContinue
+    if ($wgSvc) {
+        return [ordered]@{ present = $true; path = ''; detection = 'service-manager' }
+    }
+    return [ordered]@{ present = $false; path = ''; detection = 'not-found' }
+}
+
 function Test-ImagePathContainsToken {
     param(
         [string]$ImagePath,
@@ -256,8 +276,13 @@ function Write-ReviewedEnvFile {
     ) | Out-File -Encoding ascii $Path
 }
 
+$wireGuardProbe = [ordered]@{ present = $false; path = ''; detection = 'not-checked' }
+
 $script:InstallFailureStep = 'ensure-runtime-layout'
 Ensure-RustyNetRuntimeLayout -InstallRoot $InstallRoot -StateRoot $StateRoot
+
+$script:InstallFailureStep = 'check-wireguard-driver'
+$wireGuardProbe = Test-WireGuardDriverPresence
 
 $script:InstallFailureStep = 'locate-build-artifacts'
 $daemonCandidates = @(
@@ -400,6 +425,9 @@ if (-not $runtimeSignals.has_windows_service) {
 if (-not $runtimeSignals.has_env_file) {
     $notes += 'env-file-flag-missing'
 }
+if (-not $wireGuardProbe.present) {
+    $notes += 'wireguard-driver-not-found'
+}
 if (-not $serviceRuntime.present) {
     $notes += 'service-missing'
 }
@@ -489,6 +517,8 @@ $report = [ordered]@{
     service_env_file_pinned = $serviceEnvFilePinned
     service_binary_path_pinned_to_install_root = Test-PathPinnedToBinary -ImagePath $imagePath -BinaryPath $daemonDest
     runtime_flags_present = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
+    wireguard_driver_present = $wireGuardProbe.present
+    wireguard_driver_probe = $wireGuardProbe
     failure_step = $script:InstallFailureStep
     runtime_signals = $runtimeSignals
     notes = $notes
