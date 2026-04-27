@@ -1,6 +1,8 @@
-use std::time::Duration;
-use std::os::unix::fs::FileTypeExt;
 #![forbid(unsafe_code)]
+
+use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;

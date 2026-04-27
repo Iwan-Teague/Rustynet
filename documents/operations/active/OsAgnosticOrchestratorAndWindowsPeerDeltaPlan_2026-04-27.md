@@ -1,0 +1,981 @@
+# OS-Agnostic Orchestrator + Windows-Peer Delta Plan
+
+Date: 2026-04-27
+Owner: Rustynet engineering
+Status: active delta ledger
+Branch baseline at creation: `main` @ `52372a7` (all local branches and `origin/main` aligned at `f838a76` ancestor; no divergent worktree work to recover)
+
+## 0) Mission
+
+Make `vm-lab-orchestrate-live-lab` accept any 5 UTM guests as equal first-class
+peers in the live-lab mesh, regardless of guest OS, **without weakening any
+existing security control**. Today the orchestrator only accepts five Linux
+guests, with Windows bolted on as a sidecar that runs after Linux stages
+finish. This plan turns Windows into a real peer that can fill any slot and
+keeps Mac/iOS/Android scaffolding in place for later turn-on.
+
+The orchestrator's security responsibility — enforcing a single hardened
+execution path per security-sensitive workflow on every node — is the load-
+bearing requirement. Cross-OS support that lowers the bar is rejected.
+
+## 1) Scope And Non-Scope
+
+In scope:
+
+- Replace the Linux-only live-lab gate with a per-stage capability-aware
+  dispatcher that can drive Linux or Windows nodes in any of the five lab
+  roles (`exit`, `client`, `entry`/`relay`, `aux`, `extra`).
+- Close the Windows security-parity gaps the orchestrator currently relies on
+  the Linux unit/path/DNS toolchain to enforce.
+- Land a `StageOrchestrator` abstraction in Rust so each live-lab stage can
+  dispatch on `VmPlatformProfile` instead of shelling to one bash script.
+- Keep macOS / iOS / Android variants of the abstractions as `Unsupported`
+  stubs with clear blocker text and negative tests asserting the rejection,
+  so future work has a stable target.
+- Stay aligned with `documents/Requirements.md` and
+  `documents/SecurityMinimumBar.md`.
+
+Not in scope (this delta):
+
+- macOS guest implementation. Daemon path on Darwin is untested; tracked
+  separately. Stubs only.
+- iOS / Android guest implementation.
+- Replacing the Linux bash orchestrator wholesale. Linux remains the
+  reference implementation; the dispatcher wraps it during transition.
+- Promoting Windows out of `runtime-host-capable only` posture in the
+  release matrix. That promotion is gated on the broader work tracked in
+  [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+  and remains untouched by this plan.
+
+## 2) Source-Of-Truth Cross-References
+
+This delta is layered on top of, and must not contradict, these documents.
+When this plan disagrees with one of them, fix this plan, not the other.
+
+- [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+  — Windows daemon backend / runtime-host posture. Owns "what Windows must
+  prove before it counts as working." This delta does not relax that bar; it
+  only adds the orchestrator-side dispatch and parity stages that let a
+  Windows guest be tested in a peer slot once the backend exists.
+- [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+  — Windows UTM access / SSH / callback bootstrapping. This delta consumes
+  whatever guest-access path that plan stabilizes; it does not replace it.
+- [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
+  — historical cross-platform gap analysis. Treat as background context.
+- [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+  — bash→Rust migration of `start.sh` privileged subflows and evidence
+  pipelines. The orchestrator-stage dispatch work in this delta is the next
+  natural step after that plan; it migrates the **live-lab orchestration
+  shell** itself out of pure bash.
+- [MasterWorkPlan_2026-03-22.md](./MasterWorkPlan_2026-03-22.md) and
+  [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
+  — broader execution ledgers. Add a back-link to this delta in their next
+  routine update.
+- `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` and
+  `documents/operations/active/vm_lab_inventory.json` — VM inventory truth.
+- `crates/rustynet-cli/src/vm_lab/mod.rs` — current orchestrator
+  implementation; primary code under change.
+
+## 3) Current State Snapshot (2026-04-27)
+
+Captured from a fresh repo + agent walk; verify against current code if
+anything below looks off.
+
+### 3.1 Live-lab orchestrator
+- CLI: `vm-lab-orchestrate-live-lab` in `crates/rustynet-cli/src/main.rs`,
+  with `--windows-vm <alias>` sidecar flag.
+- Stage runner is largely a Rust wrapper around
+  `scripts/e2e/live_linux_lab_orchestrator.sh` (~109 lines of Linux-only
+  shell: `systemctl`, `/etc/...`, `apt`/`dnf`, `systemd-resolved`,
+  `nft`/`ip route`, `tc`/`netem`).
+- Hard gate: `ensure_live_lab_profile_linux_only()` at
+  `crates/rustynet-cli/src/vm_lab/mod.rs:5445` rejects any non-Linux node
+  with `requires platform=linux remote_shell=posix
+  guest_exec_mode=linux_bash service_manager=systemd`.
+- Windows sidecar runs after Linux stages finish:
+  `run_windows_orchestration_stages()` at
+  `crates/rustynet-cli/src/vm_lab/mod.rs:4954-5138`. Three stages only:
+  `bootstrap_windows_host`, `validate_windows_client_install`,
+  `validate_windows_mesh_join` (deferred / unimplemented).
+
+### 3.2 Existing platform abstractions (unused by stages)
+Defined in `crates/rustynet-cli/src/vm_lab/mod.rs`:
+- `VmGuestPlatform` (~line 500): Linux, Macos, Windows, Ios, Android.
+- `VmRemoteShell` (~line 575): Posix, Powershell, Unsupported.
+- `VmGuestExecMode` (~line 602): LinuxBash, MacosPosix, WindowsPowershell,
+  Unsupported.
+- `VmServiceManager` (~line 632): Systemd, Launchd, WindowsService,
+  Unsupported.
+- `VmPlatformProfile` (~line 660) bundles all four; `default_platform_profile()`
+  (~line 675) maps each OS to correct defaults.
+
+These types exist and parse correctly. **Stages do not dispatch on them.**
+
+### 3.3 Daemon cross-platform status
+- Linux: production target, well-evidenced.
+- Windows: `rustynetd --windows-service --env-file …` runs;
+  `windows-unsupported` and opt-in `windows-wireguard-nt` backend labels
+  exist behind the backend abstraction; no reviewed Windows backend ships
+  yet (see [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+  §"Current Repo Truth"). Windows runtime paths under
+  `C:\ProgramData\RustyNet\…`, DPAPI passphrase custody, named-pipe IPC, and
+  service-installer ACL repair already landed in Phase 2.
+- macOS daemon: builds POSIX but is untested as a guest. Out of scope here.
+- iOS / Android: out of scope.
+
+### 3.4 VM inventory
+- `debian-headless-1` … `debian-headless-5` cover the five Linux peer roles.
+- `windows-utm-1` is `include_in_all=false`, `lab_role=windows_client`,
+  sidecar-only today.
+
+### 3.5 Branch state at doc creation
+- `main` @ `52372a7` (and `origin/main`).
+- `dazzling-wilson-16b7df` (active worktree) @ `52372a7`.
+- `claude/amazing-antonelli-190578` (other worktree) @ `f838a76` (one
+  ancestor commit behind `main`; no unique work).
+- No stashes. No uncommitted changes in the active worktree at creation.
+
+If you pick this plan up later, re-run the branch survey before assuming the
+above is still true.
+
+## 4) Non-Negotiable Constraints
+
+These come from `CLAUDE.md`, `AGENTS.md`, `documents/SecurityMinimumBar.md`,
+and the existing related plans. They override every choice in this plan.
+
+1. **One hardened execution path per security-sensitive workflow.** No
+   runtime fallback, downgrade, or legacy branch in production paths. The
+   dispatcher selects an OS-specific implementation; once selected it is the
+   only path.
+2. **Default-deny.** ACL, routes, DNS, trust state. The dispatcher must not
+   relax this on any OS.
+3. **Fail closed** when trust/security state is missing, invalid, stale,
+   replayed, or unauthorized. A stage that cannot verify its security
+   guarantee on a given OS must refuse to run on that OS rather than skip
+   the check.
+4. **No custom crypto, no custom VPN protocol invention.** WireGuard remains
+   a backend adapter. Cross-OS work does not get to invent shortcuts.
+5. **No WireGuard / OS specifics leaking into protocol-agnostic crates.** OS
+   adapters live behind the backend / orchestrator abstractions.
+6. **Argv-only privileged exec.** No `cmd.exe /c …` and no PowerShell string
+   interpolation with untrusted input on Windows. No shell construction
+   with untrusted values on Linux.
+7. **Strict key custody.** OS keystore (DPAPI on Windows; OS keystore on
+   Linux when available) else encrypted-at-rest fallback with strict
+   permissions and startup permission checks. Never log key material.
+8. **No TODO/FIXME/placeholders in completed deliverables.**
+9. **Each implemented security control has both an enforcement point in
+   code and a verification method** (unit test, integration test, negative
+   test, or gate check). Negative tests are mandatory for every fail-closed
+   claim.
+10. **macOS / iOS / Android stubs must reject explicitly with a clear
+    blocker reason.** No silent "no-op success" branches.
+11. **Linux behavior must not regress.** All existing Linux gates pass on
+    every increment.
+12. **Mandatory gates** (CLAUDE.md §7) run for every substantial increment:
+    `cargo fmt --check`, `cargo clippy -D warnings`, `cargo check`,
+    `cargo test`, `cargo audit --deny warnings`,
+    `cargo deny check bans licenses sources advisories`, plus any
+    scope-specific gate scripts.
+
+## 5) Security-Parity Matrix (Windows-First)
+
+For each existing Linux orchestrator-enforced control, list the Windows
+equivalent that must exist before a Windows guest can fill any of the five
+peer slots. Mac/iOS/Android entries are intentionally `Stub only — out of
+scope this delta`.
+
+| # | Control (Linux today) | Windows equivalent required | Status today |
+|---|---|---|---|
+| 1 | Service hardening: systemd unit with `NoNewPrivileges`, `ProtectSystem=strict`, `ReadOnlyPaths`, etc. | Windows Service running under restricted virtual SID; binary path ACL'd to SYSTEM+Admins; no interactive desktop; recovery action defined; service-image-path drift detection | Service exists (`crates/rustynetd/src/windows_service.rs`); hardening profile + verifier still needed |
+| 2 | Privileged exec: argv-only, no shell construction | `CreateProcess` with explicit argv; never `cmd.exe /c`; never PowerShell string concat with untrusted input; helper exec audited end-to-end | Recent commit `f838a76` hardened helper exec; full audit pending |
+| 3 | Config dir perms: `/etc/rustynet` 0700, owner check at startup | `C:\ProgramData\RustyNet\` ACL: SYSTEM + Administrators full, Users denied; startup ACL verifier; fail-closed if drift; orchestrator stage that re-verifies on the live guest | Phase 2 installer repairs ACLs; explicit startup verifier + orchestrator stage missing |
+| 4 | Key custody: OS keystore else encrypted-at-rest with permission check | DPAPI machine scope (or CNG NCrypt) for runtime passphrase; encrypted-at-rest fallback with same ACL check; no plaintext key on disk; orchestrator stage validates the live state | DPAPI passphrase custody landed (Phase 2); orchestrator-side validation stage missing |
+| 5 | DNS fail-closed in protected mode | NRPT rules + interface-bound resolver; orchestrator stage applies, validates, and runs a negative test that proves bypass is impossible | Stage missing on Windows |
+| 6 | Default-deny ACL applied + verified by traffic test | Same protocol layer (daemon-enforced); traffic-test probe must run from a Windows node and confirm denies | Probe harness Linux-shell-only today |
+| 7 | Signed trust state + anti-replay before mutation | Protocol-layer, daemon-side; cross-platform if the Windows daemon takes the same code path | Verify the Windows daemon takes the shared path and not a parallel branch |
+| 8 | Wrapper-script hygiene: shell wrappers must dispatch to Rust only and fail closed | Same rule on Windows: no PowerShell wrapper that does anything beyond dispatch; argv-only | Audit pending |
+| 9 | Binary integrity at install (signed release artifact + checksum) | Authenticode signature verification on the Windows binary before service registration; reject unsigned | Not enforced today |
+| 10 | Membership and assignment distribution under owner-checked dir | Same on Windows under `C:\ProgramData\RustyNet\membership` and `\trust`, with the same ownership/ACL invariants | Path layout exists; stage that distributes membership/assignment to a Windows peer missing |
+
+Each row, when implemented, must produce: (a) enforcement code, (b) an
+orchestrator stage that verifies it on a live Windows guest, (c) a negative
+test that proves it fails closed.
+
+## 6) Architecture Plan
+
+### 6.1 `StageOrchestrator` trait
+New trait in `crates/rustynet-cli/src/vm_lab/`:
+
+- One method per live-lab stage (or a single `execute_stage(stage_id,
+  &[RemoteTarget])` enum-driven entry, to be decided at first impl).
+- Two real impls land in P1:
+  - `LinuxBashOrchestrator`: wraps the existing
+    `scripts/e2e/live_linux_lab_orchestrator.sh` for back-compat. Used when
+    every node in a stage's target set is Linux.
+  - `RustOrchestrator`: dispatches per-target on `VmPlatformProfile`
+    (service manager, remote shell, paths). Used when any node is non-Linux,
+    or when invoked under an explicit migration flag for a Linux-only run.
+- Stage outputs converge on a single typed report. No "which orchestrator
+  ran" branching downstream.
+
+### 6.2 Capability-based stage gating
+Replace `ensure_live_lab_profile_linux_only` with per-stage capability
+declarations. Each stage declares:
+
+- required capabilities (e.g. `requires_capability(NetemImpairment)`),
+- supported OS variants and the specific reason any unsupported variant is
+  rejected.
+
+A stage that cannot run on a given target's OS skips with an explicit
+recorded reason. A stage whose security guarantee cannot be verified on a
+target's OS does **not** skip — it fails the run. Distinguish these two
+cases in the report.
+
+### 6.3 Per-OS adapters
+- `ServiceManager` adapter trait: systemd | windows-service | launchd
+  (stub) | unsupported. Operations: install, enable, start, stop, status,
+  uninstall.
+- `RuntimePaths` adapter trait: returns canonical config / membership /
+  trust / logs / secrets roots per OS. Linux + Windows real, macOS stub.
+- `RemoteExec` adapter: argv-only command dispatch over the configured
+  remote-shell channel (POSIX SSH, WinRM/SSH+PowerShell). Already partially
+  exists for Windows sidecar; consolidate.
+- `DaemonProbe` adapter: typed daemon-reported state (mesh join, ACL
+  effective set, DNS resolver state). Cross-platform because it is
+  daemon-driven, not host-shell-driven.
+
+### 6.4 Test harness moves to daemon-driven probes where possible
+Replace shell `nc` / `ping` / `curl` traffic checks with daemon-issued probes
+that report typed results. Removes the per-OS shell divergence and gives
+one hardened parser path per check (consistent with the wider Phase G
+direction in `ShellToRustMigrationPlan_2026-03-06.md`).
+
+### 6.5 Linux-only capabilities stay Linux-only
+Examples: `tc`/`netem` cross-network impairment, `nftables` forwarding
+introspection. These are kernel-feature-bound; declare them as
+Linux-capability stages and skip-with-reason when the target is Windows.
+Do not fake or simulate them.
+
+## 7) Phased Plan
+
+Each phase ends with: code change, code-side verifier, negative test, gate
+re-run, doc status update in this file.
+
+### Phase W0 — Doc + capture baseline (this plan)
+- Land this delta plan and index it. **(in progress)**
+- Capture an evidence baseline: current `vm-lab-orchestrate-live-lab`
+  stage list, current Linux-only gate, current Windows sidecar surface, with
+  exact file:line refs (already inline in §3).
+
+Exit: this document is committed and indexed.
+
+### Phase W1 — Security parity gates 1 (config dir + DNS fail-closed)
+Closes matrix rows 3 and 5.
+
+- W1.1 Implement Windows runtime-dir startup ACL verifier in `rustynetd`
+  Windows path. SYSTEM + Administrators only, deny Users, deny Everyone.
+  Daemon refuses to start if drifted. Negative test: drift the ACL, expect
+  startup refusal with exact error code.
+- W1.2 Implement orchestrator stage `validate_windows_runtime_acls` that
+  runs the verifier against a live guest and reports per-path results.
+- W1.3 Implement Windows DNS fail-closed enforcement (NRPT + interface-bound
+  resolver) in the runtime path. Daemon-side enforcement; orchestrator
+  applies and validates.
+- W1.4 Implement orchestrator stage `validate_windows_dns_failclosed`. Must
+  include a negative test that attempts a bypass (e.g. setting a rogue DNS
+  server on the test interface) and confirms the daemon shuts the path down.
+- W1.5 Run mandatory gates plus any Windows-specific gate scripts.
+
+Exit: a Windows guest can pass the same DNS-fail-closed and config-dir-ACL
+guarantees the Linux nodes pass. Status of each item recorded inline in
+§10.
+
+### Phase W2 — Security parity gates 2 (key custody + binary integrity + exec audit)
+Closes matrix rows 1, 2, 4, 8, 9.
+
+- W2.1 Authenticode signature verification on the Windows binary before
+  service registration in the bootstrap provider. Reject unsigned. Negative
+  test with a tampered binary.
+- W2.2 Service hardening profile verifier (restricted SID, no interactive
+  desktop, image-path pin, recovery action). Daemon-side verifier and
+  orchestrator stage `validate_windows_service_hardening`.
+- W2.3 Audit every Windows `CreateProcess` / shell-out call site for
+  argv-only discipline. Add lints / tests where feasible to prevent
+  reintroduction.
+- W2.4 Daemon-side validator that confirms key material is DPAPI-protected
+  at rest and not present in plaintext. Orchestrator stage
+  `validate_windows_key_custody`.
+- W2.5 Wrapper-hygiene audit (no PowerShell wrapper does anything beyond
+  argv-only dispatch).
+- W2.6 Run mandatory gates.
+
+Exit: Windows guest passes the matrix rows 1, 2, 4, 8, 9 with code +
+verifier + negative test for each.
+
+### Phase W3 — Orchestrator dispatcher (`StageOrchestrator` trait)
+- W3.1 Define `StageOrchestrator` trait + `LinuxBashOrchestrator` impl that
+  wraps the existing bash script. Behavior unchanged for pure-Linux runs.
+- W3.2 Define `ServiceManager`, `RuntimePaths`, `RemoteExec`, `DaemonProbe`
+  adapter traits with Linux + Windows real impls and macOS / iOS / Android
+  `Unsupported` stubs. Negative tests assert each stub rejects with a clear
+  blocker reason.
+- W3.3 Land `RustOrchestrator` impl that dispatches per-target on
+  `VmPlatformProfile`. For pure-Linux node sets, it must produce
+  byte-identical (or behaviorally equivalent — to be defined precisely
+  before the swap) reports to the bash impl. No silent divergence.
+- W3.4 Run mandatory gates plus the full Linux live-lab gate to prove no
+  regression on the reference path.
+
+Exit: dispatcher exists and Linux runs are unaffected. Windows runs still
+go through the sidecar path until Phase W4.
+
+### Phase W4 — Per-stage capability gating + Windows mesh-join
+- W4.1 Replace `ensure_live_lab_profile_linux_only` with per-stage
+  capability checks. Stages that require kernel features unavailable on
+  Windows (e.g. `tc`/`netem`) skip-with-reason; stages that enforce
+  security guarantees that have no Windows verifier yet **fail** the run
+  rather than skip.
+- W4.2 Implement Windows mesh-join stage (currently deferred at
+  `crates/rustynet-cli/src/vm_lab/mod.rs:5132`). Membership + assignment
+  ingestion via the existing Windows IPC path, with the same signed-state
+  + anti-replay guarantees.
+- W4.3 Implement Windows traffic-test peer participation. Daemon-driven
+  probes in/out of the Windows node confirm default-deny and selected
+  allows. Negative tests for both directions.
+- W4.4 Implement Windows route + DNS lifecycle stages within the lab
+  orchestrator (consume rather than re-implement the daemon-side route/DNS
+  truth from [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+  §"Route And DNS Runtime Truth").
+- W4.5 Run mandatory gates plus a 4×Linux + 1×Windows live-lab run as the
+  first heterogeneous proof. Capture artifacts under
+  `artifacts/orchestrator_w4/<UTC-timestamp>/`.
+
+Exit: any one of the five peer slots can be Windows. The orchestrator
+stops gating on `platform=linux` and gates on per-stage capability
+declarations instead.
+
+### Phase W5 — Stretch: 5×Windows and mixed-arrangement matrices
+- W5.1 5×Windows live-lab run. Likely requires extra Windows guests in the
+  inventory; track that ask in `vm_lab_inventory.json` updates.
+- W5.2 Random arrangements (e.g. Windows as exit; Windows as relay; two
+  Windows + three Linux) covered by a matrix runner.
+- W5.3 Promote Windows posture in the release matrix only after this
+  evidence exists **and** the [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+  §"Definition Of Done" has independently been met.
+
+Exit: heterogeneous topology evidence is current and reproducible.
+
+### Stub-only (kept for future)
+- `ServiceManager::Launchd` stub returning `Unsupported("macos
+  orchestration not yet implemented")`.
+- `RuntimePaths` macOS stub returning `Unsupported(...)`.
+- iOS / Android: `VmGuestPlatform` variants stay; no provider; tests assert
+  rejection.
+- A future delta will fill these in. Do not delete the variants in this
+  delta even if they are unused.
+
+## 8) Validation Strategy
+
+Per CLAUDE.md §7 — mandatory on every increment:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo test --workspace --all-targets --all-features`
+- `cargo audit --deny warnings`
+- `cargo deny check bans licenses sources advisories`
+
+Scope-specific:
+
+- `./scripts/ci/phase9_gates.sh`
+- `./scripts/ci/phase10_gates.sh`
+- `./scripts/ci/membership_gates.sh`
+- Active-phase gate scripts as they emerge under the Windows / orchestrator
+  scope.
+
+Live-lab evidence (capture under `artifacts/`):
+
+- pre-change baseline: 5×Linux live-lab run on the current main, archive the
+  report;
+- per-phase: re-run 5×Linux to prove no regression;
+- W4 milestone: 4×Linux + 1×Windows live-lab run, archive report and the
+  per-stage capability decisions;
+- W5 milestone: heterogeneous matrix runs.
+
+Negative tests are mandatory for every fail-closed claim. A stage that
+cannot demonstrate fail-closed on the live guest does not count as
+complete.
+
+## 9) Rollback Strategy
+
+- Use git history for rollback; do not keep parallel active orchestrator
+  paths in tree.
+- During W3, the `LinuxBashOrchestrator` impl preserves byte-/behavior-
+  level parity with the current bash script. If `RustOrchestrator` shows
+  divergence on a Linux-only run, revert the dispatcher selection (still
+  one path) rather than running both side by side.
+- The Linux-only gate is removed only at W4.1, after W1, W2, W3 are
+  complete and all Linux gates still pass on the dispatcher path. Until
+  then, Windows continues to run as the sidecar.
+
+## 10) Status Tracker
+
+Update this section as work lands. Use the same "Agent Update Rules" as
+[ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+§"Agent Update Rules": exact file paths, exact verification commands,
+exact artifact paths, residual risk, and blockers if any. Mark
+conservatively.
+
+### Phase W0
+- [x] Doc drafted and committed at branch `dazzling-wilson-16b7df`.
+  - Changed files: this file, `documents/operations/active/README.md`.
+  - Verification: doc review by user before code work begins.
+  - Residual risk: none.
+
+### Phase W1 (Security parity gates 1: config dir + DNS fail-closed)
+- [x] W1.1 Windows runtime-dir startup ACL verifier
+  - Changed files:
+    - `crates/rustynetd/src/windows_paths.rs` — extracted pure SDDL
+      evaluators (`evaluate_windows_runtime_acl_sddl`,
+      `evaluate_windows_local_secret_acl_sddl`,
+      `evaluate_windows_protected_dacl_sddl`); refactored
+      `validate_windows_runtime_acl` and `validate_windows_local_secret_acl`
+      to delegate; added `validate_windows_runtime_startup_acls()` that
+      hard-requires every reviewed root (state, config, logs, trust,
+      membership, keys, secrets, key-custody) to exist as a real directory
+      with a protected DACL, a recognized owner, and grants for LocalSystem
+      and Builtin Administrators only. Daemon refuses to start on drift.
+    - `crates/rustynetd/src/daemon.rs` — `run_daemon` now calls
+      `validate_windows_runtime_startup_acls()` under `#[cfg(windows)]`
+      between `validate_daemon_config` and any FS mutation; failures map to
+      `DaemonError::InvalidConfig` (fail-closed startup).
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynetd --lib windows_paths` — 23 / 23 pass
+      (including 14 new SDDL-evaluator tests covering: reviewed-directory
+      acceptance, service-SID owner acceptance, missing protected DACL,
+      world-writable principals (`WD`/`AU`/`BU`), missing LocalSystem grant,
+      missing Administrators grant, unrecognized owner, missing owner,
+      missing DACL marker, unprotected-but-allowed file ACL, DPAPI blob
+      acceptance, DPAPI blob WD-rejection, startup-roots completeness, and
+      a non-Windows `validate_windows_runtime_startup_acls` failure check).
+    - `cargo test -p rustynetd --lib` — 351 / 351 pass.
+    - `cargo test -p rustynetd windows_` — 28 / 28 pass.
+    - `cargo test -p rustynet-crypto` — 21 / 21 pass.
+    - `cargo check -p rustynetd -p rustynet-crypto -p rustynet-windows-native`
+      clean.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+    - `cargo check -p rustynet-crypto --target x86_64-pc-windows-msvc`
+      clean.
+  - Artifacts: none (code-only slice; no runtime artifacts produced).
+  - Residual risk:
+    - Full `cargo check -p rustynetd --target x86_64-pc-windows-msvc` is
+      still blocked by the documented `libsqlite3-sys` cross-compilation
+      gap (per
+      [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+      §"Current Phase 2 validation blocker"). The new code path is purely
+      additive within an existing `#[cfg(windows)]` block in `run_daemon`
+      and the cross-target compile of `rustynet-windows-native` (which
+      contains the `inspect_file_sddl` binding) succeeds, so the verifier
+      will resolve once the toolchain blocker is addressed; no change is
+      needed in this code.
+    - Workspace-wide `cargo clippy --workspace --all-targets --all-features
+      -- -D warnings` fails on baseline `main` due to pre-existing
+      `clippy::too_many_arguments` and `clippy::type_complexity` errors in
+      `rustynet-backend-wireguard/src/windows_command.rs` (unrelated to
+      this slice). Tracked as a separate cleanup outside this delta.
+    - Live-guest drift proof (drift the ACL on a real Windows VM and
+      observe daemon refusal) is owned by stage W1.2.
+  - Blocker / prerequisite: none for W1.1; W1.2 depends on the Windows
+    UTM access path stabilized by
+    [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
+- [x] W1.2a Daemon-side dispatchable subcommand
+      `rustynetd windows-runtime-acls-check`
+  - Changed files:
+    - `crates/rustynetd/src/windows_paths.rs` — added typed report types
+      `WindowsRuntimeAclRootStatus` (`ok` / `missing` / `drifted`),
+      `WindowsRuntimeAclRootEntry`, `WindowsRuntimeAclReport`
+      (schema_version=1, overall_ok, per-root entries) and
+      `collect_windows_runtime_acl_report()` which iterates the canonical
+      reviewed roots and captures per-root status without aborting on the
+      first failure. Startup gate from W1.1 stays fail-fast; the diagnostic
+      command produces a complete drift map for the orchestrator in a
+      single round-trip.
+    - `crates/rustynetd/src/main.rs` — added subcommand
+      `windows-runtime-acls-check [--no-fail-on-drift]`. Default behavior
+      prints the JSON report and exits non-zero on any drift (fail-closed
+      for orchestrator dispatch); `--no-fail-on-drift` is report-only for
+      diagnostics. Help text advertises the subcommand and flag.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynetd` — 388 / 388 pass (354 lib + 31 bin + 3
+      integration), including 3 new `windows_paths` report-shape tests
+      (status-tag serialization, off-Windows full-report shape,
+      `WindowsRuntimeAclReport` schema serialization) and 3 new bin tests
+      (help-text advertising, unknown-flag rejection, off-Windows
+      fail-closed default + `--no-fail-on-drift` opt-out).
+    - `cargo check -p rustynetd -p rustynet-crypto -p rustynet-windows-native`
+      clean.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+  - Artifacts: none (code-only slice).
+  - Residual risk:
+    - Same `libsqlite3-sys` Windows-target compile blocker as W1.1; report
+      types and subcommand are platform-agnostic Rust, so cross-target
+      compile of `rustynet-windows-native` (which holds the SDDL binding)
+      is unaffected.
+    - Same workspace-clippy baseline failure as W1.1; not introduced here.
+- [x] W1.2b Orchestrator-side live-lab stage `validate_windows_runtime_acls`
+  - Changed files:
+    - `crates/rustynetd/src/windows_paths.rs` — added `Deserialize` to the
+      report types so the orchestrator can parse them.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added new live-lab stage
+      `validate_windows_runtime_acls` between `validate_windows_client_install`
+      and the deferred `validate_windows_mesh_join` in
+      `run_windows_orchestration_stages`. Stage skips on dry-run or when
+      bootstrap / install validation didn't pass; otherwise it dispatches
+      `& 'C:\Program Files\RustyNet\rustynetd.exe' windows-runtime-acls-check
+      --no-fail-on-drift` over the existing argv-only PowerShell-encoded SSH
+      channel, parses the typed JSON report, and on drift produces a
+      `VmLabStageStatus::Fail` outcome with each drifted/missing root
+      identified by label and reason. The raw report is archived under
+      `report_dir/logs/validate_windows_runtime_acls.log` for evidence.
+      Pure parser/evaluator extracted as
+      `evaluate_windows_runtime_acls_report` for direct unit testing.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo build -p rustynet-cli` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 356 / 356 pass
+      (was 348; +8 new evaluator tests covering: all-ok payload accept,
+      drifted-root reason propagation, missing-root reason propagation,
+      unknown schema_version reject, empty-roots reject, two
+      overall_ok/per-root inconsistency rejects, malformed-JSON reject).
+    - `cargo test -p rustynetd` — 388 / 388 still pass after adding
+      `Deserialize`.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+  - Artifacts: none in this slice (real artifacts produced when the stage
+    runs against a live Windows VM).
+  - Residual risk:
+    - Live-guest evidence (drift the ACL on a real Windows VM and observe
+      orchestrator-side `Fail` w/ the right root identified) is the missing
+      end-to-end proof. Owned by the next live-lab run, which depends on
+      [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+      stabilizing the UTM access path.
+    - The stage assumes the installed binary lives at
+      `C:\Program Files\RustyNet\rustynetd.exe`. If a future bootstrap
+      provider relocates the binary, the orchestrator constant
+      `WINDOWS_RUSTYNETD_EXE_PATH` and the daemon-side
+      `DEFAULT_WINDOWS_INSTALL_ROOT` must move together; track in W2.2.
+    - Same pre-existing baseline workspace-clippy failure as W1.1; tracked
+      separately, not introduced here.
+- [ ] W1.3 Windows DNS fail-closed enforcement
+- [ ] W1.4 Orchestrator stage `validate_windows_dns_failclosed` (with
+      negative bypass test)
+- [ ] W1.5 Mandatory gates rerun
+
+### Phase W2 (Security parity gates 2: key custody + binary integrity + exec audit)
+- [x] W2.1 Authenticode signature **presence** verification (W2.1a)
+  - Changed files:
+    - `crates/rustynetd/src/windows_authenticode.rs` (new) — pure-Rust PE
+      parser (no `unsafe`, no external crates). Walks the DOS header → PE
+      header → COFF header → optional header (PE32 or PE32+) → data
+      directories → Certificate Table directory entry, then iterates
+      `WIN_CERTIFICATE` entries with 8-byte alignment. Recognises
+      revision=0x0200 (`WIN_CERT_REVISION_2_0`) + type=0x0002
+      (`WIN_CERT_TYPE_PKCS_SIGNED_DATA`) as a valid Authenticode entry.
+      Typed `WindowsAuthenticodeReport` (schema_version=1, binary_path,
+      binary_size_bytes, overall_ok, signature_present,
+      certificate_table_offset, certificate_table_size, certificates,
+      drift_reasons). Public `inspect_authenticode_signature(path)` that
+      reads the binary and returns the report.
+    - `crates/rustynetd/src/lib.rs` — exposed the new module.
+    - `crates/rustynetd/src/main.rs` — added subcommand
+      `windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]`.
+      Default binary path = `C:\Program Files\RustyNet\rustynetd.exe`.
+      Default behavior is fail-closed.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added live-lab stage
+      `validate_windows_authenticode` between
+      `validate_windows_key_custody` and the deferred
+      `validate_windows_mesh_join`. Stage skips when an earlier stage
+      didn't pass; otherwise dispatches the new subcommand and parses the
+      typed JSON report. Pure parser/evaluator extracted as
+      `evaluate_windows_authenticode_report` for direct unit testing.
+      Raw report archived under
+      `report_dir/logs/validate_windows_authenticode.log`.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynetd` — 447 / 447 pass (401 lib + 43 bin + 3
+      integration). +12 lib tests in `windows_authenticode` covering:
+      well-formed PE w/ PKCS signature accept, empty Cert Table directory
+      reject, Cert Table offset outside binary reject, non-PKCS cert
+      type drift-flag, missing MZ reject, wrong PE magic reject, tiny
+      binary reject, bogus optional header magic reject, two-cert PE
+      accept, zero-length WIN_CERTIFICATE entry reject, report serde
+      round-trip, missing-binary read-failure path. +5 bin tests in
+      `main.rs` (help advertises subcommand + flag, unknown-flag reject,
+      missing `--binary-path` value reject, missing-binary fail-closed,
+      `--no-fail-on-drift` opt-out for missing binary).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 375 / 375 pass.
+      +6 evaluator tests covering: signed payload accept w/ identity-rich
+      summary, unsigned-binary reject, schema-version reject, two
+      overall_ok / signature_present / drift_reasons inconsistency
+      rejects, malformed-JSON reject.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+  - Artifacts: none in this slice; live-lab artifacts produced by the
+    stage when run against a real Windows VM with the signed installer.
+  - Residual risk:
+    - **Presence check only.** This slice rejects unsigned binaries and
+      malformed signatures, but does NOT validate the PKCS#7 SignedData
+      payload, the certificate chain, the file-hash binding via
+      `spcIndirectData`, or timestamp validity. An attacker who can
+      produce a self-signed Authenticode entry will pass this gate. Full
+      chain validation requires Win32 `WinVerifyTrust` (W2.1b — adds
+      `Win32_Security_WinTrust` feature to `windows-sys` deps and a
+      safe wrapper in `rustynet-windows-native`).
+    - The PE parser is targeted at well-formed PE32+ binaries. It bounds-
+      checks every read, but unusual layouts (overlapping cert table and
+      sections, etc.) may fail to parse. That's still fail-closed
+      behavior; the daemon refuses to start.
+    - The orchestrator stage assumes the installed binary lives at
+      `C:\Program Files\RustyNet\rustynetd.exe`. Same constant
+      reconciliation note as W1.2b / W2.2.
+- [x] W2.2 Service hardening profile verifier + stage
+  - Changed files:
+    - `crates/rustynetd/src/windows_service_hardening.rs` (new) — typed
+      `WindowsServiceHardeningSnapshot` and `WindowsServiceHardeningReport`
+      structs, pure `evaluate_windows_service_hardening` aggregator that
+      returns every drift reason in one pass, `build_windows_service_hardening_report`
+      wrapper, best-effort `parse_windows_image_path_argv` for the SCM
+      `ImagePath` string, and a `cfg(windows)` snapshot collector that
+      queries the live SCM via the existing `windows-service` crate
+      (`Service::query_config`, `get_config_service_sid_info`,
+      `get_failure_actions`) and inspects the binary file ACL via
+      `rustynet_windows_native::inspect_file_sddl`. Non-Windows hosts get
+      a clear blocker error so the subcommand still fails-closed without
+      pretending to verify. The binary-ACL check delegates to the same
+      `evaluate_windows_runtime_acl_sddl` evaluator W1.1 introduced, so
+      both rows of the security-parity matrix land on the same hardened
+      DACL contract.
+    - `crates/rustynetd/src/lib.rs` — exposed the new module.
+    - `crates/rustynetd/src/main.rs` — added subcommand
+      `windows-service-hardening-check [--no-fail-on-drift]`. Default is
+      fail-closed (non-zero on drift, suitable for orchestrator dispatch);
+      `--no-fail-on-drift` is report-only.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added live-lab stage
+      `validate_windows_service_hardening` between
+      `validate_windows_runtime_acls` and the deferred
+      `validate_windows_mesh_join` in `run_windows_orchestration_stages`.
+      Stage skips on dry-run or when an earlier stage didn't pass;
+      otherwise dispatches the new subcommand over the existing argv-only
+      PowerShell-encoded SSH channel and parses the typed JSON report.
+      Pure parser/evaluator extracted as
+      `evaluate_windows_service_hardening_report` for direct unit testing.
+      Raw report archived under
+      `report_dir/logs/validate_windows_service_hardening.log`.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynetd` — 415 / 415 pass (378 lib + 34 bin + 3
+      integration). +24 lib tests in `windows_service_hardening` covering:
+      reviewed-snapshot accept, NT-SERVICE virtual account + restricted
+      SID accept, schema-version reject, wrong-service-name reject,
+      binary-outside-install-root reject, renamed-binary reject,
+      missing-`--windows-service` reject, missing-`--env-file` reject,
+      inline-daemon-flag reject (e.g. `--backend windows-wireguard-nt`),
+      unreviewed-account reject, SID-type-`none` reject,
+      interactive-process reject, zero-failure-actions reject,
+      drifted-binary-ACL reject, empty-binary-ACL reject, multiple-drift
+      aggregation, build-report ok shape, build-report drift shape, three
+      `parse_windows_image_path_argv` cases (quoted exe with spaces,
+      unquoted exe without spaces, empty input), report serde value
+      shape, full report serde round-trip, off-Windows collector
+      blocker. +3 bin tests in `main.rs` (help advertises subcommand,
+      unknown-flag rejection, off-Windows fail-closed default).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 362 / 362 pass.
+      +6 evaluator tests in `vm_lab::tests` covering: reviewed payload
+      accept w/ identity-rich summary, drift payload reject w/ specific
+      reasons surfaced, schema-version reject, two
+      overall_ok/drift_reasons inconsistency rejects, malformed-JSON
+      reject.
+    - `cargo test -p rustynet-crypto` — 21 / 21 pass.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+  - Artifacts: none in this slice; live-lab artifacts produced by the
+    stage when run against a real Windows VM.
+  - Residual risk:
+    - Cross-target `cargo check -p rustynetd --target
+      x86_64-pc-windows-{msvc,gnu}` from this macOS host is still blocked
+      by the documented `libsqlite3-sys` (MSVC) / missing
+      `x86_64-w64-mingw32-gcc` (GNU) toolchain gaps. The new
+      `cfg(windows)` collector uses the `windows-service` crate APIs
+      (`Service::query_config`, `get_config_service_sid_info`,
+      `get_failure_actions`) which were verified by reading the crate
+      sources at `~/.cargo/registry/src/index.crates.io-…/windows-service-0.8.0`
+      — `ServiceConfig::executable_path` (PathBuf), `account_name`
+      (Option<OsString>), `service_type` (`ServiceType` bitflags including
+      `INTERACTIVE_PROCESS`), `start_type` (`ServiceStartType` enum), and
+      `ServiceFailureActions::actions` (Option<Vec<ServiceAction>>) — so
+      the build is expected to succeed once the toolchain blocker clears.
+      No new `windows-sys` features were required.
+    - The argv parser is a best-effort split optimized for the reviewed
+      install's quoted-exe + space-separated flags shape. If a
+      future installer emits a more elaborate command line (escaped
+      backslashes, `^` quoting, etc.), the evaluator may flag a false
+      drift. Reviewed installer never produces such shapes today; flag in
+      `WindowsWorkingNodePlan` if it changes.
+    - Live-guest evidence (drift the service registration on a real
+      Windows VM and observe orchestrator-side `Fail` w/ the specific
+      drift reason) requires the same UTM access path as W1.2b.
+- [x] W2.3 Argv-only audit for Windows exec sites
+  - Findings:
+    - All `Command::new("ssh"|"scp"|"git"|"cargo"|"bash"|utmctl)` sites in
+      `crates/rustynet-cli/src/vm_lab/` use Rust's `Command::arg(...)` /
+      `args(...)` API, which builds `argv` arrays and passes them to
+      `execve` with no shell interpretation. No `cmd.exe /c` or
+      shell-string constructions found in active production paths.
+    - PowerShell script bodies that get sent over the SSH channel are
+      built by `build_windows_helper_command` and similar helpers in
+      `crates/rustynet-cli/src/vm_lab/mod.rs`, which run every
+      interpolated path / value through `powershell_quote` (single-quoted
+      PS literal w/ proper `'` → `''` escape) and pre-flight every
+      string with `ensure_no_control_chars`. Long flags matching
+      `--[A-Za-z0-9-]+` pass through unquoted (PS parser treats them as
+      tokens). Short / value args always get quoted. The whole script
+      body is then base64-encoded and dispatched as
+      `powershell.exe -EncodedCommand <b64>` — the encoding step makes
+      the SSH-layer transport oblivious to PS quoting concerns.
+    - The Windows service host registration path
+      (`crates/rustynetd/src/windows_service.rs`) uses the
+      `windows-service` crate's typed `ServiceManager::create_service`
+      API, which passes the binary path and args through Win32 SCM
+      structs (no shell). Audit confirmed via cargo-source review at
+      `~/.cargo/registry/src/index.crates.io-…/windows-service-0.8.0`.
+  - Hardening landed in this slice:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — extracted shared builder
+      `build_windows_security_check_invocation(subcommand, extra_args)`.
+      The builder rejects subcommands that are empty or contain anything
+      other than ASCII-alphanumeric + hyphen (so a future caller cannot
+      sneak a metacharacter through), runs every value-arg through
+      `powershell_quote` w/ `ensure_no_control_chars`, lets well-formed
+      `--long-flag` tokens pass unquoted, and emits a
+      single-quoted-literal `& 'C:\Program Files\RustyNet\rustynetd.exe'
+      <subcommand> --no-fail-on-drift [...]`. All four W1.2/W2.2/W2.4/
+      W2.1 stage helpers now route through this builder instead of
+      hand-rolled `format!` — single audit point.
+    - 6 new unit tests in `vm_lab::tests` covering: well-formed
+      invocation shape (quoted exe path + subcommand + fail-closed flag);
+      rejection of subcommands carrying `;`, backticks, `$`, spaces,
+      apostrophes, or empty string; apostrophe in a value arg gets
+      doubled (`'` → `''`) and the resulting script keeps its
+      single-quote count even (balanced literal); control-byte arg
+      rejected; long-flag passes unquoted; positional / short arg gets
+      quoted.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 382 / 382 pass
+      (was 376 before this slice; +6 new tests).
+    - `cargo test -p rustynetd` — 447 / 447 pass.
+    - `cargo build -p rustynet-cli --release` clean.
+  - Residual risk:
+    - Audit covered the active Windows orchestrator + daemon code paths
+      I've touched in this delta. Older PowerShell helper scripts under
+      `scripts/bootstrap/windows/` are static `.ps1` files (not
+      constructed at runtime) and were not in scope; their argv handling
+      lives inside the script files themselves.
+    - The `--EncodedCommand` base64 wrap keeps SSH transport safe but
+      the PS interpreter still parses the decoded body — the in-script
+      quoting discipline is what protects us there. Tests assert that
+      contract.
+- [x] W2.4 DPAPI key-custody validator + stage
+  - Changed files:
+    - `crates/rustynetd/src/windows_key_custody.rs` (new) — typed
+      `WindowsKeyCustodyEntry` (with present/absent requirement string and
+      a tagged `WindowsKeyCustodyEntryStatus` enum: `ok`/`missing`/
+      `invalid`/`forbidden`/`absent_as_expected`) and
+      `WindowsKeyCustodyReport`. Pure aggregator
+      `evaluate_windows_key_custody` returns every drift reason in one
+      pass and rejects collector inconsistencies (required reported
+      absent, absent reported ok, etc.). Cross-platform collector
+      `collect_windows_key_custody_snapshot` walks the canonical paths:
+      WG passphrase blob (`.dpapi`), WG encrypted private key (`.enc`),
+      WG public key (`.pub`) — all required, all ACL-locked via the
+      shared `evaluate_windows_local_secret_acl_sddl` evaluator from
+      W1.1; plus the WG plaintext runtime private key — must be ABSENT
+      at rest (Phase E migrated runtime custody to encrypted-at-rest).
+      Entries sorted by label for deterministic JSON output.
+    - `crates/rustynetd/src/lib.rs` — exposed the new module.
+    - `crates/rustynetd/src/main.rs` — added subcommand
+      `windows-key-custody-check [--no-fail-on-drift]`.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added live-lab stage
+      `validate_windows_key_custody` between
+      `validate_windows_service_hardening` and the deferred
+      `validate_windows_mesh_join`. Stage skips when an earlier stage
+      didn't pass; otherwise dispatches the new subcommand and parses
+      the typed JSON report. Pure parser/evaluator extracted as
+      `evaluate_windows_key_custody_report` for direct unit testing.
+      Raw report archived under
+      `report_dir/logs/validate_windows_key_custody.log`.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynetd` — 430 / 430 pass after this slice (389
+      lib + 38 bin + 3 integration). +11 lib tests in
+      `windows_key_custody`: clean-snapshot accept, empty-entries
+      reject, required-missing reject, required-invalid-ACL reject,
+      forbidden-present reject, requirement/status inconsistency rejects
+      (4 variants), unknown-requirement reject, multi-drift aggregation,
+      off-Windows snapshot shape, serde round-trip. +4 bin tests in
+      `main.rs` (help advertising, unknown-flag reject, off-Windows
+      fail-closed default, `--no-fail-on-drift` opt-out).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 369 / 369 pass.
+      +7 evaluator tests covering: reviewed payload accept w/
+      "4 reviewed artifacts" summary, drift payload reject w/ specific
+      reasons surfaced, schema-version reject, empty-entries reject,
+      two overall_ok/drift_reasons inconsistency rejects, malformed-JSON
+      reject.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean.
+  - Artifacts: none in this slice.
+  - Residual risk:
+    - The collector validates **on-disk presence + ACL + extension** for
+      each artifact. It does not (yet) crack the DPAPI blob to confirm
+      it is in fact DPAPI-protected and not arbitrary bytes — that would
+      require a `CryptUnprotectData` test round-trip, which the existing
+      `windows_runtime_boundary` self-check already does for a
+      synthetic blob. Combining this with W2.4 is a follow-up if needed.
+    - Same pre-existing baseline blockers as the rest of W1/W2.
+- [ ] W2.4-followup: DPAPI round-trip self-test for the live runtime
+      passphrase (currently only synthesized in
+      `windows_runtime_boundary::run_windows_runtime_boundary_check`).
+- [ ] W2.5 Wrapper-hygiene audit
+- [ ] W2.6 Mandatory gates rerun
+
+### Phase W3 (Orchestrator dispatcher)
+- [ ] W3.1 `StageOrchestrator` trait + `LinuxBashOrchestrator`
+- [ ] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
+      traits with Linux + Windows impls and macOS/iOS/Android `Unsupported`
+      stubs
+- [ ] W3.3 `RustOrchestrator` impl with parity proof on Linux runs
+- [ ] W3.4 Mandatory gates + full Linux live-lab regression
+
+### Phase W4 (Per-stage capability gating + Windows mesh-join)
+- [ ] W4.1 Replace `ensure_live_lab_profile_linux_only` with per-stage
+      capabilities
+- [ ] W4.2 Windows mesh-join stage
+- [ ] W4.3 Windows traffic-test peer participation
+- [ ] W4.4 Windows route + DNS lifecycle stages
+- [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived
+
+### W1/W2 supporting tooling
+- [x] Standalone `ops vm-lab-validate-windows-security` subcommand
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — new
+      `VmLabValidateWindowsSecurityConfig` (inventory, windows_vm, SSH,
+      report_dir, dry_run, skip_access_bootstrap, skip_install) and
+      `run_validate_windows_security` runner. Dispatches the existing
+      `run_windows_orchestration_stages_with_options` with the new
+      `WindowsOrchestrationOptions { skip_access_bootstrap, skip_install }`,
+      writing a typed JSON aggregate report to
+      `<report_dir>/windows_security_validation.json`. Exits non-zero on
+      any per-stage `Fail`. Lets us iterate on the security validation
+      stages without spinning up the full 5-Linux + 1-Windows live-lab.
+    - `crates/rustynet-cli/src/main.rs` — added subcommand
+      `ops vm-lab-validate-windows-security ... [--skip-access-bootstrap]
+      [--skip-install]`. Help line advertises the new flags.
+    - `crates/rustynet-cli/Cargo.toml` — added `tempfile = "3"` as
+      dev-dependency for the new dry-run integration test.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 376 / 376 pass
+      (was 369 before this slice; +1 new
+      `run_validate_windows_security_dry_run_emits_skipped_stages_and_writes_report`
+      integration test that constructs an inventory + identity file in a
+      tempdir, runs the dry-run path, and verifies every stage emits a
+      "skipped" entry in the JSON report; 6 hardening evaluator tests
+      added in W2.4 also live in this binary's test set).
+    - Native dry-run smoke against the live inventory entry
+      `windows-utm-1` produced the expected 7-stage skipped report.
+  - Live-UTM result (2026-04-27 first attempt):
+    - Live invocation against the running UTM Windows guest at
+      `192.168.64.14` reached `bootstrap_windows_host` and failed with
+      `stage Windows helper script failed with status 1`. Root cause:
+      the orchestrator's Windows access-establishment phase requires
+      `utmctl file push <vm> <dst>` to succeed, and `utmctl` returns
+      OSStatus `-1743` (Automation permission denied) from the headless
+      shell context this Claude Code session runs in, with the message
+      "utmctl does not work from SSH sessions or before logging in."
+      `ssh_fallback_allowed_for_target` returns `false` for
+      `(AccessEstablishment, local_utm, Windows)` so no SSH fallback is
+      tried — by design, because access-establishment exists exactly to
+      bring SSH up.
+    - Two workarounds available, neither weakens the security bar:
+      1. Run the same command from a user-owned Terminal.app session
+         where utmctl has Automation permission.
+      2. Manually pre-stage OpenSSH Server + the automation public key
+         on the Windows guest, then re-run with
+         `--skip-access-bootstrap`. The skip flag bypasses only the
+         UTM-side access-establishment probe; every downstream
+         security validation stage still runs identically.
+  - Residual risk:
+    - The `--skip-install` flag also bypasses `InstallRelease` /
+      `RestartRuntime` / `VerifyRuntime`. Use only when the binary at
+      `C:\Program Files\RustyNet\rustynetd.exe` is already current —
+      otherwise the security-validation subcommands run against a stale
+      binary. The flag is meant for fast iteration on the validators,
+      not for production gating.
+
+### Phase W5 (Stretch: heterogeneous topologies)
+- [ ] W5.1 5×Windows run
+- [ ] W5.2 Mixed-arrangement matrix
+- [ ] W5.3 Posture promotion only after independent
+      [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+      DoD met
+
+## 11) Definition Of Done
+
+This delta closes only when **all** are true:
+
+- §5 security-parity matrix has, for every Windows row, an enforcement
+  point in code, an orchestrator stage that verifies it on a live Windows
+  guest, and a negative test that proves it fails closed.
+- `vm-lab-orchestrate-live-lab` runs a 4×Linux + 1×Windows live-lab to
+  completion with the new dispatcher, with the Windows node filling at
+  least one non-trivial role (not only the lowest-privilege slot).
+- The `ensure_live_lab_profile_linux_only` gate is gone, replaced by
+  per-stage capability checks.
+- macOS / iOS / Android variants remain present, return `Unsupported` with
+  clear blocker text, and have negative tests asserting the rejection.
+- All mandatory CLAUDE.md §7 gates pass on the final increment.
+- No TODO/FIXME/placeholders in the shipped code.
+- The existing related ledgers
+  ([WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md),
+  [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md),
+  [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md))
+  reference the relevant outcomes of this delta and remain self-consistent.
+
+Posture promotion of Windows in the release matrix is **not** in this
+delta's DoD. That is owned by
+[WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md).
+
+## 12) Agent Update Rules
+
+Same rules as
+[ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+§"Agent Update Rules":
+
+1. Update this document immediately after each materially completed slice;
+   do not maintain a private checklist that diverges from this file.
+2. Mark completion conservatively. `[x]` only after code + verification.
+   Use `Status: partial` or `Status: blocked` honestly.
+3. Record evidence under the touched section. Minimum fields: `Changed
+   files:`, `Verification:`, `Artifacts:`, `Residual risk:`, `Blocker /
+   prerequisite:` (only when applicable).
+4. Use UTC timestamps and commit SHAs where possible.
+5. Do not delete historical context that still matters; correct stale
+   claims in place.
+6. Keep security claims evidence-backed. If live validation is unavailable,
+   say so and record the missing prerequisite.
+7. If a test or gate fails, fix the root cause. Do not weaken the check or
+   bypass the security control to make this plan look complete.

@@ -1,4 +1,5 @@
 use rustynet_windows_native::inspect_file_sddl;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -106,71 +107,207 @@ pub fn validate_windows_secret_blob_path(path: &Path, label: &str) -> Result<(),
 pub fn validate_windows_runtime_acl(path: &Path, label: &str) -> Result<(), String> {
     let sddl = inspect_file_sddl(path)
         .map_err(|err| format!("{label} ACL inspection failed ({}): {err}", path.display()))?;
-    validate_windows_sddl_has_protected_dacl(path, label, sddl.as_str())?;
-    if !sddl_contains_principal(sddl.as_str(), "SY") {
-        return Err(format!(
-            "{label} ACL must grant LocalSystem access: {}",
-            path.display()
-        ));
-    }
-    if !sddl_contains_principal(sddl.as_str(), "BA") {
-        return Err(format!(
-            "{label} ACL must grant Builtin Administrators access: {}",
-            path.display()
-        ));
-    }
-    let owner = extract_sddl_owner(sddl.as_str()).ok_or_else(|| {
-        format!(
-            "{label} ACL must expose an owner entry in SDDL form: {}",
-            path.display()
-        )
-    })?;
-    if !matches!(owner, "SY" | "BA") && !owner.starts_with("S-1-5-80-") {
-        return Err(format!(
-            "{label} ACL owner must be LocalSystem, Builtin Administrators, or a service SID; found {owner} for {}",
-            path.display()
-        ));
-    }
-    Ok(())
+    let is_dir = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("{label} metadata read failed ({}): {err}", path.display()))?
+        .is_dir();
+    evaluate_windows_runtime_acl_sddl(label, sddl.as_str(), is_dir)
+        .map_err(|err| format!("{err}: {}", path.display()))
 }
 
 pub fn validate_windows_local_secret_acl(path: &Path, label: &str) -> Result<(), String> {
     let sddl = inspect_file_sddl(path)
         .map_err(|err| format!("{label} ACL inspection failed ({}): {err}", path.display()))?;
-    validate_windows_sddl_has_protected_dacl(path, label, sddl.as_str())?;
-    if extract_sddl_owner(sddl.as_str()).is_none() {
+    let is_dir = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("{label} metadata read failed ({}): {err}", path.display()))?
+        .is_dir();
+    evaluate_windows_local_secret_acl_sddl(label, sddl.as_str(), is_dir)
+        .map_err(|err| format!("{err}: {}", path.display()))
+}
+
+/// Validate the canonical Windows runtime root directories at daemon startup.
+///
+/// All reviewed roots under `C:\ProgramData\RustyNet` must (a) exist, (b) be
+/// directories, (c) carry a protected DACL with no broader-than-reviewed
+/// principals, (d) grant LocalSystem and Builtin Administrators, and (e) be
+/// owned by LocalSystem, Builtin Administrators, or a service SID.
+///
+/// The daemon refuses to start when any root drifts. This is a fail-closed
+/// gate; missing roots are treated as drift and rejected. The Windows service
+/// installer is responsible for provisioning these roots before the daemon
+/// runs.
+pub fn validate_windows_runtime_startup_acls() -> Result<(), String> {
+    for (path_str, label) in WINDOWS_RUNTIME_STARTUP_ACL_ROOTS {
+        let path = Path::new(path_str);
+        let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+            format!(
+                "{label} must exist before rustynetd starts on Windows ({}): {err}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "{label} must be a real directory, not a symlink or file ({})",
+                path.display()
+            ));
+        }
+        validate_windows_runtime_acl(path, label)?;
+    }
+    Ok(())
+}
+
+/// Per-root verification result for the Windows runtime ACL diagnostic
+/// command. Captures success or the exact failure reason for each reviewed
+/// root, so the orchestrator can pinpoint drift without re-parsing free-form
+/// daemon errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsRuntimeAclRootStatus {
+    /// Root exists, is a directory, and ACL evaluation passed.
+    Ok,
+    /// Root path could not be inspected (typically: missing or non-directory).
+    Missing { reason: String },
+    /// Root exists but ACL evaluation failed (drifted ACL, wrong owner, etc.).
+    Drifted { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsRuntimeAclRootEntry {
+    pub label: String,
+    pub path: String,
+    #[serde(flatten)]
+    pub status: WindowsRuntimeAclRootStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsRuntimeAclReport {
+    pub schema_version: u32,
+    pub overall_ok: bool,
+    pub roots: Vec<WindowsRuntimeAclRootEntry>,
+}
+
+/// Diagnostic walk over the canonical Windows runtime roots. Unlike
+/// `validate_windows_runtime_startup_acls`, this collects per-root status
+/// instead of failing fast, so a remote orchestrator can render a complete
+/// drift report in a single round-trip.
+///
+/// The function still returns `overall_ok = false` if any root failed; the
+/// caller decides whether to treat that as fatal. The startup gate keeps the
+/// fail-fast behavior to refuse daemon launch on the first drift.
+pub fn collect_windows_runtime_acl_report() -> WindowsRuntimeAclReport {
+    let roots = WINDOWS_RUNTIME_STARTUP_ACL_ROOTS
+        .iter()
+        .map(|(path_str, label)| {
+            let path = Path::new(path_str);
+            let status = inspect_runtime_root_status(path, label);
+            WindowsRuntimeAclRootEntry {
+                label: (*label).to_string(),
+                path: path.display().to_string(),
+                status,
+            }
+        })
+        .collect::<Vec<_>>();
+    let overall_ok = roots
+        .iter()
+        .all(|entry| matches!(entry.status, WindowsRuntimeAclRootStatus::Ok));
+    WindowsRuntimeAclReport {
+        schema_version: 1,
+        overall_ok,
+        roots,
+    }
+}
+
+fn inspect_runtime_root_status(path: &Path, label: &str) -> WindowsRuntimeAclRootStatus {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            return WindowsRuntimeAclRootStatus::Missing {
+                reason: format!(
+                    "{label} must exist before rustynetd starts on Windows ({}): {err}",
+                    path.display()
+                ),
+            };
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return WindowsRuntimeAclRootStatus::Missing {
+            reason: format!(
+                "{label} must be a real directory, not a symlink or file ({})",
+                path.display()
+            ),
+        };
+    }
+    match validate_windows_runtime_acl(path, label) {
+        Ok(()) => WindowsRuntimeAclRootStatus::Ok,
+        Err(reason) => WindowsRuntimeAclRootStatus::Drifted { reason },
+    }
+}
+
+const WINDOWS_RUNTIME_STARTUP_ACL_ROOTS: &[(&str, &str)] = &[
+    (DEFAULT_WINDOWS_STATE_ROOT, "state root"),
+    (DEFAULT_WINDOWS_CONFIG_ROOT, "config root"),
+    (DEFAULT_WINDOWS_LOG_ROOT, "log root"),
+    (DEFAULT_WINDOWS_TRUST_ROOT, "trust root"),
+    (DEFAULT_WINDOWS_MEMBERSHIP_ROOT, "membership root"),
+    (DEFAULT_WINDOWS_KEYS_ROOT, "keys root"),
+    (DEFAULT_WINDOWS_SECRET_ROOT, "secret root"),
+    (DEFAULT_WINDOWS_KEY_CUSTODY_ROOT, "key-custody root"),
+];
+
+pub(crate) fn evaluate_windows_runtime_acl_sddl(
+    label: &str,
+    sddl: &str,
+    is_dir: bool,
+) -> Result<(), String> {
+    evaluate_windows_protected_dacl_sddl(label, sddl, is_dir)?;
+    if !sddl_contains_principal(sddl, "SY") {
+        return Err(format!("{label} ACL must grant LocalSystem access"));
+    }
+    if !sddl_contains_principal(sddl, "BA") {
         return Err(format!(
-            "{label} ACL must expose an owner entry in SDDL form: {}",
-            path.display()
+            "{label} ACL must grant Builtin Administrators access"
+        ));
+    }
+    let owner = extract_sddl_owner(sddl)
+        .ok_or_else(|| format!("{label} ACL must expose an owner entry in SDDL form"))?;
+    if !matches!(owner, "SY" | "BA") && !owner.starts_with("S-1-5-80-") {
+        return Err(format!(
+            "{label} ACL owner must be LocalSystem, Builtin Administrators, or a service SID; found {owner}"
         ));
     }
     Ok(())
 }
 
-fn validate_windows_sddl_has_protected_dacl(
-    path: &Path,
+pub(crate) fn evaluate_windows_local_secret_acl_sddl(
     label: &str,
     sddl: &str,
+    is_dir: bool,
 ) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|err| format!("{label} metadata read failed ({}): {err}", path.display()))?;
-    if !sddl.contains("D:") {
+    evaluate_windows_protected_dacl_sddl(label, sddl, is_dir)?;
+    if extract_sddl_owner(sddl).is_none() {
         return Err(format!(
-            "{label} must expose a Windows DACL in SDDL form: {}",
-            path.display()
+            "{label} ACL must expose an owner entry in SDDL form"
         ));
     }
-    if metadata.is_dir() && !sddl.contains("D:P") {
+    Ok(())
+}
+
+fn evaluate_windows_protected_dacl_sddl(
+    label: &str,
+    sddl: &str,
+    is_dir: bool,
+) -> Result<(), String> {
+    if !sddl.contains("D:") {
+        return Err(format!("{label} must expose a Windows DACL in SDDL form"));
+    }
+    if is_dir && !sddl.contains("D:P") {
         return Err(format!(
-            "{label} must use a protected DACL with inheritance disabled: {}",
-            path.display()
+            "{label} must use a protected DACL with inheritance disabled"
         ));
     }
     for principal in FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS {
         if sddl_contains_principal(sddl, principal) {
             return Err(format!(
-                "{label} ACL grants a broader-than-reviewed Windows principal ({principal}): {}",
-                path.display()
+                "{label} ACL grants a broader-than-reviewed Windows principal ({principal})"
             ));
         }
     }
@@ -351,5 +488,246 @@ mod tests {
     fn sddl_principal_match_is_ace_scoped() {
         assert!(sddl_contains_principal("D:P(A;;FA;;;SY)(A;;FA;;;BA)", "SY"));
         assert!(!sddl_contains_principal("O:SYG:SYD:P", "SY"));
+    }
+
+    const REVIEWED_DIRECTORY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+    #[test]
+    fn evaluate_runtime_acl_accepts_reviewed_directory_sddl() {
+        evaluate_windows_runtime_acl_sddl("state root", REVIEWED_DIRECTORY_SDDL, true)
+            .expect("reviewed directory SDDL should validate");
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_accepts_service_sid_owner() {
+        let sddl = "O:S-1-5-80-1234G:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect("service SID owner should validate");
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_directory_without_protected_dacl() {
+        let sddl = "O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("directory without protected DACL must fail");
+        assert!(
+            err.contains("protected DACL with inheritance disabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_world_writable_principals() {
+        for principal in ["WD", "AU", "BU"] {
+            let sddl = format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{principal})");
+            let err = evaluate_windows_runtime_acl_sddl("state root", sddl.as_str(), true)
+                .expect_err("ACE for broad principal must fail");
+            assert!(
+                err.contains("broader-than-reviewed Windows principal") && err.contains(principal),
+                "unexpected error for {principal}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_missing_localsystem_grant() {
+        let sddl = "O:BAG:BAD:P(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("missing LocalSystem grant must fail");
+        assert!(
+            err.contains("must grant LocalSystem access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_missing_administrators_grant() {
+        let sddl = "O:BAG:BAD:P(A;;FA;;;SY)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("missing Administrators grant must fail");
+        assert!(
+            err.contains("must grant Builtin Administrators access"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_unrecognized_owner() {
+        let sddl = "O:WDG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("unrecognized owner must fail");
+        assert!(
+            err.contains("ACL owner must be LocalSystem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_missing_owner() {
+        let sddl = "G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("missing owner must fail");
+        assert!(
+            err.contains("must expose an owner entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_rejects_missing_dacl_marker() {
+        let sddl = "O:BAG:BA";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("missing DACL marker must fail");
+        assert!(
+            err.contains("must expose a Windows DACL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_runtime_acl_allows_unprotected_dacl_for_files() {
+        let sddl = "O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_runtime_acl_sddl("state file", sddl, false)
+            .expect("file ACL without explicit protection bit should still validate");
+    }
+
+    #[test]
+    fn evaluate_local_secret_acl_accepts_dpapi_owner_only_sddl() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)";
+        evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect("local secret ACL with service SID owner should validate");
+    }
+
+    #[test]
+    fn evaluate_local_secret_acl_rejects_world_writable_principals() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;WD)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("local secret ACL with WD principal must fail");
+        assert!(
+            err.contains("broader-than-reviewed Windows principal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_runtime_startup_acl_roots_cover_every_reviewed_root() {
+        let labels = WINDOWS_RUNTIME_STARTUP_ACL_ROOTS
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            labels.len(),
+            "startup ACL root labels must be unique: {labels:?}"
+        );
+
+        let paths = WINDOWS_RUNTIME_STARTUP_ACL_ROOTS
+            .iter()
+            .map(|(path, _)| *path)
+            .collect::<Vec<_>>();
+        for required in [
+            DEFAULT_WINDOWS_STATE_ROOT,
+            DEFAULT_WINDOWS_CONFIG_ROOT,
+            DEFAULT_WINDOWS_LOG_ROOT,
+            DEFAULT_WINDOWS_TRUST_ROOT,
+            DEFAULT_WINDOWS_MEMBERSHIP_ROOT,
+            DEFAULT_WINDOWS_KEYS_ROOT,
+            DEFAULT_WINDOWS_SECRET_ROOT,
+            DEFAULT_WINDOWS_KEY_CUSTODY_ROOT,
+        ] {
+            assert!(
+                paths.contains(&required),
+                "startup ACL root list missing reviewed runtime root {required}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_windows_runtime_startup_acls_fails_off_windows() {
+        let err = validate_windows_runtime_startup_acls()
+            .expect_err("ACL inspection must not succeed on non-Windows hosts");
+        assert!(
+            err.contains("must exist before rustynetd starts on Windows")
+                || err.contains("ACL inspection failed")
+                || err.contains("Windows ACL inspection is only available on Windows hosts"),
+            "unexpected non-Windows error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_runtime_acl_report_root_status_serializes_with_status_tag() {
+        let entry_ok = WindowsRuntimeAclRootEntry {
+            label: "state root".to_string(),
+            path: r"C:\ProgramData\RustyNet".to_string(),
+            status: WindowsRuntimeAclRootStatus::Ok,
+        };
+        let json = serde_json::to_value(&entry_ok).expect("serialize ok entry");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["label"], "state root");
+        assert_eq!(json["path"], r"C:\ProgramData\RustyNet");
+
+        let entry_drifted = WindowsRuntimeAclRootEntry {
+            label: "config root".to_string(),
+            path: r"C:\ProgramData\RustyNet\config".to_string(),
+            status: WindowsRuntimeAclRootStatus::Drifted {
+                reason: "config root ACL must grant LocalSystem access".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&entry_drifted).expect("serialize drifted entry");
+        assert_eq!(json["status"], "drifted");
+        assert_eq!(
+            json["reason"],
+            "config root ACL must grant LocalSystem access"
+        );
+
+        let entry_missing = WindowsRuntimeAclRootEntry {
+            label: "log root".to_string(),
+            path: r"C:\ProgramData\RustyNet\logs".to_string(),
+            status: WindowsRuntimeAclRootStatus::Missing {
+                reason: "log root must be a real directory".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&entry_missing).expect("serialize missing entry");
+        assert_eq!(json["status"], "missing");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn collect_windows_runtime_acl_report_marks_every_root_off_windows() {
+        let report = collect_windows_runtime_acl_report();
+        assert_eq!(report.schema_version, 1);
+        assert!(
+            !report.overall_ok,
+            "non-Windows host must not report overall_ok=true"
+        );
+        assert_eq!(
+            report.roots.len(),
+            WINDOWS_RUNTIME_STARTUP_ACL_ROOTS.len(),
+            "every reviewed root must appear in the diagnostic report"
+        );
+        for entry in &report.roots {
+            assert!(
+                !matches!(entry.status, WindowsRuntimeAclRootStatus::Ok),
+                "non-Windows host must not mark {} as Ok",
+                entry.label
+            );
+        }
+    }
+
+    #[test]
+    fn windows_runtime_acl_report_overall_ok_requires_all_roots_ok() {
+        let report = WindowsRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: true,
+            roots: vec![],
+        };
+        let json = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["overall_ok"], true);
+        assert!(json["roots"].is_array());
     }
 }
