@@ -267,6 +267,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// When set, the orchestrator includes this VM in UTM discovery/restart, then runs
     /// Windows-specific bootstrap and validation stages after all Linux stages pass.
     pub windows_vm: Option<String>,
+    /// Skip all Linux stages and run only the Windows bootstrap and validation stages.
+    /// Requires `--windows-vm`. Use when the Linux lab is already known-good and only
+    /// the Windows client path needs to be exercised.
+    pub windows_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +863,7 @@ struct LocalUtmReadyState {
     live_ip: Option<String>,
     ssh_port_status: String,
     ssh_auth_status: String,
+    platform: VmGuestPlatform,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1211,6 +1216,26 @@ pub fn default_lab_ssh_identity_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
         .join(".ssh/rustynet_lab_ed25519")
+}
+
+/// Reboots a target host using SSH and systemctl reboot
+pub fn run_host_reboot(target: &str) -> Result<(), String> {
+    // Create a command to run via SSH
+    let mut cmd = Command::new("ssh");
+    cmd.arg(target);
+    cmd.arg("sudo -n systemctl reboot");
+    
+    // Execute the command with a timeout of 20 seconds
+    let output = run_output_with_timeout(&mut cmd, timeout_or_default(20, DEFAULT_RUN_TIMEOUT_SECS))
+        .map_err(|e| format!("Failed to execute reboot command: {}", e))?;
+    
+    // The command may fail (e.g., if host is unreachable), but we don't want to fail the entire process
+    // as reboot is expected to fail immediately
+    if !output.status.success() {
+        eprintln!("Warning: Reboot command failed for target {}: {}", target, String::from_utf8_lossy(&output.stderr));
+    }
+    
+    Ok(())
 }
 
 fn default_live_lab_setup_profile_path(report_dir: &Path) -> PathBuf {
@@ -2358,6 +2383,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                             reason.clone()
                         }
                     },
+                    platform: discovery_platform,
                 });
             }
         }
@@ -4414,10 +4440,10 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     // Build discovery alias list: Linux nodes + optional Windows node.
     // selected_aliases (Linux only) continues to be used for profile/setup.
     let mut discovery_aliases = selected_aliases.clone();
-    if let Some(ref windows_alias) = config.windows_vm {
-        if !discovery_aliases.contains(windows_alias) {
-            discovery_aliases.push(windows_alias.clone());
-        }
+    if let Some(ref windows_alias) = config.windows_vm
+        && !discovery_aliases.contains(windows_alias)
+    {
+        discovery_aliases.push(windows_alias.clone());
     }
     let effective_profile_path = match config.profile_path.clone() {
         Some(path) => resolve_absolute_path(path.as_path())?,
@@ -4479,6 +4505,58 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     );
     emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &discovery_outcome);
     outcomes.push(discovery_outcome);
+
+    // --windows-only: skip all Linux stages and go straight to Windows orchestration.
+    if config.windows_only {
+        let windows_alias = config
+            .windows_vm
+            .as_deref()
+            .ok_or_else(|| "--windows-only requires --windows-vm to be set".to_string())?;
+        if !unready_aliases.is_empty() {
+            let unready_str = unready_aliases.join(", ");
+            materialize_orchestration_staging_dir(
+                pre_setup_orchestration_dir.as_path(),
+                orchestration_dir.as_path(),
+            )?;
+            return finalize_vm_lab_orchestration_result(
+                "vm-lab-orchestrate-live-lab",
+                report_dir.as_path(),
+                orchestration_dir.as_path(),
+                outcomes,
+                warnings,
+                vec![format!(
+                    "VMs not ready before Windows-only run: {unready_str}. Boot them first."
+                )],
+            );
+        }
+        let windows_outcomes = run_windows_orchestration_stages(
+            windows_alias,
+            inventory_path.as_path(),
+            config.ssh_identity_file.as_path(),
+            config.known_hosts_path.as_deref(),
+            config.ssh_port,
+            config.utm_documents_root.as_deref(),
+            config.utmctl_path.as_deref(),
+            config.dry_run,
+            report_dir.as_path(),
+        );
+        for outcome in &windows_outcomes {
+            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+        }
+        outcomes.extend(windows_outcomes);
+        materialize_orchestration_staging_dir(
+            pre_setup_orchestration_dir.as_path(),
+            orchestration_dir.as_path(),
+        )?;
+        return finalize_vm_lab_orchestration_result(
+            "vm-lab-orchestrate-live-lab",
+            report_dir.as_path(),
+            orchestration_dir.as_path(),
+            outcomes,
+            warnings,
+            next_actions,
+        );
+    }
 
     if !unready_aliases.is_empty() {
         warnings.push(format!(
@@ -4951,6 +5029,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_windows_orchestration_stages(
     windows_alias: &str,
     inventory_path: &Path,
@@ -4990,12 +5069,23 @@ fn run_windows_orchestration_stages(
                 ));
             }
             let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+            // Read the `.pub` sibling of the identity file so `prepare-transport`
+            // can write it to administrators_authorized_keys on the Windows guest.
+            // A missing or unreadable public key is non-fatal: bootstrap proceeds
+            // without key authorization (useful when the key is already present).
+            let pub_key_path = ssh_identity_file.with_extension(
+                match ssh_identity_file.extension().and_then(|e| e.to_str()) {
+                    Some(ext) => format!("{ext}.pub"),
+                    None => "pub".to_string(),
+                },
+            );
+            let automation_public_key = std::fs::read_to_string(&pub_key_path).ok();
             let host_key = bootstrap_windows_access_for_target(
                 &target,
                 None,
                 Some(ssh_identity_file),
                 known_hosts_path,
-                None,
+                automation_public_key.as_deref(),
                 ssh_port,
                 timeout,
             )?;
@@ -7616,12 +7706,14 @@ fn build_utm_readiness(inputs: UtmReadinessInputs<'_>) -> VmLabReadiness {
         }
         reason_codes
     };
-    let execution_ready = powered
-        && networked
-        && tcp_ready
-        && auth_ready
-        && inputs.authoritative_target_present
-        && (inputs.platform != VmGuestPlatform::Windows || reason_codes.is_empty());
+    // Windows VMs participate in the lab but SSH may not be configured or may be
+    // firewalled. Execution-ready for Windows means the VM is booted and reachable
+    // on the network; SSH readiness is advisory and does not gate orchestration.
+    let execution_ready = if inputs.platform == VmGuestPlatform::Windows {
+        powered && networked
+    } else {
+        powered && networked && tcp_ready && auth_ready && inputs.authoritative_target_present
+    };
     VmLabReadiness {
         powered,
         networked,
@@ -9320,31 +9412,45 @@ fn observe_local_utm_target_ready(
         target.mesh_ip.as_deref(),
         utmctl_path,
     );
-    let ssh_port_status = match live_ip.as_deref() {
-        Some(ip) => probe_tcp_port_status(ip, ssh_port, timeout)
-            .map(|(status, _)| status)
-            .unwrap_or_else(|_| "unknown".to_string()),
-        None => "unavailable".to_string(),
+    // SSH is only probed for Linux and macOS targets. Windows VMs may have SSH
+    // firewalled or unconfigured; they are considered ready once powered + networked.
+    let requires_ssh = matches!(
+        target.platform_profile.platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos
+    );
+    let ssh_port_status = if !requires_ssh {
+        "n/a".to_string()
+    } else {
+        match live_ip.as_deref() {
+            Some(ip) => probe_tcp_port_status(ip, ssh_port, timeout)
+                .map(|(status, _)| status)
+                .unwrap_or_else(|_| "unknown".to_string()),
+            None => "unavailable".to_string(),
+        }
     };
-    let ssh_auth_status = match (live_ip.as_deref(), target.ssh_user.as_deref()) {
-        (None, _) => "skipped-no-live-ip".to_string(),
-        (_, None) => "skipped-no-ssh-user".to_string(),
-        (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_string(),
-        (Some(ip), Some(ssh_user)) => match ssh_auth_probe_command(target.platform_profile) {
-            Ok(probe_command) => match run_remote_shell_command(
-                ip,
-                Some(ssh_user),
-                ssh_identity_file,
-                known_hosts_path,
-                probe_command,
-                timeout,
-            ) {
-                Ok(status) if status.success() => "ok".to_string(),
-                Ok(status) => format!("failed-exit-{}", status_code(status)),
+    let ssh_auth_status = if !requires_ssh {
+        "n/a".to_string()
+    } else {
+        match (live_ip.as_deref(), target.ssh_user.as_deref()) {
+            (None, _) => "skipped-no-live-ip".to_string(),
+            (_, None) => "skipped-no-ssh-user".to_string(),
+            (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_string(),
+            (Some(ip), Some(ssh_user)) => match ssh_auth_probe_command(target.platform_profile) {
+                Ok(probe_command) => match run_remote_shell_command(
+                    ip,
+                    Some(ssh_user),
+                    ssh_identity_file,
+                    known_hosts_path,
+                    probe_command,
+                    timeout,
+                ) {
+                    Ok(status) if status.success() => "ok".to_string(),
+                    Ok(status) => format!("failed-exit-{}", status_code(status)),
+                    Err(err) => format!("error:{err}"),
+                },
                 Err(err) => format!("error:{err}"),
             },
-            Err(err) => format!("error:{err}"),
-        },
+        }
     };
     LocalUtmReadyState {
         alias: target.alias.clone(),
@@ -9353,14 +9459,21 @@ fn observe_local_utm_target_ready(
         live_ip,
         ssh_port_status,
         ssh_auth_status,
+        platform: target.platform_profile.platform,
     }
 }
 
 fn local_utm_ready_state_is_ready(state: &LocalUtmReadyState) -> bool {
-    state.process_present
-        && state.live_ip.is_some()
-        && state.ssh_port_status == "open"
-        && state.ssh_auth_status == "ok"
+    if !state.process_present || state.live_ip.is_none() {
+        return false;
+    }
+    // Windows VMs are ready once powered and networked; SSH is not required.
+    match state.platform {
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos => {
+            state.ssh_port_status == "open" && state.ssh_auth_status == "ok"
+        }
+        _ => true,
+    }
 }
 
 fn render_local_utm_ready_states(states: &[LocalUtmReadyState]) -> String {
@@ -13063,14 +13176,13 @@ fn execute_utm_remote_powershell_capture(
         ));
     }
     let rc_text = read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc")
-        .map_err(|err| {
+        .inspect_err(|_| {
             let _ = best_effort_remove_windows_local_utm_guest_files(
                 utm_name,
                 &[remote_output_path.as_str(), remote_rc_path.as_str()],
                 Duration::from_secs(20),
             );
             let _ = fs::remove_dir_all(local_root.as_path());
-            err
         })?;
     let rc = rc_text.trim().parse::<i32>().map_err(|_| {
         let _ = best_effort_remove_windows_local_utm_guest_files(
@@ -13107,14 +13219,13 @@ fn execute_utm_remote_powershell_capture(
     }
     let output =
         read_windows_local_utm_utf8_file(local_output_path.as_path(), "UTM Windows output")
-            .map_err(|err| {
+            .inspect_err(|_| {
                 let _ = best_effort_remove_windows_local_utm_guest_files(
                     utm_name,
                     &[remote_output_path.as_str(), remote_rc_path.as_str()],
                     Duration::from_secs(20),
                 );
                 let _ = fs::remove_dir_all(local_root.as_path());
-                err
             })?;
     let _ = best_effort_remove_windows_local_utm_guest_files(
         utm_name,
@@ -16797,6 +16908,7 @@ mod tests {
                 live_ip: Some("192.168.64.8".to_string()),
                 ssh_port_status: "open".to_string(),
                 ssh_auth_status: "ok".to_string(),
+                platform: super::VmGuestPlatform::Linux,
             }],
         )
         .expect("inventory live IP update should succeed");

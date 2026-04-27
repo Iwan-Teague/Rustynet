@@ -69,18 +69,18 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     #[cfg(not(windows))]
     {
         let source_path = resolve_passphrase_source(path)?;
-        return read_passphrase_from_source(&source_path);
+        read_passphrase_from_source(&source_path)
     }
 }
 
 pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, String> {
     #[cfg(windows)]
     {
-        return read_windows_explicit_passphrase_source(path);
+        read_windows_explicit_passphrase_source(path)
     }
     #[cfg(not(windows))]
     {
-        return read_passphrase_from_source(path);
+        read_passphrase_from_source(path)
     }
 }
 

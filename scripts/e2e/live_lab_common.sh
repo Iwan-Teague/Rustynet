@@ -1282,15 +1282,109 @@ live_lab_base64_to_hex() {
   printf '%s' "$value" | openssl base64 -d -A 2>/dev/null | xxd -p -c 256 | tr -d '\n'
 }
 
+# ---------------------------------------------------------------------------
+# Platform-aware path helpers.
+#
+# Each function accepts a platform string ("linux", "windows", "macos") and
+# returns the canonical Rustynet path for that platform.  The default is
+# "linux" so existing callers that never pass a platform continue to work.
+# ---------------------------------------------------------------------------
+
+# Returns the data directory for rustynetd on the given platform.
+rustynet_data_dir() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet' ;;
+    *)       printf '%s' '/var/lib/rustynet' ;;
+  esac
+}
+
+# Returns the config directory for rustynetd on the given platform.
+rustynet_config_dir() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\config' ;;
+    *)       printf '%s' '/etc/rustynet' ;;
+  esac
+}
+
+# Returns the daemon control socket / named-pipe path for the given platform.
+rustynet_daemon_socket() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' '\\.\pipe\RustyNet\rustynetd' ;;
+    *)       printf '%s' '/run/rustynet/rustynetd.sock' ;;
+  esac
+}
+
+# Returns the WireGuard public key path for the given platform.
+rustynet_wg_pub_key_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\keys\wireguard.pub' ;;
+    *)       printf '%s' '/var/lib/rustynet/keys/wireguard.pub' ;;
+  esac
+}
+
+# Returns the assignment bundle path for the given platform.
+rustynet_assignment_bundle_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.assignment' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.assignment' ;;
+  esac
+}
+
+# Returns the assignment watermark path for the given platform.
+rustynet_assignment_watermark_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.assignment.watermark' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.assignment.watermark' ;;
+  esac
+}
+
+# Returns the assignment verifier key path for the given platform.
+rustynet_assignment_pub_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\assignment.pub' ;;
+    *)       printf '%s' '/etc/rustynet/assignment.pub' ;;
+  esac
+}
+
+# Returns true (exit 0) if the platform uses a Unix/SSH shell; false (exit 1) for Windows.
+rustynet_platform_uses_unix_shell() {
+  local platform="${1:-linux}"
+  [[ "$platform" != "windows" ]]
+}
+
+# ---------------------------------------------------------------------------
+# End platform-aware path helpers.
+# ---------------------------------------------------------------------------
+
 live_lab_collect_pubkey_hex() {
   local target="$1"
+  local platform="${2:-linux}"
+  local wg_pub_path
+  wg_pub_path="$(rustynet_wg_pub_key_path "$platform")"
   local pub_b64
   if live_lab_target_uses_utm_transport "$target"; then
-    pub_b64="$(live_lab_utm_exec_root "$target" "cat /var/lib/rustynet/keys/wireguard.pub | tr -d '[:space:]'; printf '\n'")" || return 1
+    if rustynet_platform_uses_unix_shell "$platform"; then
+      pub_b64="$(live_lab_utm_exec_root "$target" "cat '${wg_pub_path}' | tr -d '[:space:]'; printf '\n'")" || return 1
+    else
+      # Windows UTM: read the key via PowerShell, stripping whitespace.
+      pub_b64="$(live_lab_utm_exec_root "$target" "powershell.exe -NoProfile -Command \"(Get-Content -Path '${wg_pub_path}' -Raw).Trim()\"")" || return 1
+    fi
     pub_b64="${pub_b64//$'\r'/}"
     pub_b64="${pub_b64//$'\n'/}"
   else
-    pub_b64="$(live_lab_capture_root "$target" "root cat /var/lib/rustynet/keys/wireguard.pub | tr -d '[:space:]'")"
+    if rustynet_platform_uses_unix_shell "$platform"; then
+      pub_b64="$(live_lab_capture_root "$target" "root cat '${wg_pub_path}' | tr -d '[:space:]'")"
+    else
+      # Windows SSH: shell is PowerShell; read via Get-Content.
+      pub_b64="$(live_lab_capture_root "$target" "powershell.exe -NoProfile -Command \"(Get-Content -Path '${wg_pub_path}' -Raw).Trim()\"")"
+    fi
   fi
   local pub_hex
   pub_hex="$(live_lab_base64_to_hex "$pub_b64")"
@@ -1439,11 +1533,20 @@ live_lab_apply_role_coupling() {
   local target_role="$2"
   local preferred_exit_node_id="${3:-}"
   local enable_exit_advertise="${4:-false}"
-  local env_path="${5:-/etc/rustynet/assignment-refresh.env}"
+  local env_path="${5:-}"
   local skip_client_exit_route_wait="${6:-false}"
+  local platform="${7:-linux}"
   local command
+  local daemon_socket bundle_path watermark_path config_dir
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  bundle_path="$(rustynet_assignment_bundle_path "$platform")"
+  watermark_path="$(rustynet_assignment_watermark_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  if [[ -z "$env_path" ]]; then
+    env_path="${config_dir}/assignment-refresh.env"
+  fi
   live_lab_push_sudo_password "$target" || return 1
-  command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-role-coupling --target-role '${target_role}' --enable-exit-advertise '${enable_exit_advertise}' --env-path '${env_path}'"
+  command="root env RUSTYNET_SOCKET='${daemon_socket}' RUSTYNET_AUTO_TUNNEL_BUNDLE='${bundle_path}' RUSTYNET_AUTO_TUNNEL_WATERMARK='${watermark_path}' rustynet ops apply-role-coupling --target-role '${target_role}' --enable-exit-advertise '${enable_exit_advertise}' --env-path '${env_path}'"
   if [[ -n "$preferred_exit_node_id" ]]; then
     command+=" --preferred-exit-node-id '${preferred_exit_node_id}'"
   fi
@@ -1457,10 +1560,19 @@ live_lab_apply_lan_access_coupling() {
   local target="$1"
   local enable="$2"
   local lan_routes="${3:-}"
-  local env_path="${4:-/etc/rustynet/assignment-refresh.env}"
+  local env_path="${4:-}"
+  local platform="${5:-linux}"
   local command
+  local daemon_socket bundle_path watermark_path config_dir
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  bundle_path="$(rustynet_assignment_bundle_path "$platform")"
+  watermark_path="$(rustynet_assignment_watermark_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  if [[ -z "$env_path" ]]; then
+    env_path="${config_dir}/assignment-refresh.env"
+  fi
   live_lab_push_sudo_password "$target" || return 1
-  command="root env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-lan-access-coupling --enable '${enable}' --env-path '${env_path}'"
+  command="root env RUSTYNET_SOCKET='${daemon_socket}' RUSTYNET_AUTO_TUNNEL_BUNDLE='${bundle_path}' RUSTYNET_AUTO_TUNNEL_WATERMARK='${watermark_path}' rustynet ops apply-lan-access-coupling --enable '${enable}' --env-path '${env_path}'"
   if [[ -n "$lan_routes" ]]; then
     command+=" --lan-routes '${lan_routes}'"
   fi
@@ -1472,12 +1584,25 @@ live_lab_wait_for_daemon_socket() {
   local socket_path="${2:-/run/rustynet/rustynetd.sock}"
   local attempts="${3:-20}"
   local sleep_secs="${4:-2}"
-  live_lab_retry_root "$target" "root test -S '${socket_path}'" "$attempts" "$sleep_secs" || return 1
+  # For Unix: check for the socket file.  For Windows (named pipe), the socket
+  # path argument is not a filesystem path — callers should pass the pre-built
+  # platform-aware path but the test command differs.
+  local test_command
+  if [[ "$socket_path" == \\\\* || "$socket_path" == '\\'* ]]; then
+    # Named pipe: probe by attempting a zero-byte read with rustynet status.
+    test_command="root rustynet status"
+  else
+    test_command="root test -S '${socket_path}'"
+  fi
+  live_lab_retry_root "$target" "$test_command" "$attempts" "$sleep_secs" || return 1
 }
 
 live_lab_status() {
   local target="$1"
-  live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status"
+  local platform="${2:-linux}"
+  local daemon_socket
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  live_lab_capture_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet status"
 }
 
 live_lab_shell_quote() {
