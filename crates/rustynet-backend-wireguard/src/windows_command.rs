@@ -39,6 +39,7 @@ pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
 }
 
 impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runner: R,
         tunnel_name: impl Into<String>,
@@ -749,6 +750,7 @@ mod tests {
 
     #[derive(Debug, Clone, Default)]
     struct RecordingRunner {
+        #[allow(clippy::type_complexity)]
         commands: Arc<Mutex<Vec<(String, Vec<String>)>>>,
         handshake_output: Arc<Mutex<String>>,
         transfer_output: Arc<Mutex<String>>,

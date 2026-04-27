@@ -26,3 +26,4 @@ __pycache__/
 /third_party/boringtun/.cargo-ok
 /third_party/boringtun/.cargo_vcs_info.json
 /third_party/boringtun/Cargo.toml.orig
+.aider*
