@@ -1016,7 +1016,92 @@ conservatively.
 - [ ] W2.6 Mandatory gates rerun
 
 ### Phase W3 (Orchestrator dispatcher)
-- [ ] W3.1 `StageOrchestrator` trait + `LinuxBashOrchestrator`
+- [x] W3.1 `StageOrchestrator` trait + `LinuxBashOrchestrator`
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added the
+      `StageOrchestrator` trait (single method
+      `execute_live_lab(&LiveLabRunInputs) -> Result<LiveLabRunReport,
+      String>`), the `LiveLabRunInputs` struct (orchestrator-agnostic
+      execution inputs: profile path, report dir, source mode, repo
+      ref, timeout, dry-run + skip-* flags, plus a
+      `continue_from_setup` signal that translates to the bash
+      script's `--skip-setup --preserve-report-state` pair on the
+      reusable-setup path), and the `LiveLabRunReport` struct
+      (uniform completion shape — `exit_status_code` +
+      `success`). Implemented `LinuxBashOrchestrator` whose
+      `execute_live_lab` is byte-identical to the inline
+      `Command::new("bash") <script> --profile ... --report-dir ...`
+      dispatch it replaces — same flag set, same
+      `run_status_with_timeout_passthrough` invocation under the same
+      hard timeout, same TSV-on-disk contract documented in
+      `scripts/e2e/live_linux_lab_orchestrator.sh`. The
+      `build_command` helper is split out so unit tests can assert
+      argv shape without spawning bash. `execute_ops_vm_lab_run_live_lab`
+      now constructs `LiveLabRunInputs`, instantiates
+      `LinuxBashOrchestrator::new(config.script_path.clone())`, and
+      reads `run_report.success` for downstream pass/fail, release-
+      gate completeness, run-provenance, and result-rendering logic.
+      No behavior change for pure-Linux runs — the trait is a thin
+      shim over the existing flow, fulfilling the §6.1 + §9 rollback
+      contract that "the Linux-only gate is removed only at W4.1, after
+      W1, W2, W3 are complete and all Linux gates still pass on the
+      dispatcher path."
+  - Verification:
+    - `cargo fmt -p rustynetd -p rustynet-cli -- --check` clean.
+    - `cargo build --workspace` clean (one pre-existing dead-code
+      warning on the unrelated `run_host_reboot` helper; not introduced
+      here).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 399 / 399
+      pass (was 393). +6 new tests in `vm_lab::tests`:
+      - `linux_bash_orchestrator_builds_command_with_minimal_args` —
+        baseline argv shape (`bash <script> --profile … --report-dir …
+        --source-mode …`); asserts none of the optional flags
+        (`--dry-run`, `--skip-setup`, `--preserve-report-state`,
+        `--skip-gates`, `--skip-soak`, `--skip-cross-network`,
+        `--repo-ref`) appear when defaults are used;
+      - `linux_bash_orchestrator_builds_command_with_all_skip_flags_set` —
+        every skip flag plus `--dry-run` propagates;
+      - `linux_bash_orchestrator_continue_from_setup_implies_skip_setup_pair` —
+        the `continue_from_setup=true, skip_setup=false` case still
+        emits `--skip-setup --preserve-report-state` so the bash
+        script reuses, rather than re-runs, validated setup stages;
+      - `linux_bash_orchestrator_emits_repo_ref_when_set` — repo ref
+        passes through as a `--repo-ref <value>` pair (not stuck
+        together);
+      - `linux_bash_orchestrator_script_path_round_trips` — getter
+        sanity;
+      - `stage_orchestrator_trait_supports_test_implementations` —
+        proves the dispatch surface is implementable by something
+        that does not spawn bash, so the future `RustOrchestrator`
+        (W3.3) and per-test fakes can share it without duplicating
+        the caller's post-processing path.
+    - `cargo test -p rustynetd` unchanged: 439 lib + 52 bin + 3
+      integration pass (no Rust types or APIs in `rustynetd` were
+      touched by this slice).
+  - Artifacts: none (refactor slice; no runtime artifacts produced).
+  - Residual risk:
+    - This slice is the trait + Linux impl only. `RustOrchestrator`
+      (W3.3) does not exist yet — the live-lab driver always selects
+      `LinuxBashOrchestrator` today. Consequently the Linux-only gate
+      `ensure_live_lab_profile_linux_only` at
+      `crates/rustynet-cli/src/vm_lab/mod.rs:5445` still rejects any
+      non-Linux node before the orchestrator is even instantiated;
+      Windows continues to run as the sidecar. That gate falls in
+      W4.1 once W3.3 has produced the per-target Rust impl.
+    - The trait method returns `LiveLabRunReport` rather than the
+      richer `Vec<VmLabStageOutcome>` the Windows-side
+      `run_windows_orchestration_stages_with_options` returns; this
+      is intentional for the Linux-bash impl because per-stage
+      records are produced by the bash script as TSV under
+      `${REPORT_DIR}/state/stages.tsv` and parsed by the caller. The
+      `RustOrchestrator` slice will populate `Vec<VmLabStageOutcome>`
+      directly from per-stage adapter dispatch and the trait can be
+      widened then without breaking Linux callers (the existing
+      `LiveLabRunReport` becomes one variant of the wider return
+      type, or a thin-summary derived from the outcome vec).
+    - Same pre-existing baseline workspace-clippy posture as W1.x
+      and W2.x — no new lints introduced; the open vm_lab/mod.rs
+      format-string drift is unchanged by this slice.
 - [ ] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
       traits with Linux + Windows impls and macOS/iOS/Android `Unsupported`
       stubs

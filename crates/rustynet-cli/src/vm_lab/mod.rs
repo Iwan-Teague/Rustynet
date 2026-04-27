@@ -4305,6 +4305,114 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     }
 }
 
+/// Inputs to a single live-lab run, independent of which orchestrator
+/// drives the stages. Both `LinuxBashOrchestrator` (W3.1) and the future
+/// `RustOrchestrator` (W3.3) accept this shape so downstream post-
+/// processing — TSV parsing, release-gate completeness, report
+/// rendering — does not branch on which orchestrator ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveLabRunInputs {
+    pub profile_path: PathBuf,
+    pub report_dir: PathBuf,
+    pub source_mode: String,
+    pub repo_ref: Option<String>,
+    pub timeout: Duration,
+    pub dry_run: bool,
+    pub skip_setup: bool,
+    /// Set when the orchestrator detected a re-usable setup pass under
+    /// `report_dir` (e.g. preserved-state continuation). Translates to
+    /// `--skip-setup --preserve-report-state` for the bash impl.
+    pub continue_from_setup: bool,
+    pub skip_gates: bool,
+    pub skip_soak: bool,
+    pub skip_cross_network: bool,
+}
+
+/// Outcome of one live-lab run, surfaced uniformly across orchestrator
+/// implementations. Stage records, release-gate completeness, and the
+/// rendered summary are read off disk under `report_dir` after the run
+/// returns; the orchestrator only owns dispatch + completion state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveLabRunReport {
+    pub exit_status_code: Option<i32>,
+    pub success: bool,
+}
+
+/// Live-lab dispatch surface. The trait exists so the live-lab driver can
+/// pick a Linux-bash impl (today) or a per-target Rust impl (W3.3) without
+/// downstream code branching on which one ran. The trait deliberately
+/// returns a uniform `LiveLabRunReport`; per-stage records are written to
+/// disk under `inputs.report_dir` and parsed by the caller (preserves the
+/// existing TSV-on-disk contract documented in
+/// `scripts/e2e/live_linux_lab_orchestrator.sh`).
+pub trait StageOrchestrator {
+    fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String>;
+}
+
+/// `StageOrchestrator` implementation that wraps the existing
+/// `scripts/e2e/live_linux_lab_orchestrator.sh` bash driver. Behavior is
+/// byte-identical to the inline dispatch this replaced — same `bash
+/// <script> --profile … --report-dir … [flags]` invocation, same
+/// post-processing path. The script is invoked under a hard timeout via
+/// `run_status_with_timeout_passthrough` so a stuck bash process cannot
+/// hang the orchestrator indefinitely.
+pub struct LinuxBashOrchestrator {
+    script_path: PathBuf,
+}
+
+impl LinuxBashOrchestrator {
+    pub fn new(script_path: PathBuf) -> Self {
+        Self { script_path }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn script_path(&self) -> &Path {
+        &self.script_path
+    }
+
+    /// Build the bash command for an execution. Extracted so unit tests
+    /// can assert the dispatch shape without spawning a subprocess.
+    fn build_command(&self, inputs: &LiveLabRunInputs) -> Command {
+        let mut command = Command::new("bash");
+        command.arg(&self.script_path);
+        command.arg("--profile").arg(&inputs.profile_path);
+        command.arg("--report-dir").arg(&inputs.report_dir);
+        if inputs.dry_run {
+            command.arg("--dry-run");
+        }
+        if inputs.skip_setup || inputs.continue_from_setup {
+            command.arg("--skip-setup");
+            command.arg("--preserve-report-state");
+        }
+        if inputs.skip_gates {
+            command.arg("--skip-gates");
+        }
+        if inputs.skip_soak {
+            command.arg("--skip-soak");
+        }
+        if inputs.skip_cross_network {
+            command.arg("--skip-cross-network");
+        }
+        command.arg("--source-mode").arg(&inputs.source_mode);
+        if let Some(value) = inputs.repo_ref.as_deref() {
+            command.arg("--repo-ref").arg(value);
+        }
+        command
+    }
+}
+
+impl StageOrchestrator for LinuxBashOrchestrator {
+    fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String> {
+        let mut command = self.build_command(inputs);
+        let status = run_status_with_timeout_passthrough(&mut command, inputs.timeout)
+            .map_err(|err| format!("live-lab run failed: {err}"))?;
+        Ok(LiveLabRunReport {
+            exit_status_code: status.code(),
+            success: status.success(),
+        })
+    }
+}
+
 pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<String, String> {
     ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
@@ -4366,35 +4474,21 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         write_report_state(report_dir.as_path(), &report_state)?;
     }
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
-    let mut command = Command::new("bash");
-    command.arg(config.script_path.as_path());
-    command.arg("--profile").arg(config.profile_path.as_path());
-    command.arg("--report-dir").arg(report_dir.as_path());
-    if config.dry_run {
-        command.arg("--dry-run");
-    }
-    if config.skip_setup || can_continue_from_setup {
-        command.arg("--skip-setup");
-        command.arg("--preserve-report-state");
-    }
-    if config.skip_gates {
-        command.arg("--skip-gates");
-    }
-    if config.skip_soak {
-        command.arg("--skip-soak");
-    }
-    if config.skip_cross_network {
-        command.arg("--skip-cross-network");
-    }
-    command
-        .arg("--source-mode")
-        .arg(resolved_source_mode.as_str());
-    if let Some(value) = resolved_repo_ref.as_deref() {
-        command.arg("--repo-ref").arg(value);
-    }
-
-    let status = run_status_with_timeout_passthrough(&mut command, timeout)
-        .map_err(|err| format!("live-lab run failed: {err}"))?;
+    let inputs = LiveLabRunInputs {
+        profile_path: config.profile_path.clone(),
+        report_dir: report_dir.clone(),
+        source_mode: resolved_source_mode.clone(),
+        repo_ref: resolved_repo_ref.clone(),
+        timeout,
+        dry_run: config.dry_run,
+        skip_setup: config.skip_setup,
+        continue_from_setup: can_continue_from_setup,
+        skip_gates: config.skip_gates,
+        skip_soak: config.skip_soak,
+        skip_cross_network: config.skip_cross_network,
+    };
+    let orchestrator = LinuxBashOrchestrator::new(config.script_path.clone());
+    let run_report = orchestrator.execute_live_lab(&inputs)?;
     validate_live_lab_run_artifacts(report_dir.as_path())?;
     let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let records = parse_live_lab_stage_records(report_dir.as_path())?;
@@ -4422,7 +4516,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     } else {
         None
     };
-    let run_passed = status.success() && completeness_error.is_none();
+    let run_passed = run_report.success && completeness_error.is_none();
     let full_release_evidence_complete =
         run_passed && release_gate_report.requested && release_gate_report.status == "complete";
     let state_update_error = match build_run_provenance(
@@ -4453,7 +4547,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
             Some(err)
         }
     };
-    let next_actions = if status.success() && completeness_error.is_none() {
+    let next_actions = if run_report.success && completeness_error.is_none() {
         Vec::new()
     } else if let Some(message) = completeness_error.as_ref() {
         vec![
@@ -4485,11 +4579,11 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
             .or_else(|| {
                 completeness_error
                     .as_ref()
-                    .filter(|_| status.success())
+                    .filter(|_| run_report.success)
                     .map(|_| VmLabCommandOverallStatus::Fail)
             }),
     )?;
-    if status.success() && completeness_error.is_none() && state_update_error.is_none() {
+    if run_report.success && completeness_error.is_none() && state_update_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -16208,12 +16302,13 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::{
         LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState, RepoSyncDispatchKind,
-        RepoSyncMode, UtmReadinessInputs, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
-        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
-        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
-        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
-        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
+        RepoSyncMode, StageOrchestrator as _, UtmReadinessInputs, VmGuestExecMode, VmGuestPlatform,
+        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
+        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
+        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
@@ -21026,6 +21121,155 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             err.contains("parse windows-dns-failclosed-check JSON output failed"),
             "unexpected error: {err}"
         );
+    }
+
+    fn baseline_live_lab_run_inputs() -> super::LiveLabRunInputs {
+        super::LiveLabRunInputs {
+            profile_path: PathBuf::from("/tmp/profile.env"),
+            report_dir: PathBuf::from("/tmp/report"),
+            source_mode: "local-head".to_string(),
+            repo_ref: None,
+            timeout: Duration::from_secs(60),
+            dry_run: false,
+            skip_setup: false,
+            continue_from_setup: false,
+            skip_gates: false,
+            skip_soak: false,
+            skip_cross_network: false,
+        }
+    }
+
+    fn collect_command_args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_builds_command_with_minimal_args() {
+        let orchestrator =
+            super::LinuxBashOrchestrator::new(PathBuf::from("/usr/local/bin/orchestrator.sh"));
+        let inputs = baseline_live_lab_run_inputs();
+        let command = orchestrator.build_command(&inputs);
+        assert_eq!(command.get_program(), "bash");
+        let args = collect_command_args(&command);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("/usr/local/bin/orchestrator.sh")
+        );
+        assert!(args.contains(&"--profile".to_string()));
+        assert!(args.contains(&"/tmp/profile.env".to_string()));
+        assert!(args.contains(&"--report-dir".to_string()));
+        assert!(args.contains(&"/tmp/report".to_string()));
+        assert!(args.contains(&"--source-mode".to_string()));
+        assert!(args.contains(&"local-head".to_string()));
+        // No optional flags should appear when defaults are used.
+        for forbidden in [
+            "--dry-run",
+            "--skip-setup",
+            "--preserve-report-state",
+            "--skip-gates",
+            "--skip-soak",
+            "--skip-cross-network",
+            "--repo-ref",
+        ] {
+            assert!(
+                !args.contains(&forbidden.to_string()),
+                "default-build args must omit {forbidden}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_builds_command_with_all_skip_flags_set() {
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let mut inputs = baseline_live_lab_run_inputs();
+        inputs.dry_run = true;
+        inputs.skip_setup = true;
+        inputs.skip_gates = true;
+        inputs.skip_soak = true;
+        inputs.skip_cross_network = true;
+        let args = collect_command_args(&orchestrator.build_command(&inputs));
+        for required in [
+            "--dry-run",
+            "--skip-setup",
+            "--preserve-report-state",
+            "--skip-gates",
+            "--skip-soak",
+            "--skip-cross-network",
+        ] {
+            assert!(
+                args.contains(&required.to_string()),
+                "all-skip args must include {required}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_continue_from_setup_implies_skip_setup_pair() {
+        // continue_from_setup is the orchestrator's "I detected reusable
+        // setup state" signal; it must translate to the same
+        // --skip-setup --preserve-report-state pair the bash script
+        // expects, even when the user did not pass --skip-setup
+        // explicitly. Without this the orchestrator would re-run setup
+        // stages that already produced reviewed evidence.
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let mut inputs = baseline_live_lab_run_inputs();
+        inputs.skip_setup = false;
+        inputs.continue_from_setup = true;
+        let args = collect_command_args(&orchestrator.build_command(&inputs));
+        assert!(args.contains(&"--skip-setup".to_string()));
+        assert!(args.contains(&"--preserve-report-state".to_string()));
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_emits_repo_ref_when_set() {
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let mut inputs = baseline_live_lab_run_inputs();
+        inputs.repo_ref = Some("v1.2.3".to_string());
+        let args = collect_command_args(&orchestrator.build_command(&inputs));
+        // Must appear as the pair "--repo-ref" "v1.2.3", not stuck together.
+        let repo_index = args
+            .iter()
+            .position(|a| a == "--repo-ref")
+            .expect("--repo-ref must be emitted");
+        assert_eq!(args.get(repo_index + 1).map(String::as_str), Some("v1.2.3"));
+    }
+
+    #[test]
+    fn linux_bash_orchestrator_script_path_round_trips() {
+        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/path/to/orch.sh"));
+        assert_eq!(
+            orchestrator.script_path(),
+            std::path::Path::new("/path/to/orch.sh")
+        );
+    }
+
+    #[test]
+    fn stage_orchestrator_trait_supports_test_implementations() {
+        // Sanity: the trait can be implemented by something that does
+        // not spawn bash, so future RustOrchestrator + test fakes can
+        // share the dispatch surface without re-implementing the
+        // caller's post-processing path.
+        struct StubOrchestrator;
+        impl super::StageOrchestrator for StubOrchestrator {
+            fn execute_live_lab(
+                &self,
+                _inputs: &super::LiveLabRunInputs,
+            ) -> Result<super::LiveLabRunReport, String> {
+                Ok(super::LiveLabRunReport {
+                    exit_status_code: Some(0),
+                    success: true,
+                })
+            }
+        }
+        let inputs = baseline_live_lab_run_inputs();
+        let report = StubOrchestrator
+            .execute_live_lab(&inputs)
+            .expect("stub must return Ok");
+        assert!(report.success);
+        assert_eq!(report.exit_status_code, Some(0));
     }
 
     #[test]
