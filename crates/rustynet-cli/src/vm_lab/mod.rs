@@ -7608,140 +7608,172 @@ fn evaluate_windows_mesh_join_report(
 // W4.2-followup: Windows membership-snapshot distribution
 // ---------------------------------------------------------------------------
 
-/// Canonical Windows path the daemon's membership ingestion reads
-/// from. Mirrors `crates/rustynetd/src/windows_paths.rs:21`
-/// (`DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH`). Hard-coded here
-/// rather than imported via runtime path lookup so the orchestrator
-/// can build the install script statically without touching the
-/// daemon binary on the local host.
-const WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.snapshot";
+/// Reviewed Windows-side bundle distribution contract — the path
+/// triple every signed bundle's distribution helper needs (canonical
+/// landing path, watermark path the daemon's WatermarkStore reads,
+/// staging directory for in-flight uploads, filename prefix for the
+/// per-run unique staging file).
+///
+/// All four bundle types — membership, assignment, traversal,
+/// dns-zone — share the same scp + atomic-install + watermark-clear
+/// pattern, distinguished only by the constants in the contract.
+/// Funnelling them through a single dispatch fn means there is one
+/// audited code path for every bundle distribution rather than four
+/// near-duplicates.
+#[derive(Debug, Clone, Copy)]
+struct WindowsBundleDistributionContract {
+    /// Human-readable label included in the success summary, error
+    /// messages, and the staging-filename charset rejection. Keep
+    /// it lowercase + hyphens so log lines stay grep-stable.
+    label: &'static str,
+    /// Canonical landing path on the Windows guest. The daemon's
+    /// fetcher reads this on every refresh tick.
+    canonical_path: &'static str,
+    /// Watermark-store path the daemon's WatermarkStore reads.
+    /// Deleting this file forces the daemon to re-ingest the new
+    /// bundle on next refresh — same semantics as
+    /// `root rm -f /var/lib/rustynet/<bundle>.watermark` on the
+    /// Linux orchestrator's distribute_*_worker fns.
+    watermark_path: &'static str,
+    /// Staging directory for in-flight uploads. Atomic install
+    /// pattern: upload to a per-run unique filename under
+    /// `.staging\`, then `Move-Item -Force` over the canonical path.
+    /// Lives under the same reviewed `C:\ProgramData\RustyNet\…`
+    /// subtree as the canonical path so the upload transit window
+    /// does not expose the bundle to a wider audience than its
+    /// final ACL.
+    staging_dir: &'static str,
+    /// Prefix for the per-run unique staging filename. The full
+    /// filename is `<prefix>.<hex-u128>.staging`. Fixed prefix +
+    /// generated suffix is the only shape the install-script
+    /// charset filter accepts.
+    staging_prefix: &'static str,
+}
 
-/// Canonical Windows path the watermark store reads from. Mirrors
-/// `DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH`. Deleting this file
-/// is the orchestrator's signal to the daemon "the snapshot you'll
-/// see next is fresh; ignore the existing watermark counter" — same
-/// semantics the bash orchestrator's `distribute_membership_worker`
-/// uses on Linux peers (`root rm -f /var/lib/rustynet/membership.watermark`).
-const WINDOWS_MEMBERSHIP_WATERMARK_REMOTE: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.watermark";
+const WINDOWS_BUNDLE_MEMBERSHIP: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "membership",
+        canonical_path: r"C:\ProgramData\RustyNet\membership\membership.snapshot",
+        watermark_path: r"C:\ProgramData\RustyNet\membership\membership.watermark",
+        staging_dir: r"C:\ProgramData\RustyNet\membership\.staging",
+        staging_prefix: "membership.snapshot",
+    };
 
-/// Staging directory for in-flight uploads. Atomic install pattern:
-/// upload to a per-run unique filename under `.staging\`, then
-/// `Move-Item -Force` over the canonical path. Both the staging
-/// directory AND the canonical-path parent (`membership\`) live
-/// under `C:\ProgramData\RustyNet\` — a reviewed root locked to
-/// SYSTEM + Administrators by the W1.1 ACL verifier — so the upload
-/// transit window does not expose the snapshot to a wider audience
-/// than the canonical path itself.
-const WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE: &str = r"C:\ProgramData\RustyNet\membership\.staging";
+const WINDOWS_BUNDLE_ASSIGNMENT: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "assignment",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\rustynetd.assignment",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\rustynetd.assignment.watermark",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "rustynetd.assignment",
+    };
+
+const WINDOWS_BUNDLE_TRAVERSAL: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "traversal",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\rustynetd.traversal",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\rustynetd.traversal.watermark",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "rustynetd.traversal",
+    };
+
+const WINDOWS_BUNDLE_DNS_ZONE: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "dns-zone",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone.watermark",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "rustynetd.dns-zone",
+    };
 
 /// Build the PowerShell script body that ensures the staging
-/// directory exists on the Windows guest. Runs before `scp` — the
-/// scp will fail if the parent directory does not exist on a Windows
-/// host, so we create it explicitly. `New-Item -Force` is idempotent.
-/// The path is a hard-coded reviewed constant so no untrusted value
-/// crosses the PowerShell boundary; we still wrap through the
-/// `powershell_quote` discipline for argv-only consistency with the
-/// rest of the orchestrator's PS construction.
+/// directory exists. `New-Item -Force` is idempotent. The path is
+/// a hard-coded reviewed constant so no untrusted value crosses the
+/// PowerShell boundary; we still wrap through `powershell_quote`
+/// for argv-only consistency with the rest of the orchestrator's
+/// PS construction.
 #[allow(dead_code)]
-fn build_windows_membership_ensure_staging_dir_script() -> Result<String, String> {
-    let quoted_dir = powershell_quote(WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE)?;
+fn build_windows_bundle_ensure_staging_dir_script(
+    contract: &WindowsBundleDistributionContract,
+) -> Result<String, String> {
+    let quoted_dir = powershell_quote(contract.staging_dir)?;
     Ok(format!(
         "New-Item -ItemType Directory -Force -Path {quoted_dir} | Out-Null"
     ))
 }
 
-/// Build the PowerShell script body that performs the atomic
-/// install: rename `<staging>\<filename>` over the canonical
-/// snapshot path, then delete the watermark file (force the daemon
-/// to re-ingest). All three paths cross the boundary as
-/// single-quoted PowerShell literals via `powershell_quote`, with
-/// the existing `ensure_no_control_chars` filter rejecting anything
-/// that could break out of the quote. Equivalent to the Linux
-/// orchestrator's `install -m 0600` + `rm -f watermark` pair.
+/// Build the atomic install + watermark-clear PowerShell body. The
+/// staging filename is filtered to ASCII alphanumeric + `-` `_` `.`
+/// only — defense-in-depth against a future caller who feeds an
+/// operator-controlled value into the staging-name parameter and
+/// inadvertently lets `\`-traversal or PS literal escapes through.
 #[allow(dead_code)]
-fn build_windows_membership_atomic_install_script(
+fn build_windows_bundle_atomic_install_script(
+    contract: &WindowsBundleDistributionContract,
     staging_filename: &str,
 ) -> Result<String, String> {
-    ensure_no_control_chars("windows membership staging filename", staging_filename)?;
+    let label_field = format!("windows {} staging filename", contract.label);
+    ensure_no_control_chars(label_field.as_str(), staging_filename)?;
     if staging_filename.is_empty() {
-        return Err("windows membership staging filename must not be empty".to_string());
+        return Err(format!(
+            "windows {} staging filename must not be empty",
+            contract.label
+        ));
     }
-    // Defensive filter on the staging filename: only accept
-    // alphanumerics, dashes, underscores, dots. The orchestrator
-    // generates this from `unique_suffix()` (a hex u128) plus a
-    // fixed prefix; rejecting anything else means a future caller
-    // who feeds in user-controlled values cannot inject `\`-traversal
-    // or shell metacharacters into the resulting Move-Item call.
     for ch in staging_filename.chars() {
         if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.') {
             return Err(format!(
-                "windows membership staging filename rejected on {ch:?}; allowed: ASCII alphanumeric + '-' '_' '.'"
+                "windows {} staging filename rejected on {ch:?}; allowed: ASCII alphanumeric + '-' '_' '.'",
+                contract.label
             ));
         }
     }
-    let staging_full = format!(
-        "{}\\{}",
-        WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE, staging_filename
-    );
+    let staging_full = format!("{}\\{}", contract.staging_dir, staging_filename);
     let quoted_staging = powershell_quote(&staging_full)?;
-    let quoted_canonical = powershell_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE)?;
-    let quoted_watermark = powershell_quote(WINDOWS_MEMBERSHIP_WATERMARK_REMOTE)?;
+    let quoted_canonical = powershell_quote(contract.canonical_path)?;
+    let quoted_watermark = powershell_quote(contract.watermark_path)?;
     Ok(format!(
         "Move-Item -Force -LiteralPath {quoted_staging} -Destination {quoted_canonical}; \
          Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath {quoted_watermark}"
     ))
 }
 
-/// Build a unique staging filename. Format:
-/// `membership.snapshot.<hex-u128>.staging`. The hex u128 is the
-/// orchestrator's existing `unique_suffix()` so collisions across
-/// concurrent runs are negligible. The `.staging` suffix is a
-/// belt-and-braces marker that distinguishes uploaded-but-not-yet-
-/// renamed files from the canonical snapshot, useful when an operator
-/// inspects the staging directory mid-flight.
+/// Per-run unique staging filename. Format: `<prefix>.<hex-u128>.staging`.
 #[allow(dead_code)]
-fn windows_membership_staging_filename(suffix: u128) -> String {
-    format!("membership.snapshot.{suffix:032x}.staging")
+fn windows_bundle_staging_filename(
+    contract: &WindowsBundleDistributionContract,
+    suffix: u128,
+) -> String {
+    format!("{}.{suffix:032x}.staging", contract.staging_prefix)
 }
 
-/// Distribute a local signed-membership snapshot to the Windows
-/// guest. Three SSH/SCP round-trips:
-///   1. Ensure the `.staging` directory exists on the guest.
-///   2. SCP the local snapshot to a per-run unique filename under
-///      `.staging\`.
-///   3. Atomic `Move-Item -Force` over the canonical path, then
-///      delete the watermark to force the daemon's next refresh
-///      tick to re-ingest.
+/// Single audited dispatch fn for every Windows-side signed-bundle
+/// distribution. Three SSH/SCP round-trips per the plan §6.4
+/// contract: ensure staging dir, scp to staging, atomic install +
+/// watermark clear.
 ///
-/// The local snapshot path is validated as a regular file before
-/// any SSH activity. The PowerShell script bodies are built via the
-/// same argv-only-with-`powershell_quote` discipline the W2.x
-/// security validator helpers use; no value crosses the PS
-/// boundary unquoted.
-///
-/// Today the Windows daemon ships on the `windows-unsupported`
-/// backend label and refuses to start, so the snapshot the
-/// orchestrator pushes here will not actually be ingested until a
-/// reviewed Windows backend ships (tracked in
+/// Today the Windows daemon ships on `windows-unsupported` and
+/// refuses to start, so a pushed bundle will not be ingested until
+/// a working backend lands (tracked in
 /// `WindowsWorkingNodePlan_2026-04-17.md`). The distribution code
-/// path is correct and ready; it lands the file in the
-/// daemon-expected location with the daemon-expected ACL inherited
-/// from the W1.1 reviewed `membership\` root.
+/// path is correct + ready; the file lands in the daemon-expected
+/// location with the daemon-expected ACL inherited from the W1.1
+/// reviewed parent root.
 #[allow(dead_code)]
-pub fn run_distribute_windows_membership_stage(
+fn run_distribute_windows_bundle_stage(
+    contract: &WindowsBundleDistributionContract,
     windows_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
-    local_snapshot_path: &Path,
+    local_bundle_path: &Path,
 ) -> Result<(String, String), (String, String)> {
-    if !local_snapshot_path.is_file() {
+    if !local_bundle_path.is_file() {
         return Err((
             format!(
-                "local membership snapshot not a regular file: {}",
-                local_snapshot_path.display()
+                "local {} bundle not a regular file: {}",
+                contract.label,
+                local_bundle_path.display()
             ),
             String::new(),
         ));
@@ -7768,8 +7800,8 @@ pub fn run_distribute_windows_membership_stage(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
 
     // Step 1: ensure staging dir exists.
-    let ensure_dir_script =
-        build_windows_membership_ensure_staging_dir_script().map_err(|err| (err, String::new()))?;
+    let ensure_dir_script = build_windows_bundle_ensure_staging_dir_script(contract)
+        .map_err(|err| (err, String::new()))?;
     let ensure_dir_invocation = build_ssh_powershell_encoded_invocation(ensure_dir_script.as_str())
         .map_err(|err| (err, String::new()))?;
     let _ = capture_remote_shell_command_for_target(
@@ -7782,36 +7814,40 @@ pub fn run_distribute_windows_membership_stage(
     )
     .map_err(|err| {
         (
-            format!("ensure-staging-dir for windows membership distribution failed: {err}"),
+            format!(
+                "ensure-staging-dir for windows {} distribution failed: {err}",
+                contract.label
+            ),
             String::new(),
         )
     })?;
 
-    // Step 2: SCP local snapshot to staging.
-    let staging_filename = windows_membership_staging_filename(unique_suffix());
-    let staging_remote_path = format!(
-        "{}\\{}",
-        WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE, staging_filename
-    );
+    // Step 2: SCP local bundle to staging.
+    let staging_filename = windows_bundle_staging_filename(contract, unique_suffix());
+    let staging_remote_path = format!("{}\\{}", contract.staging_dir, staging_filename);
     let scp_status = scp_to_remote_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        local_snapshot_path,
+        local_bundle_path,
         staging_remote_path.as_str(),
         timeout,
     )
     .map_err(|err| {
         (
-            format!("scp of windows membership snapshot to staging failed: {err}"),
+            format!(
+                "scp of windows {} bundle to staging failed: {err}",
+                contract.label
+            ),
             String::new(),
         )
     })?;
     if !scp_status.success() {
         return Err((
             format!(
-                "scp of windows membership snapshot to staging exited non-zero: {}",
+                "scp of windows {} bundle to staging exited non-zero: {}",
+                contract.label,
                 status_code(scp_status)
             ),
             String::new(),
@@ -7819,8 +7855,9 @@ pub fn run_distribute_windows_membership_stage(
     }
 
     // Step 3: atomic install + delete watermark.
-    let install_script = build_windows_membership_atomic_install_script(staging_filename.as_str())
-        .map_err(|err| (err, String::new()))?;
+    let install_script =
+        build_windows_bundle_atomic_install_script(contract, staging_filename.as_str())
+            .map_err(|err| (err, String::new()))?;
     let install_invocation = build_ssh_powershell_encoded_invocation(install_script.as_str())
         .map_err(|err| (err, String::new()))?;
     let _ = capture_remote_shell_command_for_target(
@@ -7833,17 +7870,103 @@ pub fn run_distribute_windows_membership_stage(
     )
     .map_err(|err| {
         (
-            format!("atomic install of windows membership snapshot failed: {err}"),
+            format!(
+                "atomic install of windows {} bundle failed: {err}",
+                contract.label
+            ),
             String::new(),
         )
     })?;
 
     Ok((
         format!(
-            "Windows membership snapshot distributed to {windows_alias} (staging={staging_filename}, canonical={WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE})"
+            "Windows {} bundle distributed to {windows_alias} (staging={staging_filename}, canonical={})",
+            contract.label, contract.canonical_path
         ),
         String::new(),
     ))
+}
+
+/// Distribute a local signed-membership snapshot to the Windows guest.
+#[allow(dead_code)]
+pub fn run_distribute_windows_membership_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_snapshot_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_MEMBERSHIP,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_snapshot_path,
+    )
+}
+
+/// Distribute a local signed-assignment (auto-tunnel) bundle to the
+/// Windows guest. Mirrors the bash orchestrator's
+/// `distribute_assignment_worker` semantics.
+#[allow(dead_code)]
+pub fn run_distribute_windows_assignment_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_bundle_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_ASSIGNMENT,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_bundle_path,
+    )
+}
+
+/// Distribute a local signed-traversal bundle to the Windows guest.
+/// Mirrors the bash orchestrator's `distribute_traversal_worker`
+/// semantics.
+#[allow(dead_code)]
+pub fn run_distribute_windows_traversal_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_bundle_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_TRAVERSAL,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_bundle_path,
+    )
+}
+
+/// Distribute a local signed-DNS-zone bundle to the Windows guest.
+/// Mirrors the bash orchestrator's `distribute_dns_zone_worker`
+/// semantics.
+#[allow(dead_code)]
+pub fn run_distribute_windows_dns_zone_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_bundle_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_DNS_ZONE,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_bundle_path,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22906,71 +23029,118 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     // ---------------------------------------------------------------
 
     #[test]
-    fn windows_membership_staging_filename_uses_hex_unique_suffix() {
-        let filename = super::windows_membership_staging_filename(0xdeadbeef_u128);
-        // 32 hex chars (u128 padded to 32) + the fixed prefix/suffix.
-        assert!(
-            filename.starts_with("membership.snapshot."),
-            "filename must start with prefix: {filename}"
-        );
-        assert!(
-            filename.ends_with(".staging"),
-            "filename must end with .staging marker: {filename}"
-        );
-        // The hex digits portion is exactly 32 chars (padded u128).
-        let core = filename
-            .strip_prefix("membership.snapshot.")
-            .unwrap()
-            .strip_suffix(".staging")
-            .unwrap();
-        assert_eq!(core.len(), 32, "hex u128 portion must be 32 chars");
-        assert!(
-            core.chars().all(|c| c.is_ascii_hexdigit()),
-            "hex portion must be all hex digits: {core}"
-        );
+    fn windows_bundle_staging_filename_uses_hex_unique_suffix_for_every_bundle() {
+        // Every reviewed bundle contract produces filenames in the
+        // same `<prefix>.<32-hex-u128>.staging` shape; only the prefix
+        // differs.
+        for (contract, expected_prefix) in [
+            (&super::WINDOWS_BUNDLE_MEMBERSHIP, "membership.snapshot"),
+            (&super::WINDOWS_BUNDLE_ASSIGNMENT, "rustynetd.assignment"),
+            (&super::WINDOWS_BUNDLE_TRAVERSAL, "rustynetd.traversal"),
+            (&super::WINDOWS_BUNDLE_DNS_ZONE, "rustynetd.dns-zone"),
+        ] {
+            let filename = super::windows_bundle_staging_filename(contract, 0xdeadbeef_u128);
+            assert!(
+                filename.starts_with(&format!("{expected_prefix}.")),
+                "filename must start with {expected_prefix}.: {filename}"
+            );
+            assert!(filename.ends_with(".staging"));
+            let core = filename
+                .strip_prefix(&format!("{expected_prefix}."))
+                .unwrap()
+                .strip_suffix(".staging")
+                .unwrap();
+            assert_eq!(core.len(), 32, "hex u128 portion must be 32 chars");
+            assert!(
+                core.chars().all(|c| c.is_ascii_hexdigit()),
+                "hex portion must be all hex digits: {core}"
+            );
+        }
     }
 
     #[test]
-    fn build_windows_membership_ensure_staging_dir_script_uses_quoted_canonical_path() {
-        let script = super::build_windows_membership_ensure_staging_dir_script()
-            .expect("ensure-staging-dir script must build");
-        // The reviewed staging path is quoted as a single-quoted PS literal.
-        assert!(
-            script.contains("'C:\\ProgramData\\RustyNet\\membership\\.staging'"),
-            "script must reference the reviewed staging path: {script}"
-        );
-        assert!(
-            script.contains("New-Item -ItemType Directory -Force"),
-            "script must use idempotent New-Item -Force: {script}"
-        );
+    fn build_windows_bundle_ensure_staging_dir_script_emits_quoted_path_per_bundle() {
+        // Each contract's staging dir is quoted as a single-quoted
+        // PS literal in the produced ensure-dir script.
+        for (contract, expected_dir) in [
+            (
+                &super::WINDOWS_BUNDLE_MEMBERSHIP,
+                r"C:\ProgramData\RustyNet\membership\.staging",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_ASSIGNMENT,
+                r"C:\ProgramData\RustyNet\trust\.staging",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_TRAVERSAL,
+                r"C:\ProgramData\RustyNet\trust\.staging",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_DNS_ZONE,
+                r"C:\ProgramData\RustyNet\trust\.staging",
+            ),
+        ] {
+            let script = super::build_windows_bundle_ensure_staging_dir_script(contract)
+                .expect("ensure-staging-dir script must build");
+            assert!(
+                script.contains(&format!("'{expected_dir}'")),
+                "script must reference {expected_dir}: {script}"
+            );
+            assert!(script.contains("New-Item -ItemType Directory -Force"));
+        }
     }
 
     #[test]
-    fn build_windows_membership_atomic_install_script_emits_move_and_remove() {
-        let script = super::build_windows_membership_atomic_install_script(
-            "membership.snapshot.deadbeef.staging",
-        )
-        .expect("atomic-install script must build");
-        // Must reference the canonical reviewed paths in single-quoted form.
-        assert!(
-            script.contains("'C:\\ProgramData\\RustyNet\\membership\\membership.snapshot'"),
-            "script must reference canonical snapshot path: {script}"
-        );
-        assert!(
-            script.contains("'C:\\ProgramData\\RustyNet\\membership\\membership.watermark'"),
-            "script must reference canonical watermark path: {script}"
-        );
-        assert!(script.contains("Move-Item -Force -LiteralPath"));
-        assert!(script.contains("Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath"));
+    fn build_windows_bundle_atomic_install_script_emits_canonical_paths_per_bundle() {
+        for (contract, canonical, watermark) in [
+            (
+                &super::WINDOWS_BUNDLE_MEMBERSHIP,
+                r"C:\ProgramData\RustyNet\membership\membership.snapshot",
+                r"C:\ProgramData\RustyNet\membership\membership.watermark",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_ASSIGNMENT,
+                r"C:\ProgramData\RustyNet\trust\rustynetd.assignment",
+                r"C:\ProgramData\RustyNet\trust\rustynetd.assignment.watermark",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_TRAVERSAL,
+                r"C:\ProgramData\RustyNet\trust\rustynetd.traversal",
+                r"C:\ProgramData\RustyNet\trust\rustynetd.traversal.watermark",
+            ),
+            (
+                &super::WINDOWS_BUNDLE_DNS_ZONE,
+                r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone",
+                r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone.watermark",
+            ),
+        ] {
+            let script = super::build_windows_bundle_atomic_install_script(
+                contract,
+                "deadbeef.deadbeef.staging",
+            )
+            .expect("atomic-install script must build");
+            assert!(
+                script.contains(&format!("'{canonical}'")),
+                "script must reference canonical {canonical}: {script}"
+            );
+            assert!(
+                script.contains(&format!("'{watermark}'")),
+                "script must reference watermark {watermark}: {script}"
+            );
+            assert!(script.contains("Move-Item -Force -LiteralPath"));
+            assert!(
+                script.contains("Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath")
+            );
+        }
     }
 
     #[test]
-    fn build_windows_membership_atomic_install_script_rejects_metacharacters() {
+    fn build_windows_bundle_atomic_install_script_rejects_metacharacters() {
         // Defensive: the staging filename must be ASCII alphanumeric
         // + '-' '_' '.'. Anything else (especially `\` for path
         // traversal, or `'` for PS literal escape) rejects so a
         // future caller cannot inject through the staging-name
-        // parameter.
+        // parameter. Same charset applies to every bundle contract.
         for bad in [
             "evil\\..\\membership.snapshot",
             "name'; Remove-Item C:\\ProgramData\\RustyNet -Recurse",
@@ -22980,30 +23150,45 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "name;Remove-Item",
             "",
         ] {
-            let err = super::build_windows_membership_atomic_install_script(bad)
-                .expect_err(&format!("staging filename {bad:?} must be rejected"));
-            // Empty input has its own rejection path; everything
-            // else must mention "rejected on" + the offending char.
-            if bad.is_empty() {
-                assert!(err.contains("must not be empty"), "unexpected: {err}");
-            } else {
-                assert!(
-                    err.contains("rejected") || err.to_lowercase().contains("control"),
-                    "unexpected error for {bad:?}: {err}"
-                );
+            for contract in [
+                &super::WINDOWS_BUNDLE_MEMBERSHIP,
+                &super::WINDOWS_BUNDLE_ASSIGNMENT,
+                &super::WINDOWS_BUNDLE_TRAVERSAL,
+                &super::WINDOWS_BUNDLE_DNS_ZONE,
+            ] {
+                let err = super::build_windows_bundle_atomic_install_script(contract, bad)
+                    .expect_err(&format!(
+                        "staging filename {bad:?} for {} must be rejected",
+                        contract.label
+                    ));
+                if bad.is_empty() {
+                    assert!(err.contains("must not be empty"), "unexpected: {err}");
+                } else {
+                    assert!(
+                        err.contains("rejected") || err.to_lowercase().contains("control"),
+                        "unexpected error for {bad:?} on {}: {err}",
+                        contract.label
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn build_windows_membership_atomic_install_script_accepts_unique_suffix_filename() {
-        // The orchestrator's `windows_membership_staging_filename(unique_suffix())`
-        // produces names like `membership.snapshot.<32-hex>.staging`.
-        // This test pins the round-trip: filename produced by the
-        // helper passes the install-script charset filter.
-        let filename = super::windows_membership_staging_filename(0xfeedface_u128);
-        super::build_windows_membership_atomic_install_script(filename.as_str())
-            .expect("orchestrator-produced filename must pass install charset filter");
+    fn build_windows_bundle_atomic_install_script_accepts_unique_suffix_filename_per_bundle() {
+        // Orchestrator-produced filename always passes the install
+        // charset filter for every bundle contract.
+        for contract in [
+            &super::WINDOWS_BUNDLE_MEMBERSHIP,
+            &super::WINDOWS_BUNDLE_ASSIGNMENT,
+            &super::WINDOWS_BUNDLE_TRAVERSAL,
+            &super::WINDOWS_BUNDLE_DNS_ZONE,
+        ] {
+            let filename = super::windows_bundle_staging_filename(contract, 0xfeedface_u128);
+            super::build_windows_bundle_atomic_install_script(contract, filename.as_str()).expect(
+                "orchestrator-produced filename must pass install charset filter for every bundle",
+            );
+        }
     }
 
     fn baseline_live_lab_run_inputs() -> super::LiveLabRunInputs {
