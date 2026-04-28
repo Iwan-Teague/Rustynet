@@ -2214,6 +2214,64 @@ conservatively.
       defaults today. A future slice can extend
       `LinuxOrchestrationOptions` to carry the same overrides per
       the Windows shape.
+- [x] W3.2-followup-8 — `vm-lab-orchestrate-live-lab` integration:
+      `--validate-linux-daemon-state`
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` —
+      `VmLabOrchestrateLiveLabConfig::validate_linux_daemon_state`
+      (default false to preserve existing latency); new
+      `run_linux_daemon_validators_for_aliases` helper that iterates
+      a list of Linux aliases, runs the
+      `run_linux_orchestration_stages_with_options` chainer against
+      each, and prefixes every stage name with `<alias>::` so the
+      report disambiguates between peers cleanly. Per-alias log
+      subdirs land under
+      `<report-dir>/validate_linux_daemon_state/<alias>/`. Continues
+      across peers on failure so a single bad peer does not mask
+      drift on the others.
+    - Wired into the post-`execute_ops_vm_lab_run_live_lab` block
+      in `execute_ops_vm_lab_orchestrate_live_lab` after the
+      optional Windows post-validate, before
+      `finalize_vm_lab_orchestration_result`.
+    - `crates/rustynet-cli/src/main.rs` — new CLI flag
+      `--validate-linux-daemon-state` on `vm-lab-orchestrate-live-lab`
+      + help-text update.
+  - Cost: 6 stages × N peers ≈ 30 SSH round-trips per 5-peer run
+    when enabled. Cheap relative to the install path; operators can
+    flip on for evidence-grade runs without restructuring pipelines.
+  - Verification: 480 / 480 cli tests (was 478, +2 fixture pins on
+    helper shape + per-alias log subdirs).
+- [x] W3.2-followup-9 — Linux mesh-status override parity with
+      Windows (`--mesh-status-state-path` /
+      `--mesh-status-expected-peer-ids` /
+      `--mesh-status-max-age-seconds`)
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` —
+      `build_linux_daemon_check_invocation` extended with an
+      `extra_args: &[String]` parameter; each extra flows through
+      `shell_quote` and rejects control characters so a future
+      caller cannot inject shell metacharacters via the override
+      parameter. New `MeshStatusOverrides` struct +
+      `build_linux_mesh_status_extra_args` mapping helper. New
+      `run_validate_linux_mesh_status_stage_with_overrides` runner
+      replacing the no-overrides wrapper that lived previously
+      (the chainer captures overrides directly so fn-pointer
+      dispatch is no longer used for mesh-status).
+      `LinuxOrchestrationOptions` + `VmLabValidateLinuxSecurityConfig`
+      extended; `run_linux_daemon_validators_for_aliases` continues
+      to use defaults so the orchestrate-live-lab path is
+      unchanged.
+    - `crates/rustynet-cli/src/main.rs` — three new CLI flags on
+      `vm-lab-validate-linux-security` + help-text update.
+      Comma-separated peer IDs (since the existing `OptionParser`
+      stores in `HashMap` so repeated `--key` overwrites).
+  - Verification: 484 / 484 cli tests (was 480, +4 pins on quoted-
+    extras shape, control-char rejection, canonical arg order,
+    default-empty short-circuit).
+  - Residual risk: The peer-ID parser splits on `,` so peer IDs that
+    legitimately contain commas need a future repeatable-arg surface
+    in `OptionParser`. Today no peer ID format includes a comma so
+    this is theoretical-only.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

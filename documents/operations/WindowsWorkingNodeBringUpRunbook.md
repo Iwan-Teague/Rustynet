@@ -298,6 +298,11 @@ been altered; reinstall WireGuard for Windows.
 - WireGuard backend implementation:
   `crates/rustynet-backend-wireguard/src/windows_command.rs`
   (1042 lines wrapping `wireguard.exe` / `wg.exe` / `netsh.exe`)
+- Linux symmetric tooling: [`LinuxDaemonValidatorRunbook.md`](./LinuxDaemonValidatorRunbook.md)
+  describes the parallel `linux-*-check` daemon-side validators +
+  the `vm-lab-validate-linux-security` orchestrator subcommand.
+  Both Windows and Linux validator surfaces emit the same JSON
+  schema so downstream tooling parses both with one parser.
 
 ## 6) What's Still Pending
 

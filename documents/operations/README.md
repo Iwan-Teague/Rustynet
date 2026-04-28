@@ -74,6 +74,7 @@ Current phase-local hardening checklist:
 - [DisasterRecoveryValidation.md](./DisasterRecoveryValidation.md)
 - [FinalLaunchChecklist.md](./FinalLaunchChecklist.md)
 - [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md)
+- [LinuxDaemonValidatorRunbook.md](./LinuxDaemonValidatorRunbook.md)
 - [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md)
 - [MacosLaunchdServiceManagement.md](./MacosLaunchdServiceManagement.md)
 - [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md)
