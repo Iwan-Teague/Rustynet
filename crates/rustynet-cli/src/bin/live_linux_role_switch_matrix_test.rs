@@ -725,8 +725,7 @@ fn refresh_traversal_bundles_for_transition(
         known_hosts,
         refresh.exit_host.as_str(),
         format!(
-            "rustynet ops e2e-issue-traversal-bundles-from-env --env-file '{}' --issue-dir '{}'",
-            remote_env_path, remote_issue_dir
+            "rustynet ops e2e-issue-traversal-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
         )
         .as_str(),
     ) {
@@ -734,7 +733,7 @@ fn refresh_traversal_bundles_for_transition(
             identity,
             known_hosts,
             refresh.exit_host.as_str(),
-            format!("rm -f '{}'", remote_env_path).as_str(),
+            format!("rm -f '{remote_env_path}'").as_str(),
         );
         return Err(err);
     }
@@ -742,7 +741,7 @@ fn refresh_traversal_bundles_for_transition(
         identity,
         known_hosts,
         refresh.exit_host.as_str(),
-        format!("rm -f '{}'", remote_env_path).as_str(),
+        format!("rm -f '{remote_env_path}'").as_str(),
     );
 
     let verifier_key = issue_dir.join("rn-traversal.pub");
@@ -818,8 +817,7 @@ fn refresh_dns_zone_bundles_for_transition(
         known_hosts,
         refresh.exit_host.as_str(),
         format!(
-            "rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file '{}' --issue-dir '{}'",
-            remote_env_path, remote_issue_dir
+            "rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
         )
         .as_str(),
     ) {
@@ -827,7 +825,7 @@ fn refresh_dns_zone_bundles_for_transition(
             identity,
             known_hosts,
             refresh.exit_host.as_str(),
-            format!("rm -f '{}'", remote_env_path).as_str(),
+            format!("rm -f '{remote_env_path}'").as_str(),
         );
         return Err(err);
     }
@@ -835,7 +833,7 @@ fn refresh_dns_zone_bundles_for_transition(
         identity,
         known_hosts,
         refresh.exit_host.as_str(),
-        format!("rm -f '{}'", remote_env_path).as_str(),
+        format!("rm -f '{remote_env_path}'").as_str(),
     );
 
     let verifier_key = issue_dir.join("rn-dns-zone.pub");

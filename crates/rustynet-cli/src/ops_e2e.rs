@@ -1879,10 +1879,7 @@ fn issue_dns_zone_bundle_artifacts(
                 .into_iter()
                 .map(|target_node_id| {
                     let target = nodes_by_id.get(&target_node_id).ok_or_else(|| {
-                        format!(
-                            "dns zone target {} is missing from NODES_SPEC",
-                            target_node_id
-                        )
+                        format!("dns zone target {target_node_id} is missing from NODES_SPEC")
                     })?;
                     Ok(DnsRecordRequest {
                         label: target.node_id.clone(),
@@ -5219,6 +5216,95 @@ fn utc_timestamp() -> String {
     }
 }
 
+pub fn wait_for_daemon_socket_locally(
+    socket_path: &str,
+    attempts: usize,
+    sleep_secs: u64,
+) -> Result<(), String> {
+    for i in 1..=attempts {
+        if Path::new(socket_path).exists() {
+            if let Ok(metadata) = std::fs::metadata(socket_path) {
+                if metadata.file_type().is_socket() {
+                    return Ok(());
+                }
+            }
+        }
+        if i < attempts {
+            std::thread::sleep(Duration::from_secs(sleep_secs));
+        }
+    }
+    Err(format!("daemon socket not ready after {attempts} attempts"))
+}
+
+pub fn execute_ops_e2e_worker_refresh_trust_evidence(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[trust-refresh] {label} {target} ({node_id})");
+    ensure_running_as_root()?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    run_status(
+        "rustynet",
+        &["ops", "refresh-signed-trust"],
+        &[],
+        "failed to refresh signed trust",
+    )?;
+    Ok(format!("trust evidence refreshed for {node_id}"))
+}
+
+pub fn execute_ops_e2e_worker_refresh_runtime_state(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[runtime-refresh] {label} {target} ({node_id})");
+    ensure_running_as_root()?;
+    run_status(
+        "rustynet",
+        &["ops", "force-local-assignment-refresh-now"],
+        &[],
+        "failed to force local assignment refresh",
+    )?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    Ok(format!("runtime state refreshed for {node_id}"))
+}
+
+pub fn execute_ops_e2e_worker_refresh_signed_state(
+    label: String,
+    target: String,
+    node_id: String,
+) -> Result<String, String> {
+    println!("[signed-state-refresh] {label} {target} ({node_id})");
+    ensure_running_as_root()?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+    // The bash script does: env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh
+    run_status(
+        "rustynet",
+        &["state", "refresh"],
+        &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
+        "failed to refresh signed state",
+    )?;
+    Ok(format!("signed state refreshed for {node_id}"))
+}
+
+pub fn execute_ops_e2e_worker_enforce_runtime(
+    label: String,
+    target: String,
+    node_id: String,
+    role: String,
+    src_dir: PathBuf,
+    ssh_allow_cidrs: String,
+) -> Result<String, String> {
+    println!("[runtime-enforce] {label} {target} ({node_id} {role})");
+    ensure_running_as_root()?;
+
+    execute_ops_e2e_enforce_host(role, node_id.clone(), src_dir, ssh_allow_cidrs)?;
+    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
+
+    Ok(format!("runtime enforced for {node_id}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -5621,96 +5707,4 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             "unexpected error: {err}"
         );
     }
-}
-
-pub fn wait_for_daemon_socket_locally(
-    socket_path: &str,
-    attempts: usize,
-    sleep_secs: u64,
-) -> Result<(), String> {
-    for i in 1..=attempts {
-        if Path::new(socket_path).exists() {
-            if let Ok(metadata) = std::fs::metadata(socket_path) {
-                if metadata.file_type().is_socket() {
-                    return Ok(());
-                }
-            }
-        }
-        if i < attempts {
-            std::thread::sleep(Duration::from_secs(sleep_secs));
-        }
-    }
-    Err(format!("daemon socket not ready after {attempts} attempts"))
-}
-
-pub fn execute_ops_e2e_worker_refresh_trust_evidence(
-    label: String,
-    target: String,
-    node_id: String,
-) -> Result<String, String> {
-    println!("[trust-refresh] {} {} ({})", label, target, node_id);
-    ensure_running_as_root()?;
-    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
-    run_status(
-        "rustynet",
-        &["ops", "refresh-signed-trust"],
-        &[],
-        "failed to refresh signed trust",
-    )?;
-    Ok(format!("trust evidence refreshed for {}", node_id))
-}
-
-pub fn execute_ops_e2e_worker_refresh_runtime_state(
-    label: String,
-    target: String,
-    node_id: String,
-) -> Result<String, String> {
-    println!("[runtime-refresh] {} {} ({})", label, target, node_id);
-    ensure_running_as_root()?;
-    run_status(
-        "rustynet",
-        &["ops", "force-local-assignment-refresh-now"],
-        &[],
-        "failed to force local assignment refresh",
-    )?;
-    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
-    Ok(format!("runtime state refreshed for {}", node_id))
-}
-
-pub fn execute_ops_e2e_worker_refresh_signed_state(
-    label: String,
-    target: String,
-    node_id: String,
-) -> Result<String, String> {
-    println!("[signed-state-refresh] {} {} ({})", label, target, node_id);
-    ensure_running_as_root()?;
-    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
-    // The bash script does: env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh
-    run_status(
-        "rustynet",
-        &["state", "refresh"],
-        &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
-        "failed to refresh signed state",
-    )?;
-    Ok(format!("signed state refreshed for {}", node_id))
-}
-
-pub fn execute_ops_e2e_worker_enforce_runtime(
-    label: String,
-    target: String,
-    node_id: String,
-    role: String,
-    src_dir: PathBuf,
-    ssh_allow_cidrs: String,
-) -> Result<String, String> {
-    println!(
-        "[runtime-enforce] {} {} ({} {})",
-        label, target, node_id, role
-    );
-    ensure_running_as_root()?;
-
-    execute_ops_e2e_enforce_host(role, node_id.clone(), src_dir, ssh_allow_cidrs)?;
-    wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
-
-    Ok(format!("runtime enforced for {}", node_id))
 }

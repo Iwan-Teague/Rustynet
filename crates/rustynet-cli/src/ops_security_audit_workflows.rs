@@ -1438,7 +1438,7 @@ fn render_comparative_markdown(
         if !entry.live_validation_scripts.is_empty() {
             lines.push("- Live validation scripts:".to_string());
             for script in entry.live_validation_scripts {
-                lines.push(format!("  - `{}`", script));
+                lines.push(format!("  - `{script}`"));
             }
         }
         lines.push(format!("- Primary sources: {}", entry.sources.join(", ")));

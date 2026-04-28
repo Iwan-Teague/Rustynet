@@ -585,7 +585,7 @@ enum VmController {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum VmGuestPlatform {
+pub enum VmGuestPlatform {
     Linux,
     Macos,
     Windows,
@@ -1303,6 +1303,7 @@ pub fn default_lab_ssh_identity_path() -> PathBuf {
 }
 
 /// Reboots a target host using SSH and systemctl reboot
+#[allow(dead_code)]
 pub fn run_host_reboot(target: &str) -> Result<(), String> {
     // Create a command to run via SSH
     let mut cmd = Command::new("ssh");
@@ -1312,7 +1313,7 @@ pub fn run_host_reboot(target: &str) -> Result<(), String> {
     // Execute the command with a timeout of 20 seconds
     let output =
         run_output_with_timeout(&mut cmd, timeout_or_default(20, DEFAULT_RUN_TIMEOUT_SECS))
-            .map_err(|e| format!("Failed to execute reboot command: {}", e))?;
+            .map_err(|e| format!("Failed to execute reboot command: {e}"))?;
 
     // The command may fail (e.g., if host is unreachable), but we don't want to fail the entire process
     // as reboot is expected to fail immediately
@@ -3225,23 +3226,23 @@ fn append_target_platform_metadata(
 ) -> Result<(), String> {
     let prefix = env_prefix.to_ascii_uppercase();
     lines.push(format_env_assignment(
-        format!("{}_PLATFORM", prefix).as_str(),
+        format!("{prefix}_PLATFORM").as_str(),
         target.platform_profile.platform.as_str(),
     )?);
     lines.push(format_env_assignment(
-        format!("{}_REMOTE_SHELL", prefix).as_str(),
+        format!("{prefix}_REMOTE_SHELL").as_str(),
         target.platform_profile.remote_shell.as_str(),
     )?);
     lines.push(format_env_assignment(
-        format!("{}_GUEST_EXEC_MODE", prefix).as_str(),
+        format!("{prefix}_GUEST_EXEC_MODE").as_str(),
         target.platform_profile.guest_exec_mode.as_str(),
     )?);
     lines.push(format_env_assignment(
-        format!("{}_SERVICE_MANAGER", prefix).as_str(),
+        format!("{prefix}_SERVICE_MANAGER").as_str(),
         target.platform_profile.service_manager.as_str(),
     )?);
     lines.push(format_env_assignment(
-        format!("{}_RUSTYNET_SRC_DIR", prefix).as_str(),
+        format!("{prefix}_RUSTYNET_SRC_DIR").as_str(),
         target.rustynet_src_dir.as_deref().unwrap_or(""),
     )?);
     Ok(())
@@ -3253,23 +3254,23 @@ fn append_empty_target_platform_metadata(
 ) -> Result<(), String> {
     let prefix = env_prefix.to_ascii_uppercase();
     lines.push(format_env_assignment(
-        format!("{}_PLATFORM", prefix).as_str(),
+        format!("{prefix}_PLATFORM").as_str(),
         "",
     )?);
     lines.push(format_env_assignment(
-        format!("{}_REMOTE_SHELL", prefix).as_str(),
+        format!("{prefix}_REMOTE_SHELL").as_str(),
         "",
     )?);
     lines.push(format_env_assignment(
-        format!("{}_GUEST_EXEC_MODE", prefix).as_str(),
+        format!("{prefix}_GUEST_EXEC_MODE").as_str(),
         "",
     )?);
     lines.push(format_env_assignment(
-        format!("{}_SERVICE_MANAGER", prefix).as_str(),
+        format!("{prefix}_SERVICE_MANAGER").as_str(),
         "",
     )?);
     lines.push(format_env_assignment(
-        format!("{}_RUSTYNET_SRC_DIR", prefix).as_str(),
+        format!("{prefix}_RUSTYNET_SRC_DIR").as_str(),
         "",
     )?);
     Ok(())
@@ -8875,7 +8876,7 @@ fn live_lab_profile_target_platform_profile(
     role: &str,
 ) -> Result<Option<VmPlatformProfile>, String> {
     let prefix = role.to_ascii_uppercase();
-    let target_key = format!("{}_TARGET", prefix);
+    let target_key = format!("{prefix}_TARGET");
     let Some(target) = profile.optional(target_key.as_str()) else {
         return Ok(None);
     };
@@ -8885,25 +8886,25 @@ fn live_lab_profile_target_platform_profile(
 
     let platform = VmGuestPlatform::parse(
         profile
-            .required(format!("{}_PLATFORM", prefix).as_str())?
+            .required(format!("{prefix}_PLATFORM").as_str())?
             .as_str(),
     )
     .map_err(|err| format!("{prefix}_PLATFORM: {err}"))?;
     let remote_shell = VmRemoteShell::parse(
         profile
-            .required(format!("{}_REMOTE_SHELL", prefix).as_str())?
+            .required(format!("{prefix}_REMOTE_SHELL").as_str())?
             .as_str(),
     )
     .map_err(|err| format!("{prefix}_REMOTE_SHELL: {err}"))?;
     let guest_exec_mode = VmGuestExecMode::parse(
         profile
-            .required(format!("{}_GUEST_EXEC_MODE", prefix).as_str())?
+            .required(format!("{prefix}_GUEST_EXEC_MODE").as_str())?
             .as_str(),
     )
     .map_err(|err| format!("{prefix}_GUEST_EXEC_MODE: {err}"))?;
     let service_manager = VmServiceManager::parse(
         profile
-            .required(format!("{}_SERVICE_MANAGER", prefix).as_str())?
+            .required(format!("{prefix}_SERVICE_MANAGER").as_str())?
             .as_str(),
     )
     .map_err(|err| format!("{prefix}_SERVICE_MANAGER: {err}"))?;
@@ -11742,8 +11743,7 @@ fn persist_local_utm_ready_states_to_inventory(
                 Value::Array(ordered.into_iter().map(Value::String).collect::<Vec<_>>());
         }
         updated_aliases.push(format!(
-            "{} ssh_target={} last_known_ip={}",
-            alias, new_ssh_target, live_ip
+            "{alias} ssh_target={new_ssh_target} last_known_ip={live_ip}"
         ));
     }
     if !missing_aliases.is_empty() {
@@ -22305,8 +22305,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 .expect_err("macos stub must reject every role");
             assert!(
                 err.contains("not yet defined for platform 'macos'") && err.contains(role.as_str()),
-                "blocker reason for role={:?} must name role + macos: {err}",
-                role
+                "blocker reason for role={role:?} must name role + macos: {err}"
             );
         }
     }

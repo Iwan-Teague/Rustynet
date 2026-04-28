@@ -353,15 +353,11 @@ fn parse_windows_build_release_report_output(
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "Windows bootstrap build-release produced no report for {}",
-            target_label
+            "Windows bootstrap build-release produced no report for {target_label}"
         ));
     }
     let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
-        format!(
-            "Windows bootstrap build-release did not emit valid JSON for {}: {err}",
-            target_label
-        )
+        format!("Windows bootstrap build-release did not emit valid JSON for {target_label}: {err}")
     })?;
     let status = parsed
         .get("status")
@@ -378,8 +374,7 @@ fn parse_windows_build_release_report_output(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             format!(
-                "Windows bootstrap build-release report was missing report_root for {}",
-                target_label
+                "Windows bootstrap build-release report was missing report_root for {target_label}"
             )
         })?;
     let exit_code = parsed
@@ -416,15 +411,11 @@ fn parse_windows_runtime_report_output(
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "{helper_label} produced no output for {}",
-            target_label
+            "{helper_label} produced no output for {target_label}"
         ));
     }
     let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
-        format!(
-            "{helper_label} did not emit valid JSON for {}: {err}",
-            target_label
-        )
+        format!("{helper_label} did not emit valid JSON for {target_label}: {err}")
     })?;
     let status = parsed
         .get("status")
@@ -507,8 +498,7 @@ fn parse_windows_runtime_report_output(
         format!(" {}", details.join(" "))
     };
     Err(format!(
-        "{helper_label} reported status={status} for {}{}",
-        target_label, detail_suffix
+        "{helper_label} reported status={status} for {target_label}{detail_suffix}"
     ))
 }
 
@@ -516,14 +506,12 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return Err(format!(
-            "Windows service-host smoke helper produced no output for {}",
-            target_label
+            "Windows service-host smoke helper produced no output for {target_label}"
         ));
     }
     let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
         format!(
-            "Windows service-host smoke helper did not emit valid JSON for {}: {err}",
-            target_label
+            "Windows service-host smoke helper did not emit valid JSON for {target_label}: {err}"
         )
     })?;
     let status = parsed
