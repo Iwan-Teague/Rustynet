@@ -1893,6 +1893,76 @@ conservatively.
       supported path; a single combined "pull + distribute"
       subcommand is deliberately not provided so the staging-dir
       contents are auditable between fetch and push.
+- [x] W4.2-followup-5 — `Uninstall-RustyNetWindowsService.ps1`
+      (closes the install / uninstall pair)
+  - Changed files:
+    - `scripts/bootstrap/windows/Uninstall-RustyNetWindowsService.ps1`
+      (new) — operator-facing uninstall helper. Mirrors the
+      install helper's PS5.1 + Set-StrictMode + trap-handler shape:
+      same `Test-RustyNetServiceName` /
+      `Test-RustyNetReviewedInstallRoot` /
+      `Test-RustyNetReviewedStateRoot` validators run before the trap
+      registers so a typo cannot redirect the destructive
+      `Remove-Item` against an unreviewed path. Same JSON-report
+      output shape (schema_version 1, captured_at_utc, status / reason
+      / failure_step / notes) so downstream tooling parses both with
+      one schema.
+    - Execution path:
+        1. Snapshot service state pre-uninstall.
+        2. Stop service if running (force, with 30s deadline).
+        3. `sc.exe delete` the SCM registration; PS5.1-safe because
+           the argv has no spaces / quotes (the New-Service /
+           sc.exe-create native-arg quoting bug from the install side
+           does not apply here). Wait for SCM cache to drop with a
+           10s deadline so the post-removal snapshot observes
+           `service_present=false` rather than a stale entry.
+        4. Remove `<InstallRoot>\rustynetd.exe`, `<InstallRoot>\rustynet.exe`,
+           and `<StateRoot>\config\rustynetd.env`.
+        5. **Default behavior preserves the `C:\ProgramData\RustyNet\`
+           state root** (membership snapshots, signed bundles,
+           encrypted key custody). Reinstalling on top of a kept
+           state root re-adopts the prior identity. Pass
+           `-PurgeStateRoot` to wipe trust state.
+        6. Pass `-PurgeInstallRoot` to remove the
+           `C:\Program Files\RustyNet\` directory if it ends up empty
+           after the binary is removed.
+        7. Snapshot service state post-uninstall and emit the report.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added
+      `WINDOWS_SERVICE_UNINSTALL_HELPER_FILE` constant +
+      `windows_service_uninstall_helper_script_local_path()` helper
+      so the orchestrator can dispatch the uninstall script through
+      the same `windows_helper_script_local_path` lookup pattern as
+      install / verify / smoke / collect-diagnostics. Carrying the
+      constant in source pins the script filename: a future
+      rename of the script file fails the
+      `windows_service_uninstall_helper_selection_uses_canonical_script_path`
+      pin test.
+    - `documents/operations/WindowsWorkingNodeBringUpRunbook.md` §5
+      cross-references the new uninstall helper with the safer-default
+      flag table.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 461 / 461 pass
+      (was 459). +2 new tests:
+      `windows_service_uninstall_helper_selection_uses_canonical_script_path`
+      (path pin),
+      `windows_service_uninstall_helper_script_exists_on_disk`
+      (content pin: validators present, `Stop-Service` + `sc.exe delete`
+      both wired so the install / uninstall behavior pair stays
+      symmetric in source).
+  - Residual risk:
+    - **No live evidence yet.** Like the install helper, the
+      uninstall helper is unit-tested for filename + content shape
+      but has not been exercised against a live Windows 11 guest.
+      Follow-up under live-evidence runbook §3 once a UTM Windows
+      VM is available.
+    - **Operator must opt-in to destructive flags.** Default
+      behavior preserves trust material under
+      `C:\ProgramData\RustyNet\`. Operators reinstalling on a
+      different network or rotating identities must remember to
+      pass `-PurgeStateRoot` — the default is "preserve identity",
+      not "fresh install".
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

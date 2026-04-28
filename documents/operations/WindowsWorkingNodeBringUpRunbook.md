@@ -281,6 +281,13 @@ been altered; reinstall WireGuard for Windows.
   `crates/rustynetd/src/windows_backend_readiness.rs`
 - Install helper:
   `scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1`
+- Uninstall helper:
+  `scripts/bootstrap/windows/Uninstall-RustyNetWindowsService.ps1`
+  (least-destructive default: stops + removes the SCM service +
+  removes the daemon binary, but preserves the `C:\ProgramData\RustyNet\`
+  state root so a reinstall re-adopts the prior identity. Pass
+  `-PurgeStateRoot` to wipe trust state, `-PurgeInstallRoot` to wipe
+  `C:\Program Files\RustyNet\` if it ends up empty.)
 - Bundle distribution helpers (membership / assignment / traversal /
   dns-zone): `crates/rustynet-cli/src/vm_lab/mod.rs`
   (`run_distribute_windows_*_stage` fns)
@@ -302,11 +309,16 @@ release-ready:
   with WireGuard for Windows installed, confirming traffic flows.
   Today every step is unit-tested + cross-target compiled but no
   live evidence has been captured.
-- **Orchestrator wiring** — the four `run_distribute_windows_*_stage`
+- ~~**Orchestrator wiring** — the four `run_distribute_windows_*_stage`
   helpers are `pub fn`s callable from orchestrator code; they're
   not yet wired into `run_windows_orchestration_stages_with_options`
   or exposed as a `vm-lab-distribute-windows-state` CLI subcommand.
-  W4.5 territory.
+  W4.5 territory.~~ **Closed** — orchestrator wiring landed in
+  W4.5 (commit `414099d`); standalone subcommand
+  `vm-lab-distribute-windows-state` landed in W4.2-followup-3
+  (commit `0c171d9`); pull-from-Linux-exit subcommand
+  `vm-lab-pull-windows-state-from-linux-exit` landed in
+  W4.2-followup-4 (commit `186a48b`).
 - **Signed-release production rollout** — the release-signing
   workflow exists (§3.5 references it) but requires the operator
   to plug in a code-signing cert via GitHub Secrets. Until then

@@ -51,6 +51,7 @@ const WINDOWS_BOOTSTRAP_WINGET_CONFIG_FILE: &str = "RustyNetBootstrap.winget.yml
 const WINDOWS_BOOTSTRAP_VSCONFIG_FILE: &str = "RustyNetBuildTools.vsconfig";
 const WINDOWS_ENABLE_ACCESS_HELPER_FILE: &str = "Enable-WindowsVmLabAccess.ps1";
 const WINDOWS_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsService.ps1";
+const WINDOWS_SERVICE_UNINSTALL_HELPER_FILE: &str = "Uninstall-RustyNetWindowsService.ps1";
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
@@ -1311,6 +1312,11 @@ fn windows_bootstrap_helper_script_local_path() -> PathBuf {
 
 fn windows_service_install_helper_script_local_path() -> PathBuf {
     windows_helper_script_local_path(WINDOWS_SERVICE_INSTALL_HELPER_FILE)
+}
+
+#[allow(dead_code)]
+fn windows_service_uninstall_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_SERVICE_UNINSTALL_HELPER_FILE)
 }
 
 fn windows_verify_helper_script_local_path() -> PathBuf {
@@ -18673,8 +18679,9 @@ mod tests {
         validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
         windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
         windows_service_host_smoke_helper_script_local_path,
-        windows_service_install_helper_script_local_path, windows_verify_helper_script_local_path,
-        workspace_root_path,
+        windows_service_install_helper_script_local_path,
+        windows_service_uninstall_helper_script_local_path,
+        windows_verify_helper_script_local_path, workspace_root_path,
     };
     use serde_json::json;
     use std::fs;
@@ -19579,6 +19586,39 @@ mod tests {
             windows_service_install_helper_script_local_path().ends_with(Path::new(
                 "scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1"
             ))
+        );
+    }
+
+    #[test]
+    fn windows_service_uninstall_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_service_uninstall_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Uninstall-RustyNetWindowsService.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_service_uninstall_helper_script_exists_on_disk() {
+        let path = windows_service_uninstall_helper_script_local_path();
+        assert!(
+            path.is_file(),
+            "uninstall helper must ship in the source tree at {}",
+            path.display()
+        );
+        let body = std::fs::read_to_string(path.as_path()).expect("read uninstall helper");
+        assert!(
+            body.contains("Test-RustyNetReviewedInstallRoot")
+                && body.contains("Test-RustyNetReviewedStateRoot"),
+            "uninstall helper must mirror install helper's path validators"
+        );
+        assert!(
+            body.contains("sc.exe delete"),
+            "uninstall helper must remove the SCM service via sc.exe delete"
+        );
+        assert!(
+            body.contains("Stop-Service"),
+            "uninstall helper must stop the service before deletion"
         );
     }
 
