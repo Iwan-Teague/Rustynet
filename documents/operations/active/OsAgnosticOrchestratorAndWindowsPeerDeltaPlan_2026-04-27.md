@@ -2131,6 +2131,89 @@ conservatively.
       parent's `0700`. The full Windows-side 8-root walk has not
       been replicated; the verifier behavior matches the Windows
       side's startup-fail-closed gate, not the diagnostic walk.
+- [x] W3.2-followup-7 — Linux validators wired into orchestrator
+      stages (`vm-lab-validate-linux-security` subcommand)
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added the
+      Linux-side validator orchestration block (mirror of the
+      Windows orchestrator's per-op stage runners + chainer):
+        * `LINUX_RUSTYNETD_PATH = "/usr/local/bin/rustynetd"` —
+          pinned in source so a future rename of the install path
+          fails the
+          `linux_daemon_check_invocation_pins_canonical_install_path`
+          test rather than silently dispatching against a stale
+          path.
+        * `build_linux_daemon_check_invocation(daemon_path, subcommand)`
+          — POSIX-shell invocation builder. Both args flow through
+          `shell_quote` and the subcommand charset is filtered to
+          ASCII alphanumeric + `-` so a future caller cannot inject
+          shell metacharacters via the subcommand parameter.
+        * `run_linux_daemon_check_remote(...)` — generic SSH
+          dispatcher: resolves the alias, asserts the platform is
+          Linux, builds the POSIX invocation, captures the trimmed
+          raw stdout. Stage runners parse that output through their
+          op-specific evaluator.
+        * Six pure evaluators (`evaluate_linux_*_report`) that parse
+          the typed JSON each `linux-*-check` subcommand emits and
+          return one-line summaries on success or precise drift
+          reasons on failure. Cross-platform unit-testable; no SSH
+          / IO required.
+        * Six thin stage runners (`run_validate_linux_*_stage`)
+          wrapping dispatch + evaluator into the same
+          `Result<(summary, raw), (reason, raw)>` shape every
+          orchestrator stage uses.
+        * `run_linux_orchestration_stages_with_options` chainer —
+          executes the six stages with a skip-cascade gating chain.
+          Every stage gates on `runtime_acls_passed` because the
+          foundational ACL pin is the prerequisite for trusting any
+          other on-disk state. mesh-status gates additionally on
+          key-custody / hardening / dns-failclosed all passing,
+          matching the W4.2 Windows pattern.
+        * `VmLabValidateLinuxSecurityConfig` +
+          `run_validate_linux_security` — the operator-facing
+          entry, mirroring `VmLabValidateWindowsSecurityConfig` /
+          `run_validate_windows_security`. Writes a typed JSON
+          report to `<report-dir>/linux_security_validation.json`
+          with the same shape as the Windows side so downstream
+          tooling consumes both with one parser.
+    - `crates/rustynet-cli/src/main.rs` — added
+      `OpsCommand::VmLabValidateLinuxSecurity`, the
+      `vm-lab-validate-linux-security` arg parser
+      (`--inventory`, `--linux-vm`, `--ssh-identity-file`,
+      `--known-hosts-file`, `--report-dir`, `--dry-run`), the
+      dispatch arm, and the help text.
+  - Closes the heterogeneous live-lab parity gap end-to-end:
+    Linux peers + Windows peers now go through symmetric validator
+    stage chainers, both writing the same typed JSON report shape.
+    The orchestrator's `LinuxBashOrchestrator` continues to handle
+    the install / bootstrap path via the existing
+    `scripts/e2e/live_linux_lab_orchestrator.sh`; this slice is the
+    *validator* path only — no install / access bootstrap stages
+    here.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings`
+      clean.
+    - `cargo test --workspace --all-features` —
+      `rustynet-cli` 478 / 478 (was 462 → +16): build_linux_daemon_check
+      argv-shape pin + metacharacter-rejection pin (covering 7
+      hostile inputs), canonical-install-path pin, six per-op
+      evaluator round-trip pins (clean accept + drift reject for
+      each), `run_validate_linux_security_dry_run` 6-stage shape +
+      skip-status assertion. `rustynetd` 509 / 509 unchanged.
+  - Residual risk:
+    - **No live evidence yet.** The chainer + evaluators are
+      unit-tested but have not been exercised against a live
+      Linux peer. Live evidence depends on the operator running
+      the bash orchestrator first to install + start the daemon,
+      then dispatching `ops vm-lab-validate-linux-security` against
+      the running peer.
+    - **Mesh-status options still hard-coded to defaults.** The
+      Windows side accepts `--state-path / --expected-peer-id /
+      --max-age-seconds` overrides; the Linux side dispatches with
+      defaults today. A future slice can extend
+      `LinuxOrchestrationOptions` to carry the same overrides per
+      the Windows shape.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

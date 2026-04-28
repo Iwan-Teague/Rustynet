@@ -8587,6 +8587,691 @@ pub fn run_distribute_windows_dns_zone_stage(
     )
 }
 
+// =====================================================================
+// Linux daemon-side validator orchestration (W3.2-followup-7)
+//
+// Mirror of the Windows orchestrator's per-op stage runners + chainer
+// (see `run_validate_windows_*_stage` + `run_windows_orchestration_stages_with_options`).
+// Dispatches each `linux-*-check` subcommand of the live Linux peer's
+// installed `rustynetd` binary over SSH, parses the typed JSON report,
+// and emits Pass / Fail / Skipped outcomes the orchestrator's
+// `vm-lab-validate-linux-security` subcommand records into a typed
+// JSON summary.
+//
+// Linux peers are bootstrapped by the existing bash orchestrator
+// (`scripts/e2e/live_linux_lab_orchestrator.sh`); this stage set is
+// the *validator* path only — no install / access bootstrap stages
+// here. The orchestrator's heterogeneous live-lab can drive both
+// peer types through one trait surface (LinuxBashOrchestrator runs
+// the install path; this validator chainer probes the live state
+// after install).
+// =====================================================================
+
+/// Canonical install path of `rustynetd` on Linux peers, mirroring
+/// `ExecStart=/usr/local/bin/rustynetd …` in
+/// `scripts/systemd/rustynetd.service`. Pinned in source so a future
+/// rename of the install path fails the
+/// `linux_daemon_check_invocation_pins_canonical_install_path` test
+/// rather than silently dispatching against a stale path.
+pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
+
+/// Build the POSIX-shell invocation that calls one of the `linux-*-check`
+/// subcommands on the live Linux peer. Centralizes argv-only discipline
+/// so every stage helper goes through the same audited path: the
+/// daemon path + subcommand both flow through `shell_quote`, and the
+/// subcommand charset is filtered to ASCII alphanumeric + `-` (rejecting
+/// anything that could carry shell metacharacters).
+fn build_linux_daemon_check_invocation(
+    daemon_path: &str,
+    subcommand: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("linux daemon path", daemon_path)?;
+    ensure_no_control_chars("linux daemon subcommand", subcommand)?;
+    if subcommand.is_empty() {
+        return Err("linux daemon subcommand must not be empty".to_string());
+    }
+    if !subcommand
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(format!(
+            "linux daemon subcommand rejected on charset: {subcommand:?}; allowed: ASCII alphanumeric + '-'"
+        ));
+    }
+    Ok(format!(
+        "{} {} --no-fail-on-drift",
+        shell_quote(daemon_path),
+        shell_quote(subcommand)
+    ))
+}
+
+/// Generic SSH dispatcher for a Linux daemon-check subcommand. Resolves
+/// the alias, asserts the platform is Linux, builds the POSIX
+/// invocation, and returns the trimmed raw stdout. Stage runners parse
+/// that output through their op-specific evaluator.
+fn run_linux_daemon_check_remote(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    subcommand: &str,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_string()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let invocation = build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand)?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
+    Ok(raw_output.trim().to_string())
+}
+
+/// Pure evaluator for the JSON output of `rustynetd linux-runtime-acls-check`.
+fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::linux_runtime_acls::LinuxRuntimeAclReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse linux-runtime-acls-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-runtime-acls-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.roots.is_empty() {
+        return Err(
+            "linux-runtime-acls-check returned an empty roots list; expected the canonical \
+             Linux runtime root set"
+                .to_string(),
+        );
+    }
+    if !report.overall_ok {
+        let drifted = report
+            .roots
+            .iter()
+            .filter_map(|entry| match &entry.status {
+                rustynetd::linux_runtime_acls::LinuxRuntimeAclRootStatus::Ok => None,
+                rustynetd::linux_runtime_acls::LinuxRuntimeAclRootStatus::Missing { reason } => {
+                    Some(format!("{} missing: {reason}", entry.label))
+                }
+                rustynetd::linux_runtime_acls::LinuxRuntimeAclRootStatus::Drifted { reason } => {
+                    Some(format!("{} drifted: {reason}", entry.label))
+                }
+            })
+            .collect::<Vec<_>>();
+        let summary = if drifted.is_empty() {
+            "report set overall_ok=false but every per-root entry is Ok; output is inconsistent"
+                .to_string()
+        } else {
+            drifted.join("; ")
+        };
+        return Err(format!("Linux runtime ACL drift detected: {summary}"));
+    }
+    let inspected = report.roots.len();
+    Ok(format!(
+        "Linux runtime ACLs verified on {linux_alias}: {inspected} reviewed roots passed"
+    ))
+}
+
+fn evaluate_linux_mesh_status_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::linux_mesh_status::LinuxMeshStatusReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse linux-mesh-status-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-mesh-status-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Linux mesh status drift detected: {summary}"));
+    }
+    Ok(format!(
+        "Linux mesh status verified on {linux_alias}: state at {}",
+        report.state_path
+    ))
+}
+
+fn evaluate_linux_key_custody_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::linux_key_custody::LinuxKeyCustodyReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse linux-key-custody-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-key-custody-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.entries.is_empty() {
+        return Err(
+            "linux-key-custody-check returned an empty entries list; expected the canonical \
+             Linux key-custody artifacts"
+                .to_string(),
+        );
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Linux key custody drift detected: {summary}"));
+    }
+    Ok(format!(
+        "Linux key custody verified on {linux_alias}: {} reviewed artifacts checked",
+        report.entries.len()
+    ))
+}
+
+fn evaluate_linux_authenticode_report(linux_alias: &str, raw_json: &str) -> Result<String, String> {
+    let report: rustynetd::linux_authenticode::LinuxAuthenticodeReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse linux-authenticode-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-authenticode-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    // The Linux daemon's authenticode subcommand always emits
+    // `applicable: false, overall_ok: true` because Linux does not
+    // enforce runtime binary signatures. Pass-through with a clear
+    // summary so the orchestrator records the not-applicable verdict
+    // honestly rather than silently passing.
+    if report.applicable {
+        // Future-proofing: if a slice ever wires dpkg/rpm signature
+        // verification, the report would flip applicable=true and
+        // overall_ok would carry the verdict.
+        if !report.overall_ok {
+            return Err(format!(
+                "Linux authenticode check failed: {}",
+                report.reason
+            ));
+        }
+        Ok(format!(
+            "Linux authenticode verified on {linux_alias}: {}",
+            report.reason
+        ))
+    } else {
+        Ok(format!(
+            "Linux authenticode not applicable on {linux_alias} (runtime binary signature \
+             attestation is Windows-specific; Linux relies on dpkg/rpm install-time signature \
+             verification)"
+        ))
+    }
+}
+
+fn evaluate_linux_service_hardening_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::linux_service_hardening::LinuxServiceHardeningReport =
+        serde_json::from_str(raw_json).map_err(|err| {
+            format!("parse linux-service-hardening-check JSON output failed: {err}")
+        })?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-service-hardening-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.probed {
+        return Err(format!(
+            "Linux service hardening probe could not run: {}",
+            report
+                .probe_reason
+                .as_deref()
+                .unwrap_or("(no reason recorded)")
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Linux service hardening drift detected: {summary}"));
+    }
+    Ok(format!(
+        "Linux service hardening verified on {linux_alias}: {} reviewed directives matched",
+        report.observed.len()
+    ))
+}
+
+fn evaluate_linux_dns_failclosed_report(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::linux_dns_failclosed::LinuxDnsFailclosedReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse linux-dns-failclosed-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "linux-dns-failclosed-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let summary = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Linux DNS fail-closed drift detected: {summary}"));
+    }
+    Ok(format!(
+        "Linux DNS fail-closed verified on {linux_alias}: resolv.conf at {} loopback-only",
+        report.snapshot.resolv_conf_path
+    ))
+}
+
+/// Per-stage thin runner. All six follow the same shape: dispatch the
+/// subcommand over SSH, parse the typed JSON via the op-specific
+/// evaluator, return `(summary, raw)` on success or `(reason, raw)` on
+/// failure. The wrapper keeps the orchestrator-side stage code
+/// compact + matches the Windows side's per-op runner shape exactly.
+fn run_validate_linux_runtime_acls_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-runtime-acls-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_runtime_acls_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_mesh_status_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-mesh-status-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_mesh_status_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_key_custody_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-key-custody-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_key_custody_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_authenticode_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-authenticode-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_authenticode_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_service_hardening_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-service-hardening-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_service_hardening_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+fn run_validate_linux_dns_failclosed_stage(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let raw = run_linux_daemon_check_remote(
+        linux_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        "linux-dns-failclosed-check",
+    )
+    .map_err(|err| (err, String::new()))?;
+    evaluate_linux_dns_failclosed_report(linux_alias, raw.as_str())
+        .map(|summary| (summary, raw.clone()))
+        .map_err(|reason| (reason, raw))
+}
+
+/// Per-run knobs for the Linux orchestrator. Today only `dry_run`
+/// exists; future slices can opt-out of individual stages or pass
+/// `--expected-peer-id` / `--max-age-seconds` overrides for the
+/// mesh-status stage the way the Windows side does.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LinuxOrchestrationOptions {
+    dry_run: bool,
+}
+
+/// Linux-side validator orchestrator. Mirrors the Windows
+/// `run_windows_orchestration_stages_with_options` shape but covers
+/// only the validator path — Linux peers are bootstrapped /
+/// installed by the existing bash orchestrator, so this chainer
+/// starts from a fully-installed peer and exercises each
+/// `linux-*-check` subcommand in order.
+///
+/// Stage skip-cascade: every stage gates on `runtime_acls_passed`
+/// because the foundational ACL pin is the prerequisite for trusting
+/// any other on-disk state. Subsequent stages add their own gates so
+/// a failure halfway through still leaves the operator with the full
+/// set of upstream-blocker reasons in the report.
+fn run_linux_orchestration_stages_with_options(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+    options: LinuxOrchestrationOptions,
+) -> Vec<VmLabStageOutcome> {
+    let logs_dir = report_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let runtime_acls_log_path = logs_dir.join("validate_linux_runtime_acls.log");
+    let mesh_status_log_path = logs_dir.join("validate_linux_mesh_status.log");
+    let key_custody_log_path = logs_dir.join("validate_linux_key_custody.log");
+    let authenticode_log_path = logs_dir.join("validate_linux_authenticode.log");
+    let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
+    let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
+
+    type LinuxStageFn =
+        fn(&str, &Path, &Path, Option<&Path>) -> Result<(String, String), (String, String)>;
+    let dispatch_stage =
+        |stage_name: &'static str, log_path: &Path, dispatch: LinuxStageFn| -> VmLabStageOutcome {
+            if options.dry_run {
+                return stage_outcome(
+                    stage_name,
+                    VmLabStageStatus::Skipped,
+                    format!("dry-run: would dispatch {stage_name} on {linux_alias}"),
+                    vec![],
+                );
+            }
+            match dispatch(
+                linux_alias,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+            ) {
+                Ok((summary, raw)) => {
+                    let log_body = if raw.is_empty() {
+                        summary.clone()
+                    } else {
+                        format!("{summary}\n--- raw report ---\n{raw}")
+                    };
+                    let _ = std::fs::write(log_path, log_body.as_str());
+                    stage_outcome(
+                        stage_name,
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![log_path.to_path_buf()],
+                    )
+                }
+                Err((reason, raw)) => {
+                    let log_body = if raw.is_empty() {
+                        reason.clone()
+                    } else {
+                        format!("{reason}\n--- raw report ---\n{raw}")
+                    };
+                    let _ = std::fs::write(log_path, log_body.as_str());
+                    stage_outcome(
+                        stage_name,
+                        VmLabStageStatus::Fail,
+                        format!("{stage_name} failed for {linux_alias}: {reason}"),
+                        vec![log_path.to_path_buf()],
+                    )
+                }
+            }
+        };
+
+    let runtime_acls_outcome = dispatch_stage(
+        "validate_linux_runtime_acls",
+        runtime_acls_log_path.as_path(),
+        run_validate_linux_runtime_acls_stage,
+    );
+    let runtime_acls_passed = runtime_acls_outcome.status == VmLabStageStatus::Pass;
+
+    let make_skipped = |stage_name: &'static str, upstream: &str| -> VmLabStageOutcome {
+        stage_outcome(
+            stage_name,
+            VmLabStageStatus::Skipped,
+            format!("skipped: {upstream} did not pass for {linux_alias}"),
+            vec![],
+        )
+    };
+
+    let key_custody_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped("validate_linux_key_custody", "validate_linux_runtime_acls")
+    } else {
+        dispatch_stage(
+            "validate_linux_key_custody",
+            key_custody_log_path.as_path(),
+            run_validate_linux_key_custody_stage,
+        )
+    };
+    let key_custody_passed = key_custody_outcome.status == VmLabStageStatus::Pass;
+
+    let hardening_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_service_hardening",
+            "validate_linux_runtime_acls",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_service_hardening",
+            hardening_log_path.as_path(),
+            run_validate_linux_service_hardening_stage,
+        )
+    };
+    let hardening_passed = hardening_outcome.status == VmLabStageStatus::Pass;
+
+    let authenticode_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped("validate_linux_authenticode", "validate_linux_runtime_acls")
+    } else {
+        dispatch_stage(
+            "validate_linux_authenticode",
+            authenticode_log_path.as_path(),
+            run_validate_linux_authenticode_stage,
+        )
+    };
+
+    let dns_failclosed_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_dns_failclosed",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_dns_failclosed",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_dns_failclosed",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_dns_failclosed",
+            dns_failclosed_log_path.as_path(),
+            run_validate_linux_dns_failclosed_stage,
+        )
+    };
+    let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
+
+    let mesh_status_outcome = if !runtime_acls_passed && !options.dry_run {
+        make_skipped("validate_linux_mesh_status", "validate_linux_runtime_acls")
+    } else if !key_custody_passed && !options.dry_run {
+        make_skipped("validate_linux_mesh_status", "validate_linux_key_custody")
+    } else if !hardening_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_mesh_status",
+            "validate_linux_service_hardening",
+        )
+    } else if !dns_failclosed_passed && !options.dry_run {
+        make_skipped(
+            "validate_linux_mesh_status",
+            "validate_linux_dns_failclosed",
+        )
+    } else {
+        dispatch_stage(
+            "validate_linux_mesh_status",
+            mesh_status_log_path.as_path(),
+            run_validate_linux_mesh_status_stage,
+        )
+    };
+
+    vec![
+        runtime_acls_outcome,
+        key_custody_outcome,
+        hardening_outcome,
+        authenticode_outcome,
+        dns_failclosed_outcome,
+        mesh_status_outcome,
+    ]
+}
+
+/// Operator-facing config for the `vm-lab-validate-linux-security`
+/// subcommand. Linux parity for `VmLabValidateWindowsSecurityConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabValidateLinuxSecurityConfig {
+    pub inventory_path: PathBuf,
+    pub linux_vm: String,
+    pub ssh_identity_file: PathBuf,
+    pub known_hosts_path: Option<PathBuf>,
+    pub report_dir: PathBuf,
+    pub dry_run: bool,
+}
+
+pub fn run_validate_linux_security(
+    config: &VmLabValidateLinuxSecurityConfig,
+) -> Result<String, String> {
+    std::fs::create_dir_all(&config.report_dir).map_err(|err| {
+        format!(
+            "create report dir {} failed: {err}",
+            config.report_dir.display()
+        )
+    })?;
+    let outcomes = run_linux_orchestration_stages_with_options(
+        config.linux_vm.as_str(),
+        config.inventory_path.as_path(),
+        config.ssh_identity_file.as_path(),
+        config.known_hosts_path.as_deref(),
+        config.report_dir.as_path(),
+        LinuxOrchestrationOptions {
+            dry_run: config.dry_run,
+        },
+    );
+    let summary_path = config.report_dir.join("linux_security_validation.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "linux_vm": config.linux_vm,
+        "dry_run": config.dry_run,
+        "stages": outcomes
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "stage": o.stage,
+                    "status": format!("{:?}", o.status).to_ascii_lowercase(),
+                    "summary": o.summary,
+                    "artifacts": o.artifacts.clone(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("serialize Linux security validation report failed: {err}"))?;
+    std::fs::write(summary_path.as_path(), serialized.as_str()).map_err(|err| {
+        format!(
+            "write Linux security validation report to {} failed: {err}",
+            summary_path.display()
+        )
+    })?;
+    println!("{serialized}");
+    let any_failed = outcomes.iter().any(|o| o.status == VmLabStageStatus::Fail);
+    if any_failed {
+        return Err(format!(
+            "Linux security validation reported one or more stage failures; report at {}",
+            summary_path.display()
+        ));
+    }
+    Ok(format!(
+        "Linux security validation passed for {}; report at {}",
+        config.linux_vm,
+        summary_path.display()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveLabStageSummary {
     overall_status: String,
@@ -25168,6 +25853,317 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 "assignment_bundle",
                 "traversal_bundle",
                 "dns_zone_bundle",
+            ]
+        );
+        assert!(
+            stages.iter().all(|s| s["status"] == "skipped"),
+            "every dry-run stage must be skipped: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn build_linux_daemon_check_invocation_emits_quoted_argv() {
+        let script = super::build_linux_daemon_check_invocation(
+            super::LINUX_RUSTYNETD_PATH,
+            "linux-runtime-acls-check",
+        )
+        .expect("well-formed invocation must build");
+        assert!(
+            script.starts_with("'/usr/local/bin/rustynetd' "),
+            "script must start with the quoted canonical install path: {script:?}"
+        );
+        assert!(
+            script.ends_with("'linux-runtime-acls-check' --no-fail-on-drift"),
+            "script must end with quoted subcommand + fail-closed flag: {script:?}"
+        );
+    }
+
+    #[test]
+    fn build_linux_daemon_check_invocation_rejects_subcommand_with_metacharacters() {
+        for bad in [
+            "linux-runtime-acls-check; rm -rf /",
+            "linux-runtime-acls-check`whoami`",
+            "linux-runtime-acls-check$(id)",
+            "linux-runtime-acls-check && cat /etc/shadow",
+            "linux-runtime-acls-check|id",
+            "linux runtime acls check",
+            "",
+        ] {
+            let err = super::build_linux_daemon_check_invocation(super::LINUX_RUSTYNETD_PATH, bad)
+                .expect_err("hostile subcommand must reject");
+            assert!(
+                err.contains("rejected") || err.contains("must not be empty"),
+                "rejection must surface charset / empty: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_daemon_check_invocation_pins_canonical_install_path() {
+        // Pin: /usr/local/bin/rustynetd matches the systemd unit's
+        // ExecStart= line. Any rename must update the unit file in
+        // the same commit.
+        assert_eq!(super::LINUX_RUSTYNETD_PATH, "/usr/local/bin/rustynetd");
+    }
+
+    #[test]
+    fn evaluate_linux_runtime_acls_report_accepts_clean_report() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "roots": [
+                {"label": "state root", "path": "/var/lib/rustynet", "status": "ok"},
+                {"label": "config root", "path": "/etc/rustynet", "status": "ok"}
+            ]
+        }"#;
+        let summary = super::evaluate_linux_runtime_acls_report("debian-utm-1", raw)
+            .expect("clean report must validate");
+        assert!(summary.contains("debian-utm-1"));
+        assert!(summary.contains("2 reviewed roots passed"));
+    }
+
+    #[test]
+    fn evaluate_linux_runtime_acls_report_surfaces_drift_per_root() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "roots": [
+                {"label": "state root", "path": "/var/lib/rustynet", "status": "drifted",
+                 "reason": "state root mode is 0o755, expected 0o700"},
+                {"label": "config root", "path": "/etc/rustynet", "status": "ok"}
+            ]
+        }"#;
+        let err = super::evaluate_linux_runtime_acls_report("debian-utm-1", raw)
+            .expect_err("drift must reject");
+        assert!(err.contains("state root drifted"));
+        assert!(err.contains("0o755"));
+    }
+
+    #[test]
+    fn evaluate_linux_runtime_acls_report_rejects_unsupported_schema_version() {
+        let raw = r#"{"schema_version": 999, "overall_ok": true, "roots": []}"#;
+        let err = super::evaluate_linux_runtime_acls_report("debian-utm-1", raw)
+            .expect_err("unsupported schema must reject");
+        assert!(err.contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn evaluate_linux_mesh_status_report_accepts_clean_report() {
+        let raw = r#"{
+            "schema_version": 1,
+            "state_path": "/var/lib/rustynet/rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1700000000,
+                "age_seconds": 30,
+                "peer_ids": ["peer-a"],
+                "selected_exit_node": null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": []
+        }"#;
+        let summary = super::evaluate_linux_mesh_status_report("debian-utm-1", raw)
+            .expect("clean mesh-status must validate");
+        assert!(summary.contains("debian-utm-1"));
+        assert!(summary.contains("/var/lib/rustynet/rustynetd.state"));
+    }
+
+    #[test]
+    fn evaluate_linux_mesh_status_report_surfaces_drift_reasons() {
+        let raw = r#"{
+            "schema_version": 1,
+            "state_path": "/var/lib/rustynet/rustynetd.state",
+            "overall_ok": false,
+            "snapshot": {"load_status": "missing", "reason": "ENOENT"},
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": ["state snapshot missing: ENOENT"]
+        }"#;
+        let err = super::evaluate_linux_mesh_status_report("debian-utm-1", raw)
+            .expect_err("missing state must reject");
+        assert!(err.contains("state snapshot missing"));
+    }
+
+    #[test]
+    fn evaluate_linux_key_custody_report_accepts_clean_report() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/var/lib/rustynet/keys",
+                 "requirement": "present", "status": "ok",
+                 "mode": 16832, "uid": 998, "gid": 998}
+            ],
+            "drift_reasons": []
+        }"#;
+        let summary = super::evaluate_linux_key_custody_report("debian-utm-1", raw)
+            .expect("clean key-custody must validate");
+        assert!(summary.contains("debian-utm-1"));
+    }
+
+    #[test]
+    fn evaluate_linux_key_custody_report_surfaces_forbidden_plaintext_key() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "entries": [
+                {"label": "plaintext WireGuard private key (legacy)",
+                 "path": "/var/lib/rustynet/keys/wireguard.key",
+                 "requirement": "absent", "status": "forbidden",
+                 "reason": "must not exist at rest"}
+            ],
+            "drift_reasons": [
+                "plaintext WireGuard private key (legacy) forbidden but present at rest: must not exist at rest"
+            ]
+        }"#;
+        let err = super::evaluate_linux_key_custody_report("debian-utm-1", raw)
+            .expect_err("forbidden plaintext must reject");
+        assert!(err.contains("forbidden but present at rest"));
+    }
+
+    #[test]
+    fn evaluate_linux_authenticode_report_passes_through_not_applicable_verdict() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "applicable": false,
+            "reason": "Linux does not enforce binary signatures at runtime"
+        }"#;
+        let summary = super::evaluate_linux_authenticode_report("debian-utm-1", raw)
+            .expect("not-applicable must pass through");
+        assert!(summary.contains("not applicable on debian-utm-1"));
+        assert!(summary.contains("dpkg/rpm"));
+    }
+
+    #[test]
+    fn evaluate_linux_service_hardening_report_accepts_clean_probed_report() {
+        let raw = r#"{
+            "schema_version": 1,
+            "service_name": "rustynetd.service",
+            "overall_ok": true,
+            "probed": true,
+            "probe_reason": null,
+            "drift_reasons": [],
+            "observed": {"User": "rustynetd", "ProtectSystem": "strict"}
+        }"#;
+        let summary = super::evaluate_linux_service_hardening_report("debian-utm-1", raw)
+            .expect("clean hardening must validate");
+        assert!(summary.contains("debian-utm-1"));
+        assert!(summary.contains("2 reviewed directives matched"));
+    }
+
+    #[test]
+    fn evaluate_linux_service_hardening_report_surfaces_unprobed_blocker() {
+        let raw = r#"{
+            "schema_version": 1,
+            "service_name": "rustynetd.service",
+            "overall_ok": false,
+            "probed": false,
+            "probe_reason": "systemctl unavailable",
+            "drift_reasons": ["systemctl unavailable"],
+            "observed": {}
+        }"#;
+        let err = super::evaluate_linux_service_hardening_report("debian-utm-1", raw)
+            .expect_err("unprobed must reject");
+        assert!(err.contains("systemctl unavailable"));
+    }
+
+    #[test]
+    fn evaluate_linux_dns_failclosed_report_accepts_loopback_only() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "snapshot": {
+                "resolv_conf_path": "/etc/resolv.conf",
+                "resolv_conf_present": true,
+                "nameservers": ["127.0.0.53"],
+                "search_domains": [],
+                "loopback_resolver_advertised": true
+            },
+            "drift_reasons": []
+        }"#;
+        let summary = super::evaluate_linux_dns_failclosed_report("debian-utm-1", raw)
+            .expect("loopback-only must validate");
+        assert!(summary.contains("debian-utm-1"));
+        assert!(summary.contains("/etc/resolv.conf"));
+    }
+
+    #[test]
+    fn evaluate_linux_dns_failclosed_report_surfaces_external_dns() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "snapshot": {
+                "resolv_conf_path": "/etc/resolv.conf",
+                "resolv_conf_present": true,
+                "nameservers": ["8.8.8.8"],
+                "search_domains": [],
+                "loopback_resolver_advertised": true
+            },
+            "drift_reasons": ["nameserver 8.8.8.8 is non-loopback; mesh DNS queries leak off-host"]
+        }"#;
+        let err = super::evaluate_linux_dns_failclosed_report("debian-utm-1", raw)
+            .expect_err("external DNS must reject");
+        assert!(err.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn run_validate_linux_security_dry_run_emits_skipped_stages_and_writes_report() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let report_dir = temp.path().to_path_buf();
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{"version":1,"entries":[{
+                "alias":"debian-utm-1",
+                "controller":{"type":"local_utm","utm_name":"Debian","bundle_path":"/dev/null"},
+                "platform":"linux",
+                "remote_shell":"posix",
+                "guest_exec_mode":"posix_shell",
+                "service_manager":"systemd",
+                "os":"Debian 12",
+                "ssh_target":"192.168.64.10",
+                "ssh_user":"rustynet",
+                "rustynet_src_dir":"/srv/Rustynet",
+                "include_in_all":false
+            }]}"#,
+        )
+        .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let config = super::VmLabValidateLinuxSecurityConfig {
+            inventory_path: inventory,
+            linux_vm: "debian-utm-1".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            report_dir: report_dir.clone(),
+            dry_run: true,
+        };
+        let summary = super::run_validate_linux_security(&config).expect("dry-run must succeed");
+        assert!(summary.contains("debian-utm-1"));
+        let report_path = report_dir.join("linux_security_validation.json");
+        let report_text = std::fs::read_to_string(report_path.as_path()).expect("read report");
+        let report: serde_json::Value =
+            serde_json::from_str(report_text.as_str()).expect("report parses as JSON");
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["linux_vm"], "debian-utm-1");
+        let stages = report["stages"].as_array().expect("stages array");
+        let stage_names: Vec<&str> = stages
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            stage_names,
+            vec![
+                "validate_linux_runtime_acls",
+                "validate_linux_key_custody",
+                "validate_linux_service_hardening",
+                "validate_linux_authenticode",
+                "validate_linux_dns_failclosed",
+                "validate_linux_mesh_status",
             ]
         );
         assert!(

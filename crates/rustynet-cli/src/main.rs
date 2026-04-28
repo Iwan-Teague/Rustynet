@@ -526,6 +526,9 @@ enum OpsCommand {
     VmLabValidateWindowsSecurity {
         config: vm_lab::VmLabValidateWindowsSecurityConfig,
     },
+    VmLabValidateLinuxSecurity {
+        config: vm_lab::VmLabValidateLinuxSecurityConfig,
+    },
     VmLabDistributeWindowsState {
         config: vm_lab::VmLabDistributeWindowsStateConfig,
     },
@@ -2262,6 +2265,19 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .optional_path("--distribute-windows-traversal-bundle"),
                 distribute_windows_dns_zone_bundle: parser
                     .optional_path("--distribute-windows-dns-zone-bundle"),
+            },
+        }),
+        "vm-lab-validate-linux-security" => Ok(OpsCommand::VmLabValidateLinuxSecurity {
+            config: vm_lab::VmLabValidateLinuxSecurityConfig {
+                inventory_path: parser
+                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                linux_vm: parser
+                    .value("--linux-vm")
+                    .ok_or_else(|| "--linux-vm <alias> is required".to_string())?,
+                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                report_dir: parser.required_path("--report-dir")?,
+                dry_run: parser.has_flag("--dry-run"),
             },
         }),
         "vm-lab-distribute-windows-state" => Ok(OpsCommand::VmLabDistributeWindowsState {
@@ -4490,6 +4506,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabValidateWindowsSecurity { config } => {
             vm_lab::run_validate_windows_security(&config)
+        }
+        OpsCommand::VmLabValidateLinuxSecurity { config } => {
+            vm_lab::run_validate_linux_security(&config)
         }
         OpsCommand::VmLabDistributeWindowsState { config } => {
             vm_lab::run_distribute_windows_state(&config)
@@ -12053,6 +12072,7 @@ fn help_text() -> String {
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
         "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
+        "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",
         "  ops vm-lab-pull-windows-state-from-linux-exit [--inventory <path>] --linux-exit-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --dest-dir <path> --report-dir <path> [--dry-run]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
