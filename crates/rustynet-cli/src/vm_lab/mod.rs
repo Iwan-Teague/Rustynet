@@ -249,6 +249,13 @@ pub struct VmLabValidateWindowsSecurityConfig {
     pub dry_run: bool,
     pub skip_access_bootstrap: bool,
     pub skip_install: bool,
+    /// Local signed-bundle paths for the W4.5 orchestrator-side
+    /// distribution stages. `None` skips the corresponding stage with
+    /// reason "no local bundle path provided".
+    pub distribute_windows_membership_bundle: Option<PathBuf>,
+    pub distribute_windows_assignment_bundle: Option<PathBuf>,
+    pub distribute_windows_traversal_bundle: Option<PathBuf>,
+    pub distribute_windows_dns_zone_bundle: Option<PathBuf>,
 }
 
 pub fn run_validate_windows_security(
@@ -273,6 +280,14 @@ pub fn run_validate_windows_security(
         WindowsOrchestrationOptions {
             skip_access_bootstrap: config.skip_access_bootstrap,
             skip_install: config.skip_install,
+            distribute_windows_membership_bundle: config
+                .distribute_windows_membership_bundle
+                .clone(),
+            distribute_windows_assignment_bundle: config
+                .distribute_windows_assignment_bundle
+                .clone(),
+            distribute_windows_traversal_bundle: config.distribute_windows_traversal_bundle.clone(),
+            distribute_windows_dns_zone_bundle: config.distribute_windows_dns_zone_bundle.clone(),
         },
     );
     let summary_path = config.report_dir.join("windows_security_validation.json");
@@ -6218,7 +6233,15 @@ fn run_windows_orchestration_stages(
 /// historical full-bootstrap behavior for the `vm-lab-orchestrate-live-lab`
 /// path. The standalone `vm-lab-validate-windows-security` subcommand exposes
 /// these flags so iteration loops can skip already-completed phases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// W4.5: the four `distribute_windows_*_bundle` fields opt into the
+/// orchestrator-side signed-bundle distribution stages. When a path is
+/// `Some(_)`, the corresponding distribution stage runs after the
+/// security validators and before `validate_windows_mesh_join`. When
+/// `None`, the stage is `Skipped` with a "no local bundle path
+/// provided" reason — the orchestration sequence remains stable for
+/// callers that have not yet built their local bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowsOrchestrationOptions {
     /// Skip the UTM-result-file access bootstrap step. Use when SSH +
     /// authorized_keys are already set up on the guest, and utmctl is
@@ -6229,6 +6252,16 @@ pub struct WindowsOrchestrationOptions {
     /// at the reviewed install path is already current and you only want to
     /// re-run the security validation stages.
     pub skip_install: bool,
+    /// Local path to a signed-membership snapshot to push to the
+    /// Windows guest's canonical membership path. `None` skips the
+    /// distribute_windows_membership stage.
+    pub distribute_windows_membership_bundle: Option<PathBuf>,
+    /// Local path to a signed-assignment bundle.
+    pub distribute_windows_assignment_bundle: Option<PathBuf>,
+    /// Local path to a signed-traversal bundle.
+    pub distribute_windows_traversal_bundle: Option<PathBuf>,
+    /// Local path to a signed-DNS-zone bundle.
+    pub distribute_windows_dns_zone_bundle: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6840,7 +6873,137 @@ fn run_windows_orchestration_stages_with_options(
 
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
 
-    // Stage 8: validate_windows_mesh_join (W4.2)
+    // Stages 8-11: distribute_windows_{membership,assignment,traversal,dns-zone}
+    // (W4.5)
+    //
+    // Each distribute stage SCPs a locally-built signed bundle to the
+    // Windows guest's reviewed canonical path under
+    // `C:\ProgramData\RustyNet\…`, atomic-installs over the canonical
+    // file, and clears the daemon's watermark so the next refresh tick
+    // re-ingests the bundle. When the corresponding option path is
+    // `None` the stage emits `Skipped` with reason "no local bundle
+    // path provided" — keeps the orchestration sequence stable for
+    // callers that have not yet built their local bundles. When `Some`
+    // and any prior security validator has not passed the stage emits
+    // `Skipped` with the upstream-failure reason: distribution depends
+    // on a hardened guest, never on a partially-validated guest.
+    let distribute_membership_log_path = logs_dir.join("distribute_windows_membership.log");
+    let distribute_assignment_log_path = logs_dir.join("distribute_windows_assignment.log");
+    let distribute_traversal_log_path = logs_dir.join("distribute_windows_traversal.log");
+    let distribute_dns_zone_log_path = logs_dir.join("distribute_windows_dns_zone.log");
+
+    type DistributeFn =
+        fn(&str, &Path, &Path, Option<&Path>, &Path) -> Result<(String, String), (String, String)>;
+    let run_distribute = |stage_name: &'static str,
+                          log_path: &Path,
+                          local_bundle: Option<&Path>,
+                          dispatch: DistributeFn|
+     -> VmLabStageOutcome {
+        if dry_run {
+            return stage_outcome(
+                stage_name,
+                VmLabStageStatus::Skipped,
+                format!("dry-run: would distribute {stage_name} bundle to {windows_alias}"),
+                vec![],
+            );
+        }
+        let upstream_blocker = if !bootstrap_passed {
+            Some("bootstrap_windows_host")
+        } else if !validate_passed {
+            Some("validate_windows_client_install")
+        } else if !acls_passed {
+            Some("validate_windows_runtime_acls")
+        } else if !hardening_passed {
+            Some("validate_windows_service_hardening")
+        } else if !custody_passed {
+            Some("validate_windows_key_custody")
+        } else if !authenticode_passed {
+            Some("validate_windows_authenticode")
+        } else if !dns_failclosed_passed {
+            Some("validate_windows_dns_failclosed")
+        } else {
+            None
+        };
+        if let Some(upstream) = upstream_blocker {
+            return stage_outcome(
+                stage_name,
+                VmLabStageStatus::Skipped,
+                format!("skipped: {upstream} did not pass for {windows_alias}"),
+                vec![],
+            );
+        }
+        let Some(bundle_path) = local_bundle else {
+            return stage_outcome(
+                stage_name,
+                VmLabStageStatus::Skipped,
+                format!("skipped: no local bundle path provided for {stage_name}"),
+                vec![],
+            );
+        };
+        match dispatch(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            bundle_path,
+        ) {
+            Ok((summary, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    summary.clone()
+                } else {
+                    format!("{summary}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(log_path, log_body.as_str());
+                stage_outcome(
+                    stage_name,
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![log_path.to_path_buf()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(log_path, log_body.as_str());
+                stage_outcome(
+                    stage_name,
+                    VmLabStageStatus::Fail,
+                    format!("{stage_name} distribution failed for {windows_alias}: {reason}"),
+                    vec![log_path.to_path_buf()],
+                )
+            }
+        }
+    };
+
+    let distribute_membership_outcome = run_distribute(
+        "distribute_windows_membership",
+        distribute_membership_log_path.as_path(),
+        options.distribute_windows_membership_bundle.as_deref(),
+        run_distribute_windows_membership_stage,
+    );
+    let distribute_assignment_outcome = run_distribute(
+        "distribute_windows_assignment",
+        distribute_assignment_log_path.as_path(),
+        options.distribute_windows_assignment_bundle.as_deref(),
+        run_distribute_windows_assignment_stage,
+    );
+    let distribute_traversal_outcome = run_distribute(
+        "distribute_windows_traversal",
+        distribute_traversal_log_path.as_path(),
+        options.distribute_windows_traversal_bundle.as_deref(),
+        run_distribute_windows_traversal_stage,
+    );
+    let distribute_dns_zone_outcome = run_distribute(
+        "distribute_windows_dns_zone",
+        distribute_dns_zone_log_path.as_path(),
+        options.distribute_windows_dns_zone_bundle.as_deref(),
+        run_distribute_windows_dns_zone_stage,
+    );
+
+    // Stage 12: validate_windows_mesh_join (W4.2)
     // Dispatches `rustynetd windows-mesh-status-check --no-fail-on-drift`
     // on the live Windows guest, parses the typed JSON snapshot of
     // `C:\ProgramData\RustyNet\rustynetd.state`, and emits a Pass/Fail
@@ -6955,6 +7118,10 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        distribute_membership_outcome,
+        distribute_assignment_outcome,
+        distribute_traversal_outcome,
+        distribute_dns_zone_outcome,
         mesh_join_outcome,
     ]
 }
@@ -24285,6 +24452,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             dry_run: true,
             skip_access_bootstrap: false,
             skip_install: false,
+            distribute_windows_membership_bundle: None,
+            distribute_windows_assignment_bundle: None,
+            distribute_windows_traversal_bundle: None,
+            distribute_windows_dns_zone_bundle: None,
         };
         let summary = super::run_validate_windows_security(&config).expect("dry-run must succeed");
         assert!(summary.contains("windows-utm-1"));
@@ -24304,6 +24475,11 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
         assert!(stage_names.contains(&"validate_windows_dns_failclosed"));
+        assert!(stage_names.contains(&"distribute_windows_membership"));
+        assert!(stage_names.contains(&"distribute_windows_assignment"));
+        assert!(stage_names.contains(&"distribute_windows_traversal"));
+        assert!(stage_names.contains(&"distribute_windows_dns_zone"));
+        assert!(stage_names.contains(&"validate_windows_mesh_join"));
         assert!(
             stages.iter().all(|s| s["status"] == "skipped"),
             "every dry-run stage must be skipped: {stages:?}"

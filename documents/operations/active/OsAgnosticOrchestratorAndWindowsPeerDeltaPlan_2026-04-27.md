@@ -1708,6 +1708,78 @@ conservatively.
       atomically; the second operator's snapshot wins. Operators
       who need strict serialisation should coordinate via the
       existing membership-owner lock (out of orchestrator scope).
+- [x] W4.2-followup-2 — Assignment / traversal / DNS-zone distribution
+      helpers + orchestrator wiring landed
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — extended the existing
+      W4.2-followup membership helper into a generic
+      `WindowsBundleDistributionContract` shape with one audited
+      `run_distribute_windows_bundle_stage` dispatch fn. Four thin
+      wrapper helpers route the four bundle types to the right
+      reviewed canonical / watermark / staging paths under
+      `C:\ProgramData\RustyNet\…`:
+        * `run_distribute_windows_membership_stage`
+        * `run_distribute_windows_assignment_stage`
+        * `run_distribute_windows_traversal_stage`
+        * `run_distribute_windows_dns_zone_stage`
+      All four wrappers reuse the membership three-round-trip flow
+      (ensure-staging-dir → SCP → atomic Move-Item + watermark
+      clear). The argv-only PowerShell discipline + staging-charset
+      filter from the membership slice carry over unchanged.
+      Wired the four wrappers into `run_windows_orchestration_stages_with_options`
+      between Stage 7 (`validate_windows_dns_failclosed`) and Stage 8
+      (`validate_windows_mesh_join`) as Stages 8–11
+      (`distribute_windows_{membership,assignment,traversal,dns_zone}`).
+      Each distribution stage gates on every prior security validator
+      passing — distribution depends on a hardened guest, never on a
+      partially-validated guest. When the corresponding optional
+      `WindowsOrchestrationOptions::distribute_windows_*_bundle` path
+      is `None`, the stage emits `Skipped` with reason "no local
+      bundle path provided" — orchestration sequence remains stable
+      for callers that have not yet built their local bundles. When
+      `Some`, the wrapper is invoked through a single `DistributeFn`
+      function-pointer dispatch closure that produces the same
+      pass/fail/log pattern every existing stage emits.
+    - `crates/rustynet-cli/src/main.rs` — extended the
+      `vm-lab-validate-windows-security` arg parser with four new
+      optional flags (`--distribute-windows-membership-bundle`,
+      `--distribute-windows-assignment-bundle`,
+      `--distribute-windows-traversal-bundle`,
+      `--distribute-windows-dns-zone-bundle`) and updated the help
+      text. The standalone subcommand now drives end-to-end
+      distribution + validation in a single invocation when the four
+      bundle paths are provided, or pure validation when they are
+      omitted.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 455 / 455 pass.
+      `run_validate_windows_security_dry_run_emits_skipped_stages_and_writes_report`
+      extended to assert the 12-stage sequence (8 prior + 4 new
+      distribution stages) all appear with `status=skipped` under
+      `--dry-run`.
+    - Pre-existing `clippy::collapsible_if` regression in
+      `crates/rustynet-cli/src/ops_e2e.rs` (toolchain bump to
+      clippy 1.94 introduced the lint as deny) folded into this slice
+      so the workspace gate stays green.
+  - Residual risk:
+    - **Daemon-side ingestion still gated on Windows backend.** Same
+      as the W4.2-followup membership slice: until a reviewed Windows
+      backend lands (`windows-wireguard-nt`), the daemon ships on
+      `windows-unsupported` and refuses to start, so the four bundles
+      the orchestrator pushes here will not be ingested into a
+      running daemon's trust state. The distribution code path is
+      correct + ready; each file lands in the daemon-expected
+      location with the daemon-expected ACL inherited from the
+      W1.1-verified parent root.
+    - **Distribution stages are opt-in via path arguments.** The
+      orchestration sequence emits `Skipped` outcomes for any
+      distribution stage whose `distribute_windows_*_bundle` option
+      is `None`. Operators building a heterogeneous live-lab need to
+      pre-build the four signed bundles + pass their paths through
+      the new CLI flags. A future slice can wire the four bundle
+      paths directly into `vm-lab-orchestrate-live-lab` once the
+      pull-from-Linux-exit Rust helper is done.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

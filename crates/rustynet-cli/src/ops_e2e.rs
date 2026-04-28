@@ -5222,12 +5222,11 @@ pub fn wait_for_daemon_socket_locally(
     sleep_secs: u64,
 ) -> Result<(), String> {
     for i in 1..=attempts {
-        if Path::new(socket_path).exists() {
-            if let Ok(metadata) = std::fs::metadata(socket_path) {
-                if metadata.file_type().is_socket() {
-                    return Ok(());
-                }
-            }
+        if Path::new(socket_path).exists()
+            && let Ok(metadata) = std::fs::metadata(socket_path)
+            && metadata.file_type().is_socket()
+        {
+            return Ok(());
         }
         if i < attempts {
             std::thread::sleep(Duration::from_secs(sleep_secs));
