@@ -1612,6 +1612,102 @@ conservatively.
       stage record is `Fail` in that case; once the
       distribution-side work lands the same probe will return
       `Pass` with a peer count + age summary.
+- [x] W4.2-followup (membership only) — Windows membership-snapshot
+      distribution helper landed; assignment / traversal / DNS-zone
+      bundles still pending (mechanical follow-ups using the same
+      pattern)
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added the
+      `run_distribute_windows_membership_stage` helper plus the two
+      script-builder helpers it relies on
+      (`build_windows_membership_ensure_staging_dir_script`,
+      `build_windows_membership_atomic_install_script`) and a unique-
+      filename helper (`windows_membership_staging_filename`). The
+      flow is three round-trips:
+        1. SSH + PowerShell `New-Item -ItemType Directory -Force`
+           on `C:\ProgramData\RustyNet\membership\.staging\`
+           (idempotent — the membership root itself was already
+           created with reviewed ACLs by the W1.1-verified install
+           helper, but the `.staging\` subdir is new and is
+           inherited under the same SYSTEM + Administrators DACL).
+        2. SCP the local snapshot to a per-run unique filename under
+           `.staging\` — `membership.snapshot.<32-hex-u128>.staging`.
+        3. SSH + PowerShell atomic install: `Move-Item -Force
+           -LiteralPath <staging> -Destination <canonical>` over the
+           reviewed
+           `C:\ProgramData\RustyNet\membership\membership.snapshot`
+           path, then `Remove-Item -Force -ErrorAction
+           SilentlyContinue -LiteralPath <watermark>` on
+           `C:\ProgramData\RustyNet\membership\membership.watermark`
+           to force the daemon's next refresh tick to re-ingest.
+           Mirrors the bash orchestrator's
+           `distribute_membership_worker` semantics on Linux peers
+           (`root install` + `rm -f watermark`).
+      Every PowerShell-boundary value (canonical paths, watermark
+      path, staging filename) is wrapped through `powershell_quote`
+      so the boundary is the same audited single-quoted-PS-literal
+      pattern the W2.x security validators use.
+      `build_windows_membership_atomic_install_script` defensively
+      filters the staging-filename charset to ASCII alphanumeric +
+      `-` `_` `.` so a future caller cannot inject `\`-traversal or
+      shell metacharacters via the staging-name parameter.
+      `run_distribute_windows_membership_stage` validates the local
+      snapshot is a regular file before any SSH activity, resolves
+      the target alias from the inventory, and rejects non-Windows
+      platforms up-front.
+  - Verification:
+    - `cargo fmt -p rustynet-cli -- --check` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 455 / 455
+      pass (was 450). +5 new tests in `vm_lab::tests`:
+      `windows_membership_staging_filename_uses_hex_unique_suffix`,
+      `build_windows_membership_ensure_staging_dir_script_uses_quoted_canonical_path`,
+      `build_windows_membership_atomic_install_script_emits_move_and_remove`,
+      `build_windows_membership_atomic_install_script_rejects_metacharacters`
+      (covering 7 hostile staging-filename inputs including
+      `..`-traversal, PS literal escape, command separators, etc.),
+      `build_windows_membership_atomic_install_script_accepts_unique_suffix_filename`
+      (round-trip pin: orchestrator-produced filename always passes
+      the install charset filter).
+  - Residual risk:
+    - **Daemon-side ingestion gated on Windows backend.** The
+      Windows daemon ships on `windows-unsupported` today
+      (per `WindowsWorkingNodePlan_2026-04-17.md`) and refuses to
+      start, so the snapshot the orchestrator pushes here will not
+      actually be ingested into a running daemon's peer table until
+      a reviewed Windows backend lands. The distribution code path
+      is correct and ready — the file is in the daemon-expected
+      location, with the daemon-expected ACL inherited from the
+      W1.1-reviewed `membership\` root, with the watermark cleared
+      so the next refresh tick re-ingests. When the Windows backend
+      ships, this code is the unblocker for live mesh-join evidence
+      on the W4.2 verifier.
+    - **Membership-only this slice.** Assignment, traversal, and
+      DNS-zone bundles follow the same scp + atomic-install
+      pattern but each lands in their own canonical Windows path
+      (`C:\ProgramData\RustyNet\trust\`,
+      `C:\ProgramData\RustyNet\…assignment`, etc. per
+      `crates/rustynetd/src/windows_paths.rs`). Each is a
+      mechanical follow-up to this slice; the orchestrator's
+      distribution code path does not need re-architecting.
+    - **Not yet wired into orchestrator stage sequence.** The
+      helper is exported as a `pub fn` callable from the
+      orchestrator code path but is not yet referenced from
+      `run_windows_orchestration_stages_with_options`. Wiring it
+      into the heterogeneous live-lab orchestration sequence is
+      W4.3/W4.5 territory (the live-lab run that pulls a snapshot
+      from the Linux exit and pushes to the Windows peer end-to-
+      end). The CLI subcommand surface that exposes the helper to
+      operators (`ops vm-lab-distribute-windows-membership` or
+      similar) is also a follow-up.
+    - **Multi-snapshot collision window.** If two operators
+      simultaneously distribute a snapshot to the same Windows
+      guest, the staging filenames collide with negligible
+      probability (32-hex u128) but the canonical-path Move-Item
+      could race between the second SCP and the first install.
+      The reviewed Move-Item is `-Force` so it overwrites
+      atomically; the second operator's snapshot wins. Operators
+      who need strict serialisation should coordinate via the
+      existing membership-owner lock (out of orchestrator scope).
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

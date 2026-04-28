@@ -7604,6 +7604,248 @@ fn evaluate_windows_mesh_join_report(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// W4.2-followup: Windows membership-snapshot distribution
+// ---------------------------------------------------------------------------
+
+/// Canonical Windows path the daemon's membership ingestion reads
+/// from. Mirrors `crates/rustynetd/src/windows_paths.rs:21`
+/// (`DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH`). Hard-coded here
+/// rather than imported via runtime path lookup so the orchestrator
+/// can build the install script statically without touching the
+/// daemon binary on the local host.
+const WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.snapshot";
+
+/// Canonical Windows path the watermark store reads from. Mirrors
+/// `DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH`. Deleting this file
+/// is the orchestrator's signal to the daemon "the snapshot you'll
+/// see next is fresh; ignore the existing watermark counter" — same
+/// semantics the bash orchestrator's `distribute_membership_worker`
+/// uses on Linux peers (`root rm -f /var/lib/rustynet/membership.watermark`).
+const WINDOWS_MEMBERSHIP_WATERMARK_REMOTE: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.watermark";
+
+/// Staging directory for in-flight uploads. Atomic install pattern:
+/// upload to a per-run unique filename under `.staging\`, then
+/// `Move-Item -Force` over the canonical path. Both the staging
+/// directory AND the canonical-path parent (`membership\`) live
+/// under `C:\ProgramData\RustyNet\` — a reviewed root locked to
+/// SYSTEM + Administrators by the W1.1 ACL verifier — so the upload
+/// transit window does not expose the snapshot to a wider audience
+/// than the canonical path itself.
+const WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE: &str = r"C:\ProgramData\RustyNet\membership\.staging";
+
+/// Build the PowerShell script body that ensures the staging
+/// directory exists on the Windows guest. Runs before `scp` — the
+/// scp will fail if the parent directory does not exist on a Windows
+/// host, so we create it explicitly. `New-Item -Force` is idempotent.
+/// The path is a hard-coded reviewed constant so no untrusted value
+/// crosses the PowerShell boundary; we still wrap through the
+/// `powershell_quote` discipline for argv-only consistency with the
+/// rest of the orchestrator's PS construction.
+#[allow(dead_code)]
+fn build_windows_membership_ensure_staging_dir_script() -> Result<String, String> {
+    let quoted_dir = powershell_quote(WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE)?;
+    Ok(format!(
+        "New-Item -ItemType Directory -Force -Path {quoted_dir} | Out-Null"
+    ))
+}
+
+/// Build the PowerShell script body that performs the atomic
+/// install: rename `<staging>\<filename>` over the canonical
+/// snapshot path, then delete the watermark file (force the daemon
+/// to re-ingest). All three paths cross the boundary as
+/// single-quoted PowerShell literals via `powershell_quote`, with
+/// the existing `ensure_no_control_chars` filter rejecting anything
+/// that could break out of the quote. Equivalent to the Linux
+/// orchestrator's `install -m 0600` + `rm -f watermark` pair.
+#[allow(dead_code)]
+fn build_windows_membership_atomic_install_script(
+    staging_filename: &str,
+) -> Result<String, String> {
+    ensure_no_control_chars("windows membership staging filename", staging_filename)?;
+    if staging_filename.is_empty() {
+        return Err("windows membership staging filename must not be empty".to_string());
+    }
+    // Defensive filter on the staging filename: only accept
+    // alphanumerics, dashes, underscores, dots. The orchestrator
+    // generates this from `unique_suffix()` (a hex u128) plus a
+    // fixed prefix; rejecting anything else means a future caller
+    // who feeds in user-controlled values cannot inject `\`-traversal
+    // or shell metacharacters into the resulting Move-Item call.
+    for ch in staging_filename.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.') {
+            return Err(format!(
+                "windows membership staging filename rejected on {ch:?}; allowed: ASCII alphanumeric + '-' '_' '.'"
+            ));
+        }
+    }
+    let staging_full = format!(
+        "{}\\{}",
+        WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE, staging_filename
+    );
+    let quoted_staging = powershell_quote(&staging_full)?;
+    let quoted_canonical = powershell_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE)?;
+    let quoted_watermark = powershell_quote(WINDOWS_MEMBERSHIP_WATERMARK_REMOTE)?;
+    Ok(format!(
+        "Move-Item -Force -LiteralPath {quoted_staging} -Destination {quoted_canonical}; \
+         Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath {quoted_watermark}"
+    ))
+}
+
+/// Build a unique staging filename. Format:
+/// `membership.snapshot.<hex-u128>.staging`. The hex u128 is the
+/// orchestrator's existing `unique_suffix()` so collisions across
+/// concurrent runs are negligible. The `.staging` suffix is a
+/// belt-and-braces marker that distinguishes uploaded-but-not-yet-
+/// renamed files from the canonical snapshot, useful when an operator
+/// inspects the staging directory mid-flight.
+#[allow(dead_code)]
+fn windows_membership_staging_filename(suffix: u128) -> String {
+    format!("membership.snapshot.{suffix:032x}.staging")
+}
+
+/// Distribute a local signed-membership snapshot to the Windows
+/// guest. Three SSH/SCP round-trips:
+///   1. Ensure the `.staging` directory exists on the guest.
+///   2. SCP the local snapshot to a per-run unique filename under
+///      `.staging\`.
+///   3. Atomic `Move-Item -Force` over the canonical path, then
+///      delete the watermark to force the daemon's next refresh
+///      tick to re-ingest.
+///
+/// The local snapshot path is validated as a regular file before
+/// any SSH activity. The PowerShell script bodies are built via the
+/// same argv-only-with-`powershell_quote` discipline the W2.x
+/// security validator helpers use; no value crosses the PS
+/// boundary unquoted.
+///
+/// Today the Windows daemon ships on the `windows-unsupported`
+/// backend label and refuses to start, so the snapshot the
+/// orchestrator pushes here will not actually be ingested until a
+/// reviewed Windows backend ships (tracked in
+/// `WindowsWorkingNodePlan_2026-04-17.md`). The distribution code
+/// path is correct and ready; it lands the file in the
+/// daemon-expected location with the daemon-expected ACL inherited
+/// from the W1.1 reviewed `membership\` root.
+#[allow(dead_code)]
+pub fn run_distribute_windows_membership_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_snapshot_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    if !local_snapshot_path.is_file() {
+        return Err((
+            format!(
+                "local membership snapshot not a regular file: {}",
+                local_snapshot_path.display()
+            ),
+            String::new(),
+        ));
+    }
+
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+    // Step 1: ensure staging dir exists.
+    let ensure_dir_script =
+        build_windows_membership_ensure_staging_dir_script().map_err(|err| (err, String::new()))?;
+    let ensure_dir_invocation = build_ssh_powershell_encoded_invocation(ensure_dir_script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let _ = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        ensure_dir_invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("ensure-staging-dir for windows membership distribution failed: {err}"),
+            String::new(),
+        )
+    })?;
+
+    // Step 2: SCP local snapshot to staging.
+    let staging_filename = windows_membership_staging_filename(unique_suffix());
+    let staging_remote_path = format!(
+        "{}\\{}",
+        WINDOWS_MEMBERSHIP_STAGING_DIR_REMOTE, staging_filename
+    );
+    let scp_status = scp_to_remote_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        local_snapshot_path,
+        staging_remote_path.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("scp of windows membership snapshot to staging failed: {err}"),
+            String::new(),
+        )
+    })?;
+    if !scp_status.success() {
+        return Err((
+            format!(
+                "scp of windows membership snapshot to staging exited non-zero: {}",
+                status_code(scp_status)
+            ),
+            String::new(),
+        ));
+    }
+
+    // Step 3: atomic install + delete watermark.
+    let install_script = build_windows_membership_atomic_install_script(staging_filename.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let install_invocation = build_ssh_powershell_encoded_invocation(install_script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let _ = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        install_invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("atomic install of windows membership snapshot failed: {err}"),
+            String::new(),
+        )
+    })?;
+
+    Ok((
+        format!(
+            "Windows membership snapshot distributed to {windows_alias} (staging={staging_filename}, canonical={WINDOWS_MEMBERSHIP_SNAPSHOT_REMOTE})"
+        ),
+        String::new(),
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveLabStageSummary {
     overall_status: String,
@@ -22657,6 +22899,111 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             err.contains("parse windows-mesh-status-check JSON output failed"),
             "unexpected: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // W4.2-followup: distribute_windows_membership tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn windows_membership_staging_filename_uses_hex_unique_suffix() {
+        let filename = super::windows_membership_staging_filename(0xdeadbeef_u128);
+        // 32 hex chars (u128 padded to 32) + the fixed prefix/suffix.
+        assert!(
+            filename.starts_with("membership.snapshot."),
+            "filename must start with prefix: {filename}"
+        );
+        assert!(
+            filename.ends_with(".staging"),
+            "filename must end with .staging marker: {filename}"
+        );
+        // The hex digits portion is exactly 32 chars (padded u128).
+        let core = filename
+            .strip_prefix("membership.snapshot.")
+            .unwrap()
+            .strip_suffix(".staging")
+            .unwrap();
+        assert_eq!(core.len(), 32, "hex u128 portion must be 32 chars");
+        assert!(
+            core.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex portion must be all hex digits: {core}"
+        );
+    }
+
+    #[test]
+    fn build_windows_membership_ensure_staging_dir_script_uses_quoted_canonical_path() {
+        let script = super::build_windows_membership_ensure_staging_dir_script()
+            .expect("ensure-staging-dir script must build");
+        // The reviewed staging path is quoted as a single-quoted PS literal.
+        assert!(
+            script.contains("'C:\\ProgramData\\RustyNet\\membership\\.staging'"),
+            "script must reference the reviewed staging path: {script}"
+        );
+        assert!(
+            script.contains("New-Item -ItemType Directory -Force"),
+            "script must use idempotent New-Item -Force: {script}"
+        );
+    }
+
+    #[test]
+    fn build_windows_membership_atomic_install_script_emits_move_and_remove() {
+        let script = super::build_windows_membership_atomic_install_script(
+            "membership.snapshot.deadbeef.staging",
+        )
+        .expect("atomic-install script must build");
+        // Must reference the canonical reviewed paths in single-quoted form.
+        assert!(
+            script.contains("'C:\\ProgramData\\RustyNet\\membership\\membership.snapshot'"),
+            "script must reference canonical snapshot path: {script}"
+        );
+        assert!(
+            script.contains("'C:\\ProgramData\\RustyNet\\membership\\membership.watermark'"),
+            "script must reference canonical watermark path: {script}"
+        );
+        assert!(script.contains("Move-Item -Force -LiteralPath"));
+        assert!(script.contains("Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath"));
+    }
+
+    #[test]
+    fn build_windows_membership_atomic_install_script_rejects_metacharacters() {
+        // Defensive: the staging filename must be ASCII alphanumeric
+        // + '-' '_' '.'. Anything else (especially `\` for path
+        // traversal, or `'` for PS literal escape) rejects so a
+        // future caller cannot inject through the staging-name
+        // parameter.
+        for bad in [
+            "evil\\..\\membership.snapshot",
+            "name'; Remove-Item C:\\ProgramData\\RustyNet -Recurse",
+            "name with spaces",
+            "name`whoami`",
+            "name$(rm)",
+            "name;Remove-Item",
+            "",
+        ] {
+            let err = super::build_windows_membership_atomic_install_script(bad)
+                .expect_err(&format!("staging filename {bad:?} must be rejected"));
+            // Empty input has its own rejection path; everything
+            // else must mention "rejected on" + the offending char.
+            if bad.is_empty() {
+                assert!(err.contains("must not be empty"), "unexpected: {err}");
+            } else {
+                assert!(
+                    err.contains("rejected") || err.to_lowercase().contains("control"),
+                    "unexpected error for {bad:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_windows_membership_atomic_install_script_accepts_unique_suffix_filename() {
+        // The orchestrator's `windows_membership_staging_filename(unique_suffix())`
+        // produces names like `membership.snapshot.<32-hex>.staging`.
+        // This test pins the round-trip: filename produced by the
+        // helper passes the install-script charset filter.
+        let filename = super::windows_membership_staging_filename(0xfeedface_u128);
+        super::build_windows_membership_atomic_install_script(filename.as_str())
+            .expect("orchestrator-produced filename must pass install charset filter");
     }
 
     fn baseline_live_lab_run_inputs() -> super::LiveLabRunInputs {
