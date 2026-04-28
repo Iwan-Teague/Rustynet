@@ -222,6 +222,21 @@ impl SignedBundle {
         let mut expires_at_unix = 0;
         let mut watermark = 0;
 
+        // Reject malformed integer fields explicitly. The previous
+        // `unwrap_or(0)` silently mapped bad input to 0, which:
+        //   - was fail-closed for `expires_at_unix` (0 < now_unix
+        //     means "expired", caller rejects);
+        //   - was fail-closed for `nonce` IF the watermark store
+        //     already had a non-zero current watermark (replay
+        //     check rejects 0);
+        //   - but on a freshly-initialised host with no prior
+        //     watermark, a `nonce=garbage` bundle parses as
+        //     watermark=0 and the watermark store accepts it (its
+        //     check is `new <= current` and current=0 here means
+        //     "no prior bundle accepted" — but a malformed nonce
+        //     is NOT the same as a nonce of 0). Tightening this
+        //     means a malformed bundle is rejected at parse time,
+        //     never reaching the verifier or watermark store.
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix(sig_marker) {
                 let hex_str = rest.trim();
@@ -232,11 +247,20 @@ impl SignedBundle {
                 signature_bytes.copy_from_slice(&decoded);
                 found_sig = true;
             } else if let Some(rest) = line.strip_prefix("generated_at_unix=") {
-                issued_at_unix = rest.trim().parse().unwrap_or(0);
+                issued_at_unix = rest
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("invalid generated_at_unix: {err}"))?;
             } else if let Some(rest) = line.strip_prefix("expires_at_unix=") {
-                expires_at_unix = rest.trim().parse().unwrap_or(0);
+                expires_at_unix = rest
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("invalid expires_at_unix: {err}"))?;
             } else if let Some(rest) = line.strip_prefix("nonce=") {
-                watermark = rest.trim().parse().unwrap_or(0);
+                watermark = rest
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("invalid nonce: {err}"))?;
             }
         }
 
@@ -515,6 +539,115 @@ mod tests {
             hex_encode(&signature.to_bytes())
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_malformed_generated_at_unix() {
+        // Adversarial input: a bundle whose generated_at_unix isn't
+        // parseable. Previously SignedBundle::parse used
+        // `unwrap_or(0)` which silently accepted malformed input.
+        // After the tightening, parse rejects with a precise reason.
+        let body =
+            b"version=1\ngenerated_at_unix=garbage\nexpires_at_unix=10\nnonce=1\nsignature=00\n";
+        let err = super::SignedBundle::parse(body).expect_err("malformed integer must reject");
+        assert!(
+            err.contains("invalid generated_at_unix"),
+            "rejection must cite the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_malformed_expires_at_unix() {
+        let body = b"version=1\ngenerated_at_unix=1\nexpires_at_unix=not-a-number\nnonce=1\nsignature=00\n";
+        let err = super::SignedBundle::parse(body).expect_err("malformed integer must reject");
+        assert!(
+            err.contains("invalid expires_at_unix"),
+            "rejection must cite the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_malformed_nonce() {
+        // Most security-relevant of the three: a bundle with
+        // `nonce=garbage` previously parsed as watermark=0, which on
+        // a fresh watermark store (no prior bundle) would pass the
+        // replay check (`new <= current` with current=0). Tightening
+        // the parse rejects garbage at the bundle layer so the
+        // watermark store never sees it.
+        let body =
+            b"version=1\ngenerated_at_unix=1\nexpires_at_unix=10\nnonce=garbage\nsignature=00\n";
+        let err = super::SignedBundle::parse(body).expect_err("malformed nonce must reject");
+        assert!(
+            err.contains("invalid nonce"),
+            "rejection must cite the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_overflow_nonce() {
+        // u64 max is 18446744073709551615; appending a digit
+        // overflows the parse.
+        let body = b"version=1\ngenerated_at_unix=1\nexpires_at_unix=10\nnonce=184467440737095516159\nsignature=00\n";
+        let err = super::SignedBundle::parse(body).expect_err("overflow nonce must reject");
+        assert!(err.contains("invalid nonce"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_negative_generated_at_unix() {
+        // unsigned integer parser rejects '-1'.
+        let body = b"version=1\ngenerated_at_unix=-1\nexpires_at_unix=10\nnonce=1\nsignature=00\n";
+        let err =
+            super::SignedBundle::parse(body).expect_err("negative generated_at_unix must reject");
+        assert!(
+            err.contains("invalid generated_at_unix"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_empty_input() {
+        let err = super::SignedBundle::parse(b"").expect_err("empty input must reject");
+        // Empty body has no signature= line — falls into the
+        // `missing signature` rejection arm, which is the same
+        // failure-shape an attacker would get with any signature-
+        // less payload.
+        assert!(err.contains("missing signature"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_non_utf8_input() {
+        let body: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
+        let err = super::SignedBundle::parse(body).expect_err("non-utf8 input must reject");
+        assert!(err.contains("not valid utf8"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_signature_with_odd_hex_length() {
+        // hex_decode rejects odd-length hex strings. Even though the
+        // length check on the decoded bytes (== 64) would also
+        // reject this, catching the parse error earlier means we
+        // never allocate the (possibly huge) buffer for the decode.
+        let body = b"version=1\ngenerated_at_unix=1\nexpires_at_unix=10\nnonce=1\nsignature=abc\n";
+        let err = super::SignedBundle::parse(body).expect_err("odd-length hex must reject");
+        assert!(err.contains("odd length"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_signature_short_decoded() {
+        // Even-length hex but decodes to fewer than 64 bytes.
+        let body = b"version=1\ngenerated_at_unix=1\nexpires_at_unix=10\nnonce=1\nsignature=abcd\n";
+        let err = super::SignedBundle::parse(body).expect_err("short signature must reject");
+        assert!(
+            err.contains("invalid signature length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_signed_bundle_parse_rejects_signature_invalid_hex_char() {
+        let body = b"version=1\ngenerated_at_unix=1\nexpires_at_unix=10\nnonce=1\nsignature=ZZZZ\n";
+        let err = super::SignedBundle::parse(body).expect_err("invalid hex char must reject");
+        assert!(err.contains("invalid hex char"), "unexpected error: {err}");
     }
 
     #[test]
