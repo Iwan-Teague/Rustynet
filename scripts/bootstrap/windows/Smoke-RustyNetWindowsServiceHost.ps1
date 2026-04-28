@@ -11,6 +11,24 @@ $ProgressPreference = 'SilentlyContinue'
 $script:SmokeFailureStep = 'init'
 $script:SmokeRuntimeSignals = $null
 
+# Defense-in-depth parameter validators mirroring Rust orchestrator's
+# `validate_service_name` (vm_lab/mod.rs). The smoke helper accepts a
+# distinct service name (`RustyNetSmoke`) but the same charset rule
+# applies so the helper can never install a service under an injected
+# name.
+if ([string]::IsNullOrEmpty($ServiceName)) {
+    throw 'smoke service name must not be empty'
+}
+if ($ServiceName.Length -gt 128) {
+    throw ('smoke service name exceeds 128 chars: {0} chars' -f $ServiceName.Length)
+}
+if ($ServiceName -notmatch '^[A-Za-z0-9_-]+$') {
+    throw ('smoke service name must be ASCII alphanumeric + `-` + `_`; rejected: {0}' -f $ServiceName)
+}
+if ($StateRoot -ne 'C:\ProgramData\RustyNet') {
+    throw ('state root must be C:\ProgramData\RustyNet; received {0}' -f $StateRoot)
+}
+
 function New-FailClosedSmokeReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
     return [ordered]@{

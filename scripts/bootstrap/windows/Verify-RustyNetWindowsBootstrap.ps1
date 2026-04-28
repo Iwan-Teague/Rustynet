@@ -12,6 +12,31 @@ $ProgressPreference = 'SilentlyContinue'
 $script:VerifyFailureStep = 'init'
 $script:VerifyRuntimeSignals = $null
 
+# Defense-in-depth parameter validators mirroring the Rust orchestrator's
+# `validate_service_name` (vm_lab/mod.rs) and the daemon-side reviewed
+# install/state roots. Helper fails loudly with a precise reason if a
+# malformed parameter slips past the orchestrator-side gates.
+function Test-RustyNetServiceName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) {
+        throw 'service name must not be empty'
+    }
+    if ($Name.Length -gt 128) {
+        throw ('service name exceeds 128 chars: {0} chars' -f $Name.Length)
+    }
+    if ($Name -notmatch '^[A-Za-z0-9_-]+$') {
+        throw ('service name must be ASCII alphanumeric + `-` + `_`; rejected: {0}' -f $Name)
+    }
+}
+
+Test-RustyNetServiceName -Name $ServiceName
+if ($InstallRoot -ne 'C:\Program Files\RustyNet') {
+    throw ('install root must be C:\Program Files\RustyNet; received {0}' -f $InstallRoot)
+}
+if ($StateRoot -ne 'C:\ProgramData\RustyNet') {
+    throw ('state root must be C:\ProgramData\RustyNet; received {0}' -f $StateRoot)
+}
+
 function New-FailClosedVerifyReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
     return [ordered]@{

@@ -12,6 +12,53 @@ $ProgressPreference = 'SilentlyContinue'
 $script:InstallFailureStep = 'init'
 $script:InstallRuntimeSignals = $null
 
+# Defense-in-depth: PS-side validators that mirror the Rust orchestrator's
+# `validate_service_name` (see crates/rustynet-cli/src/vm_lab/mod.rs) and
+# `validate_windows_runtime_file_path` (see crates/rustynetd/src/windows_paths.rs)
+# so this helper fails closed even if a future caller bypasses the
+# orchestrator-side check or runs the helper directly. The reviewed
+# charset for service names is ASCII alphanumeric + `-` + `_`, non-empty,
+# ≤128 chars (intersection of systemd unit naming + Windows SCM service
+# naming rules). Reviewed install/state roots are pinned to
+# `C:\Program Files\RustyNet` and `C:\ProgramData\RustyNet`; deviation
+# rejects so the helper cannot install RustyNet under an unreviewed
+# layout.
+function Test-RustyNetServiceName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) {
+        throw 'service name must not be empty'
+    }
+    if ($Name.Length -gt 128) {
+        throw ('service name exceeds 128 chars: {0} chars' -f $Name.Length)
+    }
+    if ($Name -notmatch '^[A-Za-z0-9_-]+$') {
+        throw ('service name must be ASCII alphanumeric + `-` + `_`; rejected: {0}' -f $Name)
+    }
+}
+
+function Test-RustyNetReviewedInstallRoot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $expected = 'C:\Program Files\RustyNet'
+    if ($Path -ne $expected) {
+        throw ('install root must be {0}; received {1}' -f $expected, $Path)
+    }
+}
+
+function Test-RustyNetReviewedStateRoot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $expected = 'C:\ProgramData\RustyNet'
+    if ($Path -ne $expected) {
+        throw ('state root must be {0}; received {1}' -f $expected, $Path)
+    }
+}
+
+# Run validators before the trap handler is registered so a malformed
+# parameter fails loudly with the precise reason rather than collapsing
+# to a generic 'install-init-exception'.
+Test-RustyNetServiceName -Name $ServiceName
+Test-RustyNetReviewedInstallRoot -Path $InstallRoot
+Test-RustyNetReviewedStateRoot -Path $StateRoot
+
 function New-FailClosedInstallReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
     return [ordered]@{

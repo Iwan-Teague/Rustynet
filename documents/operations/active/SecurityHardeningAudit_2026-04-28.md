@@ -209,27 +209,40 @@ prompt; key categories below.
   itself validates URL/ref shape but no pre-validation in the
   script.
 
-**Cross-cutting hardening recommendation (deferred to a follow-up
-W2.5b slice — not landed in this audit pass):**
-1. Add a `Test-RustyNetServiceName` validator at the top of every
-   PS helper that accepts `-ServiceName`, mirroring the Rust-side
-   `validate_service_name` (ASCII alphanumeric + `-` + `_`,
-   non-empty, ≤128 chars). Defense-in-depth even though the
-   orchestrator-side helpers already validate before dispatch.
-2. Add a `Test-RustyNetReviewedRoot` validator for `-InstallRoot`
-   and `-StateRoot` parameters that rejects non-canonical paths
-   outside the reviewed `C:\Program Files\RustyNet` /
-   `C:\ProgramData\RustyNet` roots (matches the daemon-side
-   `validate_windows_runtime_file_path`).
-3. Replace `cmd.exe /c $commandText` in
+**Cross-cutting hardening recommendation status (W2.5b):**
+1. **[x] LANDED** — `Test-RustyNetServiceName` defense-in-depth
+   validators added at the top of `Install-RustyNetWindowsService.ps1`,
+   `Verify-RustyNetWindowsBootstrap.ps1`, and
+   `Smoke-RustyNetWindowsServiceHost.ps1`. Mirror the Rust-side
+   `validate_service_name`: ASCII alphanumeric + `-` + `_`,
+   non-empty, ≤128 chars. Run BEFORE the trap handler is registered
+   so a malformed parameter fails loudly with the precise reason
+   instead of collapsing to a generic exception.
+2. **[x] LANDED** — `Test-RustyNetReviewedInstallRoot` /
+   `Test-RustyNetReviewedStateRoot` validators added to
+   `Install-RustyNetWindowsService.ps1` (full pair) and
+   `Verify-RustyNetWindowsBootstrap.ps1` /
+   `Smoke-RustyNetWindowsServiceHost.ps1` (StateRoot check;
+   InstallRoot check on Verify). Reject any deviation from the
+   reviewed `C:\Program Files\RustyNet` / `C:\ProgramData\RustyNet`
+   roots so the helper cannot install RustyNet under an unreviewed
+   layout.
+3. **[ ] DEFERRED** — Replace `cmd.exe /c $commandText` in
    `Bootstrap-RustyNetWindows.ps1:460, 1031` and
    `Collect-RustyNetWindowsDiagnostics.ps1:288` with direct
-   `Start-Process` -ArgumentList arrays.
-4. Replace `Get-CimInstance -Filter "Name='..."` with
-   `Get-Service -Name $ServiceName -ErrorAction SilentlyContinue`
-   pattern (which we already use elsewhere).
-5. Quote every `icacls $Path` and `sc.exe delete $ServiceName` arg
-   with explicit `"$Path"` even though PS5.1 usually wraps it.
+   `Start-Process` -ArgumentList arrays. Bigger refactor; not in
+   this slice.
+4. **[ ] DEFERRED** — Replace `Get-CimInstance -Filter
+   "Name='...'"` with `Get-Service -Name $ServiceName
+   -ErrorAction SilentlyContinue` pattern (which we already use
+   elsewhere). Theoretical-only since `$ServiceName` charset is
+   now validated by the Test-RustyNetServiceName helper that
+   landed in item 1.
+5. **[ ] DEFERRED** — Quote every `icacls $Path` and `sc.exe
+   delete $ServiceName` arg with explicit `"$Path"` even though
+   PS5.1 usually wraps it. Theoretical-only since `$Path` values
+   come from validated `$InstallRoot` / `$StateRoot` per item 2,
+   and `$ServiceName` is validated per item 1.
 
 **Verdict:** Audit complete. None of the findings are
 attacker-reachable today (script values come from controlled
