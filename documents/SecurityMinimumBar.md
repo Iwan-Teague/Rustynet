@@ -101,6 +101,67 @@ These budgets are release gates once benchmarking harnesses are active.
 - Privileged-helper command-input safety tests.
 - Patch-SLA and emergency-release drill evidence.
 
+## 6.B) Bootstrap Trust Anchor (Membership Owner Public Key)
+
+A new node's first contact with the mesh consumes a *signed
+membership snapshot*. The owner-signing-key public part is the
+trust anchor that lets the node verify subsequent snapshots,
+assignment bundles, traversal bundles, and DNS-zone bundles. The
+private side never leaves the membership owner's secure keystore.
+
+The public side (`membership.owner.key.pub`) MUST reach the
+new node *out of band*, before the daemon is allowed to load any
+signed state. Every reviewed Rustynet install carries the public
+key at:
+
+- Linux: `/etc/rustynet/membership.owner.key.pub`
+- Windows: `C:\ProgramData\RustyNet\trust\membership.owner.key.pub`
+
+Approved out-of-band delivery channels (in decreasing preference):
+
+1. **Pre-baked into the install image.** The reviewed bootstrap
+   helper for the install track (e.g. `cloud-init` user-data on
+   Linux, MDM device profile on Windows) lays the public key down
+   before the daemon's first start. This is the most-secure
+   default — the trust anchor is bound to the image build, not
+   to any post-deployment trust transfer.
+
+2. **Out-of-band copy from a trusted operator workstation** —
+   the operator distributes the public key via SSH or a signed
+   file-transfer channel rooted in the operator's existing trust.
+   The target host's daemon refuses to start until the file is
+   present + ACL'd to root/SYSTEM-only.
+
+3. **Sneakernet / printed thumbprint with pre-distributed
+   software.** For air-gapped deployments, the public key is
+   printed (or QR-coded) and visually verified against a known
+   source. This is rare in normal Rustynet deployments and is the
+   fallback for environments that forbid in-band trust transfer.
+
+**Forbidden / not approved:**
+- Fetching the public key over plaintext HTTP (no trust anchor
+  yet, so HTTPS is the *minimum* but the daemon SHOULD prefer
+  pre-baking instead).
+- Fetching the public key over a TLS-only channel without the
+  operator visually verifying the thumbprint — TLS alone does not
+  bind the certificate to the membership owner.
+- Sharing the public key over a chat channel that does not
+  publish key material in a tamper-evident form.
+
+**Verification (post-install):**
+- `sha256sum /etc/rustynet/membership.owner.key.pub` (Linux) or
+  `Get-FileHash -Algorithm SHA256
+  C:\ProgramData\RustyNet\trust\membership.owner.key.pub` (Windows)
+  must match the operator's published key thumbprint.
+- The file's ACL must be SYSTEM/Administrators / root-only;
+  Rustynet's runtime ACL verifier (Linux) and W1.2 verifier
+  (Windows) reject non-canonical ACLs at daemon start.
+
+This subsection captures the previously-implicit Tofu (trust on
+first use) handshake the Rustynet bootstrap performs with the
+out-of-band trust anchor; making it explicit closes
+SecurityHardeningAudit_2026-04-28.md §B.9.1.
+
 ## 7) Phase Mapping
 - Phase 1: baseline standards and threat model defined.
 - Phase 2: auth/enrollment abuse controls + key custody baseline + atomic one-time key handling.

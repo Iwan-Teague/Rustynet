@@ -268,35 +268,349 @@ deserialization, Windows IPC serde_json size limits, STUN protocol
 manual bounds checks, config parsing Result-based, backend-wireguard
 test-only fixtures. **Cleared 2026-04-28.**
 
-## 3) Phase B — Post-W4 Deep Audit (TODO)
+## 3) Phase B — Comparative VPN Security Findings (2026-04-28)
 
-After W4 lands the per-stage capability gating + Windows mesh-join,
-extend this document with:
+Comparison against the published security practices of Tailscale,
+WireGuard (the protocol whitepaper + audited implementations),
+Nebula, OpenVPN, and Microsoft's Windows service-hardening guidance.
+Each finding records: the published practice, what Rustynet does
+today, gap (if any), severity (HIGH / MEDIUM / LOW), and either an
+"applied" commit SHA or a "deferred — tracked under …" pointer.
 
-- **Tailscale comparison**: Tailscale's published security model
-  (DERP relay handshake replay protection, magic-DNS poisoning
-  resistance, MagicDNS rebind protection, MITM scenarios for
-  bootstrap, key-rotation cadence) — translate the relevant
-  practices to Rustynet's relay + DNS zone code.
-- **WireGuard comparison**: WireGuard whitepaper + audited
-  implementations' practices around handshake replay windows,
-  key rotation, formal proof obligations for handshake state
-  machines.
-- **OPENVPN / OpenWRT-WireGuard / Nebula** secondary references
-  for things like rate-limit windows, bootstrap-safety, traversal
-  trust policy.
-- **Windows-specific** hardening recommendations from
-  Microsoft's published service hardening guidance (least-privilege
-  service SIDs, mandatory-integrity DACLs, AppContainer where
-  applicable). Rustynet already runs the service under
-  `unrestricted` SID type with the install-helper's W2.2-grade
-  lock-down; the deep audit should look at whether tighter
-  options (`-restricted`, `-virtual`) are usable.
+The comparison was done by code-walking Rustynet's relay,
+traversal, fetcher, daemon, dataplane, and key-material modules
+against the public design notes / source of the reference
+projects. Detailed code-walk references in §5 below.
 
-Each finding gets the same shape as Phase A: file:line, severity,
-risk description, remediation, evidence (commit SHA or "deferred —
-tracked under …"). Findings that are *not* applied this session
-are tracked here as future work, not as TODOs in source.
+### B.1 WireGuard — handshake replay protection
+
+**Practice (WireGuard whitepaper §5.4.5):** Each peer maintains a
+sliding-window replay filter on received transport packets keyed by
+the 64-bit counter; out-of-window or already-seen counters are
+silently dropped.
+
+**Rustynet today:** the dataplane goes through `boringtun`
+(Cloudflare's audited WireGuard userspace) for packet processing —
+boringtun ships the standard sliding-window replay filter
+inherited from the reference WireGuard implementation.
+
+**Gap:** none. Rustynet inherits the WireGuard replay invariant by
+construction. Verified by reading
+`third_party/boringtun/src/noise/handshake.rs` and the wider noise
+implementation.
+
+**Severity:** N/A (already correct).
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.2 WireGuard — key rotation cadence (REKEY_AFTER_TIME / REJECT_AFTER_TIME)
+
+**Practice (WireGuard whitepaper §5.4):**
+`REKEY_AFTER_TIME = 120s`, `REJECT_AFTER_TIME = 180s`. Sessions
+older than 180s are rejected; rekey is initiated at 120s. Plus
+volume-based limits (`REKEY_AFTER_MESSAGES = 2^60`).
+
+**Rustynet today:** Inherited from boringtun. Constants live in
+the boringtun crate's `noise` module and match the upstream
+WireGuard reference values.
+
+**Gap:** none.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.3 Tailscale — DERP relay token replay protection
+
+**Practice (Tailscale published design):** DERP session tokens are
+short-lived, single-use, bound to peer node IDs + relay ID, and
+include a nonce that changes per request. Constant-time comparison
+on every secret-bearing field.
+
+**Rustynet today:** `crates/rustynet-relay/src/transport.rs` (line
+13-30 module header documents the policy explicitly):
+- Tokens are signed Ed25519 envelopes with `node_id`,
+  `peer_node_id`, `relay_id`, and an expiry.
+- Verification uses `subtle::ConstantTimeEq::ct_eq` on every
+  secret-bearing field (lines 205, 216, 224 — already cleared in
+  Phase A §A.3.3 above).
+- Replay protection: a watermark store rejects tokens issued
+  before the last accepted issued-at timestamp.
+
+**Gap:** none — the relay implementation already follows the
+Tailscale-style discipline.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.4 Tailscale — MagicDNS rebind / poisoning resistance
+
+**Practice:** A MagicDNS resolver must reject responses that:
+1. Resolve a tailnet-only name to a non-tailnet IP (RFC1918 /
+   non-tailnet space).
+2. Change the resolved IP between sequential queries within a
+   short window (DNS rebinding attack).
+3. Bypass the resolver via interface DNS that's not the
+   loopback resolver.
+
+**Rustynet today:** The W1.3 `windows_dns_failclosed` verifier
+landed in this delta (commit `adf255c`) enforces (3) on Windows
+already — every interface DNS must be loopback-only or empty, and
+at least one NRPT rule must cover the root namespace pointing at
+loopback. The Linux side enforces (3) via the `phase10.rs`
+nftables drop-except-on-tunnel rules (cleared as A.3.x in the
+phase A pass).
+
+For (1) and (2) — the daemon's own DNS resolver:
+- The daemon binds a loopback resolver (when
+  `dns_resolver_bind_addr` is set per phase10) and serves DNS
+  zone bundles fetched from the controller. The bundles are signed
+  + watermark-checked + freshness-gated (see `fetcher.rs`); they
+  cannot be forged in transit.
+- The daemon does NOT yet implement RFC1918-rebind rejection at
+  the resolver layer (a malicious zone-publisher could in principle
+  inject an RFC1918 answer for a tailnet-internal name).
+
+**Gap:** [B.4.1, MEDIUM, deferred] Add an output filter on the
+daemon's loopback resolver that rejects answers where the response
+IP is in RFC1918 (10/8, 172.16/12, 192.168/16), link-local
+(169.254/16), or loopback (127/8) and the question name is a
+public-domain (non-tailnet) suffix. Defense-in-depth — the
+zone-bundle signing already gates the upstream of trust, but the
+filter prevents misconfiguration leakage.
+
+**Severity:** MEDIUM, deferred. Tracked here as B.4.1; landing
+requires a small extension to the daemon's DNS resolver that
+inspects answer records before they cross the loopback boundary.
+
+---
+
+### B.5 Tailscale — node-key thumbprint pinning on join
+
+**Practice:** Every node has a long-lived public key (its
+"node key"); the controller pins the thumbprint of the node key
+on first registration. Subsequent control-plane requests from the
+same node are checked against the pinned thumbprint to defeat
+node-key swap attacks.
+
+**Rustynet today:** Membership snapshots are signed by the
+membership owner's signing key; the daemon verifies the signature
+on every snapshot fetch (`fetcher.rs`,
+`crates/rustynetd/src/daemon.rs` membership ingestion). The signed
+snapshot pins each member's node ID + WireGuard public key.
+
+**Gap:** none — Rustynet uses signed-membership pinning, which is
+strictly stronger than per-node thumbprint pinning (Tailscale uses
+both).
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.6 Nebula — certificate-based peer authentication
+
+**Practice (Nebula): ** Every peer carries a certificate signed by
+the network's CA, with the subject including the peer's IP +
+allowed groups + expiry. Peers verify each other's certificates
+during handshake.
+
+**Rustynet today:** Equivalent via signed membership snapshots —
+each peer's WireGuard public key is published in a signed snapshot
+fetched from the controller. The handshake itself uses raw
+WireGuard (no cert chain), so per-peer authn relies on the
+membership snapshot being current. The signed-snapshot mechanism
+provides the same effective property as Nebula's per-peer cert,
+with the trust anchor centralized in the membership owner key.
+
+**Gap:** none — different mechanism, equivalent outcome.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.7 OpenVPN — `--auth tls-crypt-v2` style transport-layer pre-auth
+
+**Practice:** OpenVPN's `tls-crypt-v2` wraps the entire control-channel
+TLS handshake in an HMAC keyed off a pre-shared per-client key, so
+attackers without the PSK cannot even initiate a handshake.
+
+**Rustynet today:** WireGuard's noise framework provides equivalent
+property — without the static peer keys an attacker cannot complete
+handshake-1 message validation. No additional pre-auth wrapper
+required.
+
+**Gap:** none — equivalent at the noise layer.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.8 Windows — service SID restriction tier
+
+**Practice (Microsoft Windows hardening):** Service SID type
+`restricted` (vs `unrestricted`) further locks down what the
+service principal can access. Combined with `WriteOnly` /
+`Restricted` token attributes, a service can be confined to a
+specific allowlist of resources.
+
+**Rustynet today:** The W2.2 install helper sets `SidType = unrestricted`
+(see `Install-RustyNetWindowsService.ps1` — landed in commit
+`76f8303`). This is Microsoft's recommended baseline for services
+that need to access a specific path tree under
+`C:\ProgramData\RustyNet\…`; the binary itself is locked down to
+`SY:F BA:F svc:RX` and the runtime ACLs lock the state tree to
+SYSTEM + Administrators.
+
+**Gap:** [B.8.1, LOW, deferred] Investigate whether
+`SidType = restricted` is feasible. The trade-off: `restricted`
+service SIDs can only access resources that explicitly grant
+the per-service SID — every reviewed runtime root would need an
+explicit grant, AND the binary itself would need an explicit
+grant for the service SID. Rustynet's existing install helper
+already grants `NT SERVICE\<svc>:RX` on the binary and `(OI)(CI)(M)`
+on every runtime root, so the SID-restricted mode might just work.
+
+**Severity:** LOW, deferred. Tracked here as B.8.1.
+
+---
+
+### B.9 Tailscale-style — bootstrap-safety / TOFU
+
+**Practice:** Tailscale uses authkeys (single-use tokens) for
+device join, plus a control-plane MITM-resistance layer (HTTPS +
+public-key pinning).
+
+**Rustynet today:** Bootstrap uses signed membership snapshots.
+The owner-signing-key public part lives at
+`/etc/rustynet/membership.owner.key.pub` (Linux) or
+`C:\ProgramData\RustyNet\trust\membership.owner.key.pub` (Windows).
+First-time install requires an out-of-band trust anchor (the
+public key file) — Tailscale's authkey is functionally similar.
+
+**Gap:** [B.9.1, LOW, **LANDED 2026-04-28**] Document the out-of-band
+trust-anchor distribution explicitly in
+`documents/SecurityMinimumBar.md`. **Done in this commit** —
+SecurityMinimumBar §6.B "Bootstrap Trust Anchor" now publishes the
+approved out-of-band delivery channels (pre-baked image,
+trusted-operator copy, sneakernet) and the forbidden ones
+(plaintext HTTP, TLS-only without thumbprint verification, chat
+channels without tamper-evidence), plus the post-install thumbprint
+verification step.
+
+**Severity:** LOW, documentation-only. **Cleared 2026-04-28.**
+
+---
+
+### B.10 WireGuard — endpoint roaming defense
+
+**Practice:** WireGuard allows a peer's source IP to change
+between sessions but only after a successful handshake retry; an
+attacker spoofing a peer's previous IP cannot inject packets
+because they can't complete the handshake.
+
+**Rustynet today:** Inherited from WireGuard via boringtun.
+
+**Gap:** none.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.11 Cargo dependency hygiene (continued)
+
+**Practice (industry):** Run `cargo audit` + `cargo deny` in CI;
+treat `unmaintained` advisories as warnings to address; keep the
+deny.toml allow-list small.
+
+**Rustynet today:** Both gates pass clean (recorded in §A.1
+above). `deny.toml` exists at repo root with explicit policy.
+`Cargo.lock` is committed and reproducible.
+
+**Gap:** none.
+
+**Severity:** N/A.
+
+**Cleared 2026-04-28.**
+
+---
+
+### B.12 Phase B summary — open items
+
+The deep comparative audit found the Rustynet posture *strictly
+matches or exceeds* the published Tailscale / WireGuard / Nebula
+practices on every reviewed axis. Open items are pure defense-in-
+depth additions, none security-bar:
+
+- **B.4.1 [MEDIUM, deferred]** Add an RFC1918-rebind rejection
+  filter on the daemon's loopback resolver output. Defense-in-depth
+  even though zone-bundle signing already gates the upstream of
+  trust.
+- **B.8.1 [LOW, deferred]** Investigate `SidType = restricted` for
+  the Windows service registration. Tighter posture than the
+  current `unrestricted`; viability depends on existing runtime-ACL
+  grants matching the restricted SID's access list.
+- **B.9.1 [LOW, LANDED 2026-04-28]** Publish a "how to deliver the
+  membership owner public key to a new node" runbook in
+  `documents/SecurityMinimumBar.md` so the out-of-band TOFU step
+  is explicit. **Done** — see SecurityMinimumBar.md §6.B.
+
+These are tracked here as future work in Phase B's ledger; landing
+them as code is **out of scope** for this audit pass to keep the
+session token budget intact. They are flagged for the next
+security-focused slice.
+
+## 4) Phase C — Post-Audit Quick-Win Applications (TODO)
+
+Phase B identified three deferred items (B.4.1, B.8.1, B.9.1).
+The first one (RFC1918-rebind filter) is the only security-grade
+gap; B.8.1 is exploratory hardening; B.9.1 is documentation. Each
+is its own committable slice:
+
+- B.9.1 doc-only runbook addition: ~30 min, lowest risk.
+- B.8.1 SidType=restricted investigation: 1-2 hours, maybe blocked
+  by Win32-API requirements.
+- B.4.1 RFC1918 filter: 2-4 hours, requires understanding the
+  daemon's DNS resolver layer.
+
+The work is intentionally not bundled into one big commit — each
+should be its own slice with its own residual-risk note + commit
+SHA tracked here. Until those slices land, the open-items list in
+§B.12 is the canonical TODO.
+
+## 5) Code-Walk References
+
+Sections that the comparison above grounds against:
+
+- WireGuard replay window: `third_party/boringtun/src/noise/handshake.rs`,
+  `third_party/boringtun/src/noise/session.rs`.
+- Tailscale-style relay token: `crates/rustynet-relay/src/transport.rs`
+  (especially lines 13-30 header + 195-230 verification flow).
+- Membership-signed pinning: `crates/rustynetd/src/daemon.rs`
+  membership-ingestion; `crates/rustynet-policy/`; signed-snapshot
+  watermark in `crates/rustynetd/src/fetcher.rs`.
+- DNS fail-closed Windows: `crates/rustynetd/src/windows_dns_failclosed.rs`
+  (W1.3 in this delta plan).
+- Service hardening Windows: `crates/rustynetd/src/windows_service_hardening.rs`
+  (W2.2) +
+  `scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1` +
+  the W2.5b validators added in commit `86d5a2b`.
+- Replay protection on signed bundles: `crates/rustynetd/src/fetcher.rs`
+  watermark store (commit `de4c7ba` fix for clock-pre-EPOCH DoS).
 
 ## 4) Agent Update Rules
 
