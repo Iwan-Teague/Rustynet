@@ -7383,6 +7383,20 @@ fn evaluate_windows_authenticode_report(
             report.binary_path
         ));
     }
+    // W2.1b: overall_ok=true MUST imply chain_status=Verified. The
+    // daemon-side `inspect_authenticode_signature` enforces this
+    // invariant; the orchestrator double-checks because a stale or
+    // crafted JSON payload could try to claim overall_ok=true with a
+    // weaker chain status.
+    if !matches!(
+        report.chain_status,
+        rustynetd::windows_authenticode::WindowsAuthenticodeChainStatus::Verified
+    ) {
+        return Err(format!(
+            "Windows Authenticode report marked overall_ok=true but chain_status is not 'verified' for {}; output is inconsistent",
+            report.binary_path
+        ));
+    }
     if !report.drift_reasons.is_empty() {
         return Err(format!(
             "report set overall_ok=true but drift_reasons is non-empty: {}",
@@ -7390,7 +7404,7 @@ fn evaluate_windows_authenticode_report(
         ));
     }
     Ok(format!(
-        "Windows Authenticode signature present on {windows_alias} ({}, {} certificate entries, {} bytes)",
+        "Windows Authenticode signature + chain verified on {windows_alias} ({}, {} certificate entries, {} bytes)",
         report.binary_path,
         report.certificates.len(),
         report.binary_size_bytes
@@ -22276,6 +22290,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "certificates": [
                 { "length": 504, "revision": 512, "certificate_type": 2 }
             ],
+            "chain_status": { "outcome": "verified" },
             "drift_reasons": []
         })
     }
@@ -22366,6 +22381,68 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(
             err.contains("parse windows-authenticode-check JSON output failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_overall_ok_true_with_untrusted_chain() {
+        // W2.1b: overall_ok=true must imply chain_status=verified. A
+        // stale or crafted JSON payload could try to claim overall_ok
+        // while leaving chain_status as untrusted; the orchestrator-
+        // side double-check rejects it as inconsistent.
+        let mut payload = signed_authenticode_payload();
+        payload["chain_status"] = serde_json::json!({
+            "outcome": "untrusted",
+            "reason": "WinVerifyTrust returned 0x800b0109 (CERT_E_UNTRUSTEDROOT) for ...",
+            "hresult": 0x800B0109_i64
+        });
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with untrusted chain must fail closed");
+        assert!(
+            err.contains("chain_status is not 'verified'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_rejects_overall_ok_true_with_not_evaluated_chain() {
+        // Same invariant as above for the NotEvaluated variant. The
+        // off-Windows path is the typical case here; the daemon-side
+        // collector should already mark overall_ok=false in that
+        // case, but we double-check at the orchestrator boundary.
+        let mut payload = signed_authenticode_payload();
+        payload["chain_status"] = serde_json::json!({
+            "outcome": "not_evaluated",
+            "reason": "off-Windows host"
+        });
+        let err = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with not_evaluated chain must fail closed");
+        assert!(
+            err.contains("chain_status is not 'verified'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_authenticode_report_accepts_payload_with_verified_chain() {
+        // The reviewed payload already has chain_status=verified;
+        // validate the success summary now mentions "chain verified"
+        // explicitly so downstream tooling can grep for the new
+        // posture (W2.1a's summary said "signature present").
+        let summary = super::evaluate_windows_authenticode_report(
+            "windows-utm-1",
+            signed_authenticode_payload().to_string().as_str(),
+        )
+        .expect("verified-chain payload must validate");
+        assert!(
+            summary.contains("signature + chain verified"),
+            "summary must mention W2.1b chain-verified posture: {summary}"
         );
     }
 

@@ -1,31 +1,30 @@
 #![allow(clippy::result_large_err)]
 
-//! Windows Authenticode signature **presence** verifier.
+//! Windows Authenticode signature verifier (presence + chain).
 //!
-//! This module parses a PE binary's Certificate Table directory entry
-//! (IMAGE_DIRECTORY_ENTRY_SECURITY, index 4 in the optional header data
-//! directories) and confirms that at least one well-formed Authenticode
-//! WIN_CERTIFICATE entry is attached. Its purpose is to **reject unsigned
-//! installs** before the daemon proceeds — an attacker who replaces the
-//! binary with an unsigned one fails this gate immediately.
+//! Two-stage verification:
 //!
-//! What this module **does NOT** do:
+//! 1. **Presence (W2.1a)** — parse the PE binary's Certificate Table
+//!    directory entry (`IMAGE_DIRECTORY_ENTRY_SECURITY`, index 4 in the
+//!    optional header data directories) and confirm that at least one
+//!    well-formed Authenticode `WIN_CERTIFICATE` entry is attached. This
+//!    rejects the unsigned-binary case at minimal cost. Pure Rust,
+//!    bounds-checked, no `unsafe`, cross-platform.
 //!
-//! * It does not validate the PKCS#7 SignedData payload.
-//! * It does not validate the certificate chain back to a trusted root.
-//! * It does not verify the file hash against the signature's spcIndirectData.
-//! * It does not check timestamping.
+//! 2. **Chain validation (W2.1b)** — call Win32 `WinVerifyTrust` with
+//!    `WINTRUST_ACTION_GENERIC_VERIFY_V2` and chain-revocation enabled
+//!    (`WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT`). This validates the
+//!    full PKCS#7 SignedData payload, the certificate chain back to a
+//!    trusted root, the file hash against `SpcIndirectData`, and any
+//!    counter-signature timestamps. Windows-only; off-Windows the chain
+//!    status surfaces as `NotEvaluated` and `overall_ok` is false (the
+//!    verifier fails closed when the trust state cannot be observed).
 //!
-//! Full chain validation requires Win32 `WinVerifyTrust` (out of scope for
-//! this slice; tracked as W2.1b in the OS-agnostic delta plan). Until that
-//! lands, this presence check is the cheap-but-real first gate that catches
-//! the unsigned-binary case (which is by far the most likely tamper class
-//! the orchestrator can fail-closed against today).
-//!
-//! All parsing is pure Rust with bounds-checked slicing — no `unsafe`, no
-//! external crates. Cross-platform; identical behavior on Linux, macOS,
-//! Windows.
+//! `overall_ok` requires BOTH presence AND chain-verified — an attacker
+//! who self-signs a binary now fails the gate, where the W2.1a-only
+//! presence check would have accepted them.
 
+use rustynet_windows_native::{AuthenticodeChainOutcome, verify_authenticode_chain};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -48,6 +47,33 @@ pub struct WindowsAuthenticodeCertificateEntry {
     pub certificate_type: u16,
 }
 
+/// W2.1b chain-validation outcome. Mirrors
+/// `rustynet_windows_native::AuthenticodeChainOutcome` plus a
+/// `NotEvaluated` variant for cases where the chain check could not run
+/// at all (off-Windows host, missing binary, or earlier presence-stage
+/// failure that would make a chain check meaningless).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WindowsAuthenticodeChainStatus {
+    /// `WinVerifyTrust` returned `S_OK` for
+    /// `WINTRUST_ACTION_GENERIC_VERIFY_V2` with chain revocation
+    /// enabled. The full PKCS#7 chain is trusted, the file digest
+    /// matches `SpcIndirectData`, and any counter-signature
+    /// timestamps validated.
+    Verified,
+    /// `WinVerifyTrust` rejected the binary. `reason` carries the
+    /// canonical HRESULT label (e.g. `TRUST_E_NOSIGNATURE`,
+    /// `CERT_E_UNTRUSTEDROOT`, `CERT_E_REVOKED`,
+    /// `TRUST_E_BAD_DIGEST`) and `hresult` carries the raw
+    /// sign-extended 32-bit code.
+    Untrusted { reason: String, hresult: i64 },
+    /// Chain check could not run. Typical reasons: off-Windows host
+    /// (collector bypassed `WinVerifyTrust` entirely), binary read
+    /// failed at the presence stage, or presence stage detected a
+    /// malformed PE that would not pass `WinVerifyTrust` either.
+    NotEvaluated { reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsAuthenticodeReport {
     pub schema_version: u32,
@@ -60,12 +86,26 @@ pub struct WindowsAuthenticodeReport {
     pub certificate_table_offset: Option<u32>,
     pub certificate_table_size: Option<u32>,
     pub certificates: Vec<WindowsAuthenticodeCertificateEntry>,
+    /// W2.1b chain-validation outcome. `Verified` is required for
+    /// `overall_ok=true`; any other variant fails the gate.
+    pub chain_status: WindowsAuthenticodeChainStatus,
     pub drift_reasons: Vec<String>,
 }
 
-/// Inspect the binary at `path` and produce a typed Authenticode presence
-/// report. Returns a populated report regardless of outcome; `overall_ok` and
-/// `drift_reasons` reflect the verification result.
+/// Inspect the binary at `path` and produce a typed Authenticode report
+/// covering BOTH the W2.1a presence stage AND the W2.1b chain-validation
+/// stage. Returns a populated report regardless of outcome; `overall_ok`,
+/// `chain_status`, and `drift_reasons` reflect the combined result.
+///
+/// `overall_ok` is true only when:
+/// - the PE parser found at least one PKCS-signed `WIN_CERTIFICATE` entry,
+/// - AND `WinVerifyTrust` returned `Verified` for the binary.
+///
+/// On non-Windows hosts the chain stage is `NotEvaluated` with a clear
+/// blocker reason, so `overall_ok` is false — fail-closed when the trust
+/// state cannot be observed. The orchestrator stage that dispatches this
+/// subcommand always runs on the live Windows guest, where the chain
+/// stage runs for real.
 pub fn inspect_authenticode_signature(path: &Path) -> WindowsAuthenticodeReport {
     let display_path = path.display().to_string();
     let bytes = match std::fs::read(path) {
@@ -80,27 +120,71 @@ pub fn inspect_authenticode_signature(path: &Path) -> WindowsAuthenticodeReport 
                 certificate_table_offset: None,
                 certificate_table_size: None,
                 certificates: Vec::new(),
+                chain_status: WindowsAuthenticodeChainStatus::NotEvaluated {
+                    reason: format!("binary read failed; chain validation skipped: {err}"),
+                },
                 drift_reasons: vec![format!("read binary failed: {err}")],
             };
         }
     };
     let size = bytes.len() as u64;
     let parse = parse_authenticode_signature(bytes.as_slice());
+    let signature_present = matches!(&parse, Ok(report) if report.signature_present);
+
+    // Stage 2: chain validation via WinVerifyTrust. Skip when the
+    // presence stage already rejected the binary — running
+    // WinVerifyTrust on a malformed PE adds no information and the
+    // drift_reasons list already has the precise failure.
+    let chain_status = if !signature_present {
+        WindowsAuthenticodeChainStatus::NotEvaluated {
+            reason:
+                "chain validation skipped: presence stage did not find a PKCS-signed certificate"
+                    .to_string(),
+        }
+    } else {
+        match verify_authenticode_chain(path) {
+            Ok(AuthenticodeChainOutcome::Verified) => WindowsAuthenticodeChainStatus::Verified,
+            Ok(AuthenticodeChainOutcome::Untrusted { reason, hresult }) => {
+                WindowsAuthenticodeChainStatus::Untrusted { reason, hresult }
+            }
+            Err(err) => WindowsAuthenticodeChainStatus::NotEvaluated { reason: err },
+        }
+    };
+    let chain_verified = matches!(chain_status, WindowsAuthenticodeChainStatus::Verified);
+
+    let mut drift_reasons = parse
+        .as_ref()
+        .map(|p| p.drift_reasons.clone())
+        .unwrap_or_else(|err| vec![err.clone()]);
+    // Surface the chain-stage outcome in drift_reasons too so callers
+    // that only check `drift_reasons` (e.g. early-cut tooling) still
+    // see the reason.
+    match &chain_status {
+        WindowsAuthenticodeChainStatus::Verified => {}
+        WindowsAuthenticodeChainStatus::Untrusted { reason, .. } => {
+            drift_reasons.push(format!("chain validation rejected binary: {reason}"));
+        }
+        WindowsAuthenticodeChainStatus::NotEvaluated { reason } => {
+            drift_reasons.push(format!("chain validation not evaluated: {reason}"));
+        }
+    }
+
+    let overall_ok = signature_present && chain_verified;
+
     WindowsAuthenticodeReport {
         schema_version: 1,
         binary_path: display_path,
         binary_size_bytes: size,
-        overall_ok: parse.is_ok(),
-        signature_present: matches!(&parse, Ok(report) if report.signature_present),
+        overall_ok,
+        signature_present,
         certificate_table_offset: parse.as_ref().ok().and_then(|p| p.certificate_table_offset),
         certificate_table_size: parse.as_ref().ok().and_then(|p| p.certificate_table_size),
         certificates: parse
             .as_ref()
             .map(|p| p.certificates.clone())
             .unwrap_or_default(),
-        drift_reasons: parse
-            .map(|p| p.drift_reasons)
-            .unwrap_or_else(|err| vec![err]),
+        chain_status,
+        drift_reasons,
     }
 }
 
@@ -491,12 +575,70 @@ mod tests {
                 revision: WIN_CERT_REVISION_2_0,
                 certificate_type: WIN_CERT_TYPE_PKCS_SIGNED_DATA,
             }],
+            chain_status: WindowsAuthenticodeChainStatus::Verified,
             drift_reasons: Vec::new(),
         };
         let serialized = serde_json::to_string(&report).expect("serialize");
         let restored: WindowsAuthenticodeReport =
             serde_json::from_str(serialized.as_str()).expect("deserialize");
         assert_eq!(restored, report);
+    }
+
+    #[test]
+    fn report_round_trips_chain_status_untrusted_variant() {
+        let report = WindowsAuthenticodeReport {
+            schema_version: 1,
+            binary_path: r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
+            binary_size_bytes: 1234,
+            overall_ok: false,
+            signature_present: true,
+            certificate_table_offset: Some(0x1000),
+            certificate_table_size: Some(0x200),
+            certificates: vec![WindowsAuthenticodeCertificateEntry {
+                length: 0x1F0,
+                revision: WIN_CERT_REVISION_2_0,
+                certificate_type: WIN_CERT_TYPE_PKCS_SIGNED_DATA,
+            }],
+            chain_status: WindowsAuthenticodeChainStatus::Untrusted {
+                reason: "WinVerifyTrust returned 0x800b0109 (CERT_E_UNTRUSTEDROOT) for ..."
+                    .to_string(),
+                hresult: 0x800B0109_i64,
+            },
+            drift_reasons: vec![
+                "chain validation rejected binary: WinVerifyTrust returned 0x800b0109 \
+                 (CERT_E_UNTRUSTEDROOT) for ..."
+                    .to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&report).expect("serialize untrusted");
+        let restored: WindowsAuthenticodeReport =
+            serde_json::from_str(&json).expect("deserialize untrusted");
+        assert_eq!(restored, report);
+        // Chain_status should serialize with the `outcome` tag.
+        assert!(json.contains("\"outcome\":\"untrusted\""));
+    }
+
+    #[test]
+    fn report_round_trips_chain_status_not_evaluated_variant() {
+        let report = WindowsAuthenticodeReport {
+            schema_version: 1,
+            binary_path: "/tmp/x".to_string(),
+            binary_size_bytes: 0,
+            overall_ok: false,
+            signature_present: false,
+            certificate_table_offset: None,
+            certificate_table_size: None,
+            certificates: Vec::new(),
+            chain_status: WindowsAuthenticodeChainStatus::NotEvaluated {
+                reason: "off-Windows host".to_string(),
+            },
+            drift_reasons: vec!["chain validation not evaluated: off-Windows host".to_string()],
+        };
+        let json = serde_json::to_string(&report).expect("serialize not_evaluated");
+        let restored: WindowsAuthenticodeReport =
+            serde_json::from_str(&json).expect("deserialize not_evaluated");
+        assert_eq!(restored, report);
+        assert!(json.contains("\"outcome\":\"not_evaluated\""));
     }
 
     #[test]

@@ -798,7 +798,8 @@ conservatively.
       produce a self-signed Authenticode entry will pass this gate. Full
       chain validation requires Win32 `WinVerifyTrust` (W2.1b — adds
       `Win32_Security_WinTrust` feature to `windows-sys` deps and a
-      safe wrapper in `rustynet-windows-native`).
+      safe wrapper in `rustynet-windows-native`). **Closed by W2.1b
+      below.**
     - The PE parser is targeted at well-formed PE32+ binaries. It bounds-
       checks every read, but unusual layouts (overlapping cert table and
       sections, etc.) may fail to parse. That's still fail-closed
@@ -806,6 +807,96 @@ conservatively.
     - The orchestrator stage assumes the installed binary lives at
       `C:\Program Files\RustyNet\rustynetd.exe`. Same constant
       reconciliation note as W1.2b / W2.2.
+- [x] W2.1b Full Authenticode chain validation via `WinVerifyTrust`
+  - Changed files:
+    - `crates/rustynet-windows-native/Cargo.toml` — added
+      `Win32_Security_WinTrust` to the windows-sys feature list so
+      the FFI types (`WINTRUST_DATA`, `WINTRUST_FILE_INFO`,
+      `WINTRUST_ACTION_GENERIC_VERIFY_V2`, etc.) are available on
+      the Windows target.
+    - `crates/rustynet-windows-native/src/lib.rs` — added the
+      `AuthenticodeChainOutcome` public enum (`Verified` |
+      `Untrusted { reason, hresult }`) and the
+      `verify_authenticode_chain(path)` wrapper. Off-Windows the fn
+      returns an `Err` blocker. On Windows the fn calls
+      `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`,
+      `WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT` (root certs
+      typically self-signed; checking everything below the root is
+      the canonical Authenticode posture), `WTD_UI_NONE` (no UI), and
+      always pairs the verify call with a follow-up
+      `WTD_STATEACTION_CLOSE` cleanup so verifier state never leaks
+      into subsequent calls. Non-zero HRESULTs are mapped to the
+      canonical Win32 label set (`TRUST_E_NOSIGNATURE`,
+      `CERT_E_UNTRUSTEDROOT`, `CERT_E_REVOKED`, `TRUST_E_BAD_DIGEST`,
+      etc.) so the orchestrator-side log is human-readable rather
+      than a hex code. Cross-target check
+      (`cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc`) clean.
+    - `crates/rustynetd/src/windows_authenticode.rs` — extended
+      the report shape: new `WindowsAuthenticodeChainStatus` enum
+      (`Verified` | `Untrusted { reason, hresult }` |
+      `NotEvaluated { reason }`) with serde tag `outcome`; new
+      `chain_status` field on `WindowsAuthenticodeReport`; module
+      header rewritten to reflect the two-stage (presence + chain)
+      verification posture.
+      `inspect_authenticode_signature` now runs both stages and
+      tightens `overall_ok` to require BOTH `signature_present` AND
+      `chain_status == Verified`. The chain stage is *skipped* when
+      the presence stage already rejected the binary (running
+      WinVerifyTrust on a malformed PE adds no information). Chain-
+      stage outcomes are mirrored into `drift_reasons` so callers
+      that grep `drift_reasons` only still see the chain-side
+      rejection. Off-Windows the chain stage surfaces as
+      `NotEvaluated` and `overall_ok` is false — fail-closed when
+      the trust state cannot be observed.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — orchestrator-side
+      `evaluate_windows_authenticode_report` now double-checks
+      that `overall_ok=true` implies `chain_status=Verified`
+      (rejects a stale or crafted JSON payload that claims
+      overall_ok with a weaker chain status). Success summary
+      updated to `"Windows Authenticode signature + chain
+      verified"` so downstream tooling can grep for the new posture
+      (W2.1a's summary said "signature present"). Test fixture
+      updated to set `chain_status: { outcome: 'verified' }` in the
+      reviewed-payload helper.
+  - Verification:
+    - `cargo fmt -p rustynetd -p rustynet-cli -p rustynet-windows-native -- --check` clean.
+    - `cargo check -p rustynet-windows-native --target
+      x86_64-pc-windows-msvc` clean (FFI compiles against
+      `Win32_Security_WinTrust`).
+    - `cargo test -p rustynetd` — 441 lib + 52 bin + 3 integration
+      pass (was 439 lib + 52 + 3). +2 new lib tests for the
+      report's new chain_status variants:
+      `report_round_trips_chain_status_untrusted_variant`,
+      `report_round_trips_chain_status_not_evaluated_variant`.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 450 / 450
+      pass (was 447). +3 new evaluator tests:
+      `evaluate_windows_authenticode_report_rejects_overall_ok_true_with_untrusted_chain`,
+      `evaluate_windows_authenticode_report_rejects_overall_ok_true_with_not_evaluated_chain`,
+      `evaluate_windows_authenticode_report_accepts_payload_with_verified_chain`.
+  - Residual risk:
+    - `WinVerifyTrust` does network I/O for revocation checks
+      (CRL/OCSP fetch). On a fully air-gapped Windows host the
+      revocation check returns `CRYPT_E_REVOCATION_OFFLINE` and the
+      chain stage rejects. This is fail-closed by design; an
+      operator deploying RustyNet to an air-gapped network should
+      pre-cache the revocation responses or pre-validate the
+      release artefact's trust chain at build time and ship a
+      signed-attestation alongside the binary.
+    - The chain validation is gated behind a presence-stage pass.
+      An attacker could in principle craft a PE that the presence
+      parser accepts but `WinVerifyTrust` would also reject — that
+      case lands in the `Untrusted` branch and `overall_ok` is
+      still false. The skip-on-presence-fail behavior is purely a
+      no-info-gain optimisation, not a security relaxation.
+    - Live evidence on the actual `windows-utm-1` UTM guest is
+      pending — the Windows VM's installed binary is an unsigned
+      `cargo build --release` artefact, so the chain stage will
+      report `Untrusted { TRUST_E_NOSIGNATURE }` (or skip with
+      `NotEvaluated` if presence stage's pure-Rust parser rejects
+      first). Real signed-binary evidence requires the production
+      release-signing workflow to ship and is tracked separately
+      under `documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md`.
 - [x] W2.2 Service hardening profile verifier + stage
   - Changed files:
     - `crates/rustynetd/src/windows_service_hardening.rs` (new) — typed

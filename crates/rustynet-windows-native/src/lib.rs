@@ -9,6 +9,24 @@ pub enum WindowsDpapiScope {
     LocalMachine,
 }
 
+/// Outcome of a `verify_authenticode_chain` call. Variants:
+/// - `Verified`: WinVerifyTrust returned `S_OK` for the
+///   `WINTRUST_ACTION_GENERIC_VERIFY_V2` policy with chain
+///   revocation enabled. The signing certificate's full chain is
+///   trusted, the file digest matches the SpcIndirectData, and any
+///   counter-signature timestamps are valid.
+/// - `Untrusted`: WinVerifyTrust returned a non-zero HRESULT. The
+///   `reason` carries the canonical error label (e.g.
+///   `TRUST_E_NOSIGNATURE`, `CERT_E_UNTRUSTEDROOT`,
+///   `CERT_E_REVOKED`, `TRUST_E_BAD_DIGEST`) and `hresult` carries
+///   the raw 32-bit code (sign-extended into i64 so callers can
+///   round-trip through serde without precision loss).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticodeChainOutcome {
+    Verified,
+    Untrusted { reason: String, hresult: i64 },
+}
+
 #[cfg(not(windows))]
 pub fn dpapi_protect(
     _plaintext: &[u8],
@@ -26,6 +44,21 @@ pub fn dpapi_unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(not(windows))]
 pub fn inspect_file_sddl(_path: &Path) -> Result<String, String> {
     Err("Windows ACL inspection is only available on Windows hosts".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn verify_authenticode_chain(_path: &Path) -> Result<AuthenticodeChainOutcome, String> {
+    // Off-Windows: WinVerifyTrust is unavailable. The verifier
+    // contract is "fail closed when the trust state cannot be
+    // observed", so callers MUST treat this Err as a drift outcome
+    // (not as a trust grant). The pure PE-parser surface in
+    // `crates/rustynetd/src/windows_authenticode.rs` continues to
+    // report signature *presence* off-Windows for diagnostic
+    // purposes; the chain check stays Windows-only.
+    Err(
+        "WinVerifyTrust authenticode chain validation is only available on Windows hosts"
+            .to_string(),
+    )
 }
 
 #[cfg(not(windows))]
@@ -594,10 +627,132 @@ mod imp {
         }
         security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
     }
+
+    /// Authenticode chain validation via `WinVerifyTrust`. Wraps the
+    /// canonical `WINTRUST_ACTION_GENERIC_VERIFY_V2` verb with
+    /// chain-revocation checking enabled (`WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT`)
+    /// and the UI suppressed (`WTD_UI_NONE`). Verification succeeds
+    /// only when the full PKCS#7 chain is trusted, the file digest
+    /// matches the SpcIndirectData, and any counter-signature
+    /// timestamps are valid; any of those failing maps to a typed
+    /// `Untrusted` outcome with the canonical HRESULT label.
+    ///
+    /// State cleanup: the Win32 contract requires a follow-up call
+    /// with `dwStateAction = WTD_STATEACTION_CLOSE` after every
+    /// `WTD_STATEACTION_VERIFY`. The wrapper performs the cleanup
+    /// even when the verify call returns an error so we do not leak
+    /// the verifier state into subsequent calls.
+    pub fn verify_authenticode_chain(
+        path: &Path,
+    ) -> Result<super::AuthenticodeChainOutcome, String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::WinTrust::{
+            WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
+            WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_STATEACTION_CLOSE,
+            WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+        };
+
+        // Reject empty paths up-front — passing an empty string to
+        // WinVerifyTrust would surface as a confusing internal error
+        // rather than a clear "bad input" rejection.
+        if path.as_os_str().is_empty() {
+            return Err("verify_authenticode_chain: path must not be empty".to_string());
+        }
+
+        // Encode path as UTF-16 with explicit NUL terminator. The
+        // Win32 wide-string contract requires the caller to provide
+        // the NUL.
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+
+        let mut file_info = WINTRUST_FILE_INFO {
+            cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: wide.as_ptr(),
+            hFile: null_mut(),
+            pgKnownSubject: null_mut(),
+        };
+
+        let mut wvt_data = WINTRUST_DATA {
+            cbStruct: size_of::<WINTRUST_DATA>() as u32,
+            pPolicyCallbackData: null_mut(),
+            pSIPClientData: null_mut(),
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+            dwUnionChoice: WTD_CHOICE_FILE,
+            Anonymous: WINTRUST_DATA_0 {
+                pFile: &mut file_info,
+            },
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            hWVTStateData: null_mut(),
+            pwszURLReference: null_mut(),
+            dwProvFlags: 0,
+            dwUIContext: 0,
+            pSignatureSettings: null_mut(),
+        };
+
+        let mut action_guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        let verify_status = unsafe {
+            WinVerifyTrust(
+                null_mut(),
+                &mut action_guid,
+                &mut wvt_data as *mut WINTRUST_DATA as *mut c_void,
+            )
+        };
+
+        // Always cleanup state, even on verify failure, to avoid
+        // leaking handles/state into subsequent calls.
+        wvt_data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = unsafe {
+            WinVerifyTrust(
+                null_mut(),
+                &mut action_guid,
+                &mut wvt_data as *mut WINTRUST_DATA as *mut c_void,
+            )
+        };
+
+        if verify_status == 0 {
+            Ok(super::AuthenticodeChainOutcome::Verified)
+        } else {
+            let raw_u32 = verify_status as u32;
+            let label = match raw_u32 {
+                0x800B0001 => "TRUST_E_PROVIDER_UNKNOWN",
+                0x800B0100 => "TRUST_E_NOSIGNATURE",
+                0x800B0101 => "CERT_E_EXPIRED",
+                0x800B0102 => "CERT_E_VALIDITYPERIODNESTING",
+                0x800B0103 => "CERT_E_ROLE",
+                0x800B0104 => "CERT_E_PATHLENCONST",
+                0x800B0105 => "CERT_E_CRITICAL",
+                0x800B0106 => "CERT_E_PURPOSE",
+                0x800B0107 => "CERT_E_ISSUERCHAINING",
+                0x800B0108 => "CERT_E_MALFORMED",
+                0x800B0109 => "CERT_E_UNTRUSTEDROOT",
+                0x800B010A => "CERT_E_CHAINING",
+                0x800B010B => "TRUST_E_FAIL",
+                0x800B010C => "CERT_E_REVOKED",
+                0x800B010D => "CERT_E_UNTRUSTEDTESTROOT",
+                0x800B010E => "CERT_E_REVOCATION_FAILURE",
+                0x80092010 => "CRYPT_E_REVOKED",
+                0x80092012 => "CRYPT_E_NO_REVOCATION_CHECK",
+                0x80092013 => "CRYPT_E_REVOCATION_OFFLINE",
+                0x80096010 => "TRUST_E_BAD_DIGEST",
+                0x800B0110 => "TRUST_E_CERT_SIGNATURE",
+                0x800B0111 => "TRUST_E_TIME_STAMP",
+                _ => "UNKNOWN",
+            };
+            let reason = format!(
+                "WinVerifyTrust returned 0x{raw_u32:08x} ({label}) for {}",
+                path.display()
+            );
+            Ok(super::AuthenticodeChainOutcome::Untrusted {
+                reason,
+                hresult: verify_status as i64,
+            })
+        }
+    }
 }
 
 #[cfg(windows)]
 pub use imp::{
     call_named_pipe, dpapi_protect, dpapi_unprotect, inspect_file_sddl, lookup_account_sid_string,
-    serve_named_pipe_one_message,
+    serve_named_pipe_one_message, verify_authenticode_chain,
 };
