@@ -16,6 +16,7 @@ Start with these when you need current status, remaining work, or the public imp
 - [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
 - [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
+- [RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md](./RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md)
 - [Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
 - [Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
