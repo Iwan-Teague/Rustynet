@@ -6139,6 +6139,14 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &discovery_outcome);
     outcomes.push(discovery_outcome);
 
+    if config.windows_only && config.validate_linux_daemon_state {
+        warnings.push(
+            "--validate-linux-daemon-state was passed with --windows-only; Linux daemon \
+             validators will not run because --windows-only skips all Linux peers. \
+             Drop one of the two flags to remove the ambiguity."
+                .to_string(),
+        );
+    }
     // --windows-only: skip all Linux stages and go straight to Windows orchestration.
     if config.windows_only {
         let windows_alias = config
