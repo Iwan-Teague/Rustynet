@@ -23,6 +23,7 @@ use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
+use rustynetd::linux_runtime_acls::collect_linux_runtime_acl_report;
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
@@ -111,6 +112,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "windows-backend-readiness-check" => {
                 run_windows_backend_readiness_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-runtime-acls-check" => {
+                run_linux_runtime_acls_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -435,6 +439,36 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_linux_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!("unknown linux-runtime-acls-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_linux_runtime_acl_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux runtime-acls report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-runtime-acls-check reported drift on at least one reviewed runtime root"
                 .to_string(),
         );
     }
@@ -1593,6 +1627,7 @@ fn help_text() -> String {
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
+        "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",

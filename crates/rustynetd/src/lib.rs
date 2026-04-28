@@ -5,6 +5,7 @@ pub mod dataplane;
 pub mod fetcher;
 pub mod ipc;
 pub mod key_material;
+pub mod linux_runtime_acls;
 pub mod perf;
 pub mod phase10;
 pub mod platform;

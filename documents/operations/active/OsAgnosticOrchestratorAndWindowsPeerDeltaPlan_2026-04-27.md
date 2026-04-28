@@ -1963,6 +1963,83 @@ conservatively.
       different network or rotating identities must remember to
       pass `-PurgeStateRoot` — the default is "preserve identity",
       not "fresh install".
+- [x] W3.2-followup-1 — Linux daemon parity verifier:
+      `linux-runtime-acls-check`
+  - Changed files:
+    - `crates/rustynetd/src/linux_runtime_acls.rs` (new) — pure
+      evaluator + Linux-only collector. Walks the canonical Linux
+      runtime roots
+        * `/var/lib/rustynet/` — owner `rustynetd:rustynetd`, mode `0700`
+        * `/etc/rustynet/`     — owner `root:rustynetd`,      mode `0750`
+      and confirms each root is a real directory (not a symlink) with
+      the reviewed mode + owner uid + group gid. Username / groupname
+      resolution goes through `nix::unistd::User::from_name` /
+      `nix::unistd::Group::from_name` so the daemon stays
+      `#![forbid(unsafe_code)]` (no raw `libc::getpwnam` FFI). The
+      reviewed posture comes from two sources of truth: the systemd
+      unit (`StateDirectoryMode=0700`, `User=rustynetd`,
+      `Group=rustynetd`) and the e2e bootstrap install commands in
+      `scripts/e2e/live_lab_common.sh:1457`. Off-Linux every root is
+      reported `Missing` with an explicit "requires a Linux runtime
+      host" reason — same off-platform discipline the
+      `WindowsRuntimeAclReport` collector uses off-Windows.
+      The pure evaluator takes
+      `LinuxRuntimeAclExpectation` + `LinuxRuntimeAclSnapshot`
+      structs (rather than 9 positional args) so unit tests can build
+      a snapshot in memory and validate against the reviewed
+      posture deterministically. The Linux-only `inspect_runtime_root_status`
+      goes through `std::os::unix::fs::MetadataExt` to populate the
+      snapshot from a live `symlink_metadata` call.
+    - `crates/rustynetd/src/lib.rs` — `pub mod linux_runtime_acls`.
+    - `crates/rustynetd/src/main.rs` — added the
+      `linux-runtime-acls-check [--no-fail-on-drift]` subcommand
+      dispatch + help-text entry. Mirrors the
+      `windows-runtime-acls-check` shape so downstream JSON parsers
+      can consume both with one schema.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — `LinuxDaemonProbe`
+      now emits argv for the `RuntimeAcls` op:
+      `[<daemon>, "linux-runtime-acls-check", "--no-fail-on-drift"]`.
+      The remaining 5 ops (ServiceHardening / KeyCustody /
+      Authenticode / MeshStatus / DnsFailclosed) still reject with
+      precise per-op blockers so the orchestrator surfaces "Linux
+      daemon does not yet expose <op>" rather than parsing a bash
+      127 exit as drift. Closes the parity gap one op at a time.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test --workspace --all-features` — 1434 passing.
+    - `crates/rustynetd` adds 10 new lib tests covering: matching
+      posture acceptance, symlink rejection, file-not-dir rejection,
+      world-readable mode rejection (cites both actual + expected
+      mode in the failure), wrong-uid + wrong-gid rejections,
+      file-type-bit masking, off-Linux blocker reason pinning, and
+      two serde round-trip pins (Ok variant + Drifted variant).
+    - `crates/rustynet-cli` swaps the prior
+      `linux_daemon_probe_rejects_with_roadmap_blocker_today`
+      blanket-reject test with three precise tests:
+      `linux_daemon_probe_emits_argv_for_runtime_acls_op` (positive
+      pin: argv shape matches the daemon's CLI dispatch),
+      `linux_daemon_probe_rejects_remaining_ops_with_roadmap_blocker`
+      (negative pin: every other op still surfaces the precise op
+      label so the operator knows exactly what's missing),
+      `linux_daemon_probe_rejects_empty_daemon_path` (parity with the
+      Windows probe's defensive guard).
+  - Residual risk:
+    - **Subset of reviewed roots.** This slice covers `/var/lib/rustynet`
+      and `/etc/rustynet`. The systemd unit also reads `/run/rustynet`
+      via `RuntimeDirectory=`; the bootstrap installer puts keys
+      under `/var/lib/rustynet/keys/` (owned by the same
+      `rustynetd:rustynetd`). Those are subdirectories of the
+      already-checked state root, so their posture is implicitly
+      pinned by the parent's `0700`. A future slice can extend the
+      reviewed-roots table to walk them explicitly the way the
+      Windows side walks 8 roots; covering 2 today is enough to
+      flip `LinuxDaemonProbe::RuntimeAcls` from blanket-reject to
+      Pass + drift-detection, which was the gating wart.
+    - **Five Linux-side ops still missing.** ServiceHardening,
+      KeyCustody, Authenticode, MeshStatus, DnsFailclosed all still
+      reject in `LinuxDaemonProbe`. Each one is its own slice; this
+      is the first of six.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

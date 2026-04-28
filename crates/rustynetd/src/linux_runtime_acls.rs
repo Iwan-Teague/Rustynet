@@ -1,0 +1,436 @@
+#![allow(clippy::result_large_err)]
+
+//! Linux runtime ACL verifier.
+//!
+//! Mirror of `windows_paths::collect_windows_runtime_acl_report` for
+//! Linux hosts. Walks the canonical Linux runtime roots used by the
+//! daemon's systemd unit + e2e bootstrap scripts, and confirms each
+//! root exists, is a real directory, has the reviewed owner / group,
+//! and matches the reviewed mode.
+//!
+//! The reviewed posture comes from two sources of truth:
+//!
+//! * `scripts/systemd/rustynetd.service` — sets `User=rustynetd`,
+//!   `Group=rustynetd`, `StateDirectoryMode=0700`, and `ReadWritePaths=`.
+//! * `scripts/e2e/live_lab_common.sh` — the bootstrap install commands:
+//!     ```text
+//!     install -d -m 0750 -o root      -g rustynetd /etc/rustynet
+//!     install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet
+//!     ```
+//!
+//! Off-Linux the report's per-root status is `Missing` with an explicit
+//! "requires a Linux runtime host" reason so the orchestrator surfaces
+//! a clear blocker rather than a fabricated answer.
+//!
+//! This is the Linux parity for the W1.1 Windows runtime-ACL verifier.
+//! Wired through the CLI as `rustynetd linux-runtime-acls-check`. The
+//! orchestrator's `LinuxDaemonProbe` adapter dispatches the
+//! `RuntimeAcls` op to this subcommand.
+
+use serde::{Deserialize, Serialize};
+
+/// Reviewed Linux runtime roots. Each entry is
+/// `(path, label, expected_mode, expected_owner, expected_group)` where
+/// `expected_mode` is the directory mode bits (octal in source for
+/// readability; persisted as decimal-mode in JSON).
+///
+/// `expected_owner` and `expected_group` are the textual usernames the
+/// systemd unit + bootstrap scripts use. The verifier resolves them to
+/// uid / gid at probe time so a host with a different uid mapping for
+/// `rustynetd` (eg. distros that pre-allocate different system uids)
+/// still passes when the *name* matches the reviewed posture.
+const LINUX_RUNTIME_STARTUP_ACL_ROOTS: &[(&str, &str, u32, &str, &str)] = &[
+    (
+        "/var/lib/rustynet",
+        "state root",
+        0o700,
+        "rustynetd",
+        "rustynetd",
+    ),
+    ("/etc/rustynet", "config root", 0o750, "root", "rustynetd"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LinuxRuntimeAclRootStatus {
+    Ok,
+    Missing { reason: String },
+    Drifted { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxRuntimeAclRootEntry {
+    pub label: String,
+    pub path: String,
+    #[serde(flatten)]
+    pub status: LinuxRuntimeAclRootStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxRuntimeAclReport {
+    pub schema_version: u32,
+    pub overall_ok: bool,
+    pub roots: Vec<LinuxRuntimeAclRootEntry>,
+}
+
+/// Diagnostic walk over the canonical Linux runtime roots. Collects
+/// per-root status instead of failing fast so a remote orchestrator
+/// can render a complete drift report in a single round-trip.
+pub fn collect_linux_runtime_acl_report() -> LinuxRuntimeAclReport {
+    let roots = LINUX_RUNTIME_STARTUP_ACL_ROOTS
+        .iter()
+        .map(|(path_str, label, mode, owner, group)| {
+            let status = inspect_runtime_root_status(path_str, label, *mode, owner, group);
+            LinuxRuntimeAclRootEntry {
+                label: (*label).to_string(),
+                path: (*path_str).to_string(),
+                status,
+            }
+        })
+        .collect::<Vec<_>>();
+    let overall_ok = roots
+        .iter()
+        .all(|entry| matches!(entry.status, LinuxRuntimeAclRootStatus::Ok));
+    LinuxRuntimeAclReport {
+        schema_version: 1,
+        overall_ok,
+        roots,
+    }
+}
+
+/// Reviewed posture for one runtime root, resolved at probe time so
+/// the evaluator can stay platform-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxRuntimeAclExpectation {
+    pub mode: u32,
+    pub owner_uid: u32,
+    pub group_gid: u32,
+}
+
+/// Live metadata snapshot of one runtime root. Fields mirror the
+/// `std::os::unix::fs::MetadataExt` view so the evaluator can stay
+/// `cfg`-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxRuntimeAclSnapshot {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+/// Pure evaluator: takes a fully-populated metadata snapshot and
+/// confirms it matches the reviewed posture. Splitting this out from
+/// the syscall-driven probe keeps unit tests deterministic — the
+/// fixture builds the snapshot in memory and the evaluator validates.
+pub fn evaluate_linux_runtime_acl_metadata(
+    label: &str,
+    expected: LinuxRuntimeAclExpectation,
+    actual: LinuxRuntimeAclSnapshot,
+) -> Result<(), String> {
+    if actual.is_symlink {
+        return Err(format!("{label} must be a real directory, not a symlink"));
+    }
+    if !actual.is_dir {
+        return Err(format!("{label} must be a directory, not a file"));
+    }
+    let actual_perms = actual.mode & 0o7777;
+    if actual_perms != expected.mode {
+        return Err(format!(
+            "{label} mode is 0o{actual_perms:o}, expected 0o{:o}",
+            expected.mode
+        ));
+    }
+    if actual.uid != expected.owner_uid {
+        return Err(format!(
+            "{label} owner uid is {}, expected {}",
+            actual.uid, expected.owner_uid
+        ));
+    }
+    if actual.gid != expected.group_gid {
+        return Err(format!(
+            "{label} group gid is {}, expected {}",
+            actual.gid, expected.group_gid
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_runtime_root_status(
+    path_str: &str,
+    label: &str,
+    expected_mode: u32,
+    expected_owner: &str,
+    expected_group: &str,
+) -> LinuxRuntimeAclRootStatus {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::Path::new(path_str);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) => {
+            return LinuxRuntimeAclRootStatus::Missing {
+                reason: format!(
+                    "{label} must exist before rustynetd starts on Linux ({path_str}): {err}"
+                ),
+            };
+        }
+    };
+    let is_symlink = metadata.file_type().is_symlink();
+    let is_dir = metadata.is_dir();
+
+    let expected_owner_uid = match resolve_uid_for_username(expected_owner) {
+        Some(uid) => uid,
+        None => {
+            return LinuxRuntimeAclRootStatus::Drifted {
+                reason: format!(
+                    "{label} reviewed owner {expected_owner:?} is not present on this host"
+                ),
+            };
+        }
+    };
+    let expected_group_gid = match resolve_gid_for_groupname(expected_group) {
+        Some(gid) => gid,
+        None => {
+            return LinuxRuntimeAclRootStatus::Drifted {
+                reason: format!(
+                    "{label} reviewed group {expected_group:?} is not present on this host"
+                ),
+            };
+        }
+    };
+
+    match evaluate_linux_runtime_acl_metadata(
+        label,
+        LinuxRuntimeAclExpectation {
+            mode: expected_mode,
+            owner_uid: expected_owner_uid,
+            group_gid: expected_group_gid,
+        },
+        LinuxRuntimeAclSnapshot {
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            is_dir,
+            is_symlink,
+        },
+    ) {
+        Ok(()) => LinuxRuntimeAclRootStatus::Ok,
+        Err(reason) => LinuxRuntimeAclRootStatus::Drifted { reason },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inspect_runtime_root_status(
+    path_str: &str,
+    label: &str,
+    _expected_mode: u32,
+    _expected_owner: &str,
+    _expected_group: &str,
+) -> LinuxRuntimeAclRootStatus {
+    LinuxRuntimeAclRootStatus::Missing {
+        reason: format!(
+            "{label} probe at {path_str} requires a Linux runtime host; \
+             linux-runtime-acls-check is not meaningful off-Linux"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_uid_for_username(username: &str) -> Option<u32> {
+    nix::unistd::User::from_name(username)
+        .ok()
+        .flatten()
+        .map(|user| user.uid.as_raw())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_gid_for_groupname(groupname: &str) -> Option<u32> {
+    nix::unistd::Group::from_name(groupname)
+        .ok()
+        .flatten()
+        .map(|group| group.gid.as_raw())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_root_expectation() -> LinuxRuntimeAclExpectation {
+        LinuxRuntimeAclExpectation {
+            mode: 0o700,
+            owner_uid: 998,
+            group_gid: 998,
+        }
+    }
+
+    fn config_root_expectation() -> LinuxRuntimeAclExpectation {
+        LinuxRuntimeAclExpectation {
+            mode: 0o750,
+            owner_uid: 0,
+            group_gid: 998,
+        }
+    }
+
+    fn good_state_root_snapshot() -> LinuxRuntimeAclSnapshot {
+        LinuxRuntimeAclSnapshot {
+            mode: 0o40700,
+            uid: 998,
+            gid: 998,
+            is_dir: true,
+            is_symlink: false,
+        }
+    }
+
+    #[test]
+    fn evaluator_accepts_matching_posture() {
+        evaluate_linux_runtime_acl_metadata(
+            "state root",
+            state_root_expectation(),
+            good_state_root_snapshot(),
+        )
+        .expect("matching posture must validate");
+    }
+
+    #[test]
+    fn evaluator_rejects_symlink() {
+        let mut snap = good_state_root_snapshot();
+        snap.is_symlink = true;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("symlink must reject");
+        assert!(
+            err.contains("symlink"),
+            "rejection must cite symlink: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_file_instead_of_dir() {
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o100644,
+            uid: 998,
+            gid: 998,
+            is_dir: false,
+            is_symlink: false,
+        };
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("non-dir must reject");
+        assert!(
+            err.contains("directory"),
+            "rejection must cite directory: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_world_readable_state_root() {
+        let mut snap = good_state_root_snapshot();
+        snap.mode = 0o40755;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("0755 must reject when 0700 is reviewed");
+        assert!(
+            err.contains("0o755"),
+            "rejection must cite the actual mode: {err}"
+        );
+        assert!(
+            err.contains("0o700"),
+            "rejection must cite the expected mode: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_wrong_owner() {
+        let mut snap = good_state_root_snapshot();
+        snap.uid = 0;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("uid mismatch must reject");
+        assert!(err.contains("owner"), "rejection must cite owner: {err}");
+        assert!(err.contains(" 0,"), "rejection must cite actual uid: {err}");
+        assert!(
+            err.contains(" 998"),
+            "rejection must cite the expected uid: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_wrong_group() {
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40750,
+            uid: 0,
+            gid: 0,
+            is_dir: true,
+            is_symlink: false,
+        };
+        let err =
+            evaluate_linux_runtime_acl_metadata("config root", config_root_expectation(), snap)
+                .expect_err("gid mismatch must reject");
+        assert!(err.contains("group"), "rejection must cite group: {err}");
+    }
+
+    #[test]
+    fn evaluator_ignores_high_bits_above_mode_mask() {
+        // S_IFDIR is 0o40000; the evaluator masks with 0o7777 so the
+        // file-type bits do not corrupt the mode comparison.
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40750,
+            uid: 0,
+            gid: 998,
+            is_dir: true,
+            is_symlink: false,
+        };
+        evaluate_linux_runtime_acl_metadata("config root", config_root_expectation(), snap)
+            .expect("high bits must be masked out");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn collect_off_linux_marks_every_root_missing() {
+        let report = collect_linux_runtime_acl_report();
+        assert!(!report.overall_ok);
+        for entry in &report.roots {
+            match &entry.status {
+                LinuxRuntimeAclRootStatus::Missing { reason } => {
+                    assert!(
+                        reason.contains("requires a Linux runtime host"),
+                        "off-Linux blocker reason expected: {reason}"
+                    );
+                }
+                other => panic!("expected Missing off-Linux, got {other:?}"),
+            }
+        }
+        assert_eq!(report.roots.len(), 2);
+    }
+
+    #[test]
+    fn report_serde_round_trips() {
+        let report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: true,
+            roots: vec![LinuxRuntimeAclRootEntry {
+                label: "state root".to_string(),
+                path: "/var/lib/rustynet".to_string(),
+                status: LinuxRuntimeAclRootStatus::Ok,
+            }],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: LinuxRuntimeAclReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn report_serde_drifted_round_trips() {
+        let report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: false,
+            roots: vec![LinuxRuntimeAclRootEntry {
+                label: "state root".to_string(),
+                path: "/var/lib/rustynet".to_string(),
+                status: LinuxRuntimeAclRootStatus::Drifted {
+                    reason: "state root mode is 0o755, expected 0o700".to_string(),
+                },
+            }],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: LinuxRuntimeAclReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+}

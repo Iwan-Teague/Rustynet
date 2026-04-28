@@ -5633,17 +5633,33 @@ pub trait DaemonProbe {
 pub struct LinuxDaemonProbe;
 
 impl DaemonProbe for LinuxDaemonProbe {
-    fn build_argv(&self, op: DaemonProbeOp, _daemon_path: &Path) -> Result<Vec<String>, String> {
-        // Linux daemon does not yet expose validator subcommands at
-        // parity with Windows. Until the Linux-side subcommands ship
-        // (tracked alongside W4 capability gating) the adapter rejects
-        // every Linux-side daemon probe — better than silently dispatching
-        // a non-existent subcommand and parsing a bash 127 exit as
-        // "drift".
-        Err(format!(
-            "RustyNet daemon-side probe '{}' is not yet implemented on Linux; the Windows daemon ships these validators today and the Linux side is tracked under the OS-agnostic delta plan W4",
-            op.as_str()
-        ))
+    fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
+        let daemon = daemon_path.to_string_lossy().into_owned();
+        if daemon.is_empty() {
+            return Err("daemon_path must not be empty".to_string());
+        }
+        // The Linux daemon ships parity validator subcommands one at a
+        // time. Until each lands, the adapter rejects with the precise
+        // op label so the orchestrator surfaces a "Linux daemon does
+        // not yet expose <op>" blocker rather than dispatching a non-
+        // existent subcommand and parsing a 127 exit as "drift".
+        let subcommand = match op {
+            DaemonProbeOp::RuntimeAcls => "linux-runtime-acls-check",
+            other => {
+                return Err(format!(
+                    "RustyNet daemon-side probe '{}' is not yet implemented on Linux; \
+                     the Windows daemon ships every validator today and the remaining \
+                     Linux-side subcommands land one at a time under the OS-agnostic \
+                     delta plan W4",
+                    other.as_str()
+                ));
+            }
+        };
+        Ok(vec![
+            daemon,
+            subcommand.to_string(),
+            "--no-fail-on-drift".to_string(),
+        ])
     }
     fn platform_label(&self) -> &'static str {
         "linux"
@@ -24641,23 +24657,58 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
-    fn linux_daemon_probe_rejects_with_roadmap_blocker_today() {
-        // Linux daemon does not yet expose the validator subcommand
-        // surface at parity with Windows. Adapter rejects up-front so
-        // the orchestrator does not waste an SSH round-trip on a
-        // non-existent subcommand.
+    fn linux_daemon_probe_emits_argv_for_runtime_acls_op() {
+        // Linux daemon ships parity validators one at a time. The
+        // RuntimeAcls op resolves to the `linux-runtime-acls-check`
+        // subcommand wired in `crates/rustynetd/src/main.rs`; the
+        // remaining ops still reject with a precise per-op blocker so
+        // the orchestrator surfaces "Linux daemon does not yet expose
+        // <op>" rather than parsing a bash 127 exit as "drift".
         let probe = super::LinuxDaemonProbe;
         assert_eq!(probe.platform_label(), "linux");
+        let argv = probe
+            .build_argv(
+                super::DaemonProbeOp::RuntimeAcls,
+                std::path::Path::new("/usr/local/bin/rustynetd"),
+            )
+            .expect("RuntimeAcls op must resolve to a Linux subcommand today");
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/rustynetd".to_string(),
+                "linux-runtime-acls-check".to_string(),
+                "--no-fail-on-drift".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_daemon_probe_rejects_remaining_ops_with_roadmap_blocker() {
+        let probe = super::LinuxDaemonProbe;
         for op in [
-            super::DaemonProbeOp::RuntimeAcls,
             super::DaemonProbeOp::ServiceHardening,
             super::DaemonProbeOp::KeyCustody,
+            super::DaemonProbeOp::Authenticode,
+            super::DaemonProbeOp::MeshStatus,
+            super::DaemonProbeOp::DnsFailclosed,
         ] {
             let err = probe
                 .build_argv(op, std::path::Path::new("/usr/local/bin/rustynetd"))
-                .expect_err("linux probe must reject today");
-            assert!(err.contains("not yet implemented on Linux"));
+                .expect_err("unimplemented op must reject");
+            assert!(
+                err.contains("not yet implemented on Linux") && err.contains(op.as_str()),
+                "rejection must surface the missing op label: {err}"
+            );
         }
+    }
+
+    #[test]
+    fn linux_daemon_probe_rejects_empty_daemon_path() {
+        let probe = super::LinuxDaemonProbe;
+        let err = probe
+            .build_argv(super::DaemonProbeOp::RuntimeAcls, std::path::Path::new(""))
+            .expect_err("empty daemon path must reject");
+        assert!(err.contains("daemon_path"));
     }
 
     #[test]
