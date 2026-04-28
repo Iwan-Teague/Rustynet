@@ -8643,9 +8643,16 @@ pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 /// daemon path + subcommand both flow through `shell_quote`, and the
 /// subcommand charset is filtered to ASCII alphanumeric + `-` (rejecting
 /// anything that could carry shell metacharacters).
+///
+/// `extra_args` are appended after `--no-fail-on-drift`. Each extra arg
+/// flows through `shell_quote` and rejects control characters so a
+/// future caller cannot inject shell metacharacters via the override
+/// parameter. Used today for the mesh-status stage's
+/// `--state-path / --expected-peer-id / --max-age-seconds` overrides.
 fn build_linux_daemon_check_invocation(
     daemon_path: &str,
     subcommand: &str,
+    extra_args: &[String],
 ) -> Result<String, String> {
     ensure_no_control_chars("linux daemon path", daemon_path)?;
     ensure_no_control_chars("linux daemon subcommand", subcommand)?;
@@ -8660,11 +8667,17 @@ fn build_linux_daemon_check_invocation(
             "linux daemon subcommand rejected on charset: {subcommand:?}; allowed: ASCII alphanumeric + '-'"
         ));
     }
-    Ok(format!(
+    let mut command = format!(
         "{} {} --no-fail-on-drift",
         shell_quote(daemon_path),
         shell_quote(subcommand)
-    ))
+    );
+    for arg in extra_args {
+        ensure_no_control_chars("linux daemon extra arg", arg.as_str())?;
+        command.push(' ');
+        command.push_str(shell_quote(arg.as_str()).as_str());
+    }
+    Ok(command)
 }
 
 /// Generic SSH dispatcher for a Linux daemon-check subcommand. Resolves
@@ -8677,6 +8690,7 @@ fn run_linux_daemon_check_remote(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
     subcommand: &str,
+    extra_args: &[String],
 ) -> Result<String, String> {
     let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_string()], false, &[])?;
     let target = targets
@@ -8690,7 +8704,8 @@ fn run_linux_daemon_check_remote(
         ));
     }
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
-    let invocation = build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand)?;
+    let invocation =
+        build_linux_daemon_check_invocation(LINUX_RUSTYNETD_PATH, subcommand, extra_args)?;
     let raw_output = capture_remote_shell_command_for_target(
         &target,
         None,
@@ -8927,6 +8942,7 @@ fn run_validate_linux_runtime_acls_stage(
         ssh_identity_file,
         known_hosts_path,
         "linux-runtime-acls-check",
+        &[],
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_runtime_acls_report(linux_alias, raw.as_str())
@@ -8934,24 +8950,53 @@ fn run_validate_linux_runtime_acls_stage(
         .map_err(|reason| (reason, raw))
 }
 
-fn run_validate_linux_mesh_status_stage(
+/// Build the `--state-path / --expected-peer-id / --max-age-seconds`
+/// extras for the mesh-status subcommand from a `MeshStatusOverrides`
+/// struct. Centralizes the override-to-argv mapping so callers don't
+/// have to re-derive it.
+fn build_linux_mesh_status_extra_args(overrides: &MeshStatusOverrides) -> Vec<String> {
+    let mut extras: Vec<String> = Vec::new();
+    if let Some(path) = overrides.state_path.as_ref() {
+        extras.push("--state-path".to_string());
+        extras.push(path.display().to_string());
+    }
+    for peer in &overrides.expected_peer_ids {
+        extras.push("--expected-peer-id".to_string());
+        extras.push(peer.clone());
+    }
+    if let Some(secs) = overrides.max_age_seconds {
+        extras.push("--max-age-seconds".to_string());
+        extras.push(secs.to_string());
+    }
+    extras
+}
+
+fn run_validate_linux_mesh_status_stage_with_overrides(
     linux_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    overrides: &MeshStatusOverrides,
 ) -> Result<(String, String), (String, String)> {
+    let extras = build_linux_mesh_status_extra_args(overrides);
     let raw = run_linux_daemon_check_remote(
         linux_alias,
         inventory_path,
         ssh_identity_file,
         known_hosts_path,
         "linux-mesh-status-check",
+        extras.as_slice(),
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_mesh_status_report(linux_alias, raw.as_str())
         .map(|summary| (summary, raw.clone()))
         .map_err(|reason| (reason, raw))
 }
+
+// `run_validate_linux_mesh_status_stage_with_overrides` replaces the
+// no-overrides wrapper that lived here previously. Callers that don't
+// need overrides pass `&MeshStatusOverrides::default()` directly so
+// there is one path through the dispatch + evaluator.
 
 fn run_validate_linux_key_custody_stage(
     linux_alias: &str,
@@ -8965,6 +9010,7 @@ fn run_validate_linux_key_custody_stage(
         ssh_identity_file,
         known_hosts_path,
         "linux-key-custody-check",
+        &[],
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_key_custody_report(linux_alias, raw.as_str())
@@ -8984,6 +9030,7 @@ fn run_validate_linux_authenticode_stage(
         ssh_identity_file,
         known_hosts_path,
         "linux-authenticode-check",
+        &[],
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_authenticode_report(linux_alias, raw.as_str())
@@ -9003,6 +9050,7 @@ fn run_validate_linux_service_hardening_stage(
         ssh_identity_file,
         known_hosts_path,
         "linux-service-hardening-check",
+        &[],
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_service_hardening_report(linux_alias, raw.as_str())
@@ -9022,6 +9070,7 @@ fn run_validate_linux_dns_failclosed_stage(
         ssh_identity_file,
         known_hosts_path,
         "linux-dns-failclosed-check",
+        &[],
     )
     .map_err(|err| (err, String::new()))?;
     evaluate_linux_dns_failclosed_report(linux_alias, raw.as_str())
@@ -9029,13 +9078,25 @@ fn run_validate_linux_dns_failclosed_stage(
         .map_err(|reason| (reason, raw))
 }
 
-/// Per-run knobs for the Linux orchestrator. Today only `dry_run`
-/// exists; future slices can opt-out of individual stages or pass
-/// `--expected-peer-id` / `--max-age-seconds` overrides for the
-/// mesh-status stage the way the Windows side does.
+/// Mesh-status stage overrides — Linux parity for the Windows side's
+/// `--state-path / --expected-peer-id / --max-age-seconds` knobs.
+/// `None` / empty means "use the daemon's defaults"; the daemon
+/// already pins `/var/lib/rustynet/rustynetd.state` as the default
+/// state path and disables freshness checking when no max-age is set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MeshStatusOverrides {
+    pub state_path: Option<PathBuf>,
+    pub expected_peer_ids: Vec<String>,
+    pub max_age_seconds: Option<i64>,
+}
+
+/// Per-run knobs for the Linux orchestrator. Mirrors the
+/// `WindowsOrchestrationOptions` shape; `mesh_status_overrides`
+/// match the Windows-side mesh-join flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LinuxOrchestrationOptions {
     dry_run: bool,
+    mesh_status_overrides: MeshStatusOverrides,
 }
 
 /// Linux-side validator orchestrator. Mirrors the Windows
@@ -9205,12 +9266,54 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_mesh_status",
             "validate_linux_dns_failclosed",
         )
-    } else {
-        dispatch_stage(
+    } else if options.dry_run {
+        stage_outcome(
             "validate_linux_mesh_status",
-            mesh_status_log_path.as_path(),
-            run_validate_linux_mesh_status_stage,
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would dispatch validate_linux_mesh_status on {linux_alias}"),
+            vec![],
         )
+    } else {
+        // Mesh-status uses the with-overrides runner because the
+        // operator can pass `--state-path / --expected-peer-id /
+        // --max-age-seconds` through the CLI; the other five
+        // stages run with daemon defaults.
+        match run_validate_linux_mesh_status_stage_with_overrides(
+            linux_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            &options.mesh_status_overrides,
+        ) {
+            Ok((summary, raw)) => {
+                let log_body = if raw.is_empty() {
+                    summary.clone()
+                } else {
+                    format!("{summary}\n--- raw report ---\n{raw}")
+                };
+                let _ = std::fs::write(mesh_status_log_path.as_path(), log_body.as_str());
+                stage_outcome(
+                    "validate_linux_mesh_status",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![mesh_status_log_path.clone()],
+                )
+            }
+            Err((reason, raw)) => {
+                let log_body = if raw.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw}")
+                };
+                let _ = std::fs::write(mesh_status_log_path.as_path(), log_body.as_str());
+                stage_outcome(
+                    "validate_linux_mesh_status",
+                    VmLabStageStatus::Fail,
+                    format!("validate_linux_mesh_status failed for {linux_alias}: {reason}"),
+                    vec![mesh_status_log_path.clone()],
+                )
+            }
+        }
     };
 
     vec![
@@ -9252,7 +9355,10 @@ fn run_linux_daemon_validators_for_aliases(
             ssh_identity_file,
             known_hosts_path,
             per_alias_dir.as_path(),
-            LinuxOrchestrationOptions { dry_run },
+            LinuxOrchestrationOptions {
+                dry_run,
+                mesh_status_overrides: MeshStatusOverrides::default(),
+            },
         );
         for mut outcome in chainer_outcomes {
             outcome.stage = format!("{alias}::{}", outcome.stage);
@@ -9272,6 +9378,16 @@ pub struct VmLabValidateLinuxSecurityConfig {
     pub known_hosts_path: Option<PathBuf>,
     pub report_dir: PathBuf,
     pub dry_run: bool,
+    /// Mesh-status stage override: alternate path to the daemon's
+    /// session-snapshot file (defaults to
+    /// `/var/lib/rustynet/rustynetd.state` per the systemd unit).
+    pub mesh_status_state_path: Option<PathBuf>,
+    /// Mesh-status stage override: peer IDs the operator expects the
+    /// daemon to have loaded. Empty list = no peer-presence check.
+    pub mesh_status_expected_peer_ids: Vec<String>,
+    /// Mesh-status stage override: snapshot freshness budget. `None`
+    /// disables the freshness check.
+    pub mesh_status_max_age_seconds: Option<i64>,
 }
 
 pub fn run_validate_linux_security(
@@ -9291,6 +9407,11 @@ pub fn run_validate_linux_security(
         config.report_dir.as_path(),
         LinuxOrchestrationOptions {
             dry_run: config.dry_run,
+            mesh_status_overrides: MeshStatusOverrides {
+                state_path: config.mesh_status_state_path.clone(),
+                expected_peer_ids: config.mesh_status_expected_peer_ids.clone(),
+                max_age_seconds: config.mesh_status_max_age_seconds,
+            },
         },
     );
     let summary_path = config.report_dir.join("linux_security_validation.json");
@@ -25927,6 +26048,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let script = super::build_linux_daemon_check_invocation(
             super::LINUX_RUSTYNETD_PATH,
             "linux-runtime-acls-check",
+            &[],
         )
         .expect("well-formed invocation must build");
         assert!(
@@ -25940,6 +26062,73 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
+    fn build_linux_daemon_check_invocation_appends_quoted_extras() {
+        let script = super::build_linux_daemon_check_invocation(
+            super::LINUX_RUSTYNETD_PATH,
+            "linux-mesh-status-check",
+            &[
+                "--state-path".to_string(),
+                "/var/lib/rustynet/rustynetd.state".to_string(),
+                "--expected-peer-id".to_string(),
+                "peer-a".to_string(),
+                "--max-age-seconds".to_string(),
+                "300".to_string(),
+            ],
+        )
+        .expect("well-formed extras must build");
+        assert!(script.contains("'--state-path'"));
+        assert!(script.contains("'/var/lib/rustynet/rustynetd.state'"));
+        assert!(script.contains("'--expected-peer-id'"));
+        assert!(script.contains("'peer-a'"));
+        assert!(script.contains("'--max-age-seconds'"));
+        assert!(script.contains("'300'"));
+    }
+
+    #[test]
+    fn build_linux_daemon_check_invocation_rejects_extras_with_control_chars() {
+        let err = super::build_linux_daemon_check_invocation(
+            super::LINUX_RUSTYNETD_PATH,
+            "linux-mesh-status-check",
+            &["--state-path".to_string(), "/var/lib\nrm -rf /".to_string()],
+        )
+        .expect_err("control chars in extras must reject");
+        assert!(
+            err.contains("control") || err.contains("extra arg"),
+            "rejection must cite control / extra arg: {err}"
+        );
+    }
+
+    #[test]
+    fn build_linux_mesh_status_extra_args_emits_canonical_arg_order() {
+        let overrides = super::MeshStatusOverrides {
+            state_path: Some(std::path::PathBuf::from("/tmp/state")),
+            expected_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            max_age_seconds: Some(600),
+        };
+        let extras = super::build_linux_mesh_status_extra_args(&overrides);
+        assert_eq!(
+            extras,
+            vec![
+                "--state-path".to_string(),
+                "/tmp/state".to_string(),
+                "--expected-peer-id".to_string(),
+                "peer-a".to_string(),
+                "--expected-peer-id".to_string(),
+                "peer-b".to_string(),
+                "--max-age-seconds".to_string(),
+                "600".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_linux_mesh_status_extra_args_emits_empty_for_default_overrides() {
+        let extras =
+            super::build_linux_mesh_status_extra_args(&super::MeshStatusOverrides::default());
+        assert!(extras.is_empty());
+    }
+
+    #[test]
     fn build_linux_daemon_check_invocation_rejects_subcommand_with_metacharacters() {
         for bad in [
             "linux-runtime-acls-check; rm -rf /",
@@ -25950,8 +26139,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "linux runtime acls check",
             "",
         ] {
-            let err = super::build_linux_daemon_check_invocation(super::LINUX_RUSTYNETD_PATH, bad)
-                .expect_err("hostile subcommand must reject");
+            let err =
+                super::build_linux_daemon_check_invocation(super::LINUX_RUSTYNETD_PATH, bad, &[])
+                    .expect_err("hostile subcommand must reject");
             assert!(
                 err.contains("rejected") || err.contains("must not be empty"),
                 "rejection must surface charset / empty: {err}"
@@ -26260,6 +26450,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             known_hosts_path: None,
             report_dir: report_dir.clone(),
             dry_run: true,
+            mesh_status_state_path: None,
+            mesh_status_expected_peer_ids: vec![],
+            mesh_status_max_age_seconds: None,
         };
         let summary = super::run_validate_linux_security(&config).expect("dry-run must succeed");
         assert!(summary.contains("debian-utm-1"));
