@@ -5,10 +5,19 @@ Owner: AI implementation agent (per `CLAUDE.md`)
 Supersedes the bash orchestrator's monopoly on the live-lab install path.
 Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4 deliverables this plan builds on top of).
 
-> **Status: PLAN ONLY — no implementation yet.**
+> **Status: W5.0 COMPLETE — foundation traits + tests merged.**
 > Each W5.x slice listed below is a future commit. Mark `[x]` as each
 > ships with a commit SHA, evidence pointers, and residual-risk notes
 > following the existing W3.2-followup-N entry pattern.
+>
+> - [x] W5.0 — Foundation (traits, stubs, 26 unit tests). All gates green.
+> - [ ] W5.1 — LinuxNodeAdapter + --node flag opt-in
+> - [ ] W5.2 — WindowsNodeAdapter
+> - [ ] W5.3 — MacosNodeAdapter
+> - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS)
+> - [ ] W5.5 — 17 stage implementations + parity run
+> - [ ] W5.6 — Promote --node to default + deprecate old flags
+> - [ ] W5.7 — Live-evidence campaign + bash removal
 
 ## 0) TL;DR
 
@@ -140,7 +149,31 @@ Each stage emits a per-stage log file under `<report-dir>/logs/`. The final `fai
 
 ### 3.1 Two new traits
 
-**`NodeAdapter`** — captures everything that's per-node + per-OS for the orchestration path. One impl per OS.
+**`NodeConnection`** — transport injected at adapter construction time. `NodeAdapter` methods carry no connection argument; the transport is baked in by the factory. This is the key design decision that enables true OS-agnosticism: iOS (MDM), Android (ADB), and any future platform can implement the same trait surface without receiving an SSH struct they cannot use.
+
+```rust
+/// Transport injected at adapter construction by `node_adapter_for`.
+/// NodeAdapter methods take no connection argument — connection details
+/// live here, not on every call site.
+pub enum NodeConnection {
+    /// SSH to a POSIX or PowerShell-capable host (Linux, Windows, macOS).
+    Ssh {
+        host: String,
+        port: u16,
+        user: Option<String>,
+        identity_file: PathBuf,
+        /// Required. `StrictHostKeyChecking=yes` enforced at SSH layer.
+        /// Absent file or key mismatch = hard fail at construction, not a warning.
+        known_hosts: PathBuf,
+    },
+    /// Android Debug Bridge (future AndroidNodeAdapter — lab-only).
+    Adb { device_serial: String },
+    /// Apple MDM / Network Extension management channel (future IosNodeAdapter).
+    Mdm { enrollment_id: String },
+}
+```
+
+**`NodeAdapter`** — captures everything that's per-node + per-OS for the orchestration path. One impl per OS. Connection details live in `NodeConnection`, injected at construction; no `RemoteTarget` threading through every call.
 
 ```rust
 pub trait NodeAdapter: Send + Sync {
@@ -149,25 +182,22 @@ pub trait NodeAdapter: Send + Sync {
     // ── Install lifecycle ─────────────────────────────────────────
     fn install_daemon(
         &self,
-        target: &RemoteTarget,
         source: &SourceArchive,
         ctx: &OrchestrationContext,
     ) -> Result<InstallReport, AdapterError>;
 
-    fn start_daemon(&self, target: &RemoteTarget) -> Result<(), AdapterError>;
-    fn stop_daemon(&self, target: &RemoteTarget) -> Result<(), AdapterError>;
-    fn restart_daemon(&self, target: &RemoteTarget) -> Result<(), AdapterError>;
-    fn uninstall_daemon(&self, target: &RemoteTarget) -> Result<(), AdapterError>;
+    fn start_daemon(&self) -> Result<(), AdapterError>;
+    fn stop_daemon(&self) -> Result<(), AdapterError>;
+    fn restart_daemon(&self) -> Result<(), AdapterError>;
+    fn uninstall_daemon(&self) -> Result<(), AdapterError>;
 
     // ── Membership owner (exit role only) ─────────────────────────
     fn issue_membership_owner_key(
         &self,
-        target: &RemoteTarget,
     ) -> Result<MembershipOwnerKey, AdapterError>;
 
     fn init_membership_snapshot(
         &self,
-        target: &RemoteTarget,
         owner_key: &MembershipOwnerKey,
         peers: &[NodeRoleAssignment],
     ) -> Result<MembershipSnapshot, AdapterError>;
@@ -175,15 +205,13 @@ pub trait NodeAdapter: Send + Sync {
     // ── Per-node identity + key collection ────────────────────────
     fn collect_wireguard_public_key(
         &self,
-        target: &RemoteTarget,
     ) -> Result<WireguardPublicKey, AdapterError>;
 
-    fn collect_node_id(&self, target: &RemoteTarget) -> Result<NodeId, AdapterError>;
+    fn collect_node_id(&self) -> Result<NodeId, AdapterError>;
 
     // ── Bundle distribution (any non-exit role) ───────────────────
     fn distribute_signed_bundle(
         &self,
-        target: &RemoteTarget,
         kind: BundleKind,
         bundle_path: &Path,
     ) -> Result<(), AdapterError>;
@@ -191,31 +219,54 @@ pub trait NodeAdapter: Send + Sync {
     // ── Validators (delegates to existing W3.x DaemonProbe) ───────
     fn run_validator(
         &self,
-        target: &RemoteTarget,
         op: DaemonProbeOp,
     ) -> Result<ValidatorReport, AdapterError>;
 
     // ── Traffic test ──────────────────────────────────────────────
+    /// Positive connectivity: confirm this node reaches peer_mesh_ip via tunnel.
     fn ping_mesh_peer(
         &self,
-        source: &RemoteTarget,
         peer_mesh_ip: &str,
+    ) -> Result<TrafficTestResult, AdapterError>;
+
+    /// Negative ACL test: confirm default-deny blocks traffic to a non-mesh IP.
+    /// Must return `TrafficTestResult::Blocked` for the stage to pass.
+    /// A `Reachable` result is a security failure and fails the stage.
+    fn probe_denied_peer(
+        &self,
+        denied_ip: &str,
     ) -> Result<TrafficTestResult, AdapterError>;
 
     fn collect_active_tunnels(
         &self,
-        target: &RemoteTarget,
     ) -> Result<TunnelsList, AdapterError>;
 
     // ── Diagnostics + cleanup ─────────────────────────────────────
+    /// Collect diagnostic artifacts to dst.
+    /// Key material MUST be excluded: `*/keys/*`, `*.priv`, `*.pem` paths
+    /// must never appear in the archive. Implementations must test this invariant.
     fn collect_artifacts(
         &self,
-        target: &RemoteTarget,
         dst: &Path,
     ) -> Result<(), AdapterError>;
 
-    fn cleanup_runtime_state(&self, target: &RemoteTarget) -> Result<(), AdapterError>;
+    fn cleanup_runtime_state(&self) -> Result<(), AdapterError>;
 }
+```
+
+The factory signature reflects the connection-injection pattern:
+
+```rust
+/// Build an adapter for `platform` using `conn` as its transport.
+/// Returns `Err(AdapterError::UnsupportedPlatform { .. })` for platforms
+/// not yet implemented (iOS, Android). The error message names the specific
+/// security barriers that block the platform (see §11).
+/// Returns `Err(AdapterError::ConnectionPlatformMismatch { .. })` if the
+/// connection type is not valid for the platform (e.g. Adb for Linux).
+pub fn node_adapter_for(
+    platform: VmGuestPlatform,
+    conn: NodeConnection,
+) -> Result<Box<dyn NodeAdapter>, AdapterError>;
 ```
 
 **`OrchestrationStage`** — captures the orchestrator's behavior. One impl per stage.
@@ -313,7 +364,7 @@ The bash orchestrator script stays in place. It is invoked by the legacy code pa
 | `Aux` | ✓ | ✓ | ✓ | ✗ | ✗ |
 | `Extra` | ✓ | ✓ | ✓ | ✗ | ✗ |
 
-iOS / Android adapters ship as `UnsupportedOp` stubs with clear blocker messages so the orchestrator surfaces a precise rejection rather than a confusing partial-failure mid-run.
+iOS / Android adapters ship as `UnsupportedOp` stubs that fail closed with **security-specific rejection messages**. The message must name the concrete security barriers — not just "not yet implemented." Required text elements: (1) no daemon validator coverage (service hardening, key custody, DNS fail-closed not implemented for the platform); (2) no reviewed key custody model (Secure Enclave / Android Keystore integration undesigned); (3) connection model (MDM/ADB) not reviewed against security minimum bar. A test asserts each stub's error string contains "security minimum bar". See §11 for what a future W6 track would need.
 
 ### 3.5 CLI surface (target end state)
 
@@ -324,6 +375,7 @@ ops vm-lab-orchestrate-live-lab \
   --inventory <path> \
   --report-dir <path> \
   --ssh-identity-file <path> \
+  --known-hosts-file <path> \           # required; StrictHostKeyChecking=yes enforced
   --node <alias>:<role> [--node <alias>:<role>]... \
   [--source-mode working-tree|local-head|origin-main|ref] \
   [--require-min-nodes <n>] \
@@ -331,6 +383,8 @@ ops vm-lab-orchestrate-live-lab \
   [--rerun-stage <stage-id>] [--rerun-stage <stage-id>]... \
   [--legacy-bash-orchestrator]   # transitional, deprecated by W5.7
 ```
+
+`--known-hosts-file` is **required** (not optional). The SSH layer enforces `StrictHostKeyChecking=yes` against the provided file. Absent file, absent host entry, or key mismatch = hard fail at connection construction; the orchestrator does not continue with an unverified host. This applies to every SSH session including the initial bootstrap — a MITM at `install_daemon` time could substitute a malicious daemon binary.
 
 The 6 named flags (`--exit-vm`, `--client-vm`, `--entry-vm`, `--aux-vm`, `--extra-vm`, `--windows-vm`) keep working as deprecation aliases for the duration of W5; they translate internally into `--node <alias>:<role>` pairs. W5.7 removes them.
 
@@ -344,14 +398,15 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Files added:**
 - `crates/rustynet-cli/src/vm_lab/orchestrator/mod.rs`
-- `crates/rustynet-cli/src/vm_lab/orchestrator/error.rs` (`AdapterError`, `StageError`, `StageOutcome`)
+- `crates/rustynet-cli/src/vm_lab/orchestrator/error.rs` (`AdapterError` incl. `UnsupportedPlatform` + `ConnectionPlatformMismatch` variants, `StageError`, `StageOutcome`)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/role.rs` (`NodeRole`)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/role_assignment.rs` (`NodeRoleAssignment` + `parse_node_role_arg(&str) -> Result<…>`)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/source_archive.rs` (`SourceArchive` type)
+- `crates/rustynet-cli/src/vm_lab/orchestrator/connection.rs` (`NodeConnection` enum — `Ssh`, `Adb`, `Mdm` variants; `Ssh` validates `known_hosts` path at construction)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/context.rs` (`OrchestrationContext`)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/mod.rs`
-- `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/node_adapter.rs` (the trait def)
-- `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/factory.rs` (`node_adapter_for(VmGuestPlatform) -> Box<dyn NodeAdapter>`)
+- `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/node_adapter.rs` (trait def — no `RemoteTarget` in method signatures)
+- `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/factory.rs` (`node_adapter_for(VmGuestPlatform, NodeConnection) -> Result<Box<dyn NodeAdapter>, AdapterError>`)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs` (the trait def + `StageId` enum)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/plan.rs` (`PlanBuilder` — empty for now)
 - `crates/rustynet-cli/src/vm_lab/orchestrator/runner.rs` (`StateMachineRunner` skeleton)
@@ -362,17 +417,23 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Tests:**
 - `parse_node_role_arg` accepts `alias:exit` / `alias:client` / `alias:entry` / `alias:aux` / `alias:extra` / `alias:custom-foo`.
-- `parse_node_role_arg` rejects empty, malformed, unknown roles.
+- `parse_node_role_arg` rejects empty, malformed, unknown roles (including typos like `exti`).
 - `NodeRole::is_unique_per_lab()` returns true for `Exit`, false for others (exactly one Exit per lab).
-- `node_adapter_for` returns the right concrete type for each `VmGuestPlatform` variant (using stub impls).
+- `node_adapter_for` returns the right concrete type for Linux/Windows/macOS (using stub impls).
+- `node_adapter_for(VmGuestPlatform::Ios, _)` and `node_adapter_for(VmGuestPlatform::Android, _)` return `Err(AdapterError::UnsupportedPlatform)` whose message contains "security minimum bar".
+- `node_adapter_for` returns `Err(AdapterError::ConnectionPlatformMismatch)` for mismatched pairs (e.g. `Adb` + Linux, `Ssh` + iOS).
+- `NodeConnection::Ssh` construction returns `Err` if `known_hosts` path does not exist (validated at construction, not at first use).
 - `StateMachineRunner` honors skip-cascade for a stub 3-stage plan with one failing stage.
+- `StateMachineRunner` executes stages in dependency order (not insertion order) for a 3-stage plan where C depends on A but not B.
 
 **Acceptance criteria:**
 - `cargo fmt --all -- --check` clean.
 - `cargo clippy --workspace --all-features -- -D warnings` clean.
-- `cargo test --workspace --all-features` clean (~10-15 new tests).
+- `cargo test --workspace --all-features` clean (~15-20 new tests).
 - No behavior change to `vm-lab-orchestrate-live-lab` or any existing subcommand.
 - New module compiles + is reachable via `pub mod orchestrator;` from `vm_lab/mod.rs`.
+- iOS + Android `UnsupportedPlatform` error strings verified by test to contain "security minimum bar".
+- `NodeConnection::Ssh` path-validation test passes.
 
 **Estimated LOC:** 800-1200 (most is type definitions + trait scaffolding + tests).
 
@@ -403,16 +464,24 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 | `run_validator` | `rustynetd linux-<op>-check` over SSH (delegates to `LinuxDaemonProbe::build_argv`). |
 | `ping_mesh_peer` | `ping -c 3 <peer-mesh-ip>` over SSH + parse output. |
 | `collect_active_tunnels` | `wg show <iface>` over SSH + parse. |
-| `collect_artifacts` | `tar -czf - /var/lib/rustynet/ /var/log/rustynet/ <log paths>` piped to local file. |
+| `collect_artifacts` | `tar -czf - /var/lib/rustynet/ /var/log/rustynet/ <log paths> --exclude='*/keys/*' --exclude='*.priv' --exclude='*.pem'` piped to local file. Key material must never appear in collected artifacts; see §3.1 `NodeAdapter` contract. |
 | `cleanup_runtime_state` | `systemctl stop rustynetd && rm -rf /var/lib/rustynet/*` (preserves keys directory shape). |
+
+**CLI surface (opt-in, added in W5.1):** `--node <alias>:<role>` and `--known-hosts-file <path>` are wired to the CLI parser in W5.1 as opt-in flags alongside the existing `--exit-vm / --client-vm / …` flags. W5.2–W5.5 are developed and tested using `--node`. W5.6 promotes `--node` to the default and removes the old flags.
+
+**Files modified (W5.1, in addition to adapter files):**
+- `crates/rustynet-cli/src/main.rs` — add `--node`, `--known-hosts-file` flags as opt-in.
+- `crates/rustynet-cli/src/vm_lab/mod.rs` — route to new adapter code path when `--node` is present.
 
 **Tests:**
 - Unit tests for argv-building helpers (e.g., `build_systemctl_action_invocation("start", "rustynetd")`).
 - Integration test (gated env) that drives `LinuxNodeAdapter` against one live Debian VM and confirms each method works.
-- Snapshot test: byte-for-byte parity check of LinuxNodeAdapter output for `install_daemon` vs bash orchestrator's `bootstrap_hosts` stage. Both produce a daemon at `/usr/local/bin/rustynetd` with the same systemd unit.
+- Snapshot test: byte-for-byte parity check of `LinuxNodeAdapter::install_daemon` vs bash orchestrator's `bootstrap_hosts` stage. Both produce a daemon at `/usr/local/bin/rustynetd` with the same systemd unit.
+- Key-exclusion invariant: `collect_artifacts` output archive must not contain any path containing `keys/`, `.priv`, or `.pem`. Test creates a mock remote tree with a fake `wireguard.priv` file and asserts its absence in the tarball.
 
 **Acceptance criteria:**
 - All gates pass.
+- `--node` opt-in flag works end-to-end against a Debian VM using `LinuxNodeAdapter`.
 - Live evidence: drive the new adapter against one Debian VM, install daemon, run validators, distribute a fake bundle. Capture as `documents/operations/active/W5_LinuxAdapter_LiveEvidence_2026-XX-XX.md`.
 - Bash orchestrator unchanged — operators continue to use it through `--legacy-bash-orchestrator` (default for W5.1-5.4).
 
@@ -447,7 +516,7 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 | `run_validator` | `rustynetd windows-<op>-check` (delegates to `WindowsDaemonProbe::build_argv`). |
 | `ping_mesh_peer` | `Test-Connection <peer-mesh-ip> -Count 3` over PS-encoded SSH. |
 | `collect_active_tunnels` | `wg show <iface>` via wireguard.exe over PS-encoded SSH. |
-| `collect_artifacts` | scp `C:\ProgramData\RustyNet\logs\` to local. |
+| `collect_artifacts` | scp `C:\ProgramData\RustyNet\logs\` to local, explicitly excluding `C:\ProgramData\RustyNet\keys\*`. Key material must never appear in collected artifacts. |
 | `cleanup_runtime_state` | `Uninstall-RustyNetWindowsService.ps1 -PurgeStateRoot` (existing helper). |
 
 **Tests:** parallel structure to W5.1.
@@ -498,7 +567,7 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 | `run_validator` | `rustynetd macos-<op>-check` over SSH (new `MacosDaemonProbe::build_argv`). |
 | `ping_mesh_peer` | `ping -c 3 <peer-mesh-ip>` over SSH (POSIX, same as Linux). |
 | `collect_active_tunnels` | `wg show <iface>` via wireguard tools over SSH. |
-| `collect_artifacts` | `tar -czf - /usr/local/var/rustynet /var/log/rustynet …` over SSH. |
+| `collect_artifacts` | `tar -czf - /usr/local/var/rustynet /var/log/rustynet … --exclude='*/keys/*' --exclude='*.priv' --exclude='*.pem'` over SSH. Key material excluded per §3.1 contract. |
 | `cleanup_runtime_state` | `launchctl bootout system/com.rustynet.daemon && rm -rf /usr/local/var/rustynet/*`. |
 
 **Tests:** parallel structure to W5.1.
@@ -535,29 +604,30 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 **Tests per stage:** unit test of the stage's logic with a mocked `NodeAdapter`. Integration test (gated) drives the stage against a live VM.
 
 **Acceptance criteria:**
-- Side-by-side run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Compare per-stage outcomes — must be identical.** Capture diff as evidence.
+- Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity is defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. The parity runner produces a machine-readable JSON diff; CI asserts zero diff. Capture diff + summary as evidence.
+- `TrafficTestMatrix` stage includes both **positive probes** (mesh peers reachable via tunnel — N×N) and **negative probes** (default-deny ACL blocks a non-mesh probe IP from each node). Stage result is PASS only when all positive probes succeed AND all negative probes return `Blocked`. A `Reachable` result on any negative probe is a security failure that fails the stage and blocks phase progression. Both probe sets are documented in per-stage evidence.
 - All gates pass.
 
 **Estimated LOC:** 3000-4000 across 17 stage files + per-stage tests.
 
-### W5.6 — `--node <alias>:<role>` CLI surface + role assignment (1-2 sessions)
+### W5.6 — Promote `--node` to default + deprecate old flags (1 session)
 
-**Deliverable:** `vm-lab-orchestrate-live-lab` accepts the new flag shape. Old flags translate to `--node` pairs. New code path (PlanBuilder + StateMachineRunner) is the default; `--legacy-bash-orchestrator` opts in to the old path.
+**Deliverable:** `--node` (opt-in since W5.1) becomes the default code path. Old flags (`--exit-vm`, `--client-vm`, `--entry-vm`, `--aux-vm`, `--extra-vm`, `--windows-vm`) keep working as deprecated translation aliases. `--legacy-bash-orchestrator` remains available until W5.7.
 
 **Files modified:**
-- `crates/rustynet-cli/src/main.rs` — CLI parser additions.
-- `crates/rustynet-cli/src/vm_lab/mod.rs` — `execute_ops_vm_lab_orchestrate_live_lab` becomes a router: new flag set → new code path; legacy flag set → old code path.
+- `crates/rustynet-cli/src/main.rs` — mark old flags deprecated; new path is default.
+- `crates/rustynet-cli/src/vm_lab/mod.rs` — flip the router default: new path unless `--legacy-bash-orchestrator`.
 
 **Tests:**
-- Unit tests for flag-to-role-assignment translation.
 - Pin test: `--exit-vm A --client-vm B --entry-vm C --aux-vm D --extra-vm E` produces the same role assignments as `--node A:exit --node B:client --node C:entry --node D:aux --node E:extra`.
+- Deprecation warning emitted when old flags are used.
 
 **Acceptance criteria:**
-- Existing CI invocations of `vm-lab-orchestrate-live-lab` keep working unchanged.
-- Operators can use `--node` flag.
+- Existing CI invocations of `vm-lab-orchestrate-live-lab` keep working unchanged (old flags still translate correctly).
+- New path is default; operators who have already adopted `--node` since W5.1 see no change.
 - All gates pass.
 
-**Estimated LOC:** 400-600.
+**Estimated LOC:** 200-300 (most work already done in W5.1).
 
 ### W5.7 — Live-evidence campaign + bash orchestrator removal (2-3 sessions)
 
@@ -613,7 +683,9 @@ Risk mitigation:
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Rust orchestrator regresses behavior the bash path silently relied on | High | High | Side-by-side parity runs at end of W5.5. Bash path stays callable until W5.7. Daemon-side validators (W3.2-followup) provide cross-check. |
+| Rust orchestrator regresses behavior the bash path silently relied on | High | High | Side-by-side parity runs at end of W5.5 with machine-readable JSON diff. Bash path stays callable until W5.7. Daemon-side validators (W3.2-followup) provide cross-check. |
+| SSH MITM during `install_daemon` → attacker substitutes malicious daemon binary | Medium | Critical | `StrictHostKeyChecking=yes` + required `--known-hosts-file` enforced at `NodeConnection::Ssh` construction. Orchestrator hard-fails on absent file or key mismatch. Pre-populate known-hosts before first orchestrator run via key-exchange ceremony documented in runbook. |
+| `collect_artifacts` captures key material → private key exfiltration via artifact archive | Low | Critical | Key dirs excluded at the `tar` invocation level (`--exclude='*/keys/*' --exclude='*.priv' --exclude='*.pem'`). Key-exclusion invariant tested: mock tarball must not contain `wireguard.priv`. |
 | `cargo build --release` over SSH on a UTM Linux VM is too slow (>20 min) → CI timeouts | Medium | Medium | Add binary-cache mode: build once on the macOS host (cross-compile), scp the binary, skip remote cargo. Optional flag, falls back to remote-build if cross-compile not configured. |
 | macOS adapter blocked by no available macOS VM during W5.3 | High | Medium | macOS adapter compiles + has unit tests. Live evidence runs deferred to when a Mac mini / macOS UTM VM is available. Marked as "compile + unit ready, live evidence pending". |
 | WireGuard for Windows install via winget unreliable in CI | Medium | High | Add a `--require-wireguard-preinstalled` flag that skips winget. CI runners pre-install via base-image automation. |
@@ -634,23 +706,41 @@ Risk mitigation:
 - [ ] No new TODOs / FIXMEs in completed deliverables.
 - [ ] `MasterWorkPlan_2026-03-22.md` updated to reference W5 track + close it.
 
-## 8) Open questions / decisions needed before W5.0
+## 8) Architecture decisions made before W5.0
 
-1. **macOS scope:** include `MacosNodeAdapter` as part of the initial cut (W5.3) or defer to a later track?
-   - **Recommendation:** include. Adding macOS later costs more (retrofit the trait shape; missed test coverage during W5.0 → W5.6).
-   - **Operator decision:** ?
-2. **macOS VM availability:** does the operator have a macOS UTM VM available for W5.3 live evidence?
-   - **Recommendation:** if not, ship W5.3 as "compile + unit complete, live evidence deferred". Flag in residual risk.
-   - **Operator decision:** ?
-3. **Cross-compile vs remote-build:** should `install_daemon` cross-compile rustynetd on the macOS host + scp the binary, or build remotely on each VM?
-   - **Trade-off:** cross-compile = faster (~10s vs ~60s per VM) but requires the host's Cargo to have all target toolchains installed (`aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, etc.). Remote build is simpler + matches the bash orchestrator's behavior.
-   - **Recommendation:** ship W5.1 with remote-build matching bash orchestrator. Add cross-compile as an opt-in flag in a later slice.
-4. **Bash script retention:** keep `live_lab_common.sh` after `live_linux_lab_orchestrator.sh` removal?
-   - **Recommendation:** audit first. Some helpers may be reusable from other E2E test scripts.
-5. **`Custom(String)` role:** support custom role names from W5.0, or restrict to the 5 named roles for now?
-   - **Recommendation:** ship the enum with `Custom(String)` from W5.0 but **gate it behind an `--allow-custom-roles` flag** until N-node topologies are designed. Prevents accidental typos like `--node a:exti` becoming `Custom("exti")` silently.
-6. **Stage skip-cascade gating:** make stages opt-out via `--skip-stage <id>` flag? Bash orchestrator has `--rerun-stage`. Should the new orchestrator support a richer gating language?
-   - **Recommendation:** ship `--skip-stage` + `--rerun-stage` as direct ports of bash semantics in W5.6. Don't add new gating language until operators ask.
+The following decisions were made during plan review (2026-04-28) and are now closed. They are recorded here as decisions, not open questions.
+
+**D1 — `NodeAdapter` connection-injection pattern (P0, blocking W5.0):**
+`NodeAdapter` methods carry no `RemoteTarget` / connection argument. Connection details live in `NodeConnection`, injected at adapter construction by `node_adapter_for(platform, conn)`. Rationale: SSH-centric `RemoteTarget` in every method signature blocks iOS (MDM) and Android (ADB) from ever implementing the trait without a hack.
+
+**D2 — SSH known-hosts enforcement (P1, security):**
+`--known-hosts-file <path>` is a required CLI flag. `NodeConnection::Ssh` validates the path at construction. `StrictHostKeyChecking=yes` is non-negotiable at the SSH layer. Rationale: MITM during `install_daemon` allows daemon binary substitution.
+
+**D3 — Negative traffic tests mandatory in `TrafficTestMatrix` (P1, security):**
+`probe_denied_peer` is a required `NodeAdapter` method. `TrafficTestMatrix` stage PASS requires all negative probes return `Blocked`. Rationale: positive-only connectivity test gives false assurance for default-deny ACL verification.
+
+**D4 — `collect_artifacts` key-exclusion required (P1, security):**
+`*/keys/*`, `*.priv`, `*.pem` excluded from artifact archives at the `tar` invocation level. Exclusion tested with an invariant test. Rationale: `SecurityMinimumBar.md §3.4` prohibits logging/leaking key material.
+
+**D5 — iOS/Android blocker messages name security barriers (P1, security):**
+Error strings from `node_adapter_for(Ios|Android, _)` must contain "security minimum bar". Rationale: operator needs to know the rejection is a security decision, not a missing feature, and what future work is required to unblock it.
+
+**D6 — `--node` opt-in flag ships in W5.1, not W5.6 (P2, plan quality):**
+W5.1 wires `--node` and `--known-hosts-file` as opt-in flags. W5.2–W5.5 are developed and tested using `--node`. W5.6 promotes to default + deprecates old flags. Rationale: first test of the new path should not be after all 17 stages are already implemented.
+
+**D7 — W5.5 parity defined as machine-readable JSON diff (P2, plan quality):**
+Parity = same stage IDs, same pass/fail, same exit code, same `outcome` field values, numeric counts ±0. CI asserts zero diff on a machine-readable JSON diff artifact. See §4 W5.5 acceptance criteria for full definition.
+
+**D8 — macOS in scope (W5.3), Android/iOS deferred to W6+ (P2):**
+macOS is included in W5 as specified. iOS and Android require a different connection model (MDM/ADB), different validator coverage, and a reviewed key custody model. They are W6+ work. See §11 for the full forward roadmap.
+
+**Remaining open questions (operator input needed):**
+
+1. **macOS VM availability:** does the operator have a macOS UTM VM for W5.3 live evidence? If not, W5.3 ships as "compile + unit complete, live evidence deferred".
+2. **Cross-compile vs remote-build:** confirmed remote-build (matching bash orchestrator) for W5.1. Cross-compile opt-in flag in a later slice.
+3. **`live_lab_common.sh` retention:** audit at W5.7; keep only if another consumer exists.
+4. **`Custom(String)` role gating:** ship enum with `Custom(String)` from W5.0 but gate behind `--allow-custom-roles` flag to prevent silent typo promotion.
+5. **Stage gating language:** ship `--skip-stage` + `--rerun-stage` as direct ports of bash semantics in W5.6. No new gating language until operators request it.
 
 ## 9) Files-to-touch summary
 
@@ -659,19 +749,20 @@ For quick orientation. Per-phase details in §4.
 ### Files added (across all phases)
 
 ```
-crates/rustynet-cli/src/vm_lab/orchestrator/                   (new module, ~30 files)
+crates/rustynet-cli/src/vm_lab/orchestrator/                   (new module, ~32 files)
   ├── mod.rs
-  ├── error.rs
+  ├── error.rs                  (AdapterError incl. UnsupportedPlatform, ConnectionPlatformMismatch)
   ├── role.rs
   ├── role_assignment.rs
   ├── source_archive.rs
+  ├── connection.rs             (NodeConnection: Ssh/Adb/Mdm; known_hosts validated at construction)
   ├── context.rs
   ├── plan.rs
   ├── runner.rs
   ├── report.rs
   ├── adapter/
   │   ├── mod.rs
-  │   ├── node_adapter.rs       (trait def)
+  │   ├── node_adapter.rs       (trait def — no RemoteTarget in method signatures)
   │   ├── linux.rs              (W5.1)
   │   ├── linux_install.rs      (W5.1)
   │   ├── linux_membership.rs   (W5.1)
@@ -723,7 +814,7 @@ tests/orchestrator_*_smoke.rs                                  (W5.1-3, gated in
 
 ```
 crates/rustynet-cli/src/vm_lab/mod.rs           (add `mod orchestrator;` W5.0; gradually shrink as logic moves out W5.5-7)
-crates/rustynet-cli/src/main.rs                 (CLI flag additions W5.6)
+crates/rustynet-cli/src/main.rs                 (--node + --known-hosts-file opt-in W5.1; promote to default W5.6)
 crates/rustynetd/src/lib.rs                     (W5.3: `pub mod macos_*` for new validators)
 crates/rustynetd/src/main.rs                    (W5.3: 6 new `macos-*-check` subcommands)
 documents/operations/LiveLinuxLabOrchestrator.md   (W5.7 rewrite)
@@ -753,3 +844,43 @@ After W5 is complete:
 - Bug-discovery velocity for cross-OS interop is gated by VM availability + CI capacity, not by orchestrator code work.
 
 This positions the project for the operator's stated goal: "in the wild rustynet will be deployed on multiple devices with varying OS. I want to make sure they interact correctly." After W5, every CI run can spin up a heterogeneous mesh of arbitrary OS combinations + validate them end-to-end. That's the bug-finding harness the project needs to ship reliably.
+
+## 11) iOS / Android — What a Future W6 Track Requires
+
+W5 ships iOS and Android as `UnsupportedOp` stubs that fail closed with security-specific rejection messages. This is the correct default: these platforms cannot be added to a production mesh until each of the following barriers is cleared. This section exists so the W6 track owner has a concrete target.
+
+### 11.1 Connection model (blocking)
+
+- **iOS** has no SSH daemon. The `NodeConnection::Mdm` variant is the forward slot. Filling it in requires either Apple MDM enrollment (enterprise / supervised device) or a custom in-app management socket exposed by the Rustynet iOS Network Extension. Neither is designed yet.
+- **Android** can use ADB for lab-only bootstrapping (`NodeConnection::Adb`), but production Android nodes run as a VPN-service app, not a system service. Production Android requires an app-layer management channel distinct from ADB. The `Adb` variant is explicitly a lab escape hatch, not a production path.
+
+Both paths require explicit security review of the channel authentication model before the `UnsupportedPlatform` guard is lifted.
+
+### 11.2 Daemon validator coverage (blocking)
+
+All 6 W3.2-followup validators must be ported before live evidence is accepted:
+
+| Validator | iOS target | Android target |
+|---|---|---|
+| `service-hardening-check` | iOS app sandbox + Network Extension entitlements | SELinux policy + VpnService permissions |
+| `key-custody-check` | Secure Enclave-backed WireGuard key | Android Keystore hardware-backed key |
+| `dns-failclosed-check` | iOS VPN profile DNS configuration | Android VPN DNS configuration |
+| `runtime-acls-check` | App container file ACLs | App-private storage ACLs |
+| `mesh-status-check` | Daemon reachable via in-app IPC | Daemon reachable via in-app IPC |
+| `authenticode-check` | App Store / TestFlight signing | APK signing + Play Protect status |
+
+### 11.3 Key custody model (blocking)
+
+- **iOS:** WireGuard private key stored in Secure Enclave where available; Keychain fallback with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` as minimum. Explicit threat model for the case where the device is lost/stolen while unlocked.
+- **Android:** WireGuard private key stored in Android Keystore with `StrongBox` hardware-backed protection where available. Threat model for rooted devices documented and fail-closed behavior specified.
+
+### 11.4 Service hardening (blocking)
+
+- **iOS:** App cannot be killed by other apps; runs with minimum entitlements; Network Extension restart behavior on crash is defined; background execution constraints documented.
+- **Android:** SELinux `vpn` domain applied; `BIND_VPN_SERVICE` permission is system-only; app signing enforced; background execution restrictions documented.
+
+### 11.5 Estimated effort
+
+- iOS: 5-8 weeks. Apple's Network Extension and Secure Enclave APIs are constrained; App Store review adds latency. ADB connection model is not applicable; MDM enrollment or custom socket is required from day one.
+- Android: 4-6 weeks for ADB-backed lab path; 6-8 weeks for production Play Store app-layer path (separate from the lab path).
+- Both tracks can proceed in parallel after W5 ships. Neither blocks W5.

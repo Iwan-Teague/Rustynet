@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bootstrap;
+pub mod orchestrator;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;

@@ -1,0 +1,106 @@
+#![allow(dead_code)]
+use std::path::Path;
+
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+use crate::vm_lab::orchestrator::connection::NodeConnection;
+use crate::vm_lab::orchestrator::context::OrchestrationContext;
+use crate::vm_lab::orchestrator::error::{
+    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
+    TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+};
+use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+
+/// iOS adapter — not yet implemented.
+/// All methods fail closed with a security-specific rejection.
+/// See §11 of RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md
+/// for what a future W6 track requires before this guard can be lifted.
+#[derive(Debug)]
+pub struct IosNodeAdapter {
+    #[allow(dead_code)]
+    conn: NodeConnection,
+}
+
+impl IosNodeAdapter {
+    pub fn new(conn: NodeConnection) -> Self {
+        IosNodeAdapter { conn }
+    }
+}
+
+const IOS_UNSUPPORTED_MSG: &str = "\
+iOS node adapter is not yet implemented. Blocked by security minimum bar: \
+(1) no daemon validator coverage — service-hardening-check, key-custody-check, \
+dns-failclosed-check not implemented for iOS; \
+(2) no reviewed key custody model — Secure Enclave / Keychain integration not designed; \
+(3) MDM/Network Extension connection model not reviewed against security minimum bar.";
+
+fn ios_unsupported() -> AdapterError {
+    AdapterError::UnsupportedPlatform {
+        platform: VmGuestPlatform::Ios,
+        message: IOS_UNSUPPORTED_MSG.to_string(),
+    }
+}
+
+impl NodeAdapter for IosNodeAdapter {
+    fn platform(&self) -> VmGuestPlatform {
+        VmGuestPlatform::Ios
+    }
+    fn install_daemon(
+        &self,
+        _: &SourceArchive,
+        _: &OrchestrationContext,
+    ) -> Result<InstallReport, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn start_daemon(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn stop_daemon(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn restart_daemon(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn init_membership_snapshot(
+        &self,
+        _: &MembershipOwnerKey,
+        _: &[NodeRoleAssignment],
+    ) -> Result<MembershipSnapshot, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn distribute_signed_bundle(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn run_validator(&self, _: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn ping_mesh_peer(&self, _: &str) -> Result<TrafficTestResult, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn probe_denied_peer(&self, _: &str) -> Result<TrafficTestResult, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn collect_artifacts(&self, _: &Path) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+}
