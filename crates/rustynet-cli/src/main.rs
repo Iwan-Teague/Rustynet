@@ -529,6 +529,9 @@ enum OpsCommand {
     VmLabDistributeWindowsState {
         config: vm_lab::VmLabDistributeWindowsStateConfig,
     },
+    VmLabPullWindowsStateFromLinuxExit {
+        config: vm_lab::VmLabPullWindowsStateFromLinuxExitConfig,
+    },
     VmLabValidateLiveLabProfile {
         config: vm_lab::VmLabValidateLiveLabProfileConfig,
     },
@@ -2278,6 +2281,22 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 dns_zone_bundle: parser.optional_path("--dns-zone-bundle"),
             },
         }),
+        "vm-lab-pull-windows-state-from-linux-exit" => {
+            Ok(OpsCommand::VmLabPullWindowsStateFromLinuxExit {
+                config: vm_lab::VmLabPullWindowsStateFromLinuxExitConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    linux_exit_alias: parser
+                        .value("--linux-exit-vm")
+                        .ok_or_else(|| "--linux-exit-vm <alias> is required".to_string())?,
+                    ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    dest_dir: parser.required_path("--dest-dir")?,
+                    report_dir: parser.required_path("--report-dir")?,
+                    dry_run: parser.has_flag("--dry-run"),
+                },
+            })
+        }
         "vm-lab-validate-live-lab-profile" => Ok(OpsCommand::VmLabValidateLiveLabProfile {
             config: vm_lab::VmLabValidateLiveLabProfileConfig {
                 profile_path: parser.required_path("--profile")?,
@@ -4474,6 +4493,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabDistributeWindowsState { config } => {
             vm_lab::run_distribute_windows_state(&config)
+        }
+        OpsCommand::VmLabPullWindowsStateFromLinuxExit { config } => {
+            vm_lab::run_pull_windows_state_from_linux_exit(&config).map(|(summary, _)| summary)
         }
         OpsCommand::VmLabValidateLiveLabProfile { config } => {
             vm_lab::execute_ops_vm_lab_validate_live_lab_profile(config)
@@ -12032,6 +12054,7 @@ fn help_text() -> String {
         "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",
+        "  ops vm-lab-pull-windows-state-from-linux-exit [--inventory <path>] --linux-exit-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --dest-dir <path> --report-dir <path> [--dry-run]",
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",

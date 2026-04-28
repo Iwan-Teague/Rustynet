@@ -1818,6 +1818,81 @@ conservatively.
       `run_distribute_windows_state_dry_run_emits_skipped_stages_and_writes_report`
       (positive pin: typed report shape + 4-stage sequence + dry-run
       skip status).
+- [x] W4.2-followup-4 — Pull-from-Linux-exit Rust helper +
+      `vm-lab-pull-windows-state-from-linux-exit` subcommand
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added
+      `LINUX_EXIT_{MEMBERSHIP_SNAPSHOT,ASSIGNMENT_BUNDLE,TRAVERSAL_BUNDLE,DNS_ZONE_BUNDLE}_PATH`
+      constants pinning the four canonical Linux exit source paths
+      (mirroring the `RUSTYNET_*_BUNDLE` env vars in the
+      `scripts/systemd/rustynetd.service` unit). Added
+      `VmLabPullWindowsStateFromLinuxExitConfig` +
+      `PulledLinuxExitBundles` + `run_pull_windows_state_from_linux_exit`.
+      Pure-pull path: SCPs all four bundles in sequence from the
+      reviewed Linux source paths to a local staging directory using
+      the existing `scp_from_remote` helper. Rejects non-Linux pull
+      sources up-front (alias must resolve to `VmGuestPlatform::Linux`).
+      Per-bundle Pass / Fail outcomes — a single bundle's SCP failure
+      does not abort the others, so the operator sees the full set of
+      blockers in one report rather than chasing one failure at a time.
+      Writes a typed JSON report to
+      `<report-dir>/windows_state_pull_from_linux_exit.json`.
+      On overall Pass returns the four local paths in
+      `PulledLinuxExitBundles` so Rust callers can hand them straight
+      to `run_distribute_windows_state` without re-deriving filenames.
+    - `crates/rustynet-cli/src/main.rs` — added
+      `OpsCommand::VmLabPullWindowsStateFromLinuxExit`, the
+      `vm-lab-pull-windows-state-from-linux-exit` arg parser
+      (`--linux-exit-vm`, `--ssh-identity-file`, `--known-hosts-file`,
+      `--dest-dir`, `--report-dir`, `--dry-run`), the dispatch arm
+      (drops the `PulledLinuxExitBundles` so the CLI surface returns a
+      plain summary string), and the help text.
+  - End-to-end loop (heterogeneous live-lab):
+      Linux exit          orchestrator host                Windows peer
+      ----------          -----------------                ------------
+      `/var/lib/rustynet/membership.snapshot`  →           `C:\ProgramData\RustyNet\membership\membership.snapshot`
+      `/var/lib/rustynet/rustynetd.assignment` →           `C:\ProgramData\RustyNet\trust\rustynetd.assignment`
+      `/var/lib/rustynet/rustynetd.traversal`  →           `C:\ProgramData\RustyNet\trust\rustynetd.traversal`
+      `/var/lib/rustynet/rustynetd.dns-zone`   →           `C:\ProgramData\RustyNet\trust\rustynetd.dns-zone`
+    Two-step operator flow:
+      1. `ops vm-lab-pull-windows-state-from-linux-exit
+          --linux-exit-vm <linux-alias>
+          --ssh-identity-file <path>
+          --dest-dir <local-staging>
+          --report-dir <pull-report>`
+      2. `ops vm-lab-distribute-windows-state
+          --windows-vm <windows-alias>
+          --ssh-identity-file <path>
+          --membership-bundle <local-staging>/membership.snapshot
+          --assignment-bundle <local-staging>/rustynetd.assignment
+          --traversal-bundle  <local-staging>/rustynetd.traversal
+          --dns-zone-bundle   <local-staging>/rustynetd.dns-zone
+          --report-dir <distribute-report>`
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 459 / 459 pass
+      (was 457). +2 new tests:
+      `run_pull_windows_state_from_linux_exit_dry_run_emits_skipped_stages_and_writes_report`
+      (positive pin: 4-stage sequence + skipped status + returned
+      `PulledLinuxExitBundles` filename mapping),
+      `run_pull_windows_state_from_linux_exit_rejects_windows_alias`
+      (negative pin: pull source must resolve to a Linux platform).
+  - Residual risk:
+    - **SSH user must have read access to `/var/lib/rustynet/`.** The
+      reviewed Linux source paths are owned by `root:rustynetd` with
+      `0640` perms (per
+      `scripts/e2e/live_lab_common.sh:1457` distribute-worker
+      `install` semantics). Operators running the pull must use an
+      SSH user that is a member of `rustynetd` group, or run the SSH
+      target as root. The helper surfaces SCP non-zero exits with the
+      Linux remote path in the failure summary so a permissions gap
+      is honest, not silent.
+    - **Read-only on the source.** The pull never mutates the Linux
+      exit's bundles or watermarks. The two-step flow is the only
+      supported path; a single combined "pull + distribute"
+      subcommand is deliberately not provided so the staging-dir
+      contents are auditable between fetch and push.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

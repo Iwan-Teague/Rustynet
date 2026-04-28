@@ -516,6 +516,253 @@ pub fn run_distribute_windows_state(
     ))
 }
 
+/// Reviewed source paths on the Linux exit guest. Match the
+/// `RUSTYNET_*_BUNDLE` environment variables baked into the
+/// `scripts/systemd/rustynetd.service` unit file.
+pub const LINUX_EXIT_MEMBERSHIP_SNAPSHOT_PATH: &str = "/var/lib/rustynet/membership.snapshot";
+pub const LINUX_EXIT_ASSIGNMENT_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
+pub const LINUX_EXIT_TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
+pub const LINUX_EXIT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
+
+/// Operator-facing config for the
+/// `vm-lab-pull-windows-state-from-linux-exit` subcommand.
+///
+/// Pulls the four signed bundles from the canonical Linux exit
+/// locations down to a local staging directory. The output paths can
+/// then be fed straight into
+/// `vm-lab-distribute-windows-state --membership-bundle … --assignment-bundle …`
+/// to push them onto a Windows guest, closing the heterogeneous
+/// (Linux exit → orchestrator host → Windows peer) loop end-to-end.
+///
+/// The pull step is read-only on the Linux exit: the daemon's
+/// canonical bundle paths are owned by the `rustynetd` group with
+/// `0640` perms, but the SCP probe runs as a non-root user (the
+/// inventory's configured `ssh_user` if any, otherwise the SSH
+/// default). Operators must ensure their SSH user has read access to
+/// `/var/lib/rustynet/` on the Linux exit (typically by adding the
+/// user to the `rustynetd` group); the helper surfaces SCP exit
+/// codes so a permission failure is honest, not silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabPullWindowsStateFromLinuxExitConfig {
+    pub inventory_path: PathBuf,
+    pub linux_exit_alias: String,
+    pub ssh_identity_file: PathBuf,
+    pub known_hosts_path: Option<PathBuf>,
+    pub dest_dir: PathBuf,
+    pub report_dir: PathBuf,
+    pub dry_run: bool,
+}
+
+/// Output paths after a successful
+/// `run_pull_windows_state_from_linux_exit`. Each field is the local
+/// path of the pulled bundle, suitable for feeding into
+/// `VmLabDistributeWindowsStateConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledLinuxExitBundles {
+    pub membership_snapshot: PathBuf,
+    pub assignment_bundle: PathBuf,
+    pub traversal_bundle: PathBuf,
+    pub dns_zone_bundle: PathBuf,
+}
+
+/// Pull the four signed bundles from a Linux exit guest down to a
+/// local staging directory. Writes a typed JSON report under
+/// `<report_dir>/windows_state_pull_from_linux_exit.json` with one
+/// entry per bundle (name + status + local_path + summary). On Pass
+/// the local paths are returned in `PulledLinuxExitBundles`. On Fail
+/// the function returns an `Err` with the report path so operators
+/// can see exactly which bundle's SCP failed and why.
+pub fn run_pull_windows_state_from_linux_exit(
+    config: &VmLabPullWindowsStateFromLinuxExitConfig,
+) -> Result<(String, PulledLinuxExitBundles), String> {
+    std::fs::create_dir_all(&config.report_dir).map_err(|err| {
+        format!(
+            "create report dir {} failed: {err}",
+            config.report_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(&config.dest_dir).map_err(|err| {
+        format!(
+            "create dest dir {} failed: {err}",
+            config.dest_dir.display()
+        )
+    })?;
+
+    let membership_local = config.dest_dir.join("membership.snapshot");
+    let assignment_local = config.dest_dir.join("rustynetd.assignment");
+    let traversal_local = config.dest_dir.join("rustynetd.traversal");
+    let dns_zone_local = config.dest_dir.join("rustynetd.dns-zone");
+
+    let bundles: [(&str, &str, &Path); 4] = [
+        (
+            "membership_snapshot",
+            LINUX_EXIT_MEMBERSHIP_SNAPSHOT_PATH,
+            membership_local.as_path(),
+        ),
+        (
+            "assignment_bundle",
+            LINUX_EXIT_ASSIGNMENT_BUNDLE_PATH,
+            assignment_local.as_path(),
+        ),
+        (
+            "traversal_bundle",
+            LINUX_EXIT_TRAVERSAL_BUNDLE_PATH,
+            traversal_local.as_path(),
+        ),
+        (
+            "dns_zone_bundle",
+            LINUX_EXIT_DNS_ZONE_BUNDLE_PATH,
+            dns_zone_local.as_path(),
+        ),
+    ];
+
+    let mut outcomes: Vec<VmLabStageOutcome> = Vec::new();
+
+    if config.dry_run {
+        for (label, src, dst) in bundles.iter() {
+            outcomes.push(stage_outcome(
+                label,
+                VmLabStageStatus::Skipped,
+                format!(
+                    "dry-run: would scp {src} from {} to {}",
+                    config.linux_exit_alias,
+                    dst.display()
+                ),
+                vec![],
+            ));
+        }
+    } else {
+        let targets = resolve_remote_targets(
+            config.inventory_path.as_path(),
+            std::slice::from_ref(&config.linux_exit_alias),
+            false,
+            &[],
+        )?;
+        let target = targets
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no target resolved for alias {}", config.linux_exit_alias))?;
+        if target.platform_profile.platform != VmGuestPlatform::Linux {
+            return Err(format!(
+                "alias {} resolved to non-Linux platform: {} (pull source must be a Linux exit)",
+                config.linux_exit_alias,
+                target.platform_profile.platform.as_str()
+            ));
+        }
+        let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+        for (label, src, dst) in bundles.iter() {
+            let result = scp_from_remote(
+                &target,
+                None,
+                Some(config.ssh_identity_file.as_path()),
+                config.known_hosts_path.as_deref(),
+                src,
+                dst,
+                timeout,
+            );
+            let outcome = match result {
+                Ok(status) if status.success() => {
+                    if !dst.is_file() {
+                        stage_outcome(
+                            label,
+                            VmLabStageStatus::Fail,
+                            format!(
+                                "scp reported success but local destination is missing: {}",
+                                dst.display()
+                            ),
+                            vec![],
+                        )
+                    } else {
+                        stage_outcome(
+                            label,
+                            VmLabStageStatus::Pass,
+                            format!(
+                                "pulled {src} from {} to {}",
+                                config.linux_exit_alias,
+                                dst.display()
+                            ),
+                            vec![dst.to_path_buf()],
+                        )
+                    }
+                }
+                Ok(status) => stage_outcome(
+                    label,
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "scp of {src} from {} exited non-zero: {}",
+                        config.linux_exit_alias,
+                        status_code(status)
+                    ),
+                    vec![],
+                ),
+                Err(err) => stage_outcome(
+                    label,
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "scp of {src} from {} failed: {err}",
+                        config.linux_exit_alias
+                    ),
+                    vec![],
+                ),
+            };
+            outcomes.push(outcome);
+        }
+    }
+
+    let summary_path = config
+        .report_dir
+        .join("windows_state_pull_from_linux_exit.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "linux_exit_alias": config.linux_exit_alias,
+        "dest_dir": config.dest_dir.display().to_string(),
+        "dry_run": config.dry_run,
+        "stages": outcomes
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "stage": o.stage,
+                    "status": format!("{:?}", o.status).to_ascii_lowercase(),
+                    "summary": o.summary,
+                    "artifacts": o.artifacts.clone(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("serialize Windows state pull report failed: {err}"))?;
+    std::fs::write(summary_path.as_path(), serialized.as_str()).map_err(|err| {
+        format!(
+            "write Windows state pull report to {} failed: {err}",
+            summary_path.display()
+        )
+    })?;
+    println!("{serialized}");
+
+    let any_failed = outcomes.iter().any(|o| o.status == VmLabStageStatus::Fail);
+    if any_failed {
+        return Err(format!(
+            "Windows state pull from Linux exit reported one or more bundle failures; report at {}",
+            summary_path.display()
+        ));
+    }
+
+    Ok((
+        format!(
+            "Windows state pulled from Linux exit {}; report at {}",
+            config.linux_exit_alias,
+            summary_path.display()
+        ),
+        PulledLinuxExitBundles {
+            membership_snapshot: membership_local,
+            assignment_bundle: assignment_local,
+            traversal_bundle: traversal_local,
+            dns_zone_bundle: dns_zone_local,
+        },
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabOrchestrateLiveLabConfig {
     pub inventory_path: PathBuf,
@@ -24762,6 +25009,123 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(
             stages.iter().all(|s| s["status"] == "skipped"),
             "every dry-run stage must be skipped: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn run_pull_windows_state_from_linux_exit_dry_run_emits_skipped_stages_and_writes_report() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let report_dir = temp.path().join("report");
+        let dest_dir = temp.path().join("staging");
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{"entries":[{
+                "alias":"linux-exit",
+                "controller":{"type":"local_utm","utm_name":"Linux","bundle_path":"/dev/null"},
+                "platform":"linux",
+                "remote_shell":"posix",
+                "guest_exec_mode":"posix_shell",
+                "service_manager":"systemd",
+                "os":"Debian 12",
+                "ssh_target":"192.168.64.10",
+                "ssh_user":"rustynet",
+                "rustynet_src_dir":"/srv/Rustynet",
+                "include_in_all":false
+            }]}"#,
+        )
+        .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let config = super::VmLabPullWindowsStateFromLinuxExitConfig {
+            inventory_path: inventory,
+            linux_exit_alias: "linux-exit".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            dest_dir: dest_dir.clone(),
+            report_dir: report_dir.clone(),
+            dry_run: true,
+        };
+        let (summary, pulled) =
+            super::run_pull_windows_state_from_linux_exit(&config).expect("dry-run must succeed");
+        assert!(summary.contains("linux-exit"));
+        assert_eq!(
+            pulled.membership_snapshot,
+            dest_dir.join("membership.snapshot")
+        );
+        assert_eq!(
+            pulled.assignment_bundle,
+            dest_dir.join("rustynetd.assignment")
+        );
+        assert_eq!(
+            pulled.traversal_bundle,
+            dest_dir.join("rustynetd.traversal")
+        );
+        assert_eq!(pulled.dns_zone_bundle, dest_dir.join("rustynetd.dns-zone"));
+
+        let report_path = report_dir.join("windows_state_pull_from_linux_exit.json");
+        let report_text = std::fs::read_to_string(report_path.as_path()).expect("read report");
+        let report: serde_json::Value =
+            serde_json::from_str(report_text.as_str()).expect("report parses as JSON");
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["linux_exit_alias"], "linux-exit");
+        let stages = report["stages"].as_array().expect("stages array");
+        let stage_names: Vec<&str> = stages
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            stage_names,
+            vec![
+                "membership_snapshot",
+                "assignment_bundle",
+                "traversal_bundle",
+                "dns_zone_bundle",
+            ]
+        );
+        assert!(
+            stages.iter().all(|s| s["status"] == "skipped"),
+            "every dry-run stage must be skipped: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn run_pull_windows_state_from_linux_exit_rejects_windows_alias() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{"version":1,"entries":[{
+                "alias":"windows-utm-1",
+                "controller":{"type":"local_utm","utm_name":"Windows","bundle_path":"/dev/null"},
+                "platform":"windows",
+                "remote_shell":"powershell",
+                "guest_exec_mode":"windows_powershell",
+                "service_manager":"windows_service",
+                "os":"Windows 11",
+                "ssh_target":"192.168.64.14",
+                "ssh_user":"Administrator",
+                "rustynet_src_dir":"C:\\Rustynet",
+                "include_in_all":false
+            }]}"#,
+        )
+        .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let config = super::VmLabPullWindowsStateFromLinuxExitConfig {
+            inventory_path: inventory,
+            linux_exit_alias: "windows-utm-1".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            dest_dir: temp.path().join("staging"),
+            report_dir: temp.path().join("report"),
+            dry_run: false,
+        };
+        let err = super::run_pull_windows_state_from_linux_exit(&config)
+            .expect_err("non-Linux pull source must be rejected");
+        assert!(
+            err.contains("non-Linux platform") && err.contains("windows-utm-1"),
+            "rejection must surface alias + platform mismatch: {err}"
         );
     }
 
