@@ -1780,6 +1780,44 @@ conservatively.
       the new CLI flags. A future slice can wire the four bundle
       paths directly into `vm-lab-orchestrate-live-lab` once the
       pull-from-Linux-exit Rust helper is done.
+- [x] W4.2-followup-3 — Operator-facing distribution subcommand
+      `vm-lab-distribute-windows-state`
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added
+      `VmLabDistributeWindowsStateConfig` + `run_distribute_windows_state`.
+      Pure-distribution path: walks the four optional bundle paths and
+      calls the corresponding `run_distribute_windows_*_stage` wrapper
+      for each one provided. Fail-fast rejection when zero bundle paths
+      are supplied (running the subcommand with no work is a no-op
+      operator error). Writes a typed JSON report to
+      `<report-dir>/windows_state_distribution.json` mirroring the
+      validate-windows-security report shape so downstream tooling can
+      consume both with one parser.
+    - `crates/rustynet-cli/src/main.rs` — added
+      `OpsCommand::VmLabDistributeWindowsState`, the
+      `vm-lab-distribute-windows-state` arg parser (4 bundle path flags
+      + inventory + identity + report-dir + dry-run), the dispatch arm,
+      and the help text.
+  - Use cases:
+    - Operator has already passed the W2.x security validators in a
+      prior run and only wants to refresh trust state — call this
+      subcommand directly, skipping the bootstrap + 7 validator stages.
+    - Trust-state-only iteration loop on a long-running Windows guest
+      where re-running the validators on every iteration is wasted
+      latency.
+    - For the combined "validate + distribute in one pass" flow, the
+      `vm-lab-validate-windows-security --distribute-windows-*-bundle`
+      flags from W4.2-followup-2 remain the right call.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 457 / 457 pass
+      (was 455). +2 new tests:
+      `run_distribute_windows_state_rejects_zero_bundle_paths` (negative
+      pin: zero bundles must surface the required-flags list),
+      `run_distribute_windows_state_dry_run_emits_skipped_stages_and_writes_report`
+      (positive pin: typed report shape + 4-stage sequence + dry-run
+      skip status).
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

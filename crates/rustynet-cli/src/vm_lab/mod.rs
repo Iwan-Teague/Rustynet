@@ -330,6 +330,192 @@ pub fn run_validate_windows_security(
     ))
 }
 
+/// Operator-facing config for the `vm-lab-distribute-windows-state`
+/// subcommand: pure distribution path. Pushes one or more pre-built
+/// signed bundles to a reviewed Windows guest without running the
+/// security validators. Use when the security validators have already
+/// passed in a prior run and you only want to refresh trust state.
+///
+/// At least one of the four bundle paths must be `Some`. The
+/// validator path
+/// (`vm-lab-validate-windows-security --distribute-windows-*-bundle`)
+/// is the right call when validators + distribution should run in the
+/// same invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDistributeWindowsStateConfig {
+    pub inventory_path: PathBuf,
+    pub windows_vm: String,
+    pub ssh_identity_file: PathBuf,
+    pub known_hosts_path: Option<PathBuf>,
+    pub report_dir: PathBuf,
+    pub dry_run: bool,
+    pub membership_bundle: Option<PathBuf>,
+    pub assignment_bundle: Option<PathBuf>,
+    pub traversal_bundle: Option<PathBuf>,
+    pub dns_zone_bundle: Option<PathBuf>,
+}
+
+/// Pure-distribution dispatch: walks the four optional bundle paths
+/// and calls the corresponding `run_distribute_windows_*_stage`
+/// wrapper for each one provided. Writes a typed JSON report under
+/// `<report_dir>/windows_state_distribution.json` mirroring the
+/// validate-windows-security report shape so downstream tooling can
+/// consume both with one parser.
+pub fn run_distribute_windows_state(
+    config: &VmLabDistributeWindowsStateConfig,
+) -> Result<String, String> {
+    let any_bundle = config.membership_bundle.is_some()
+        || config.assignment_bundle.is_some()
+        || config.traversal_bundle.is_some()
+        || config.dns_zone_bundle.is_some();
+    if !any_bundle {
+        return Err(
+            "at least one of --membership-bundle, --assignment-bundle, --traversal-bundle, --dns-zone-bundle is required"
+                .to_string(),
+        );
+    }
+
+    std::fs::create_dir_all(&config.report_dir).map_err(|err| {
+        format!(
+            "create report dir {} failed: {err}",
+            config.report_dir.display()
+        )
+    })?;
+    let logs_dir = config.report_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+
+    type DistributeFn =
+        fn(&str, &Path, &Path, Option<&Path>, &Path) -> Result<(String, String), (String, String)>;
+
+    let dispatch_one = |stage_name: &'static str,
+                        log_filename: &str,
+                        bundle: Option<&Path>,
+                        dispatch: DistributeFn|
+     -> VmLabStageOutcome {
+        let log_path = logs_dir.join(log_filename);
+        if config.dry_run {
+            return stage_outcome(
+                stage_name,
+                VmLabStageStatus::Skipped,
+                format!(
+                    "dry-run: would distribute {stage_name} bundle to {}",
+                    config.windows_vm
+                ),
+                vec![],
+            );
+        }
+        let Some(bundle_path) = bundle else {
+            return stage_outcome(
+                stage_name,
+                VmLabStageStatus::Skipped,
+                format!("skipped: no local bundle path provided for {stage_name}"),
+                vec![],
+            );
+        };
+        match dispatch(
+            config.windows_vm.as_str(),
+            config.inventory_path.as_path(),
+            config.ssh_identity_file.as_path(),
+            config.known_hosts_path.as_deref(),
+            bundle_path,
+        ) {
+            Ok((summary, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    summary.clone()
+                } else {
+                    format!("{summary}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(log_path.as_path(), log_body.as_str());
+                stage_outcome(stage_name, VmLabStageStatus::Pass, summary, vec![log_path])
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(log_path.as_path(), log_body.as_str());
+                stage_outcome(
+                    stage_name,
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "{stage_name} distribution failed for {}: {reason}",
+                        config.windows_vm
+                    ),
+                    vec![log_path],
+                )
+            }
+        }
+    };
+
+    let outcomes: Vec<VmLabStageOutcome> = [
+        dispatch_one(
+            "distribute_windows_membership",
+            "distribute_windows_membership.log",
+            config.membership_bundle.as_deref(),
+            run_distribute_windows_membership_stage,
+        ),
+        dispatch_one(
+            "distribute_windows_assignment",
+            "distribute_windows_assignment.log",
+            config.assignment_bundle.as_deref(),
+            run_distribute_windows_assignment_stage,
+        ),
+        dispatch_one(
+            "distribute_windows_traversal",
+            "distribute_windows_traversal.log",
+            config.traversal_bundle.as_deref(),
+            run_distribute_windows_traversal_stage,
+        ),
+        dispatch_one(
+            "distribute_windows_dns_zone",
+            "distribute_windows_dns_zone.log",
+            config.dns_zone_bundle.as_deref(),
+            run_distribute_windows_dns_zone_stage,
+        ),
+    ]
+    .to_vec();
+
+    let summary_path = config.report_dir.join("windows_state_distribution.json");
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "windows_vm": config.windows_vm,
+        "dry_run": config.dry_run,
+        "stages": outcomes
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "stage": o.stage,
+                    "status": format!("{:?}", o.status).to_ascii_lowercase(),
+                    "summary": o.summary,
+                    "artifacts": o.artifacts.clone(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|err| format!("serialize Windows state distribution report failed: {err}"))?;
+    std::fs::write(summary_path.as_path(), serialized.as_str()).map_err(|err| {
+        format!(
+            "write Windows state distribution report to {} failed: {err}",
+            summary_path.display()
+        )
+    })?;
+    println!("{serialized}");
+    let any_failed = outcomes.iter().any(|o| o.status == VmLabStageStatus::Fail);
+    if any_failed {
+        return Err(format!(
+            "Windows state distribution reported one or more stage failures; report at {}",
+            summary_path.display()
+        ));
+    }
+    Ok(format!(
+        "Windows state distribution completed for {}; report at {}",
+        config.windows_vm,
+        summary_path.display()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabOrchestrateLiveLabConfig {
     pub inventory_path: PathBuf,
@@ -24480,6 +24666,99 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"distribute_windows_traversal"));
         assert!(stage_names.contains(&"distribute_windows_dns_zone"));
         assert!(stage_names.contains(&"validate_windows_mesh_join"));
+        assert!(
+            stages.iter().all(|s| s["status"] == "skipped"),
+            "every dry-run stage must be skipped: {stages:?}"
+        );
+    }
+
+    #[test]
+    fn run_distribute_windows_state_rejects_zero_bundle_paths() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(inventory.as_path(), r#"{"entries":[]}"#).expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let config = super::VmLabDistributeWindowsStateConfig {
+            inventory_path: inventory,
+            windows_vm: "windows-utm-1".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            report_dir: temp.path().to_path_buf(),
+            dry_run: false,
+            membership_bundle: None,
+            assignment_bundle: None,
+            traversal_bundle: None,
+            dns_zone_bundle: None,
+        };
+        let err = super::run_distribute_windows_state(&config)
+            .expect_err("zero bundles must be rejected");
+        assert!(
+            err.contains("at least one of") && err.contains("--membership-bundle"),
+            "rejection must surface required-bundle list: {err}"
+        );
+    }
+
+    #[test]
+    fn run_distribute_windows_state_dry_run_emits_skipped_stages_and_writes_report() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let report_dir = temp.path().to_path_buf();
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{"entries":[{
+                "alias":"windows-utm-1",
+                "controller":{"type":"local_utm","utm_name":"Windows","bundle_path":"/dev/null"},
+                "platform":"windows",
+                "remote_shell":"powershell",
+                "guest_exec_mode":"windows_powershell",
+                "service_manager":"windows_service",
+                "os":"Windows 11",
+                "ssh_target":"192.168.64.14",
+                "ssh_user":"Administrator",
+                "rustynet_src_dir":"C:\\Rustynet",
+                "include_in_all":false
+            }]}"#,
+        )
+        .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let bundle_path = temp.path().join("membership.snapshot");
+        std::fs::write(bundle_path.as_path(), b"fake-bundle").expect("write bundle");
+        let config = super::VmLabDistributeWindowsStateConfig {
+            inventory_path: inventory,
+            windows_vm: "windows-utm-1".to_string(),
+            ssh_identity_file: identity,
+            known_hosts_path: None,
+            report_dir: report_dir.clone(),
+            dry_run: true,
+            membership_bundle: Some(bundle_path),
+            assignment_bundle: None,
+            traversal_bundle: None,
+            dns_zone_bundle: None,
+        };
+        let summary = super::run_distribute_windows_state(&config).expect("dry-run must succeed");
+        assert!(summary.contains("windows-utm-1"));
+        let report_path = report_dir.join("windows_state_distribution.json");
+        let report_text = std::fs::read_to_string(report_path.as_path()).expect("read report");
+        let report: serde_json::Value =
+            serde_json::from_str(report_text.as_str()).expect("report parses as JSON");
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["windows_vm"], "windows-utm-1");
+        let stages = report["stages"].as_array().expect("stages array");
+        let stage_names: Vec<&str> = stages
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            stage_names,
+            vec![
+                "distribute_windows_membership",
+                "distribute_windows_assignment",
+                "distribute_windows_traversal",
+                "distribute_windows_dns_zone",
+            ]
+        );
         assert!(
             stages.iter().all(|s| s["status"] == "skipped"),
             "every dry-run stage must be skipped: {stages:?}"
