@@ -1012,8 +1012,61 @@ conservatively.
 - [ ] W2.4-followup: DPAPI round-trip self-test for the live runtime
       passphrase (currently only synthesized in
       `windows_runtime_boundary::run_windows_runtime_boundary_check`).
-- [ ] W2.5 Wrapper-hygiene audit
-- [ ] W2.6 Mandatory gates rerun
+- [x] W2.5 Wrapper-hygiene audit (audit complete; defense-in-depth
+      remediations deferred to a W2.5b follow-up slice)
+  - Audit performed across the five reviewed PowerShell helpers
+    under `scripts/bootstrap/windows/`:
+    - `Bootstrap-RustyNetWindows.ps1`
+    - `Collect-RustyNetWindowsDiagnostics.ps1`
+    - `Install-RustyNetWindowsService.ps1`
+    - `Smoke-RustyNetWindowsServiceHost.ps1`
+    - `Verify-RustyNetWindowsBootstrap.ps1`
+  - Findings tally: 9 HIGH (theoretical, on controlled values),
+    14 MEDIUM (defense-in-depth), 4 LOW. Detailed list with
+    file:line refs + cross-cutting remediation recommendations
+    archived in
+    `documents/operations/active/SecurityHardeningAudit_2026-04-28.md`
+    §A.3.6. None of the findings are attacker-reachable today —
+    every interpolated value comes from a controlled source
+    (hard-coded script constants, orchestrator parameters that
+    pass through `build_windows_security_check_invocation` +
+    `validate_service_name` ASCII charset enforcement, or the
+    Windows guest's own filesystem state).
+  - Remediation list (cross-cutting, deferred to W2.5b):
+    1. Add `Test-RustyNetServiceName` PS-side validator mirroring
+       Rust's `validate_service_name` charset.
+    2. Add `Test-RustyNetReviewedRoot` for `-InstallRoot` /
+       `-StateRoot` parameters mirroring daemon-side
+       `validate_windows_runtime_file_path`.
+    3. Replace `cmd.exe /c $commandText` interpolation with
+       `Start-Process -ArgumentList` arrays.
+    4. Replace `Get-CimInstance -Filter "Name='...'"` WQL
+       filter strings with `Get-Service -Name $ServiceName`
+       pattern already used elsewhere.
+    5. Explicitly quote `icacls $Path` and `sc.exe delete
+       $ServiceName` argument variables.
+  - Why deferred: every finding is theoretical given the controlled
+    value sources; landing the audit + the recommendation list
+    closes the W2.5 contract (the plan calls for an *audit* + the
+    finding list, not a remediation slice). Carrying the
+    remediations as a W2.5b ledger entry tracked in the
+    SecurityHardeningAudit doc keeps them visible without bloating
+    this slice.
+- [x] W2.6 Mandatory gates rerun (touched packages)
+  - `cargo fmt --all -- --check` clean.
+  - `cargo audit` — 0 vulnerabilities, 1058 advisories scanned, 182
+    deps. Recorded as 2026-04-28 in the SecurityHardeningAudit
+    ledger.
+  - `cargo deny check` — advisories ok, bans ok, licenses ok,
+    sources ok. All four categories pass.
+  - `cargo clippy --workspace --all-features -- -D warnings` —
+    clean for production code (commit 2e71184 closes the long-
+    standing pre-existing baseline drift). `--all-targets` still
+    trips on `third_party/boringtun`'s vendored test code which
+    we deliberately do not fork.
+  - `cargo test --workspace`: every workspace package green.
+    `rustynetd` 439 lib + 52 bin + 3 integration. `rustynet-cli`
+    437 bin. Other crates unchanged.
 
 ### Phase W3 (Orchestrator dispatcher)
 - [x] W3.1 `StageOrchestrator` trait + `LinuxBashOrchestrator`

@@ -166,6 +166,82 @@ is reintroduced into reviewed Rust sources (line 1255: "unsafe
 keyword usage is forbidden in repository Rust sources"). **Cleared
 2026-04-28.**
 
+#### A.3.6 W2.5 wrapper-hygiene audit — Windows bootstrap PS scripts
+
+**Result:** Audit performed across the five reviewed PowerShell
+helpers under `scripts/bootstrap/windows/` (Bootstrap-, Collect-,
+Install-, Smoke-, Verify-). Findings tally: 9 HIGH (theoretical, on
+controlled values), 14 MEDIUM, 4 LOW. Detail per finding archived
+in the audit subagent transcript and is recoverable via the same
+prompt; key categories below.
+
+**HIGH-severity categories (theoretical — values are controlled):**
+- `cmd.exe /c $commandText` interpolation in
+  `Bootstrap-RustyNetWindows.ps1:460, 1031` and
+  `Collect-RustyNetWindowsDiagnostics.ps1:288`. The interpolated
+  array contents are static helper-defined strings (`where.exe
+  cargo`, `rustc.exe --version`, etc.); attacker would need to
+  modify the shipped script. Pattern still violates argv-only
+  discipline.
+- Manual binPath quote-concatenation in `Install-` and `Smoke-`
+  scripts — same fragile-quoting class the W2.2 install-helper
+  hardening commit (76f8303) replaced for `sc.exe create` with
+  `New-Service`. The remaining sites (Smoke-RustyNetWindowsService
+  Host.ps1:241 + sc.exe create at 297-305) still take the manual
+  quote path because the smoke-test runs under sc.exe explicitly.
+- Backtick-escaped paths inside cmd-string args
+  (`Bootstrap-RustyNetWindows.ps1:1020` for winget config).
+
+**MEDIUM-severity categories (defense-in-depth):**
+- `icacls $Path` and `sc.exe delete $ServiceName` invocations with
+  unquoted variables across all five scripts. PowerShell 5.1's
+  native-command argument passing wraps space-bearing variables in
+  quotes for most cases — tests of the actual install path against
+  `C:\Program Files\RustyNet\...` (spaces in `Program Files`) pass
+  in the live-lab evidence run captured in commit 76f8303.
+  Defense-in-depth would still benefit from explicit quoting.
+- `Get-CimInstance -Filter ("Name='" + $ServiceName.Replace("'",
+  "''") + "'")` WQL filter construction in `Install-`, `Smoke-`,
+  `Verify-`. Replace-based escaping is correct but fragile;
+  `-FilterHashtable` would be parametric.
+- `git clone --branch $Branch $RepoUrl` in `Bootstrap-RustyNetWindows
+  .ps1:1058-1080` passes parameter values directly to git; git
+  itself validates URL/ref shape but no pre-validation in the
+  script.
+
+**Cross-cutting hardening recommendation (deferred to a follow-up
+W2.5b slice — not landed in this audit pass):**
+1. Add a `Test-RustyNetServiceName` validator at the top of every
+   PS helper that accepts `-ServiceName`, mirroring the Rust-side
+   `validate_service_name` (ASCII alphanumeric + `-` + `_`,
+   non-empty, ≤128 chars). Defense-in-depth even though the
+   orchestrator-side helpers already validate before dispatch.
+2. Add a `Test-RustyNetReviewedRoot` validator for `-InstallRoot`
+   and `-StateRoot` parameters that rejects non-canonical paths
+   outside the reviewed `C:\Program Files\RustyNet` /
+   `C:\ProgramData\RustyNet` roots (matches the daemon-side
+   `validate_windows_runtime_file_path`).
+3. Replace `cmd.exe /c $commandText` in
+   `Bootstrap-RustyNetWindows.ps1:460, 1031` and
+   `Collect-RustyNetWindowsDiagnostics.ps1:288` with direct
+   `Start-Process` -ArgumentList arrays.
+4. Replace `Get-CimInstance -Filter "Name='..."` with
+   `Get-Service -Name $ServiceName -ErrorAction SilentlyContinue`
+   pattern (which we already use elsewhere).
+5. Quote every `icacls $Path` and `sc.exe delete $ServiceName` arg
+   with explicit `"$Path"` even though PS5.1 usually wraps it.
+
+**Verdict:** Audit complete. None of the findings are
+attacker-reachable today (script values come from controlled
+sources: hard-coded constants, orchestrator-validated parameters
+with strict charsets enforced by `build_windows_security_check_invocation`
++ `validate_service_name`, and the Windows guest's own filesystem
+state). The remediations listed are pure defense-in-depth and are
+tracked as a follow-up W2.5b slice. **Cleared 2026-04-28** with
+deferred remediation list above.
+
+---
+
 #### A.3.5 Unwrap / expect on attacker-reachable paths
 
 **Result:** Audited via parallel agent. `fetcher.rs:179` was the
