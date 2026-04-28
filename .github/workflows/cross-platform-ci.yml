@@ -63,3 +63,76 @@ jobs:
       - name: Run real dataplane E2E harness
         run: |
           sudo -E ./scripts/e2e/real_wireguard_exitnode_e2e.sh
+
+  windows:
+    name: Windows build+security (rustynetd + windows-native)
+    runs-on: windows-2022
+    # Scope: this job exercises the Windows-portable crates that
+    # carry the W1.x / W2.x / W4.x Windows verifier surface (the
+    # SCM API bindings + DPAPI / SDDL / named-pipe / WinVerifyTrust
+    # FFI in rustynet-windows-native, the `windows-…-check`
+    # subcommands in rustynetd). The orchestrator crate
+    # (rustynet-cli) deliberately ships unix-only modules
+    # (ops_install_systemd, ops_phase9) at top level and therefore
+    # cannot build on Windows; cross-target check from the macOS +
+    # Debian jobs above already covers rustynet-cli's wire-format
+    # compatibility with the Windows daemon.
+    defaults:
+      run:
+        # Use Git Bash (pre-installed on windows-2022 runners) so
+        # the cargo invocations match the macOS / Debian jobs above.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin toolchain + install cargo-audit / cargo-deny
+        run: |
+          # The bash bootstrap wrapper invokes `cargo run -p
+          # rustynet-cli --bin bootstrap_ci_tools`; rustynet-cli
+          # does not build on Windows so we cannot use the wrapper
+          # here. Pin the same versions inline, mirroring the
+          # bootstrap binary's contract (PINNED_TOOLCHAIN=1.85.0,
+          # security toolchain=1.88.0, cargo-audit=0.22.1,
+          # cargo-deny=0.19.1).
+          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.85.0
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo install cargo-audit --locked --version 0.22.1 --force
+          cargo install cargo-deny --locked --version 0.19.1 --force
+      - name: Build + test Windows-portable crates
+        run: |
+          # Crate selection is intentional. rustynetd carries every
+          # Windows-side validator (windows_paths,
+          # windows_authenticode, windows_dns_failclosed,
+          # windows_key_custody, windows_mesh_status,
+          # windows_runtime_boundary, windows_service,
+          # windows_service_hardening, windows_ipc, etc.).
+          # rustynet-windows-native carries the FFI wrappers (DPAPI,
+          # SDDL, named-pipe, WinVerifyTrust). The remaining crates
+          # are the protocol-agnostic primitives the Windows daemon
+          # links against; building them here exercises both
+          # platform-conditional cfg paths AND any unix-only
+          # regression that would slip past the Linux-side jobs.
+          PKGS=(
+            -p rustynetd
+            -p rustynet-windows-native
+            -p rustynet-crypto
+            -p rustynet-policy
+            -p rustynet-dns-zone
+            -p rustynet-control
+            -p rustynet-backend-api
+            -p rustynet-backend-stub
+            -p rustynet-relay
+            -p rustynet-local-security
+          )
+          cargo fmt "${PKGS[@]}" -- --check
+          cargo clippy "${PKGS[@]}" --all-targets --all-features -- -D warnings
+          cargo check "${PKGS[@]}" --all-targets --all-features
+          cargo test "${PKGS[@]}" --all-targets --all-features
+      - name: Security gates
+        run: |
+          # cargo-audit + cargo-deny operate on Cargo.lock + the
+          # workspace manifest, so they validate the whole
+          # dependency surface (including rustynet-cli's deps) even
+          # though we only built the Windows-portable subset above.
+          cargo audit --deny warnings
+          cargo deny check bans licenses sources advisories
