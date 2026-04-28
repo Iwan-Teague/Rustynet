@@ -5648,15 +5648,8 @@ impl DaemonProbe for LinuxDaemonProbe {
             DaemonProbeOp::MeshStatus => "linux-mesh-status-check",
             DaemonProbeOp::KeyCustody => "linux-key-custody-check",
             DaemonProbeOp::Authenticode => "linux-authenticode-check",
-            other => {
-                return Err(format!(
-                    "RustyNet daemon-side probe '{}' is not yet implemented on Linux; \
-                     the Windows daemon ships every validator today and the remaining \
-                     Linux-side subcommands land one at a time under the OS-agnostic \
-                     delta plan W4",
-                    other.as_str()
-                ));
-            }
+            DaemonProbeOp::ServiceHardening => "linux-service-hardening-check",
+            DaemonProbeOp::DnsFailclosed => "linux-dns-failclosed-check",
         };
         Ok(vec![
             daemon,
@@ -24660,13 +24653,15 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
-    fn linux_daemon_probe_emits_argv_for_implemented_ops() {
-        // Linux daemon ships parity validators one at a time. The
-        // implemented ops resolve to their `linux-*-check` subcommands
-        // wired in `crates/rustynetd/src/main.rs`. The remaining ops
-        // still reject with a precise per-op blocker so the
-        // orchestrator surfaces "Linux daemon does not yet expose
-        // <op>" rather than parsing a bash 127 exit as "drift".
+    fn linux_daemon_probe_emits_argv_for_every_op() {
+        // The Linux daemon now ships every parity validator subcommand
+        // at the wire-format level. Each op resolves to its
+        // `linux-*-check` subcommand wired in
+        // `crates/rustynetd/src/main.rs`. The Linux + Windows probe
+        // surfaces are at full parity; the daemon-side enforcement
+        // posture differs only where the underlying mechanism does not
+        // exist on Linux (eg. authenticode emits applicable=false,
+        // overall_ok=true rather than rejecting).
         let probe = super::LinuxDaemonProbe;
         assert_eq!(probe.platform_label(), "linux");
         for (op, expected_subcommand) in [
@@ -24680,10 +24675,18 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 super::DaemonProbeOp::Authenticode,
                 "linux-authenticode-check",
             ),
+            (
+                super::DaemonProbeOp::ServiceHardening,
+                "linux-service-hardening-check",
+            ),
+            (
+                super::DaemonProbeOp::DnsFailclosed,
+                "linux-dns-failclosed-check",
+            ),
         ] {
             let argv = probe
                 .build_argv(op, std::path::Path::new("/usr/local/bin/rustynetd"))
-                .expect("implemented op must resolve to a Linux subcommand");
+                .expect("every op must resolve to a Linux subcommand at parity");
             assert_eq!(
                 argv,
                 vec![
@@ -24691,23 +24694,6 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                     expected_subcommand.to_string(),
                     "--no-fail-on-drift".to_string(),
                 ]
-            );
-        }
-    }
-
-    #[test]
-    fn linux_daemon_probe_rejects_remaining_ops_with_roadmap_blocker() {
-        let probe = super::LinuxDaemonProbe;
-        for op in [
-            super::DaemonProbeOp::ServiceHardening,
-            super::DaemonProbeOp::DnsFailclosed,
-        ] {
-            let err = probe
-                .build_argv(op, std::path::Path::new("/usr/local/bin/rustynetd"))
-                .expect_err("unimplemented op must reject");
-            assert!(
-                err.contains("not yet implemented on Linux") && err.contains(op.as_str()),
-                "rejection must surface the missing op label: {err}"
             );
         }
     }

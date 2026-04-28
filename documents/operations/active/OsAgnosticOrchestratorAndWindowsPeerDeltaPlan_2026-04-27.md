@@ -2040,6 +2040,97 @@ conservatively.
       KeyCustody, Authenticode, MeshStatus, DnsFailclosed all still
       reject in `LinuxDaemonProbe`. Each one is its own slice; this
       is the first of six.
+- [x] W3.2-followup-2-through-6 — Linux daemon parity verifiers
+      (mesh-status, key-custody, authenticode, service-hardening,
+      DNS fail-closed) + full `LinuxDaemonProbe` parity
+  - Changed files:
+    - `crates/rustynetd/src/linux_mesh_status.rs` (new, batch 1) —
+      reads `/var/lib/rustynet/rustynetd.state` via the existing
+      `resilience::load_session_snapshot` path. Re-uses
+      `windows_mesh_status::evaluate_windows_mesh_status` as the
+      platform-neutral pure evaluator — only the default state path
+      differs from Windows. Mirrors W4.2.
+    - `crates/rustynetd/src/linux_key_custody.rs` (new, batch 1) —
+      walks `/var/lib/rustynet/keys/` (dir 0700), the encrypted
+      private key (file 0600), the public key (file 0640), and pins
+      the legacy plaintext private key path as forbidden-at-rest
+      (Phase E migrated runtime key custody to encrypted-at-rest).
+      Same requirement+status enum as the Windows verifier
+      (Ok / Missing / Invalid / Forbidden / AbsentAsExpected).
+      `nix::unistd::User::from_name` for username -> uid resolution
+      so the daemon stays `#![forbid(unsafe_code)]`.
+    - `crates/rustynetd/src/linux_authenticode.rs` (new, batch 1) —
+      stub emitting `applicable: false, overall_ok: true`. Linux
+      does not enforce binary signatures at runtime; package
+      signature verification happens at install time via dpkg/rpm.
+      Keeps the `LinuxDaemonProbe::build_argv` shape uniform — every
+      op resolves to argv — so the orchestrator gets a consistent
+      JSON shape regardless of platform. A future slice can swap
+      this for actual dpkg/rpm signature verification without
+      changing the wire format.
+    - `crates/rustynetd/src/linux_service_hardening.rs` (new, batch
+      2) — runs `systemctl show rustynetd.service` and parses the
+      `key=value` output into a `BTreeMap`. Walks the reviewed
+      hardening directives table (User/Group/NoNewPrivileges/
+      PrivateTmp/PrivateDevices/ProtectSystem=strict/ProtectHome/
+      ProtectControlGroups/ProtectKernelTunables/ProtectKernelModules/
+      ProtectKernelLogs/MemoryDenyWriteExecute/LockPersonality/
+      RestrictSUIDSGID/RestrictRealtime/SystemCallArchitectures/
+      empty CapabilityBoundingSet/empty AmbientCapabilities/UMask=0077)
+      and emits drift reasons for each property that disagrees. Off-
+      Linux returns `probed=false` with a "requires a Linux runtime
+      host with systemctl" reason.
+    - `crates/rustynetd/src/linux_dns_failclosed.rs` (new, batch 2) —
+      reads `/etc/resolv.conf`, parses nameserver / search / domain
+      lines, and confirms every nameserver is loopback (127.0.0.0/8
+      for IPv4, ::1/128 for IPv6). External / RFC1918 / unparseable
+      nameservers all surface as drift. The resolv.conf check stays
+      as the floor; a future slice can extend to query
+      `resolvectl status` for systemd-resolved-managed hosts.
+    - `crates/rustynetd/src/lib.rs` — five new `pub mod` entries.
+    - `crates/rustynetd/src/main.rs` — five new `linux-*-check`
+      subcommands wired into the dispatch table + help text. Each
+      mirrors the Windows side's `[--no-fail-on-drift]` flag pattern.
+      The mesh-status subcommand additionally accepts
+      `--state-path / --expected-peer-id / --max-age-seconds` to
+      match the W4.2 Windows shape.
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — `LinuxDaemonProbe::build_argv`
+      now resolves every `DaemonProbeOp` to a `linux-*-check`
+      subcommand. **The Linux + Windows probe surfaces are at full
+      wire-format parity.** Daemon-side enforcement posture differs
+      only where the underlying mechanism does not exist on Linux
+      (eg. authenticode emits `applicable=false, overall_ok=true`
+      rather than rejecting). The blanket `other => Err(...)` arm is
+      gone; the match is exhaustive.
+  - Verification:
+    - `cargo fmt --all -- --check` clean.
+    - `cargo clippy --workspace --all-features -- -D warnings` clean.
+    - `cargo test --workspace --all-features`:
+      `rustynetd` 509 / 509 (was 470 → +39: 4 mesh-status, 7 key-
+      custody, 3 authenticode, 11 service-hardening, 12 dns-failclosed,
+      +2 forbidden-at-rest pins).
+      `rustynet-cli` 462 / 462 (LinuxDaemonProbe test reshaped to
+      cover all six ops + retains the empty-daemon-path defensive
+      guard; the prior "remaining ops reject" test is gone because
+      no ops remain to reject).
+  - Residual risk:
+    - **Linux daemon parity is wire-format-only for some ops.** The
+      authenticode subcommand always emits `applicable: false`; a
+      future slice can wire dpkg/rpm signature verification into the
+      same JSON shape and flip `applicable` to `true`. The DNS fail-
+      closed verifier checks `/etc/resolv.conf` only; it does not
+      query `resolvectl status` or inspect `nft` rules, so a
+      systemd-resolved deployment that bypasses resolv.conf would
+      pass this check while still leaking DNS. The service-hardening
+      verifier requires `systemctl` on the host; non-systemd Linux
+      deployments (eg. Alpine + OpenRC) will report `probed=false`
+      and fail closed with the precise reason.
+    - **Subset of reviewed ACL roots.** `linux-runtime-acls-check`
+      walks the two top-level state + config roots; subdirectories
+      (keys/, secrets/, membership/) are implicitly pinned by their
+      parent's `0700`. The full Windows-side 8-root walk has not
+      been replicated; the verifier behavior matches the Windows
+      side's startup-fail-closed gate, not the diagnostic walk.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

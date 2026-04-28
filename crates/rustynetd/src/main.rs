@@ -24,9 +24,13 @@ use rustynetd::key_material::{
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
 use rustynetd::linux_authenticode::collect_linux_authenticode_report;
+use rustynetd::linux_dns_failclosed::{
+    build_linux_dns_failclosed_report, collect_linux_dns_failclosed_snapshot,
+};
 use rustynetd::linux_key_custody::collect_linux_key_custody_report;
 use rustynetd::linux_mesh_status::{LinuxMeshStatusOptions, collect_linux_mesh_status_report};
 use rustynetd::linux_runtime_acls::collect_linux_runtime_acl_report;
+use rustynetd::linux_service_hardening::collect_linux_service_hardening_report;
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
@@ -127,6 +131,12 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "linux-authenticode-check" => {
                 run_linux_authenticode_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-service-hardening-check" => {
+                run_linux_service_hardening_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-dns-failclosed-check" => {
+                run_linux_dns_failclosed_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -451,6 +461,71 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_linux_service_hardening_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-service-hardening-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_linux_service_hardening_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux service-hardening report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-service-hardening-check reported drift in the live RustyNet service hardening posture"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_linux_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-dns-failclosed-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let snapshot = collect_linux_dns_failclosed_snapshot();
+    let report = build_linux_dns_failclosed_report(snapshot);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux dns-failclosed report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture"
                 .to_string(),
         );
     }
@@ -1767,6 +1842,8 @@ fn help_text() -> String {
         "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd linux-key-custody-check [--no-fail-on-drift]",
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
+        "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
+        "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
