@@ -174,9 +174,19 @@ impl StateFetcher {
     }
 
     fn check_freshness(&self, bundle: &SignedBundle) -> Result<(), String> {
+        // System clock before UNIX_EPOCH is fail-closed evidence of a
+        // misconfigured / attacker-rolled-back host clock. Refuse to
+        // accept any signed bundle in that state rather than panic
+        // and crash the daemon (which would tear down enforced
+        // routes). Net effect: stale-bundle rejection by another
+        // name — same fail-closed posture, no crash.
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|err| {
+                format!(
+                    "host clock is before UNIX_EPOCH ({err}); refusing signed bundle freshness check until clock is corrected"
+                )
+            })?
             .as_secs();
 
         if bundle.expires_at_unix < now_unix {
