@@ -22,11 +22,15 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub struct AndroidNodeAdapter {
     #[allow(dead_code)]
     conn: NodeConnection,
+    alias: String,
 }
 
 impl AndroidNodeAdapter {
-    pub fn new(conn: NodeConnection) -> Self {
-        AndroidNodeAdapter { conn }
+    pub fn new(alias: impl Into<String>, conn: NodeConnection) -> Self {
+        AndroidNodeAdapter {
+            alias: alias.into(),
+            conn,
+        }
     }
 }
 
@@ -48,6 +52,9 @@ fn android_unsupported() -> AdapterError {
 impl NodeAdapter for AndroidNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Android
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
     fn install_daemon(
         &self,

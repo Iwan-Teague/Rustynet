@@ -2242,6 +2242,17 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 dry_run: parser.has_flag("--dry-run"),
                 windows_only: parser.has_flag("--windows-only"),
                 validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
+                node_assignments: {
+                    let raw = collect_repeated_option_values(&args[1..], "--node");
+                    let mut out = Vec::with_capacity(raw.len());
+                    for s in raw {
+                        out.push(
+                            vm_lab::orchestrator::role_assignment::parse_node_role_arg(&s)
+                                .map_err(|e| format!("invalid --node value '{s}': {e}"))?,
+                        );
+                    }
+                    out
+                },
             },
         }),
         "vm-lab-validate-windows-security" => Ok(OpsCommand::VmLabValidateWindowsSecurity {

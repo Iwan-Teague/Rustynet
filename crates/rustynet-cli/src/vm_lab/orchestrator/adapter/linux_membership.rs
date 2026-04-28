@@ -1,0 +1,227 @@
+#![allow(dead_code)]
+use std::path::Path;
+use std::time::Duration;
+
+use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::connection::NodeConnection;
+use crate::vm_lab::orchestrator::error::{
+    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
+};
+use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+
+const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
+const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Read the membership owner public key from the exit node.
+/// The exit node is the only node that holds the owner signing key;
+/// calling this on a non-exit node will return an empty key or error.
+pub fn issue_membership_owner_key(
+    conn: &NodeConnection,
+) -> Result<MembershipOwnerKey, AdapterError> {
+    let pem = ssh::run_remote(
+        conn,
+        "cat /etc/rustynet/membership.owner.key.pub 2>/dev/null || \
+         cat /var/lib/rustynet/membership.owner.key.pub 2>/dev/null || \
+         echo ''",
+        SHORT_TIMEOUT,
+    )?;
+    if pem.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "membership owner public key not found on remote; \
+                      has membership been initialized?"
+                .to_string(),
+        });
+    }
+    Ok(MembershipOwnerKey {
+        public_key_pem: pem,
+    })
+}
+
+/// Initialize the membership snapshot on the exit node and return its bytes.
+/// Runs `rustynet ops init-membership` for each non-exit peer that is in
+/// `peers`, then reads back the snapshot + log from the remote.
+pub fn init_membership_snapshot(
+    conn: &NodeConnection,
+    _owner_key: &MembershipOwnerKey,
+    peers: &[NodeRoleAssignment],
+) -> Result<MembershipSnapshot, AdapterError> {
+    // 1. Run ops init-membership on the exit node (idempotent if already done).
+    ssh::run_remote(
+        conn,
+        "env RUSTYNET_NODE_ROLE=admin rustynet ops init-membership",
+        MEDIUM_TIMEOUT,
+    )?;
+
+    // 2. Add each non-exit peer via e2e-membership-add.
+    for peer in peers {
+        let role_str = match &peer.role {
+            crate::vm_lab::orchestrator::role::NodeRole::Exit => continue, // skip exit
+            crate::vm_lab::orchestrator::role::NodeRole::Client => "client",
+            crate::vm_lab::orchestrator::role::NodeRole::Entry => "client",
+            crate::vm_lab::orchestrator::role::NodeRole::Aux => "client",
+            crate::vm_lab::orchestrator::role::NodeRole::Extra => "client",
+            crate::vm_lab::orchestrator::role::NodeRole::Custom(_) => "client",
+        };
+        let _ = role_str; // role passed through env; alias used as node_id here
+        let node_id_arg = shell_safe_arg(&peer.alias)?;
+        ssh::run_remote(
+            conn,
+            &format!(
+                "rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
+                 --client-pubkey-hex '' --owner-approver-id '$(rustynet ops owner-approver-id 2>/dev/null || echo none)'"
+            ),
+            MEDIUM_TIMEOUT,
+        )?;
+    }
+
+    // 3. Read back the snapshot bytes.
+    let snapshot_b64 = ssh::run_remote(
+        conn,
+        "cat /var/lib/rustynet/membership.snapshot | base64 -w 0",
+        SHORT_TIMEOUT,
+    )?;
+    let data = base64_decode(&snapshot_b64)?;
+    Ok(MembershipSnapshot { data })
+}
+
+/// Distribute a signed bundle to this (non-exit) node.
+/// The bundle is scp'd to a temp path, then installed atomically via
+/// `install -m 0640 -o root -g rustynetd`.
+pub fn distribute_signed_bundle(
+    conn: &NodeConnection,
+    kind: BundleKind,
+    bundle_path: &Path,
+) -> Result<(), AdapterError> {
+    let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
+    // SCP bundle to temp path.
+    ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
+    // Install atomically with correct permissions.
+    let install_dir = install_dst
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("/var/lib/rustynet");
+    ssh::run_remote(
+        conn,
+        &format!(
+            "install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
+             install -m 0640 -o root -g rustynetd '{remote_tmp}' '{install_dst}' && \
+             rm -f '{remote_tmp}'"
+        ),
+        SHORT_TIMEOUT,
+    )?;
+    Ok(())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
+    match kind {
+        BundleKind::Membership => (
+            "/tmp/rn-membership.snapshot".to_string(),
+            "/var/lib/rustynet/membership.snapshot".to_string(),
+        ),
+        BundleKind::Assignment => (
+            "/tmp/rn-assignment.bundle".to_string(),
+            "/var/lib/rustynet/rustynetd.assignment".to_string(),
+        ),
+        BundleKind::Traversal => (
+            "/tmp/rn-traversal.bundle".to_string(),
+            "/var/lib/rustynet/rustynetd.traversal".to_string(),
+        ),
+        BundleKind::DnsZone => (
+            "/tmp/rn-dns-zone.bundle".to_string(),
+            "/var/lib/rustynet/rustynetd.dns-zone".to_string(),
+        ),
+    }
+}
+
+/// Reject shell-dangerous characters to prevent injection via alias strings.
+fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "value '{value}' contains characters not safe for shell argument embedding \
+                 (allowed: alphanumeric, hyphen, underscore, dot)"
+            ),
+        })
+    }
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>, AdapterError> {
+    // Simple base64 decode without pulling in a new crate: delegate to the
+    // `base64` crate already used by mod.rs via the `base64` dependency.
+    // We access it via `std` since `base64` is workspace-level.
+    // For now: spawn `base64 -d` locally on the received bytes.
+    // This is an internal implementation detail — the bytes are used only
+    // for forwarding the snapshot to non-exit peers, not for cryptographic ops.
+    let decoded = base64_std_decode(encoded).map_err(|err| AdapterError::Protocol {
+        message: format!("base64 decode of membership snapshot failed: {err}"),
+    })?;
+    Ok(decoded)
+}
+
+fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
+    // base64 alphabet: A-Z a-z 0-9 + / = (padding) and whitespace (ignored).
+    let clean: String = encoded
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    // Use base64 via a process call so we don't need direct crate access here.
+    // (The base64 crate is available but accessed via the workspace; routing
+    // through a shell call is simpler at this layer.)
+    use std::process::Command;
+    let output = Command::new("base64")
+        .arg("-d")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.take() {
+                let mut stdin = stdin;
+                let _ = stdin.write_all(clean.as_bytes());
+            }
+            child.wait_with_output()
+        })
+        .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("base64 -d failed: {stderr}"));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_safe_arg_accepts_valid() {
+        assert_eq!(shell_safe_arg("node-exit-1").unwrap(), "node-exit-1");
+        assert_eq!(shell_safe_arg("abc.def_ghi").unwrap(), "abc.def_ghi");
+    }
+
+    #[test]
+    fn shell_safe_arg_rejects_special_chars() {
+        assert!(shell_safe_arg("node; rm -rf /").is_err());
+        assert!(shell_safe_arg("node$(whoami)").is_err());
+        assert!(shell_safe_arg("node`id`").is_err());
+    }
+
+    #[test]
+    fn remote_bundle_paths_correct() {
+        let (tmp, dst) = remote_bundle_paths(&BundleKind::Membership);
+        assert!(tmp.contains("membership"));
+        assert!(dst.contains("membership.snapshot"));
+
+        let (tmp, dst) = remote_bundle_paths(&BundleKind::Assignment);
+        assert!(tmp.contains("assignment"));
+        assert!(dst.contains("rustynetd.assignment"));
+    }
+}

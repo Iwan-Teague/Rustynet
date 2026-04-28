@@ -21,11 +21,15 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub struct IosNodeAdapter {
     #[allow(dead_code)]
     conn: NodeConnection,
+    alias: String,
 }
 
 impl IosNodeAdapter {
-    pub fn new(conn: NodeConnection) -> Self {
-        IosNodeAdapter { conn }
+    pub fn new(alias: impl Into<String>, conn: NodeConnection) -> Self {
+        IosNodeAdapter {
+            alias: alias.into(),
+            conn,
+        }
     }
 }
 
@@ -46,6 +50,9 @@ fn ios_unsupported() -> AdapterError {
 impl NodeAdapter for IosNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Ios
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
     fn install_daemon(
         &self,

@@ -17,6 +17,9 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     fn platform(&self) -> VmGuestPlatform;
 
+    /// The alias this adapter was constructed for (matches `NodeRoleAssignment::alias`).
+    fn alias(&self) -> &str;
+
     // ── Install lifecycle ─────────────────────────────────────────
 
     fn install_daemon(

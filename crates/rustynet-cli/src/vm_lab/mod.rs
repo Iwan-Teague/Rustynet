@@ -813,6 +813,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// wants live-evidence proof that each Linux peer's daemon-side state
     /// matches the reviewed posture (W3.2-followup-7 verifier set).
     pub validate_linux_daemon_state: bool,
+    /// When non-empty, route to the Rust-native `NodeAdapter` pipeline
+    /// instead of the bash orchestrator. Each entry is parsed from a
+    /// `--node <alias>:<role>` CLI flag. (W5.1 opt-in; W5.6 promotes to default.)
+    pub node_assignments: Vec<orchestrator::role_assignment::NodeRoleAssignment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6065,9 +6069,166 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     }
 }
 
+fn execute_rust_native_orchestration(
+    config: VmLabOrchestrateLiveLabConfig,
+) -> Result<String, String> {
+    use orchestrator::adapter::factory::node_adapter_for;
+    use orchestrator::connection::NodeConnection;
+    use orchestrator::context::OrchestrationContext;
+    use orchestrator::error::StageOutcome;
+    use orchestrator::runner::StateMachineRunner;
+    use orchestrator::stage::OrchestrationStage;
+    use orchestrator::stage::{
+        cleanup::CleanupHostsStage, collect_pubkeys::CollectPubkeysStage,
+        distribute_assignments::DistributeAssignmentsStage,
+        distribute_dns_zone::DistributeDnsZoneStage,
+        distribute_membership::DistributeMembershipStage,
+        distribute_traversal::DistributeTraversalStage,
+        enforce_runtime::EnforceBaselineRuntimeStage, exit_handoff::ExitHandoffStage,
+        install::BootstrapHostsStage, membership_init::MembershipInitStage,
+        preflight::PreflightStage, role_switch_matrix::RoleSwitchMatrixStage,
+        source_archive::PrepareSourceArchiveStage, traffic_test_matrix::TrafficTestMatrixStage,
+        validate_runtime::ValidateBaselineRuntimeStage, verify_ssh::VerifySshReachabilityStage,
+    };
+
+    let known_hosts = config.known_hosts_path.ok_or_else(|| {
+        "--known-hosts-file is required when --node flags are present".to_string()
+    })?;
+    ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
+    ensure_local_regular_file_path(known_hosts.as_path(), "SSH known-hosts file")?;
+
+    let inventory_path = resolve_absolute_path(config.inventory_path.as_path())?;
+    let inventory = load_inventory(&inventory_path)?;
+
+    let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
+    ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")?;
+    fs::create_dir_all(report_dir.as_path()).map_err(|err| {
+        format!(
+            "create report directory failed ({}): {err}",
+            report_dir.display()
+        )
+    })?;
+
+    let network_id = format!(
+        "rustynet-lab-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+
+    let mut ctx = OrchestrationContext::new(
+        config.node_assignments.clone(),
+        report_dir.clone(),
+        network_id,
+    );
+
+    for assignment in &config.node_assignments {
+        let entry = inventory
+            .iter()
+            .find(|e| e.alias == assignment.alias)
+            .ok_or_else(|| {
+                format!(
+                    "alias '{}' not found in inventory ({})",
+                    assignment.alias,
+                    inventory_path.display()
+                )
+            })?;
+
+        let host = entry
+            .last_known_ip
+            .as_deref()
+            .unwrap_or(entry.ssh_target.as_str())
+            .to_string();
+
+        let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+
+        let conn = NodeConnection::ssh(
+            host.clone(),
+            config.ssh_port,
+            entry.ssh_user.clone(),
+            config.ssh_identity_file.clone(),
+            known_hosts.clone(),
+        )
+        .map_err(|err| {
+            format!(
+                "build SSH connection for alias '{}' ({}): {err}",
+                assignment.alias, host
+            )
+        })?;
+
+        let adapter =
+            node_adapter_for(assignment.alias.clone(), platform, conn).map_err(|err| {
+                format!(
+                    "create adapter for alias '{}' (platform {platform:?}): {err}",
+                    assignment.alias
+                )
+            })?;
+
+        ctx.adapters.insert(assignment.alias.clone(), adapter);
+    }
+
+    let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+        Box::new(PreflightStage),
+        Box::new(PrepareSourceArchiveStage),
+        Box::new(VerifySshReachabilityStage),
+        Box::new(CleanupHostsStage),
+        Box::new(BootstrapHostsStage),
+        Box::new(CollectPubkeysStage),
+        Box::new(MembershipInitStage),
+        Box::new(DistributeMembershipStage),
+        Box::new(DistributeAssignmentsStage),
+        Box::new(DistributeTraversalStage),
+        Box::new(DistributeDnsZoneStage),
+        Box::new(EnforceBaselineRuntimeStage),
+        Box::new(ValidateBaselineRuntimeStage),
+        Box::new(TrafficTestMatrixStage),
+        Box::new(RoleSwitchMatrixStage),
+        Box::new(ExitHandoffStage),
+    ];
+
+    let runner = StateMachineRunner::new(stages);
+    let results = runner.run(&mut ctx);
+
+    let passed = results
+        .iter()
+        .filter(|(_, o)| matches!(o, StageOutcome::Passed))
+        .count();
+    let failed = results
+        .iter()
+        .filter(|(_, o)| matches!(o, StageOutcome::Failed(_)))
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|(_, o)| matches!(o, StageOutcome::Skipped))
+        .count();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "rust orchestrator: {} node(s), {} stage(s)",
+        config.node_assignments.len(),
+        results.len()
+    );
+    for (id, outcome) in &results {
+        let label = match outcome {
+            StageOutcome::Passed => "passed",
+            StageOutcome::Failed(_) => "failed",
+            StageOutcome::Skipped => "skipped",
+        };
+        let _ = writeln!(out, "  {}: {label}", id.as_str());
+    }
+    let _ = writeln!(out, "passed={passed} failed={failed} skipped={skipped}");
+
+    if failed > 0 { Err(out) } else { Ok(out) }
+}
+
 pub fn execute_ops_vm_lab_orchestrate_live_lab(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
+    if !config.node_assignments.is_empty() {
+        return execute_rust_native_orchestration(config);
+    }
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
     ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
     ensure_optional_local_regular_file_path(

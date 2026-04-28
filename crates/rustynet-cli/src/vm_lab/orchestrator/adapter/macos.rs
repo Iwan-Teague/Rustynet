@@ -18,11 +18,15 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub struct MacosNodeAdapter {
     #[allow(dead_code)]
     conn: NodeConnection,
+    alias: String,
 }
 
 impl MacosNodeAdapter {
-    pub fn new(conn: NodeConnection) -> Self {
-        MacosNodeAdapter { conn }
+    pub fn new(alias: impl Into<String>, conn: NodeConnection) -> Self {
+        MacosNodeAdapter {
+            alias: alias.into(),
+            conn,
+        }
     }
 }
 
@@ -35,6 +39,9 @@ fn unimplemented_macos() -> AdapterError {
 impl NodeAdapter for MacosNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Macos
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
     fn install_daemon(
         &self,

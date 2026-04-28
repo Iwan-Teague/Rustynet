@@ -18,11 +18,15 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 pub struct WindowsNodeAdapter {
     #[allow(dead_code)]
     conn: NodeConnection,
+    alias: String,
 }
 
 impl WindowsNodeAdapter {
-    pub fn new(conn: NodeConnection) -> Self {
-        WindowsNodeAdapter { conn }
+    pub fn new(alias: impl Into<String>, conn: NodeConnection) -> Self {
+        WindowsNodeAdapter {
+            alias: alias.into(),
+            conn,
+        }
     }
 }
 
@@ -35,6 +39,9 @@ fn unimplemented_windows() -> AdapterError {
 impl NodeAdapter for WindowsNodeAdapter {
     fn platform(&self) -> VmGuestPlatform {
         VmGuestPlatform::Windows
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
     fn install_daemon(
         &self,

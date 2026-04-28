@@ -22,10 +22,24 @@ pub struct OrchestrationContext {
     pub stage_outcomes: HashMap<StageId, StageOutcome>,
     /// Collected WireGuard public keys, keyed by node alias.
     pub collected_pubkeys: HashMap<String, WireguardPublicKey>,
+    /// Mesh network identifier passed to the bootstrap env.
+    pub network_id: String,
+    /// Pre-generated node IDs, keyed by alias.
+    /// Populated by the Preflight / PrepareSourceArchive stage before
+    /// `install_daemon` runs. If absent for an alias, `install_daemon`
+    /// falls back to `<alias>-bootstrap`.
+    pub node_ids: HashMap<String, String>,
+    /// CIDRs that SSH is allowed from (passed to bootstrap env as
+    /// `SSH_ALLOW_CIDRS`). Empty string means no restriction at bootstrap.
+    pub ssh_allow_cidrs: String,
 }
 
 impl OrchestrationContext {
-    pub fn new(assignments: Vec<NodeRoleAssignment>, report_dir: PathBuf) -> Self {
+    pub fn new(
+        assignments: Vec<NodeRoleAssignment>,
+        report_dir: PathBuf,
+        network_id: String,
+    ) -> Self {
         OrchestrationContext {
             assignments,
             adapters: HashMap::new(),
@@ -33,6 +47,9 @@ impl OrchestrationContext {
             report_dir,
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            network_id,
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
         }
     }
 

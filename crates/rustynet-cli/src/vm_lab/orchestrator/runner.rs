@@ -180,7 +180,11 @@ mod tests {
     }
 
     fn make_ctx() -> OrchestrationContext {
-        OrchestrationContext::new(vec![], PathBuf::from("/tmp/test-report"))
+        OrchestrationContext::new(
+            vec![],
+            PathBuf::from("/tmp/test-report"),
+            "test-net".to_string(),
+        )
     }
 
     // ── Skip-cascade tests ────────────────────────────────────────────────────
