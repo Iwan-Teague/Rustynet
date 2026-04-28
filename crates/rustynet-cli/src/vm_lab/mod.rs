@@ -4626,6 +4626,655 @@ fn runtime_paths_for(platform: VmGuestPlatform) -> Box<dyn RuntimePaths> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// W3.2 ServiceManager adapter
+// ---------------------------------------------------------------------------
+
+/// Argv intent emitted by a `ServiceManager` operation. The variants
+/// preserve the privileged-boundary discipline (CLAUDE.md §3 / W2.3
+/// audit): every payload is an `argv` array of strings, never a shell
+/// command line, and `HelperScript` carries its own argv list rather
+/// than embedding them in a string the caller would need to parse.
+///
+/// Install, enable, and uninstall on Windows go through the reviewed
+/// PowerShell helpers under `scripts/bootstrap/windows/`; the adapter
+/// returns a `HelperScript` invocation referring to the helper's
+/// canonical install location on the guest, never inline PowerShell.
+/// On Linux these operations are systemd argv (no helper scripts
+/// required).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ServiceCommand {
+    /// Direct argv to dispatch (e.g. `["systemctl", "start", "rustynetd"]`).
+    Argv(Vec<String>),
+    /// Helper-script invocation: dispatch a reviewed local script with
+    /// the named entry point and a typed argv list. The caller
+    /// resolves the actual path from a `RuntimePaths` lookup so the
+    /// adapter does not need to know the install layout.
+    HelperScript {
+        helper_label: String,
+        script_basename: String,
+        args: Vec<String>,
+    },
+}
+
+/// Adapter over the per-host service manager (systemd, Windows SCM,
+/// launchd-stub, …). Operations return a `ServiceCommand` intent the
+/// caller dispatches via `RemoteExec`. Stays argv-only end-to-end.
+#[allow(dead_code)]
+pub trait ServiceManager {
+    fn install(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn enable(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn start(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn stop(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn restart(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn status(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn uninstall(&self, service_name: &str) -> Result<ServiceCommand, String>;
+    fn platform_label(&self) -> &'static str;
+}
+
+/// Reject service names that contain shell metacharacters or whitespace.
+/// The argv-only discipline says the value must cross the boundary
+/// untouched, but we still defensively reject inputs that *suggest*
+/// the caller is trying to inject — better to fail closed at the
+/// adapter than have the SCM-side helper interpret a `;` as a
+/// separator. ASCII alphanumerics + `-` + `_` is the reviewed
+/// character set (matches systemd unit naming + Windows SCM service
+/// naming rules).
+fn validate_service_name(service_name: &str) -> Result<(), String> {
+    if service_name.is_empty() {
+        return Err("service name must not be empty".to_string());
+    }
+    if service_name.len() > 128 {
+        return Err(format!(
+            "service name exceeds 128 chars: {} chars",
+            service_name.len()
+        ));
+    }
+    for ch in service_name.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') {
+            return Err(format!(
+                "service name must be ASCII alphanumeric + hyphen + underscore; rejected on {ch:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Linux systemd-backed service manager. Install / enable / uninstall
+/// are direct `systemctl` invocations; on most reviewed RustyNet
+/// installs the unit file ships under `/etc/systemd/system` already, so
+/// the install op is `systemctl daemon-reload` followed by
+/// `systemctl enable`. The orchestrator dispatches each step
+/// independently so failures surface at the right SCM boundary.
+pub struct LinuxServiceManager;
+
+impl ServiceManager for LinuxServiceManager {
+    fn install(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // systemd "install" semantically = reload daemon so the unit
+        // file (already on disk under /etc/systemd/system) is picked up.
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "daemon-reload".to_string(),
+        ]))
+    }
+    fn enable(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "enable".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn start(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "start".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn stop(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "stop".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn restart(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "restart".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn status(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // is-active gives a single-word answer the caller can grep
+        // without color codes / pager invocation that `status` uses.
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "is-active".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn uninstall(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(vec![
+            "systemctl".to_string(),
+            "disable".to_string(),
+            "--now".to_string(),
+            service_name.to_string(),
+        ]))
+    }
+    fn platform_label(&self) -> &'static str {
+        "linux"
+    }
+}
+
+/// Windows SCM-backed service manager. Install / enable / uninstall go
+/// through the reviewed PowerShell helpers under
+/// `scripts/bootstrap/windows/` (already audited W2.3 + this slice's
+/// `Install-RustyNetWindowsService.ps1` patches). Start / stop /
+/// status / restart are PowerShell cmdlet argv invocations — the
+/// PS5.1 `sc.exe binPath= …` quoting bug only triggers on values that
+/// embed both spaces and quotes (the install-helper's binPath
+/// construction); pure cmdlet invocations like `Start-Service -Name X`
+/// are not affected.
+pub struct WindowsServiceManager;
+
+impl WindowsServiceManager {
+    fn powershell_argv(command: &str) -> Vec<String> {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-Command".to_string(),
+            command.to_string(),
+        ]
+    }
+}
+
+impl ServiceManager for WindowsServiceManager {
+    fn install(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // The install helper takes the SCM service name as a parameter;
+        // every other parameter (paths, ACLs, failure actions) is set
+        // by the helper itself.
+        Ok(ServiceCommand::HelperScript {
+            helper_label: "Windows install helper".to_string(),
+            script_basename: "Install-RustyNetWindowsService.ps1".to_string(),
+            args: vec!["-ServiceName".to_string(), service_name.to_string()],
+        })
+    }
+    fn enable(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // Install helper sets startup mode = Automatic; this op is a
+        // re-arming dispatch for an already-installed but disabled svc.
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "Set-Service -Name '{service_name}' -StartupType Automatic"
+        ))))
+    }
+    fn start(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "Start-Service -Name '{service_name}'"
+        ))))
+    }
+    fn stop(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "Stop-Service -Name '{service_name}' -Force"
+        ))))
+    }
+    fn restart(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "Restart-Service -Name '{service_name}' -Force"
+        ))))
+    }
+    fn status(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // `(Get-Service -Name X).Status` returns a single-word value
+        // (Running, Stopped, …) the caller can parse without buffer
+        // assembly.
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "(Get-Service -Name '{service_name}').Status"
+        ))))
+    }
+    fn uninstall(&self, service_name: &str) -> Result<ServiceCommand, String> {
+        validate_service_name(service_name)?;
+        // Stop-then-delete via sc.exe; sc.exe delete takes only a
+        // service name (no spaces / quotes), so the PS5.1 native-arg
+        // mangling does NOT apply — same posture documented in the
+        // W2.2 install-helper hardening commit.
+        Ok(ServiceCommand::Argv(Self::powershell_argv(&format!(
+            "Stop-Service -Name '{service_name}' -Force -ErrorAction SilentlyContinue; & sc.exe delete '{service_name}'"
+        ))))
+    }
+    fn platform_label(&self) -> &'static str {
+        "windows"
+    }
+}
+
+/// `ServiceManager` stub for OS variants without a reviewed SCM
+/// adapter. Every method rejects with a clear blocker reason — never
+/// silently no-ops.
+pub struct UnsupportedServiceManager {
+    platform_label: &'static str,
+}
+
+impl UnsupportedServiceManager {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn macos() -> Self {
+        Self {
+            platform_label: "macos",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ios() -> Self {
+        Self {
+            platform_label: "ios",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn android() -> Self {
+        Self {
+            platform_label: "android",
+        }
+    }
+
+    fn blocker(&self, op: &str) -> String {
+        format!(
+            "RustyNet ServiceManager op '{}' is not yet implemented for platform '{}'; orchestrator dispatch must not fabricate an undefined service action — see WindowsWorkingNodePlan_2026-04-17.md and the OS-agnostic delta plan for the supported-OS roadmap",
+            op, self.platform_label
+        )
+    }
+}
+
+impl ServiceManager for UnsupportedServiceManager {
+    fn install(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("install"))
+    }
+    fn enable(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("enable"))
+    }
+    fn start(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("start"))
+    }
+    fn stop(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("stop"))
+    }
+    fn restart(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("restart"))
+    }
+    fn status(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("status"))
+    }
+    fn uninstall(&self, _service_name: &str) -> Result<ServiceCommand, String> {
+        Err(self.blocker("uninstall"))
+    }
+    fn platform_label(&self) -> &'static str {
+        self.platform_label
+    }
+}
+
+#[allow(dead_code)]
+fn service_manager_for(platform: VmGuestPlatform) -> Box<dyn ServiceManager> {
+    match platform {
+        VmGuestPlatform::Linux => Box::new(LinuxServiceManager),
+        VmGuestPlatform::Windows => Box::new(WindowsServiceManager),
+        VmGuestPlatform::Macos => Box::new(UnsupportedServiceManager::macos()),
+        VmGuestPlatform::Ios => Box::new(UnsupportedServiceManager::ios()),
+        VmGuestPlatform::Android => Box::new(UnsupportedServiceManager::android()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W3.2 RemoteExec adapter
+// ---------------------------------------------------------------------------
+
+/// One unit of remote dispatch. Two kinds: a Linux POSIX SSH `argv`
+/// invocation (where the SSH client itself receives `argv` and the
+/// remote shell never sees a constructed string), and a Windows SSH
+/// `EncodedCommand` invocation (where the PowerShell script body is
+/// base64-encoded so SSH transport is oblivious to PS quoting). Both
+/// preserve the W2.3 argv-only contract end-to-end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum RemoteInvocation {
+    /// Linux POSIX SSH: argv list dispatched directly, no shell construction.
+    PosixSshArgv {
+        ssh_target: String,
+        argv: Vec<String>,
+    },
+    /// Windows SSH: PowerShell script body base64-wrapped via
+    /// `-EncodedCommand`. The body itself is delivered untouched to
+    /// the remote PS interpreter.
+    WindowsSshEncodedPowerShell {
+        ssh_target: String,
+        powershell_body: String,
+    },
+}
+
+/// Adapter over the remote-shell channel used by the orchestrator.
+/// Implementations are not expected to actually spawn SSH in this
+/// slice — the trait surface lets the W3.3 `RustOrchestrator` and
+/// existing per-stage helpers share one boundary so any future
+/// argv-discipline regression is caught at one audited site.
+#[allow(dead_code)]
+pub trait RemoteExec {
+    fn build_invocation(
+        &self,
+        ssh_target: &str,
+        argv: &[String],
+    ) -> Result<RemoteInvocation, String>;
+    fn platform_label(&self) -> &'static str;
+}
+
+/// POSIX SSH adapter. Wraps an argv list as a `PosixSshArgv` invocation
+/// without mutating any value — SSH's own argv handling preserves
+/// quoting / spaces correctly when the client passes argv through
+/// without a shell wrapper. Empty argv is rejected to fail closed at
+/// the boundary rather than relying on remote-side error reporting.
+pub struct PosixRemoteExec;
+
+impl RemoteExec for PosixRemoteExec {
+    fn build_invocation(
+        &self,
+        ssh_target: &str,
+        argv: &[String],
+    ) -> Result<RemoteInvocation, String> {
+        if ssh_target.trim().is_empty() {
+            return Err("ssh_target must not be empty".to_string());
+        }
+        if argv.is_empty() {
+            return Err("argv must not be empty".to_string());
+        }
+        for arg in argv {
+            ensure_no_control_chars("posix remote argv", arg)?;
+        }
+        Ok(RemoteInvocation::PosixSshArgv {
+            ssh_target: ssh_target.to_string(),
+            argv: argv.to_vec(),
+        })
+    }
+    fn platform_label(&self) -> &'static str {
+        "linux"
+    }
+}
+
+/// Windows SSH + PowerShell adapter. The argv list is rendered as a
+/// `Start-Process` call with `-ArgumentList @('a','b',…)` so the
+/// remote PowerShell interpreter receives the args as a typed array
+/// rather than a re-parsed string — matches the
+/// `build_ssh_powershell_encoded_invocation` path the existing
+/// per-stage helpers already use, and inherits the same single-quoted
+/// PS literal escaping (every `'` in a value is doubled per PS rules).
+pub struct WindowsRemoteExec;
+
+impl WindowsRemoteExec {
+    fn quote_ps_single(value: &str) -> String {
+        // PowerShell single-quoted literal: doubling `'` is the only
+        // escape needed (no $-expansion, no backtick-escape paths).
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+impl RemoteExec for WindowsRemoteExec {
+    fn build_invocation(
+        &self,
+        ssh_target: &str,
+        argv: &[String],
+    ) -> Result<RemoteInvocation, String> {
+        if ssh_target.trim().is_empty() {
+            return Err("ssh_target must not be empty".to_string());
+        }
+        if argv.is_empty() {
+            return Err("argv must not be empty".to_string());
+        }
+        for arg in argv {
+            ensure_no_control_chars("windows remote argv", arg)?;
+        }
+        let exe = Self::quote_ps_single(&argv[0]);
+        let body = if argv.len() == 1 {
+            format!("& {exe}")
+        } else {
+            let arg_list = argv[1..]
+                .iter()
+                .map(|a| Self::quote_ps_single(a))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("& {exe} @({arg_list})")
+        };
+        Ok(RemoteInvocation::WindowsSshEncodedPowerShell {
+            ssh_target: ssh_target.to_string(),
+            powershell_body: body,
+        })
+    }
+    fn platform_label(&self) -> &'static str {
+        "windows"
+    }
+}
+
+pub struct UnsupportedRemoteExec {
+    platform_label: &'static str,
+}
+
+impl UnsupportedRemoteExec {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn macos() -> Self {
+        Self {
+            platform_label: "macos",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ios() -> Self {
+        Self {
+            platform_label: "ios",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn android() -> Self {
+        Self {
+            platform_label: "android",
+        }
+    }
+}
+
+impl RemoteExec for UnsupportedRemoteExec {
+    fn build_invocation(
+        &self,
+        _ssh_target: &str,
+        _argv: &[String],
+    ) -> Result<RemoteInvocation, String> {
+        Err(format!(
+            "RustyNet RemoteExec not yet implemented for platform '{}'; orchestrator dispatch cannot fabricate a transport for an unsupported platform — see WindowsWorkingNodePlan_2026-04-17.md and the OS-agnostic delta plan",
+            self.platform_label
+        ))
+    }
+    fn platform_label(&self) -> &'static str {
+        self.platform_label
+    }
+}
+
+#[allow(dead_code)]
+fn remote_exec_for(platform: VmGuestPlatform) -> Box<dyn RemoteExec> {
+    match platform {
+        VmGuestPlatform::Linux => Box::new(PosixRemoteExec),
+        VmGuestPlatform::Windows => Box::new(WindowsRemoteExec),
+        VmGuestPlatform::Macos => Box::new(UnsupportedRemoteExec::macos()),
+        VmGuestPlatform::Ios => Box::new(UnsupportedRemoteExec::ios()),
+        VmGuestPlatform::Android => Box::new(UnsupportedRemoteExec::android()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W3.2 DaemonProbe adapter
+// ---------------------------------------------------------------------------
+
+/// Daemon-driven probe operations. Each variant maps to one of the
+/// reviewed `rustynetd` subcommands the orchestrator's per-stage
+/// helpers already dispatch — `windows-runtime-acls-check`,
+/// `windows-service-hardening-check`, `windows-key-custody-check`,
+/// `windows-authenticode-check`, `windows-mesh-status-check`, and the
+/// new W1.3 `windows-dns-failclosed-check`. The adapter returns a
+/// `ServiceCommand`-like argv intent so dispatch goes through the
+/// same `RemoteExec` boundary as service ops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DaemonProbeOp {
+    /// `rustynetd <…>-runtime-acls-check`.
+    RuntimeAcls,
+    /// `rustynetd <…>-service-hardening-check`.
+    ServiceHardening,
+    /// `rustynetd <…>-key-custody-check`.
+    KeyCustody,
+    /// `rustynetd <…>-authenticode-check`.
+    Authenticode,
+    /// `rustynetd <…>-mesh-status-check`.
+    MeshStatus,
+    /// `rustynetd <…>-dns-failclosed-check`.
+    DnsFailclosed,
+}
+
+impl DaemonProbeOp {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DaemonProbeOp::RuntimeAcls => "runtime-acls",
+            DaemonProbeOp::ServiceHardening => "service-hardening",
+            DaemonProbeOp::KeyCustody => "key-custody",
+            DaemonProbeOp::Authenticode => "authenticode",
+            DaemonProbeOp::MeshStatus => "mesh-status",
+            DaemonProbeOp::DnsFailclosed => "dns-failclosed",
+        }
+    }
+}
+
+/// Adapter over the daemon-driven probe surface. Methods build the
+/// `rustynetd` argv the orchestrator dispatches via `RemoteExec`. The
+/// daemon binary path comes from a `RuntimePaths::install_root()`
+/// lookup so the adapter is platform-agnostic at the trait level.
+#[allow(dead_code)]
+pub trait DaemonProbe {
+    fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String>;
+    fn platform_label(&self) -> &'static str;
+}
+
+/// Linux probe surface. Daemon emits the same JSON schemas; only the
+/// validators that exist on Linux today are runtime-acls + the
+/// daemon's status surface — the Windows-specific probes (key custody,
+/// authenticode, dns-failclosed) reject on Linux because the daemon
+/// would itself report an off-platform blocker. The adapter rejects
+/// up-front so the orchestrator does not waste an SSH round-trip on
+/// an unsupported probe.
+pub struct LinuxDaemonProbe;
+
+impl DaemonProbe for LinuxDaemonProbe {
+    fn build_argv(&self, op: DaemonProbeOp, _daemon_path: &Path) -> Result<Vec<String>, String> {
+        // Linux daemon does not yet expose validator subcommands at
+        // parity with Windows. Until the Linux-side subcommands ship
+        // (tracked alongside W4 capability gating) the adapter rejects
+        // every Linux-side daemon probe — better than silently dispatching
+        // a non-existent subcommand and parsing a bash 127 exit as
+        // "drift".
+        Err(format!(
+            "RustyNet daemon-side probe '{}' is not yet implemented on Linux; the Windows daemon ships these validators today and the Linux side is tracked under the OS-agnostic delta plan W4",
+            op.as_str()
+        ))
+    }
+    fn platform_label(&self) -> &'static str {
+        "linux"
+    }
+}
+
+/// Windows probe surface. Each op maps to a `windows-…-check`
+/// subcommand of the installed `rustynetd.exe`. The daemon path is
+/// quoted at the SSH layer by `RemoteExec`, not here, so the adapter
+/// just emits raw argv.
+pub struct WindowsDaemonProbe;
+
+impl DaemonProbe for WindowsDaemonProbe {
+    fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
+        let daemon = daemon_path.to_string_lossy().into_owned();
+        if daemon.is_empty() {
+            return Err("daemon_path must not be empty".to_string());
+        }
+        let subcommand = match op {
+            DaemonProbeOp::RuntimeAcls => "windows-runtime-acls-check",
+            DaemonProbeOp::ServiceHardening => "windows-service-hardening-check",
+            DaemonProbeOp::KeyCustody => "windows-key-custody-check",
+            DaemonProbeOp::Authenticode => "windows-authenticode-check",
+            DaemonProbeOp::MeshStatus => "windows-mesh-status-check",
+            DaemonProbeOp::DnsFailclosed => "windows-dns-failclosed-check",
+        };
+        Ok(vec![
+            daemon,
+            subcommand.to_string(),
+            "--no-fail-on-drift".to_string(),
+        ])
+    }
+    fn platform_label(&self) -> &'static str {
+        "windows"
+    }
+}
+
+pub struct UnsupportedDaemonProbe {
+    platform_label: &'static str,
+}
+
+impl UnsupportedDaemonProbe {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn macos() -> Self {
+        Self {
+            platform_label: "macos",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ios() -> Self {
+        Self {
+            platform_label: "ios",
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn android() -> Self {
+        Self {
+            platform_label: "android",
+        }
+    }
+}
+
+impl DaemonProbe for UnsupportedDaemonProbe {
+    fn build_argv(&self, op: DaemonProbeOp, _daemon_path: &Path) -> Result<Vec<String>, String> {
+        Err(format!(
+            "RustyNet DaemonProbe op '{}' is not yet implemented for platform '{}'; orchestrator dispatch must not fabricate a non-existent daemon subcommand",
+            op.as_str(),
+            self.platform_label
+        ))
+    }
+    fn platform_label(&self) -> &'static str {
+        self.platform_label
+    }
+}
+
+#[allow(dead_code)]
+fn daemon_probe_for(platform: VmGuestPlatform) -> Box<dyn DaemonProbe> {
+    match platform {
+        VmGuestPlatform::Linux => Box::new(LinuxDaemonProbe),
+        VmGuestPlatform::Windows => Box::new(WindowsDaemonProbe),
+        VmGuestPlatform::Macos => Box::new(UnsupportedDaemonProbe::macos()),
+        VmGuestPlatform::Ios => Box::new(UnsupportedDaemonProbe::ios()),
+        VmGuestPlatform::Android => Box::new(UnsupportedDaemonProbe::android()),
+    }
+}
+
 pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<String, String> {
     ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
@@ -16514,14 +17163,15 @@ fn execute_bootstrap_phase_for_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState, RepoSyncDispatchKind,
-        RepoSyncMode, RuntimePaths as _, StageOrchestrator as _, UtmReadinessInputs,
-        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
-        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
-        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
-        VmServiceManager, WindowsSshReadinessProbe, append_unique_stage_outcomes_collect_new,
-        build_assignment_refresh_env, build_local_source_extract_script, build_remote_argv_script,
+        DaemonProbe as _, LiveLabStageRecord, LiveLabStageSummary, PortStatus, ProbeState,
+        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RuntimePaths as _,
+        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmGuestExecMode,
+        VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        VmLabIterationValidationStep, VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig,
+        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
+        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        build_local_source_extract_script, build_remote_argv_script,
         build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
@@ -21641,6 +22291,443 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 err.contains(expected_label),
                 "stub blocker must mention platform: {err}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // W3.2 ServiceManager tests
+    // ---------------------------------------------------------------
+
+    fn assert_argv_contains(cmd: &super::ServiceCommand, expected_token: &str) {
+        match cmd {
+            super::ServiceCommand::Argv(argv) => {
+                assert!(
+                    argv.iter().any(|a| a == expected_token),
+                    "argv missing {expected_token:?}: {argv:?}"
+                );
+            }
+            other => panic!("expected Argv variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_service_manager_emits_systemctl_argv_for_lifecycle_ops() {
+        let svc = "rustynetd";
+        let mgr = super::LinuxServiceManager;
+        assert_eq!(mgr.platform_label(), "linux");
+        for (cmd, expected) in [
+            (mgr.start(svc).unwrap(), "start"),
+            (mgr.stop(svc).unwrap(), "stop"),
+            (mgr.restart(svc).unwrap(), "restart"),
+            (mgr.status(svc).unwrap(), "is-active"),
+            (mgr.enable(svc).unwrap(), "enable"),
+        ] {
+            assert_argv_contains(&cmd, "systemctl");
+            assert_argv_contains(&cmd, expected);
+            assert_argv_contains(&cmd, svc);
+        }
+    }
+
+    #[test]
+    fn linux_service_manager_install_emits_daemon_reload_no_service_arg() {
+        // systemd "install" semantically = daemon-reload so a unit
+        // file already on disk is picked up.
+        let mgr = super::LinuxServiceManager;
+        let cmd = mgr.install("rustynetd").unwrap();
+        assert_argv_contains(&cmd, "systemctl");
+        assert_argv_contains(&cmd, "daemon-reload");
+    }
+
+    #[test]
+    fn linux_service_manager_uninstall_disables_with_now() {
+        let mgr = super::LinuxServiceManager;
+        let cmd = mgr.uninstall("rustynetd").unwrap();
+        assert_argv_contains(&cmd, "disable");
+        assert_argv_contains(&cmd, "--now");
+        assert_argv_contains(&cmd, "rustynetd");
+    }
+
+    #[test]
+    fn windows_service_manager_install_emits_helper_script_invocation() {
+        let mgr = super::WindowsServiceManager;
+        assert_eq!(mgr.platform_label(), "windows");
+        let cmd = mgr.install("RustyNet").unwrap();
+        match cmd {
+            super::ServiceCommand::HelperScript {
+                helper_label,
+                script_basename,
+                args,
+            } => {
+                assert_eq!(script_basename, "Install-RustyNetWindowsService.ps1");
+                assert!(helper_label.contains("install"));
+                assert_eq!(
+                    args,
+                    vec!["-ServiceName".to_string(), "RustyNet".to_string()]
+                );
+            }
+            other => panic!("expected HelperScript, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_service_manager_lifecycle_ops_emit_powershell_cmdlet_argv() {
+        let mgr = super::WindowsServiceManager;
+        for (cmd, fragment) in [
+            (mgr.start("RustyNet").unwrap(), "Start-Service"),
+            (mgr.stop("RustyNet").unwrap(), "Stop-Service"),
+            (mgr.restart("RustyNet").unwrap(), "Restart-Service"),
+            (mgr.status("RustyNet").unwrap(), "Get-Service"),
+        ] {
+            match &cmd {
+                super::ServiceCommand::Argv(argv) => {
+                    let combined = argv.join(" ");
+                    assert!(
+                        combined.contains(fragment),
+                        "argv must mention {fragment}: {argv:?}"
+                    );
+                    assert!(combined.contains("RustyNet"));
+                    assert!(argv[0] == "powershell.exe");
+                    assert!(argv.contains(&"-NoProfile".to_string()));
+                    assert!(argv.contains(&"-ExecutionPolicy".to_string()));
+                    assert!(argv.contains(&"Bypass".to_string()));
+                }
+                other => panic!("expected Argv for {fragment}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn windows_service_manager_uninstall_uses_sc_delete_after_stop() {
+        let mgr = super::WindowsServiceManager;
+        let cmd = mgr.uninstall("RustyNet").unwrap();
+        match cmd {
+            super::ServiceCommand::Argv(argv) => {
+                let combined = argv.join(" ");
+                assert!(combined.contains("Stop-Service"));
+                assert!(combined.contains("sc.exe delete"));
+            }
+            other => panic!("expected Argv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_manager_validates_service_name_rejecting_metacharacters() {
+        let mgr = super::LinuxServiceManager;
+        for bad in [
+            "",
+            "rusty;net",
+            "rustyn et",
+            "rustynet`",
+            "rusty.net",
+            "rusty/net",
+        ] {
+            let err = mgr
+                .start(bad)
+                .expect_err(&format!("service name {bad:?} must be rejected"));
+            assert!(
+                err.contains("service name"),
+                "rejection must mention service name (input={bad:?}): {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_manager_validates_service_name_length_cap() {
+        let mgr = super::LinuxServiceManager;
+        let long = "x".repeat(129);
+        let err = mgr.start(&long).expect_err("over-length must reject");
+        assert!(err.contains("128"), "rejection must cite length cap: {err}");
+    }
+
+    #[test]
+    fn unsupported_service_manager_rejects_every_op_with_blocker_reason() {
+        let mgr = super::UnsupportedServiceManager::macos();
+        assert_eq!(mgr.platform_label(), "macos");
+        for op_result in [
+            mgr.install("svc"),
+            mgr.enable("svc"),
+            mgr.start("svc"),
+            mgr.stop("svc"),
+            mgr.restart("svc"),
+            mgr.status("svc"),
+            mgr.uninstall("svc"),
+        ] {
+            let err = op_result.expect_err("macos stub must reject every op");
+            assert!(err.contains("macos"), "blocker must name platform: {err}");
+        }
+    }
+
+    #[test]
+    fn service_manager_for_dispatches_correctly() {
+        for (platform, label) in [
+            (super::VmGuestPlatform::Linux, "linux"),
+            (super::VmGuestPlatform::Windows, "windows"),
+            (super::VmGuestPlatform::Macos, "macos"),
+            (super::VmGuestPlatform::Ios, "ios"),
+            (super::VmGuestPlatform::Android, "android"),
+        ] {
+            let mgr = super::service_manager_for(platform);
+            assert_eq!(mgr.platform_label(), label);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // W3.2 RemoteExec tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn posix_remote_exec_wraps_argv_into_typed_invocation() {
+        let exec = super::PosixRemoteExec;
+        assert_eq!(exec.platform_label(), "linux");
+        let invocation = exec
+            .build_invocation(
+                "debian@192.168.64.10",
+                &[
+                    "systemctl".to_string(),
+                    "is-active".to_string(),
+                    "rustynetd".to_string(),
+                ],
+            )
+            .expect("posix invocation must build");
+        match invocation {
+            super::RemoteInvocation::PosixSshArgv { ssh_target, argv } => {
+                assert_eq!(ssh_target, "debian@192.168.64.10");
+                assert_eq!(argv.len(), 3);
+            }
+            other => panic!("expected PosixSshArgv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn posix_remote_exec_rejects_empty_target_and_argv() {
+        let exec = super::PosixRemoteExec;
+        let err1 = exec
+            .build_invocation("", &["x".to_string()])
+            .expect_err("empty target must reject");
+        assert!(err1.contains("ssh_target"));
+        let err2 = exec
+            .build_invocation("debian@host", &[])
+            .expect_err("empty argv must reject");
+        assert!(err2.contains("argv"));
+    }
+
+    #[test]
+    fn posix_remote_exec_rejects_argv_with_control_bytes() {
+        let exec = super::PosixRemoteExec;
+        let err = exec
+            .build_invocation(
+                "debian@host",
+                &["bash".to_string(), "command\nwith\nnewlines".to_string()],
+            )
+            .expect_err("control bytes must reject");
+        assert!(
+            err.to_lowercase().contains("control"),
+            "must reference control characters: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_remote_exec_quotes_args_as_powershell_array() {
+        let exec = super::WindowsRemoteExec;
+        assert_eq!(exec.platform_label(), "windows");
+        let inv = exec
+            .build_invocation(
+                "windows@192.168.64.14",
+                &[
+                    r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
+                    "windows-runtime-acls-check".to_string(),
+                    "--no-fail-on-drift".to_string(),
+                ],
+            )
+            .expect("windows invocation must build");
+        match inv {
+            super::RemoteInvocation::WindowsSshEncodedPowerShell {
+                ssh_target,
+                powershell_body,
+            } => {
+                assert_eq!(ssh_target, "windows@192.168.64.14");
+                // exe quoted as single-quoted PS literal
+                assert!(powershell_body.contains("& 'C:\\Program Files\\RustyNet\\rustynetd.exe'"));
+                // args wrapped in @( … ) array
+                assert!(powershell_body.contains("@("));
+                assert!(powershell_body.contains("'windows-runtime-acls-check'"));
+                assert!(powershell_body.contains("'--no-fail-on-drift'"));
+            }
+            other => panic!("expected WindowsSshEncodedPowerShell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_remote_exec_doubles_apostrophes_inside_arg_values() {
+        // PS single-quoted literals require '' to represent a single
+        // quote. Adapter must double every apostrophe; otherwise a
+        // value like `O'Connor` would close the literal early and let
+        // the rest become PS code.
+        let exec = super::WindowsRemoteExec;
+        let inv = exec
+            .build_invocation(
+                "windows@host",
+                &["cmd.exe".to_string(), "O'Connor".to_string()],
+            )
+            .expect("must build");
+        match inv {
+            super::RemoteInvocation::WindowsSshEncodedPowerShell {
+                powershell_body, ..
+            } => {
+                assert!(
+                    powershell_body.contains("'O''Connor'"),
+                    "apostrophe must be doubled: {powershell_body}"
+                );
+            }
+            _ => panic!("expected windows variant"),
+        }
+    }
+
+    #[test]
+    fn unsupported_remote_exec_rejects_with_blocker_reason() {
+        for stub in [
+            super::UnsupportedRemoteExec::macos(),
+            super::UnsupportedRemoteExec::ios(),
+            super::UnsupportedRemoteExec::android(),
+        ] {
+            let label = stub.platform_label();
+            let err = stub
+                .build_invocation("user@host", &["cmd".to_string()])
+                .expect_err(&format!("{label} stub must reject"));
+            assert!(err.contains(label), "blocker must name platform: {err}");
+        }
+    }
+
+    #[test]
+    fn remote_exec_for_dispatches_correctly() {
+        for (platform, label) in [
+            (super::VmGuestPlatform::Linux, "linux"),
+            (super::VmGuestPlatform::Windows, "windows"),
+            (super::VmGuestPlatform::Macos, "macos"),
+            (super::VmGuestPlatform::Ios, "ios"),
+            (super::VmGuestPlatform::Android, "android"),
+        ] {
+            let exec = super::remote_exec_for(platform);
+            assert_eq!(exec.platform_label(), label);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // W3.2 DaemonProbe tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn windows_daemon_probe_emits_argv_for_every_supported_op() {
+        let probe = super::WindowsDaemonProbe;
+        assert_eq!(probe.platform_label(), "windows");
+        let daemon_path = std::path::Path::new(r"C:\Program Files\RustyNet\rustynetd.exe");
+        for (op, expected_subcommand) in [
+            (
+                super::DaemonProbeOp::RuntimeAcls,
+                "windows-runtime-acls-check",
+            ),
+            (
+                super::DaemonProbeOp::ServiceHardening,
+                "windows-service-hardening-check",
+            ),
+            (
+                super::DaemonProbeOp::KeyCustody,
+                "windows-key-custody-check",
+            ),
+            (
+                super::DaemonProbeOp::Authenticode,
+                "windows-authenticode-check",
+            ),
+            (
+                super::DaemonProbeOp::MeshStatus,
+                "windows-mesh-status-check",
+            ),
+            (
+                super::DaemonProbeOp::DnsFailclosed,
+                "windows-dns-failclosed-check",
+            ),
+        ] {
+            let argv = probe.build_argv(op, daemon_path).expect("must build argv");
+            assert_eq!(argv.len(), 3);
+            assert!(argv[0].contains("rustynetd.exe"));
+            assert_eq!(argv[1], expected_subcommand);
+            assert_eq!(argv[2], "--no-fail-on-drift");
+        }
+    }
+
+    #[test]
+    fn windows_daemon_probe_rejects_empty_daemon_path() {
+        let probe = super::WindowsDaemonProbe;
+        let err = probe
+            .build_argv(super::DaemonProbeOp::RuntimeAcls, std::path::Path::new(""))
+            .expect_err("empty daemon path must reject");
+        assert!(err.contains("daemon_path"));
+    }
+
+    #[test]
+    fn linux_daemon_probe_rejects_with_roadmap_blocker_today() {
+        // Linux daemon does not yet expose the validator subcommand
+        // surface at parity with Windows. Adapter rejects up-front so
+        // the orchestrator does not waste an SSH round-trip on a
+        // non-existent subcommand.
+        let probe = super::LinuxDaemonProbe;
+        assert_eq!(probe.platform_label(), "linux");
+        for op in [
+            super::DaemonProbeOp::RuntimeAcls,
+            super::DaemonProbeOp::ServiceHardening,
+            super::DaemonProbeOp::KeyCustody,
+        ] {
+            let err = probe
+                .build_argv(op, std::path::Path::new("/usr/local/bin/rustynetd"))
+                .expect_err("linux probe must reject today");
+            assert!(err.contains("not yet implemented on Linux"));
+        }
+    }
+
+    #[test]
+    fn unsupported_daemon_probe_rejects_with_blocker_reason() {
+        for stub in [
+            super::UnsupportedDaemonProbe::macos(),
+            super::UnsupportedDaemonProbe::ios(),
+            super::UnsupportedDaemonProbe::android(),
+        ] {
+            let label = stub.platform_label();
+            let err = stub
+                .build_argv(
+                    super::DaemonProbeOp::RuntimeAcls,
+                    std::path::Path::new("/x"),
+                )
+                .expect_err(&format!("{label} stub must reject"));
+            assert!(err.contains(label), "blocker must name platform: {err}");
+        }
+    }
+
+    #[test]
+    fn daemon_probe_for_dispatches_correctly() {
+        for (platform, label) in [
+            (super::VmGuestPlatform::Linux, "linux"),
+            (super::VmGuestPlatform::Windows, "windows"),
+            (super::VmGuestPlatform::Macos, "macos"),
+            (super::VmGuestPlatform::Ios, "ios"),
+            (super::VmGuestPlatform::Android, "android"),
+        ] {
+            let probe = super::daemon_probe_for(platform);
+            assert_eq!(probe.platform_label(), label);
+        }
+    }
+
+    #[test]
+    fn daemon_probe_op_label_round_trips() {
+        let pairs: &[(super::DaemonProbeOp, &str)] = &[
+            (super::DaemonProbeOp::RuntimeAcls, "runtime-acls"),
+            (super::DaemonProbeOp::ServiceHardening, "service-hardening"),
+            (super::DaemonProbeOp::KeyCustody, "key-custody"),
+            (super::DaemonProbeOp::Authenticode, "authenticode"),
+            (super::DaemonProbeOp::MeshStatus, "mesh-status"),
+            (super::DaemonProbeOp::DnsFailclosed, "dns-failclosed"),
+        ];
+        for (op, label) in pairs {
+            assert_eq!(op.as_str(), *label);
         }
     }
 

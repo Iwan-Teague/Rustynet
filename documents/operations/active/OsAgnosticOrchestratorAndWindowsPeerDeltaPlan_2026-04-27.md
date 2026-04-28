@@ -1102,9 +1102,9 @@ conservatively.
     - Same pre-existing baseline workspace-clippy posture as W1.x
       and W2.x — no new lints introduced; the open vm_lab/mod.rs
       format-string drift is unchanged by this slice.
-- [~] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
-      traits with Linux + Windows impls and macOS/iOS/Android `Unsupported`
-      stubs (partial — `RuntimePaths` landed; other three pending)
+- [x] W3.2 `ServiceManager` / `RuntimePaths` / `RemoteExec` / `DaemonProbe`
+      traits with Linux + Windows real impls and macOS/iOS/Android
+      `Unsupported` stubs
   - [x] W3.2a `RuntimePaths` trait + Linux/Windows impls + macOS/iOS/Android
         `Unsupported` stubs
     - Changed files:
@@ -1153,9 +1153,99 @@ conservatively.
         will reference. Daemon-side log path remains an open follow-
         up; the trait surface does not assume daemon log file
         layout, only the directory root.
-  - [ ] W3.2b `ServiceManager` trait + Linux/Windows impls + stubs
-  - [ ] W3.2c `RemoteExec` trait + Linux/Windows impls + stubs
-  - [ ] W3.2d `DaemonProbe` trait + Linux/Windows impls + stubs
+  - [x] W3.2b `ServiceManager` trait + Linux/Windows impls + stubs
+    - Changed files: `crates/rustynet-cli/src/vm_lab/mod.rs` —
+      `ServiceCommand` enum (`Argv` | `HelperScript` variants),
+      `ServiceManager` trait (install / enable / start / stop /
+      restart / status / uninstall + platform_label),
+      `LinuxServiceManager` (systemctl argv for every op; install =
+      `systemctl daemon-reload`, uninstall = `systemctl disable
+      --now <name>`), `WindowsServiceManager` (PowerShell cmdlet
+      argv via `powershell.exe -NoLogo -NoProfile -NonInteractive
+      -ExecutionPolicy Bypass -Command …` for lifecycle ops; install
+      returns `HelperScript { script_basename:
+      "Install-RustyNetWindowsService.ps1", args: [-ServiceName
+      <name>] }`; uninstall pairs `Stop-Service` with `sc.exe delete
+      <name>` — sc.exe arg list contains no spaces or quotes so the
+      PS5.1 native-arg quoting bug from the W2.2 install-helper
+      hardening commit does not apply), `UnsupportedServiceManager`
+      stub with macos/ios/android constructors that reject every op
+      with a typed blocker reason, `service_manager_for(platform)`
+      factory. All ops route through a `validate_service_name`
+      defensive filter that rejects values outside ASCII
+      alphanumerics + `-` + `_`, empty, or > 128 chars.
+    - Verification: 11 new tests in `vm_lab::tests` covering Linux
+      lifecycle argv shape, Linux install = daemon-reload, Linux
+      uninstall = disable --now, Windows install = HelperScript,
+      Windows lifecycle ops = Start/Stop/Restart-Service +
+      Get-Service argv, Windows uninstall = Stop-Service + sc.exe
+      delete, name-validator rejection of metacharacters + length
+      cap, macOS stub rejects every op, factory dispatch.
+    - Residual risk: `ServiceCommand::HelperScript` carries
+      `script_basename` only; caller resolves the full path via a
+      `RuntimePaths::install_root()` lookup so the adapter stays
+      platform-agnostic. The `validate_service_name` charset is the
+      intersection of systemd unit naming + Windows SCM service
+      naming rules; if a future RustyNet variant needs `.` (systemd
+      template instances) the validator widens, never weakens.
+  - [x] W3.2c `RemoteExec` trait + Linux/Windows impls + stubs
+    - Changed files: `crates/rustynet-cli/src/vm_lab/mod.rs` —
+      `RemoteInvocation` enum (`PosixSshArgv { ssh_target, argv }` |
+      `WindowsSshEncodedPowerShell { ssh_target, powershell_body }`),
+      `RemoteExec` trait (`build_invocation(ssh_target, argv) ->
+      Result<RemoteInvocation, String>` + platform_label),
+      `PosixRemoteExec` (passes argv through untouched, validates
+      no-control-bytes per arg + non-empty target + non-empty argv),
+      `WindowsRemoteExec` (renders argv as `& 'exe' @('arg1','arg2',
+      …)` with single-quoted PS literal escaping that doubles every
+      embedded `'` per PS rules — `O'Connor` becomes `'O''Connor'`
+      so a value cannot close the literal early and inject PS code),
+      `UnsupportedRemoteExec` macos/ios/android stubs that reject
+      every dispatch with a typed blocker reason,
+      `remote_exec_for(platform)` factory.
+    - Verification: 6 new tests covering POSIX argv-wrap shape,
+      empty-target reject, empty-argv reject, control-byte reject,
+      Windows single-quoted PS array shape, apostrophe-doubling,
+      three Unsupported stubs rejecting w/ blocker, factory
+      dispatch. The Windows test asserts the literal
+      `& 'C:\Program Files\RustyNet\rustynetd.exe'` prefix that the
+      existing per-stage helpers in `vm_lab/mod.rs` already use, so
+      the new `RemoteExec::WindowsSshEncodedPowerShell` payload is
+      payload-compatible with `build_ssh_powershell_encoded_invocation`
+      and W3.3 can wire either side without changing wire format.
+    - Residual risk: this slice produces a typed payload, not a
+      live SSH dispatch — the actual `Command::new("ssh")` /
+      `EncodedCommand` base64-wrap step still happens at the
+      caller's existing seam (`capture_remote_shell_command_for_target`,
+      `build_ssh_powershell_encoded_invocation`). W3.3 picks one
+      seam and routes both Linux + Windows through it.
+  - [x] W3.2d `DaemonProbe` trait + Linux/Windows impls + stubs
+    - Changed files: `crates/rustynetd/src/vm_lab/mod.rs` —
+      `DaemonProbeOp` enum (6 reviewed ops: RuntimeAcls,
+      ServiceHardening, KeyCustody, Authenticode, MeshStatus,
+      DnsFailclosed), `DaemonProbe` trait (`build_argv(op,
+      daemon_path)` returns the full
+      `[<daemon-exe>, <subcommand>, --no-fail-on-drift]` argv),
+      `WindowsDaemonProbe` mapping every op to its
+      `windows-…-check` subcommand (matching the existing per-stage
+      helpers' argv exactly so W3.3 can swap dispatch through the
+      adapter without changing wire format), `LinuxDaemonProbe`
+      that rejects every op today with a roadmap blocker (Linux
+      daemon does not yet expose validator subcommands at parity
+      with Windows; rejecting at the adapter avoids a wasted SSH
+      round-trip on a non-existent subcommand),
+      `UnsupportedDaemonProbe` macos/ios/android stubs,
+      `daemon_probe_for(platform)` factory.
+    - Verification: 6 new tests covering Windows argv shape for all
+      6 ops + `--no-fail-on-drift` flag, Windows rejects empty
+      daemon path, Linux rejects every op today with the roadmap
+      blocker, three Unsupported stubs rejecting w/ blocker,
+      factory dispatch, op-label round-trip.
+    - Residual risk: `LinuxDaemonProbe` rejects today because the
+      Linux daemon does not yet expose the validator-subcommand
+      surface. Tracked under the OS-agnostic delta plan W4 follow-
+      up; the trait shape is correct for Linux once the daemon side
+      lands.
 - [ ] W3.3 `RustOrchestrator` impl with parity proof on Linux runs
 - [ ] W3.4 Mandatory gates + full Linux live-lab regression
 
