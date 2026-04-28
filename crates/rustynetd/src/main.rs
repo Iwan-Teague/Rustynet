@@ -31,6 +31,7 @@ use rustynetd::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
     parse_windows_backend_mode,
 };
+use rustynetd::windows_backend_readiness::collect_windows_backend_readiness_report;
 use rustynetd::windows_dns_failclosed::{
     build_windows_dns_failclosed_report, collect_windows_dns_failclosed_snapshot,
 };
@@ -107,6 +108,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "windows-dns-failclosed-check" => {
                 run_windows_dns_failclosed_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-backend-readiness-check" => {
+                run_windows_backend_readiness_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -464,6 +468,38 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed state"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_backend_readiness_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-backend-readiness-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_windows_backend_readiness_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize backend-readiness report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-backend-readiness-check reported drift; the windows-wireguard-nt backend cannot be enabled until the missing prerequisites are installed"
                 .to_string(),
         );
     }
@@ -1562,6 +1598,7 @@ fn help_text() -> String {
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
         "defaults:",
@@ -1640,9 +1677,9 @@ fn help_text() -> String {
 mod tests {
     use super::{
         help_text, parse_daemon_config, run_windows_authenticode_check_command,
-        run_windows_dns_failclosed_check_command, run_windows_key_custody_check_command,
-        run_windows_mesh_status_check_command, run_windows_runtime_acls_check_command,
-        run_windows_service_hardening_check_command,
+        run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
+        run_windows_key_custody_check_command, run_windows_mesh_status_check_command,
+        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -1933,6 +1970,44 @@ mod tests {
             err.contains("requires a Windows runtime host"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn help_text_advertises_windows_backend_readiness_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-backend-readiness-check"),
+            "help text must advertise windows-backend-readiness-check subcommand"
+        );
+    }
+
+    #[test]
+    fn run_windows_backend_readiness_check_command_rejects_unknown_flags() {
+        let err = run_windows_backend_readiness_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-backend-readiness-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_backend_readiness_check_command_off_windows_reports_drift() {
+        // Off-Windows the collector marks every entry probed=false
+        // with a "requires a Windows runtime host" reason; the
+        // evaluator surfaces that as drift; default behaviour fails
+        // closed.
+        let err = run_windows_backend_readiness_check_command(&[])
+            .expect_err("off-Windows host must fail closed");
+        assert!(err.contains("reported drift"), "unexpected error: {err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_windows_backend_readiness_check_command_no_fail_on_drift_off_windows_returns_ok() {
+        run_windows_backend_readiness_check_command(&["--no-fail-on-drift".to_string()])
+            .expect("--no-fail-on-drift must allow report-only execution off Windows");
     }
 
     #[test]

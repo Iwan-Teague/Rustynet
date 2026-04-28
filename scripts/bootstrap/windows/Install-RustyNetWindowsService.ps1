@@ -3,7 +3,19 @@ param(
     [string]$InstallRoot = 'C:\Program Files\RustyNet',
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
     [string]$ServiceName = 'RustyNet',
-    [string]$OutputPath = ''
+    [string]$OutputPath = '',
+    # Operator override: pin the daemon to the explicit fail-closed
+    # `windows-unsupported` backend even when WireGuard for Windows
+    # is detected on the host. Useful for staging / dry-run hosts
+    # where the operator wants the install pipeline to land but the
+    # daemon should not yet attempt to bring up real tunnels.
+    # Default behavior (auto-detect): if WireGuard for Windows is
+    # installed, the env file selects `--backend windows-wireguard-nt`
+    # so the daemon comes up on a working data-plane; if not, the
+    # env file selects `--backend windows-unsupported` and the
+    # daemon refuses to start until WireGuard for Windows is
+    # installed.
+    [switch]$ForceUnsupportedBackend
 )
 
 Set-StrictMode -Version Latest
@@ -362,16 +374,60 @@ function Set-RustyNetServiceFailureActions {
     }
 }
 
+function Resolve-ReviewedBackendLabel {
+    param(
+        [Parameter(Mandatory = $true)]$WireGuardProbe,
+        [Parameter(Mandatory = $true)][bool]$ForceUnsupported
+    )
+    # Decision matrix:
+    #   - operator passed -ForceUnsupportedBackend: ALWAYS use the
+    #     fail-closed label, irrespective of WireGuard presence.
+    #     This is the staging / dry-run path.
+    #   - WireGuard for Windows detected (canonical install path or
+    #     PATH match or WireGuardManager service registered): use
+    #     `windows-wireguard-nt` so the daemon brings up real
+    #     tunnels via wireguard.exe / wg.exe.
+    #   - WireGuard for Windows NOT detected: use
+    #     `windows-unsupported` so the daemon refuses to start
+    #     rather than failing later when it tries to call missing
+    #     binaries. Operator gets a precise blocker instead of a
+    #     mid-bringup crash.
+    if ($ForceUnsupported) {
+        return 'windows-unsupported'
+    }
+    if ($WireGuardProbe.present) {
+        return 'windows-wireguard-nt'
+    }
+    return 'windows-unsupported'
+}
+
 function Build-ReviewedDaemonArgsJson {
-    return (@('--backend', 'windows-unsupported') | ConvertTo-Json -Compress)
+    param([Parameter(Mandatory = $true)][string]$BackendLabel)
+    if ($BackendLabel -ne 'windows-unsupported' -and
+        $BackendLabel -ne 'windows-wireguard-nt') {
+        # Defense-in-depth: the only two labels the daemon's
+        # `parse_windows_backend_mode` accepts. A future caller
+        # threading an unknown label through this function gets a
+        # precise blocker rather than the daemon erroring at
+        # startup with "invalid Windows backend value".
+        throw ('Build-ReviewedDaemonArgsJson rejects unknown backend label: {0}' -f $BackendLabel)
+    }
+    return (@('--backend', $BackendLabel) | ConvertTo-Json -Compress)
 }
 
 function Write-ReviewedEnvFile {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BackendLabel
+    )
+    $banner = if ($BackendLabel -eq 'windows-wireguard-nt') {
+        '# Reviewed RustyNet Windows service host configuration. WireGuard for Windows detected; daemon will bring up tunnels via the wireguard.exe / wg.exe / netsh.exe toolchain.'
+    } else {
+        '# Reviewed RustyNet Windows service host configuration. WireGuard for Windows NOT detected (or operator passed -ForceUnsupportedBackend); the daemon will refuse to start until a reviewed backend is selected. Install WireGuard for Windows from https://www.wireguard.com/install/ and re-run the install helper to switch the daemon to windows-wireguard-nt.'
+    }
     @(
-        '# Reviewed RustyNet Windows service host configuration'
-        '# The current branch only provides windows-unsupported as an explicit fail-closed backend label.'
-        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson))
+        $banner
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel))
     ) | Out-File -Encoding ascii $Path
 }
 
@@ -417,7 +473,12 @@ if ($cliSource) {
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $script:InstallFailureStep = 'write-reviewed-env-file'
-Write-ReviewedEnvFile -Path $configPath
+$backendLabel = Resolve-ReviewedBackendLabel `
+    -WireGuardProbe $wireGuardProbe `
+    -ForceUnsupported ([bool]$ForceUnsupportedBackend)
+Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}, force-unsupported={2})" -f
+    $backendLabel, [bool]$wireGuardProbe.present, [bool]$ForceUnsupportedBackend)
+Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel
 
 $script:InstallFailureStep = 'probe-runtime-support'
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest

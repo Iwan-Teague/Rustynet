@@ -15,6 +15,7 @@ pub mod stun_client;
 pub mod traversal;
 pub mod windows_authenticode;
 pub mod windows_backend_gate;
+pub mod windows_backend_readiness;
 pub mod windows_dns_failclosed;
 pub mod windows_ipc;
 pub mod windows_key_custody;
