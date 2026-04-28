@@ -1453,7 +1453,74 @@ conservatively.
       stages as skip-with-reason on Windows targets while
       Nftables / systemd-resolved-requiring stages fail-with-reason
       so the orchestrator never silently drops a security stage.
-- [ ] W4.2 Windows mesh-join stage
+- [x] W4.2 Windows mesh-join stage (verifier upgrade — membership +
+      assignment distribution to Windows is W4.2-followup)
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — promoted Stage 8 of
+      `run_windows_orchestration_stages_with_options` from a
+      hardcoded `VmLabStageStatus::Skipped` to a real verifier
+      dispatch. The new path mirrors the W2.1 / W2.4 / W1.4 pattern:
+      dry-run + per-prereq-stage skip cascade (skip when bootstrap /
+      install / runtime-acls / hardening / key-custody /
+      authenticode / dns-failclosed didn't pass), otherwise
+      dispatches `& 'C:\Program Files\RustyNet\rustynetd.exe'
+      windows-mesh-status-check --no-fail-on-drift` over the existing
+      argv-only PowerShell-encoded SSH channel via
+      `build_windows_security_check_invocation`, parses the typed
+      `WindowsMeshStatusReport` JSON, and emits a `Pass`/`Fail`
+      outcome with the raw report archived under
+      `report_dir/logs/validate_windows_mesh_join.log`. The pure
+      `evaluate_windows_mesh_join_report` evaluator splits success
+      vs drift handling per the existing pattern, including the
+      enum-variant match on `WindowsMeshSnapshotLoad` so the
+      success summary surfaces `peers=N age_seconds=M` from the
+      `Ok` variant and a precise self-inconsistency reason from the
+      other variants if a payload claims overall_ok=true but
+      reports a non-Ok load_status.
+    - Plus the cascading `pub` visibility fixes on
+      `VmPlatformProfile`, `VmRemoteShell`, `VmGuestExecMode`, and
+      `VmServiceManager` — these are now exposed via the W4.1
+      `target_capabilities(VmPlatformProfile)` public function so
+      they need to match its visibility. No behavior change; the
+      types were already widely used module-private and now match
+      the trait surface introduced in W3.2.
+  - Verification:
+    - `cargo fmt -p rustynet-cli -p rustynetd -- --check` clean.
+    - `cargo build --workspace` clean (pre-existing
+      `run_host_reboot` warning only).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 447 / 447
+      pass (was 442). +5 new evaluator tests in `vm_lab::tests`:
+      reviewed payload accept w/ identity-rich summary
+      (`peers=2 age_seconds=12`), missing-state drift reject,
+      schema-version reject, overall_ok=false-with-empty-drift-
+      reasons inconsistency reject, malformed JSON reject.
+    - `cargo test -p rustynetd` unchanged: 439 lib + 52 bin + 3
+      integration. No rustynetd APIs touched.
+  - Residual risk:
+    - **Verifier-only slice.** This commit lands the
+      orchestrator-side stage upgrade — the daemon-side
+      `windows-mesh-status-check` subcommand has shipped since
+      the original W4.2 daemon-side work, so the orchestrator
+      path is now end-to-end. What's still pending is **the other
+      half of W4.2**: the actual membership + assignment
+      distribution to the Windows guest (the bash orchestrator's
+      `distribute_membership_state` /
+      `issue_and_distribute_assignments` /
+      `issue_and_distribute_traversal` stages target Linux peers
+      only today). When that distribution lands the verifier here
+      gains live evidence rather than expected `state snapshot
+      missing` drift.
+    - On the current Windows VM (running the
+      `windows-unsupported` backend label per
+      `WindowsWorkingNodePlan_2026-04-17.md`) the stage will
+      report drift because no `rustynetd.state` file appears.
+      That drift is honest — the Windows daemon hasn't been
+      asked to join a mesh yet — and matches the "not yet
+      joined" posture documented under W2.4 (key custody) +
+      W1.3 (DNS fail-closed) verifier slices. The orchestrator's
+      stage record is `Fail` in that case; once the
+      distribution-side work lands the same probe will return
+      `Pass` with a peer count + age summary.
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

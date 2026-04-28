@@ -660,7 +660,7 @@ impl VmGuestPlatform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum VmRemoteShell {
+pub enum VmRemoteShell {
     Posix,
     Powershell,
     Unsupported,
@@ -687,7 +687,7 @@ impl VmRemoteShell {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum VmGuestExecMode {
+pub enum VmGuestExecMode {
     LinuxBash,
     MacosPosix,
     WindowsPowershell,
@@ -717,7 +717,7 @@ impl VmGuestExecMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum VmServiceManager {
+pub enum VmServiceManager {
     Systemd,
     Launchd,
     WindowsService,
@@ -746,11 +746,11 @@ impl VmServiceManager {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VmPlatformProfile {
-    platform: VmGuestPlatform,
-    remote_shell: VmRemoteShell,
-    guest_exec_mode: VmGuestExecMode,
-    service_manager: VmServiceManager,
+pub struct VmPlatformProfile {
+    pub platform: VmGuestPlatform,
+    pub remote_shell: VmRemoteShell,
+    pub guest_exec_mode: VmGuestExecMode,
+    pub service_manager: VmServiceManager,
 }
 
 fn controller_utm_name(controller: Option<&VmController>) -> Option<&str> {
@@ -6838,14 +6838,114 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
-    // Stage 8: validate_windows_mesh_join (deferred — mesh distribution to Windows not yet implemented)
-    let mesh_join_outcome = stage_outcome(
-        "validate_windows_mesh_join",
-        VmLabStageStatus::Skipped,
-        "Windows mesh join validation requires membership/assignment distribution to Windows \
-         nodes (not yet implemented in Linux shell orchestrator); bootstrap stages passed",
-        vec![],
-    );
+    let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 8: validate_windows_mesh_join (W4.2)
+    // Dispatches `rustynetd windows-mesh-status-check --no-fail-on-drift`
+    // on the live Windows guest, parses the typed JSON snapshot of
+    // `C:\ProgramData\RustyNet\rustynetd.state`, and emits a Pass/Fail
+    // outcome based on whether the daemon has loaded a current
+    // membership + assignment snapshot. Today the Windows daemon ships
+    // on the `windows-unsupported` backend label so the state file
+    // does not yet appear; the stage will report
+    // `state snapshot missing` as drift, matching the honest "not yet
+    // joined" posture documented under W2.4 (key custody) +
+    // W1.3 (DNS fail-closed) verifier slices. Membership +
+    // assignment distribution itself — the other half of W4.2 — lands
+    // in a follow-up slice that exercises the new Windows IPC path
+    // landed in commit 3e34b19 (Windows daemon control-pipe IPC +
+    // install-service e2e flow). When that follow-up lands the
+    // verifier here gains live evidence rather than expected drift.
+    let mesh_join_log_path = logs_dir.join("validate_windows_mesh_join.log");
+    let mesh_join_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows mesh-join state on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !custody_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_key_custody did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !authenticode_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_authenticode did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "validate_windows_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_mesh_join_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&mesh_join_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_mesh_join",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![mesh_join_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&mesh_join_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_mesh_join",
+                    VmLabStageStatus::Fail,
+                    format!("Windows mesh-join validation failed for {windows_alias}: {reason}"),
+                    vec![mesh_join_log_path.clone()],
+                )
+            }
+        }
+    };
 
     vec![
         bootstrap_outcome,
@@ -7381,6 +7481,112 @@ fn evaluate_windows_dns_failclosed_report(
         "Windows DNS fail-closed verified on {windows_alias} ({} interfaces, {} NRPT rules)",
         report.snapshot.interfaces.len(),
         report.snapshot.nrpt_rules.len()
+    ))
+}
+
+fn run_validate_windows_mesh_join_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-mesh-status-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-mesh-status-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    evaluate_windows_mesh_join_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+/// Pure evaluator for the JSON output of `rustynetd
+/// windows-mesh-status-check`. Returns a one-line success summary
+/// when the daemon reports a current membership + assignment
+/// snapshot, or a precise drift reason. Callable in tests without
+/// SSH/IO.
+fn evaluate_windows_mesh_join_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_mesh_status::WindowsMeshStatusReport =
+        serde_json::from_str(raw_json)
+            .map_err(|err| format!("parse windows-mesh-status-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-mesh-status-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if !report.overall_ok {
+        let reasons = if report.drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_string()
+        } else {
+            report.drift_reasons.join("; ")
+        };
+        return Err(format!("Windows mesh-join state drift detected: {reasons}"));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    let summary_detail = match &report.snapshot {
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok {
+            peer_ids,
+            age_seconds,
+            ..
+        } => format!("peers={} age_seconds={}", peer_ids.len(), age_seconds),
+        // The variants below would normally be drift cases handled
+        // above (overall_ok=false). They appear here only on a
+        // self-inconsistent payload — keep the summary informative
+        // rather than panicking.
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Missing { reason } => {
+            format!("inconsistent: load_status=missing reason={reason}")
+        }
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::IntegrityMismatch { reason } => {
+            format!("inconsistent: load_status=integrity-mismatch reason={reason}")
+        }
+        rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::InvalidFormat { reason } => {
+            format!("inconsistent: load_status=invalid-format reason={reason}")
+        }
+    };
+    Ok(format!(
+        "Windows mesh-join state verified on {windows_alias} ({summary_detail})"
     ))
 }
 
@@ -22279,6 +22485,100 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(
             err.contains("parse windows-dns-failclosed-check JSON output failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // W4.2 Windows mesh-join evaluator tests
+    // ---------------------------------------------------------------
+
+    fn reviewed_mesh_join_payload() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "state_path": "C:\\ProgramData\\RustyNet\\rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1_745_000_000,
+                "age_seconds": 12,
+                "peer_ids": ["debian-headless-1", "debian-headless-2"],
+                "selected_exit_node": "debian-headless-1",
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": []
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_mesh_join_report_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_mesh_join_report(
+            "windows-utm-1",
+            reviewed_mesh_join_payload().to_string().as_str(),
+        )
+        .expect("reviewed payload must validate");
+        assert!(
+            summary.contains("windows-utm-1")
+                && summary.contains("peers=2")
+                && summary.contains("age_seconds=12"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_mesh_join_report_rejects_missing_state_drift() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "state_path": "C:\\ProgramData\\RustyNet\\rustynetd.state",
+            "overall_ok": false,
+            "snapshot": {
+                "load_status": "missing",
+                "reason": "runtime state path is unreadable on this host: ..."
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": [
+                "state snapshot missing: runtime state path is unreadable on this host"
+            ]
+        });
+        let err =
+            super::evaluate_windows_mesh_join_report("windows-utm-1", payload.to_string().as_str())
+                .expect_err("missing state must fail");
+        assert!(
+            err.contains("state snapshot missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_mesh_join_report_rejects_unknown_schema_version() {
+        let mut payload = reviewed_mesh_join_payload();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err =
+            super::evaluate_windows_mesh_join_report("windows-utm-1", payload.to_string().as_str())
+                .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_mesh_join_report_rejects_inconsistent_overall_ok_false_no_reasons() {
+        let mut payload = reviewed_mesh_join_payload();
+        payload["overall_ok"] = serde_json::Value::Bool(false);
+        // drift_reasons stays empty
+        let err =
+            super::evaluate_windows_mesh_join_report("windows-utm-1", payload.to_string().as_str())
+                .expect_err("overall_ok=false with no reasons must fail");
+        assert!(err.contains("output is inconsistent"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn evaluate_windows_mesh_join_report_rejects_malformed_json() {
+        let err = super::evaluate_windows_mesh_join_report("windows-utm-1", "{not valid json")
+            .expect_err("malformed JSON must fail");
+        assert!(
+            err.contains("parse windows-mesh-status-check JSON output failed"),
+            "unexpected: {err}"
         );
     }
 
