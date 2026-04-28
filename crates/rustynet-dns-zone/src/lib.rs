@@ -652,9 +652,62 @@ fn parse_expected_ip(
                     "record {index} expected_ip must be a unicast ipv4 address"
                 )));
             }
+            // Defense-in-depth (related to SecurityHardeningAudit B.4.1):
+            // a malicious zone-publisher must not be able to inject an
+            // expected_ip in a range that is universally-inappropriate
+            // for a mesh peer. The daemon's loopback resolver answer
+            // filter (B.4.1 proper) is still pending — once the
+            // protocol-level DNS responder lands the same posture
+            // applies at the resolver-output layer too. Until then,
+            // catching these at zone-bundle parse time is the strictest
+            // defense the signed-state contract can publish.
+            if is_universally_inappropriate_mesh_ipv4(&ip) {
+                return Err(DnsZoneError::InvalidFormat(format!(
+                    "record {index} expected_ip {} is in a range that cannot host a mesh peer (loopback, link-local, or RFC 5737 documentation)",
+                    ip
+                )));
+            }
             Ok(ip.to_string())
         }
     }
+}
+
+/// Returns true for IPv4 ranges that are universally inappropriate as
+/// a mesh-peer expected_ip — irrespective of operator network choices.
+/// The list is intentionally narrow: loopback, link-local APIPA, and
+/// the three RFC 5737 documentation ranges. RFC1918 ranges (10/8,
+/// 172.16-31/16, 192.168/16) are NOT rejected here because some
+/// operators legitimately deploy meshes inside their corporate RFC1918
+/// space; rejecting RFC1918 globally would break those deployments.
+/// An operator who wants to additionally constrain the mesh IP range
+/// to a specific allowlist publishes that constraint via a separate
+/// per-deployment policy gate (out of scope for the zone-bundle
+/// validator, which intentionally publishes only universally-true
+/// invariants).
+fn is_universally_inappropriate_mesh_ipv4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // Loopback: 127.0.0.0/8 — RFC 6890. Never a mesh peer.
+    if octets[0] == 127 {
+        return true;
+    }
+    // Link-local APIPA: 169.254.0.0/16 — RFC 3927.
+    if octets[0] == 169 && octets[1] == 254 {
+        return true;
+    }
+    // RFC 5737 documentation / TEST-NET-{1,2,3}.
+    // 192.0.2.0/24
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+        return true;
+    }
+    // 198.51.100.0/24
+    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+        return true;
+    }
+    // 203.0.113.0/24
+    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+        return true;
+    }
+    false
 }
 
 fn parse_aliases(value: &str, zone_name: &str, index: usize) -> Result<Vec<String>, DnsZoneError> {
@@ -800,6 +853,110 @@ mod tests {
         render_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle,
     };
     use ed25519_dalek::SigningKey;
+
+    fn build_bundle_with_expected_ip(
+        ip: &str,
+    ) -> Result<super::SignedDnsZoneBundle, super::DnsZoneError> {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        build_signed_dns_zone_bundle(
+            &signing_key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_string(),
+                target_node_id: "node-nas-1".to_string(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: ip.to_string(),
+                ttl_secs: 60,
+                aliases: vec![],
+            }],
+        )
+    }
+
+    #[test]
+    fn build_bundle_rejects_loopback_expected_ip() {
+        let err = build_bundle_with_expected_ip("127.0.0.1")
+            .expect_err("loopback expected_ip must be rejected");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("loopback") && reason.contains("127.0.0.1"),
+                    "rejection must cite loopback + the IP: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bundle_rejects_link_local_expected_ip() {
+        let err = build_bundle_with_expected_ip("169.254.42.1")
+            .expect_err("link-local expected_ip must be rejected");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("link-local"),
+                    "rejection must cite link-local: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bundle_rejects_documentation_expected_ip_test_net_1() {
+        let err = build_bundle_with_expected_ip("192.0.2.50")
+            .expect_err("RFC 5737 TEST-NET-1 expected_ip must be rejected");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("documentation"),
+                    "rejection must cite documentation range: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bundle_rejects_documentation_expected_ip_test_net_2() {
+        let err = build_bundle_with_expected_ip("198.51.100.5")
+            .expect_err("RFC 5737 TEST-NET-2 expected_ip must be rejected");
+        assert!(matches!(err, super::DnsZoneError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn build_bundle_rejects_documentation_expected_ip_test_net_3() {
+        let err = build_bundle_with_expected_ip("203.0.113.99")
+            .expect_err("RFC 5737 TEST-NET-3 expected_ip must be rejected");
+        assert!(matches!(err, super::DnsZoneError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn build_bundle_accepts_rfc1918_10_dot_space() {
+        // RFC1918 10/8 stays permissive — operators sometimes deploy
+        // mesh in their corporate 10.x space. The zone-bundle
+        // validator does not reject; per-deployment policy may
+        // narrow further (out of scope here).
+        build_bundle_with_expected_ip("10.0.0.5")
+            .expect("RFC1918 10.x must remain permissive at zone-bundle layer");
+    }
+
+    #[test]
+    fn build_bundle_accepts_rfc1918_192_168_dot_space() {
+        build_bundle_with_expected_ip("192.168.1.42")
+            .expect("RFC1918 192.168.x must remain permissive at zone-bundle layer");
+    }
+
+    #[test]
+    fn build_bundle_accepts_tailnet_style_100_dot_64_dot_space() {
+        build_bundle_with_expected_ip("100.68.1.10")
+            .expect("tailnet-style 100.64/10 mesh IP must be accepted");
+    }
 
     #[test]
     fn signed_bundle_roundtrip_verifies_and_preserves_records() {

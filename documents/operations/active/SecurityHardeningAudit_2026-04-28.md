@@ -556,10 +556,34 @@ matches or exceeds* the published Tailscale / WireGuard / Nebula
 practices on every reviewed axis. Open items are pure defense-in-
 depth additions, none security-bar:
 
-- **B.4.1 [MEDIUM, deferred]** Add an RFC1918-rebind rejection
-  filter on the daemon's loopback resolver output. Defense-in-depth
-  even though zone-bundle signing already gates the upstream of
-  trust.
+- **B.4.1 [MEDIUM, partially LANDED 2026-04-28]** The original
+  finding called for a resolver-output filter on the daemon's
+  loopback DNS responder. The protocol-level DNS responder code
+  itself is still pending (the daemon binds `dns_resolver_bind_addr`
+  but does not yet implement the DNS protocol handler), so a
+  resolver-output filter has nothing to filter today. **Landed in
+  this commit:** the related signed-zone-bundle-layer defense.
+  `parse_expected_ip` in `crates/rustynet-dns-zone/src/lib.rs`
+  now rejects records whose `expected_ip` is in a range that is
+  universally inappropriate for a mesh peer:
+    - Loopback (`127.0.0.0/8`, RFC 6890)
+    - Link-local APIPA (`169.254.0.0/16`, RFC 3927)
+    - RFC 5737 documentation / TEST-NET-1/2/3
+      (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`)
+  RFC1918 ranges (`10/8`, `172.16-31/16`, `192.168/16`) stay
+  permissive because some operators legitimately deploy meshes
+  inside their corporate RFC1918 space; rejecting RFC1918 globally
+  would break those deployments. This catches a malicious zone-
+  publisher who tries to inject loopback/link-local/test-net
+  expected_ip into a signed zone record at the bundle-validator
+  layer, matching the same threat class B.4.1 calls out at the
+  resolver-output layer. The resolver-output filter remains future-
+  work for when the protocol-level DNS responder lands; the same
+  posture applies there. Evidence: 8 new unit tests in
+  `rustynet-dns-zone/src/lib.rs` covering loopback / link-local /
+  3× documentation rejections + 3 explicit accepts (RFC1918 10/8,
+  RFC1918 192.168/16, tailnet-style 100.64/10). Commit:
+  to-be-filled-in by the next slice's commit message.
 - **B.8.1 [LOW, deferred]** Investigate `SidType = restricted` for
   the Windows service registration. Tighter posture than the
   current `unrestricted`; viability depends on existing runtime-ACL
