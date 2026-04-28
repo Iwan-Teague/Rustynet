@@ -8940,36 +8940,209 @@ fn ensure_live_lab_profile_platform_metadata(profile: &LiveLabProfile) -> Result
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// W4.1 LiveLabStageCapability machinery
+// ---------------------------------------------------------------------------
+
+/// Per-stage host-capability tag. Each live-lab stage that depends on
+/// a kernel / userland feature publishes its required capability set;
+/// a target satisfies the stage only when its `target_capabilities()`
+/// is a superset of the stage's requirement set.
+///
+/// Adding a new capability:
+/// - It MUST name a feature that is observable at orchestration time
+///   (i.e. derived from `VmPlatformProfile`, not from a runtime probe).
+/// - Capabilities expressing security guarantees (e.g. NFT default-
+///   deny enforcement) MUST follow CLAUDE.md §3.10: a target without
+///   the capability fails the stage rather than skipping it. Pure
+///   convenience capabilities (e.g. NETEM kernel-impairment for test
+///   stages) skip-with-reason.
+///
+/// The labels listed here mirror the eight reviewed stage-set
+/// dependencies the bash orchestrator (`scripts/e2e/live_linux_lab_orchestrator.sh`)
+/// currently encodes implicitly via its all-or-nothing `platform=linux`
+/// gate — surfacing them as typed capabilities lets W4.2+ heterogeneous
+/// dispatch decide per-stage rather than per-run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum LiveLabStageCapability {
+    /// POSIX-shell remote dispatch (SSH + bash).
+    PosixShell,
+    /// systemd unit lifecycle management on the target host.
+    Systemd,
+    /// Linux bash interpreter on the target host (the orchestrator
+    /// shell scripts are bash-specific; sh / zsh would not satisfy).
+    LinuxBashGuestExec,
+    /// `tc` / netem kernel network impairment (Linux-only kernel
+    /// feature; pure convenience for impairment-test stages).
+    NetemImpairment,
+    /// `nftables` ingress / egress filtering (Linux-only kernel
+    /// feature; security-bar capability for default-deny stages).
+    NftablesFiltering,
+    /// `systemd-resolved` DNS interception for the protected-mode
+    /// resolver bind (Linux-only userspace; security-bar for the
+    /// Linux DNS fail-closed stage).
+    SystemdResolvedDns,
+    /// Windows SCM service manager (lifecycle + service identity).
+    WindowsServiceManager,
+    /// Windows NRPT (Name Resolution Policy Table) for the
+    /// protected-mode DNS path (security-bar for the W1.3 verifier
+    /// + W1.4 stage).
+    WindowsNrptDns,
+    /// PowerShell SSH dispatch over the encoded-command channel.
+    WindowsPowershellShell,
+}
+
+impl LiveLabStageCapability {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveLabStageCapability::PosixShell => "posix-shell",
+            LiveLabStageCapability::Systemd => "systemd",
+            LiveLabStageCapability::LinuxBashGuestExec => "linux-bash-guest-exec",
+            LiveLabStageCapability::NetemImpairment => "netem-impairment",
+            LiveLabStageCapability::NftablesFiltering => "nftables-filtering",
+            LiveLabStageCapability::SystemdResolvedDns => "systemd-resolved-dns",
+            LiveLabStageCapability::WindowsServiceManager => "windows-service-manager",
+            LiveLabStageCapability::WindowsNrptDns => "windows-nrpt-dns",
+            LiveLabStageCapability::WindowsPowershellShell => "windows-powershell-shell",
+        }
+    }
+}
+
+/// Capabilities published by a target's platform profile. The lookup
+/// is a pure function of the profile (no runtime probe) so the
+/// orchestrator can compute the per-target capability set up-front
+/// before any SSH dispatch.
+#[allow(dead_code)]
+pub fn target_capabilities(profile: VmPlatformProfile) -> Vec<LiveLabStageCapability> {
+    let mut caps = Vec::new();
+    match profile.remote_shell {
+        VmRemoteShell::Posix => caps.push(LiveLabStageCapability::PosixShell),
+        VmRemoteShell::Powershell => caps.push(LiveLabStageCapability::WindowsPowershellShell),
+        VmRemoteShell::Unsupported => {}
+    }
+    match profile.service_manager {
+        VmServiceManager::Systemd => caps.push(LiveLabStageCapability::Systemd),
+        VmServiceManager::WindowsService => {
+            caps.push(LiveLabStageCapability::WindowsServiceManager)
+        }
+        VmServiceManager::Launchd | VmServiceManager::Unsupported => {}
+    }
+    if matches!(profile.guest_exec_mode, VmGuestExecMode::LinuxBash) {
+        caps.push(LiveLabStageCapability::LinuxBashGuestExec);
+    }
+    match profile.platform {
+        VmGuestPlatform::Linux => {
+            // Linux kernel + userspace bring tc/netem, nftables, and
+            // systemd-resolved into reach by default on the reviewed
+            // RustyNet Linux distros (debian-headless-*).
+            caps.push(LiveLabStageCapability::NetemImpairment);
+            caps.push(LiveLabStageCapability::NftablesFiltering);
+            caps.push(LiveLabStageCapability::SystemdResolvedDns);
+        }
+        VmGuestPlatform::Windows => {
+            caps.push(LiveLabStageCapability::WindowsNrptDns);
+        }
+        VmGuestPlatform::Macos | VmGuestPlatform::Ios | VmGuestPlatform::Android => {}
+    }
+    caps
+}
+
+/// Capability set the existing Linux bash orchestrator's stage list
+/// implicitly requires of every target. Today this is the strict
+/// 5×Linux all-or-nothing set the `ensure_live_lab_profile_linux_only`
+/// gate enforced; surfacing it as a typed list lets W4.2+ split the
+/// stages so individual stages can drop dependencies they don't need
+/// (e.g. a Windows-only validator stage drops `LinuxBashGuestExec`).
+#[allow(dead_code)]
+pub const LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES: &[LiveLabStageCapability] = &[
+    LiveLabStageCapability::PosixShell,
+    LiveLabStageCapability::Systemd,
+    LiveLabStageCapability::LinuxBashGuestExec,
+    LiveLabStageCapability::NftablesFiltering,
+    LiveLabStageCapability::SystemdResolvedDns,
+];
+
+/// Gate the orchestrator entry points on a typed capability list.
+/// Returns the list of `(role, target, missing_capabilities)` tuples
+/// for any target that does not advertise a superset of `required`.
+/// Each entry point chooses how to react: today every entry point
+/// rejects a non-empty result (matches the
+/// `ensure_live_lab_profile_linux_only` semantics this fn replaces).
+#[allow(dead_code)]
+fn live_lab_targets_missing_capabilities(
+    profile: &LiveLabProfile,
+    required: &[LiveLabStageCapability],
+) -> Result<Vec<(String, String, Vec<LiveLabStageCapability>)>, String> {
+    let mut blocked = Vec::new();
+    for (role, target, platform_profile) in configured_live_lab_target_platform_profiles(profile)? {
+        let caps = target_capabilities(platform_profile);
+        let missing: Vec<LiveLabStageCapability> = required
+            .iter()
+            .copied()
+            .filter(|cap| !caps.contains(cap))
+            .collect();
+        if !missing.is_empty() {
+            blocked.push((role, target, missing));
+        }
+    }
+    Ok(blocked)
+}
+
+/// Capability-driven gate. Orchestrator entry points call this with
+/// the per-stage-set required-capability list; a non-empty
+/// `missing` list rejects with a precise per-target reason. The
+/// `command_name` is included in the rejection blocker for
+/// downstream diagnose-live-lab-failure ergonomics.
+#[allow(dead_code)]
+fn ensure_live_lab_profile_capabilities(
+    profile: &LiveLabProfile,
+    required: &[LiveLabStageCapability],
+    command_name: &str,
+) -> Result<(), String> {
+    let blocked = live_lab_targets_missing_capabilities(profile, required)?;
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    let rendered = blocked
+        .into_iter()
+        .map(|(role, target, missing)| {
+            let labels = missing
+                .iter()
+                .map(|cap| cap.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("role={role} target={target} missing={labels}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "{command_name} requires capabilities [{}]; blocked targets: {rendered}",
+        required
+            .iter()
+            .map(|cap| cap.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
 fn ensure_live_lab_profile_linux_only(
     profile: &LiveLabProfile,
     command_name: &str,
 ) -> Result<(), String> {
-    let blocked = configured_live_lab_target_platform_profiles(profile)?
-        .into_iter()
-        .filter(|(_, _, platform_profile)| {
-            platform_profile.platform != VmGuestPlatform::Linux
-                || platform_profile.remote_shell != VmRemoteShell::Posix
-                || platform_profile.guest_exec_mode != VmGuestExecMode::LinuxBash
-                || platform_profile.service_manager != VmServiceManager::Systemd
-        })
-        .map(|(role, target, platform_profile)| {
-            format!(
-                "role={role} target={target} platform={} remote_shell={} guest_exec_mode={} service_manager={}",
-                platform_profile.platform.as_str(),
-                platform_profile.remote_shell.as_str(),
-                platform_profile.guest_exec_mode.as_str(),
-                platform_profile.service_manager.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
-    if blocked.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{command_name} requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd in the current Linux live-lab shell orchestrator; blocked targets: {}",
-            blocked.join("; ")
-        ))
-    }
+    // Delegate to the new capability-driven gate with the legacy
+    // Linux-bash-orchestrator capability set. Behavior preserved:
+    // any target that does not advertise the full Linux capability
+    // bundle still rejects with a precise reason, just rendered via
+    // the new capability vocabulary so downstream tooling can grep
+    // on stable capability labels rather than the older
+    // `platform=linux remote_shell=posix …` free-form string.
+    ensure_live_lab_profile_capabilities(
+        profile,
+        LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES,
+        command_name,
+    )
 }
 
 fn load_live_lab_profile(path: &Path) -> Result<LiveLabProfile, String> {
@@ -20105,10 +20278,20 @@ REPO_REF=\"HEAD\"\n",
         })
         .expect_err("non-linux live-lab targets must fail closed");
 
-        assert!(err.contains(
-            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
-        ));
-        assert!(err.contains("platform=windows"));
+        // W4.1 capability gate format: rejection enumerates the
+        // missing capability labels for each blocked target. A
+        // Windows target lacks the Linux kernel/userspace caps
+        // (`linux-bash-guest-exec`, `nftables-filtering`,
+        // `systemd-resolved-dns`) that the bash orchestrator's
+        // existing stage list still requires.
+        assert!(err.contains("requires capabilities"));
+        assert!(err.contains("blocked targets"));
+        assert!(err.contains("missing="));
+        assert!(
+            err.contains("linux-bash-guest-exec")
+                || err.contains("nftables-filtering")
+                || err.contains("systemd-resolved-dns")
+        );
 
         cleanup_temp_path(profile_path.as_path());
     }
@@ -20732,10 +20915,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         });
 
         let err = result.expect_err("windows profile must be blocked before shell invocation");
-        assert!(err.contains(
-            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
-        ));
-        assert!(err.contains("platform=windows"));
+        // W4.1 capability gate format.
+        assert!(err.contains("requires capabilities"));
+        assert!(err.contains("blocked targets"));
+        assert!(err.contains("missing="));
         assert!(
             !marker_path.exists(),
             "shell helper should not have executed"
@@ -20817,10 +21000,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
 
         let err =
             result.expect_err("windows profile must be blocked before setup shell invocation");
-        assert!(err.contains(
-            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
-        ));
-        assert!(err.contains("platform=windows"));
+        // W4.1 capability gate format.
+        assert!(err.contains("requires capabilities"));
+        assert!(err.contains("blocked targets"));
+        assert!(err.contains("missing="));
         assert!(
             !marker_path.exists(),
             "shell helper should not have executed"
@@ -20859,10 +21042,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         )
         .expect_err("windows live-lab diagnostics must fail closed before collection starts");
 
-        assert!(err.contains(
-            "requires platform=linux remote_shell=posix guest_exec_mode=linux_bash service_manager=systemd"
-        ));
-        assert!(err.contains("platform=windows"));
+        // W4.1 capability gate format.
+        assert!(err.contains("requires capabilities"));
+        assert!(err.contains("blocked targets"));
+        assert!(err.contains("missing="));
         assert!(
             !output_dir.exists(),
             "diagnostics output should not be created before the Linux-only guard passes"
@@ -22120,6 +22303,138 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    // ---------------------------------------------------------------
+    // W4.1 LiveLabStageCapability tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn target_capabilities_for_linux_advertises_kernel_userspace_set() {
+        let profile = super::VmPlatformProfile {
+            platform: super::VmGuestPlatform::Linux,
+            remote_shell: super::VmRemoteShell::Posix,
+            guest_exec_mode: super::VmGuestExecMode::LinuxBash,
+            service_manager: super::VmServiceManager::Systemd,
+        };
+        let caps = super::target_capabilities(profile);
+        assert!(caps.contains(&super::LiveLabStageCapability::PosixShell));
+        assert!(caps.contains(&super::LiveLabStageCapability::Systemd));
+        assert!(caps.contains(&super::LiveLabStageCapability::LinuxBashGuestExec));
+        assert!(caps.contains(&super::LiveLabStageCapability::NetemImpairment));
+        assert!(caps.contains(&super::LiveLabStageCapability::NftablesFiltering));
+        assert!(caps.contains(&super::LiveLabStageCapability::SystemdResolvedDns));
+        // Linux must NOT advertise Windows-only capabilities.
+        assert!(!caps.contains(&super::LiveLabStageCapability::WindowsServiceManager));
+        assert!(!caps.contains(&super::LiveLabStageCapability::WindowsNrptDns));
+        assert!(!caps.contains(&super::LiveLabStageCapability::WindowsPowershellShell));
+    }
+
+    #[test]
+    fn target_capabilities_for_windows_advertises_windows_only_set() {
+        let profile = super::VmPlatformProfile {
+            platform: super::VmGuestPlatform::Windows,
+            remote_shell: super::VmRemoteShell::Powershell,
+            guest_exec_mode: super::VmGuestExecMode::WindowsPowershell,
+            service_manager: super::VmServiceManager::WindowsService,
+        };
+        let caps = super::target_capabilities(profile);
+        assert!(caps.contains(&super::LiveLabStageCapability::WindowsPowershellShell));
+        assert!(caps.contains(&super::LiveLabStageCapability::WindowsServiceManager));
+        assert!(caps.contains(&super::LiveLabStageCapability::WindowsNrptDns));
+        // Windows must NOT advertise Linux-only kernel features.
+        assert!(!caps.contains(&super::LiveLabStageCapability::LinuxBashGuestExec));
+        assert!(!caps.contains(&super::LiveLabStageCapability::NftablesFiltering));
+        assert!(!caps.contains(&super::LiveLabStageCapability::NetemImpairment));
+        assert!(!caps.contains(&super::LiveLabStageCapability::SystemdResolvedDns));
+        assert!(!caps.contains(&super::LiveLabStageCapability::PosixShell));
+    }
+
+    #[test]
+    fn target_capabilities_for_macos_returns_minimal_unsupported_set() {
+        // macOS is a stub platform — its profile defaults reflect
+        // POSIX shell + Launchd which the capability lookup
+        // currently maps to a small set (PosixShell only). The
+        // important guarantee is that NO Linux-only kernel cap nor
+        // Windows-only cap appears.
+        let profile = super::VmPlatformProfile {
+            platform: super::VmGuestPlatform::Macos,
+            remote_shell: super::VmRemoteShell::Posix,
+            guest_exec_mode: super::VmGuestExecMode::MacosPosix,
+            service_manager: super::VmServiceManager::Launchd,
+        };
+        let caps = super::target_capabilities(profile);
+        assert!(caps.contains(&super::LiveLabStageCapability::PosixShell));
+        assert!(!caps.contains(&super::LiveLabStageCapability::LinuxBashGuestExec));
+        assert!(!caps.contains(&super::LiveLabStageCapability::Systemd));
+        assert!(!caps.contains(&super::LiveLabStageCapability::NftablesFiltering));
+        assert!(!caps.contains(&super::LiveLabStageCapability::WindowsNrptDns));
+    }
+
+    #[test]
+    fn live_lab_stage_capability_label_round_trips() {
+        let pairs: &[(super::LiveLabStageCapability, &str)] = &[
+            (super::LiveLabStageCapability::PosixShell, "posix-shell"),
+            (super::LiveLabStageCapability::Systemd, "systemd"),
+            (
+                super::LiveLabStageCapability::LinuxBashGuestExec,
+                "linux-bash-guest-exec",
+            ),
+            (
+                super::LiveLabStageCapability::NetemImpairment,
+                "netem-impairment",
+            ),
+            (
+                super::LiveLabStageCapability::NftablesFiltering,
+                "nftables-filtering",
+            ),
+            (
+                super::LiveLabStageCapability::SystemdResolvedDns,
+                "systemd-resolved-dns",
+            ),
+            (
+                super::LiveLabStageCapability::WindowsServiceManager,
+                "windows-service-manager",
+            ),
+            (
+                super::LiveLabStageCapability::WindowsNrptDns,
+                "windows-nrpt-dns",
+            ),
+            (
+                super::LiveLabStageCapability::WindowsPowershellShell,
+                "windows-powershell-shell",
+            ),
+        ];
+        for (cap, label) in pairs {
+            assert_eq!(cap.as_str(), *label);
+        }
+    }
+
+    #[test]
+    fn linux_only_required_capabilities_constant_matches_legacy_gate_intent() {
+        // The legacy gate required Linux+POSIX+systemd+linux-bash and
+        // implicitly Linux kernel features. The capability constant
+        // surfacing this set must include all the same checks; if a
+        // future cleanup widens the constant, this test pins the
+        // intent so the change is visible in review.
+        let required: std::collections::HashSet<_> =
+            super::LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES
+                .iter()
+                .copied()
+                .collect();
+        for cap in [
+            super::LiveLabStageCapability::PosixShell,
+            super::LiveLabStageCapability::Systemd,
+            super::LiveLabStageCapability::LinuxBashGuestExec,
+            super::LiveLabStageCapability::NftablesFiltering,
+            super::LiveLabStageCapability::SystemdResolvedDns,
+        ] {
+            assert!(
+                required.contains(&cap),
+                "linux-only capability constant must include {:?}",
+                cap
+            );
+        }
     }
 
     #[test]

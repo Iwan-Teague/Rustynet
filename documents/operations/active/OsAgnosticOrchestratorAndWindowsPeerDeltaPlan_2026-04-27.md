@@ -1385,8 +1385,74 @@ conservatively.
     is unchanged by this slice.
 
 ### Phase W4 (Per-stage capability gating + Windows mesh-join)
-- [ ] W4.1 Replace `ensure_live_lab_profile_linux_only` with per-stage
-      capabilities
+- [x] W4.1 Replace `ensure_live_lab_profile_linux_only` with per-stage
+      capabilities (machinery + legacy-set delegation; per-stage
+      capability dispatch deferred to W4.2+)
+  - Changed files:
+    - `crates/rustynet-cli/src/vm_lab/mod.rs` — added the
+      `LiveLabStageCapability` enum (9 reviewed capability tags
+      covering POSIX shell + systemd + Linux bash + tc/netem +
+      nftables + systemd-resolved on the Linux side; WindowsService +
+      WindowsNRPT + WindowsPowershell on the Windows side),
+      `LiveLabStageCapability::as_str` for stable lowercase-hyphen
+      labels (downstream tooling can grep on these), the
+      `target_capabilities(VmPlatformProfile) -> Vec<…>` lookup
+      that publishes a target's capability set as a pure function
+      of its platform profile (no runtime probe, computable
+      up-front), the
+      `LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES` constant that
+      surfaces the legacy gate's intent as a typed list, the new
+      `live_lab_targets_missing_capabilities(profile, required)`
+      helper that returns `(role, target, missing_caps)` per
+      blocked target, and the new
+      `ensure_live_lab_profile_capabilities(profile, required,
+      command)` gate that rejects with a precise per-target
+      missing-capability list. The legacy
+      `ensure_live_lab_profile_linux_only` now delegates to the
+      capability gate with the linux-only set so behavior is
+      preserved at every existing entry point (vm-lab-setup-live-lab,
+      vm-lab-run-live-lab, vm-lab-validate-live-lab-profile,
+      vm-lab-diagnose-live-lab-failure, plus the
+      RustOrchestrator's belt-and-braces trait-boundary gate from
+      W3.3); the rejection rendering migrates from the freeform
+      `requires platform=linux remote_shell=posix …` string to the
+      capability-vocabulary `requires capabilities [posix-shell,
+      systemd, …]; blocked targets: role=… target=…
+      missing=cap1,cap2` so per-target diff is now grep-stable.
+  - Verification:
+    - `cargo fmt -p rustynet-cli -p rustynetd -- --check` clean.
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 442 / 442
+      pass (was 437). +5 new tests in `vm_lab::tests`:
+      `target_capabilities_for_linux_advertises_kernel_userspace_set`,
+      `target_capabilities_for_windows_advertises_windows_only_set`,
+      `target_capabilities_for_macos_returns_minimal_unsupported_set`,
+      `live_lab_stage_capability_label_round_trips`,
+      `linux_only_required_capabilities_constant_matches_legacy_gate_intent`.
+      Plus four pre-existing test assertions on the legacy gate's
+      freeform error string updated to assert on the new capability-
+      vocabulary format (`requires capabilities`, `blocked targets`,
+      `missing=`); test count is unchanged because the assertions
+      are in-place updates, not net-new tests.
+    - `cargo test -p rustynetd` unchanged: 439 lib + 52 bin + 3
+      integration. No rustynetd APIs touched.
+  - Residual risk:
+    - This slice lands the capability *machinery* and migrates the
+      existing entry-point gate to delegate through it. Per-stage
+      capability dispatch — i.e. the bash orchestrator's individual
+      stages declaring their own required-capability subset and
+      skip-with-reason / fail-with-reason on heterogeneous targets —
+      is W4.2's job. Today the legacy linux-only set is still the
+      only consumer of the gate; behavior is preserved and the
+      Linux-only enforcement remains the most-secure default until
+      W4.2 lands the per-stage decisions.
+    - The `LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES` constant
+      includes `NftablesFiltering` and `SystemdResolvedDns`
+      (security-bar capabilities) but NOT `NetemImpairment` (a
+      pure convenience capability). When per-stage dispatch lands
+      W4.2 will be careful to mark NetemImpairment-requiring
+      stages as skip-with-reason on Windows targets while
+      Nftables / systemd-resolved-requiring stages fail-with-reason
+      so the orchestrator never silently drops a security stage.
 - [ ] W4.2 Windows mesh-join stage
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
