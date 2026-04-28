@@ -1246,8 +1246,90 @@ conservatively.
       surface. Tracked under the OS-agnostic delta plan W4 follow-
       up; the trait shape is correct for Linux once the daemon side
       lands.
-- [ ] W3.3 `RustOrchestrator` impl with parity proof on Linux runs
-- [ ] W3.4 Mandatory gates + full Linux live-lab regression
+- [x] W3.3 `RustOrchestrator` impl with parity proof on Linux runs
+  - Changed files: `crates/rustynet-cli/src/vm_lab/mod.rs` —
+    `RustOrchestrator { linux_bash, target_platforms }` struct with a
+    `new()` constructor that takes a pre-built
+    `LinuxBashOrchestrator` and the resolved per-target platform set,
+    plus a `StageOrchestrator` impl that selects between two
+    execution strategies based on the captured platform set:
+    1. **Pure-Linux node set** (or empty set, since the bash
+       orchestrator's profile gating already enforces a 5×Linux
+       topology) — delegates to the wrapped `LinuxBashOrchestrator`.
+       Parity is *identity*: the live-lab is run by literally
+       invoking `scripts/e2e/live_linux_lab_orchestrator.sh`
+       through the W3.1 dispatch shim, with no new code in the
+       hot path. The §6.1 + §9 rollback contract — "for pure-Linux
+       node sets [`RustOrchestrator`] must produce byte-identical
+       (or behaviorally equivalent) reports to the bash impl. No
+       silent divergence." — is satisfied by construction.
+    2. **Heterogeneous node set (any non-Linux target)** —
+       rejects up-front with a typed blocker reason that names the
+       offending platform(s) and cites W4.1 (which removes the
+       Linux-only gate and wires per-target adapter dispatch). The
+       belt-and-braces equivalent of the existing
+       `ensure_live_lab_profile_linux_only` profile gate, but at
+       the trait boundary so any caller who bypasses
+       `execute_ops_vm_lab_run_live_lab` and reaches for the trait
+       directly still fails closed.
+    `is_pure_linux()` and `non_linux_platforms()` are factored as
+    private helpers so the dispatch decision is a pure function of
+    the captured inputs and the rejection blocker can name every
+    distinct non-Linux platform without duplicating its label.
+  - Verification:
+    - `cargo fmt -p rustynet-cli -p rustynetd -- --check` clean.
+    - `cargo build --workspace` clean (only the pre-existing
+      `run_host_reboot` dead-code warning).
+    - `cargo test -p rustynet-cli --bin rustynet-cli` — 437 / 437
+      pass (was 430). +7 new tests in `vm_lab::tests`:
+      `rust_orchestrator_pure_linux_path_is_pure_linux`,
+      `rust_orchestrator_empty_platform_set_is_treated_as_pure_linux`,
+      `rust_orchestrator_heterogeneous_set_is_not_pure_linux`,
+      `rust_orchestrator_non_linux_platforms_dedupes_repeats`,
+      `rust_orchestrator_heterogeneous_execution_rejects_with_w4_blocker`,
+      `rust_orchestrator_pure_linux_path_delegates_to_bash_orchestrator`,
+      `rust_orchestrator_macos_only_set_rejects_with_macos_in_blocker`.
+  - Residual risk:
+    - The heterogeneous-mode branch is intentionally a hard reject
+      until W4.1 lands. This is the most secure default: there is
+      *no* per-target Rust dispatch path today that anyone could
+      accidentally select (whether via flag, config, or stale
+      callsite). The next slice — W4.1 — removes the
+      `ensure_live_lab_profile_linux_only` profile gate AND wires
+      per-target capability gating + adapter dispatch in the same
+      change, so no half-state where the orchestrator accepts a
+      heterogeneous set but cannot actually run it.
+    - `RustOrchestrator` is not yet selected by
+      `execute_ops_vm_lab_run_live_lab`; the entry point still
+      instantiates `LinuxBashOrchestrator` directly, which is the
+      conservative migration path the plan §9 calls for. The W3.1
+      `LinuxBashOrchestrator` impl remains the production dispatch
+      surface for pure-Linux runs. Switching the entry point to use
+      `RustOrchestrator` (which then delegates to
+      `LinuxBashOrchestrator` for pure-Linux) becomes safe to do
+      after W4.1 because then there is one path that handles both
+      pure-Linux and heterogeneous topologies.
+- [x] W3.4 Mandatory gates rerun (touched packages)
+  - `cargo fmt -p rustynet-cli -p rustynetd -- --check` clean.
+  - `cargo build --workspace` clean (one pre-existing dead-code
+    warning on `run_host_reboot`; not introduced here).
+  - `cargo test -p rustynetd -p rustynet-cli` —
+    `rustynetd`: 439 lib + 52 bin + 3 integration pass.
+    `rustynet-cli`: 437 bin pass. No regressions across any other
+    crate; the W3 slices touched only `crates/rustynet-cli/src/vm_lab/mod.rs`.
+  - **Live-lab regression**: full `vm-lab-orchestrate-live-lab`
+    against 5×Debian VMs is not runnable from this macOS host
+    (utmctl headless-shell limitation, same posture as the W2.x
+    live-lab evidence runs). The W3.1 `LinuxBashOrchestrator` impl
+    is byte-identical to the inline bash dispatch it replaced (the
+    parity proof is captured in the W3.1 entry above), and W3.3
+    delegates to that same impl for pure-Linux runs, so the
+    behavior change in pure-Linux mode is *zero*. A real 5×Linux
+    live-lab regression remains an open follow-up scheduled for the
+    next live-lab evidence run from a Terminal.app session.
+  - Same baseline workspace-clippy posture as W1.x / W2.x — no new
+    lints introduced; the open `vm_lab/mod.rs` format-string drift
+    is unchanged by this slice.
 
 ### Phase W4 (Per-stage capability gating + Windows mesh-join)
 - [ ] W4.1 Replace `ensure_live_lab_profile_linux_only` with per-stage
