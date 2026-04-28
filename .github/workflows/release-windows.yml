@@ -172,3 +172,38 @@ jobs:
           if ($env:RUSTYNET_SIGNING_PFX_PATH -and (Test-Path -LiteralPath $env:RUSTYNET_SIGNING_PFX_PATH)) {
               Remove-Item -LiteralPath $env:RUSTYNET_SIGNING_PFX_PATH -Force
           }
+
+  release-sbom:
+    name: SBOM generation + release upload
+    runs-on: ubuntu-latest
+    # Runs in parallel with windows-release; only attaches to a real
+    # release on tag push. Workflow_dispatch dry-runs still produce
+    # the SBOM (so operators can validate the path) but do not
+    # upload it anywhere.
+    needs: []
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+      - name: Generate release SBOM
+        run: |
+          # Reuses the reviewed `ops generate-release-sbom`
+          # subcommand under crates/rustynet-cli/src/ops_ci_release_perf.rs.
+          # Produces:
+          #   artifacts/release/sbom.cargo-metadata.json
+          #   artifacts/release/sbom.sha256
+          # The .json is `cargo metadata --format-version 1` output —
+          # a complete dependency tree with versions, sources,
+          # features, and repository links. The .sha256 is the
+          # content digest for tamper-evidence.
+          cargo run --release --quiet -p rustynet-cli -- ops generate-release-sbom
+          ls -la artifacts/release/sbom.cargo-metadata.json artifacts/release/sbom.sha256
+      - name: Upload SBOM to release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/release/sbom.cargo-metadata.json
+            artifacts/release/sbom.sha256
