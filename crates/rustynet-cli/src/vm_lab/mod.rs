@@ -804,6 +804,14 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// Requires `--windows-vm`. Use when the Linux lab is already known-good and only
     /// the Windows client path needs to be exercised.
     pub windows_only: bool,
+    /// When true, after the live-lab install + 5-node test path completes,
+    /// dispatch the new `rustynetd linux-*-check` daemon-side validator
+    /// chainer against every selected Linux alias. Adds 6 stages × N peers
+    /// to the orchestration report. Off by default to keep existing
+    /// orchestrate-live-lab latency unchanged; flip on when the operator
+    /// wants live-evidence proof that each Linux peer's daemon-side state
+    /// matches the reviewed posture (W3.2-followup-7 verifier set).
+    pub validate_linux_daemon_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6552,6 +6560,20 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 }
                 outcomes.extend(windows_outcomes);
             }
+            if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
+                let linux_outcomes = run_linux_daemon_validators_for_aliases(
+                    selected_aliases.as_slice(),
+                    inventory_path.as_path(),
+                    config.ssh_identity_file.as_path(),
+                    config.known_hosts_path.as_deref(),
+                    report_dir.as_path(),
+                    config.dry_run,
+                );
+                for outcome in &linux_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(linux_outcomes);
+            }
             finalize_vm_lab_orchestration_result(
                 "vm-lab-orchestrate-live-lab",
                 report_dir.as_path(),
@@ -9199,6 +9221,45 @@ fn run_linux_orchestration_stages_with_options(
         dns_failclosed_outcome,
         mesh_status_outcome,
     ]
+}
+
+/// Run the Linux validator chainer against every alias in `linux_aliases`,
+/// each scoped under a per-alias log subdirectory under `report_dir`.
+/// Stage names are prefixed with `<alias>::` so the orchestration report's
+/// stage list disambiguates between peers cleanly.
+///
+/// Returns the flattened outcome list (in alias order). The caller decides
+/// whether to short-circuit on first failure or continue across peers; this
+/// helper continues across peers so a single bad peer does not mask drift
+/// on the others.
+fn run_linux_daemon_validators_for_aliases(
+    linux_aliases: &[String],
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+    dry_run: bool,
+) -> Vec<VmLabStageOutcome> {
+    let mut outcomes: Vec<VmLabStageOutcome> = Vec::new();
+    let validate_root = report_dir.join("validate_linux_daemon_state");
+    let _ = std::fs::create_dir_all(validate_root.as_path());
+    for alias in linux_aliases {
+        let per_alias_dir = validate_root.join(alias);
+        let _ = std::fs::create_dir_all(per_alias_dir.as_path());
+        let chainer_outcomes = run_linux_orchestration_stages_with_options(
+            alias.as_str(),
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            per_alias_dir.as_path(),
+            LinuxOrchestrationOptions { dry_run },
+        );
+        for mut outcome in chainer_outcomes {
+            outcome.stage = format!("{alias}::{}", outcome.stage);
+            outcomes.push(outcome);
+        }
+    }
+    outcomes
 }
 
 /// Operator-facing config for the `vm-lab-validate-linux-security`
@@ -26108,6 +26169,64 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let err = super::evaluate_linux_dns_failclosed_report("debian-utm-1", raw)
             .expect_err("external DNS must reject");
         assert!(err.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn run_linux_daemon_validators_for_aliases_dry_run_prefixes_stage_names_per_alias() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let report_dir = temp.path().to_path_buf();
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(inventory.as_path(), r#"{"version":1,"entries":[]}"#)
+            .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let aliases = vec!["debian-utm-1".to_string(), "debian-utm-2".to_string()];
+        let outcomes = super::run_linux_daemon_validators_for_aliases(
+            aliases.as_slice(),
+            inventory.as_path(),
+            identity.as_path(),
+            None,
+            report_dir.as_path(),
+            true,
+        );
+        // 6 stages × 2 aliases.
+        assert_eq!(outcomes.len(), 12);
+        for outcome in &outcomes {
+            assert!(
+                outcome.stage.contains("::"),
+                "stage name must be prefixed with alias::: {}",
+                outcome.stage
+            );
+            assert!(
+                outcome.stage.starts_with("debian-utm-1::")
+                    || outcome.stage.starts_with("debian-utm-2::"),
+                "stage prefix must match one of the aliases: {}",
+                outcome.stage
+            );
+        }
+        // Per-alias log subdirs created.
+        let validate_root = report_dir.join("validate_linux_daemon_state");
+        assert!(validate_root.join("debian-utm-1").is_dir());
+        assert!(validate_root.join("debian-utm-2").is_dir());
+    }
+
+    #[test]
+    fn run_linux_daemon_validators_for_aliases_returns_empty_for_empty_alias_list() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(inventory.as_path(), r#"{"version":1,"entries":[]}"#)
+            .expect("write inventory");
+        let identity = temp.path().join("id_ed25519");
+        std::fs::write(identity.as_path(), b"fake-key").expect("write key");
+        let outcomes = super::run_linux_daemon_validators_for_aliases(
+            &[],
+            inventory.as_path(),
+            identity.as_path(),
+            None,
+            temp.path(),
+            true,
+        );
+        assert!(outcomes.is_empty());
     }
 
     #[test]
