@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "summary": {
+    "targets": 6,
+    "ready": 1,
+    "blocked": 5
+  },
+  "results": [
+    {
+      "alias": "debian-headless-1",
+      "ssh_target": "192.168.64.8",
+      "platform": "linux",
+      "ssh_user": "debian",
+      "tcp_port_open": false,
+      "tcp_probe_reason": "connection timed out",
+      "ready": false,
+      "blocker": "TCP/22 not reachable on 192.168.64.8 (VM offline, sshd not running, or firewall)"
+    },
+    {
+      "alias": "debian-headless-2",
+      "ssh_target": "192.168.64.4",
+      "platform": "linux",
+      "ssh_user": "debian",
+      "tcp_port_open": false,
+      "tcp_probe_reason": "connection timed out",
+      "ready": false,
+      "blocker": "TCP/22 not reachable on 192.168.64.4 (VM offline, sshd not running, or firewall)"
+    },
+    {
+      "alias": "debian-headless-3",
+      "ssh_target": "192.168.64.9",
+      "platform": "linux",
+      "ssh_user": "debian",
+      "tcp_port_open": false,
+      "tcp_probe_reason": "connection timed out",
+      "ready": false,
+      "blocker": "TCP/22 not reachable on 192.168.64.9 (VM offline, sshd not running, or firewall)"
+    },
+    {
+      "alias": "debian-headless-4",
+      "ssh_target": "192.168.64.10",
+      "platform": "linux",
+      "ssh_user": "debian",
+      "tcp_port_open": false,
+      "tcp_probe_reason": "connection timed out",
+      "ready": false,
+      "blocker": "TCP/22 not reachable on 192.168.64.10 (VM offline, sshd not running, or firewall)"
+    },
+    {
+      "alias": "debian-headless-5",
+      "ssh_target": "192.168.64.11",
+      "platform": "linux",
+      "ssh_user": "debian",
+      "tcp_port_open": false,
+      "tcp_probe_reason": "connection timed out",
+      "ready": false,
+      "blocker": "TCP/22 not reachable on 192.168.64.11 (VM offline, sshd not running, or firewall)"
+    },
+    {
+      "alias": "windows-utm-1",
+      "ssh_target": "192.168.64.14",
+      "platform": "windows",
+      "ssh_user": "windows",
+      "tcp_port_open": true,
+      "auth_ok": true,
+      "observed_user": "win-f3t6jvfodov\\windows",
+      "ready": true
+    }
+  ]
+}

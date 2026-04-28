@@ -1,0 +1,46 @@
+{
+    "schema_version": 1,
+    "overall_ok": true,
+    "roots": [
+        {
+            "label": "state root",
+            "path": "C:\\ProgramData\\RustyNet",
+            "status": "ok"
+        },
+        {
+            "label": "config root",
+            "path": "C:\\ProgramData\\RustyNet\\config",
+            "status": "ok"
+        },
+        {
+            "label": "log root",
+            "path": "C:\\ProgramData\\RustyNet\\logs",
+            "status": "ok"
+        },
+        {
+            "label": "trust root",
+            "path": "C:\\ProgramData\\RustyNet\\trust",
+            "status": "ok"
+        },
+        {
+            "label": "membership root",
+            "path": "C:\\ProgramData\\RustyNet\\membership",
+            "status": "ok"
+        },
+        {
+            "label": "keys root",
+            "path": "C:\\ProgramData\\RustyNet\\keys",
+            "status": "ok"
+        },
+        {
+            "label": "secret root",
+            "path": "C:\\ProgramData\\RustyNet\\secrets",
+            "status": "ok"
+        },
+        {
+            "label": "key-custody root",
+            "path": "C:\\ProgramData\\RustyNet\\secrets\\key-custody",
+            "status": "ok"
+        }
+    ]
+}

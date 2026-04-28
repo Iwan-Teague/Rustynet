@@ -1,0 +1,24 @@
+{
+    "schema_version": 1,
+    "overall_ok": true,
+    "snapshot": {
+        "schema_version": 1,
+        "service_name": "RustyNet",
+        "binary_image_path": "\"C:\\Program Files\\RustyNet\\rustynetd.exe\" --windows-service --service-name \"RustyNet\" --env-file \"C:\\ProgramData\\RustyNet\\config\\rustynetd.env\"",
+        "binary_image_argv": [
+            "C:\\Program Files\\RustyNet\\rustynetd.exe",
+            "--windows-service",
+            "--service-name",
+            "RustyNet",
+            "--env-file",
+            "C:\\ProgramData\\RustyNet\\config\\rustynetd.env"
+        ],
+        "start_name": "LocalSystem",
+        "service_sid_type": "unrestricted",
+        "start_type": "auto_start",
+        "interactive_process": false,
+        "failure_action_count": 3,
+        "binary_path_acl_sddl": "O:BAD:PAI(A;;0x1200a9;;;S-1-5-80-2600478946-110503101-455006072-1496682732-4207308082)(A;;FA;;;SY)(A;;FA;;;BA)"
+    },
+    "drift_reasons": []
+}

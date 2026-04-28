@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "windows_vm": "windows-utm-1",
+  "dry_run": false,
+  "stages": [
+    {
+      "stage": "bootstrap_windows_host",
+      "status": "pass",
+      "summary": "Windows host windows-utm-1 bootstrapped (access bootstrap skipped) (install phases skipped); host_key=skipped-access-bootstrap",
+      "artifacts": [
+        "/tmp/rustynet-stage2/logs/bootstrap_windows_host.log"
+      ]
+    },
+    {
+      "stage": "validate_windows_client_install",
+      "status": "fail",
+      "summary": "Windows client install validation failed for windows-utm-1: RustyNet service is not Running on windows-utm-1: status=\"Stopped\"",
+      "artifacts": [
+        "/tmp/rustynet-stage2/logs/validate_windows_client_install.log"
+      ]
+    },
+    {
+      "stage": "validate_windows_runtime_acls",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "validate_windows_service_hardening",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "validate_windows_key_custody",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "validate_windows_authenticode",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "validate_windows_dns_failclosed",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "distribute_windows_membership",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "distribute_windows_assignment",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "distribute_windows_traversal",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "distribute_windows_dns_zone",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    },
+    {
+      "stage": "validate_windows_mesh_join",
+      "status": "skipped",
+      "summary": "skipped: validate_windows_client_install did not pass for windows-utm-1",
+      "artifacts": []
+    }
+  ]
+}

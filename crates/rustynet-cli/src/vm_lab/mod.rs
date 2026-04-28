@@ -933,6 +933,30 @@ pub struct VmLabPreflightConfig {
     pub timeout_secs: u64,
 }
 
+/// Operator-facing config for the `vm-lab-readiness-check` subcommand.
+///
+/// Pre-orchestrate readiness gate: walks every selected alias and
+/// confirms the VM is reachable + SSH-authenticatable + at the right
+/// platform identity before the orchestrator wastes a 30-minute run
+/// on a host that's offline or has a broken SSH server config.
+///
+/// Continues across aliases on failure so a single bad host does not
+/// mask blockers on the others. Emits a typed JSON report listing
+/// every alias's readiness status, blocker reason (if any), and the
+/// observed platform identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabReadinessCheckConfig {
+    pub inventory_path: PathBuf,
+    pub vm_aliases: Vec<String>,
+    pub raw_targets: Vec<String>,
+    pub select_all: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub ssh_port: u16,
+    pub connect_timeout_secs: u64,
+    pub report_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabCheckKnownHostsConfig {
     pub inventory_path: PathBuf,
@@ -12548,6 +12572,212 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
     }
 }
 
+/// Pre-orchestrate readiness check.
+///
+/// For each selected alias:
+///   1. Resolve the SSH target IP from the inventory.
+///   2. Probe TCP/<ssh_port> with a short timeout to confirm the VM
+///      is up + SSH server is listening.
+///   3. If TCP open, run a minimal identity probe over SSH (`whoami`
+///      on POSIX, `whoami` via PowerShell on Windows) to confirm
+///      authentication + the right user identity.
+///   4. Record alias / ssh_target / platform / port_open / auth_ok
+///      / observed_user / blocker.
+///
+/// Continues across aliases so the operator sees the full set of
+/// blockers in one report. Returns the report JSON on success
+/// (every alias ready) or wraps the same JSON in `Err` when any
+/// alias has a blocker — matching the preflight subcommand's
+/// pass/fail convention.
+pub fn execute_ops_vm_lab_readiness_check(
+    config: VmLabReadinessCheckConfig,
+) -> Result<String, String> {
+    ensure_optional_local_regular_file_path(
+        config.ssh_identity_file.as_deref(),
+        "SSH identity file",
+    )?;
+    ensure_optional_local_regular_file_path(
+        config.known_hosts_path.as_deref(),
+        "SSH known_hosts file",
+    )?;
+    let targets = resolve_remote_targets(
+        config.inventory_path.as_path(),
+        config.vm_aliases.as_slice(),
+        config.select_all,
+        config.raw_targets.as_slice(),
+    )?;
+    if targets.is_empty() {
+        return Err(
+            "no targets selected for readiness check; pass --vms <alias[,alias...]> or --all"
+                .to_string(),
+        );
+    }
+    let connect_timeout = Duration::from_secs(if config.connect_timeout_secs == 0 {
+        5
+    } else {
+        config.connect_timeout_secs
+    });
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut failures = 0usize;
+
+    for target in &targets {
+        let platform = target.platform_profile.platform.as_str().to_string();
+        let ssh_user_for_probe =
+            target
+                .ssh_user
+                .clone()
+                .unwrap_or_else(|| match target.platform_profile.platform {
+                    VmGuestPlatform::Windows => "Administrator".to_string(),
+                    _ => "user".to_string(),
+                });
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "alias".to_string(),
+            serde_json::Value::String(target.label.clone()),
+        );
+        entry.insert(
+            "ssh_target".to_string(),
+            serde_json::Value::String(target.ssh_target.clone()),
+        );
+        entry.insert(
+            "platform".to_string(),
+            serde_json::Value::String(platform.clone()),
+        );
+        entry.insert(
+            "ssh_user".to_string(),
+            serde_json::Value::String(ssh_user_for_probe.clone()),
+        );
+
+        // Step 1: TCP/<port> probe.
+        let port_status = match probe_tcp_port_status(
+            target.ssh_target.as_str(),
+            config.ssh_port,
+            connect_timeout,
+        ) {
+            Ok((status, reason)) => (status, reason),
+            Err(err) => ("invalid".to_string(), Some(err)),
+        };
+        let port_open = port_status.0 == "open";
+        entry.insert(
+            "tcp_port_open".to_string(),
+            serde_json::Value::Bool(port_open),
+        );
+        if let Some(reason) = port_status.1 {
+            entry.insert(
+                "tcp_probe_reason".to_string(),
+                serde_json::Value::String(reason),
+            );
+        }
+        if !port_open {
+            failures += 1;
+            entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+            entry.insert(
+                "blocker".to_string(),
+                serde_json::Value::String(format!(
+                    "TCP/{} not reachable on {} (VM offline, sshd not running, or firewall)",
+                    config.ssh_port, target.ssh_target
+                )),
+            );
+            results.push(serde_json::Value::Object(entry));
+            continue;
+        }
+
+        // Step 2: SSH identity probe (`whoami`).
+        let identity_script = match target.platform_profile.remote_shell {
+            VmRemoteShell::Posix => "whoami".to_string(),
+            VmRemoteShell::Powershell => match build_ssh_powershell_encoded_invocation("whoami") {
+                Ok(script) => script,
+                Err(err) => {
+                    failures += 1;
+                    entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                    entry.insert(
+                        "blocker".to_string(),
+                        serde_json::Value::String(format!(
+                            "build PS-encoded whoami invocation failed: {err}"
+                        )),
+                    );
+                    results.push(serde_json::Value::Object(entry));
+                    continue;
+                }
+            },
+            VmRemoteShell::Unsupported => {
+                failures += 1;
+                entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                entry.insert(
+                    "blocker".to_string(),
+                    serde_json::Value::String(format!(
+                        "remote shell unsupported for platform {platform}"
+                    )),
+                );
+                results.push(serde_json::Value::Object(entry));
+                continue;
+            }
+        };
+        match capture_remote_shell_command_for_target(
+            target,
+            None,
+            config.ssh_identity_file.as_deref(),
+            config.known_hosts_path.as_deref(),
+            identity_script.as_str(),
+            connect_timeout,
+        ) {
+            Ok(observed) => {
+                let observed_trimmed = observed.trim().to_string();
+                entry.insert("auth_ok".to_string(), serde_json::Value::Bool(true));
+                entry.insert(
+                    "observed_user".to_string(),
+                    serde_json::Value::String(observed_trimmed.clone()),
+                );
+                entry.insert("ready".to_string(), serde_json::Value::Bool(true));
+            }
+            Err(err) => {
+                failures += 1;
+                entry.insert("auth_ok".to_string(), serde_json::Value::Bool(false));
+                entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                entry.insert(
+                    "blocker".to_string(),
+                    serde_json::Value::String(format!("SSH identity probe failed: {err}")),
+                );
+            }
+        }
+        results.push(serde_json::Value::Object(entry));
+    }
+
+    let payload = serde_json::to_string_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "summary": {
+            "targets": targets.len(),
+            "ready": targets.len().saturating_sub(failures),
+            "blocked": failures,
+        },
+        "results": results,
+    }))
+    .map_err(|err| format!("serialize readiness report failed: {err}"))?;
+
+    if let Some(report_dir) = config.report_dir.as_deref() {
+        std::fs::create_dir_all(report_dir).map_err(|err| {
+            format!(
+                "create readiness-check report dir failed ({}): {err}",
+                report_dir.display()
+            )
+        })?;
+        let report_path = report_dir.join("vm_lab_readiness_check.json");
+        std::fs::write(report_path.as_path(), payload.as_str()).map_err(|err| {
+            format!(
+                "write readiness-check report to {} failed: {err}",
+                report_path.display()
+            )
+        })?;
+    }
+
+    if failures == 0 {
+        Ok(payload)
+    } else {
+        Err(payload)
+    }
+}
+
 pub fn execute_ops_vm_lab_status(config: VmLabStatusConfig) -> Result<String, String> {
     let targets = resolve_remote_targets(
         config.inventory_path.as_path(),
@@ -17561,6 +17791,24 @@ fn execute_utm_remote_powershell_capture(
         remote_rc_path.as_str(),
     )?;
     let host_status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout);
+    // Fast-fail when utmctl exec itself errored (e.g. macOS Automation
+    // permission denied with OSStatus -1743 from a sandboxed parent).
+    // Without this guard, `pull_windows_local_utm_guest_file_with_retry`
+    // below would loop for up to `timeout.as_secs()` iterations waiting
+    // for a result file that was never written — observed as a multi-
+    // hour orchestrator hang on 2026-04-28. Returning an Err here
+    // triggers the SSH fallback in `resolve_local_utm_capture_result`.
+    if let Err(host_err) = host_status.as_ref() {
+        let _ = best_effort_remove_windows_local_utm_guest_files(
+            utm_name,
+            &[remote_output_path.as_str(), remote_rc_path.as_str()],
+            Duration::from_secs(20),
+        );
+        let _ = fs::remove_dir_all(local_root.as_path());
+        return Err(format!(
+            "UTM Windows exec failed for {utm_name} before result file could be written: {host_err}"
+        ));
+    }
     let rc_pull = pull_windows_local_utm_guest_file_with_retry(
         utm_name,
         remote_rc_path.as_str(),
@@ -26425,6 +26673,31 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             true,
         );
         assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_readiness_check_rejects_empty_alias_selection() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inventory = temp.path().join("inventory.json");
+        std::fs::write(inventory.as_path(), r#"{"version":1,"entries":[]}"#)
+            .expect("write inventory");
+        let config = super::VmLabReadinessCheckConfig {
+            inventory_path: inventory,
+            vm_aliases: vec![],
+            raw_targets: vec![],
+            select_all: false,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 22,
+            connect_timeout_secs: 3,
+            report_dir: None,
+        };
+        let err = super::execute_ops_vm_lab_readiness_check(config)
+            .expect_err("empty alias list must reject");
+        assert!(
+            err.contains("specify at least one") || err.contains("no targets selected"),
+            "rejection must surface no-targets: {err}"
+        );
     }
 
     #[test]

@@ -556,6 +556,9 @@ enum OpsCommand {
     VmLabPreflight {
         config: vm_lab::VmLabPreflightConfig,
     },
+    VmLabReadinessCheck {
+        config: vm_lab::VmLabReadinessCheckConfig,
+    },
     VmLabStatus {
         config: vm_lab::VmLabStatusConfig,
     },
@@ -2476,6 +2479,32 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     min_free_kib: parser.parse_u64_or_default("--min-free-kib", 1_048_576)?,
                     require_rustynet_installed: parser.has_flag("--require-rustynet-installed"),
                     timeout_secs: parser.parse_u64_or_default("--timeout-secs", 120)?,
+                },
+            })
+        }
+        "vm-lab-readiness-check" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            let mut raw_targets = collect_repeated_option_values(&args[1..], "--target");
+            if let Some(csv_targets) = parser.value("--targets") {
+                raw_targets.extend(split_csv(csv_targets));
+            }
+            Ok(OpsCommand::VmLabReadinessCheck {
+                config: vm_lab::VmLabReadinessCheckConfig {
+                    inventory_path: parser
+                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
+                    vm_aliases,
+                    raw_targets,
+                    select_all: parser.has_flag("--all"),
+                    ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
+                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                    connect_timeout_secs: parser
+                        .parse_u64_or_default("--connect-timeout-secs", 5)?,
+                    report_dir: parser.optional_path("--report-dir"),
                 },
             })
         }
@@ -4551,6 +4580,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             vm_lab::execute_ops_vm_lab_check_known_hosts(config)
         }
         OpsCommand::VmLabPreflight { config } => vm_lab::execute_ops_vm_lab_preflight(config),
+        OpsCommand::VmLabReadinessCheck { config } => {
+            vm_lab::execute_ops_vm_lab_readiness_check(config)
+        }
         OpsCommand::VmLabStatus { config } => vm_lab::execute_ops_vm_lab_status(config),
         OpsCommand::VmLabStop { config } => vm_lab::execute_ops_vm_lab_stop(config),
         OpsCommand::VmLabRestart { config } => vm_lab::execute_ops_vm_lab_restart(config),
@@ -12100,6 +12132,7 @@ fn help_text() -> String {
         "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",
         "  ops vm-lab-preflight [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--require-same-network] [--require-command <name>]... [--require-commands <name[,name...]>] [--min-free-kib <kib>] [--require-rustynet-installed] [--timeout-secs <secs>]",
+        "  ops vm-lab-readiness-check [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--connect-timeout-secs <secs>] [--report-dir <path>]",
         "  ops vm-lab-status [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-stop [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
         "  ops vm-lab-shutdown [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--utmctl-path <absolute-path>] [--timeout-secs <secs>]",
