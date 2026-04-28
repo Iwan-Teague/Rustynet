@@ -5645,6 +5645,9 @@ impl DaemonProbe for LinuxDaemonProbe {
         // existent subcommand and parsing a 127 exit as "drift".
         let subcommand = match op {
             DaemonProbeOp::RuntimeAcls => "linux-runtime-acls-check",
+            DaemonProbeOp::MeshStatus => "linux-mesh-status-check",
+            DaemonProbeOp::KeyCustody => "linux-key-custody-check",
+            DaemonProbeOp::Authenticode => "linux-authenticode-check",
             other => {
                 return Err(format!(
                     "RustyNet daemon-side probe '{}' is not yet implemented on Linux; \
@@ -24657,29 +24660,39 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
-    fn linux_daemon_probe_emits_argv_for_runtime_acls_op() {
+    fn linux_daemon_probe_emits_argv_for_implemented_ops() {
         // Linux daemon ships parity validators one at a time. The
-        // RuntimeAcls op resolves to the `linux-runtime-acls-check`
-        // subcommand wired in `crates/rustynetd/src/main.rs`; the
-        // remaining ops still reject with a precise per-op blocker so
-        // the orchestrator surfaces "Linux daemon does not yet expose
+        // implemented ops resolve to their `linux-*-check` subcommands
+        // wired in `crates/rustynetd/src/main.rs`. The remaining ops
+        // still reject with a precise per-op blocker so the
+        // orchestrator surfaces "Linux daemon does not yet expose
         // <op>" rather than parsing a bash 127 exit as "drift".
         let probe = super::LinuxDaemonProbe;
         assert_eq!(probe.platform_label(), "linux");
-        let argv = probe
-            .build_argv(
+        for (op, expected_subcommand) in [
+            (
                 super::DaemonProbeOp::RuntimeAcls,
-                std::path::Path::new("/usr/local/bin/rustynetd"),
-            )
-            .expect("RuntimeAcls op must resolve to a Linux subcommand today");
-        assert_eq!(
-            argv,
-            vec![
-                "/usr/local/bin/rustynetd".to_string(),
-                "linux-runtime-acls-check".to_string(),
-                "--no-fail-on-drift".to_string(),
-            ]
-        );
+                "linux-runtime-acls-check",
+            ),
+            (super::DaemonProbeOp::MeshStatus, "linux-mesh-status-check"),
+            (super::DaemonProbeOp::KeyCustody, "linux-key-custody-check"),
+            (
+                super::DaemonProbeOp::Authenticode,
+                "linux-authenticode-check",
+            ),
+        ] {
+            let argv = probe
+                .build_argv(op, std::path::Path::new("/usr/local/bin/rustynetd"))
+                .expect("implemented op must resolve to a Linux subcommand");
+            assert_eq!(
+                argv,
+                vec![
+                    "/usr/local/bin/rustynetd".to_string(),
+                    expected_subcommand.to_string(),
+                    "--no-fail-on-drift".to_string(),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -24687,9 +24700,6 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let probe = super::LinuxDaemonProbe;
         for op in [
             super::DaemonProbeOp::ServiceHardening,
-            super::DaemonProbeOp::KeyCustody,
-            super::DaemonProbeOp::Authenticode,
-            super::DaemonProbeOp::MeshStatus,
             super::DaemonProbeOp::DnsFailclosed,
         ] {
             let err = probe

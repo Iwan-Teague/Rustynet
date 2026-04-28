@@ -17,7 +17,15 @@
       "WebFetch(domain:api.github.com)",
       "Bash(node --version:*)",
       "Bash(git clone:*)",
-      "Bash(powershell -ExecutionPolicy Bypass -File \"$TEMP/caveman-install/hooks/install.ps1\")"
+      "Bash(powershell -ExecutionPolicy Bypass -File \"$TEMP/caveman-install/hooks/install.ps1\")",
+      "Bash(grep -n 'Phase\\\\|param\\(\\\\|-Phase\\\\|build-release\\\\|switch \\($Phase\\)\\\\|switch\\($Phase\\)' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1)",
+      "Bash(iconv -t UTF-16LE)",
+      "Bash(grep -n 'param\\(\\\\|-Phase\\\\|install-release\\\\|Install-RustyNetWindowsService\\\\|switch \\($Phase\\)' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1)",
+      "Bash(scp -i ~/.ssh/rustynet_lab_ed25519 -o BatchMode=yes windows@192.168.64.14:C:/Rustynet/.tmp/install.log /tmp/install.log)",
+      "Read(//tmp/**)",
+      "Bash(grep -n 'Join-Path\\\\|\\\\$.*Candidates\\\\|\\\\$.*Source\\\\|\\\\$daemonDest\\\\|\\\\$cliDest\\\\|InstallRoot.*bin\\\\|InstallRoot.*rustynetd' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1)",
+      "Bash(grep -n 'Join-Path.*'\\\\''bin'\\\\''\\\\|bin\\\\\\\\rustynetd\\\\|bin..rustynetd\\\\|\\\\$Install' /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1 /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1 /Users/iwan/Desktop/Rustynet/.claude/worktrees/dazzling-wilson-16b7df/scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1)",
+      "Bash(PATH=\"/Users/iwan/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:/usr/bin:/bin\" ./target/release/rustynet-cli ops vm-lab-bootstrap-phase --phase sync-source --vm windows-utm-1 --inventory documents/operations/active/vm_lab_inventory.json --ssh-identity-file /Users/iwan/.ssh/rustynet_lab_ed25519)"
     ]
   }
 }

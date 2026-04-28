@@ -23,6 +23,9 @@ use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
+use rustynetd::linux_authenticode::collect_linux_authenticode_report;
+use rustynetd::linux_key_custody::collect_linux_key_custody_report;
+use rustynetd::linux_mesh_status::{LinuxMeshStatusOptions, collect_linux_mesh_status_report};
 use rustynetd::linux_runtime_acls::collect_linux_runtime_acl_report;
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
@@ -115,6 +118,15 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "linux-runtime-acls-check" => {
                 run_linux_runtime_acls_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-mesh-status-check" => {
+                run_linux_mesh_status_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-key-custody-check" => {
+                run_linux_key_custody_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "linux-authenticode-check" => {
+                run_linux_authenticode_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -441,6 +453,130 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
+    // The Linux daemon does not enforce runtime binary signatures.
+    // The subcommand still parses `--no-fail-on-drift` for argv parity
+    // with the Windows side; both flags are no-ops here because the
+    // verifier always emits `applicable=false, overall_ok=true`.
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!("unknown linux-authenticode-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_linux_authenticode_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux authenticode report failed: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_linux_key_custody_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!("unknown linux-key-custody-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_linux_key_custody_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux key-custody report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-key-custody-check reported drift in the live RustyNet key custody state"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_linux_mesh_status_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut state_path: Option<std::path::PathBuf> = None;
+    let mut expected_peer_ids: Vec<String> = Vec::new();
+    let mut max_age_seconds: Option<i64> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--state-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                state_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            Some("--expected-peer-id") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                expected_peer_ids.push(value.clone());
+                index += 2;
+            }
+            Some("--max-age-seconds") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                let parsed: i64 = value
+                    .parse()
+                    .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
+                if parsed < 0 {
+                    return Err("--max-age-seconds must be non-negative".to_string());
+                }
+                max_age_seconds = Some(parsed);
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown linux-mesh-status-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let options = LinuxMeshStatusOptions {
+        state_path,
+        expected_peer_ids,
+        max_age_seconds,
+    };
+    let report = collect_linux_mesh_status_report(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux mesh-status report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(format!(
+            "linux-mesh-status-check failed for {}: {}",
+            report.state_path,
+            if report.drift_reasons.is_empty() {
+                "no drift_reasons recorded".to_string()
+            } else {
+                report.drift_reasons.join("; ")
+            }
+        ));
     }
     Ok(())
 }
@@ -1628,6 +1764,9 @@ fn help_text() -> String {
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
+        "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
+        "  rustynetd linux-key-custody-check [--no-fail-on-drift]",
+        "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
