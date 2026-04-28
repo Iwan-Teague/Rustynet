@@ -5,13 +5,13 @@ Owner: AI implementation agent (per `CLAUDE.md`)
 Supersedes the bash orchestrator's monopoly on the live-lab install path.
 Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4 deliverables this plan builds on top of).
 
-> **Status: W5.0 COMPLETE — foundation traits + tests merged.**
+> **Status: W5.1 COMPLETE — LinuxNodeAdapter + --node opt-in merged (2026-04-29).**
 > Each W5.x slice listed below is a future commit. Mark `[x]` as each
 > ships with a commit SHA, evidence pointers, and residual-risk notes
 > following the existing W3.2-followup-N entry pattern.
 >
 > - [x] W5.0 — Foundation (traits, stubs, 26 unit tests). All gates green.
-> - [ ] W5.1 — LinuxNodeAdapter + --node flag opt-in
+> - [x] W5.1 — LinuxNodeAdapter + --node flag opt-in. Commit `8c255c8`. Gates: fmt ✓ clippy ✓ 92 test suites ✓ audit ✓ deny ✓. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). rn_bootstrap.sh extracted + embedded via include_str!(). execute_rust_native_orchestration routes --node traffic to NodeAdapter pipeline.
 > - [ ] W5.2 — WindowsNodeAdapter
 > - [ ] W5.3 — MacosNodeAdapter
 > - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS)
