@@ -1,0 +1,174 @@
+name: Windows Release Signing
+
+# Triggers on tag pushes matching `v*.*.*` (e.g. v0.1.0). The job
+# builds rustynetd.exe, Authenticode-signs it via the reviewed
+# Sign-RustyNetWindowsBinary.ps1 helper, and uploads the signed
+# artifact to the release. If the signing secrets are not configured
+# in the repository's GitHub Secrets, the job fails LOUD — never
+# silently falls back to shipping an unsigned release.
+#
+# Required GitHub Secrets (configured by the operator per
+# documents/operations/ReleaseSigningRunbook.md):
+#   RUSTYNET_SIGNING_PFX_BASE64   — base64 of the PFX file
+#   RUSTYNET_SIGNING_PFX_PASSWORD — PFX password
+#
+# Optional (overrides):
+#   RUSTYNET_SIGNING_TIMESTAMP_URL — RFC 3161 timestamp authority
+#                                    (defaults to DigiCert)
+#
+# This workflow consumes the W2.1b chain-validation contract from
+# crates/rustynetd/src/windows_authenticode.rs as its post-sign gate
+# (signtool verify /pa). Any signed binary that fails WinVerifyTrust
+# fails the workflow before the artifact is uploaded.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  # Allow manual dispatch with no signing — used for dry-run testing
+  # of the build path on PRs / branches without a tagged release.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build only — skip signing + artifact upload'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write  # release upload
+
+jobs:
+  windows-release:
+    name: Windows release build + sign
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin toolchain
+        run: |
+          # Same pinning the cross-platform-ci.yml windows job uses,
+          # mirroring bootstrap_ci_tools' contract.
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+
+      - name: Build rustynetd.exe
+        run: |
+          cargo build --release -p rustynetd --locked
+          # Confirm the binary landed where the helper expects.
+          ls -la target/release/rustynetd.exe
+
+      - name: Decide whether to sign
+        id: signing-decision
+        run: |
+          # Tag pushes ALWAYS sign (release is shipping). Manual
+          # dispatch can dry-run (build-only) for path validation.
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "should_sign=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "false" ]]; then
+            echo "should_sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_sign=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify signing secrets are configured
+        if: steps.signing-decision.outputs.should_sign == 'true'
+        env:
+          PFX_BASE64: ${{ secrets.RUSTYNET_SIGNING_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.RUSTYNET_SIGNING_PFX_PASSWORD }}
+        run: |
+          # Fail LOUD if either signing secret is missing. The
+          # repository-level rule is: tag pushes ship signed
+          # binaries; if the operator hasn't configured signing,
+          # the release cannot proceed. No silent unsigned fallback.
+          if [[ -z "$PFX_BASE64" ]]; then
+            echo "::error::RUSTYNET_SIGNING_PFX_BASE64 secret is not configured"
+            echo "::error::See documents/operations/ReleaseSigningRunbook.md for setup"
+            exit 1
+          fi
+          if [[ -z "$PFX_PASSWORD" ]]; then
+            echo "::error::RUSTYNET_SIGNING_PFX_PASSWORD secret is not configured"
+            echo "::error::See documents/operations/ReleaseSigningRunbook.md for setup"
+            exit 1
+          fi
+
+      - name: Materialise signing PFX
+        if: steps.signing-decision.outputs.should_sign == 'true'
+        env:
+          PFX_BASE64: ${{ secrets.RUSTYNET_SIGNING_PFX_BASE64 }}
+        shell: pwsh
+        run: |
+          # Decode the base64 PFX to a temp path the runner can reach
+          # but no other process should. Permissions on the runner's
+          # _work tree are scoped to the job's session.
+          $pfxBytes = [System.Convert]::FromBase64String($env:PFX_BASE64)
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'release-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+          # Lock down to the runner user only.
+          icacls $pfxPath /inheritance:r | Out-Null
+          icacls $pfxPath /grant:r "$env:USERNAME`:F" | Out-Null
+          # Clear the env var so the base64 doesn't linger in
+          # subsequent step env contexts.
+          "PFX_BASE64=" | Out-File -Append -FilePath $env:GITHUB_ENV
+          "RUSTYNET_SIGNING_PFX_PATH=$pfxPath" | Out-File -Append -FilePath $env:GITHUB_ENV
+
+      - name: Sign rustynetd.exe
+        if: steps.signing-decision.outputs.should_sign == 'true'
+        env:
+          # PFX password is loaded by the helper script via the
+          # named env var; never appears on the helper's command line.
+          RUSTYNET_SIGNING_PFX_PASSWORD: ${{ secrets.RUSTYNET_SIGNING_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          $timestampUrl = $env:RUSTYNET_SIGNING_TIMESTAMP_URL
+          if ([string]::IsNullOrEmpty($timestampUrl)) {
+              $timestampUrl = 'http://timestamp.digicert.com'
+          }
+          $binaryPath = (Resolve-Path target/release/rustynetd.exe).Path
+          & .\scripts\release\Sign-RustyNetWindowsBinary.ps1 `
+              -BinaryPath $binaryPath `
+              -CertificatePath $env:RUSTYNET_SIGNING_PFX_PATH `
+              -CertificatePasswordEnvVar 'RUSTYNET_SIGNING_PFX_PASSWORD' `
+              -TimestampUrl $timestampUrl
+
+      - name: Run W2.1b chain validation against the signed binary
+        if: steps.signing-decision.outputs.should_sign == 'true'
+        run: |
+          # Eat our own dogfood: the W2.1b daemon-side gate is the
+          # final say on whether a release-signed binary is
+          # trustworthy. Any release that signtool says it signed
+          # but our own WinVerifyTrust wrapper rejects fails the
+          # workflow before the artifact ships.
+          ./target/release/rustynetd.exe windows-authenticode-check \
+              --binary-path "$(pwd)/target/release/rustynetd.exe"
+
+      - name: Compute SHA-256 of signed binary
+        if: steps.signing-decision.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Algorithm SHA256 target/release/rustynetd.exe
+          "$($hash.Hash)  rustynetd.exe" | Out-File -Encoding ascii -FilePath target/release/rustynetd.exe.sha256
+          Write-Host "[release-signing] sha256: $($hash.Hash)"
+
+      - name: Upload to release
+        if: steps.signing-decision.outputs.should_sign == 'true' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/rustynetd.exe
+            target/release/rustynetd.exe.sha256
+
+      - name: Cleanup signing material
+        if: always() && steps.signing-decision.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          # Belt-and-braces: scrub the materialised PFX. The runner
+          # also tears down the _work tree at end-of-job, but
+          # leaving the PFX on disk after sign + verify is a
+          # needless exposure window.
+          if ($env:RUSTYNET_SIGNING_PFX_PATH -and (Test-Path -LiteralPath $env:RUSTYNET_SIGNING_PFX_PATH)) {
+              Remove-Item -LiteralPath $env:RUSTYNET_SIGNING_PFX_PATH -Force
+          }
