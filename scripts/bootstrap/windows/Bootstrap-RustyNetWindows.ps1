@@ -979,6 +979,52 @@ function Ensure-WingetConfigurationDependencies {
     if ($LASTEXITCODE -ne 0) {
         throw 'winget configure failed for RustyNet bootstrap configuration'
     }
+    Assert-RustyNetWingetDependenciesInstalled
+}
+
+# After winget configure reports success, double-check that every
+# package the RustyNet bootstrap depends on actually landed at the
+# canonical path the install helper + daemon expect. winget can
+# return success when an individual package install is "best-effort"
+# OR when a previous run's cached state masks a partial failure;
+# explicit post-install verification means a degraded bootstrap
+# fails loud here rather than silently producing an install where
+# the daemon falls back to `windows-unsupported` (because WireGuard
+# wasn't actually installed).
+function Assert-RustyNetWingetDependenciesInstalled {
+    $missing = @()
+
+    # WireGuard for Windows — the daemon's `windows-wireguard-nt`
+    # backend shells out to wireguard.exe / wg.exe. Both must end up
+    # at the canonical install path; the WireGuard installer pins
+    # those paths, so any deviation means the install didn't land.
+    $wireguardExe = 'C:\Program Files\WireGuard\wireguard.exe'
+    $wgExe = 'C:\Program Files\WireGuard\wg.exe'
+    if (-not (Test-Path -LiteralPath $wireguardExe)) {
+        $missing += ('WireGuard.WireGuard (expected ' + $wireguardExe + ')')
+    }
+    if (-not (Test-Path -LiteralPath $wgExe)) {
+        $missing += ('WireGuard.WireGuard cli (expected ' + $wgExe + ')')
+    }
+
+    # Rustup — the build phase needs `cargo` on PATH eventually;
+    # rustup-init lays down `%USERPROFILE%\.cargo\bin\rustup.exe`.
+    $rustupExe = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
+    if (-not (Test-Path -LiteralPath $rustupExe)) {
+        $missing += ('Rustlang.Rustup (expected ' + $rustupExe + ')')
+    }
+
+    # Git — the source-sync flow uses git directly. winget's
+    # Git.Git package puts git.exe under `%ProgramFiles%\Git\cmd`
+    # by default; PATH addition is handled by the installer.
+    if (-not (Test-CommandPresent -Name 'git.exe')) {
+        $missing += 'Git.Git (git.exe not on PATH)'
+    }
+
+    if ($missing.Count -gt 0) {
+        $list = $missing -join '; '
+        throw ("RustyNet winget bootstrap reported success but the following packages did NOT install at their reviewed canonical paths: $list. Re-run the bootstrap; if the failure persists, install the package manually from its vendor's official source per documents/operations/WindowsWorkingNodeBringUpRunbook.md before continuing.")
+    }
 }
 
 function Ensure-CargoOnPath {

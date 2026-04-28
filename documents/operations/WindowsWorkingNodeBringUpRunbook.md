@@ -18,10 +18,10 @@ the trust anchor, no signed-state bundle can be ingested.
 ## 2) High-Level Flow
 
 ```
-[1] Install WireGuard for Windows
+[1] Run the RustyNet bootstrap (winget installs WireGuard + Git + PS7 + rustup)
 [2] Sync the Rustynet source tree to the Windows guest
 [3] Build rustynetd.exe inside the guest
-[4] Run windows-backend-readiness-check (confirms WG installed)
+[4] Run windows-backend-readiness-check (confirms WG ended up installed)
 [5] Run Install-RustyNetWindowsService.ps1 (auto-detects WG)
 [6] Run windows-runtime-acls-check + the W2.x security validators
 [7] Distribute signed bundles (membership + assignment + traversal + DNS zone)
@@ -30,25 +30,55 @@ the trust anchor, no signed-state bundle can be ingested.
 
 ## 3) Step-By-Step
 
-### 3.1 Install WireGuard for Windows
+### 3.1 Run the bootstrap (auto-installs WireGuard for Windows)
 
-Download the official installer from
-[https://www.wireguard.com/install/](https://www.wireguard.com/install/)
-— this provides:
-- `C:\Program Files\WireGuard\wireguard.exe`
-- `C:\Program Files\WireGuard\wg.exe`
-- The `WireGuardManager` tunnel-management Windows service
+The `Bootstrap-RustyNetWindows.ps1` helper runs `winget configure`
+against `RustyNetBootstrap.winget.yml`, which declares every
+prerequisite the working-node bring-up depends on:
 
-The signed installer's signature must validate (modern Windows
-validates Authenticode signatures automatically; SmartScreen flags
-unsigned installers). Verify the cert chain via PowerShell after
-install:
+- `Git.Git` — source sync
+- `Microsoft.PowerShell` (PS 7) — modern non-interactive scripting
+- `Rustlang.Rustup` — toolchain management for the build phase
+- **`WireGuard.WireGuard`** — installs the official WireGuard for
+  Windows package, providing
+  `C:\Program Files\WireGuard\wireguard.exe`,
+  `C:\Program Files\WireGuard\wg.exe`, and the `WireGuardManager`
+  tunnel-management service
+
+Invoking it (orchestrator-driven path, from a Linux/macOS
+workstation):
+
+```bash
+./target/release/rustynet-cli ops vm-lab-bootstrap-phase \
+    --phase prepare-transport \
+    --vm windows-utm-1 \
+    --inventory documents/operations/active/vm_lab_inventory.json \
+    --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+```
+
+After winget reports success, `Assert-RustyNetWingetDependenciesInstalled`
+double-checks every package landed at its canonical path. If
+WireGuard, Rustup, or Git is missing post-winget the bootstrap
+fails LOUD with a precise list — preventing a downstream install
+helper from silently falling back to `windows-unsupported` because
+WireGuard wasn't actually installed.
+
+To verify the WireGuard install signature out-of-band:
 
 ```powershell
 Get-AuthenticodeSignature 'C:\Program Files\WireGuard\wireguard.exe'
 ```
 
-Status MUST be `Valid`.
+Status MUST be `Valid`. (The winget package source is itself
+signature-verified, but operators on regulated networks may want
+the explicit confirmation.)
+
+To opt out of the WireGuard install (staging hosts that should
+stay on the fail-closed `windows-unsupported` backend), an
+operator skips Step 3.4's auto-detection by passing
+`-ForceUnsupportedBackend` to the install helper. The daemon
+will refuse to start until a future install-helper run flips the
+env file.
 
 ### 3.2 Sync source + build
 
