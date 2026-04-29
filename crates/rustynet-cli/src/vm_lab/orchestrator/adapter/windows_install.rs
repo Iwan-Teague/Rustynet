@@ -31,7 +31,7 @@ static UNINSTALL_SERVICE_SCRIPT: &str = include_str!(
 );
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-const BUILD_TIMEOUT: Duration = Duration::from_secs(1800); // cargo build on Windows takes longer
+const BUILD_TIMEOUT: Duration = Duration::from_secs(3600); // cold release build on Windows VM can take 30-60 min
 
 // ── PowerShell encoding helpers ───────────────────────────────────────────────
 

@@ -404,4 +404,3 @@ run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" "${backend_env[@]}"
   --src-dir "${HOME}/Rustynet" \
   --ssh-allow-cidrs "${SSH_ALLOW_CIDRS}" \
   --skip-apt
-EOF_BOOTSTRAP

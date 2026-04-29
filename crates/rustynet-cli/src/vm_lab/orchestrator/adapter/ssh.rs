@@ -132,13 +132,17 @@ pub fn run_remote(
         // detail to stdout (CLIXML stream / Write-Host). When stderr is
         // empty, fall back to a tail of stdout so the operator sees
         // *something* rather than a bare "(exit Some(1)): ".
+        let stdout_lossy = String::from_utf8_lossy(&output.stdout);
+        let stdout_trimmed = stdout_lossy.trim();
         let stderr = if stderr_raw.is_empty() {
-            let stdout_lossy = String::from_utf8_lossy(&output.stdout);
-            let trimmed = stdout_lossy.trim();
-            if trimmed.is_empty() {
+            // Windows PowerShell over OpenSSH frequently writes diagnostic
+            // detail to stdout (CLIXML stream / Write-Host). When stderr is
+            // empty, fall back to a tail of stdout so the operator sees
+            // *something* rather than a bare "(exit Some(1)): ".
+            if stdout_trimmed.is_empty() {
                 String::new()
             } else {
-                let tail: String = trimmed
+                let tail: String = stdout_trimmed
                     .chars()
                     .rev()
                     .take(800)
@@ -148,6 +152,27 @@ pub fn run_remote(
                     .collect();
                 format!("(stderr empty; stdout tail) {tail}")
             }
+        } else if !stdout_trimmed.is_empty() {
+            // Both streams have content. Cargo writes progress to stderr; the
+            // rustynet binary writes errors to stdout via println!. Combine
+            // tails from both so the operator sees the actual failure message.
+            let stderr_tail: String = stderr_raw
+                .chars()
+                .rev()
+                .take(600)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let stdout_tail: String = stdout_trimmed
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{stderr_tail}\n[stdout: {stdout_tail}]")
         } else {
             stderr_raw
         };

@@ -151,13 +151,11 @@ fn run_systemctl(conn: &NodeConnection, action: &str) -> Result<(), AdapterError
 }
 
 fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContext) -> String {
+    // `rustynet ops e2e-bootstrap-host --role` only accepts "admin" or "client".
+    // The bash orchestrator maps: exit→admin, everything else→client.
     let role_str = match role {
-        NodeRole::Exit => "exit",
-        NodeRole::Client => "client",
-        NodeRole::Entry => "entry",
-        NodeRole::Aux => "aux",
-        NodeRole::Extra => "extra",
-        NodeRole::Custom(s) => s.as_str(),
+        NodeRole::Exit => "admin",
+        _ => "client",
     };
     let ssh_allow_cidrs = &ctx.ssh_allow_cidrs;
     let network_id = &ctx.network_id;
@@ -211,7 +209,7 @@ mod tests {
             endpoints: HashMap::new(),
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx);
-        assert!(env.contains("ROLE=exit"), "must contain ROLE=exit: {env}");
+        assert!(env.contains("ROLE=admin"), "exit node must map to admin role: {env}");
         assert!(
             env.contains("NODE_ID=exit-node1-abc123"),
             "must contain NODE_ID: {env}"
@@ -223,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_env_custom_role() {
+    fn bootstrap_env_non_exit_roles_map_to_client() {
         use std::collections::HashMap;
         let ctx = OrchestrationContext {
             assignments: vec![],
@@ -239,8 +237,10 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
         };
-        let env = build_bootstrap_env("id1", &NodeRole::Custom("special".to_string()), &ctx);
-        assert!(env.contains("ROLE=special"), "custom role: {env}");
+        for role in [NodeRole::Client, NodeRole::Entry, NodeRole::Aux, NodeRole::Extra] {
+            let env = build_bootstrap_env("id1", &role, &ctx);
+            assert!(env.contains("ROLE=client"), "non-exit role {role:?} must map to client: {env}");
+        }
     }
 
     #[test]
