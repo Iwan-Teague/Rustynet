@@ -11,7 +11,12 @@ pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
 pub const WINDOWS_STATE_ROOT: &str = r"C:\ProgramData\RustyNet";
 pub const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
+pub const WINDOWS_RUSTYNET_PATH: &str = r"C:\Program Files\RustyNet\rustynet.exe";
 pub const WINDOWS_STAGING_DIR: &str = r"C:\ProgramData\Rustynet\vm-lab";
+pub const WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.owner.key.pub";
+pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.snapshot";
 
 static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1");

@@ -15,6 +15,11 @@ pub const MACOS_SERVICE_LABEL: &str = "com.rustynet.daemon";
 pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
 pub const MACOS_DAEMON_SOCKET: &str = "/var/run/rustynet/rustynetd.sock";
+pub const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
+pub const MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
+    "/usr/local/var/rustynet/membership/membership.owner.key.pub";
+pub const MACOS_MEMBERSHIP_SNAPSHOT_PATH: &str =
+    "/usr/local/var/rustynet/membership/membership.snapshot";
 
 static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");

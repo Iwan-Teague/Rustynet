@@ -2,51 +2,102 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
+    WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH, WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_RUSTYNET_PATH,
     WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
 };
+use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
-const WINDOWS_MEMBERSHIP_BLOCKED_MSG: &str = "\
-Windows as a membership owner (exit node) is not yet implemented. \
-Blocked by W5.4: Windows exit-node role requires (1) rustynetd.exe ops \
-init-membership subcommand reviewed and tested on Windows; \
-(2) Windows key custody model (DPAPI / credential store) reviewed \
-against security minimum bar; (3) membership signing path on Windows \
-verified end-to-end.";
-
 /// Read the membership owner public key from a Windows exit node.
-/// Blocked until W5.4 — Windows as a membership-owner exit node is not
-/// yet reviewed against the security minimum bar.
+/// Reads `WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH` via PowerShell `Get-Content`.
 pub fn issue_membership_owner_key(
-    _conn: &NodeConnection,
+    conn: &NodeConnection,
 ) -> Result<MembershipOwnerKey, AdapterError> {
-    Err(AdapterError::UnsupportedPlatform {
-        platform: VmGuestPlatform::Windows,
-        message: WINDOWS_MEMBERSHIP_BLOCKED_MSG.to_string(),
+    let read_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $p = {path_q}; \
+         if (-not (Test-Path -LiteralPath $p)) {{ \
+             throw 'membership owner public key not found at ' + $p + '; has membership been initialized?' \
+         }}; \
+         (Get-Content -LiteralPath $p -Raw).Trim()",
+        path_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH)?,
+    );
+    let pem = run_remote_ps(conn, &read_script, SHORT_TIMEOUT)?;
+    let pem = pem.trim().to_string();
+    if pem.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "membership owner public key is empty on remote; \
+                      has membership been initialized?"
+                .to_string(),
+        });
+    }
+    Ok(MembershipOwnerKey {
+        public_key_pem: pem,
     })
 }
 
 /// Initialize the membership snapshot on a Windows exit node.
-/// Blocked until W5.4 — same security minimum bar requirements as above.
+///
+/// Runs `rustynet.exe ops init-membership`, then adds each non-exit peer
+/// via `ops e2e-membership-add`, then reads back the snapshot bytes.
+/// Requires the SSH session to run as an Administrator user.
 pub fn init_membership_snapshot(
-    _conn: &NodeConnection,
+    conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
-    _peers: &[NodeRoleAssignment],
+    peers: &[NodeRoleAssignment],
 ) -> Result<MembershipSnapshot, AdapterError> {
-    Err(AdapterError::UnsupportedPlatform {
-        platform: VmGuestPlatform::Windows,
-        message: WINDOWS_MEMBERSHIP_BLOCKED_MSG.to_string(),
-    })
+    // 1. Run ops init-membership (idempotent).
+    let init_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $env:RUSTYNET_NODE_ROLE = 'admin'; \
+         & {rustynet_q} ops init-membership; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'ops init-membership failed with exit code ' + $LASTEXITCODE }}",
+        rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?,
+    );
+    run_remote_ps(conn, &init_script, MEDIUM_TIMEOUT)?;
+
+    // 2. Add each non-exit peer.
+    for peer in peers {
+        if peer.role == NodeRole::Exit {
+            continue;
+        }
+        let add_script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $ProgressPreference = 'SilentlyContinue'; \
+             & {rustynet_q} ops e2e-membership-add \
+                 --client-node-id {alias_q} \
+                 --client-pubkey-hex '' \
+                 --owner-approver-id 'none'; \
+             if ($LASTEXITCODE -ne 0) {{ \
+                 throw 'ops e2e-membership-add failed for ' + {alias_q} \
+             }}",
+            rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?,
+            alias_q = ps_quote(&peer.alias)?,
+        );
+        run_remote_ps(conn, &add_script, MEDIUM_TIMEOUT)?;
+    }
+
+    // 3. Read snapshot back as base64.
+    let read_snapshot_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         [Convert]::ToBase64String([System.IO.File]::ReadAllBytes({snapshot_q}))",
+        snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?,
+    );
+    let snapshot_b64 = run_remote_ps(conn, &read_snapshot_script, SHORT_TIMEOUT)?;
+    let data = base64_decode(snapshot_b64.trim())?;
+    Ok(MembershipSnapshot { data })
 }
 
 /// Distribute a signed bundle to a Windows client node.
@@ -59,7 +110,6 @@ pub fn distribute_signed_bundle(
 ) -> Result<(), AdapterError> {
     let (remote_staging, remote_dst) = remote_bundle_paths(&kind);
 
-    // Ensure the staging dir and the destination parent dir both exist.
     let dst_parent = remote_dst
         .rsplit_once('\\')
         .map(|(dir, _)| dir.to_string())
@@ -75,7 +125,6 @@ pub fn distribute_signed_bundle(
     );
     run_remote_ps(conn, &ensure_dirs_script, SHORT_TIMEOUT)?;
 
-    // SCP the bundle to the staging path (SCP uses forward-slash paths).
     ssh::scp_to(
         conn,
         bundle_path,
@@ -83,7 +132,6 @@ pub fn distribute_signed_bundle(
         MEDIUM_TIMEOUT,
     )?;
 
-    // Atomic install: Move-Item from staging to final destination.
     let install_script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -119,6 +167,39 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
             format!(r"{state}\trust\rustynetd.dns-zone"),
         ),
     }
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>, AdapterError> {
+    base64_std_decode(encoded).map_err(|err| AdapterError::Protocol {
+        message: format!("base64 decode of membership snapshot failed: {err}"),
+    })
+}
+
+fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
+    let clean: String = encoded
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let output = Command::new("base64")
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(clean.as_bytes());
+            }
+            child.wait_with_output()
+        })
+        .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("base64 -d failed: {stderr}"));
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -177,28 +258,37 @@ mod tests {
     }
 
     #[test]
-    fn issue_membership_owner_key_returns_unsupported() {
-        use std::io::Write;
-        use std::path::PathBuf;
-        use tempfile::NamedTempFile;
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "# kh").unwrap();
-        let conn = crate::vm_lab::orchestrator::connection::NodeConnection::ssh(
-            "10.0.0.1",
-            22,
-            None,
-            PathBuf::from("/id_rsa"),
-            f.path().to_path_buf(),
-        )
-        .unwrap();
-        let err = issue_membership_owner_key(&conn).unwrap_err();
+    fn membership_owner_pubkey_path_is_under_state_root() {
         assert!(
-            matches!(err, AdapterError::UnsupportedPlatform { .. }),
-            "expected UnsupportedPlatform, got: {err:?}"
+            WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH.starts_with(r"C:\ProgramData\RustyNet"),
+            "pubkey path must be under state root: {WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH}"
         );
+    }
+
+    #[test]
+    fn membership_snapshot_path_is_under_state_root() {
         assert!(
-            err.to_string().contains("security minimum bar"),
-            "error must mention 'security minimum bar': {err}"
+            WINDOWS_MEMBERSHIP_SNAPSHOT_PATH.starts_with(r"C:\ProgramData\RustyNet"),
+            "snapshot path must be under state root: {WINDOWS_MEMBERSHIP_SNAPSHOT_PATH}"
         );
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        let data = b"hello membership";
+        let encoded = {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("base64")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(data).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let decoded = base64_decode(encoded.trim()).unwrap();
+        assert_eq!(decoded, data);
     }
 }

@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 use std::fmt;
 
+use crate::vm_lab::VmGuestPlatform;
+
 /// OS-agnostic role definition. The 5 named roles match the bash
 /// orchestrator's existing names so membership / traffic-test / role-switch
 /// logic stays semantically identical.
@@ -23,6 +25,25 @@ impl NodeRole {
     /// Returns true for roles that act as the membership-owner (signs bundles).
     pub fn is_membership_owner(&self) -> bool {
         matches!(self, NodeRole::Exit)
+    }
+
+    /// Role-platform matrix (W5.4 end state):
+    ///
+    /// | Role   | Linux | Windows | macOS | iOS | Android |
+    /// |--------|-------|---------|-------|-----|---------|
+    /// | Exit   | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Client | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Entry  | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Aux    | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Extra  | ✓     | ✓       | ✓     | ✗   | ✗       |
+    ///
+    /// iOS and Android adapters fail closed with security-specific rejection
+    /// messages (unreviewed key custody + connection model + daemon coverage).
+    pub fn is_supported_for_platform(&self, platform: &VmGuestPlatform) -> bool {
+        match platform {
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
+            VmGuestPlatform::Linux | VmGuestPlatform::Windows | VmGuestPlatform::Macos => true,
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -107,5 +128,49 @@ mod tests {
         assert!(NodeRole::parse("custom-").is_err());
         assert!(NodeRole::parse("EXIT").is_err());
         assert!(NodeRole::parse("worker").is_err());
+    }
+
+    #[test]
+    fn is_supported_for_platform_linux_windows_macos_all_roles() {
+        let roles = [
+            NodeRole::Exit,
+            NodeRole::Client,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+        ];
+        let supported = [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Macos,
+        ];
+        for role in &roles {
+            for platform in &supported {
+                assert!(
+                    role.is_supported_for_platform(platform),
+                    "{role:?} must be supported on {platform:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_supported_for_platform_ios_android_all_roles_blocked() {
+        let roles = [
+            NodeRole::Exit,
+            NodeRole::Client,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+        ];
+        let unsupported = [VmGuestPlatform::Ios, VmGuestPlatform::Android];
+        for role in &roles {
+            for platform in &unsupported {
+                assert!(
+                    !role.is_supported_for_platform(platform),
+                    "{role:?} must not be supported on {platform:?}"
+                );
+            }
+        }
     }
 }

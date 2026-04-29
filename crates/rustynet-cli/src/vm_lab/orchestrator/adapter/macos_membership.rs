@@ -2,56 +2,105 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_STATE_ROOT;
+use crate::vm_lab::orchestrator::adapter::macos_install::{
+    MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH, MACOS_RUSTYNET_PATH,
+    MACOS_STATE_ROOT,
+};
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
 };
+use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
-const MACOS_MEMBERSHIP_BLOCKED_MSG: &str = "\
-macOS as a membership owner (exit node) is not yet implemented. \
-Blocked by W5.4: macOS exit-node role requires (1) rustynetd ops \
-init-membership subcommand reviewed and tested on macOS; \
-(2) macOS key custody model (Keychain / Secure Enclave) reviewed \
-against security minimum bar; (3) membership signing path on macOS \
-verified end-to-end.";
-
 const MACOS_STAGING_DIR: &str = "/tmp/rustynet-staging";
 
 /// Read the membership owner public key from a macOS exit node.
-/// Blocked until W5.4 — macOS as a membership-owner exit node is not
-/// yet reviewed against the security minimum bar.
+/// Reads `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` via SSH `cat`.
 pub fn issue_membership_owner_key(
-    _conn: &NodeConnection,
+    conn: &NodeConnection,
 ) -> Result<MembershipOwnerKey, AdapterError> {
-    Err(AdapterError::UnsupportedPlatform {
-        platform: VmGuestPlatform::Macos,
-        message: MACOS_MEMBERSHIP_BLOCKED_MSG.to_string(),
+    let pem = ssh::run_remote(
+        conn,
+        &format!(
+            "cat '{path}' 2>/dev/null || echo ''",
+            path = MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH
+        ),
+        SHORT_TIMEOUT,
+    )?;
+    let pem = pem.trim().to_string();
+    if pem.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "membership owner public key not found on remote; \
+                      has membership been initialized?"
+                .to_string(),
+        });
+    }
+    Ok(MembershipOwnerKey {
+        public_key_pem: pem,
     })
 }
 
 /// Initialize the membership snapshot on a macOS exit node.
-/// Blocked until W5.4 — same security minimum bar requirements as above.
+///
+/// Runs `rustynet ops init-membership`, then adds each non-exit peer
+/// via `ops e2e-membership-add`, then reads back the snapshot bytes.
+/// Requires the SSH session to have sudo / admin privilege.
 pub fn init_membership_snapshot(
-    _conn: &NodeConnection,
+    conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
-    _peers: &[NodeRoleAssignment],
+    peers: &[NodeRoleAssignment],
 ) -> Result<MembershipSnapshot, AdapterError> {
-    Err(AdapterError::UnsupportedPlatform {
-        platform: VmGuestPlatform::Macos,
-        message: MACOS_MEMBERSHIP_BLOCKED_MSG.to_string(),
-    })
+    // 1. Run ops init-membership (idempotent).
+    ssh::run_remote(
+        conn,
+        &format!(
+            "env RUSTYNET_NODE_ROLE=admin sudo '{rustynet}' ops init-membership",
+            rustynet = MACOS_RUSTYNET_PATH,
+        ),
+        MEDIUM_TIMEOUT,
+    )?;
+
+    // 2. Add each non-exit peer.
+    for peer in peers {
+        if peer.role == NodeRole::Exit {
+            continue;
+        }
+        let node_id_arg = shell_safe_arg(&peer.alias)?;
+        ssh::run_remote(
+            conn,
+            &format!(
+                "sudo '{rustynet}' ops e2e-membership-add \
+                     --client-node-id '{node_id_arg}' \
+                     --client-pubkey-hex '' \
+                     --owner-approver-id \
+                     \"$('{rustynet}' ops owner-approver-id 2>/dev/null || echo none)\"",
+                rustynet = MACOS_RUSTYNET_PATH,
+            ),
+            MEDIUM_TIMEOUT,
+        )?;
+    }
+
+    // 3. Read snapshot back as base64.
+    let snapshot_b64 = ssh::run_remote(
+        conn,
+        &format!(
+            "cat '{snapshot}' | base64",
+            snapshot = MACOS_MEMBERSHIP_SNAPSHOT_PATH,
+        ),
+        SHORT_TIMEOUT,
+    )?;
+    let data = base64_decode(snapshot_b64.trim())?;
+    Ok(MembershipSnapshot { data })
 }
 
 /// Distribute a signed bundle to a macOS client node.
 /// Uses the same atomic install pattern as Linux: scp to temp, then
-/// `install -m 0640 -o root -g rustynetd` to the final path.
+/// `sudo install -m 0640 -o root -g rustynetd` to the final path.
 pub fn distribute_signed_bundle(
     conn: &NodeConnection,
     kind: BundleKind,
@@ -100,9 +149,60 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     }
 }
 
+/// Reject shell-dangerous characters to prevent injection via alias strings.
+fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "value '{value}' contains characters not safe for shell argument embedding \
+                 (allowed: alphanumeric, hyphen, underscore, dot)"
+            ),
+        })
+    }
+}
+
+fn base64_decode(encoded: &str) -> Result<Vec<u8>, AdapterError> {
+    base64_std_decode(encoded).map_err(|err| AdapterError::Protocol {
+        message: format!("base64 decode of membership snapshot failed: {err}"),
+    })
+}
+
+fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
+    let clean: String = encoded
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let output = Command::new("base64")
+        .arg("-d")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(clean.as_bytes());
+            }
+            child.wait_with_output()
+        })
+        .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("base64 -d failed: {stderr}"));
+    }
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_MEMBERSHIP_DIR;
 
     #[test]
     fn remote_bundle_paths_contain_expected_filenames() {
@@ -136,28 +236,50 @@ mod tests {
     }
 
     #[test]
-    fn issue_membership_owner_key_returns_unsupported() {
-        use std::io::Write;
-        use std::path::PathBuf;
-        use tempfile::NamedTempFile;
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "# kh").unwrap();
-        let conn = crate::vm_lab::orchestrator::connection::NodeConnection::ssh(
-            "10.0.0.1",
-            22,
-            None,
-            PathBuf::from("/id_rsa"),
-            f.path().to_path_buf(),
-        )
-        .unwrap();
-        let err = issue_membership_owner_key(&conn).unwrap_err();
+    fn membership_owner_pubkey_path_is_under_membership_dir() {
         assert!(
-            matches!(err, AdapterError::UnsupportedPlatform { .. }),
-            "expected UnsupportedPlatform, got: {err:?}"
+            MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH.starts_with(MACOS_MEMBERSHIP_DIR),
+            "pubkey path must be under membership dir: {MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}"
         );
+    }
+
+    #[test]
+    fn membership_snapshot_path_is_under_membership_dir() {
         assert!(
-            err.to_string().contains("security minimum bar"),
-            "error must mention 'security minimum bar': {err}"
+            MACOS_MEMBERSHIP_SNAPSHOT_PATH.starts_with(MACOS_MEMBERSHIP_DIR),
+            "snapshot path must be under membership dir: {MACOS_MEMBERSHIP_SNAPSHOT_PATH}"
         );
+    }
+
+    #[test]
+    fn shell_safe_arg_accepts_valid() {
+        assert_eq!(shell_safe_arg("node-exit-1").unwrap(), "node-exit-1");
+        assert_eq!(shell_safe_arg("abc.def_ghi").unwrap(), "abc.def_ghi");
+    }
+
+    #[test]
+    fn shell_safe_arg_rejects_special_chars() {
+        assert!(shell_safe_arg("node; rm -rf /").is_err());
+        assert!(shell_safe_arg("node$(whoami)").is_err());
+        assert!(shell_safe_arg("node`id`").is_err());
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        let data = b"hello macos membership";
+        let encoded = {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("base64")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(data).unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let decoded = base64_decode(encoded.trim()).unwrap();
+        assert_eq!(decoded, data);
     }
 }
