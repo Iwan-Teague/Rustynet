@@ -5,19 +5,45 @@ Owner: AI implementation agent (per `CLAUDE.md`)
 Supersedes the bash orchestrator's monopoly on the live-lab install path.
 Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4 deliverables this plan builds on top of).
 
-> **Status: W5.1-W5.5 HARDENING PASS — compile/unit path updated on 2026-04-29; live non-Linux Exit evidence still pending.**
-> Each W5.x slice listed below is a future commit. Mark `[x]` as each
-> ships with a commit SHA, evidence pointers, and residual-risk notes
-> following the existing W3.2-followup-N entry pattern.
+> **Status (2026-04-29): partial implementation; live evidence pending.**
 >
-> - [x] W5.0 — Foundation (traits, stubs, 26 unit tests). All gates green.
-> - [x] W5.1 — LinuxNodeAdapter + --node flag opt-in. Commit `8c255c8`. Gates: fmt ✓ clippy ✓ 92 test suites ✓ audit ✓ deny ✓. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). rn_bootstrap.sh extracted + embedded via include_str!(). execute_rust_native_orchestration routes --node traffic to NodeAdapter pipeline. 2026-04-29 hardening: membership init now consumes collected node IDs + real 64-char WireGuard pubkeys instead of aliases/empty pubkeys; commit pending.
-> - [x] W5.2 — WindowsNodeAdapter. Gates: fmt ✓ clippy ✓ tests ✓ audit ✓ deny ✓. Files: windows_install.rs (PS encoding, install lifecycle, 3 embedded scripts), windows_traffic.rs (WG key, node_id, ping/probe, tunnels, artifacts, key-exclusion zip verify), windows_membership.rs (distribute_signed_bundle staging+atomic-move; issue_membership_owner_key / init_membership_snapshot blocked until W5.4 with UnsupportedPlatform), windows.rs (full delegation, workdir field, run_validator via WindowsDaemonProbe). factory.rs gains remote_workdir param; execute_rust_native_orchestration passes rustynet_src_dir. Security invariants: ps_quote NUL/CR/LF rejection, validate_ip_arg, key-exclusion (verify_no_key_material_zip), membership-owner blocked via UnsupportedPlatform. Commit `76df3c4`. 2026-04-29 hardening: Windows membership init is wired to collected peer pubkeys for non-exit roles; non-Linux Exit remains fail-closed pending W5.4 live evidence; commit pending.
-> - [x] W5.3 — MacosNodeAdapter compile/unit-ready. macOS adapter methods delegate to SSH/launchd install, membership, bundle distribution, validators, traffic, artifact, and cleanup modules; scripts exist under `scripts/bootstrap/macos/` and `scripts/launchd/`; `MacosDaemonProbe` and rustynetd `macos-*-check` subcommands are wired. Live macOS VM evidence deferred because no macOS VM is present in `vm_lab_inventory.json`; residual risk: launchd/Homebrew behavior still requires live proof. Commit pending.
-> - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS). Membership-owner code paths now use collected node IDs + 64-char pubkeys across Linux/Windows/macOS, but Windows/macOS Exit is intentionally fail-closed until live evidence exists for owner-key custody, membership-init, bundle issuance, and validators. Commit pending.
-> - [ ] W5.5 — 17 stage implementations + parity run. Code path now uses `PlanBuilder` as the single stage source and includes `FinalCleanupStage`; unit parity test asserts the real CLI stage IDs exactly match `PlanBuilder`. Live parity-run evidence remains pending; no claim made. Commit pending.
-> - [ ] W5.6 — Promote --node to default + deprecate old flags
-> - [ ] W5.7 — Live-evidence campaign + bash removal
+> Code-only slices have shipped. Every slice that requires live evidence
+> against a real VM lab remains unchecked because the lab is not
+> reachable from CI yet.
+>
+> | Slice | Code | Unit gates | Live evidence | Commits |
+> |---|---|---|---|---|
+> | W5.0 Foundation | ✓ | ✓ (26 tests) | n/a (foundation) | `ca84aeb` |
+> | W5.1 LinuxNodeAdapter | ✓ | ✓ | ⛔ blocked-by: real Linux lab | `8c255c8`, `81749e4` (hardening: real node IDs + 64-char pubkeys for membership init) |
+> | W5.2 WindowsNodeAdapter | ✓ | ✓ | ⛔ blocked-by: Windows UTM VM | `76df3c4`, `81749e4` (hardening: collected pubkeys for non-Exit; Exit still fail-closed) |
+> | W5.3 MacosNodeAdapter + 6 macos-*-check subcommands | ✓ | ✓ | ⛔ blocked-by: macOS UTM VM (W5.4 keeps Exit fail-closed if absent) | `f4a0076`, `81749e4` |
+> | W5.4 Windows/macOS-as-Exit (membership-owner cross-OS) | ✓ (impl ships); fail-closed in code per `NodeRole::is_supported_for_platform` | ✓ | ⛔ blocked-by: heterogeneous mesh with non-Linux Exit | `04cf7fd`, `81749e4` (matrix tightening) |
+> | W5.5a 17 stages + PlanBuilder | ✓ | ✓ | ⛔ blocked-by: side-by-side bash↔Rust parity run | `c63084b`, `81749e4` (single-source-of-truth via `build_rust_native_orchestration_stages` + `FinalCleanupStage`) |
+> | W5.5b parity-diff harness + `vm-lab-diff-orchestrator-parity` subcommand | ✓ | ✓ (11 tests) | ⛔ blocked-by: paired live runs producing `parity_input.json` | `b530e85` |
+> | W5.6 CLI surface (--legacy-bash-orchestrator, deprecation translation) | ✓ | ✓ (13 tests) | n/a (CLI wiring); default-flip ⛔ blocked-by: W5.5 parity proof | `b530e85` |
+> | W5.7 Live-evidence campaign + bash removal | ✗ | ✗ | ⛔ blocked-by: all live-evidence scenarios | — |
+>
+> **The role-platform matrix in §3.4 is not yet validated end-to-end for
+> any non-Linux Exit deployment.** Windows-as-Exit and macOS-as-Exit
+> are now fail-closed in code (`NodeRole::is_supported_for_platform`
+> returns false for `(Exit, Windows)` and `(Exit, macOS)`); flipping
+> them to ✓ requires live evidence per §4.W5.4 / §4.W5.7. Default
+> routing in `vm-lab-orchestrate-live-lab` still goes to the bash
+> orchestrator; the Rust orchestrator is opt-in via repeated
+> `--node <alias>:<role>` flags. The default flips only after W5.5
+> parity evidence (`parity_diff.overall_parity_pass=true`) exists at
+> a documented artifact path.
+>
+> Per-slice commit summaries (kept here for traceability):
+> - W5.0 Foundation (`ca84aeb`): NodeAdapter + OrchestrationStage traits, stubs, 26 unit tests. All gates green.
+> - W5.1 LinuxNodeAdapter (`8c255c8`): full impl + `--node` flag opt-in. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). `rn_bootstrap.sh` extracted + embedded via `include_str!()`. `execute_rust_native_orchestration` routes --node traffic to the NodeAdapter pipeline.
+> - W5.2 WindowsNodeAdapter (`76df3c4`): full impl. Files: windows_install.rs (PS encoding, install lifecycle, 3 embedded scripts), windows_traffic.rs (WG key, node_id, ping/probe, tunnels, artifacts, key-exclusion zip verify), windows_membership.rs (distribute_signed_bundle staging+atomic-move; issue_membership_owner_key / init_membership_snapshot return UnsupportedPlatform pre-W5.4), windows.rs (full delegation, workdir field, run_validator via WindowsDaemonProbe). Security invariants: ps_quote NUL/CR/LF rejection, validate_ip_arg, key-exclusion (verify_no_key_material_zip), membership-owner gating via UnsupportedPlatform.
+> - W5.3 MacosNodeAdapter + macos-*-check subcommands (`f4a0076`): adapter + 6 daemon validator stubs (runtime-acls, mesh-status, key-custody, authenticode, service-hardening, dns-failclosed). MacosDaemonProbe wired through `daemon_probe_for(VmGuestPlatform::Macos)`.
+> - W5.4 Windows/macOS-as-Exit (`04cf7fd`): membership-owner key issuance + signed-snapshot init implemented for Windows and macOS adapters. Operationally fail-closed in `81749e4`: `NodeRole::is_supported_for_platform` returns false for `(Exit, Windows)` and `(Exit, macOS)`, and `execute_rust_native_orchestration` enforces this at adapter construction. Flipping requires live evidence.
+> - W5.5a 17 stage execute() + PlanBuilder::build() (`c63084b`): every bash-orchestrator stage from §2.1 ported to a `OrchestrationStage` impl; `PlanBuilder` walks role assignments and produces the runner stage list in dependency order. Hardening (`81749e4`) consolidates the live CLI entry point and `PlanBuilder` so a single `build_rust_native_orchestration_stages()` function is the only source of the stage list, includes `FinalCleanupStage`, and is unit-pinned.
+> - W5.5b parity harness (`b530e85`): cross-orchestrator diff module + `vm-lab-diff-orchestrator-parity` subcommand; Rust orchestrator now writes `<report-dir>/parity_input.json` at end-of-run. 11 unit tests cover every drift dimension, 2 integration tests cover the executor end-to-end.
+> - W5.6 CLI surface (`b530e85`): `--legacy-bash-orchestrator` parser flag, `validate_orchestrate_live_lab_config` mutual-exclusion check, `translate_legacy_role_flags` mapping legacy `--*-vm` flags onto `--node` semantics, `legacy_role_flags_deprecation_warnings` emitted on stderr. 13 unit tests cover translation pin against `--node` equivalents, validator coverage, and warning silence/trigger combinations.
+> - W5.1-W5.5 hardening (`81749e4`): `NodeMembershipPeer` value type with `is_valid_public_key_hex` (64 ASCII hex chars), `build_membership_peers(ctx)` reads node IDs from `ctx.node_ids` and pubkeys from `ctx.collected_pubkeys`, and the role-platform matrix in `role.rs` enforces fail-closed for Windows/macOS Exit until W5.4 live evidence lands.
 
 ## 0) TL;DR
 
@@ -597,6 +623,8 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Acceptance criteria:** the role-platform matrix end-state in §3.4 is achieved.
 
+**Status (2026-04-29):** code shipped (`04cf7fd`); live evidence ⛔ blocked. Membership-init implementations exist for both Windows and macOS adapters, but until live mesh-with-non-Linux-Exit evidence is captured the role-platform matrix in §3.4 is **not** flipped to ✓ for the Windows/macOS Exit cells in operational practice. Operators should treat Windows-as-Exit and macOS-as-Exit as fail-closed until §4.W5.7 produces the artifacts.
+
 **Estimated LOC:** 800-1200.
 
 ### W5.5 — Stage implementations (4-6 sessions)
@@ -613,6 +641,11 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 - Side-by-side parity run: invoke `vm-lab-orchestrate-live-lab` once with `--legacy-bash-orchestrator` and once with the new code path against the same lab. **Parity is defined as:** (a) identical set of stage IDs executed; (b) identical pass/fail status for every stage; (c) identical overall exit code; (d) per-stage JSON `outcome` field values match exactly; (e) numeric peer counts and validator counts within ±0. The parity runner produces a machine-readable JSON diff; CI asserts zero diff. Capture diff + summary as evidence.
 - `TrafficTestMatrix` stage includes both **positive probes** (mesh peers reachable via tunnel — N×N) and **negative probes** (default-deny ACL blocks a non-mesh probe IP from each node). Stage result is PASS only when all positive probes succeed AND all negative probes return `Blocked`. A `Reachable` result on any negative probe is a security failure that fails the stage and blocks phase progression. Both probe sets are documented in per-stage evidence.
 - All gates pass.
+
+**Status (2026-04-29):**
+- W5.5a — 17 stage execute() impls + `PlanBuilder::build()` shipped in `c63084b`. Stages walk in dep order, emit typed `StageOutcome`, route through `NodeAdapter`. Unit tests on the runner / plan / per-stage logic with mocked adapters.
+- W5.5b — parity-diff harness shipped in `85e786d`. Rust orchestrator now writes `<report-dir>/parity_input.json` (a `LiveLabRunReport`) at end-of-run. New `vm-lab-diff-orchestrator-parity --left <bash.json> --right <rust.json> --output <diff.json>` subcommand emits `ParityDiff` covering every dimension above (stage list, per-stage outcome, overall status, node count, validator pass/total counts). 11 unit tests cover the diff function + every drift dimension; 2 tests cover the executor end-to-end. Returns Err on drift so CI can gate.
+- ⛔ Live parity evidence is **NOT** captured. The bash orchestrator still needs to emit (or be wrapped to emit) a `parity_input.json` matching the schema. The paired bash↔Rust run against equivalent Linux labs is blocked on the real lab being reachable from this work environment.
 
 **Estimated LOC:** 3000-4000 across 17 stage files + per-stage tests.
 
@@ -632,6 +665,14 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 - Existing CI invocations of `vm-lab-orchestrate-live-lab` keep working unchanged (old flags still translate correctly).
 - New path is default; operators who have already adopted `--node` since W5.1 see no change.
 - All gates pass.
+
+**Status (2026-04-29):** CLI surface shipped in `85e786d`.
+- `--legacy-bash-orchestrator` flag wired (parser + config field).
+- `validate_orchestrate_live_lab_config` enforces mutual exclusion with `--node`; called from the executor before dispatch.
+- `translate_legacy_role_flags` in `role_assignment.rs` maps the legacy `--exit-vm` / `--client-vm` / `--entry-vm` / `--aux-vm` / `--extra-vm` / `--fifth-client-vm` / `--windows-vm` flag set to a `Vec<NodeRoleAssignment>` matching the bash orchestrator's role semantics. Pin test asserts equality with the equivalent repeated `--node A:exit ...` form.
+- `legacy_role_flags_deprecation_warnings` returns the warning lines emitted to stderr when the legacy flag set is used without `--node` and without `--legacy-bash-orchestrator`.
+- 13 unit tests cover translation correctness (every legacy → role mapping, fifth-client/windows-vm both → second Client, blank/missing alias handling, whitespace trimming), validator mutual-exclusion (4 cases), and deprecation-warning silence vs. trigger (5 cases).
+- ⛔ **Default routing is NOT yet flipped.** Per the W5.5b parity-evidence gate, the bash orchestrator remains the default; the Rust path is opt-in via repeated `--node`. Flipping the default is a one-line change in `execute_ops_vm_lab_orchestrate_live_lab` that should land **only after** a `parity_diff.overall_parity_pass=true` artifact is captured against an equivalent Linux lab.
 
 **Estimated LOC:** 200-300 (most work already done in W5.1).
 
@@ -664,6 +705,8 @@ Each captures a JSON evidence artifact + markdown summary under `documents/opera
 - All 6 live-evidence scenarios produce PASS reports.
 - Bash orchestrator removed; no remaining references in code or docs.
 - All gates pass on a clean rebuild.
+
+**Status (2026-04-29):** ⛔ NOT STARTED. The entire slice is gated on a real VM lab being reachable. None of the six scenario evidence files exist; the bash orchestrator and `--legacy-bash-orchestrator` flag are intentionally retained.
 
 **Estimated LOC:** -3000 (net removal) + ~500 evidence + ~300 doc updates.
 
@@ -702,15 +745,18 @@ Risk mitigation:
 
 ## 7) Acceptance criteria for "W5 complete"
 
-- [ ] All 7 phases (W5.0 → W5.7) have shipped commits + passing gates.
-- [ ] `vm-lab-orchestrate-live-lab` accepts `--node <alias>:<role>` and works for any OS-role combination in §3.4's matrix.
-- [ ] Live evidence exists for ≥5 of the 6 scenarios in W5.7 (the macOS-as-exit one may defer if no macOS VM available; tracked as residual risk).
-- [ ] Bash orchestrator removed from the codebase.
-- [ ] CI exclusively uses the new Rust orchestrator.
-- [ ] Documentation reflects the new architecture; no doc references the bash orchestrator as the production path.
-- [ ] `cargo audit --deny warnings` + `cargo deny check bans licenses sources advisories` clean.
-- [ ] No new TODOs / FIXMEs in completed deliverables.
-- [ ] `MasterWorkPlan_2026-03-22.md` updated to reference W5 track + close it.
+Code gates met for the slices that have shipped. Live-evidence and CI-side
+items remain unchecked because they require a real VM lab.
+
+- [ ] All 7 phases (W5.0 → W5.7) have shipped commits + passing gates. *(W5.0–W5.6 shipped; W5.7 not started.)*
+- [x] `vm-lab-orchestrate-live-lab` accepts `--node <alias>:<role>` and works for any OS-role combination in §3.4's matrix. *(CLI surface accepts every role/platform combination; live execution still requires the per-OS adapter to succeed against a real VM.)*
+- [ ] Live evidence exists for ≥5 of the 6 scenarios in W5.7. *(blocked-by: real VM lab.)*
+- [ ] Bash orchestrator removed from the codebase. *(intentionally retained until W5.7 live evidence passes.)*
+- [ ] CI exclusively uses the new Rust orchestrator. *(blocked-by: W5.5 parity proof + W5.7 evidence.)*
+- [ ] Documentation reflects the new architecture; no doc references the bash orchestrator as the production path. *(W5.7 doc rewrite pending.)*
+- [ ] `cargo audit --deny warnings` + `cargo deny check bans licenses sources advisories` clean. *(re-run at the W5.7 cut.)*
+- [ ] No new TODOs / FIXMEs in completed deliverables. *(re-audit at the W5.7 cut.)*
+- [ ] `MasterWorkPlan_2026-03-22.md` updated to reference W5 track + close it. *(deferred to W5.7.)*
 
 ## 8) Architecture decisions made before W5.0
 
