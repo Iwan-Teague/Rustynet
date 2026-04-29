@@ -161,9 +161,14 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     );
     let _ = run_remote_ps(conn, &stop_script, SHORT_TIMEOUT);
 
-    // Remove runtime state but keep keys and installation.
+    // Remove runtime state but keep keys and installation. Best-effort:
+    // mirrors the Linux `rm -rf … 2>/dev/null; true` pattern. We deliberately
+    // do not enable Set-StrictMode here — the cleanup target list is allowed
+    // to contain paths that do not exist on a fresh box, and any other
+    // anomaly should not cascade-fail subsequent stages whose preconditions
+    // are independent of cleanup (e.g. install).
     let cleanup_script = format!(
-        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+        "$ErrorActionPreference = 'Continue'; \
          $ProgressPreference = 'SilentlyContinue'; \
          $stateRoot = {state_root_q}; \
          $toRemove = @( \
@@ -178,9 +183,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              (Join-Path $stateRoot 'trust\\rustynetd.dns-zone.watermark') \
          ); \
          foreach ($f in $toRemove) {{ \
-             Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue \
-         }}",
-        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?
+             try {{ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }} catch {{ }} \
+         }}; \
+         try {{ Remove-Item -Path {staging_q} -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}; \
+         exit 0",
+        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
+        staging_q = ps_quote(WINDOWS_STAGING_DIR)?
     );
     run_remote_ps(conn, &cleanup_script, SHORT_TIMEOUT)?;
     Ok(())

@@ -825,6 +825,12 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// because the bash orchestrator does not consume `<alias>:<role>`
     /// pairs and would silently ignore them.
     pub legacy_bash_orchestrator: bool,
+    /// CIDR list (comma-separated, e.g. `192.168.64.0/24`) propagated to
+    /// the Linux bootstrap script as `SSH_ALLOW_CIDRS`. The Rust path
+    /// pipes it into `rustynet ops e2e-bootstrap-host --ssh-allow-cidrs`,
+    /// which rejects an empty value, so the flag is effectively required
+    /// for `--node`-driven live lab runs.
+    pub orchestrate_ssh_allow_cidrs: Option<String>,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -6278,6 +6284,12 @@ fn execute_rust_native_orchestration(
         report_dir.clone(),
         network_id,
     );
+    if let Some(cidrs) = config.orchestrate_ssh_allow_cidrs.as_deref() {
+        let trimmed = cidrs.trim();
+        if !trimmed.is_empty() {
+            ctx.ssh_allow_cidrs = trimmed.to_string();
+        }
+    }
 
     for assignment in &config.node_assignments {
         let entry = inventory
@@ -27323,6 +27335,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             validate_linux_daemon_state: false,
             node_assignments: Vec::new(),
             legacy_bash_orchestrator: false,
+            orchestrate_ssh_allow_cidrs: None,
         }
     }
 

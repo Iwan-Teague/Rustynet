@@ -20,8 +20,8 @@ pub fn issue_membership_owner_key(
 ) -> Result<MembershipOwnerKey, AdapterError> {
     let pem = ssh::run_remote(
         conn,
-        "cat /etc/rustynet/membership.owner.key.pub 2>/dev/null || \
-         cat /var/lib/rustynet/membership.owner.key.pub 2>/dev/null || \
+        "sudo -n cat /etc/rustynet/membership.owner.key.pub 2>/dev/null || \
+         sudo -n cat /var/lib/rustynet/membership.owner.key.pub 2>/dev/null || \
          echo ''",
         SHORT_TIMEOUT,
     )?;
@@ -46,13 +46,15 @@ pub fn init_membership_snapshot(
     peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
     // 1. Run ops init-membership on the exit node (idempotent if already done).
+    //    Privileged: needs to write into /var/lib/rustynet/ (root:rustynetd).
     ssh::run_remote(
         conn,
-        "env RUSTYNET_NODE_ROLE=admin rustynet ops init-membership",
+        "sudo -n env RUSTYNET_NODE_ROLE=admin rustynet ops init-membership",
         MEDIUM_TIMEOUT,
     )?;
 
     // 2. Add each non-exit peer via e2e-membership-add.
+    //    Privileged: writes membership.snapshot, reads owner key.
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
@@ -62,18 +64,18 @@ pub fn init_membership_snapshot(
         ssh::run_remote(
             conn,
             &format!(
-                "owner_approver_id=\"$(rustynet ops owner-approver-id 2>/dev/null || echo none)\"; \
-                 rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
+                "owner_approver_id=\"$(sudo -n rustynet ops owner-approver-id 2>/dev/null || echo none)\"; \
+                 sudo -n rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
                  --client-pubkey-hex '{pubkey_arg}' --owner-approver-id \"$owner_approver_id\""
             ),
             MEDIUM_TIMEOUT,
         )?;
     }
 
-    // 3. Read back the snapshot bytes.
+    // 3. Read back the snapshot bytes. /var/lib/rustynet/ is mode 700 root-owned.
     let snapshot_b64 = ssh::run_remote(
         conn,
-        "cat /var/lib/rustynet/membership.snapshot | base64 -w 0",
+        "sudo -n cat /var/lib/rustynet/membership.snapshot | base64 -w 0",
         SHORT_TIMEOUT,
     )?;
     let data = base64_decode(&snapshot_b64)?;
@@ -96,12 +98,14 @@ pub fn distribute_signed_bundle(
         .rsplit_once('/')
         .map(|(dir, _)| dir)
         .unwrap_or("/var/lib/rustynet");
+    // install with -o root and into root-owned directories needs sudo;
+    // the bash orchestrator path also runs these via run_root.
     ssh::run_remote(
         conn,
         &format!(
-            "install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
-             install -m 0640 -o root -g rustynetd '{remote_tmp}' '{install_dst}' && \
-             rm -f '{remote_tmp}'"
+            "sudo -n install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
+             sudo -n install -m 0640 -o root -g rustynetd '{remote_tmp}' '{install_dst}' && \
+             sudo -n rm -f '{remote_tmp}'"
         ),
         SHORT_TIMEOUT,
     )?;

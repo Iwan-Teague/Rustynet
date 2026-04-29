@@ -27,9 +27,11 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
 
 /// Read the local node_id from the running daemon via `rustynet status`.
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
+    // /run/rustynet/ is mode 770 root:rustynetd; the daemon control socket
+    // is unreadable to a non-root SSH user, so the status query needs sudo.
     let status = ssh::run_remote(
         conn,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+        "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
         SHORT_TIMEOUT,
     )?;
     ssh::parse_status_node_id(&status).ok_or_else(|| AdapterError::Protocol {
@@ -104,9 +106,12 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
     use std::time::Duration;
 
     let remote_tmp = "/tmp/rn_diag_artifacts.tar.gz";
-    // Create archive on remote, excluding key material.
+    // Create archive on remote, excluding key material. /var/lib/rustynet/
+    // and /run/rustynet/ are root-owned, mode 700/770; tar needs sudo to
+    // read into them. We then chown the archive back so scp_from (running
+    // as the SSH user) can read it.
     let tar_script = format!(
-        "tar -czf {remote_tmp} \
+        "sudo -n tar -czf {remote_tmp} \
          --exclude='*/keys/*' \
          --exclude='*.priv' \
          --exclude='*.pem' \
@@ -116,6 +121,7 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
          /var/log/ \
          /run/rustynet/ \
          2>/dev/null; \
+         sudo -n chown \"$(id -u):$(id -g)\" {remote_tmp} 2>/dev/null; \
          true"
     );
     ssh::run_remote(conn, &tar_script, Duration::from_secs(60))?;
@@ -134,15 +140,17 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop daemon first (best-effort).
+    // Stop daemon first (best-effort). Privileged: systemctl manage daemon
+    // service.
     let _ = ssh::run_remote(
         conn,
-        "systemctl stop rustynetd 2>/dev/null || true",
+        "sudo -n systemctl stop rustynetd 2>/dev/null || true",
         Duration::from_secs(30),
     );
+    // Privileged: state files are root:rustynetd, mode 600/640.
     ssh::run_remote(
         conn,
-        "rm -rf /run/rustynet \
+        "sudo -n rm -rf /run/rustynet \
          /var/lib/rustynet/membership.snapshot \
          /var/lib/rustynet/membership.log \
          /var/lib/rustynet/membership.watermark \

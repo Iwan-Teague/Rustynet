@@ -127,7 +127,30 @@ pub fn run_remote(
             message: format!("SSH spawn failed for {host}: {message}"),
         })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Windows PowerShell over OpenSSH frequently writes diagnostic
+        // detail to stdout (CLIXML stream / Write-Host). When stderr is
+        // empty, fall back to a tail of stdout so the operator sees
+        // *something* rather than a bare "(exit Some(1)): ".
+        let stderr = if stderr_raw.is_empty() {
+            let stdout_lossy = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout_lossy.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                let tail: String = trimmed
+                    .chars()
+                    .rev()
+                    .take(800)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                format!("(stderr empty; stdout tail) {tail}")
+            }
+        } else {
+            stderr_raw
+        };
         let code = output.status.code();
         return Err(AdapterError::Command {
             exit_code: code,

@@ -91,7 +91,8 @@ pub fn install_daemon(
         BUILD_TIMEOUT,
     )?;
 
-    ssh::wait_for_remote_socket(conn, MACOS_DAEMON_SOCKET, SOCKET_TIMEOUT)?;
+    // Daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime,
+    // not at install time — install_daemon only stages binaries + bootstrap state.
 
     let verify_script = format!(
         "test -x {rustynetd} && test -x {rustynet} && \
@@ -174,7 +175,8 @@ pub fn install_daemon_from_workdir(
          sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
     );
     ssh::run_remote(conn, &build_cmd, BUILD_TIMEOUT)?;
-    ssh::wait_for_remote_socket(conn, MACOS_DAEMON_SOCKET, SOCKET_TIMEOUT)?;
+    // Daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime,
+    // not at install time — install_daemon only stages binaries + bootstrap state.
 
     Ok(InstallReport {
         daemon_path: MACOS_RUSTYNETD_PATH.into(),

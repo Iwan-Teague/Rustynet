@@ -295,6 +295,51 @@ function Get-CurrentInteractiveUserName {
     }
 }
 
+# Verify that an interactive Windows session is *currently active* (i.e. the
+# user is signed into the desktop), not merely the "last logged on" user
+# stamped in Win32_ComputerSystem.UserName. Returns the resolved active user
+# name, or empty string if no Active session exists.
+#
+# Background: Win32_ComputerSystem.UserName is non-empty even when the
+# interactive session has been disconnected or the lock screen is up; in
+# that state, Register-ScheduledTask -LogonType Interactive accepts the
+# task and Start-ScheduledTask reports success, but the task never actually
+# runs — it sits in 'Ready' state until a real session appears, which can
+# leave Bootstrap-RustyNetWindows.ps1 polling for up to 4 hours.
+function Get-ActiveInteractiveUserSessionName {
+    try {
+        $quserOutput = (& quser.exe 2>$null | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($quserOutput)) {
+            return ''
+        }
+        $lines = $quserOutput -split "`r?`n"
+        # Skip header line; columns vary by locale, so match on STATE token
+        # 'Active' (positionally column 4 in en-US, but quser doesn't quote
+        # the username column when it's prefixed with '>'). Conservative:
+        # any line whose tokens include 'Active'.
+        foreach ($line in $lines | Select-Object -Skip 1) {
+            $trimmed = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+            $tokens = $trimmed -split '\s+'
+            if ($tokens -contains 'Active') {
+                $userToken = $tokens[0]
+                if ($userToken.StartsWith('>')) {
+                    $userToken = $userToken.Substring(1)
+                }
+                if (-not [string]::IsNullOrWhiteSpace($userToken)) {
+                    return $userToken.Trim()
+                }
+            }
+        }
+        return ''
+    }
+    catch {
+        return ''
+    }
+}
+
 function Test-SystemExecutionContext {
     return [string]::Equals($env:USERNAME, 'SYSTEM', [System.StringComparison]::OrdinalIgnoreCase)
 }
@@ -473,6 +518,25 @@ function Invoke-BuildReleaseViaInteractiveUserTask {
     $interactiveUser = (Get-CurrentInteractiveUserName).Trim()
     if ($interactiveUser.Length -eq 0) {
         throw 'interactive Windows user session is not available; log into the guest as an administrator or use a pre-baked Windows lab template'
+    }
+
+    # Fail fast when the OS reports a "logged on" user (Win32_ComputerSystem.UserName)
+    # but no session is in 'Active' state per quser. In that case the
+    # Scheduled Task we are about to register cannot actually run, and the
+    # poll loop below would block for 4 hours waiting on a complete.marker
+    # that will never appear. Detect now and surface a precise error so the
+    # operator can sign into the desktop and re-run.
+    $activeSessionUser = (Get-ActiveInteractiveUserSessionName).Trim()
+    if ($activeSessionUser.Length -eq 0) {
+        throw ([string]::Concat(
+            'no Active interactive Windows session detected (Win32_ComputerSystem.UserName=',
+            $interactiveUser,
+            ' but quser reports no Active session); ',
+            'Bootstrap-RustyNetWindows.ps1 -Phase build-release requires an interactive desktop ',
+            'session to run cargo via Scheduled Task with LogonType=Interactive. ',
+            'Sign into the Windows VM console (UTM) as ', $interactiveUser,
+            ' and re-run the orchestrator.'
+        ))
     }
 
     $taskName = [string]::Concat('RustyNet-BuildRelease-', [guid]::NewGuid().ToString('N'))
@@ -995,30 +1059,27 @@ function Assert-RustyNetWingetDependenciesInstalled {
     $missing = @()
 
     # WireGuard for Windows — the daemon's `windows-wireguard-nt`
-    # backend shells out to wireguard.exe / wg.exe. Both must end up
-    # at the canonical install path; the WireGuard installer pins
-    # those paths, so any deviation means the install didn't land.
-    $wireguardExe = 'C:\Program Files\WireGuard\wireguard.exe'
-    $wgExe = 'C:\Program Files\WireGuard\wg.exe'
-    if (-not (Test-Path -LiteralPath $wireguardExe)) {
-        $missing += ('WireGuard.WireGuard (expected ' + $wireguardExe + ')')
+    # backend shells out to wireguard.exe / wg.exe. Use multi-path
+    # resolvers so an installer that picks the (x86) tree, or a
+    # pre-baked image with a non-default location, still validates.
+    if (-not (Resolve-WireGuardExePath)) {
+        $missing += 'WireGuard.WireGuard (wireguard.exe not found at any known canonical path)'
     }
-    if (-not (Test-Path -LiteralPath $wgExe)) {
-        $missing += ('WireGuard.WireGuard cli (expected ' + $wgExe + ')')
+    if (-not (Resolve-WireGuardCliPath)) {
+        $missing += 'WireGuard.WireGuard cli (wg.exe not found at any known canonical path)'
     }
 
-    # Rustup — the build phase needs `cargo` on PATH eventually;
-    # rustup-init lays down `%USERPROFILE%\.cargo\bin\rustup.exe`.
-    $rustupExe = Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'
-    if (-not (Test-Path -LiteralPath $rustupExe)) {
-        $missing += ('Rustlang.Rustup (expected ' + $rustupExe + ')')
+    # Rustup — Resolve-RustupExePath checks PATH plus the canonical
+    # rustup install (USERPROFILE\.cargo\bin) plus scoop / chocolatey
+    # alternates.
+    if (-not (Resolve-RustupExePath)) {
+        $missing += 'Rustlang.Rustup (rustup.exe not found at any known canonical path)'
     }
 
-    # Git — the source-sync flow uses git directly. winget's
-    # Git.Git package puts git.exe under `%ProgramFiles%\Git\cmd`
-    # by default; PATH addition is handled by the installer.
-    if (-not (Test-CommandPresent -Name 'git.exe')) {
-        $missing += 'Git.Git (git.exe not on PATH)'
+    # Git — the source-sync flow uses git directly. Resolve via PATH
+    # plus Program Files\Git\{cmd,bin}.
+    if (-not (Resolve-GitExePath)) {
+        $missing += 'Git.Git (git.exe not found at any known canonical path)'
     }
 
     if ($missing.Count -gt 0) {
@@ -1049,9 +1110,134 @@ function Test-CommandPresent {
 function Resolve-VsDevCmdPath {
     $candidates = @(
         'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
-        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat',
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat',
+        'C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat',
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat'
     )
     return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+# Multi-path lookup for cargo.exe. Checks PATH first (fastest), then the
+# canonical rustup install path under USERPROFILE, then a couple of common
+# alternates that surface when Rust is installed via scoop / chocolatey /
+# pre-baked images. Returns the resolved file path, or empty string if
+# absent. Use this in preference to Test-CommandPresent for tools the
+# orchestrator depends on, because Test-CommandPresent only checks PATH —
+# whereas a fresh OpenSSH login session may not have ~\.cargo\bin on PATH
+# even when the binary is present at its canonical location.
+function Resolve-CargoExePath {
+    $cmd = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'),
+        'C:\Users\Administrator\.cargo\bin\cargo.exe',
+        'C:\.cargo\bin\cargo.exe',
+        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\cargo.exe'),
+        'C:\ProgramData\chocolatey\lib\rust\tools\bin\cargo.exe'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Resolve-RustcExePath {
+    $cmd = Get-Command rustc.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        (Join-Path $env:USERPROFILE '.cargo\bin\rustc.exe'),
+        'C:\Users\Administrator\.cargo\bin\rustc.exe',
+        'C:\.cargo\bin\rustc.exe',
+        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\rustc.exe'),
+        'C:\ProgramData\chocolatey\lib\rust\tools\bin\rustc.exe'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Resolve-RustupExePath {
+    $cmd = Get-Command rustup.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        (Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'),
+        'C:\Users\Administrator\.cargo\bin\rustup.exe',
+        'C:\.cargo\bin\rustup.exe',
+        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\rustup.exe')
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Resolve-WireGuardExePath {
+    $cmd = Get-Command wireguard.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        'C:\Program Files\WireGuard\wireguard.exe',
+        'C:\Program Files (x86)\WireGuard\wireguard.exe'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Resolve-WireGuardCliPath {
+    $cmd = Get-Command wg.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        'C:\Program Files\WireGuard\wg.exe',
+        'C:\Program Files (x86)\WireGuard\wg.exe'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Resolve-GitExePath {
+    $cmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidates = @(
+        'C:\Program Files\Git\cmd\git.exe',
+        'C:\Program Files (x86)\Git\cmd\git.exe',
+        'C:\Program Files\Git\bin\git.exe'
+    )
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+# Add Windows Defender real-time-scan exclusions for the build paths the
+# RustyNet bootstrap touches. Defender scanning every cargo intermediate
+# (.rmeta / .rlib / .d / .obj / link.exe outputs) under real-time monitoring
+# can stretch a 2-minute incremental build into a 30-minute hang. Idempotent:
+# Add-MpPreference -ExclusionPath silently no-ops if the path is already
+# excluded.
+#
+# Best-effort: a non-elevated SSH session running cargo cannot modify
+# Defender preferences; in that case Set-MpPreference fails and the bootstrap
+# continues without exclusions, surfacing a warning so the operator sees
+# why subsequent runs may be slow. Setup-RustyNetWindowsHost.ps1 handles the
+# elevated first-time install.
+function Ensure-DefenderExclusionsForBuildPaths {
+    if (-not (Get-Command Add-MpPreference -ErrorAction SilentlyContinue)) {
+        Write-Output '[bootstrap] Add-MpPreference unavailable; skipping Defender exclusions.'
+        return
+    }
+    $paths = @(
+        $RustyNetRoot,
+        (Join-Path $env:USERPROFILE '.cargo'),
+        'C:\Windows\Temp\rustynet-stage',
+        $StateRoot,
+        $InstallRoot
+    )
+    foreach ($path in $paths) {
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        try {
+            Add-MpPreference -ExclusionPath $path -ErrorAction Stop
+        }
+        catch {
+            $msg = $_.Exception.Message
+            # 'Access is denied' = non-elevated session; expected when the
+            # orchestrator drives bootstrap as a regular user.
+            if ($msg -match 'denied' -or $msg -match 'requires.*elevation') {
+                Write-Output ('[bootstrap] Defender exclusion for ' + $path + ' skipped (not elevated).')
+                return
+            }
+            if ($msg -notmatch 'already' -and $msg -notmatch 'duplicate') {
+                Write-Output ('[bootstrap] WARNING: Add-MpPreference ' + $path + ' failed: ' + $msg)
+            }
+        }
+    }
 }
 
 function Ensure-BuildTools {
@@ -1165,11 +1351,25 @@ function Build-RustyNet {
         }
     }
     Ensure-CargoOnPath
+    # Add Defender exclusions for $RustyNetRoot, ~\.cargo, the orchestrator
+    # staging dir, and the daemon state/install roots. Best-effort; non-
+    # elevated sessions log and continue. The first-time-user setup script
+    # (Setup-RustyNetWindowsHost.ps1) sets these once at install and is the
+    # supported path; this idempotent call covers re-runs and lab images
+    # where the setup script was not used.
+    Ensure-DefenderExclusionsForBuildPaths
     if ($null -ne $buildReportLayout) {
         Write-BuildReleaseToolchainReport -Layout $buildReportLayout
     }
-    $cargoPresent = Test-CommandPresent -Name cargo.exe
-    $rustcPresent = Test-CommandPresent -Name rustc.exe
+    # Multi-path tool resolution: an SSH session may have a stripped-down
+    # PATH that hides ~\.cargo\bin even when cargo is installed there. The
+    # resolver functions consult PATH first, then known canonical install
+    # locations, so the bootstrap path keeps working under both cargo-on-
+    # PATH and cargo-only-at-canonical-location conditions.
+    $cargoPath = Resolve-CargoExePath
+    $rustcPath = Resolve-RustcExePath
+    $cargoPresent = [bool]$cargoPath
+    $rustcPresent = [bool]$rustcPath
     $buildToolsPresent = [bool](Resolve-VsDevCmdPath)
     $systemScopedContext = (Test-SystemExecutionContext) -or (Test-SystemProfileExecutionContext)
     if (-not $InteractiveBuildBootstrapChild -and $null -ne $buildReportLayout -and $systemScopedContext -and (-not ($cargoPresent -and $rustcPresent -and $buildToolsPresent))) {
@@ -1182,8 +1382,17 @@ function Build-RustyNet {
     Ensure-CargoOnPath
     Ensure-BuildTools -ConfigPath $VsConfigPath
     Ensure-CargoOnPath
-    Require-Command -Name cargo.exe
-    Require-Command -Name rustc.exe
+    # Re-resolve via the multi-path lookup (Ensure-CargoOnPath only adds
+    # USERPROFILE\.cargo\bin to PATH; the resolver also handles scoop /
+    # chocolatey / Administrator-profile installs).
+    $cargoPath = Resolve-CargoExePath
+    $rustcPath = Resolve-RustcExePath
+    if (-not $cargoPath) {
+        throw 'cargo.exe is not available after bootstrap (checked PATH and known canonical install locations)'
+    }
+    if (-not $rustcPath) {
+        throw 'rustc.exe is not available after bootstrap (checked PATH and known canonical install locations)'
+    }
     Enter-VsBuildEnvironment
     if ($null -ne $buildReportLayout) {
         Write-BuildReleaseToolchainReport -Layout $buildReportLayout
@@ -1193,11 +1402,11 @@ function Build-RustyNet {
         throw "RustyNet source tree is missing Cargo.toml: $RustyNetRoot"
     }
 
-    $cargoCommand = (Get-Command cargo.exe -ErrorAction Stop).Source
+    $cargoCommand = $cargoPath
     Push-Location $RustyNetRoot
     try {
         if ($null -eq $buildReportLayout) {
-            cargo build --locked --release -p rustynetd
+            & $cargoCommand build --locked --release -p rustynetd
             if ($LASTEXITCODE -ne 0) {
                 throw 'cargo build failed for Windows build-release'
             }

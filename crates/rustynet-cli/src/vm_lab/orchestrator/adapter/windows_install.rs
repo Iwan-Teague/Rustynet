@@ -12,7 +12,11 @@ pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
 pub const WINDOWS_STATE_ROOT: &str = r"C:\ProgramData\RustyNet";
 pub const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 pub const WINDOWS_RUSTYNET_PATH: &str = r"C:\Program Files\RustyNet\rustynet.exe";
-pub const WINDOWS_STAGING_DIR: &str = r"C:\ProgramData\Rustynet\vm-lab";
+// Staging lives outside C:\ProgramData\Rustynet so the hardened ACL that
+// `Install-RustyNetWindowsService.ps1` applies (NT SERVICE\RustyNet only)
+// cannot inherit onto SCP-staged files. C:\Windows\Temp is world-writable
+// by default and ships as the canonical Windows transient-binary location.
+pub const WINDOWS_STAGING_DIR: &str = r"C:\Windows\Temp\rustynet-stage";
 pub const WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.owner.key.pub";
 pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =

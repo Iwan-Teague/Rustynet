@@ -83,13 +83,18 @@ pub fn install_daemon(
         "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env",
         build_timeout,
     )?;
-
-    // Wait for daemon socket.
-    ssh::wait_for_remote_socket(conn, LINUX_DAEMON_SOCKET, socket_timeout)?;
+    let _ = socket_timeout; // daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime, not install.
 
     // Verify binaries are present and the rustynetd group exists.
+    // /var/lib/rustynet/keys is `drwx------ root:root` (mode 700) by design
+    // so the orchestrator's SSH user cannot stat through it without sudo.
+    // Using `sudo -n` keeps the check non-interactive and consistent with
+    // the bootstrap script's other privileged steps; passwordless sudo is
+    // already a precondition of the bootstrap path.
     let verify_script = format!(
-        "test -x {rustynetd} && test -x {rustynet} && test -f /var/lib/rustynet/keys/wireguard.pub && getent group rustynetd >/dev/null 2>&1",
+        "test -x {rustynetd} && test -x {rustynet} && \
+         sudo -n test -f /var/lib/rustynet/keys/wireguard.pub && \
+         getent group rustynetd >/dev/null 2>&1",
         rustynetd = LINUX_RUSTYNETD_PATH,
         rustynet = LINUX_RUSTYNET_PATH,
     );
