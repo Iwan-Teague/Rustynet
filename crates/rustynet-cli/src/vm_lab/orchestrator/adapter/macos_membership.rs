@@ -9,10 +9,9 @@ use crate::vm_lab::orchestrator::adapter::macos_install::{
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
+    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -53,7 +52,7 @@ pub fn issue_membership_owner_key(
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
-    peers: &[NodeRoleAssignment],
+    peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
     // 1. Run ops init-membership (idempotent).
     ssh::run_remote(
@@ -70,15 +69,16 @@ pub fn init_membership_snapshot(
         if peer.role == NodeRole::Exit {
             continue;
         }
-        let node_id_arg = shell_safe_arg(&peer.alias)?;
+        let node_id_arg = shell_safe_arg(&peer.node_id)?;
+        let pubkey_arg = hex_32_safe_arg(&peer.public_key_hex)?;
         ssh::run_remote(
             conn,
             &format!(
-                "sudo '{rustynet}' ops e2e-membership-add \
+                "owner_approver_id=\"$('{rustynet}' ops owner-approver-id 2>/dev/null || echo none)\"; \
+                 sudo '{rustynet}' ops e2e-membership-add \
                      --client-node-id '{node_id_arg}' \
-                     --client-pubkey-hex '' \
-                     --owner-approver-id \
-                     \"$('{rustynet}' ops owner-approver-id 2>/dev/null || echo none)\"",
+                     --client-pubkey-hex '{pubkey_arg}' \
+                     --owner-approver-id \"$owner_approver_id\"",
                 rustynet = MACOS_RUSTYNET_PATH,
             ),
             MEDIUM_TIMEOUT,
@@ -162,6 +162,16 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
                 "value '{value}' contains characters not safe for shell argument embedding \
                  (allowed: alphanumeric, hyphen, underscore, dot)"
             ),
+        })
+    }
+}
+
+fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
+    if NodeMembershipPeer::is_valid_public_key_hex(value) {
+        Ok(value.to_string())
+    } else {
+        Err(AdapterError::Protocol {
+            message: "WireGuard public key must be 64 hex chars".to_string(),
         })
     }
 }
@@ -262,6 +272,14 @@ mod tests {
         assert!(shell_safe_arg("node; rm -rf /").is_err());
         assert!(shell_safe_arg("node$(whoami)").is_err());
         assert!(shell_safe_arg("node`id`").is_err());
+    }
+
+    #[test]
+    fn hex_32_safe_arg_requires_64_hex_chars() {
+        assert!(hex_32_safe_arg(&"a".repeat(64)).is_ok());
+        assert!(hex_32_safe_arg("").is_err());
+        assert!(hex_32_safe_arg(&"g".repeat(64)).is_err());
+        assert!(hex_32_safe_arg(&"a".repeat(63)).is_err());
     }
 
     #[test]

@@ -25,7 +25,9 @@ impl OrchestrationStage for PreflightStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         // 1. report_dir writable
-        if !ctx.report_dir.exists() && let Err(e) = std::fs::create_dir_all(&ctx.report_dir) {
+        if !ctx.report_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&ctx.report_dir)
+        {
             return StageOutcome::Failed(format!(
                 "cannot create report dir '{}': {e}",
                 ctx.report_dir.display()

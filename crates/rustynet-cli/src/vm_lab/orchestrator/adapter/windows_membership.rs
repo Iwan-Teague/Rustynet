@@ -9,10 +9,9 @@ use crate::vm_lab::orchestrator::adapter::windows_install::{
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
+    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -54,7 +53,7 @@ pub fn issue_membership_owner_key(
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
-    peers: &[NodeRoleAssignment],
+    peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
     // 1. Run ops init-membership (idempotent).
     let init_script = format!(
@@ -72,18 +71,22 @@ pub fn init_membership_snapshot(
         if peer.role == NodeRole::Exit {
             continue;
         }
+        let pubkey_hex = hex_32_arg(&peer.public_key_hex)?;
         let add_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              $ProgressPreference = 'SilentlyContinue'; \
+             $ownerApprover = (& {rustynet_q} ops owner-approver-id 2>$null); \
+             if (-not $ownerApprover) {{ $ownerApprover = 'none' }}; \
              & {rustynet_q} ops e2e-membership-add \
-                 --client-node-id {alias_q} \
-                 --client-pubkey-hex '' \
-                 --owner-approver-id 'none'; \
+                 --client-node-id {node_id_q} \
+                 --client-pubkey-hex {pubkey_q} \
+                 --owner-approver-id $ownerApprover; \
              if ($LASTEXITCODE -ne 0) {{ \
-                 throw 'ops e2e-membership-add failed for ' + {alias_q} \
+                 throw 'ops e2e-membership-add failed for ' + {node_id_q} \
              }}",
             rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?,
-            alias_q = ps_quote(&peer.alias)?,
+            node_id_q = ps_quote(&peer.node_id)?,
+            pubkey_q = ps_quote(&pubkey_hex)?,
         );
         run_remote_ps(conn, &add_script, MEDIUM_TIMEOUT)?;
     }
@@ -166,6 +169,16 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
             format!(r"{staging}\rn-dns-zone.bundle"),
             format!(r"{state}\trust\rustynetd.dns-zone"),
         ),
+    }
+}
+
+fn hex_32_arg(value: &str) -> Result<String, AdapterError> {
+    if NodeMembershipPeer::is_valid_public_key_hex(value) {
+        Ok(value.to_string())
+    } else {
+        Err(AdapterError::Protocol {
+            message: "WireGuard public key must be 64 hex chars".to_string(),
+        })
     }
 }
 
@@ -271,6 +284,14 @@ mod tests {
             WINDOWS_MEMBERSHIP_SNAPSHOT_PATH.starts_with(r"C:\ProgramData\RustyNet"),
             "snapshot path must be under state root: {WINDOWS_MEMBERSHIP_SNAPSHOT_PATH}"
         );
+    }
+
+    #[test]
+    fn hex_32_arg_requires_64_hex_chars() {
+        assert!(hex_32_arg(&"a".repeat(64)).is_ok());
+        assert!(hex_32_arg("").is_err());
+        assert!(hex_32_arg(&"g".repeat(64)).is_err());
+        assert!(hex_32_arg(&"a".repeat(63)).is_err());
     }
 
     #[test]

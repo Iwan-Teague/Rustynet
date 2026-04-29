@@ -6104,19 +6104,6 @@ fn execute_rust_native_orchestration(
     use orchestrator::context::OrchestrationContext;
     use orchestrator::error::StageOutcome;
     use orchestrator::runner::StateMachineRunner;
-    use orchestrator::stage::OrchestrationStage;
-    use orchestrator::stage::{
-        cleanup::CleanupHostsStage, collect_pubkeys::CollectPubkeysStage,
-        distribute_assignments::DistributeAssignmentsStage,
-        distribute_dns_zone::DistributeDnsZoneStage,
-        distribute_membership::DistributeMembershipStage,
-        distribute_traversal::DistributeTraversalStage,
-        enforce_runtime::EnforceBaselineRuntimeStage, exit_handoff::ExitHandoffStage,
-        install::BootstrapHostsStage, membership_init::MembershipInitStage,
-        preflight::PreflightStage, role_switch_matrix::RoleSwitchMatrixStage,
-        source_archive::PrepareSourceArchiveStage, traffic_test_matrix::TrafficTestMatrixStage,
-        validate_runtime::ValidateBaselineRuntimeStage, verify_ssh::VerifySshReachabilityStage,
-    };
 
     let known_hosts = config.known_hosts_path.ok_or_else(|| {
         "--known-hosts-file is required when --node flags are present".to_string()
@@ -6169,6 +6156,12 @@ fn execute_rust_native_orchestration(
             .to_string();
 
         let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+        if !assignment.role.is_supported_for_platform(&platform) {
+            return Err(format!(
+                "role '{}' is not supported on platform {platform:?}; W5.4 Windows/macOS Exit remains fail-closed until live evidence is recorded",
+                assignment.role
+            ));
+        }
 
         let conn = NodeConnection::ssh(
             host.clone(),
@@ -6200,24 +6193,7 @@ fn execute_rust_native_orchestration(
         ctx.adapters.insert(assignment.alias.clone(), adapter);
     }
 
-    let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-        Box::new(PreflightStage),
-        Box::new(PrepareSourceArchiveStage),
-        Box::new(VerifySshReachabilityStage),
-        Box::new(CleanupHostsStage),
-        Box::new(BootstrapHostsStage),
-        Box::new(CollectPubkeysStage),
-        Box::new(MembershipInitStage),
-        Box::new(DistributeMembershipStage),
-        Box::new(DistributeAssignmentsStage),
-        Box::new(DistributeTraversalStage),
-        Box::new(DistributeDnsZoneStage),
-        Box::new(EnforceBaselineRuntimeStage),
-        Box::new(ValidateBaselineRuntimeStage),
-        Box::new(TrafficTestMatrixStage),
-        Box::new(RoleSwitchMatrixStage),
-        Box::new(ExitHandoffStage),
-    ];
+    let stages = build_rust_native_orchestration_stages();
 
     let runner = StateMachineRunner::new(stages);
     let results = runner.run(&mut ctx);
@@ -6253,6 +6229,19 @@ fn execute_rust_native_orchestration(
     let _ = writeln!(out, "passed={passed} failed={failed} skipped={skipped}");
 
     if failed > 0 { Err(out) } else { Ok(out) }
+}
+
+fn build_rust_native_orchestration_stages() -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>>
+{
+    orchestrator::plan::PlanBuilder::new().build()
+}
+
+#[cfg(test)]
+fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
+    build_rust_native_orchestration_stages()
+        .iter()
+        .map(|stage| stage.id())
+        .collect()
 }
 
 pub fn execute_ops_vm_lab_orchestrate_live_lab(
@@ -20232,6 +20221,23 @@ mod tests {
                 .display()
                 .to_string()
                 .ends_with("scripts/e2e/live_linux_lab_orchestrator.sh")
+        );
+    }
+
+    #[test]
+    fn rust_native_cli_stage_ids_match_plan_builder() {
+        let cli_ids = super::rust_native_orchestration_stage_ids();
+        let plan_ids: Vec<_> = super::orchestrator::plan::PlanBuilder::new()
+            .build()
+            .iter()
+            .map(|stage| stage.id())
+            .collect();
+
+        assert_eq!(cli_ids, plan_ids);
+        assert_eq!(cli_ids.len(), 17);
+        assert_eq!(
+            cli_ids.last(),
+            Some(&super::orchestrator::stage::StageId::Cleanup)
         );
     }
 

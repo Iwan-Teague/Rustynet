@@ -27,11 +27,12 @@ impl NodeRole {
         matches!(self, NodeRole::Exit)
     }
 
-    /// Role-platform matrix (W5.4 end state):
+    /// Role-platform matrix currently enforced by the Rust-native path.
+    /// Windows/macOS Exit remains fail-closed until W5.4 live evidence is recorded.
     ///
     /// | Role   | Linux | Windows | macOS | iOS | Android |
     /// |--------|-------|---------|-------|-----|---------|
-    /// | Exit   | ✓     | ✓       | ✓     | ✗   | ✗       |
+    /// | Exit   | ✓     | ✗       | ✗     | ✗   | ✗       |
     /// | Client | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Entry  | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Aux    | ✓     | ✓       | ✓     | ✗   | ✗       |
@@ -42,7 +43,8 @@ impl NodeRole {
     pub fn is_supported_for_platform(&self, platform: &VmGuestPlatform) -> bool {
         match platform {
             VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
-            VmGuestPlatform::Linux | VmGuestPlatform::Windows | VmGuestPlatform::Macos => true,
+            VmGuestPlatform::Linux => true,
+            VmGuestPlatform::Windows | VmGuestPlatform::Macos => !self.is_membership_owner(),
         }
     }
 
@@ -131,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_for_platform_linux_windows_macos_all_roles() {
+    fn is_supported_for_platform_linux_all_roles() {
         let roles = [
             NodeRole::Exit,
             NodeRole::Client,
@@ -139,13 +141,27 @@ mod tests {
             NodeRole::Aux,
             NodeRole::Extra,
         ];
-        let supported = [
-            VmGuestPlatform::Linux,
-            VmGuestPlatform::Windows,
-            VmGuestPlatform::Macos,
-        ];
         for role in &roles {
-            for platform in &supported {
+            assert!(
+                role.is_supported_for_platform(&VmGuestPlatform::Linux),
+                "{role:?} must be supported on Linux"
+            );
+        }
+    }
+
+    #[test]
+    fn is_supported_for_platform_windows_macos_fail_closed_for_exit_only() {
+        for platform in &[VmGuestPlatform::Windows, VmGuestPlatform::Macos] {
+            assert!(
+                !NodeRole::Exit.is_supported_for_platform(platform),
+                "Exit must remain fail-closed on {platform:?} until W5.4 live evidence exists"
+            );
+            for role in &[
+                NodeRole::Client,
+                NodeRole::Entry,
+                NodeRole::Aux,
+                NodeRole::Extra,
+            ] {
                 assert!(
                     role.is_supported_for_platform(platform),
                     "{role:?} must be supported on {platform:?}"

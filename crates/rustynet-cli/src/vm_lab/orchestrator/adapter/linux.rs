@@ -13,9 +13,8 @@ use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
 };
-use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,7 +80,7 @@ impl NodeAdapter for LinuxNodeAdapter {
     fn init_membership_snapshot(
         &self,
         owner_key: &MembershipOwnerKey,
-        peers: &[NodeRoleAssignment],
+        peers: &[NodeMembershipPeer],
     ) -> Result<MembershipSnapshot, AdapterError> {
         linux_membership::init_membership_snapshot(&self.conn, owner_key, peers)
     }

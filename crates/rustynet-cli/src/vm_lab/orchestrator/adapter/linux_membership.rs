@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot,
+    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
-use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+use crate::vm_lab::orchestrator::role::NodeRole;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -43,7 +43,7 @@ pub fn issue_membership_owner_key(
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
-    peers: &[NodeRoleAssignment],
+    peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
     // 1. Run ops init-membership on the exit node (idempotent if already done).
     ssh::run_remote(
@@ -54,21 +54,17 @@ pub fn init_membership_snapshot(
 
     // 2. Add each non-exit peer via e2e-membership-add.
     for peer in peers {
-        let role_str = match &peer.role {
-            crate::vm_lab::orchestrator::role::NodeRole::Exit => continue, // skip exit
-            crate::vm_lab::orchestrator::role::NodeRole::Client => "client",
-            crate::vm_lab::orchestrator::role::NodeRole::Entry => "client",
-            crate::vm_lab::orchestrator::role::NodeRole::Aux => "client",
-            crate::vm_lab::orchestrator::role::NodeRole::Extra => "client",
-            crate::vm_lab::orchestrator::role::NodeRole::Custom(_) => "client",
-        };
-        let _ = role_str; // role passed through env; alias used as node_id here
-        let node_id_arg = shell_safe_arg(&peer.alias)?;
+        if peer.role == NodeRole::Exit {
+            continue;
+        }
+        let node_id_arg = shell_safe_arg(&peer.node_id)?;
+        let pubkey_arg = hex_32_safe_arg(&peer.public_key_hex)?;
         ssh::run_remote(
             conn,
             &format!(
-                "rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
-                 --client-pubkey-hex '' --owner-approver-id '$(rustynet ops owner-approver-id 2>/dev/null || echo none)'"
+                "owner_approver_id=\"$(rustynet ops owner-approver-id 2>/dev/null || echo none)\"; \
+                 rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
+                 --client-pubkey-hex '{pubkey_arg}' --owner-approver-id \"$owner_approver_id\""
             ),
             MEDIUM_TIMEOUT,
         )?;
@@ -152,6 +148,16 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
     }
 }
 
+fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
+    if NodeMembershipPeer::is_valid_public_key_hex(value) {
+        Ok(value.to_string())
+    } else {
+        Err(AdapterError::Protocol {
+            message: "WireGuard public key must be 64 hex chars".to_string(),
+        })
+    }
+}
+
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, AdapterError> {
     // Simple base64 decode without pulling in a new crate: delegate to the
     // `base64` crate already used by mod.rs via the `base64` dependency.
@@ -212,6 +218,14 @@ mod tests {
         assert!(shell_safe_arg("node; rm -rf /").is_err());
         assert!(shell_safe_arg("node$(whoami)").is_err());
         assert!(shell_safe_arg("node`id`").is_err());
+    }
+
+    #[test]
+    fn hex_32_safe_arg_requires_64_hex_chars() {
+        assert!(hex_32_safe_arg(&"a".repeat(64)).is_ok());
+        assert!(hex_32_safe_arg("").is_err());
+        assert!(hex_32_safe_arg(&"g".repeat(64)).is_err());
+        assert!(hex_32_safe_arg(&"a".repeat(63)).is_err());
     }
 
     #[test]

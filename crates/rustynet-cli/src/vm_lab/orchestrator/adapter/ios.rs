@@ -8,9 +8,8 @@ use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
 };
-use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 /// iOS adapter — not yet implemented.
@@ -79,7 +78,7 @@ impl NodeAdapter for IosNodeAdapter {
     fn init_membership_snapshot(
         &self,
         _: &MembershipOwnerKey,
-        _: &[NodeRoleAssignment],
+        _: &[NodeMembershipPeer],
     ) -> Result<MembershipSnapshot, AdapterError> {
         Err(ios_unsupported())
     }

@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::role::NodeRole;
 
 // ── Domain value types ────────────────────────────────────────────────────────
 
@@ -26,6 +27,20 @@ pub struct MembershipOwnerKey {
 #[derive(Debug, Clone)]
 pub struct MembershipSnapshot {
     pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMembershipPeer {
+    pub alias: String,
+    pub role: NodeRole,
+    pub node_id: String,
+    pub public_key_hex: String,
+}
+
+impl NodeMembershipPeer {
+    pub fn is_valid_public_key_hex(value: &str) -> bool {
+        value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

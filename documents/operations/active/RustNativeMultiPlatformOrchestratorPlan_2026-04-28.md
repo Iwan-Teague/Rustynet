@@ -5,17 +5,17 @@ Owner: AI implementation agent (per `CLAUDE.md`)
 Supersedes the bash orchestrator's monopoly on the live-lab install path.
 Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4 deliverables this plan builds on top of).
 
-> **Status: W5.2 COMPLETE — WindowsNodeAdapter merged (2026-04-29).**
+> **Status: W5.1-W5.5 HARDENING PASS — compile/unit path updated on 2026-04-29; live non-Linux Exit evidence still pending.**
 > Each W5.x slice listed below is a future commit. Mark `[x]` as each
 > ships with a commit SHA, evidence pointers, and residual-risk notes
 > following the existing W3.2-followup-N entry pattern.
 >
 > - [x] W5.0 — Foundation (traits, stubs, 26 unit tests). All gates green.
-> - [x] W5.1 — LinuxNodeAdapter + --node flag opt-in. Commit `8c255c8`. Gates: fmt ✓ clippy ✓ 92 test suites ✓ audit ✓ deny ✓. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). rn_bootstrap.sh extracted + embedded via include_str!(). execute_rust_native_orchestration routes --node traffic to NodeAdapter pipeline.
-> - [x] W5.2 — WindowsNodeAdapter. Gates: fmt ✓ clippy ✓ tests ✓ audit ✓ deny ✓. Files: windows_install.rs (PS encoding, install lifecycle, 3 embedded scripts), windows_traffic.rs (WG key, node_id, ping/probe, tunnels, artifacts, key-exclusion zip verify), windows_membership.rs (distribute_signed_bundle staging+atomic-move; issue_membership_owner_key / init_membership_snapshot blocked until W5.4 with UnsupportedPlatform), windows.rs (full delegation, workdir field, run_validator via WindowsDaemonProbe). factory.rs gains remote_workdir param; execute_rust_native_orchestration passes rustynet_src_dir. Security invariants: ps_quote NUL/CR/LF rejection, validate_ip_arg, key-exclusion (verify_no_key_material_zip), membership-owner blocked via UnsupportedPlatform. Commit `76df3c4`.
-> - [ ] W5.3 — MacosNodeAdapter
-> - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS)
-> - [ ] W5.5 — 17 stage implementations + parity run
+> - [x] W5.1 — LinuxNodeAdapter + --node flag opt-in. Commit `8c255c8`. Gates: fmt ✓ clippy ✓ 92 test suites ✓ audit ✓ deny ✓. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). rn_bootstrap.sh extracted + embedded via include_str!(). execute_rust_native_orchestration routes --node traffic to NodeAdapter pipeline. 2026-04-29 hardening: membership init now consumes collected node IDs + real 64-char WireGuard pubkeys instead of aliases/empty pubkeys; commit pending.
+> - [x] W5.2 — WindowsNodeAdapter. Gates: fmt ✓ clippy ✓ tests ✓ audit ✓ deny ✓. Files: windows_install.rs (PS encoding, install lifecycle, 3 embedded scripts), windows_traffic.rs (WG key, node_id, ping/probe, tunnels, artifacts, key-exclusion zip verify), windows_membership.rs (distribute_signed_bundle staging+atomic-move; issue_membership_owner_key / init_membership_snapshot blocked until W5.4 with UnsupportedPlatform), windows.rs (full delegation, workdir field, run_validator via WindowsDaemonProbe). factory.rs gains remote_workdir param; execute_rust_native_orchestration passes rustynet_src_dir. Security invariants: ps_quote NUL/CR/LF rejection, validate_ip_arg, key-exclusion (verify_no_key_material_zip), membership-owner blocked via UnsupportedPlatform. Commit `76df3c4`. 2026-04-29 hardening: Windows membership init is wired to collected peer pubkeys for non-exit roles; non-Linux Exit remains fail-closed pending W5.4 live evidence; commit pending.
+> - [x] W5.3 — MacosNodeAdapter compile/unit-ready. macOS adapter methods delegate to SSH/launchd install, membership, bundle distribution, validators, traffic, artifact, and cleanup modules; scripts exist under `scripts/bootstrap/macos/` and `scripts/launchd/`; `MacosDaemonProbe` and rustynetd `macos-*-check` subcommands are wired. Live macOS VM evidence deferred because no macOS VM is present in `vm_lab_inventory.json`; residual risk: launchd/Homebrew behavior still requires live proof. Commit pending.
+> - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS). Membership-owner code paths now use collected node IDs + 64-char pubkeys across Linux/Windows/macOS, but Windows/macOS Exit is intentionally fail-closed until live evidence exists for owner-key custody, membership-init, bundle issuance, and validators. Commit pending.
+> - [ ] W5.5 — 17 stage implementations + parity run. Code path now uses `PlanBuilder` as the single stage source and includes `FinalCleanupStage`; unit parity test asserts the real CLI stage IDs exactly match `PlanBuilder`. Live parity-run evidence remains pending; no claim made. Commit pending.
 > - [ ] W5.6 — Promote --node to default + deprecate old flags
 > - [ ] W5.7 — Live-evidence campaign + bash removal
 
@@ -532,6 +532,8 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Deliverable:** Full `NodeAdapter` impl for macOS. Uses Homebrew + `launchd` as the per-OS analogues of apt + systemd / winget + SCM.
 
+**Current 2026-04-29 hardening state:** compile/unit-ready. `MacosNodeAdapter` delegates install/start/stop/restart/uninstall to `macos_install`, membership/bundles to `macos_membership`, traffic/artifacts/cleanup to `macos_traffic`, and validators through `MacosDaemonProbe`. Reviewed bootstrap + launchd assets exist. Live evidence is deferred because the active inventory has no macOS VM.
+
 **Files added:**
 - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos.rs`
 - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`
@@ -582,6 +584,8 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 
 **Deliverable:** Remove the "exit must be Linux" constraint. `WindowsNodeAdapter::issue_membership_owner_key` + `init_membership_snapshot` + `MacosNodeAdapter` equivalents stop returning UnsupportedOp.
 
+**Current 2026-04-29 hardening state:** non-Linux Exit is not yet enabled. The Windows/macOS membership code paths now pass collected peer node IDs and 64-char WireGuard public keys into `ops e2e-membership-add`, but `NodeRole::Exit` remains fail-closed on Windows/macOS until live evidence proves membership-owner key custody, init, signed bundle issuance, and validators on those platforms. This is intentional: exposing Windows/macOS Exit without W5.4 live evidence would violate the security minimum bar.
+
 **Files modified:**
 - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_membership.rs` — full impl using `rustynet membership init` over PS-encoded SSH.
 - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs` — full impl.
@@ -598,6 +602,8 @@ Each W5.x slice is a self-contained mergeable commit with passing gates + live e
 ### W5.5 — Stage implementations (4-6 sessions)
 
 **Deliverable:** All 17 stages from §2.1 ported from bash to Rust as `OrchestrationStage` impls. Each stage is its own file under `orchestrator/stage/`, calls `NodeAdapter` methods, and emits typed `StageOutcome`.
+
+**Current 2026-04-29 hardening state:** all 17 stage files are present and `execute_rust_native_orchestration` now builds its runtime stage vector from `PlanBuilder`, so the CLI path includes `FinalCleanupStage` and cannot drift from the plan list. A unit test pins exact stage-ID parity with `PlanBuilder`. The live parity runner/evidence remains pending, so W5.5 is not fully closed.
 
 **Files added:** 17 stage files under `crates/rustynet-cli/src/vm_lab/orchestrator/stage/`.
 
