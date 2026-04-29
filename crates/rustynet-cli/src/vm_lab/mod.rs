@@ -815,8 +815,150 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub validate_linux_daemon_state: bool,
     /// When non-empty, route to the Rust-native `NodeAdapter` pipeline
     /// instead of the bash orchestrator. Each entry is parsed from a
-    /// `--node <alias>:<role>` CLI flag. (W5.1 opt-in; W5.6 promotes to default.)
+    /// `--node <alias>:<role>` CLI flag. (W5.1 opt-in; W5.6 wires the
+    /// translation + routing surface; default flips to Rust path once
+    /// W5.5 cross-orchestrator parity evidence is captured.)
     pub node_assignments: Vec<orchestrator::role_assignment::NodeRoleAssignment>,
+    /// Transitional escape hatch (W5.6, removed in W5.7). When set, force
+    /// the bash orchestrator path even if other flags would otherwise
+    /// route to the Rust orchestrator. Mutually exclusive with `--node`
+    /// because the bash orchestrator does not consume `<alias>:<role>`
+    /// pairs and would silently ignore them.
+    pub legacy_bash_orchestrator: bool,
+}
+
+/// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
+///
+/// Currently:
+/// - `--legacy-bash-orchestrator` is mutually exclusive with `--node`
+///   (the bash path cannot consume role assignments; silently ignoring
+///   them would mask operator intent).
+pub fn validate_orchestrate_live_lab_config(
+    config: &VmLabOrchestrateLiveLabConfig,
+) -> Result<(), String> {
+    if config.legacy_bash_orchestrator && !config.node_assignments.is_empty() {
+        return Err(
+            "--legacy-bash-orchestrator is mutually exclusive with --node; \
+             pass either the legacy --*-vm flag set or --node assignments, not both"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Configuration for `vm-lab-diff-orchestrator-parity`. The subcommand is
+/// the W5.5 evidence harness: takes two `parity_input.json` snapshots
+/// (one bash, one Rust), emits a machine-readable parity diff to
+/// `--output`, and exits non-zero on any drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabDiffOrchestratorParityConfig {
+    pub left_path: PathBuf,
+    pub right_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
+pub fn execute_ops_vm_lab_diff_orchestrator_parity(
+    config: VmLabDiffOrchestratorParityConfig,
+) -> Result<String, String> {
+    let left_bytes = fs::read(&config.left_path).map_err(|err| {
+        format!(
+            "read left parity input '{}': {err}",
+            config.left_path.display()
+        )
+    })?;
+    let right_bytes = fs::read(&config.right_path).map_err(|err| {
+        format!(
+            "read right parity input '{}': {err}",
+            config.right_path.display()
+        )
+    })?;
+    let left: orchestrator::report::LiveLabRunReport = serde_json::from_slice(&left_bytes)
+        .map_err(|err| {
+            format!(
+                "parse left parity input '{}': {err}",
+                config.left_path.display()
+            )
+        })?;
+    let right: orchestrator::report::LiveLabRunReport = serde_json::from_slice(&right_bytes)
+        .map_err(|err| {
+            format!(
+                "parse right parity input '{}': {err}",
+                config.right_path.display()
+            )
+        })?;
+    let diff = orchestrator::parity::diff_live_lab_reports(&left, &right);
+    let body =
+        serde_json::to_vec_pretty(&diff).map_err(|err| format!("serialize parity diff: {err}"))?;
+    if let Some(parent) = config.output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "create parity diff output directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&config.output_path, &body).map_err(|err| {
+        format!(
+            "write parity diff to '{}': {err}",
+            config.output_path.display()
+        )
+    })?;
+    let summary = format!(
+        "parity_diff: pass={} stages={} stages_only_left={} stages_only_right={} \
+         node_count_left={} node_count_right={}",
+        diff.overall_parity_pass,
+        diff.stages.len(),
+        diff.stages_only_in_left.len(),
+        diff.stages_only_in_right.len(),
+        diff.node_count_left,
+        diff.node_count_right,
+    );
+    if diff.overall_parity_pass {
+        Ok(summary)
+    } else {
+        Err(summary)
+    }
+}
+
+/// Build the deprecation-warning lines (newline-free, one per item) that
+/// callers should emit on stderr when the operator invoked
+/// `vm-lab-orchestrate-live-lab` with the legacy `--*-vm` flag set but
+/// without `--node` and without `--legacy-bash-orchestrator`.
+///
+/// The warning is informational only: routing is unchanged for now (the
+/// bash orchestrator stays default until W5.5 parity is proven). Once
+/// proven, the default flips and the warning escalates the operator's
+/// migration path.
+pub fn legacy_role_flags_deprecation_warnings(
+    config: &VmLabOrchestrateLiveLabConfig,
+) -> Vec<String> {
+    if config.legacy_bash_orchestrator || !config.node_assignments.is_empty() {
+        return Vec::new();
+    }
+    let any_legacy_role_flag_set = config.exit_vm.is_some()
+        || config.client_vm.is_some()
+        || config.entry_vm.is_some()
+        || config.aux_vm.is_some()
+        || config.extra_vm.is_some()
+        || config.fifth_client_vm.is_some()
+        || config.windows_vm.is_some();
+    if !any_legacy_role_flag_set {
+        return Vec::new();
+    }
+    vec![
+        "deprecated: --exit-vm/--client-vm/--entry-vm/--aux-vm/--extra-vm/\
+         --fifth-client-vm/--windows-vm are transitional aliases; prefer \
+         repeated --node <alias>:<role> flags for the same role assignment."
+            .to_string(),
+        "the bash orchestrator remains the default execution path; once \
+         W5.5 cross-orchestrator parity evidence is captured the Rust \
+         orchestrator becomes default and the legacy flags will translate \
+         to --node automatically. Pass --legacy-bash-orchestrator to lock \
+         in the bash path explicitly."
+            .to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6211,6 +6353,35 @@ fn execute_rust_native_orchestration(
         .filter(|(_, o)| matches!(o, StageOutcome::Skipped))
         .count();
 
+    // Emit the parity-input JSON snapshot used by the W5.5 cross-orchestrator
+    // diff harness. Failure to write it does not fail the run; it is
+    // surfaced to the operator log so they know to re-run before claiming
+    // parity evidence.
+    let parity_path = report_dir.join("parity_input.json");
+    let timestamp_utc = format!(
+        "{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let run_id = format!("rust-{timestamp_utc}");
+    let live_lab_report =
+        orchestrator::parity::build_live_lab_run_report(run_id, timestamp_utc, &ctx, &results);
+    match serde_json::to_vec_pretty(&live_lab_report) {
+        Ok(bytes) => {
+            if let Err(err) = fs::write(&parity_path, &bytes) {
+                eprintln!(
+                    "warning: failed to write parity input snapshot at {}: {err}",
+                    parity_path.display()
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: failed to serialize parity input snapshot: {err}");
+        }
+    }
+
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -6227,6 +6398,7 @@ fn execute_rust_native_orchestration(
         let _ = writeln!(out, "  {}: {label}", id.as_str());
     }
     let _ = writeln!(out, "passed={passed} failed={failed} skipped={skipped}");
+    let _ = writeln!(out, "parity_input: {}", parity_path.display());
 
     if failed > 0 { Err(out) } else { Ok(out) }
 }
@@ -6247,9 +6419,17 @@ fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::StageId> {
 pub fn execute_ops_vm_lab_orchestrate_live_lab(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
+    validate_orchestrate_live_lab_config(&config)?;
+    for warning in legacy_role_flags_deprecation_warnings(&config) {
+        eprintln!("warning: {warning}");
+    }
     if !config.node_assignments.is_empty() {
         return execute_rust_native_orchestration(config);
     }
+    // legacy_bash_orchestrator (when set) and the absence of --node both
+    // route to the bash orchestrator below. The flag itself stays
+    // transitional until W5.7 removes the bash path entirely.
+    let _ = config.legacy_bash_orchestrator;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
     ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
     ensure_optional_local_regular_file_path(
@@ -27103,5 +27283,260 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             script.contains("'positional-value'"),
             "non-flag arg must be wrapped in PowerShell quotes: {script:?}"
         );
+    }
+
+    // ── W5.6 CLI surface tests ────────────────────────────────────────
+    fn empty_orchestrate_live_lab_config() -> super::VmLabOrchestrateLiveLabConfig {
+        super::VmLabOrchestrateLiveLabConfig {
+            inventory_path: PathBuf::from("/dev/null"),
+            profile_path: None,
+            profile_output_path: None,
+            exit_vm: None,
+            client_vm: None,
+            entry_vm: None,
+            aux_vm: None,
+            extra_vm: None,
+            fifth_client_vm: None,
+            ssh_identity_file: PathBuf::from("/dev/null"),
+            known_hosts_path: None,
+            require_same_network: false,
+            script_path: PathBuf::from("/dev/null"),
+            report_dir: PathBuf::from("/dev/null"),
+            source_mode: None,
+            repo_ref: None,
+            max_parallel_node_workers: None,
+            skip_gates: false,
+            skip_soak: false,
+            skip_cross_network: false,
+            utm_documents_root: None,
+            utmctl_path: None,
+            ssh_port: 22,
+            discovery_timeout_secs: 5,
+            ready_timeout_secs: 300,
+            timeout_secs: 86_400,
+            collect_artifacts_on_failure: false,
+            skip_diagnose_on_failure: false,
+            stop_after_ready: false,
+            dry_run: false,
+            windows_vm: None,
+            windows_only: false,
+            validate_linux_daemon_state: false,
+            node_assignments: Vec::new(),
+            legacy_bash_orchestrator: false,
+        }
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_rejects_legacy_flag_with_node_assignments() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.legacy_bash_orchestrator = true;
+        cfg.node_assignments =
+            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
+        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
+        assert!(
+            err.contains("--legacy-bash-orchestrator")
+                && err.contains("--node")
+                && err.contains("mutually exclusive"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_accepts_legacy_flag_alone() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.legacy_bash_orchestrator = true;
+        super::validate_orchestrate_live_lab_config(&cfg).expect("must accept legacy flag alone");
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_accepts_node_assignments_alone() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.node_assignments =
+            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
+        super::validate_orchestrate_live_lab_config(&cfg).expect("must accept --node alone");
+    }
+
+    #[test]
+    fn validate_orchestrate_live_lab_config_accepts_neither() {
+        let cfg = empty_orchestrate_live_lab_config();
+        super::validate_orchestrate_live_lab_config(&cfg)
+            .expect("absence of both flags must validate");
+    }
+
+    #[test]
+    fn legacy_role_flags_deprecation_warnings_silent_when_node_set() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("a".to_string());
+        cfg.client_vm = Some("b".to_string());
+        cfg.node_assignments =
+            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
+        assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn legacy_role_flags_deprecation_warnings_silent_when_legacy_flag_set() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("a".to_string());
+        cfg.client_vm = Some("b".to_string());
+        cfg.legacy_bash_orchestrator = true;
+        assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn legacy_role_flags_deprecation_warnings_silent_when_no_role_flags_set() {
+        let cfg = empty_orchestrate_live_lab_config();
+        assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn legacy_role_flags_deprecation_warnings_fires_on_legacy_flags_only() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("a".to_string());
+        cfg.client_vm = Some("b".to_string());
+        let warnings = super::legacy_role_flags_deprecation_warnings(&cfg);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected two warning lines: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("deprecated") && warnings[0].contains("--node <alias>:<role>"),
+            "first warning must point at --node: {:?}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("--legacy-bash-orchestrator") && warnings[1].contains("W5.5"),
+            "second warning must reference legacy escape hatch + parity gate: {:?}",
+            warnings[1]
+        );
+    }
+
+    #[test]
+    fn legacy_role_flags_deprecation_warnings_fires_on_windows_vm_only() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.windows_vm = Some("win".to_string());
+        let warnings = super::legacy_role_flags_deprecation_warnings(&cfg);
+        assert_eq!(warnings.len(), 2);
+    }
+
+    fn write_parity_input_json(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).expect("parity input must write");
+        path
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_diff_orchestrator_parity_writes_diff_and_returns_ok_on_match() {
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-parity-{unique}.dir"));
+        fs::create_dir_all(&tmp).expect("tmp dir");
+
+        let body = serde_json::json!({
+            "run_id": "x",
+            "timestamp_utc": "0",
+            "overall_status": "passed",
+            "stages": [{
+                "stage_id": "preflight",
+                "stage_name": "preflight",
+                "outcome": "passed",
+                "duration_ms": 0,
+                "error_detail": null
+            }],
+            "node_statuses": {}
+        })
+        .to_string();
+        let left = write_parity_input_json(&tmp, "left.json", &body);
+        let right = write_parity_input_json(&tmp, "right.json", &body);
+        let output = tmp.join("diff.json");
+        let cfg = super::VmLabDiffOrchestratorParityConfig {
+            left_path: left,
+            right_path: right,
+            output_path: output.clone(),
+        };
+        let summary = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
+            .expect("identical reports must produce parity pass");
+        assert!(summary.contains("pass=true"), "summary: {summary}");
+
+        let written = fs::read_to_string(&output).expect("diff output must exist");
+        let parsed: super::orchestrator::parity::ParityDiff =
+            serde_json::from_str(&written).expect("output must be valid ParityDiff");
+        assert!(parsed.overall_parity_pass);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn execute_ops_vm_lab_diff_orchestrator_parity_returns_err_on_drift() {
+        let unique = super::unique_suffix();
+        let tmp = std::env::temp_dir().join(format!("rustynet-parity-drift-{unique}.dir"));
+        fs::create_dir_all(&tmp).expect("tmp dir");
+
+        let left_body = serde_json::json!({
+            "run_id": "x",
+            "timestamp_utc": "0",
+            "overall_status": "passed",
+            "stages": [{
+                "stage_id": "preflight",
+                "stage_name": "preflight",
+                "outcome": "passed",
+                "duration_ms": 0,
+                "error_detail": null
+            }],
+            "node_statuses": {}
+        })
+        .to_string();
+        let right_body = serde_json::json!({
+            "run_id": "y",
+            "timestamp_utc": "0",
+            "overall_status": "failed",
+            "stages": [{
+                "stage_id": "preflight",
+                "stage_name": "preflight",
+                "outcome": "failed",
+                "duration_ms": 0,
+                "error_detail": "boom"
+            }],
+            "node_statuses": {}
+        })
+        .to_string();
+        let left = write_parity_input_json(&tmp, "left.json", &left_body);
+        let right = write_parity_input_json(&tmp, "right.json", &right_body);
+        let output = tmp.join("diff.json");
+        let cfg = super::VmLabDiffOrchestratorParityConfig {
+            left_path: left,
+            right_path: right,
+            output_path: output.clone(),
+        };
+        let err = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
+            .expect_err("drift must surface as Err");
+        assert!(err.contains("pass=false"), "summary: {err}");
+        // Diff JSON must still be written even on drift so the operator
+        // can inspect it.
+        assert!(output.exists(), "diff JSON must be written even on drift");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn legacy_role_flags_translate_matches_node_flag_pin() {
+        // Pin: legacy flag set --exit-vm A --client-vm B --entry-vm C --aux-vm D --extra-vm E
+        // produces same NodeRoleAssignment list as repeated --node A:exit ... --node E:extra.
+        let translated = super::orchestrator::role_assignment::translate_legacy_role_flags(
+            Some("A"),
+            Some("B"),
+            Some("C"),
+            Some("D"),
+            Some("E"),
+            None,
+            None,
+        );
+        let via_node: Vec<_> = ["A:exit", "B:client", "C:entry", "D:aux", "E:extra"]
+            .iter()
+            .map(|s| {
+                super::orchestrator::role_assignment::parse_node_role_arg(s)
+                    .expect("test pin literal must parse")
+            })
+            .collect();
+        assert_eq!(translated, via_node);
     }
 }

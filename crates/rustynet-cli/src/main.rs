@@ -544,6 +544,9 @@ enum OpsCommand {
     VmLabDiffLiveLabRuns {
         config: vm_lab::VmLabDiffLiveLabRunsConfig,
     },
+    VmLabDiffOrchestratorParity {
+        config: vm_lab::VmLabDiffOrchestratorParityConfig,
+    },
     VmLabIterateLiveLab {
         config: vm_lab::VmLabIterateLiveLabConfig,
     },
@@ -2253,6 +2256,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     }
                     out
                 },
+                legacy_bash_orchestrator: parser.has_flag("--legacy-bash-orchestrator"),
             },
         }),
         "vm-lab-validate-windows-security" => Ok(OpsCommand::VmLabValidateWindowsSecurity {
@@ -2369,6 +2373,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             config: vm_lab::VmLabDiffLiveLabRunsConfig {
                 old_report_dir: parser.required_path("--old-report-dir")?,
                 new_report_dir: parser.required_path("--new-report-dir")?,
+            },
+        }),
+        "vm-lab-diff-orchestrator-parity" => Ok(OpsCommand::VmLabDiffOrchestratorParity {
+            config: vm_lab::VmLabDiffOrchestratorParityConfig {
+                left_path: parser.required_path("--left")?,
+                right_path: parser.required_path("--right")?,
+                output_path: parser.required_path("--output")?,
             },
         }),
         "vm-lab-iterate-live-lab" => {
@@ -4582,6 +4593,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VmLabDiffLiveLabRuns { config } => {
             vm_lab::execute_ops_vm_lab_diff_live_lab_runs(config)
+        }
+        OpsCommand::VmLabDiffOrchestratorParity { config } => {
+            vm_lab::execute_ops_vm_lab_diff_orchestrator_parity(config)
         }
         OpsCommand::VmLabIterateLiveLab { config } => {
             vm_lab::execute_ops_vm_lab_iterate_live_lab(config)
@@ -12131,7 +12145,7 @@ fn help_text() -> String {
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",
@@ -12139,6 +12153,7 @@ fn help_text() -> String {
         "  ops vm-lab-validate-live-lab-profile --profile <path> [--expected-backend <mode>] [--expected-source-mode <mode>] [--require-five-node]",
         "  ops vm-lab-diagnose-live-lab-failure [--inventory <path>] --profile <path> --report-dir <path> [--stage <name>] [--output-dir <path>] [--collect-artifacts] [--timeout-secs <secs>]",
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
+        "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json>",
         "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
         "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",

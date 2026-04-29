@@ -3,6 +3,7 @@ pub mod adapter;
 pub mod connection;
 pub mod context;
 pub mod error;
+pub mod parity;
 pub mod plan;
 pub mod report;
 pub mod role;
